@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 itertools = "0.14"
+regex = "1"
+snafu = "0.8"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"
