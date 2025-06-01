@@ -14,7 +14,7 @@ mod tests {
 
     use super::*;
     use proptest::{prelude::*, strategy::Union};
-    use std::num::NonZeroUsize;
+    use std::{collections::BTreeMap, num::NonZeroUsize};
 
     const LARGE_VERSION: u64 = (u32::MAX as u64) + 1;
 
@@ -161,10 +161,31 @@ mod tests {
         pub const AFTER: HappenedBeforeOrdering = HappenedBeforeOrdering::After;
         pub const EQUAL: HappenedBeforeOrdering = HappenedBeforeOrdering::Equal;
         pub const CONCURRENT: HappenedBeforeOrdering = HappenedBeforeOrdering::Concurrent;
+
+        pub fn first_id() -> Identifier {
+            Identifier::from_array(["id", "first"])
+        }
+
+        pub fn second_id() -> Identifier {
+            Identifier::from_array(["id", "second"])
+        }
+
+        pub fn third_id() -> Identifier {
+            Identifier::from_array(["id", "third"])
+        }
+
+        pub fn three_group_members() -> Vec<Identifier> {
+            vec![first_id(), second_id(), third_id()]
+        }
+
         pub fn pure(a: [u64; 3]) -> VersionVector {
             let full = PureVersionVector::from(a);
             VersionVector::Full(full)
         }
+        pub fn pure_group(a: [u64; 3]) -> GroupVersionVector<Vec<Identifier>> {
+            GroupVersionVector::new(three_group_members(), pure(a))
+        }
+
         pub fn over(gv: u64, ov: (usize, u64)) -> VersionVector {
             let version = OverrideVersion::new(gv, ov.0, ov.1);
             VersionVector::Override {
@@ -172,12 +193,18 @@ mod tests {
                 version,
             }
         }
+        pub fn over_group(gv: u64, ov: (usize, u64)) -> GroupVersionVector<Vec<Identifier>> {
+            GroupVersionVector::new(three_group_members(), over(gv, ov))
+        }
 
         pub fn sync(version: u64) -> VersionVector {
             VersionVector::Synced {
                 num_members: NonZeroUsize::new(3).unwrap(),
                 version,
             }
+        }
+        pub fn sync_group(version: u64) -> GroupVersionVector<Vec<Identifier>> {
+            GroupVersionVector::new(three_group_members(), sync(version))
         }
     }
 
@@ -241,6 +268,114 @@ mod tests {
         assert_eq!(sync(1).succ_at(0), over(1, (0, 2)));
         assert_eq!(sync(1).succ_at(1), over(1, (1, 2)));
         assert_eq!(sync(1).succ_at(0).succ_at(1), pure([2, 2, 1]));
+    }
+
+    #[test]
+    fn missing_versions() {
+        use helpers::*;
+        use maplit::btreemap;
+        let group = three_group_members();
+
+        assert_eq!(
+            pure_group([1, 2, 3]).missing_to(&pure_group([1, 2, 3])),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            pure_group([1, 2, 3]).missing_to(&pure_group([1, 3, 3])),
+            btreemap! { &group[1] => vec![3] }
+        );
+        assert_eq!(
+            pure_group([1, 2, 3]).missing_to(&pure_group([2, 3, 3])),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![3] }
+        );
+        assert_eq!(
+            pure_group([1, 2, 3]).missing_to(&pure_group([2, 1, 5])),
+            btreemap! { &group[0] => vec![2], &group[2] => vec![4, 5] }
+        );
+        assert_eq!(
+            pure_group([1, 7, 3]).missing_to(&pure_group([2, 1, 5])),
+            btreemap! { &group[0] => vec![2], &group[2] => vec![4, 5] }
+        );
+
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(1, (1, 2))),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(1, (1, 3))),
+            btreemap! { &group[1] => vec![3] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(2, (1, 3))),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![3], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(1, (1, 4)).missing_to(&over_group(2, (1, 3))),
+            btreemap! { &group[0] => vec![2], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(1, (1, 3)).missing_to(&over_group(2, (1, 4))),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![4], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(1, (1, 4))),
+            btreemap! { &group[1] => vec![3, 4] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(2, (1, 4))),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![3, 4], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(2, (1, 3)).missing_to(&over_group(1, (1, 4))),
+            btreemap! { &group[1] => vec![4] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(1, (2, 2))),
+            btreemap! { &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&over_group(2, (2, 3))),
+            btreemap! { &group[0] => vec![2], &group[2] => vec![2, 3] }
+        );
+
+        assert_eq!(sync_group(1).missing_to(&sync_group(1)), BTreeMap::new());
+        assert_eq!(
+            sync_group(1).missing_to(&sync_group(2)),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![2], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            sync_group(1).missing_to(&sync_group(3)),
+            btreemap! { &group[0] => vec![2, 3], &group[1] => vec![2, 3], &group[2] => vec![2, 3] }
+        );
+
+        assert_eq!(
+            sync_group(1).missing_to(&pure_group([1, 1, 1])),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&pure_group([1, 2, 1])),
+            BTreeMap::new()
+        );
+        assert_eq!(
+            sync_group(1).missing_to(&pure_group([1, 2, 3])),
+            btreemap! { &group[1] => vec![2], &group[2] => vec![2, 3] }
+        );
+        assert_eq!(
+            sync_group(1).missing_to(&over_group(1, (1, 2))),
+            btreemap! { &group[1] => vec![2] }
+        );
+        assert_eq!(
+            sync_group(1).missing_to(&over_group(2, (1, 3))),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![2, 3], &group[2] => vec![2] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&pure_group([1, 2, 3])),
+            btreemap! { &group[2] => vec![2, 3] }
+        );
+        assert_eq!(
+            over_group(1, (1, 2)).missing_to(&pure_group([2, 5, 3])),
+            btreemap! { &group[0] => vec![2], &group[1] => vec![3, 4, 5], &group[2] => vec![2, 3] }
+        );
     }
 
     fn full_vector_strategy() -> impl Strategy<Value = VersionVector> {

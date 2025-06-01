@@ -18,7 +18,7 @@ pub enum IdentifierError {
     IllegalCharactersError { segment: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
     segments: Vec<IdentifierSegment>,
 }
@@ -149,6 +149,15 @@ where
     }
 }
 
+impl fmt::Debug for Identifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Identifier({})",
+            self.segments.iter().map(|s| format!("{s:?}")).join(", ")
+        )
+    }
+}
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.segments.iter().join(SEGMENT_SEPARATOR))

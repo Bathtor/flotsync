@@ -65,7 +65,7 @@ where
     fn hb_cmp(&self, other: &Rhs) -> HappenedBeforeOrdering;
 
     /// Get something that can be used to compare using [[PartialOrd]] for this instance.
-    fn ord(&self) -> HappenedBeforePartialOrdWrapper<Self> {
+    fn ord(&self) -> HappenedBeforePartialOrdWrapper<'_, Self> {
         HappenedBeforePartialOrdWrapper(self)
     }
 }

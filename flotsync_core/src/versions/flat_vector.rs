@@ -483,7 +483,7 @@ impl PartialOrd for PureVersionVector {
 /// but a single member is posting a new version.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OverrideVersion {
-    /// Everyone has this version, except the member with [[override_id]].
+    /// Everyone has this version, except the member with [[override_position]].
     group_version: u64,
     /// The position of the member with the newer version in the full vector of members.
     pub override_position: usize,
@@ -528,10 +528,12 @@ impl OverrideVersion {
         }
     }
 
+    /// Everyone has this version, except the member with [[override_position]].
     pub const fn group_version(&self) -> u64 {
         self.group_version
     }
 
+    /// The new version at the member with [[override_position]].
     pub const fn override_version(&self) -> u64 {
         self.override_version
     }

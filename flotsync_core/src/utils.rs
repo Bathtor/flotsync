@@ -18,7 +18,7 @@ macro_rules! option_when {
 }
 
 /// An immutable wrapper around strings.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IString(Box<str>);
 
 impl IString {
@@ -38,7 +38,12 @@ impl From<&str> for IString {
         Self(Box::<str>::from(value))
     }
 }
-
+impl fmt::Debug for IString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A bit shorter than the full generate Debug.
+        write!(f, "i\"{}\"", self.0)
+    }
+}
 impl fmt::Display for IString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
