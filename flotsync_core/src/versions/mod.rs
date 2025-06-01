@@ -48,9 +48,9 @@ impl From<cmp::Ordering> for HappenedBeforeOrdering {
     }
 }
 
-impl Into<Option<cmp::Ordering>> for HappenedBeforeOrdering {
-    fn into(self) -> Option<cmp::Ordering> {
-        match self {
+impl From<HappenedBeforeOrdering> for Option<cmp::Ordering> {
+    fn from(val: HappenedBeforeOrdering) -> Self {
+        match val {
             HappenedBeforeOrdering::Before => Some(cmp::Ordering::Less),
             HappenedBeforeOrdering::Equal => Some(cmp::Ordering::Equal),
             HappenedBeforeOrdering::After => Some(cmp::Ordering::Greater),
@@ -94,12 +94,12 @@ where
     T: HappenedBeforeOrd + ?Sized,
 {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.0.hb_cmp(&other.0).into()
+        self.0.hb_cmp(other.0).into()
     }
 }
 
 /// The most general version vector that abstracts over the exact representation.
-#[derive(Clone, Debug, Eq, Hash)]
+#[derive(Clone, Debug, Eq)]
 pub enum VersionVector {
     /// This is the full reference representation, which every participant's version listed explicitly.
     Full(PureVersionVector),
@@ -108,7 +108,7 @@ pub enum VersionVector {
         num_members: NonZeroUsize,
         version: OverrideVersion,
     },
-    /// The system is fully synced up and all participants have exactly the same versions.
+    /// The system is fully synced up and all participants have exactly the same version.
     Synced {
         num_members: NonZeroUsize,
         version: u64,
@@ -164,9 +164,13 @@ impl VersionVector {
                 num_members,
                 version,
             } => {
-                *self = Self::Override {
-                    num_members: *num_members,
-                    version: OverrideVersion::with_next_version(*version, position),
+                if num_members.get() == 1 {
+                    *version += 1;
+                } else {
+                    *self = Self::Override {
+                        num_members: *num_members,
+                        version: OverrideVersion::with_next_version(*version, position),
+                    }
                 }
             }
         }
@@ -225,30 +229,84 @@ impl HappenedBeforeOrd for VersionVector {
         }
         match (self, other) {
             (VersionVector::Full(v1), VersionVector::Full(v2)) => v1.hb_cmp(v2),
-            (VersionVector::Full(v1), VersionVector::Override { version: v2, .. }) => {
+            (
+                VersionVector::Full(v1),
+                VersionVector::Override {
+                    num_members,
+                    version: v2,
+                },
+            ) => {
+                assert!(
+                    num_members.get() > 1,
+                    "Override with a single member is not supported"
+                );
                 hb_compare_full_override(v1, v2)
             }
             (VersionVector::Full(v1), VersionVector::Synced { version: v2, .. }) => {
                 hb_compare_full_synced(v1, *v2)
             }
-            (VersionVector::Override { version: v1, .. }, VersionVector::Full(v2)) => {
+            (
+                VersionVector::Override {
+                    num_members,
+                    version: v1,
+                },
+                VersionVector::Full(v2),
+            ) => {
+                assert!(
+                    num_members.get() > 1,
+                    "Override with a single member is not supported"
+                );
                 hb_compare_full_override(v2, v1).reverse()
             }
             (
-                VersionVector::Override { version: v1, .. },
-                VersionVector::Override { version: v2, .. },
-            ) => v1.hb_cmp(v2),
+                VersionVector::Override {
+                    version: v1,
+                    num_members: n1,
+                },
+                VersionVector::Override {
+                    version: v2,
+                    num_members: n2,
+                },
+            ) => {
+                assert!(
+                    n1.get() > 1,
+                    "Override with a single member is not supported"
+                );
+                assert!(
+                    n2.get() > 1,
+                    "Override with a single member is not supported"
+                );
+                v1.hb_cmp(v2)
+            }
             (
-                VersionVector::Override { version: v1, .. },
+                VersionVector::Override {
+                    version: v1,
+                    num_members,
+                },
                 VersionVector::Synced { version: v2, .. },
-            ) => hb_compare_override_synced(v1, *v2),
+            ) => {
+                assert!(
+                    num_members.get() > 1,
+                    "Override with a single member is not supported"
+                );
+                hb_compare_override_synced(v1, *v2)
+            }
             (VersionVector::Synced { version: v1, .. }, VersionVector::Full(v2)) => {
                 hb_compare_full_synced(v2, *v1).reverse()
             }
             (
                 VersionVector::Synced { version: v1, .. },
-                VersionVector::Override { version: v2, .. },
-            ) => hb_compare_override_synced(v2, *v1).reverse(),
+                VersionVector::Override {
+                    version: v2,
+                    num_members,
+                },
+            ) => {
+                assert!(
+                    num_members.get() > 1,
+                    "Override with a single member is not supported"
+                );
+                hb_compare_override_synced(v2, *v1).reverse()
+            }
             (
                 VersionVector::Synced { version: v1, .. },
                 VersionVector::Synced { version: v2, .. },
@@ -258,16 +316,16 @@ impl HappenedBeforeOrd for VersionVector {
 }
 impl PartialEq for VersionVector {
     fn eq(&self, other: &Self) -> bool {
-        self.hb_cmp(&other) == HappenedBeforeOrdering::Equal
+        self.hb_cmp(other) == HappenedBeforeOrdering::Equal
     }
 }
 impl PartialOrd for VersionVector {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.hb_cmp(&other).into()
+        self.hb_cmp(other).into()
     }
 }
 
-/// This is somewhat equivlent to a Set<Ordering> just much more compact.
+/// This is somewhat equivalent to a Set<Ordering> just much more compact.
 struct EncounteredOrderings {
     has_equal: bool,
     has_less: bool,
@@ -300,7 +358,7 @@ impl EncounteredOrderings {
         self.has_less && self.has_greater
     }
 
-    fn to_hb_assume_loop_check(self) -> HappenedBeforeOrdering {
+    fn to_hb_assume_loop_check(&self) -> HappenedBeforeOrdering {
         debug_assert!(self.has_equal || self.has_less || self.has_greater);
         if self.has_equal && !(self.has_less || self.has_greater) {
             HappenedBeforeOrdering::Equal
@@ -415,7 +473,7 @@ impl<const N: usize> From<[u64; N]> for PureVersionVector {
 }
 impl From<Vec<u64>> for PureVersionVector {
     fn from(entries: Vec<u64>) -> Self {
-        assert!(entries.len() > 0, "Must have at least 1 entry.");
+        assert!(!entries.is_empty(), "Must have at least 1 entry.");
         Self(entries.into_boxed_slice())
     }
 }
@@ -452,7 +510,7 @@ impl HappenedBeforeOrd for PureVersionVector {
 }
 impl PartialOrd for PureVersionVector {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.hb_cmp(&other).into()
+        self.hb_cmp(other).into()
     }
 }
 
@@ -568,7 +626,7 @@ impl HappenedBeforeOrd for OverrideVersion {
 }
 impl PartialOrd for OverrideVersion {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        self.hb_cmp(&other).into()
+        self.hb_cmp(other).into()
     }
 }
 impl fmt::Display for OverrideVersion {
@@ -584,7 +642,7 @@ impl fmt::Display for OverrideVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
+    use proptest::{prelude::*, strategy::Union};
 
     const LARGE_VERSION: u64 = (u32::MAX as u64) + 1;
 
@@ -766,17 +824,26 @@ mod tests {
         })
     }
 
-    fn fixed_size_version_vector_strategy(
+    fn fixed_size_synced_strategy(
         num_members: NonZeroUsize,
     ) -> impl Strategy<Value = VersionVector> {
-        prop_oneof![
-            fixed_size_full_vector_strategy(num_members),
-            fixed_size_override_vector_strategy(num_members),
-            any::<u64>().prop_map(move |version| VersionVector::Synced {
-                num_members,
-                version
-            }),
-        ]
+        any::<u64>().prop_map(move |version| VersionVector::Synced {
+            num_members,
+            version,
+        })
+    }
+
+    fn fixed_size_version_vector_strategy(
+        num_members: NonZeroUsize,
+    ) -> BoxedStrategy<VersionVector> {
+        let mut strategies = vec![
+            fixed_size_full_vector_strategy(num_members).boxed(),
+            fixed_size_synced_strategy(num_members).boxed(),
+        ];
+        if num_members.get() > 1 {
+            strategies.push(fixed_size_override_vector_strategy(num_members).boxed());
+        }
+        Union::new(strategies).boxed()
     }
 
     fn version_vector_size_strategy() -> impl Strategy<Value = NonZeroUsize> {
@@ -820,7 +887,10 @@ mod tests {
     }
     fn single_version_vector_invariants_impl(v: VersionVector) {
         // Reflexive
-        assert_eq!(v, v);
+        #[allow(clippy::eq_op)]
+        {
+            assert_eq!(v, v);
+        }
         assert_eq!(v.hb_cmp(&v), HappenedBeforeOrdering::Equal);
 
         // Ensure that we don't overflow, and also we don't run out of memory if we need to expand to a full vector.
@@ -840,6 +910,7 @@ mod tests {
             }
         }
     }
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     fn two_version_vector_invariants_impl(v1: VersionVector, v2: VersionVector) {
         // v1 == v2 iff v1 =hb= v2
         if v1 == v2 {
@@ -888,7 +959,10 @@ mod tests {
     }
     fn single_override_version_compare_impl(v: u64) {
         let ov = OverrideVersion::with_next_version(v, 2usize);
-        assert_eq!(ov, ov);
+        #[allow(clippy::eq_op)]
+        {
+            assert_eq!(ov, ov);
+        }
         assert_eq!(ov.hb_cmp(&ov), HappenedBeforeOrdering::Equal);
     }
 
