@@ -2,6 +2,7 @@ use std::ops::Index;
 
 mod identifier;
 pub use identifier::*;
+mod identifier_trie;
 
 /// Some representation of flotsync group's members.
 pub trait GroupMembership:
@@ -27,5 +28,3 @@ impl GroupMembership for Vec<Identifier> {
         Vec::as_slice(self).iter()
     }
 }
-
-// TODO: A trie based implementation.

@@ -1,13 +1,11 @@
-use core::fmt;
-use std::{collections::BTreeMap, num::NonZeroUsize};
-
-use itertools::Itertools;
-
 use super::VersionVector;
 use crate::{
     member::{GroupMembership, Identifier},
     versions::{HappenedBeforeOrd, HappenedBeforeOrdering},
 };
+use core::fmt;
+use itertools::Itertools;
+use std::{collections::BTreeMap, num::NonZeroUsize};
 
 /// A [[versionVector]] together with the corresponding group-membership information.
 ///
@@ -110,7 +108,7 @@ where
             (current..=updated).skip(1).collect_vec()
         }
 
-        let mut result = BTreeMap::new();
+        let mut result: BTreeMap<&Identifier, Vec<u64>> = BTreeMap::new();
         match (&self.versions, &other.versions) {
             (VersionVector::Full(_), _) | (_, VersionVector::Full(_)) => {
                 for (self_version, (other_id, other_version)) in

@@ -20,7 +20,7 @@ pub enum IdentifierError {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Identifier {
-    segments: Vec<IdentifierSegment>,
+    pub(super) segments: Vec<IdentifierSegment>,
 }
 
 impl Identifier {
