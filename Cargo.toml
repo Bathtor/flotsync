@@ -1,0 +1,3 @@
+[workspace]
+members = ["flotsync_core", "flotsync_messages", "flotsync_discovery", "flotsync_discovery_cli"]
+resolver = "3"

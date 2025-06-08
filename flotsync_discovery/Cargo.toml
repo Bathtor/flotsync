@@ -1,0 +1,16 @@
+[package]
+name = "flotsync_discovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flotsync_messages = { path = "../flotsync_messages" }
+# socket2 = "0.5"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+derive_more = { version = "2", features = ["deref", "display", "from"] }
+snafu = "0.8"
+log = "0.4"
+pnet = "0.35"
+itertools = "0.14"
+uuid = { version = "1", features = ["v4"] }

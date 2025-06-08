@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+// A full socket address, specifying protocol, address, and port.
+message SocketAddress {
+
+    enum Protocol {
+        UDP = 0;
+        TCP = 1;
+    }
+
+    Protocol protocol = 1;
+    IPAddress address = 2;
+    uint32 port = 3;
+}
+
+// An IP address, either V4 or V6.
+message IPAddress {
+    oneof address {
+        // Exactly 4 bytes.
+        bytes ipv4_bytes = 1; 
+        // Exactly 16 bytes.
+        bytes ipv6_bytes = 2; 
+    }
+}
+
+// Broadcast message to announce that a peer that speaks the flotsync protocol
+// is operating in this network and can be reached at the addresses listen in the listening_on field.
+message Peer {
+    // A 16 byte UUID of the current instance of this peer.
+    bytes instance_uuid = 1;
+    repeated SocketAddress listening_on = 2;
+}
+
+// Request for a peer to identify themselves.
+// 
+// Should be answered with an [[Introduction]].
+message IntroductionRequest {
+    // Any responses should be sent to this peer.
+    Peer respond_to = 1;
+}
+
+// An identification of a peer.
+message Introduction {
+    // A 16 byte UUID of the current instance of this peer.
+    bytes instance_uuid = 1;
+
+    // List all the groups we are part of.
+    repeated GroupMemberId group_ids = 2;
+}
+
+// A combination of a replication group and an identifier within that group.
+message GroupMemberId {
+    // A 16 byte UUID.
+    bytes group_id = 1;
+    Identifier member_id = 2;  
+}
+
+// A hierarchical identifier equivalent to "a.b.c", given as individual segments "a", "b", "c".
+message Identifier {
+    repeated string segments = 1;
+}

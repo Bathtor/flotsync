@@ -1,7 +1,6 @@
 use core::fmt;
-use std::error::Error;
-
 use itertools::Itertools;
+use std::error::Error;
 
 pub type Result<T, E> = std::result::Result<T, Errors<E>>;
 

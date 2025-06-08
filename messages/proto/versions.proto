@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+// The most general version vector that abstracts over the exact representation.
+message VersionVector {
+    oneof versions {
+        FullVersionVector full = 1;
+        OverrideVersionVector override = 2;
+        SyncedVersionVector synced = 3;
+    }
+}
+
+// A version vector where every entry has its version explicity set.
+message FullVersionVector {
+    repeated uint64 entries = 1;
+}
+
+// A representation of a version vector for when the system is mostly synced up,
+// but a single member at override_position is posting a new override_version.
+message OverrideVersionVector {
+    uint64 group_version = 1;
+    uint32 override_position = 2;
+    uint64 override_version = 3;
+}
+
+message SyncedVersionVector {
+    uint64 group_version = 1;
+}
