@@ -33,6 +33,7 @@ fn main() {
 
     // Compile the .proto files into the output directory
     Codegen::new()
+        .pure()
         .cargo_out_dir("protos")
         .inputs(&proto_files)
         .include(&proto_dir)
