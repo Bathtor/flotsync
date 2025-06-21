@@ -3,6 +3,10 @@ name = "flotsync_discovery"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["zeroconf"]
+zeroconf = ["zeroconf-tokio"]
+
 [dependencies]
 flotsync_messages = { path = "../flotsync_messages" }
 # socket2 = "0.5"
@@ -14,3 +18,4 @@ log = "0.4"
 pnet = "0.35"
 itertools = "0.14"
 uuid = { version = "1", features = ["v4"] }
+zeroconf-tokio = { version = "0.2", optional = true }

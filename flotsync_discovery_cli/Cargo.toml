@@ -3,6 +3,10 @@ name = "flotsync_discovery_cli"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["zeroconf"]
+zeroconf = ["flotsync_discovery/zeroconf"]
+
 [dependencies]
 flotsync_discovery = { path = "../flotsync_discovery" }
 tokio = { version = "1", features = ["full"] }

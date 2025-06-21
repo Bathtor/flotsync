@@ -1,5 +1,6 @@
 use derive_more::{Deref, Display, From};
 
+pub use uuid;
 pub mod errors;
 pub mod services;
 

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::{Port, errors::*};
 use async_trait::async_trait;
 use snafu::prelude::*;
@@ -5,6 +7,10 @@ use tokio::sync::watch;
 
 mod peer_announcement;
 pub use peer_announcement::PeerAnnouncementService;
+
+#[cfg(feature = "zeroconf")]
+mod mdns_announcement;
+pub use mdns_announcement::MdnsAnnouncementService;
 
 #[derive(Debug)]
 pub struct ServiceHandle {
@@ -67,12 +73,16 @@ where
         loop {
             tokio::select! {
                 _ = rx.changed() => {
-                    drop(service);
-                    break;
+                    if *rx.borrow() {
+                        if let Err(e) = service.shutdown().await {
+                            log::error!("Error during service '{service_name}' shutdown: {e}");
+                        }
+                        break;
+                    }
                 }
                 res = service.run() => {
                     if let Err(e) = res {
-                        log::error!("Error during service '{service_name}' execution: {e}")
+                        log::error!("Error during service '{service_name}' execution: {e}");
                     }
                     // continue
                 }
@@ -95,4 +105,36 @@ pub trait Service {
     async fn run(&mut self) -> Result<()>;
 
     async fn shutdown(self) -> Result<()>;
+}
+
+/// A way to hold on to some arbitrary value until the service handles decides to shutdown.
+pub struct ServiceWrapper<T> {
+    inner: T,
+}
+
+impl<T> ServiceWrapper<T>
+where
+    T: Send + 'static,
+{
+    pub async fn setup(service: T) -> Result<Self> {
+        Ok(Self { inner: service })
+    }
+}
+
+#[async_trait]
+impl<T> Service for ServiceWrapper<T>
+where
+    T: Send + 'static,
+{
+    type Options = T;
+
+    async fn run(&mut self) -> Result<()> {
+        tokio::time::interval(Duration::from_secs(60)).tick().await;
+        Ok(())
+    }
+
+    async fn shutdown(self) -> Result<()> {
+        drop(self.inner);
+        Ok(())
+    }
 }

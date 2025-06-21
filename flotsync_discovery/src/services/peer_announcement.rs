@@ -2,6 +2,7 @@ use super::*;
 use flotsync_messages::discovery::Peer;
 use itertools::Itertools;
 // use socket2::{Domain, Protocol, Socket, Type};
+use flotsync_messages::protobuf::Message;
 use pnet::{
     datalink::{self, NetworkInterface},
     util::MacAddr,
@@ -14,14 +15,13 @@ use std::{
 use tokio::{net::UdpSocket, time::Interval};
 use uuid::Uuid;
 
-use flotsync_messages::protobuf::Message;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
-    bind_addr: IpAddr,
-    bind_port: Port,
-    port: Port,
-    announcement_interval: Duration,
+    pub bind_addr: IpAddr,
+    pub bind_port: Port,
+    pub port: Port,
+    pub announcement_interval: Duration,
+    pub instance_id: Uuid,
 }
 impl Options {
     pub const DEFAULT: Self = Self {
@@ -29,6 +29,7 @@ impl Options {
         bind_port: Port(0),
         port: Port(52156),
         announcement_interval: Duration::from_secs(5),
+        instance_id: Uuid::nil(),
     };
 }
 impl Default for Options {
@@ -50,6 +51,7 @@ impl PeerAnnouncementService {
     /// - bind to '0.0.0.0:0'
     /// - announce to '255.255.255.255:52156'
     /// - announce every 5s
+    /// - instance_id: Uuid::nil(),
     pub const DEFAULT_OPTIONS: Options = Options::DEFAULT;
 
     pub async fn setup(options: Options) -> Result<Self> {
