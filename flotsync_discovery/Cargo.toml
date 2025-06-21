@@ -19,3 +19,5 @@ pnet = "0.35"
 itertools = "0.14"
 uuid = { version = "1", features = ["v4"] }
 zeroconf-tokio = { version = "0.2", optional = true }
+hostname = "0.4"
+base64 = "0.22"

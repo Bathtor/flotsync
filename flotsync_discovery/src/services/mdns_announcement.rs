@@ -159,8 +159,29 @@ async fn run_mdns_service(
     txt_record: TxtRecord,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    const FALLBACK_HOST_NAME: &str = "unknown";
+
     let mut service = MdnsService::new(service_type, port);
-    service.set_name(service_provider_name.as_ref());
+    let host_name = hostname::get()
+        .map(|s| {
+            s.into_string()
+                .map(|mut s| {
+                    if s.ends_with(".local") {
+                        let _ = s.split_off(s.len() - 6);
+                    }
+                    s
+                })
+                .unwrap_or_else(|s| {
+                    log::warn!("Could not turn hostname '{s:?}' into Rust String");
+                    FALLBACK_HOST_NAME.to_string()
+                })
+        })
+        .unwrap_or_else(|e| {
+            log::warn!("Could not get hostname: {e}");
+            FALLBACK_HOST_NAME.to_string()
+        });
+    let service_name = format!("{service_provider_name}@{host_name}:{port:04X}");
+    service.set_name(&service_name);
     service.set_txt_record(txt_record);
     let mut service = MdnsServiceAsync::new(service).context(ZeroconfSnafu)?;
 

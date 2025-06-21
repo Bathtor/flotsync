@@ -1,5 +1,3 @@
-use std::any::Any;
-
 use flotsync_messages::protobuf;
 use snafu::prelude::*;
 use tokio::task::JoinError;
