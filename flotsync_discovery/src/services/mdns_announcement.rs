@@ -1,3 +1,4 @@
+use crate::utils::shutdown::{self, ShutdownHandle, ShutdownWatch};
 use std::borrow::Cow;
 use tokio::{runtime::Builder, task::LocalSet};
 use uuid::Uuid;
@@ -41,7 +42,7 @@ enum ServiceState {
         // This is almost the same as the ServiceHandle again,
         // but MdnsServiceAsync doesn't let me move it between threads,
         // so I cannot hold it's state directly here -.-
-        shutdown_handle: watch::Sender<bool>,
+        shutdown_handle: ShutdownHandle,
         join: std::thread::JoinHandle<Result<()>>,
     },
     Stopped,
@@ -89,7 +90,7 @@ impl Service for MdnsAnnouncementService {
                 let service_provider_name = self.options.service_provider_name.clone();
                 let txt_record = self.txt_record.clone();
 
-                let (tx, rx) = watch::channel(false);
+                let (handle, watch) = shutdown::watcher();
                 let rt = Builder::new_current_thread().enable_all().build().unwrap();
                 let join = std::thread::spawn(move || {
                     let local = LocalSet::new();
@@ -100,7 +101,7 @@ impl Service for MdnsAnnouncementService {
                             port,
                             service_provider_name.as_ref(),
                             txt_record,
-                            rx,
+                            watch,
                         )
                         .await
                     });
@@ -110,7 +111,7 @@ impl Service for MdnsAnnouncementService {
                     )
                 });
                 self.state = ServiceState::Running {
-                    shutdown_handle: tx,
+                    shutdown_handle: handle,
                     join,
                 };
                 Ok(())
@@ -131,16 +132,15 @@ impl Service for MdnsAnnouncementService {
                 shutdown_handle,
                 join,
             } => {
-                if shutdown_handle.send(true).is_err() {
-                    log::warn!("The MdnsService handle was already dropped.");
-                } else {
-                    tokio::task::spawn_blocking(|| {
-                        join.join().map_err(|_| ThreadJoinSnafu.build()).flatten()
-                    })
-                    .await
-                    .context(JoinSnafu)
-                    .flatten()?;
+                if let Err(e) = shutdown_handle.shutdown() {
+                    log::warn!("Error sending mDNS service shutdown instruction: {e}");
                 }
+                tokio::task::spawn_blocking(|| {
+                    join.join().map_err(|_| ThreadJoinSnafu.build()).flatten()
+                })
+                .await
+                .context(JoinSnafu)
+                .flatten()?;
                 self.state = ServiceState::Stopped;
                 Ok(())
             }
@@ -157,7 +157,7 @@ async fn run_mdns_service(
     port: u16,
     service_provider_name: &str,
     txt_record: TxtRecord,
-    mut shutdown: watch::Receiver<bool>,
+    mut shutdown: ShutdownWatch,
 ) -> Result<()> {
     const FALLBACK_HOST_NAME: &str = "unknown";
 
@@ -189,8 +189,8 @@ async fn run_mdns_service(
     log::info!("Registered mDNS service: {registration:?}");
     drop(registration);
 
-    if let Err(e) = shutdown.wait_for(|b| *b).await {
-        log::warn!("Shutdown handle for MdnsAnnouncementService was dropped: {e}");
+    if let Err(e) = shutdown.wait().await {
+        log::warn!("Error waiting for mDNS service shutdown instruction: {e}");
     }
 
     log::debug!("Shutting down mDNS service...");

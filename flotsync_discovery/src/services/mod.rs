@@ -1,9 +1,11 @@
-use std::time::Duration;
-
-use crate::{Port, errors::*};
+use crate::{
+    Port,
+    errors::*,
+    utils::shutdown::{self, ShutdownHandle},
+};
 use async_trait::async_trait;
 use snafu::prelude::*;
-use tokio::sync::watch;
+use std::time::Duration;
 
 mod peer_announcement;
 pub use peer_announcement::PeerAnnouncementService;
@@ -16,12 +18,12 @@ pub use mdns_announcement::MdnsAnnouncementService;
 pub struct ServiceHandle {
     /// Identifies the service that this handle belongs to.
     pub label: &'static str,
-    shutdown: watch::Sender<bool>,
+    shutdown: ShutdownHandle,
     join: tokio::task::JoinHandle<Result<()>>,
 }
 impl ServiceHandle {
     pub async fn shutdown(self) -> Result<()> {
-        if self.shutdown.send(true).is_err() {
+        if self.shutdown.shutdown().is_err() {
             log::warn!(
                 "The {} service referenced by this service handle was already dropped.",
                 self.label
@@ -68,17 +70,15 @@ where
 {
     let service_name = std::any::type_name::<S>();
     let mut service = constructor(options).await?;
-    let (tx, mut rx) = watch::channel(false);
+    let (handle, mut watcher) = shutdown::watcher();
     let join = tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = rx.changed() => {
-                    if *rx.borrow() {
-                        if let Err(e) = service.shutdown().await {
-                            log::error!("Error during service '{service_name}' shutdown: {e}");
-                        }
-                        break;
+                _ = watcher.wait() => {
+                    if let Err(e) = service.shutdown().await {
+                        log::error!("Error during service '{service_name}' shutdown: {e}");
                     }
+                    break;
                 }
                 res = service.run() => {
                     if let Err(e) = res {
@@ -92,7 +92,7 @@ where
     });
     Ok(ServiceHandle {
         label: service_name,
-        shutdown: tx,
+        shutdown: handle,
         join,
     })
 }
