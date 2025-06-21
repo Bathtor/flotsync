@@ -1,4 +1,5 @@
 use super::*;
+use crate::SocketPort;
 use flotsync_messages::discovery::Peer;
 use itertools::Itertools;
 // use socket2::{Domain, Protocol, Socket, Type};
@@ -18,16 +19,16 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
     pub bind_addr: IpAddr,
-    pub bind_port: Port,
-    pub port: Port,
+    pub bind_port: SocketPort,
+    pub port: SocketPort,
     pub announcement_interval: Duration,
     pub instance_id: Uuid,
 }
 impl Options {
     pub const DEFAULT: Self = Self {
         bind_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-        bind_port: Port(0),
-        port: Port(52156),
+        bind_port: SocketPort(0),
+        port: SocketPort(52156),
         announcement_interval: Duration::from_secs(5),
         instance_id: Uuid::nil(),
     };
@@ -40,7 +41,7 @@ impl Default for Options {
 
 pub struct PeerAnnouncementService {
     socket: UdpSocket,
-    broadcast_port: Port,
+    broadcast_port: SocketPort,
     broadcast_addresses: HashMap<MacAddr, SocketAddr>,
     interval: Interval,
     instance_id: Uuid,

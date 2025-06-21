@@ -1,6 +1,5 @@
 use flotsync_messages::protobuf;
 use snafu::prelude::*;
-use tokio::task::JoinError;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
@@ -16,13 +15,15 @@ pub enum ServiceError {
     Io { source: std::io::Error },
     #[snafu(display("A thread panicked"))]
     ThreadJoin,
+    #[cfg(feature = "full-tokio")]
     #[snafu(display("A task failed to shutdown properly: {source}"))]
-    Join { source: JoinError },
+    Join { source: tokio::task::JoinError },
     #[snafu(display("Error during protobuf operations: {source}"))]
     Proto { source: protobuf::Error },
+    #[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
     #[snafu(display("Error with a zeroconf service operation: {source}"))]
     Zeroconf {
-        source: zeroconf_tokio::error::Error,
+        source: crate::zeroconf::error::Error,
     },
     #[snafu(display("External service error: {}", source))]
     External {

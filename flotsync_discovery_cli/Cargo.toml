@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["zeroconf"]
-zeroconf = ["flotsync_discovery/zeroconf"]
+zeroconf = ["flotsync_discovery/zeroconf-via-kompact"]
 
 [dependencies]
 flotsync_discovery = { path = "../flotsync_discovery" }
