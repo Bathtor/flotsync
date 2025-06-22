@@ -828,6 +828,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotsync_data_types"
+version = "0.1.0"
+
+[[package]]
 name = "flotsync_discovery"
 version = "0.1.0"
 dependencies = [

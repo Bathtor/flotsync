@@ -40,11 +40,9 @@ fn main() {
 
         #[cfg(feature = "zeroconf")]
         if cfg!(feature = "zeroconf") && args.mdns {
-            use std::borrow::Cow;
-
             let mut options = MDNS_ANNOUNCEMENT_SERVICE_DEFAULT_OPTIONS;
             options.instance_id = instance_id;
-            options.service_provider_name = Cow::Borrowed("flotsync_discovery_cli");
+            options.with_service_provider_name("flotsync_discovery_cli");
             let component =
                 kompact_system.create(move || MdnsAnnouncementComponent::with_options(options));
             debug!(
@@ -62,16 +60,20 @@ fn main() {
         None
     };
 
-    println!("Press Enter to exit...");
-
-    let mut reader = BufReader::new(std::io::stdin());
-    let mut line = String::new();
-
-    // Wait for a line of input
-    reader.read_line(&mut line).unwrap();
+    wait_for_enter();
 
     log::info!("Shutting down service...");
     kompact_system.shutdown().expect("Kompact System shutdown");
+}
+
+fn wait_for_enter() {
+    let mut reader = BufReader::new(std::io::stdin());
+    let mut line = String::new();
+
+    println!("Press Enter to exit...");
+
+    // Wait for a line of input
+    reader.read_line(&mut line).unwrap();
 }
 
 // #[tokio::main]

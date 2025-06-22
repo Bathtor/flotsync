@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["zeroconf-via-kompact"]
 # These two are mutually exclusive.
 zeroconf-via-tokio = ["full-tokio", "zeroconf-tokio"]
 zeroconf-via-kompact = ["kompact", "zeroconf", "tokio-sync-only"]

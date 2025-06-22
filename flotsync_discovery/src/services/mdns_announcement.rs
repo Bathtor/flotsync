@@ -23,6 +23,14 @@ impl Options {
     pub fn with_new_instance_id(&mut self) {
         self.instance_id = Uuid::new_v4();
     }
+
+    /// Replace the current service provider name with `name`.
+    pub fn with_service_provider_name<I>(&mut self, name: I)
+    where
+        I: Into<Cow<'static, str>>,
+    {
+        self.service_provider_name = name.into();
+    }
 }
 impl Default for Options {
     fn default() -> Self {

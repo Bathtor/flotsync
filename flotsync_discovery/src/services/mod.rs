@@ -22,6 +22,9 @@ pub use mdns_announcement::{
     MdnsAnnouncementMessages,
 };
 
+#[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
+mod mdns_browser;
+
 #[cfg(feature = "full-tokio")]
 mod tokio_services {
     use super::*;
