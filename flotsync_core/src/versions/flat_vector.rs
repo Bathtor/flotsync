@@ -1,5 +1,5 @@
 use super::{HappenedBeforeOrd, HappenedBeforeOrdering};
-use crate::option_when;
+use flotsync_utils::option_when;
 use itertools::Itertools;
 use std::{cmp, fmt, num::NonZeroUsize};
 

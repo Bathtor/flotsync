@@ -830,6 +830,7 @@ name = "flotsync_core"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "flotsync_utils",
  "itertools 0.14.0",
  "maplit",
  "proptest",
@@ -842,6 +843,7 @@ dependencies = [
 name = "flotsync_data_types"
 version = "0.1.0"
 dependencies = [
+ "flotsync_utils",
  "itertools 0.14.0",
  "similar",
  "unicode-segmentation",
@@ -885,6 +887,13 @@ version = "0.1.0"
 dependencies = [
  "protobuf",
  "protobuf-codegen",
+]
+
+[[package]]
+name = "flotsync_utils"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]

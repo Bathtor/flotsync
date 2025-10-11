@@ -1,7 +1,5 @@
-use crate::{
-    errors::{Errors, ErrorsExt},
-    utils::IString,
-};
+use crate::errors::{Errors, ErrorsExt};
+use flotsync_utils::IString;
 use itertools::Itertools;
 use regex::Regex;
 use snafu::prelude::*;
