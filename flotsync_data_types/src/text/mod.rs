@@ -1,31 +1,248 @@
+use flotsync_utils::debugging::DebugFormatting;
+use std::{fmt, ops::RangeBounds};
+use unicode_segmentation::{Graphemes, UnicodeSegmentation};
+
 mod linear_data;
-pub use linear_data::{LinearData, NodeIds, VecLinearData};
+pub use linear_data::{
+    Composite,
+    IdWithIndex,
+    IdWithIndexRange,
+    LinearData,
+    NodeIdRange,
+    NodeIds,
+    VecCoalescedLinearData,
+    VecCoalescedLinearDataIter,
+    VecLinearData,
+};
+
 /// Simple diffs on plain old strings.
 mod text_diff;
 
-pub trait LinearDataString {
-    fn to_string(&self) -> String;
-}
-
-impl<L> LinearDataString for L
+pub type LinearWordString<Id> = VecLinearData<Id, String>;
+pub type LinearWordStringUntracked = LinearWordString<()>;
+impl<Id> fmt::Display for LinearWordString<Id>
 where
-    L: linear_data::LinearData<String>,
+    Id: Clone + fmt::Debug + PartialEq + 'static,
 {
-    fn to_string(&self) -> String {
-        let mut builder = String::new();
-
-        for s in self.iter_values() {
-            builder.push_str(s);
-        }
-
-        builder
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.iter_values().try_for_each(|s| f.write_str(s))
     }
 }
 
-pub type LinearString<Id> = VecLinearData<Id, String>;
-pub type LinearStringUntracked = LinearString<()>;
+#[derive(Clone, Debug)]
+pub struct LinearString<Id> {
+    data: VecCoalescedLinearData<Id, GraphemeString>,
+}
+impl<Id> LinearString<Id>
+where
+    Id: Clone + fmt::Debug + PartialEq + 'static,
+{
+    pub fn new<I>(id_generator: &mut I) -> Self
+    where
+        I: Iterator<Item = Id>,
+    {
+        let data = VecCoalescedLinearData::new(id_generator);
+        Self { data }
+    }
 
-pub fn linear_string<S>(s: S) -> LinearStringUntracked
+    pub fn with_value<I>(id_generator: &mut I, initial_value: String) -> Self
+    where
+        I: Iterator<Item = Id>,
+    {
+        let wrapped_value = GraphemeString::new(initial_value);
+        let data = VecCoalescedLinearData::with_value(id_generator, wrapped_value);
+        Self { data }
+    }
+
+    pub fn append(&mut self, id: IdWithIndex<Id>, value: String) {
+        self.data.append(id, GraphemeString::new(value));
+    }
+
+    pub fn prepend(&mut self, id: IdWithIndex<Id>, value: String) {
+        self.data.prepend(id, GraphemeString::new(value));
+    }
+
+    /// This is the number of UTF-8 Graphemes in this string.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn ids_in_range<R>(&self, range: R) -> Option<NodeIdRangeString<Id>>
+    where
+        R: RangeBounds<usize>,
+    {
+        self.data
+            .ids_in_range(range)
+            .map(|range| NodeIdRangeString(range))
+    }
+
+    #[cfg(test)]
+    pub(in crate::text) fn check_integrity(&self) {
+        self.data.check_integrity();
+    }
+}
+impl<Id> fmt::Display for LinearString<Id>
+where
+    Id: Clone + fmt::Debug + PartialEq + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.data.iter_values().try_for_each(|s| f.write_str(s))
+    }
+}
+impl<Id> LinearData<String, str> for LinearString<Id>
+where
+    Id: Clone + fmt::Debug + PartialEq + 'static,
+{
+    type Id = IdWithIndex<Id>;
+
+    type Iter<'a> = LinearStringIter<'a, Id>;
+
+    /// Get the ids relevant for the UTF-8 Grapheme at `position`.
+    fn ids_at_pos(&self, position: usize) -> Option<NodeIds<Self::Id>> {
+        self.data.ids_at_pos(position)
+    }
+
+    fn insert(
+        &mut self,
+        id: Self::Id,
+        pred: Self::Id,
+        succ: Self::Id,
+        value: String,
+    ) -> Result<(), String> {
+        let graphemes = GraphemeString::new(value);
+        self.data
+            .insert(id, pred, succ, graphemes)
+            .map_err(GraphemeString::unwrap)
+    }
+
+    fn delete<'a>(&'a mut self, id: &Self::Id) -> Option<&'a str> {
+        self.data.delete(id)
+    }
+
+    fn iter_values(&self) -> Self::Iter<'_> {
+        LinearStringIter {
+            underlying: self.data.iter_values(),
+        }
+    }
+
+    fn apply_operation(
+        &mut self,
+        operation: linear_data::DataOperation<Self::Id, String>,
+    ) -> Result<(), linear_data::DataOperation<Self::Id, String>> {
+        let op = operation.map_value(GraphemeString::new);
+        self.data
+            .apply_operation(op)
+            .map_err(|op| op.map_value(GraphemeString::unwrap))
+    }
+}
+impl<Id> DebugFormatting for LinearString<Id>
+where
+    Id: fmt::Display + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        DebugFormatting::fmt(&self.data, f)
+    }
+}
+
+/// Convenience wrapper around [[NodeIdRange]] when using it with [[LinearString]].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeIdRangeString<Id>(NodeIdRange<Id>);
+impl<Id> NodeIdRangeString<Id>
+where
+    Id: Clone + fmt::Debug + PartialEq + 'static,
+{
+    /// Tries to delete all the nodes contained in the range.
+    ///
+    /// Returns the first failing range if unsuccessful.
+    /// In this case the previous deletes will have been applied.
+    pub fn delete<'a>(
+        &'a self,
+        data: &mut LinearString<Id>,
+    ) -> Result<(), &'a IdWithIndexRange<Id>> {
+        self.0.delete(&mut data.data)
+    }
+}
+
+pub struct LinearStringIter<'a, Id> {
+    underlying: VecCoalescedLinearDataIter<'a, IdWithIndex<Id>, GraphemeString>,
+}
+impl<'a, Id> Iterator for LinearStringIter<'a, Id> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.underlying.next()
+    }
+}
+
+#[derive(Clone)]
+struct GraphemeString {
+    len: usize,
+    base: String,
+}
+impl GraphemeString {
+    pub fn new(base: String) -> Self {
+        let len = base.graphemes(true).count();
+        Self { len, base }
+    }
+
+    pub fn unwrap(self) -> String {
+        self.base
+    }
+
+    fn graphemes(&self) -> Graphemes<'_> {
+        self.base.graphemes(true)
+    }
+}
+impl Composite for GraphemeString {
+    type Element = str;
+    type Iter<'a> = Graphemes<'a>;
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get(&self, index: usize) -> Option<&Self::Element> {
+        self.graphemes().nth(index)
+    }
+
+    fn split_at(mut self, index: usize) -> (Self, Self) {
+        assert!(index < self.len);
+        let (split_index, _) = self.base.grapheme_indices(true).nth(index).unwrap();
+        let rest_string = self.base.split_off(split_index);
+        let new_string = GraphemeString {
+            len: self.len - index,
+            base: rest_string,
+        };
+        self.len = index;
+        (self, new_string)
+    }
+
+    fn concat(mut self, other: Self) -> Self {
+        self.base.push_str(&other.base);
+        self.len += other.len;
+        self
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.graphemes()
+    }
+}
+impl fmt::Debug for GraphemeString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.base)
+    }
+}
+impl fmt::Display for GraphemeString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.base)
+    }
+}
+
+pub fn linear_word_string<S>(s: S) -> LinearWordStringUntracked
 where
     S: Into<String>,
 {
@@ -36,165 +253,503 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotsync_utils::testing::CloneExt;
 
-    #[test]
-    fn linear_string_single_value_roundtrip() {
-        let input = "A simple test string";
-        let linear = linear_string(input);
-        linear.check_integrity();
-        assert_eq!(linear.to_string(), input);
+    const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
+    const UNICODE_TEST_VALUES: [&str; 12] = [
+        "A",       // basic ASCII
+        " ",       // space
+        "café",    // Latin + combining accent normalized
+        "naïve",   // more accents
+        "日本語",  // CJK (3-byte UTF-8 per char)
+        "русский", // Cyrillic
+        "עִבְרִית",   // Hebrew + Niqqud (combining marks)
+        "हिन्दी",   // Devanagari
+        "🙂",      // single emoji
+        "👨‍👩‍👦",      // emoji family using zero-width joiners
+        "🏴‍☠️",      // flag + variation selector + ZWJ
+        "𝟘𝟙𝟚",     // Mathematical bold digits (4-byte UTF-8)
+    ];
+
+    struct TestIdGenerator {
+        current: Option<u32>,
+    }
+    impl TestIdGenerator {
+        pub fn new() -> Self {
+            Self { current: Some(0) }
+        }
+
+        pub fn next_with_zero_index(&mut self) -> Option<IdWithIndex<u32>> {
+            self.next().map(IdWithIndex::zero)
+        }
+    }
+    impl Iterator for TestIdGenerator {
+        type Item = u32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let current = self.current.take();
+            if let Some(current) = current {
+                self.current = current.checked_add(1);
+            }
+            current
+        }
     }
 
-    #[test]
-    fn linear_string_appends() {
-        const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
-        let mut id_generator = &mut std::iter::repeat(());
+    mod linear_string {
+        use super::*;
 
-        let mut reference = String::new();
-        let mut linear = LinearStringUntracked::new(&mut id_generator);
-        assert_eq!(reference, linear.to_string());
-        for s in TEST_VALUES {
-            reference.push_str(s);
-            //println!("before append: {:#?}", linear);
-            linear.append((), s.to_string());
-            //println!("after append: {:#?}", linear);
+        #[test]
+        fn single_value_roundtrip() {
+            let input = "A simple test string";
+            let linear = LinearString::with_value(&mut TestIdGenerator::new(), input.to_string());
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), input);
+        }
+
+        #[test]
+        fn ascii_appends() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut reference = String::new();
+            let mut linear = LinearString::new(&mut id_generator);
+            assert_eq!(reference, linear.to_string());
+            for s in TEST_VALUES {
+                reference.push_str(s);
+                //println!("before append: {:#?}", linear);
+                linear.append(id_generator.next_with_zero_index().unwrap(), s.to_string());
+                //println!("after append: {:#?}", linear);
+                linear.check_integrity();
+                assert_eq!(linear.to_string(), reference);
+                assert_eq!(linear.len(), reference.len());
+            }
+        }
+
+        #[test]
+        fn unicode_appends() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut reference = String::new();
+            let mut linear = LinearString::new(&mut id_generator);
+            assert_eq!(reference, linear.to_string());
+            for s in UNICODE_TEST_VALUES {
+                reference.push_str(s);
+                //println!("before append: {:#?}", linear);
+                linear.append(id_generator.next_with_zero_index().unwrap(), s.to_string());
+                //println!("after append: {:#?}", linear);
+                linear.check_integrity();
+                assert_eq!(linear.to_string(), reference);
+                assert_eq!(linear.len(), reference.graphemes(true).count());
+            }
+        }
+
+        #[test]
+        fn ascii_prepends() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut reference = String::new();
+            let mut linear = LinearString::new(&mut id_generator);
+            assert_eq!(linear.to_string(), reference);
+            for s in TEST_VALUES {
+                reference.push_str(s);
+            }
+            for s in TEST_VALUES.iter().rev() {
+                linear.prepend(id_generator.next_with_zero_index().unwrap(), s.to_string());
+                linear.check_integrity();
+            }
+            assert_eq!(linear.to_string(), reference);
+            assert_eq!(linear.len(), reference.len());
+        }
+
+        #[test]
+        fn unicode_prepends() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut reference = String::new();
+            let mut linear = LinearString::new(&mut id_generator);
+            assert_eq!(linear.to_string(), reference);
+            for s in UNICODE_TEST_VALUES {
+                reference.push_str(s);
+            }
+            for s in UNICODE_TEST_VALUES.iter().rev() {
+                linear.prepend(id_generator.next_with_zero_index().unwrap(), s.to_string());
+                linear.check_integrity();
+            }
+            assert_eq!(linear.to_string(), reference);
+            assert_eq!(linear.len(), reference.graphemes(true).count());
+        }
+
+        #[test]
+        fn ascii_inserts() {
+            let mut id_generator = TestIdGenerator::new();
+
+            // Setup both strings to be the same.
+            let mut reference = TEST_VALUES.join("");
+            let mut linear = LinearString::new(&mut id_generator);
+            linear.append(
+                IdWithIndex::zero(id_generator.next().unwrap()),
+                reference.clone(),
+            );
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an insertion.
+            const INSERT_STR: &str = "yet important ";
+            let char_index_at_test_index_three = TEST_VALUES[..=3].iter().map(|s| s.len()).sum();
+            reference.insert_str(char_index_at_test_index_three, INSERT_STR);
+
+            // This happens to work, because this text only uses ascii chars.
+            let nodes_at_test_index_three =
+                linear.ids_at_pos(char_index_at_test_index_three).unwrap();
+            nodes_at_test_index_three
+                .insert_before(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an prepend-like insertion.
+            const FRONT_INSERT_STR: &str = "Not ";
+            reference.insert_str(0, FRONT_INSERT_STR);
+            let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
+            nodes_at_beginning
+                .insert_before(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    FRONT_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an append-like insertion.
+            const END_INSERT_STR: &str = "!?";
+            reference.push_str(END_INSERT_STR);
+            let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
+            nodes_at_end
+                .insert_after(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    END_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
             linear.check_integrity();
             assert_eq!(linear.to_string(), reference);
         }
+
+        #[test]
+        fn unicode_inserts() {
+            let mut id_generator = TestIdGenerator::new();
+
+            // Setup both strings to be the same.
+            let mut reference = UNICODE_TEST_VALUES.join("");
+            let mut linear = LinearString::new(&mut id_generator);
+            linear.append(
+                IdWithIndex::zero(id_generator.next().unwrap()),
+                reference.clone(),
+            );
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an insertion.
+            const INSERT_STR: &str = " inte brå ";
+
+            let byte_index_at_test_index_seven =
+                UNICODE_TEST_VALUES[..=7].iter().map(|s| s.len()).sum();
+            reference.insert_str(byte_index_at_test_index_seven, INSERT_STR);
+
+            let char_index_at_test_index_seven = UNICODE_TEST_VALUES[..=7]
+                .iter()
+                .map(|s| s.graphemes(true).count())
+                .sum();
+            let nodes_at_test_index_three =
+                linear.ids_at_pos(char_index_at_test_index_seven).unwrap();
+            nodes_at_test_index_three
+                .insert_before(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an prepend-like insertion.
+            const FRONT_INSERT_STR: &str = "Нет ";
+            reference.insert_str(0, FRONT_INSERT_STR);
+            let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
+            nodes_at_beginning
+                .insert_before(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    FRONT_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an append-like insertion.
+            const END_INSERT_STR: &str = "⸘";
+            reference.push_str(END_INSERT_STR);
+            let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
+            nodes_at_end
+                .insert_after(
+                    &mut linear,
+                    IdWithIndex::zero(id_generator.next().unwrap()),
+                    END_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+        }
+
+        #[test]
+        fn single_char_deletes() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            linear.check_integrity();
+            // println!("Initial:\n{linear:#?}");
+
+            assert_eq!(linear.to_string(), TEST_VALUES.join(""));
+
+            let ids_at_three = linear.ids_at_pos(3).unwrap();
+            assert_eq!(ids_at_three.delete(&mut linear), Some("i"));
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "A smple test string.");
+            // Doing it again should be fine but change nothing.
+            assert_eq!(ids_at_three.delete(&mut linear), Some("i"));
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "A smple test string.");
+
+            // Delete the space.
+            let ids_at_one = linear.ids_at_pos(1).unwrap();
+            assert_eq!(ids_at_one.delete(&mut linear), Some(" "));
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "Asmple test string.");
+
+            // Delete everything.
+            while !linear.is_empty() {
+                println!("Before delete:\n{linear:#?}");
+                let current_id_at_head = linear.ids_at_pos(0).unwrap();
+                println!("current_id_at_head={current_id_at_head:?}");
+                current_id_at_head
+                    .delete(&mut linear)
+                    .expect("failed to delete");
+                linear.check_integrity();
+            }
+            assert_eq!(linear.ids_at_pos(0), None);
+            assert_eq!(linear.len(), 0);
+            assert_eq!(linear.to_string().as_str(), "");
+        }
+
+        #[test]
+        fn range_deletes() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), TEST_VALUES.join(""));
+
+            println!("State before delete: {}", linear.debug_fmt());
+            let ids_for_simple = linear.ids_in_range(2..=7).unwrap();
+            println!("Ids [2, 7]: {:?}", ids_for_simple);
+            assert_eq!(ids_for_simple.delete(&mut linear), Ok(()));
+            println!("State after delete: {}", linear.debug_fmt());
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "A  test string.");
+
+            // Doing it again should be fine but change nothing.
+            assert_eq!(ids_for_simple.delete(&mut linear), Ok(()));
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "A  test string.");
+
+            // Delete the space that's now at this position.
+            let ids_for_space = linear.ids_in_range(2..=2).unwrap();
+            assert_eq!(ids_for_space.delete(&mut linear), Ok(()));
+            linear.check_integrity();
+            assert_eq!(linear.to_string().as_str(), "A test string.");
+
+            // Delete everything (in various ways).
+            fn empty_checks(l: &LinearString<u32>) {
+                l.check_integrity();
+                assert_eq!(l.ids_at_pos(0), None);
+                assert_eq!(l.ids_in_range(0..=0), None);
+                assert_eq!(l.len(), 0);
+                assert_eq!(l.to_string().as_str(), "");
+            }
+            linear.with_copy(|mut l| {
+                let ids_for_everything = l.ids_in_range(0..l.len()).unwrap();
+                assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
+                empty_checks(&l);
+            });
+            linear.with_copy(|mut l| {
+                let ids_for_everything = l.ids_in_range(0..).unwrap();
+                assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
+                empty_checks(&l);
+            });
+            linear.with_copy(|mut l| {
+                let ids_for_everything = l.ids_in_range(..l.len()).unwrap();
+                assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
+                empty_checks(&l);
+            });
+            linear.with_copy(|mut l| {
+                let ids_for_everything = l.ids_in_range(..).unwrap();
+                assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
+                empty_checks(&l);
+            });
+        }
     }
 
-    #[test]
-    fn linear_string_prepends() {
-        const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
-        let mut id_generator = &mut std::iter::repeat(());
+    mod linear_word_string {
+        use super::*;
 
-        let mut reference = String::new();
-        let mut linear = LinearStringUntracked::new(&mut id_generator);
-        assert_eq!(linear.to_string(), reference);
-        for s in TEST_VALUES {
-            reference.push_str(s);
-        }
-        for s in TEST_VALUES.iter().rev() {
-            linear.prepend((), s.to_string());
+        #[test]
+        fn single_value_roundtrip() {
+            let input = "A simple test string";
+            let linear = linear_word_string(input);
             linear.check_integrity();
+            assert_eq!(linear.to_string(), input);
         }
-        assert_eq!(linear.to_string(), reference);
-    }
 
-    #[test]
-    fn linear_string_inserts() {
-        const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
-        let mut test_id = 0u16;
-        let mut id_generator = std::iter::repeat_with(|| {
-            let next_id = test_id;
-            test_id += 1;
-            next_id
-        });
+        #[test]
+        fn appends() {
+            let mut id_generator = &mut std::iter::repeat(());
 
-        // Setup both strings to be the same.
-        let mut reference = String::new();
-        let mut linear = LinearString::new(&mut id_generator);
-        assert_eq!(linear.to_string(), reference);
-        for s in TEST_VALUES {
-            reference.push_str(s);
-            linear.append(id_generator.next().unwrap(), s.to_string());
+            let mut reference = String::new();
+            let mut linear = LinearWordStringUntracked::new(&mut id_generator);
+            assert_eq!(reference, linear.to_string());
+            for s in TEST_VALUES {
+                reference.push_str(s);
+                //println!("before append: {:#?}", linear);
+                linear.append((), s.to_string());
+                //println!("after append: {:#?}", linear);
+                linear.check_integrity();
+                assert_eq!(linear.to_string(), reference);
+            }
+        }
+
+        #[test]
+        fn prepends() {
+            let mut id_generator = &mut std::iter::repeat(());
+
+            let mut reference = String::new();
+            let mut linear = LinearWordStringUntracked::new(&mut id_generator);
+            assert_eq!(linear.to_string(), reference);
+            for s in TEST_VALUES {
+                reference.push_str(s);
+            }
+            for s in TEST_VALUES.iter().rev() {
+                linear.prepend((), s.to_string());
+                linear.check_integrity();
+            }
+            assert_eq!(linear.to_string(), reference);
+        }
+
+        #[test]
+        fn inserts() {
+            let mut id_generator = TestIdGenerator::new();
+
+            // Setup both strings to be the same.
+            let mut reference = String::new();
+            let mut linear = LinearWordString::new(&mut id_generator);
+            assert_eq!(linear.to_string(), reference);
+            for s in TEST_VALUES {
+                reference.push_str(s);
+                linear.append(id_generator.next().unwrap(), s.to_string());
+                linear.check_integrity();
+            }
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an insertion.
+            const INSERT_STR: &str = "yet important ";
+            let char_index_at_test_index_three = TEST_VALUES[..=3].iter().map(|s| s.len()).sum();
+            reference.insert_str(char_index_at_test_index_three, INSERT_STR);
+            let nodes_at_three = linear.ids_at_pos(3).unwrap();
+            nodes_at_three
+                .insert_after(
+                    &mut linear,
+                    id_generator.next().unwrap(),
+                    INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
             linear.check_integrity();
-        }
-        assert_eq!(linear.to_string(), reference);
+            assert_eq!(linear.to_string(), reference);
 
-        // Make an insertion.
-        const INSERT_STR: &str = "yet important ";
-        let char_index_at_test_index_three = TEST_VALUES[..=3].iter().map(|s| s.len()).sum();
-        reference.insert_str(char_index_at_test_index_three, INSERT_STR);
-        let nodes_at_three = linear.ids_at_pos(3).unwrap().cloned();
-        nodes_at_three
-            .insert_after(
-                &mut linear,
-                id_generator.next().unwrap(),
-                INSERT_STR.to_string(),
-            )
-            .expect("failed to insert");
-        linear.check_integrity();
-        assert_eq!(linear.to_string(), reference);
-
-        // Make an prepend-like insertion.
-        const FRONT_INSERT_STR: &str = "Not ";
-        reference.insert_str(0, FRONT_INSERT_STR);
-        let nodes_at_beginning = linear.ids_at_pos(0).unwrap().cloned();
-        nodes_at_beginning
-            .insert_before(
-                &mut linear,
-                id_generator.next().unwrap(),
-                FRONT_INSERT_STR.to_string(),
-            )
-            .expect("failed to insert");
-        linear.check_integrity();
-        assert_eq!(linear.to_string(), reference);
-
-        // Make an append-like insertion.
-        const END_INSERT_STR: &str = "!?";
-        reference.push_str(END_INSERT_STR);
-        let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap().cloned();
-        nodes_at_end
-            .insert_after(
-                &mut linear,
-                id_generator.next().unwrap(),
-                END_INSERT_STR.to_string(),
-            )
-            .expect("failed to insert");
-        linear.check_integrity();
-        assert_eq!(linear.to_string(), reference);
-    }
-
-    #[test]
-    fn linear_string_deletes() {
-        const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
-        let mut test_id = 0u16;
-        let mut id_generator = std::iter::repeat_with(|| {
-            let next_id = test_id;
-            test_id += 1;
-            next_id
-        });
-
-        let mut linear = LinearString::new(&mut id_generator);
-        for s in TEST_VALUES {
-            linear.append(id_generator.next().unwrap(), s.to_string());
+            // Make an prepend-like insertion.
+            const FRONT_INSERT_STR: &str = "Not ";
+            reference.insert_str(0, FRONT_INSERT_STR);
+            let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
+            nodes_at_beginning
+                .insert_before(
+                    &mut linear,
+                    id_generator.next().unwrap(),
+                    FRONT_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
             linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
+
+            // Make an append-like insertion.
+            const END_INSERT_STR: &str = "!?";
+            reference.push_str(END_INSERT_STR);
+            let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
+            nodes_at_end
+                .insert_after(
+                    &mut linear,
+                    id_generator.next().unwrap(),
+                    END_INSERT_STR.to_string(),
+                )
+                .expect("failed to insert");
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), reference);
         }
 
-        assert_eq!(linear.to_string(), TEST_VALUES.join(""));
+        #[test]
+        fn deletes() {
+            let mut id_generator = TestIdGenerator::new();
 
-        let ids_at_two = linear.ids_at_pos(2).unwrap().cloned();
-        assert_eq!(
-            ids_at_two.delete(&mut linear).map(|s| s.as_str()),
-            Some("simple")
-        );
-        assert_eq!(linear.to_string().as_str(), "A  test string.");
-        // Doing it again should be fine but change nothing.
-        assert_eq!(
-            ids_at_two.delete(&mut linear).map(|s| s.as_str()),
-            Some("simple")
-        );
-        assert_eq!(linear.to_string().as_str(), "A  test string.");
+            let mut linear = LinearWordString::new(&mut id_generator);
+            for s in TEST_VALUES {
+                linear.append(id_generator.next().unwrap(), s.to_string());
+                linear.check_integrity();
+            }
 
-        // Delete the space that's now at this position.
-        let new_ids_at_two = linear.ids_at_pos(2).unwrap().cloned();
-        assert_eq!(
-            new_ids_at_two.delete(&mut linear).map(|s| s.as_str()),
-            Some(" ")
-        );
-        assert_eq!(linear.to_string().as_str(), "A test string.");
+            assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
-        // Delete everything.
-        while !linear.is_empty() {
-            let current_id_at_head = linear.ids_at_pos(0).unwrap().cloned();
-            current_id_at_head
-                .delete(&mut linear)
-                .map(|s| s.as_str())
-                .expect("failed to delete");
+            let ids_at_two = linear.ids_at_pos(2).unwrap();
+            assert_eq!(
+                ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                Some("simple")
+            );
+            assert_eq!(linear.to_string().as_str(), "A  test string.");
+            // Doing it again should be fine but change nothing.
+            assert_eq!(
+                ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                Some("simple")
+            );
+            assert_eq!(linear.to_string().as_str(), "A  test string.");
+
+            // Delete the space that's now at this position.
+            let new_ids_at_two = linear.ids_at_pos(2).unwrap();
+            assert_eq!(
+                new_ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                Some(" ")
+            );
+            assert_eq!(linear.to_string().as_str(), "A test string.");
+
+            // Delete everything.
+            while !linear.is_empty() {
+                let current_id_at_head = linear.ids_at_pos(0).unwrap();
+                current_id_at_head
+                    .delete(&mut linear)
+                    .expect("failed to delete");
+            }
+            assert_eq!(linear.ids_at_pos(0), None);
+            assert_eq!(linear.len(), 0);
+            assert_eq!(linear.to_string().as_str(), "");
         }
-        assert_eq!(linear.ids_at_pos(0), None);
-        assert_eq!(linear.len(), 0);
-        assert_eq!(linear.to_string().as_str(), "");
     }
 }
