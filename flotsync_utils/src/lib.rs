@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub mod err;
+
 pub trait OptionExt<T> {
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;
 }

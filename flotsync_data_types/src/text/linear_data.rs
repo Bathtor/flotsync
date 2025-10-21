@@ -1,3 +1,4 @@
+use flotsync_utils::option_when;
 use std::{
     assert_matches::assert_matches,
     collections::{LinkedList, linked_list},
@@ -5,8 +6,6 @@ use std::{
     iter::FlatMap,
     vec,
 };
-
-use flotsync_utils::option_when;
 
 pub trait LinearData<Value> {
     type Id;
@@ -32,6 +31,9 @@ pub trait LinearData<Value> {
         value: Value,
     ) -> Result<(), Value>;
 
+    /// Deletes the value with `id` and returns a reference to it if successful.
+    fn delete<'a>(&'a mut self, id: &Self::Id) -> Option<&'a Value>;
+
     fn iter_values(&self) -> Self::Iter<'_>;
 }
 
@@ -43,6 +45,7 @@ pub trait LinearData<Value> {
 /// (e.g. read-mostly strings).
 #[derive(Clone, Debug)]
 pub struct VecLinearData<Id, Value> {
+    len: usize,
     nodes: Vec<Node<Id, Value>>,
 }
 impl<Id, Value> VecLinearData<Id, Value>
@@ -70,7 +73,7 @@ where
             operation: Operation::End,
         };
         let nodes = vec![begin_node, end_node];
-        Self { nodes }
+        Self { len: 0, nodes }
     }
 
     pub fn with_value<I>(id_generator: &mut I, initial_value: Value) -> Self
@@ -105,7 +108,7 @@ where
             operation: Operation::End,
         };
         let nodes = vec![begin_node, value_node, end_node];
-        Self { nodes }
+        Self { len: 1, nodes }
     }
 }
 impl<Id, Value> VecLinearData<Id, Value>
@@ -114,17 +117,11 @@ where
     Value: fmt::Debug,
 {
     pub fn is_empty(&self) -> bool {
-        self.nodes.len() == 2
+        self.len == 0
     }
 
     pub fn len(&self) -> usize {
-        let underlying_len = self.nodes.len();
-        assert!(
-            underlying_len >= 2,
-            "Invalid list. Missing Beginning or End node: {:#?}",
-            self.nodes
-        );
-        underlying_len - 2
+        self.len
     }
 
     pub fn append(&mut self, id: Id, value: Value) {
@@ -145,6 +142,7 @@ where
                 operation: Operation::Insert { value },
             },
         );
+        self.len += 1;
     }
 
     pub fn prepend(&mut self, id: Id, value: Value) {
@@ -160,19 +158,30 @@ where
                 operation: Operation::Insert { value },
             },
         );
+        self.len += 1;
     }
 
     #[cfg(test)]
     pub(super) fn check_integrity(&self) {
+        let mut len = 0usize;
         for index in 0..self.nodes.len() {
             let current = &self.nodes[index];
             if index == 0 {
                 assert!(matches!(current.operation, Operation::Beginning));
-            }
-            if index == self.nodes.len() {
+            } else if index == self.nodes.len() {
                 assert!(matches!(current.operation, Operation::End));
+            } else if matches!(current.operation, Operation::Insert { .. }) {
+                len += 1;
             }
         }
+        assert_eq!(self.len, len);
+    }
+
+    fn iter_inserts(&self) -> impl Iterator<Item = (usize, &Node<Id, Value>)> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.operation, Operation::Insert { .. }))
     }
 }
 impl<Id, Value> LinearData<Value> for VecLinearData<Id, Value>
@@ -189,11 +198,15 @@ where
 
     fn ids_at_pos(&self, position: usize) -> Option<NodeIds<&Id>> {
         if position < self.len() {
-            let mut it = self.nodes.iter().skip(position);
-            // All of these must exist if the list is valid, which `len` checks.
-            let predecessor = it.next().unwrap();
-            let current = it.next().unwrap();
-            let successor = it.next().unwrap();
+            let index_at_position = self
+                .iter_inserts()
+                .nth(position)
+                .map(|(index, _node)| index)
+                .unwrap(); // This must exist in this branch.
+            // All of these must exist if the list is valid.
+            let predecessor = &self.nodes[index_at_position - 1];
+            let current = &self.nodes[index_at_position];
+            let successor = &self.nodes[index_at_position + 1];
             Some(NodeIds {
                 predecessor: &predecessor.id,
                 current: &current.id,
@@ -222,6 +235,7 @@ where
                             operation: Operation::Insert { value },
                         },
                     );
+                    self.len += 1;
                     Ok(())
                 } else {
                     Err(value)
@@ -231,6 +245,43 @@ where
             }
         } else {
             Err(value)
+        }
+    }
+
+    fn delete(&mut self, id: &Self::Id) -> Option<&Value> {
+        //println!("Trying to delete id={id:?} from: {:#?}", self.nodes);
+        if let Some(node) = self.nodes.iter_mut().find(|n| &n.id == id) {
+            match node.operation {
+                Operation::Insert { .. } => {
+                    // Temporarily replace the operation in the node, so we own the value.
+                    let mut old_operation = Operation::End;
+                    std::mem::swap(&mut old_operation, &mut node.operation);
+                    if let Operation::Insert { value } = old_operation {
+                        let mut new_operation = Operation::Delete { value };
+                        std::mem::swap(&mut new_operation, &mut node.operation);
+                        self.len -= 1;
+                        if let Operation::Delete { ref value } = node.operation {
+                            Some(value)
+                        } else {
+                            // We literally just put it there.
+                            unreachable!()
+                        }
+                    } else {
+                        // We literally just checked that this is an insert operation.
+                        unreachable!()
+                    }
+                }
+                // Double delete is OK.
+                Operation::Delete { ref value } => Some(value),
+                // These cannot be deleted.
+                Operation::Beginning | Operation::End => {
+                    //println!("Tried to delete Beginning/End");
+                    None
+                }
+            }
+        } else {
+            //println!("Could not find node.");
+            None
         }
     }
 
@@ -313,6 +364,13 @@ impl<Id> NodeIds<Id> {
         L: LinearData<Value, Id = Id>,
     {
         data.insert(id, self.current, self.successor, value)
+    }
+
+    pub fn delete<'a, L, Value>(&self, data: &'a mut L) -> Option<&'a Value>
+    where
+        L: LinearData<Value, Id = Id>,
+    {
+        data.delete(&self.current)
     }
 }
 impl<Id> NodeIds<&'_ Id>

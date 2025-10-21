@@ -90,9 +90,6 @@ mod tests {
             test_id += 1;
             next_id
         });
-        // The number of ids we ended up assigning during creation
-        // Just hardcode this. Otherwise we'd have to drop the generator to inspect test_id.
-        // let empty_offset = 2;
 
         // Setup both strings to be the same.
         let mut reference = String::new();
@@ -147,5 +144,57 @@ mod tests {
             .expect("failed to insert");
         linear.check_integrity();
         assert_eq!(linear.to_string(), reference);
+    }
+
+    #[test]
+    fn linear_string_deletes() {
+        const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
+        let mut test_id = 0u16;
+        let mut id_generator = std::iter::repeat_with(|| {
+            let next_id = test_id;
+            test_id += 1;
+            next_id
+        });
+
+        let mut linear = LinearString::new(&mut id_generator);
+        for s in TEST_VALUES {
+            linear.append(id_generator.next().unwrap(), s.to_string());
+            linear.check_integrity();
+        }
+
+        assert_eq!(linear.to_string(), TEST_VALUES.join(""));
+
+        let ids_at_two = linear.ids_at_pos(2).unwrap().cloned();
+        assert_eq!(
+            ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+            Some("simple")
+        );
+        assert_eq!(linear.to_string().as_str(), "A  test string.");
+        // Doing it again should be fine but change nothing.
+        assert_eq!(
+            ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+            Some("simple")
+        );
+        assert_eq!(linear.to_string().as_str(), "A  test string.");
+
+        // Delete the space that's now at this position.
+        let new_ids_at_two = linear.ids_at_pos(2).unwrap().cloned();
+        assert_eq!(
+            new_ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+            Some(" ")
+        );
+        assert_eq!(linear.to_string().as_str(), "A test string.");
+
+        // Delete everything.
+        while !linear.is_empty() {
+            let current_id_at_head = linear.ids_at_pos(0).unwrap().cloned();
+            current_id_at_head
+                .delete(&mut linear)
+                .map(|s| s.as_str())
+                .expect("failed to delete");
+        }
+        assert_eq!(linear.ids_at_pos(0), None);
+        assert_eq!(linear.len(), 0);
+        assert_eq!(linear.to_string().as_str(), "");
     }
 }
