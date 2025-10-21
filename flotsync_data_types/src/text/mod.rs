@@ -1,9 +1,5 @@
-use crate::text::linear_data::VecLinearData;
-
-// TODO: Remove this, it's just for dev so everything isn't yellow all the time.
-#[allow(unused)]
 mod linear_data;
-pub use linear_data::{LinearData, NodeIds};
+pub use linear_data::{LinearData, NodeIds, VecLinearData};
 /// Simple diffs on plain old strings.
 mod text_diff;
 

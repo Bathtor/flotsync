@@ -43,7 +43,7 @@ pub trait LinearData<Value> {
 /// (e.g. read-mostly strings).
 #[derive(Clone, Debug)]
 pub struct VecLinearData<Id, Value> {
-    nodes: Vec<Node<Id, Option<Id>, Value>>,
+    nodes: Vec<Node<Id, Value>>,
 }
 impl<Id, Value> VecLinearData<Id, Value>
 where
@@ -61,15 +61,11 @@ where
             .expect("The generator must produce sufficient ids.");
         let begin_node = Node {
             id: begin_id.clone(),
-            predecessor: None,
-            successor: Some(end_id.clone()),
             origin: None,
             operation: Operation::Beginning,
         };
         let end_node = Node {
             id: end_id,
-            predecessor: Some(begin_id.clone()),
-            successor: None,
             origin: Some(begin_id),
             operation: Operation::End,
         };
@@ -93,15 +89,11 @@ where
 
         let begin_node = Node {
             id: begin_id.clone(),
-            predecessor: None,
-            successor: Some(value_id.clone()),
             origin: None,
             operation: Operation::Beginning,
         };
         let value_node = Node {
             id: begin_id.clone(),
-            predecessor: Some(begin_id.clone()),
-            successor: Some(end_id.clone()),
             origin: Some(begin_id.clone()),
             operation: Operation::Insert {
                 value: initial_value,
@@ -109,8 +101,6 @@ where
         };
         let end_node = Node {
             id: end_id,
-            predecessor: Some(value_id.clone()),
-            successor: None,
             origin: Some(value_id.clone()),
             operation: Operation::End,
         };
@@ -123,6 +113,10 @@ where
     Id: Clone + fmt::Debug + PartialEq,
     Value: fmt::Debug,
 {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.len() == 2
+    }
+
     pub fn len(&self) -> usize {
         let underlying_len = self.nodes.len();
         assert!(
@@ -136,22 +130,17 @@ where
     pub fn append(&mut self, id: Id, value: Value) {
         let end_index = self.nodes.len() - 1;
 
-        let end_node = &mut self.nodes[end_index];
+        let end_node = &self.nodes[end_index];
         assert_matches!(end_node.operation, Operation::End);
-        end_node.predecessor = Some(id.clone());
-        let end_node_id = end_node.id.clone();
 
         let last_index = end_index - 1;
-        let last_node = &mut self.nodes[last_index];
-        last_node.successor = Some(id.clone());
+        let last_node = &self.nodes[last_index];
         let last_node_id = last_node.id.clone();
 
         self.nodes.insert(
             end_index,
             Node {
                 id,
-                predecessor: Some(last_node_id.clone()),
-                successor: Some(end_node_id),
                 origin: Some(last_node_id),
                 operation: Operation::Insert { value },
             },
@@ -159,48 +148,28 @@ where
     }
 
     pub fn prepend(&mut self, id: Id, value: Value) {
-        let mut current_index = 0usize;
-
-        let begin_node = &mut self.nodes[current_index];
+        let begin_node = &self.nodes[0];
         assert_matches!(begin_node.operation, Operation::Beginning);
-        begin_node.successor = Some(id.clone());
         let begin_node_id = begin_node.id.clone();
 
-        current_index += 1;
-        let first_node = &mut self.nodes[current_index];
-        first_node.predecessor = Some(id.clone());
-        let first_node_id = first_node.id.clone();
-
         self.nodes.insert(
-            current_index,
+            1,
             Node {
                 id,
-                predecessor: Some(begin_node_id.clone()),
-                successor: Some(first_node_id),
                 origin: Some(begin_node_id),
                 operation: Operation::Insert { value },
             },
         );
     }
 
-    pub(crate) fn check_integrity(&self) {
-        let mut index = 0usize;
+    #[cfg(test)]
+    pub(super) fn check_integrity(&self) {
         for index in 0..self.nodes.len() {
             let current = &self.nodes[index];
-            if index > 0 {
-                let previous = &self.nodes[index - 1];
-                assert_eq!(previous.successor.as_ref(), Some(&current.id));
-                assert_eq!(current.predecessor.as_ref(), Some(&previous.id));
-            } else {
-                assert_eq!(current.predecessor, None);
+            if index == 0 {
                 assert!(matches!(current.operation, Operation::Beginning));
             }
-            if (index + 1) < self.nodes.len() {
-                let next = &self.nodes[index + 1];
-                assert_eq!(next.predecessor.as_ref(), Some(&current.id));
-                assert_eq!(current.successor.as_ref(), Some(&next.id));
-            } else {
-                assert_eq!(current.successor, None);
+            if index == self.nodes.len() {
                 assert!(matches!(current.operation, Operation::End));
             }
         }
@@ -243,19 +212,12 @@ where
             .find_map(|(index, node)| option_when!(node.id == pred, index));
         if let Some(pred_index) = pred_index_opt {
             let succ_index = pred_index + 1;
-            if let Some(succ_node) = self.nodes.get_mut(succ_index) {
+            if let Some(succ_node) = self.nodes.get(succ_index) {
                 if succ_node.id == succ {
-                    succ_node.predecessor = Some(id.clone());
-                    // We already checked above that this index exists.
-                    let pred_node = &mut self.nodes[pred_index];
-                    pred_node.successor = Some(id.clone());
-
                     self.nodes.insert(
                         succ_index,
                         Node {
                             id,
-                            predecessor: Some(pred.clone()),
-                            successor: Some(succ),
                             origin: Some(pred),
                             operation: Operation::Insert { value },
                         },
@@ -280,7 +242,7 @@ where
 }
 
 pub struct VecLinearDataIter<'a, Id, Value> {
-    underlying: std::slice::Iter<'a, Node<Id, Option<Id>, Value>>,
+    underlying: std::slice::Iter<'a, Node<Id, Value>>,
 }
 impl<'a, Id, Value> Iterator for VecLinearDataIter<'a, Id, Value> {
     type Item = &'a Value;
@@ -296,11 +258,13 @@ impl<'a, Id, Value> Iterator for VecLinearDataIter<'a, Id, Value> {
 
 /// A variant of an operation id that allows multiple ordered operations at the same time,
 /// without having to do explictly different operations for each.
+#[allow(unused)]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IdWithIndex<Id> {
     pub id: Id,
     pub index: u16, // Probably sufficient for a single operation.
 }
+#[allow(unused)]
 impl<Id> IdWithIndex<Id>
 where
     Id: Clone,
@@ -555,14 +519,12 @@ where
 // }
 
 #[derive(Clone, Debug)]
-pub struct Node<Id, Link, Value> {
+struct Node<Id, Value> {
     id: Id,
-    predecessor: Link,
-    successor: Link,
-    origin: Link,
+    origin: Option<Id>,
     operation: Operation<Value>,
 }
-impl<Id, Link, Value> Node<Id, Link, Value> {
+impl<Id, Value> Node<Id, Value> {
     pub fn get_current_value(&self) -> Option<&Value> {
         match self.operation {
             Operation::Insert { ref value } => Some(value),
