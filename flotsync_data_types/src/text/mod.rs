@@ -16,6 +16,7 @@ pub use linear_data::{
 };
 
 /// Simple diffs on plain old strings.
+#[allow(unused, reason = "TODO: Combine into linear string diff.")]
 mod text_diff;
 
 pub type LinearWordString<Id> = VecLinearData<Id, String>;

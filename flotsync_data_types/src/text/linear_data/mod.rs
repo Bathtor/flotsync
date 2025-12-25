@@ -244,6 +244,7 @@ enum Operation<Value> {
     Invalid,
 }
 impl<Value> Operation<Value> {
+    #[allow(unused)]
     pub fn is_valid(&self) -> bool {
         !matches!(self, Operation::Invalid)
     }

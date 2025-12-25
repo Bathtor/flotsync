@@ -195,11 +195,22 @@ where
             .ok_or(DeleteError::NotFound)?;
 
         enum DeleteMode {
-            Suffix { node_index: usize },
-            Subrange { node_index: usize },
-            Full { node_index: usize },
-            Prefix { node_index: usize },
-            Skip { node_index: usize },
+            Suffix {
+                node_index: usize,
+            },
+            Subrange {
+                node_index: usize,
+            },
+            Full {
+                node_index: usize,
+            },
+            Prefix {
+                node_index: usize,
+            },
+            Skip {
+                #[allow(unused, reason = "Useful for debugging and takes no extra space.")]
+                node_index: usize,
+            },
         }
 
         let item_from_node = |node_index: usize,
@@ -939,24 +950,25 @@ struct NodePosition {
     node_start_position: usize,
 }
 
-struct IdGeneratorWithZeroIndex<'a, I>
-where
-    I: Iterator,
-{
-    underlying: &'a mut I,
-}
-impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
-where
-    I: Iterator,
-{
-    type Item = IdWithIndex<I::Item>;
+// TODO: Not used atm. Uncomment if needed.
+// struct IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     underlying: &'a mut I,
+// }
+// impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     type Item = IdWithIndex<I::Item>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.underlying
-            .next()
-            .map(|id| IdWithIndex { id, index: 0 })
-    }
-}
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.underlying
+//             .next()
+//             .map(|id| IdWithIndex { id, index: 0 })
+//     }
+// }
 
 struct IdGeneratorWithSubIndex<'a, I>
 where
@@ -1159,6 +1171,10 @@ where
             start_index: id.index,
             end_index,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.start_index == self.end_index
     }
 
     pub fn len(&self) -> u16 {
