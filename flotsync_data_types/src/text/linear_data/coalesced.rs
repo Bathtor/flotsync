@@ -78,6 +78,10 @@ where
     where
         I: Iterator<Item = BaseId>,
     {
+        if initial_value.is_empty() {
+            return Self::new(id_generator);
+        }
+
         let value_len = initial_value.len();
 
         let begin_id = IdWithIndex::zero(
@@ -256,8 +260,6 @@ where
         }
         debug_assert!(found_end);
 
-        // TODO: Remove nodes that aren't INSERT nodes, since there's nothing to do for DELETE nodes.
-
         for item in work_items {
             match item {
                 DeleteMode::Skip { .. } => (), // Just do nothing for these.
@@ -303,7 +305,7 @@ where
     where
         R: RangeBounds<usize>,
     {
-        let (start_node, start_id) = {
+        let (start_node, start_id, mut next_position) = {
             match range.start_bound() {
                 std::ops::Bound::Included(position) => {
                     self.node_at_position(*position).map(|pos| {
@@ -311,7 +313,7 @@ where
                         // This must fit if position is actually within the node.
                         let start_offset: u16 =
                             (position - pos.node_start_position).try_into().unwrap();
-                        (pos, &node.id + start_offset)
+                        (pos, &node.id + start_offset, *position)
                     })?
                 }
                 std::ops::Bound::Excluded(position) => {
@@ -322,7 +324,7 @@ where
                     if node.node_len() > included_position_offset {
                         // The next position of the one we are excluding fits in here.
                         let id = &node.id + included_position_offset.try_into().unwrap();
-                        (node_at_position, id)
+                        (node_at_position, id, position + 1)
                     } else {
                         // The next position is the beginning of the next node.
                         self.base
@@ -336,7 +338,7 @@ where
                                     node_start_position: node_end_position + 1,
                                 };
                                 let id = node.id.clone();
-                                (pos, id)
+                                (pos, id, position + 1)
                             })?
                     }
                 }
@@ -348,7 +350,7 @@ where
                             node_start_position: 0,
                         };
                         let id = node.id.clone();
-                        (pos, id)
+                        (pos, id, 0)
                     })?
                 }
             }
@@ -360,7 +362,7 @@ where
         let mut current_node_start_position = start_node.node_start_position;
         let mut current_node_end_position =
             start_node.node_start_position + current_node.node_len();
-        let mut next_position = start_node.node_start_position + 1;
+
         let mut insert_nodes = self.base.iter_inserts_from(start_node.node_index + 1);
 
         let mut node_ids_in_range: Vec<IdWithIndexRange<BaseId>> = Vec::with_capacity(1);
@@ -491,7 +493,8 @@ where
         let target_node = &mut self.base.nodes[node_index];
         assert!(
             split_index <= target_node.last_index(),
-            "Cannot split a node beyond the end."
+            "Cannot split a node beyond the end (at {split_index}): {:?}",
+            self.base.nodes[node_index]
         );
         let split_offset = split_index - target_node.id.index;
 
@@ -658,6 +661,21 @@ where
     type Id = IdWithIndex<BaseId>;
 
     type Iter<'a> = VecCoalescedLinearDataIter<'a, IdWithIndex<BaseId>, Value>;
+
+    fn ids_after_head(&self) -> LinkIds<Self::Id> {
+        LinkIds {
+            predecessor: self.base.nodes[0].id.clone(),
+            successor: self.base.nodes[1].id.clone(),
+        }
+    }
+
+    fn ids_before_end(&self) -> LinkIds<Self::Id> {
+        let len = self.base.nodes.len();
+        LinkIds {
+            predecessor: self.base.nodes[len - 2].last_id(),
+            successor: self.base.nodes[len - 1].id.clone(),
+        }
+    }
 
     fn ids_at_pos(&self, position: usize) -> Option<NodeIds<Self::Id>> {
         if position < self.len {
@@ -856,6 +874,10 @@ where
             current_node_iter: None,
         }
     }
+
+    fn iter_ids(&self) -> impl Iterator<Item = &Self::Id> {
+        self.base.iter_ids()
+    }
 }
 impl<BaseId, Value> DebugFormatting for VecCoalescedLinearData<BaseId, Value>
 where
@@ -950,25 +972,32 @@ struct NodePosition {
     node_start_position: usize,
 }
 
-// TODO: Not used atm. Uncomment if needed.
-// struct IdGeneratorWithZeroIndex<'a, I>
-// where
-//     I: Iterator,
-// {
-//     underlying: &'a mut I,
-// }
-// impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
-// where
-//     I: Iterator,
-// {
-//     type Item = IdWithIndex<I::Item>;
+pub struct IdGeneratorWithZeroIndex<'a, I>
+where
+    I: Iterator,
+{
+    underlying: &'a mut I,
+}
+impl<'a, I> IdGeneratorWithZeroIndex<'a, I>
+where
+    I: Iterator,
+{
+    pub fn new(iter: &'a mut I) -> Self {
+        Self { underlying: iter }
+    }
+}
+impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
+where
+    I: Iterator,
+{
+    type Item = IdWithIndex<I::Item>;
 
-//     fn next(&mut self) -> Option<Self::Item> {
-//         self.underlying
-//             .next()
-//             .map(|id| IdWithIndex { id, index: 0 })
-//     }
-// }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.underlying
+            .next()
+            .map(|id| IdWithIndex { id, index: 0 })
+    }
+}
 
 struct IdGeneratorWithSubIndex<'a, I>
 where
@@ -1118,6 +1147,24 @@ where
             .checked_sub(other.index)
             .expect("Index different overflowed")
     }
+
+    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the largest
+    /// possible value.
+    pub fn with_max_index(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            index: u16::MAX,
+        }
+    }
+
+    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the smallest
+    /// possible value (i.e. 0).
+    pub fn with_zero_index(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            index: 0,
+        }
+    }
 }
 impl<Id> std::ops::Add<u16> for IdWithIndex<Id>
 where
@@ -1230,5 +1277,16 @@ where
             data.apply_operation(op).map_err(|_| id_range)?;
         }
         Ok(())
+    }
+
+    pub fn delete_operations<T>(self) -> impl Iterator<Item = DataOperation<IdWithIndex<Id>, T>> {
+        self.contained.into_iter().map(|range| {
+            let start = range.first();
+            let end = range.last();
+            DataOperation::Delete {
+                start,
+                end: Some(end),
+            }
+        })
     }
 }

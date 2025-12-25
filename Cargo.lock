@@ -846,6 +846,7 @@ dependencies = [
  "flotsync_utils",
  "itertools 0.14.0",
  "similar",
+ "snafu",
  "unicode-segmentation",
 ]
 

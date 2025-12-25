@@ -1,11 +1,50 @@
 use similar::TextDiff;
-use std::iter::{Enumerate, Peekable};
+use std::{
+    fmt,
+    iter::{Enumerate, Peekable},
+};
 use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextChange {
+    /// Insert `value` before position `at`.
     Insert { at: usize, value: String },
+    /// Delete graphemes in the range [at, at + len].
     Delete { at: usize, len: usize },
+}
+impl fmt::Display for TextChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TextChange::Insert { at, value } => write!(f, "@@ {at} @@ +++ {value} @@"),
+            TextChange::Delete { at, len } => write!(f, "@@ {} @@ --- @@ {} @@", at, at + len),
+        }
+    }
+}
+
+#[allow(unused, reason = "Good for debugging")]
+pub struct TextChangePrettyPrint<'a, 'b> {
+    pub from: &'a str,
+    pub changes: &'b [TextChange],
+}
+impl<'a, 'b> fmt::Display for TextChangePrettyPrint<'a, 'b> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut from_cursor = GraphemeCursor::new(self.from);
+        for entry in self.changes.iter() {
+            match entry {
+                TextChange::Insert { at, value } => {
+                    from_cursor.write_to_until(f, *at)?;
+                    write!(f, "\x1b[32m{}\x1b[0m", value)?;
+                }
+                TextChange::Delete { at, len } => {
+                    from_cursor.write_to_until(f, *at)?;
+                    f.write_str("\x1b[31m")?;
+                    from_cursor.write_to_until(f, at + len)?;
+                    f.write_str("\x1b[0m")?;
+                }
+            }
+        }
+        from_cursor.write_to(f)
+    }
 }
 
 pub fn diff(from: &str, to: &str) -> Vec<TextChange> {
@@ -97,6 +136,7 @@ pub fn diff(from: &str, to: &str) -> Vec<TextChange> {
 //     println!("Cursor position ({current_cursor_pos}):'\n{text_with_pos}\n'")
 // }
 
+#[allow(unused, reason = "Used in tests")]
 pub fn apply_text_diff(text: &str, diff: &[TextChange]) -> String {
     // Assuming that we'll need roughly the same as the input in size seems like a fair bet.
     let mut output = String::with_capacity(text.len());
@@ -151,6 +191,11 @@ impl<'s> GraphemeCursor<'s> {
     }
 
     pub fn copy_to_until(&mut self, target: &mut String, until_pos: usize) {
+        self.write_to_until(target, until_pos)
+            .expect("Writing in to String failed.")
+    }
+
+    pub fn write_to_until<W: fmt::Write>(&mut self, out: &mut W, until_pos: usize) -> fmt::Result {
         while self
             .iter
             .peek()
@@ -158,46 +203,33 @@ impl<'s> GraphemeCursor<'s> {
             .is_some()
         {
             let (_, next_grapheme) = self.iter.next().expect("Copied beyond end of cursor");
-            target.push_str(next_grapheme);
+            out.write_str(next_grapheme)?;
         }
+        Ok(())
     }
 
+    #[allow(unused, reason = "Used in tests")]
     pub fn copy_to(self, target: &mut String) {
+        self.write_to(target).expect("Writing in to String failed.")
+    }
+
+    pub fn write_to<W: fmt::Write>(self, out: &mut W) -> fmt::Result {
         for (_, next_grapheme) in self.iter {
-            target.push_str(next_grapheme);
+            out.write_str(next_grapheme)?;
         }
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use itertools::Itertools;
-
-    // #[test]
-    // fn simple_test() {
-    //     let from = "The fox is rather silly.";
-    //     let to = "The fox is now quite serious!";
-    //     let res = diff(from, to);
-    //     assert_ne!(res, vec![]);
-    //     let applied = apply_text_diff(from, &res);
-    //     assert_eq!(applied, to);
-    // }
-
-    // #[test]
-    // fn grapheme_test() {
-    //     let from = "The 🇸🇪 fox is rather silly.";
-    //     let to = "The fox is now a quite serious 🇩🇪! It likes 🌼, though.";
-    //     let res = diff(from, to);
-    //     assert_ne!(res, vec![]);
-    //     let applied = apply_text_diff(from, &res);
-    //     assert_eq!(applied, to);
-    // }
 
     // 30 strings grouped into 10 triplets of small diffs.
     // Covers: empty, ASCII edits, combining marks, emoji + skin tone, ZWJ sequences,
     // NBSP vs spaces, line endings, zero-width chars, tabs/trailing.
-    const SMALL_CHANGE_TEST_GROUPS: [[&str; 3]; 10] = [
+    pub const SMALL_CHANGE_TEST_GROUPS: [[&str; 3]; 10] = [
         // Empty → small growth
         ["", "a", "ab"],
         // Word changes.
@@ -279,39 +311,39 @@ mod tests {
         }
     }
 
-    const TEXT_A: &str = r#"
+    pub const TEXT_A: &str = r#"
 # Harbor Log — Entry Ⅰ
 
-The **ancient** harbor lay silent beneath the pale morning light.  
-Gulls 🕊 circling lazily above crooked masts—occasionally diving toward the dark water.  
+The **ancient** harbor lay silent beneath the pale morning light.
+Gulls 🕊 circling lazily above crooked masts—occasionally diving toward the dark water.
 Fishermen once gathered here at dawn:
 
-- Laughing as they prepared their nets 🎣  
-- Sharing bread and coffee ☕  
+- Laughing as they prepared their nets 🎣
+- Sharing bread and coffee ☕
 - Cursing the cold wind 🌬
 
-Now, only echoes of their voices remained.  
-A thin mist clung to the worn stone pier, wrapping everything in a cold embrace.  
-Somewhere in the distance, a *bell* tolled with a hollow, metallic ring 🔔.  
-No ships had docked here in years, yet the smell of salt and tar lingered stubbornly.  
+Now, only echoes of their voices remained.
+A thin mist clung to the worn stone pier, wrapping everything in a cold embrace.
+Somewhere in the distance, a *bell* tolled with a hollow, metallic ring 🔔.
+No ships had docked here in years, yet the smell of salt and tar lingered stubbornly.
 It felt as though the sea itself refused to forget. 🌊⚓
 "#;
 
-    const TEXT_B: &str = r#"
+    pub const TEXT_B: &str = r#"
 # Harbour Log — Entry II
 
-The **old** harbour stood quiet under the dim morning glow.  
-Seagulls 🕊 drifting in slow circles above leaning masts—sometimes swooping toward the black waters.  
+The **old** harbour stood quiet under the dim morning glow.
+Seagulls 🕊 drifting in slow circles above leaning masts—sometimes swooping toward the black waters.
 Sailors once gathered here at first light:
 
-- Smiling while they checked their gear 🧰  
-- Tearing bread and sipping bitter tea 🍵  
+- Smiling while they checked their gear 🧰
+- Tearing bread and sipping bitter tea 🍵
 - Grumbling at the biting wind 🌪
 
-Now, only faint traces of their laughter survive.  
-A light fog clung to the cracked stone jetty, coating everything in a damp shroud.  
-Far in the distance, a *bell* chimed with a hollow, echoing tone 🔔.  
-No boats had berthed here in ages, yet the scent of salt 🧂 and pitch persisted defiantly.  
+Now, only faint traces of their laughter survive.
+A light fog clung to the cracked stone jetty, coating everything in a damp shroud.
+Far in the distance, a *bell* chimed with a hollow, echoing tone 🔔.
+No boats had berthed here in ages, yet the scent of salt 🧂 and pitch persisted defiantly.
 It seemed as though the ocean itself refused to let go. 🌊⚓🪝
 "#;
     #[test]
@@ -323,37 +355,37 @@ It seemed as though the ocean itself refused to let go. 🌊⚓🪝
         );
 
         // And reverse.
-        // check_diff_and_apply(
-        //     TEXT_B,
-        //     TEXT_A,
-        //     &format!("Patching with large input:\n\"\n{TEXT_B}\n\"\n ->\n\"\n{TEXT_A}\n\""),
-        // );
-    }
-
-    #[test]
-    fn debug_me_test() {
-        let from = r#"
-# Harbor Log — Entry Ⅰ
-
-The **ancient** harbor lay silent beneath the pale morning light.  
-Gulls 🕊 circling lazily above crooked masts—occasionally diving toward the dark water.  
-Fishermen once gathered here at dawn:
-
-- Laughing as they prepared their nets 🎣  
-"#;
-        let to = r#"
-# Harbour Log — Entry II
-
-The **old** harbour stood quiet under the dim morning glow.  
-Seagulls drifting in slow circles above leaning masts—sometimes swooping toward the black waters.  
-"#;
-
         check_diff_and_apply(
-            from,
-            to,
-            &format!("Patching with large input:\n\"\n{from}\n\"\n ->\n\"\n{to}\n\""),
+            TEXT_B,
+            TEXT_A,
+            &format!("Patching with large input:\n\"\n{TEXT_B}\n\"\n ->\n\"\n{TEXT_A}\n\""),
         );
     }
+
+    //     #[test]
+    //     pub fn debug_me_test() {
+    //         let from = r#"
+    // # Harbor Log — Entry Ⅰ
+
+    // The **ancient** harbor lay silent beneath the pale morning light.
+    // Gulls 🕊 circling lazily above crooked masts—occasionally diving toward the dark water.
+    // Fishermen once gathered here at dawn:
+
+    // - Laughing as they prepared their nets 🎣
+    // "#;
+    //         let to = r#"
+    // # Harbour Log — Entry II
+
+    // The **old** harbour stood quiet under the dim morning glow.
+    // Seagulls drifting in slow circles above leaning masts—sometimes swooping toward the black waters.
+    // "#;
+
+    //         check_diff_and_apply(
+    //             from,
+    //             to,
+    //             &format!("Patching with large input:\n\"\n{from}\n\"\n ->\n\"\n{to}\n\""),
+    //         );
+    //     }
 
     fn check_diff_and_apply(from: &str, to: &str, error_context: &str) {
         let result = diff(from, to);
@@ -369,10 +401,10 @@ Seagulls drifting in slow circles above leaning masts—sometimes swooping towar
 
 #[allow(unused)]
 mod debug_helpers {
+    use super::*;
     use similar::DiffOp;
 
-    use super::*;
-
+    #[allow(clippy::print_stderr, reason = "This is designed for debug printing.")]
     pub fn print_diff_changes<'a>(diff: &TextDiff<'a, 'a, '_, str>) {
         let mut diff_str = String::new();
         for entry in diff.iter_all_changes() {
@@ -391,6 +423,7 @@ mod debug_helpers {
         eprintln!("diff: '{diff_str}'");
     }
 
+    #[allow(clippy::print_stderr, reason = "This is designed for debug printing.")]
     pub fn print_ops_changes(from: &str, to: &str, ops: &[DiffOp]) {
         let mut diff_str = String::new();
         // eprintln!("diff:\n----");

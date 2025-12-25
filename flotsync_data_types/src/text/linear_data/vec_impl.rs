@@ -162,7 +162,7 @@ where
 }
 impl<Id, Value> LinearData<Value> for VecLinearData<Id, Value>
 where
-    Id: Clone + fmt::Debug + PartialEq,
+    Id: Clone + fmt::Debug + PartialEq + 'static,
     Value: fmt::Debug,
 {
     type Id = Id;
@@ -171,6 +171,21 @@ where
     where
         Self: 'a,
         Value: 'a;
+
+    fn ids_after_head(&self) -> LinkIds<Self::Id> {
+        LinkIds {
+            predecessor: self.nodes[0].id.clone(),
+            successor: self.nodes[1].id.clone(),
+        }
+    }
+
+    fn ids_before_end(&self) -> LinkIds<Self::Id> {
+        let len = self.nodes.len();
+        LinkIds {
+            predecessor: self.nodes[len - 2].id.clone(),
+            successor: self.nodes[len - 1].id.clone(),
+        }
+    }
 
     fn ids_at_pos(&self, position: usize) -> Option<NodeIds<Id>> {
         if position < self.len() {
@@ -296,6 +311,10 @@ where
         VecLinearDataIter {
             underlying: self.nodes.iter(),
         }
+    }
+
+    fn iter_ids(&self) -> impl Iterator<Item = &Self::Id> {
+        self.nodes.iter().map(|n| &n.id)
     }
 }
 

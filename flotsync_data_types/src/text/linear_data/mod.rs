@@ -4,6 +4,7 @@ use std::{assert_matches::assert_matches, fmt, vec};
 mod coalesced;
 pub use coalesced::{
     Composite,
+    IdGeneratorWithZeroIndex,
     IdWithIndex,
     IdWithIndexRange,
     NodeIdRange,
@@ -54,16 +55,28 @@ pub trait LinearData<Value, ValueRef = Value>
 where
     ValueRef: ?Sized,
 {
-    type Id;
+    type Id: 'static;
 
     type Iter<'a>: Iterator<Item = &'a ValueRef>
     where
         Self: 'a,
         ValueRef: 'a;
 
+    /// Get the node ids between head and its successor.
+    ///
+    /// As opposed to [[ids_at_pos]], this always exists.
+    fn ids_after_head(&self) -> LinkIds<Self::Id>;
+
+    /// Get the node ids between the end and its predecessor.
+    ///
+    /// As opposed to [[ids_at_pos]], this always exists.
+    fn ids_before_end(&self) -> LinkIds<Self::Id>;
+
     /// Get the ids of the nodes at, before, and after `position`.
     ///
     /// Position is counted only for currently existing Insert nodes, consistent with the iterator.
+    ///
+    /// In particular, that means empty `self` always returns `None`.
     fn ids_at_pos(&self, position: usize) -> Option<NodeIds<Self::Id>>;
 
     /// Insert `id -> value` between `pred` and `succ` if these nodes exist and `succ`
@@ -92,16 +105,64 @@ where
     ) -> Result<(), DataOperation<Self::Id, Value>>;
 
     fn iter_values(&self) -> Self::Iter<'_>;
+
+    /// Returns an iterator over all ids that are associated with some node in the underlying
+    /// data structure.
+    fn iter_ids(&self) -> impl Iterator<Item = &Self::Id>;
+}
+
+/// A pair of ids identifying a concrete position *between* two nodes at a particular point in time.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LinkIds<Id> {
+    pub predecessor: Id,
+    pub successor: Id,
+}
+impl<Id> LinkIds<Id> {
+    pub fn insert<L, Value, ValueRef>(self, data: &mut L, id: Id, value: Value) -> Result<(), Value>
+    where
+        ValueRef: ?Sized,
+        L: LinearData<Value, ValueRef, Id = Id>,
+    {
+        data.insert(id, self.predecessor, self.successor, value)
+    }
+
+    pub(crate) fn insert_operation<Value>(self, id: Id, value: Value) -> DataOperation<Id, Value>
+    where
+        Id: Clone + fmt::Debug + PartialEq + 'static,
+    {
+        DataOperation::Insert {
+            id,
+            pred: self.predecessor,
+            succ: self.successor,
+            value,
+        }
+    }
 }
 
 /// A group of ids identifying the concrete position of a node at a particular point in time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeIds<Id> {
     pub predecessor: Id,
     pub current: Id,
     pub successor: Id,
 }
 impl<Id> NodeIds<Id> {
+    /// Return a reference to the link between this node and its predecessor.
+    pub fn before(self) -> LinkIds<Id> {
+        LinkIds {
+            predecessor: self.predecessor,
+            successor: self.current,
+        }
+    }
+
+    /// Return a reference to the link between this node and its successor.
+    pub fn after(self) -> LinkIds<Id> {
+        LinkIds {
+            predecessor: self.current,
+            successor: self.successor,
+        }
+    }
+
     pub fn insert_before<L, Value, ValueRef>(
         self,
         data: &mut L,
@@ -112,7 +173,7 @@ impl<Id> NodeIds<Id> {
         ValueRef: ?Sized,
         L: LinearData<Value, ValueRef, Id = Id>,
     {
-        data.insert(id, self.predecessor, self.current, value)
+        self.before().insert(data, id, value)
     }
 
     pub fn insert_after<L, Value, ValueRef>(
@@ -125,7 +186,7 @@ impl<Id> NodeIds<Id> {
         ValueRef: ?Sized,
         L: LinearData<Value, ValueRef, Id = Id>,
     {
-        data.insert(id, self.current, self.successor, value)
+        self.after().insert(data, id, value)
     }
 
     pub fn delete<'a, L, Value, ValueRef>(&self, data: &'a mut L) -> Option<&'a ValueRef>
