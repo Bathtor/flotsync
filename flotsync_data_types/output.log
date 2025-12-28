@@ -1,0 +1,230 @@
+   Compiling flotsync_data_types v0.1.0 (/Users/lkroll/Programming/flotsync/flotsync_data_types)
+warning: method `find_origin_pos_for_node_at` is never used
+  --> flotsync_data_types/src/text/linear_data/vec_impl.rs:84:19
+   |
+15 | / impl<Id, Value> VecLinearData<Id, Value>
+16 | | where
+17 | |     Id: Clone + fmt::Debug + PartialEq + Eq,
+   | |____________________________________________- method in this implementation
+...
+84 |       pub(super) fn find_origin_pos_for_node_at(
+   |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `flotsync_data_types` (lib) generated 1 warning
+warning: `flotsync_data_types` (lib test) generated 1 warning (1 duplicate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.29s
+     Running unittests src/lib.rs (/Users/lkroll/Programming/flotsync/target/debug/deps/flotsync_data_types-dbfc700abfd95344)
+
+running 25 tests
+test text::linear_string::tests::linear_string::single_value_roundtrip ... ok
+test text::linear_string::tests::linear_word_string::appends ... ok
+test text::linear_string::tests::linear_string::range_deletes ... ok
+test text::linear_string::tests::linear_string::ascii_inserts ... ok
+test text::linear_string::tests::linear_string::unicode_prepends ... ok
+test text::linear_string::tests::linear_string::ascii_appends ... ok
+test text::linear_string::tests::linear_string::ascii_prepends ... ok
+test text::linear_string::tests::linear_word_string::deletes ... ok
+test text::linear_string::tests::linear_word_string::inserts ... ok
+test text::linear_string::tests::linear_string::unicode_appends ... ok
+test text::linear_string::tests::linear_string::unicode_inserts ... ok
+test text::linear_string::tests::linear_word_string::prepends ... ok
+test text::linear_string::tests::linear_word_string::single_value_roundtrip ... ok
+test text::linear_string::tests::linear_string::single_char_deletes ... ok
+test text::tests::test_multi_step_repro ... ok
+test text::tests::test_with_empty_string ... ok
+test text::tests::diff_and_apply_small_changes ... ok
+test text::tests::test_single_step_convergence ... ok
+test text::text_diff::tests::diff_and_apply_small_changes ... ok
+test text::tests::diff_and_apply_distant_changes ... ok
+test text::text_diff::tests::diff_and_apply_distant_changes ... ok
+test text::tests::test_sequence_of_changes ... ok
+test text::tests::test_multi_step_convergence ... FAILED
+test text::text_diff::tests::diff_and_apply_larger_changes ... ok
+test text::tests::diff_and_apply_larger_changes ... ok
+
+failures:
+
+---- text::tests::test_multi_step_convergence stdout ----
+Inserting Insert { id: IdWithIndex { id: 1, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: a }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 2, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: ab }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 3, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: The quick brown fox jumps over the lazy dog. }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 4, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 1, index: 0 }, value: The small brown fox hops over the l }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 4, index: 35 }, pred: IdWithIndex { id: 1, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: zy dog. }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 5, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 2, index: 0 }, value: The sm }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 5, index: 6 }, pred: IdWithIndex { id: 2, index: 0 }, succ: IdWithIndex { id: 2, index: 1 }, value: ll  }
+Succ and pred are the same node 2 and we need to split at 1
+Inserting Insert { id: IdWithIndex { id: 5, index: 9 }, pred: IdWithIndex { id: 2, index: 1 }, succ: IdWithIndex { id: 0, index: 1 }, value: rown fox hops quickly over the irritated camel. }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+###
+### Checking writer order: 0, 1, 2
+###
+### Base is 'The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[44 live values, 1 live nodes]
+### Applying op
+@@ 0:0 @@ 1:0+++a @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[44 live values, 1 live nodes]
+Inserting Insert { id: IdWithIndex { id: 1, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: a }
+There is a gap between between pred=0 and succ=2 and we need to find where to insert among:
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+Determined to insert at 1, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'aThe quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|1:0|0:1> @ 'a' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[45 live values, 2 live nodes]
+### Applying op
+@@ 0:0 @@ 4:0+++The small brown fox hops over the l @@ 1:0 @@
+@@ 1:0 @@ 4:35+++zy dog. @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|1:0|0:1> @ 'a' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[45 live values, 2 live nodes]
+Inserting Insert { id: IdWithIndex { id: 4, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 1, index: 0 }, value: The small brown fox hops over the l }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 4, index: 35 }, pred: IdWithIndex { id: 1, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: zy dog. }
+There is a gap between between pred=2 and succ=4 and we need to find where to insert among:
+ { <0:0|1:0|0:1> @ 'a' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+The conflict range is empty, no other node has left=IdWithIndex { id: 1, index: 0 }, right=IdWithIndex { id: 0, index: 1 }
+Left subtree: { <0:0|1:0|0:1> @ 'a' }
+Right subtree: { <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' }
+Determined to insert at 3, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'The small brown fox hops over the lazy dog.The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[87 live values, 4 live nodes]
+### Applying op
+@@ 0:0 @@ 2:0+++ab @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[87 live values, 4 live nodes]
+Inserting Insert { id: IdWithIndex { id: 2, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: ab }
+There is a gap between between pred=0 and succ=5 and we need to find where to insert among:
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+Determined to insert at 4, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'The small brown fox hops over the lazy dog.abThe quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|2:0|0:1> @ 'ab' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[89 live values, 5 live nodes]
+### Applying op
+@@ 0:0 @@ 5:0+++The sm @@ 2:0 @@
+@@ 2:0 @@ 5:6+++ll  @@ 2:1 @@
+@@ 2:1 @@ 5:9+++rown fox hops quickly over the irritated camel. @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|2:0|0:1> @ 'ab' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[89 live values, 5 live nodes]
+Inserting Insert { id: IdWithIndex { id: 5, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 2, index: 0 }, value: The sm }
+There is a gap between between pred=0 and succ=4 and we need to find where to insert among:
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|2:0|0:1> @ 'ab' }
+The conflict range is empty, no other node has left=IdWithIndex { id: 0, index: 0 }, right=IdWithIndex { id: 2, index: 0 }
+There's a gap between the right and left subtree: [0, 3] and [4, 4]
+Left subtree: { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' }
+Right subtree: {  }
+Determined to insert at 4, i.e. before Node { id: IdWithIndex { id: 2, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: ab } }
+Inserting Insert { id: IdWithIndex { id: 5, index: 6 }, pred: IdWithIndex { id: 2, index: 0 }, succ: IdWithIndex { id: 2, index: 1 }, value: ll  }
+Succ and pred are the same node 5 and we need to split at 1
+Inserting Insert { id: IdWithIndex { id: 5, index: 9 }, pred: IdWithIndex { id: 2, index: 1 }, succ: IdWithIndex { id: 0, index: 1 }, value: rown fox hops quickly over the irritated camel. }
+There is a gap between between pred=7 and succ=9 and we need to find where to insert among:
+ { <0:0|2:1|0:1> @ 'b' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+The conflict range is empty, no other node has left=IdWithIndex { id: 2, index: 1 }, right=IdWithIndex { id: 0, index: 1 }
+Left subtree: { <0:0|2:1|0:1> @ 'b' }
+Right subtree: { <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' }
+Determined to insert at 8, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'The small brown fox hops over the lazy dog.The small brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[145 live values, 9 live nodes]
+###
+### Checking writer order: 0, 2, 1
+###
+### Base is 'The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[44 live values, 1 live nodes]
+### Applying op
+@@ 0:0 @@ 2:0+++ab @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[44 live values, 1 live nodes]
+Inserting Insert { id: IdWithIndex { id: 2, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: ab }
+There is a gap between between pred=0 and succ=2 and we need to find where to insert among:
+ { <$|0:0|0:1> -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+Determined to insert at 1, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'abThe quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|2:0|0:1> @ 'ab' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[46 live values, 2 live nodes]
+### Applying op
+@@ 0:0 @@ 5:0+++The sm @@ 2:0 @@
+@@ 2:0 @@ 5:6+++ll  @@ 2:1 @@
+@@ 2:1 @@ 5:9+++rown fox hops quickly over the irritated camel. @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|2:0|0:1> @ 'ab' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[46 live values, 2 live nodes]
+Inserting Insert { id: IdWithIndex { id: 5, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 2, index: 0 }, value: The sm }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 5, index: 6 }, pred: IdWithIndex { id: 2, index: 0 }, succ: IdWithIndex { id: 2, index: 1 }, value: ll  }
+Succ and pred are the same node 2 and we need to split at 1
+Inserting Insert { id: IdWithIndex { id: 5, index: 9 }, pred: IdWithIndex { id: 2, index: 1 }, succ: IdWithIndex { id: 0, index: 1 }, value: rown fox hops quickly over the irritated camel. }
+There is a gap between between pred=4 and succ=6 and we need to find where to insert among:
+ { <0:0|2:1|0:1> @ 'b' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+The conflict range is empty, no other node has left=IdWithIndex { id: 2, index: 1 }, right=IdWithIndex { id: 0, index: 1 }
+Left subtree: { <0:0|2:1|0:1> @ 'b' }
+Right subtree: { <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' }
+Determined to insert at 5, i.e. before Node { id: IdWithIndex { id: 3, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: The quick brown fox jumps over the lazy dog. } }
+### Got 'The small brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[102 live values, 6 live nodes]
+### Applying op
+@@ 0:0 @@ 1:0+++a @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[102 live values, 6 live nodes]
+Inserting Insert { id: IdWithIndex { id: 1, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: a }
+There is a gap between between pred=0 and succ=7 and we need to find where to insert among:
+ { <$|0:0|0:1> -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+Determined to insert at 1, i.e. before Node { id: IdWithIndex { id: 5, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 2, index: 0 }), operation: Insert { value: The sm } }
+### Got 'aThe small brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|1:0|0:1> @ 'a' -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[103 live values, 7 live nodes]
+### Applying op
+@@ 0:0 @@ 4:0+++The small brown fox hops over the l @@ 1:0 @@
+@@ 1:0 @@ 4:35+++zy dog. @@ 0:1 @@
+
+to
+ { <$|0:0|0:1> -> <0:0|1:0|0:1> @ 'a' -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[103 live values, 7 live nodes]
+Inserting Insert { id: IdWithIndex { id: 4, index: 0 }, pred: IdWithIndex { id: 0, index: 0 }, succ: IdWithIndex { id: 1, index: 0 }, value: The small brown fox hops over the l }
+Succ is the immediate successor of pred, and we just insert at the boundary.
+Inserting Insert { id: IdWithIndex { id: 4, index: 35 }, pred: IdWithIndex { id: 1, index: 0 }, succ: IdWithIndex { id: 0, index: 1 }, value: zy dog. }
+There is a gap between between pred=2 and succ=9 and we need to find where to insert among:
+ { <0:0|1:0|0:1> @ 'a' -> <0:0|5:0|2:0> @ 'The sm' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }
+The conflict range is empty, no other node has left=IdWithIndex { id: 1, index: 0 }, right=IdWithIndex { id: 0, index: 1 }
+There's a gap between the right and left subtree: [2, 3] and [4, 9]
+Left subtree: { <0:0|1:0|0:1> @ 'a' }
+Right subtree: { <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' }
+Determined to insert at 4, i.e. before Node { id: IdWithIndex { id: 2, index: 0 }, left_origin: Some(IdWithIndex { id: 0, index: 0 }), right_origin: Some(IdWithIndex { id: 0, index: 1 }), operation: Insert { value: a } }
+### Got 'The small brown fox hops over the laThe smzy dog.all brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog.':
+ { <$|0:0|0:1> -> <0:0|4:0|1:0> @ 'The small brown fox hops over the l' -> <0:0|1:0|0:1> @ 'a' -> <0:0|5:0|2:0> @ 'The sm' -> <1:0|4:35|0:1> @ 'zy dog.' -> <0:0|2:0|0:1> @ 'a' -> <2:0|5:6|2:1> @ 'll ' -> <0:0|2:1|0:1> @ 'b' -> <2:1|5:9|0:1> @ 'rown fox hops quickly over the irritated camel.' -> <0:0|3:0|0:1> @ 'The quick brown fox jumps over the lazy dog.' -> <0:0|0:1|X> }[145 live values, 9 live nodes]
+
+thread 'text::tests::test_multi_step_convergence' (12525922) panicked at flotsync_data_types/src/text/mod.rs:550:17:
+assertion `left == right` failed: Result strings did not match for permutation: 0, 2, 1
+  left: "The small brown fox hops over the lazy dog.The small brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog."
+ right: "The small brown fox hops over the laThe smzy dog.all brown fox hops quickly over the irritated camel.The quick brown fox jumps over the lazy dog."
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/85c8ff69cb3efd950395cc444a54bbbdad668865/library/std/src/panicking.rs:689:5
+   1: core::panicking::panic_fmt
+             at /rustc/85c8ff69cb3efd950395cc444a54bbbdad668865/library/core/src/panicking.rs:80:14
+   2: core::panicking::assert_failed_inner
+   3: core::panicking::assert_failed::<alloc::string::String, alloc::string::String>
+             at /Users/lkroll/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/panicking.rs:394:5
+   4: flotsync_data_types::text::tests::test_multi_step_convergence
+             at ./src/text/mod.rs:550:17
+   5: flotsync_data_types::text::tests::test_multi_step_convergence::{closure#0}
+             at ./src/text/mod.rs:506:37
+   6: <flotsync_data_types::text::tests::test_multi_step_convergence::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /Users/lkroll/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/85c8ff69cb3efd950395cc444a54bbbdad668865/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+
+
+failures:
+    text::tests::test_multi_step_convergence
+
+test result: FAILED. 24 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `--lib`

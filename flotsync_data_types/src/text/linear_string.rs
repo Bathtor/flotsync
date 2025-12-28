@@ -1,25 +1,27 @@
 use super::*;
 use crate::text::grapheme_string::GraphemeString;
+use std::hash::Hash;
 
 pub type LinearWordString<Id> = VecLinearData<Id, String>;
 #[allow(unused, reason = "Testing")]
 pub type LinearWordStringUntracked = LinearWordString<()>;
 impl<Id> fmt::Display for LinearWordString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.iter_values().try_for_each(|s| f.write_str(s))
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinearString<Id> {
     data: VecCoalescedLinearData<Id, GraphemeString>,
 }
 impl<Id> LinearString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    // TODO: Remove Display bounds again.
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     pub fn new<I>(id_generator: &mut I) -> Self
     where
@@ -83,7 +85,7 @@ where
 }
 impl<Id> fmt::Display for LinearString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.data.iter_values().try_for_each(|s| f.write_str(s))
@@ -91,7 +93,8 @@ where
 }
 impl<Id> LinearData<String, str> for LinearString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    // TODO: Remove the Display bounds again.
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     type Id = IdWithIndex<Id>;
 
@@ -163,7 +166,8 @@ where
 pub struct NodeIdRangeString<Id>(NodeIdRange<Id>);
 impl<Id> NodeIdRangeString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    // TODO: Remove Display bounds again.
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
     ///

@@ -1,7 +1,7 @@
 use crate::InternalSnafu;
 use flotsync_utils::{debugging::DebugFormatting, require};
 use snafu::prelude::*;
-use std::{collections::BTreeSet, fmt, ops::RangeBounds};
+use std::{collections::BTreeSet, fmt, hash::Hash, ops::RangeBounds};
 use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 
 mod linear_data;
@@ -43,13 +43,13 @@ where
 }
 
 /// A set of changes that can be applied to a [[LinearString]].
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LinearStringDiff<Id> {
     operations: Vec<DataOperation<IdWithIndex<Id>, String>>,
 }
 impl<Id> LinearStringDiff<Id>
 where
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Apply all the changes in this diff to `target`.
     pub fn apply_to(self, target: &mut LinearString<Id>) -> Result<(), ApplyError<Id>> {
@@ -168,7 +168,7 @@ pub fn linear_diff<Id>(
     id_generator: &mut impl Iterator<Item = Id>,
 ) -> Result<LinearStringDiff<Id>, DiffError>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     let mut id_with_index_generator = IdGeneratorWithZeroIndex::new(id_generator);
     let current_text = base.to_string();
@@ -299,10 +299,12 @@ where
 mod tests {
     use crate::text::{
         LinearString,
+        LinearStringDiff,
         linear_diff,
         linear_string::tests::TestIdGenerator,
         text_diff::tests::{SMALL_CHANGE_TEST_GROUPS, TEXT_A, TEXT_B},
     };
+    use flotsync_utils::debugging::DebugFormatting;
     use itertools::Itertools;
 
     #[test]
@@ -452,5 +454,196 @@ mod tests {
             linear_from.check_integrity();
             assert_eq!(linear_from.to_string(), *to);
         }
+    }
+
+    #[test]
+    fn test_single_step_convergence() {
+        // For each group, check that no matter in which order we apply the two diffs,
+        // they produce the same result (doesn't matter what it is, as long as its the same).
+        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+            // println!("### \n### Checking Group: {group:?}\n###");
+            let mut id_generator = TestIdGenerator::new();
+            let base = LinearString::with_value(&mut id_generator, group[0].to_owned());
+
+            let diff_to_first = linear_diff(&base, group[1], &mut id_generator).unwrap();
+            assert!(!diff_to_first.is_empty());
+            let diff_to_second = linear_diff(&base, group[2], &mut id_generator).unwrap();
+            assert!(!diff_to_second.is_empty());
+
+            let first_then_second = {
+                let mut linear = base.clone();
+                diff_to_first.clone().apply_to(&mut linear).unwrap();
+                linear.check_integrity();
+                assert_eq!(linear.to_string(), group[1]);
+                diff_to_second.clone().apply_to(&mut linear).unwrap();
+                linear.check_integrity();
+                linear
+            };
+
+            // Second then first.
+            let second_then_first = {
+                let mut linear = base.clone();
+                diff_to_second.apply_to(&mut linear).unwrap();
+                linear.check_integrity();
+                assert_eq!(linear.to_string(), group[2]);
+                diff_to_first.apply_to(&mut linear).unwrap();
+                linear.check_integrity();
+                linear
+            };
+            assert_eq!(first_then_second.to_string(), second_then_first.to_string());
+            // They should also match structurally.
+            assert_eq!(
+                first_then_second,
+                second_then_first,
+                "first_then_second:\n{}\nsecond_then_first:\n{}",
+                first_then_second.debug_fmt(),
+                second_then_first.debug_fmt()
+            );
+        }
+    }
+
+    #[test]
+    fn test_multi_step_convergence() {
+        // Treat the groups with 3 entries each as 3 indepdent writers.
+        // Have each of them make changes to its own string, recording the diffs in order.
+        // At the end, apply the other 2 diffs to each result in both orders.
+        // Ensure all results are the identical.
+        let mut id_generator = TestIdGenerator::new();
+        // Begin and end nodes need to have the same ids, of course.
+        let shared_base = LinearString::new(&mut id_generator);
+        struct Writer {
+            id: usize,
+            linear: LinearString<u32>,
+            ops: Vec<LinearStringDiff<u32>>,
+        }
+        let mut writers = Vec::from_fn(3, |id| Writer {
+            id,
+            linear: shared_base.clone(),
+            ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
+        });
+        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+            for (writer_index, writer) in writers.iter_mut().enumerate() {
+                let op =
+                    linear_diff(&writer.linear, group[writer_index], &mut id_generator).unwrap();
+                writer.ops.push(op.clone());
+                op.apply_to(&mut writer.linear).unwrap();
+                writer.linear.check_integrity();
+                assert_eq!(writer.linear.to_string(), group[writer_index]);
+            }
+        }
+        // let mut permutation_results: Vec<LinearString<u32>> = Vec::with_capacity(6);
+        let mut previous_result: Option<LinearString<u32>> = None;
+        for perm in writers.iter().permutations(3) {
+            let permutation_str = perm.iter().map(|w| w.id).join(", ");
+            //println!("###\n### Checking writer order: {}\n###", permutation_str);
+            let mut linear = perm[0].linear.clone();
+            //println!("### Base is '{}':\n {}", linear, linear.debug_fmt());
+            for writer in &perm[1..] {
+                for op in writer.ops.iter() {
+                    //println!("### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
+                    op.clone().apply_to(&mut linear).unwrap();
+                    linear.check_integrity();
+                    //println!("### Got '{}':\n {}", linear, linear.debug_fmt());
+                }
+            }
+            if let Some(ref last_result) = previous_result {
+                assert_eq!(
+                    last_result.to_string(),
+                    linear.to_string(),
+                    "Result strings did not match for permutation: {}",
+                    permutation_str
+                );
+                assert_eq!(
+                    last_result, &linear,
+                    "Results did not match for permutation: {}",
+                    permutation_str
+                );
+            }
+            // permutation_results.push(linear);
+            previous_result = Some(linear);
+        }
+        // println!(
+        //     "Permutation Results:\n{}",
+        //     permutation_results.iter().join("\n")
+        // );
+        // for ((i1, r1), (i2, r2)) in permutation_results.iter().enumerate().tuple_windows() {
+        //     assert_eq!(
+        //         r1.to_string(),
+        //         r2.to_string(),
+        //         "Result strings did not match for permutations: {i1} and {i2}"
+        //     );
+        //     assert_eq!(
+        //         r1, r2,
+        //         "Results did not match for permutations: {i1} and {i2}",
+        //     );
+        // }
+    }
+
+    #[test]
+    fn test_multi_step_repro() {
+        let mut id_generator = TestIdGenerator::new();
+        // Begin and end nodes need to have the same ids, of course.
+        let shared_base = LinearString::new(&mut id_generator);
+
+        // Writer A: "" -> "a" -> "Za" (second step references the id created in the first step).
+        let mut a = shared_base.clone();
+        let a1 = linear_diff(&a, "a", &mut id_generator).unwrap();
+        //println!("a1:{}", a1);
+        a1.clone().apply_to(&mut a).unwrap();
+        a.check_integrity();
+        let a2 = linear_diff(&a, "Za", &mut id_generator).unwrap();
+        //println!("a2:{}", a2);
+        a2.clone().apply_to(&mut a).unwrap();
+        a.check_integrity();
+
+        // Writer B: "" -> "ab" -> "aXb" (forces an insertion inside a multi-grapheme node).
+        let mut b = shared_base.clone();
+        let b1 = linear_diff(&b, "ab", &mut id_generator).unwrap();
+        //println!("b1:{}", b1);
+        b1.clone().apply_to(&mut b).unwrap();
+        b.check_integrity();
+        let b2 = linear_diff(&b, "aXb", &mut id_generator).unwrap();
+        //println!("b2:{}", b2);
+        b2.clone().apply_to(&mut b).unwrap();
+        b.check_integrity();
+
+        // Apply A then B (respecting each writer's internal ordering).
+        //println!("### Applying a1, a2, b1, b2");
+        let mut l1 = shared_base.clone();
+        a1.clone().apply_to(&mut l1).unwrap();
+        l1.check_integrity();
+        a2.clone().apply_to(&mut l1).unwrap();
+        l1.check_integrity();
+        b1.clone().apply_to(&mut l1).unwrap();
+        l1.check_integrity();
+        b2.clone().apply_to(&mut l1).unwrap();
+        l1.check_integrity();
+
+        // Apply B then A (still respects each writer's internal ordering).
+        //println!("### Applying b1, b2, a1, a2");
+        let mut l2 = shared_base.clone();
+        b1.apply_to(&mut l2).unwrap();
+        l2.check_integrity();
+        b2.apply_to(&mut l2).unwrap();
+        l2.check_integrity();
+        a1.apply_to(&mut l2).unwrap();
+        l2.check_integrity();
+        a2.apply_to(&mut l2).unwrap();
+        l2.check_integrity();
+
+        assert_eq!(
+            l1.to_string(),
+            l2.to_string(),
+            "Repro: result strings diverged\n\nOrder a1, a2, b1, b2:\n{}\n\nOrder b1, b2, a1, a2:\n{}\n",
+            l1.debug_fmt(),
+            l2.debug_fmt()
+        );
+        assert_eq!(
+            l1,
+            l2,
+            "Repro: structures diverged\n\nOrder a1, a2, b1, b2:\n{}\n\nOrder b1, b2, a1, a2:\n{}\n",
+            l1.debug_fmt(),
+            l2.debug_fmt()
+        );
     }
 }

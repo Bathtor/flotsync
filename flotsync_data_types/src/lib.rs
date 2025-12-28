@@ -1,5 +1,6 @@
 #![feature(linked_list_cursors)]
 #![feature(assert_matches)]
+#![feature(vec_from_fn)]
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]

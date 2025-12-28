@@ -6,7 +6,7 @@ use super::*;
 /// While the natural representation of this data structure is linked nodes,
 /// storing them in a Vec is likely more efficient in practice for most usages
 /// (e.g. read-mostly strings).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VecLinearData<Id, Value> {
     /// The number of Insert nodes in the linear data.
     pub(super) len: usize,
@@ -14,7 +14,7 @@ pub struct VecLinearData<Id, Value> {
 }
 impl<Id, Value> VecLinearData<Id, Value>
 where
-    Id: Clone,
+    Id: Clone + fmt::Debug + PartialEq + Eq,
 {
     pub fn new<I>(id_generator: &mut I) -> Self
     where
@@ -28,12 +28,14 @@ where
             .expect("The generator must produce sufficient ids.");
         let begin_node = Node {
             id: begin_id.clone(),
-            origin: None,
+            left_origin: None,
+            right_origin: Some(end_id.clone()),
             operation: Operation::Beginning,
         };
         let end_node = Node {
             id: end_id,
-            origin: Some(begin_id),
+            left_origin: Some(begin_id),
+            right_origin: None,
             operation: Operation::End,
         };
         let nodes = vec![begin_node, end_node];
@@ -56,28 +58,89 @@ where
 
         let begin_node = Node {
             id: begin_id.clone(),
-            origin: None,
+            left_origin: None,
+            right_origin: Some(value_id.clone()),
             operation: Operation::Beginning,
         };
         let value_node = Node {
-            id: begin_id.clone(),
-            origin: Some(begin_id.clone()),
+            id: value_id.clone(),
+            left_origin: Some(begin_id.clone()),
+            right_origin: Some(end_id.clone()),
             operation: Operation::Insert {
                 value: initial_value,
             },
         };
         let end_node = Node {
             id: end_id,
-            origin: Some(value_id.clone()),
+            left_origin: Some(value_id.clone()),
+            right_origin: None,
             operation: Operation::End,
         };
         let nodes = vec![begin_node, value_node, end_node];
         Self { len: 1, nodes }
     }
+
+    // TODO: Maybe remove this, if it's not needed.
+    // /// Find the index of the node that the `origin` field of the node at `node_index` points to.
+    // pub(super) fn find_origin_pos_for_node_at(
+    //     &self,
+    //     node_index: usize,
+    //     node_has_origin: impl Fn(&Node<Id, Value>, &Id) -> bool,
+    // ) -> Option<usize> {
+    //     let node = &self.nodes[node_index];
+    //     node.left_origin.as_ref().and_then(|origin_id| {
+    //         // Search backwards first, since in any correct list,
+    //         // the origin should occur before the node,
+    //         // most often right before if concurrency is low.
+    //         let mut next_index_opt = node_index.checked_sub(1);
+    //         while let Some(next_index) = next_index_opt {
+    //             if node_has_origin(&self.nodes[next_index], origin_id) {
+    //                 return Some(next_index);
+    //             } else {
+    //                 next_index_opt = next_index.checked_sub(1);
+    //             }
+    //         }
+    //         // Alright, this is already wrong, but let's see if it occurs in the rest of
+    //         // the structure to help debugging.
+    //         for (current_index, current_node) in self.nodes.iter().enumerate().skip(node_index) {
+    //             if &current_node.id == origin_id {
+    //                 return Some(current_index);
+    //             }
+    //         }
+    //         // Didn't occur anywhere, huh.
+    //         None
+    //     })
+    // }
+
+    /// Returns `true` iff `node` is in the transitive right subtree that includes `boundary`.
+    ///
+    /// In other words, if you follow `right_origin` anchors starting from node, you hit the
+    /// node with `id = boundary` before you find a `None`.
+    pub(super) fn ends_in_right_tree<'a>(
+        &'a self,
+        mut node: &'a Node<Id, Value>,
+        boundary: &Id,
+    ) -> bool {
+        loop {
+            if &node.id == boundary {
+                return true;
+            }
+
+            if let Some(ref right) = node.right_origin {
+                node = self
+                    .nodes
+                    .iter()
+                    .find(|n| &n.id == right)
+                    .expect("For every origin a node should exist");
+            } else {
+                return false;
+            };
+        }
+    }
 }
 impl<Id, Value> VecLinearData<Id, Value>
 where
-    Id: Clone + fmt::Debug + PartialEq,
+    Id: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord,
     Value: fmt::Debug,
 {
     pub fn is_empty(&self) -> bool {
@@ -102,7 +165,8 @@ where
             end_index,
             Node {
                 id,
-                origin: Some(last_node_id),
+                left_origin: Some(last_node_id),
+                right_origin: Some(end_node.id.clone()),
                 operation: Operation::Insert { value },
             },
         );
@@ -114,11 +178,14 @@ where
         assert_matches!(begin_node.operation, Operation::Beginning);
         let begin_node_id = begin_node.id.clone();
 
+        let first_node = &self.nodes[1];
+
         self.nodes.insert(
             1,
             Node {
                 id,
-                origin: Some(begin_node_id),
+                left_origin: Some(begin_node_id),
+                right_origin: Some(first_node.id.clone()),
                 operation: Operation::Insert { value },
             },
         );
@@ -162,7 +229,7 @@ where
 }
 impl<Id, Value> LinearData<Value> for VecLinearData<Id, Value>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord + 'static,
     Value: fmt::Debug,
 {
     type Id = Id;
@@ -271,14 +338,18 @@ where
                         if succ_node.id == *succ {
                             // Now we don't need the original operation anymore, so we can properly deconstruct it.
                             if let DataOperation::Insert {
-                                id, pred, value, ..
+                                id,
+                                pred,
+                                succ,
+                                value,
                             } = operation
                             {
                                 self.nodes.insert(
                                     succ_index,
                                     Node {
                                         id,
-                                        origin: Some(pred),
+                                        left_origin: Some(pred),
+                                        right_origin: Some(succ),
                                         operation: Operation::Insert { value },
                                     },
                                 );

@@ -1,6 +1,6 @@
 use super::*;
 use flotsync_utils::{debugging::DebugFormatting, require};
-use std::ops::RangeBounds;
+use std::{hash::Hash, ops::RangeBounds};
 
 pub trait Composite: Sized {
     /// The indivisible element type of this composite type.
@@ -54,7 +54,7 @@ pub enum DeleteError {
 /// This requires Values to implement the [[Composite]] trait, to facilitate coalescing and splitting.
 ///
 /// Otherwise the same properties as the [[VecLinearData]] apply.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VecCoalescedLinearData<Id, Value> {
     /// The number of values in Insert nodes in `base`.
     len: usize,
@@ -62,8 +62,9 @@ pub struct VecCoalescedLinearData<Id, Value> {
 }
 impl<BaseId, Value> VecCoalescedLinearData<BaseId, Value>
 where
-    BaseId: Clone + fmt::Debug + PartialEq + 'static,
-    Value: Composite + fmt::Debug + 'static,
+    // TODO: Remove Display bounds again.
+    BaseId: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Value: Composite + fmt::Debug + fmt::Display + 'static,
 {
     pub fn new<I>(id_generator: &mut I) -> Self
     where
@@ -89,16 +90,18 @@ where
                 .next()
                 .expect("The generator must produce sufficient ids."),
         );
+        let mut next_id = begin_id.increment();
+
         let begin_node = Node {
             id: begin_id.clone(),
-            origin: None,
+            left_origin: None,
+            right_origin: Some(next_id.clone()),
             operation: Operation::Beginning,
         };
 
         let mut nodes = Vec::with_capacity(3);
         nodes.push(begin_node);
 
-        let mut next_id = begin_id.increment();
         let mut remaining_value_opt = Some(initial_value);
         while let Some(remaining_value) = remaining_value_opt.take() {
             let remaining_indices = next_id.addressable_len();
@@ -126,7 +129,8 @@ where
             };
             let value_node = Node {
                 id: current_id,
-                origin: nodes.last().map(|n| n.last_id()),
+                left_origin: nodes.last().map(|n| n.last_id()),
+                right_origin: Some(next_id.clone()),
                 operation: Operation::Insert {
                     value: current_value,
                 },
@@ -137,7 +141,8 @@ where
         let end_id = next_id;
         let end_node = Node {
             id: end_id,
-            origin: nodes.last().map(|n| n.last_id()),
+            left_origin: nodes.last().map(|n| n.last_id()),
+            right_origin: None,
             operation: Operation::End,
         };
         nodes.push(end_node);
@@ -532,7 +537,8 @@ where
         // Construct a placeholder we can swap into place while we are splitting.
         let mut tmp_node = Node {
             id: target_node.id.clone(),
-            origin: None,
+            left_origin: None,
+            right_origin: None,
             operation: Operation::Invalid,
         };
         std::mem::swap(&mut tmp_node, target_node);
@@ -548,7 +554,9 @@ where
                 second_node_id.index = split_index;
                 let second_node = Node {
                     id: second_node_id,
-                    origin: Some(first_node.id.clone()),
+                    // Keep origins in tact during splitting, so all split nodes are recognised as conflicting.
+                    left_origin: first_node.left_origin.clone(), //Some(first_node.last_id()),
+                    right_origin: first_node.right_origin.clone(),
                     operation: second_node_op,
                 };
                 (first_node, second_node, None)
@@ -563,7 +571,9 @@ where
                 second_node_id.index = split_index + 1;
                 let second_node = Node {
                     id: second_node_id,
-                    origin: Some(first_node.id.clone()),
+                    // Keep origins in tact during splitting, so all split nodes are recognised as conflicting.
+                    left_origin: first_node.left_origin.clone(), //Some(first_node.last_id()),
+                    right_origin: first_node.right_origin.clone(),
                     operation: second_node_op,
                 };
                 (first_node, second_node, None)
@@ -579,13 +589,17 @@ where
                 second_node_id.index = split_index;
                 let second_node = Node {
                     id: second_node_id,
-                    origin: Some(first_node.id.clone()),
+                    // Keep origins in tact during splitting, so all split nodes are recognised as conflicting.
+                    left_origin: first_node.left_origin.clone(), //Some(first_node.last_id()),
+                    right_origin: first_node.right_origin.clone(),
                     operation: second_node_op,
                 };
                 let third_node_id = second_node.id.increment();
                 let third_node = Node {
                     id: third_node_id,
-                    origin: Some(second_node.id.clone()),
+                    // Keep origins in tact during splitting, so all split nodes are recognised as conflicting.
+                    left_origin: first_node.left_origin.clone(), //Some(second_node.last_id()),
+                    right_origin: first_node.right_origin.clone(),
                     operation: third_node_op,
                 };
 
@@ -596,9 +610,27 @@ where
         *target_node = first_node;
         // Insert second (and optionally third) node after.
         self.base.nodes.insert(node_index + 1, second_node);
+
+        // debug_assert_eq!(
+        //     Some(self.base.nodes[node_index].last_id()),
+        //     self.base.nodes[node_index + 1].left_origin,
+        //     "{:?} did not get the correct origin to fit behind {:?}",
+        //     self.base.nodes[node_index + 1],
+        //     self.base.nodes[node_index]
+        // );
+
         if let Some(third_node) = third_node_opt {
             self.base.nodes.insert(node_index + 2, third_node);
+
+            // debug_assert_eq!(
+            //     Some(self.base.nodes[node_index + 1].last_id()),
+            //     self.base.nodes[node_index + 2].left_origin,
+            //     "{:?} did not get the correct origin to fit behind {:?}",
+            //     self.base.nodes[node_index + 2],
+            //     self.base.nodes[node_index + 1]
+            // );
         }
+
         match mode {
             SplitMode::Before => {
                 self.base.len += 1;
@@ -655,8 +687,9 @@ where
 }
 impl<BaseId, Value> LinearData<Value, Value::Element> for VecCoalescedLinearData<BaseId, Value>
 where
-    BaseId: Clone + fmt::Debug + PartialEq + 'static,
-    Value: Composite + fmt::Debug + 'static,
+    // TODO: Remove the Display bounds again.
+    BaseId: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + PartialOrd + Ord + Hash + 'static,
+    Value: Composite + fmt::Debug + fmt::Display + 'static,
 {
     type Id = IdWithIndex<BaseId>;
 
@@ -776,8 +809,12 @@ where
     ) -> Result<(), DataOperation<Self::Id, Value>> {
         match operation {
             DataOperation::Insert {
-                ref pred, ref succ, ..
+                ref id,
+                ref pred,
+                ref succ,
+                ..
             } => {
+                //println!("Inserting {:?}", operation);
                 let pred_opt = self
                     .base
                     .nodes
@@ -798,12 +835,19 @@ where
                     if let Some((succ_index, succ_node)) = succ_opt {
                         if pred_index == succ_index {
                             if pred.is_followed_by(succ) {
+                                // println!(
+                                //     "Succ and pred are the same node {pred_index} and we need to split at {}",
+                                //     succ.index
+                                // );
                                 // We need to split and then we can insert where we split.
                                 let new_succ_index =
                                     self.split_node(pred_index, succ.index, SplitMode::Before);
                                 // Now we don't need the original operation anymore, so we can properly deconstruct it.
                                 if let DataOperation::Insert {
-                                    id, pred, value, ..
+                                    id,
+                                    pred,
+                                    succ,
+                                    value,
                                 } = operation
                                 {
                                     self.len += value.len();
@@ -812,7 +856,8 @@ where
                                         new_succ_index,
                                         Node {
                                             id,
-                                            origin: Some(pred),
+                                            left_origin: Some(pred),
+                                            right_origin: Some(succ),
                                             operation: Operation::Insert { value },
                                         },
                                     );
@@ -821,15 +866,28 @@ where
                                     unreachable!("We *know* it's an Insert.");
                                 }
                             } else {
-                                todo!("The nodes are apart and we need to resolve a position.");
+                                // I don't think this should happen until we try to merge nodes.
+                                // Any insert will pick 2 consecutive nodes, and if they aren't
+                                // split, there can't have been a concurrent insert in between them,
+                                // so they must be adjacent.
+                                unreachable!(
+                                    "The nodes are apart and we would need to resolve a position, but they aren't split so there cannot have been a concurrent insertion."
+                                );
                             }
                         } else if pred_index + 1 == succ_index {
                             if pred_node.last_id() == *pred && succ_node.id == *succ {
+                                // println!(
+                                //     "Succ is the immediate successor of pred, and we just insert at the boundary."
+                                // );
                                 // We can just insert directly at the existing boundary.
 
                                 // Now we don't need the original operation anymore, so we can properly deconstruct it.
                                 if let DataOperation::Insert {
-                                    id, pred, value, ..
+                                    id,
+                                    pred,
+                                    succ,
+                                    value,
+                                    ..
                                 } = operation
                                 {
                                     self.len += value.len();
@@ -838,7 +896,8 @@ where
                                         succ_index,
                                         Node {
                                             id,
-                                            origin: Some(pred),
+                                            left_origin: Some(pred),
+                                            right_origin: Some(succ),
                                             operation: Operation::Insert { value },
                                         },
                                     );
@@ -847,10 +906,135 @@ where
                                     unreachable!("We *know* it's an Insert.");
                                 }
                             } else {
-                                todo!("The nodes are apart and we need to resolve a position.");
+                                // I don't think this can happen either, for the same reason as
+                                // above.
+                                // Either some concurrent insert picked the same position,
+                                // and then there should be a split at that exact position already
+                                // (and we are in the branch below),
+                                // or there hasn't been a concurrent insert and then we should be
+                                // in the is-followed-by case above.
+                                unreachable!(
+                                    "The nodes are apart and we would need to resolve a position, but our predecessor and successor ids aren't aligned with the boundaries of that split."
+                                );
                             }
                         } else {
-                            todo!("The nodes are apart and we need to resolve a position.");
+                            // println!(
+                            //     "There is a gap between between pred={pred_index} and succ={succ_index} and we need to find where to insert among:\n {}",
+                            //     DebugSlice(&self.base.nodes[pred_index..=succ_index]).debug_fmt()
+                            // );
+                            // Must find a position between pred_index and succ_index.
+                            // Sub-splits should not be necessary, since the position cannot be
+                            // within another concurrently inserted node.
+                            // (Concurrent conflict are resolved comparing the Id without the index
+                            // and within a node only the index ever changes.)
+
+                            // We are trying to find the left-most (lowest index) position where
+                            // everything before us has an origin to the right of us
+                            // or has the same origin but a lower Id.
+
+                            // let node_has_origin_id =
+                            //     |node: &Node<Self::Id, Value>, origin_id: &Self::Id| -> bool {
+                            //         node.contains(origin_id)
+                            //     };
+
+                            let left_right_range = (pred_index + 1)..succ_index;
+                            let mut conflicting_nodes: Vec<(&BaseId, usize)> =
+                                Vec::with_capacity(left_right_range.len());
+                            // The right subtree is all the nodes that have succ as their successor,
+                            // and all node that can reach those nodes by following right_origin.
+                            let mut right_subtree_start_index_opt = None;
+                            for node_index in left_right_range {
+                                let node = &self.base.nodes[node_index];
+                                if node.left_origin.as_ref() == Some(pred)
+                                    && node.right_origin.as_ref() == Some(succ)
+                                {
+                                    conflicting_nodes.push((&node.id.id, node_index));
+                                }
+                                // TODO: Memoize!
+                                // Don't overwrite this with a later node.
+                                if right_subtree_start_index_opt.is_none()
+                                    && self.base.ends_in_right_tree(node, succ)
+                                {
+                                    right_subtree_start_index_opt = Some(node_index);
+                                }
+                            }
+                            //println!("Right subtree starts at {right_subtree_start_index_opt:?}");
+                            let right_subtree_start_index =
+                                right_subtree_start_index_opt.unwrap_or(succ_index);
+
+                            let position = if conflicting_nodes.is_empty() {
+                                // println!(
+                                //     "The conflict range is empty, no other node has left={pred:?}, right={succ:?}"
+                                // );
+                                right_subtree_start_index
+                            } else {
+                                // Double check `conflicting_nodes` is already ordered correctly.
+                                debug_assert!(
+                                    conflicting_nodes.is_sorted_by_key(|(one, _)| one),
+                                    "Conflict range should have been sorted by id already, but was: {conflicting_nodes:?}"
+                                );
+                                match conflicting_nodes
+                                    .binary_search_by(|&(probe, _)| probe.cmp(&id.id))
+                                {
+                                    Ok(_found_index) => {
+                                        // let (conflicting_id, conflicting_pos) =
+                                        //     conflicting_nodes[found_index];
+                                        // eprintln!(
+                                        //     "There is an existing node with the same base id={:?}. Nodes with the same base id should not conflict! Full id to be inserted = {:?}. Conflicting node: {:?}",
+                                        //     conflicting_id, id, &self.base.nodes[conflicting_pos]
+                                        // );
+                                        return Err(operation);
+                                    }
+                                    Err(insert_index) => {
+                                        // Still need to translate this into an index on base.nodes instead onf conflicting_nodes.
+                                        if insert_index == 0 {
+                                            // If we are supposed to insert before the first conflicting node,
+                                            // we must actually insert before *any* node in the range,
+                                            // because they might all have anchored off that first conflicting node.
+                                            pred_index + 1
+                                        } else if insert_index < conflicting_nodes.len() {
+                                            conflicting_nodes[insert_index].1
+                                        } else {
+                                            // It has to be right of all the conflicting nodes.
+                                            // Insert just before succ.
+                                            succ_index
+                                        }
+                                        // TODO: It might be all or some of these also need to take
+                                        //       local subtrees into account.
+                                        //       Don't have a repro for that, yet, though.
+                                    }
+                                }
+                            };
+
+                            // println!(
+                            //     "Determined to insert at {position}, i.e. before {:?}",
+                            //     &self.base.nodes[position]
+                            // );
+
+                            // Now we don't need the original operation anymore, so we can properly deconstruct it.
+                            if let DataOperation::Insert {
+                                id,
+                                pred,
+                                succ,
+                                value,
+                                ..
+                            } = operation
+                            {
+                                self.len += value.len();
+                                self.base.len += 1;
+                                self.base.nodes.insert(
+                                    position,
+                                    Node {
+                                        id,
+                                        left_origin: Some(pred),
+                                        right_origin: Some(succ),
+                                        operation: Operation::Insert { value },
+                                    },
+                                );
+                                Ok(())
+                            } else {
+                                unreachable!("We *know* it's an Insert.");
+                            }
                         }
                     } else {
                         // println!("Successor {succ:?} does not exist.");
@@ -885,8 +1069,25 @@ where
     Value: Composite + fmt::Display + 'static,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        DebugSlice(&self.base.nodes[..]).fmt(f)?;
+        write!(
+            f,
+            "[{} live values, {} live nodes]",
+            self.len, self.base.len
+        )
+    }
+}
+
+/// Just a newtype to wrap the slice for debug printing.
+struct DebugSlice<'a, BaseId, Value>(&'a [Node<IdWithIndex<BaseId>, Value>]);
+impl<'a, BaseId, Value> DebugFormatting for DebugSlice<'a, BaseId, Value>
+where
+    BaseId: fmt::Display + 'static,
+    Value: Composite + fmt::Display + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "{{ ")?;
-        for node in self.base.nodes.iter() {
+        for (index, node) in self.0.iter().enumerate() {
             let content = match node.operation {
                 Operation::Insert { ref value } => format!("'{}'", value),
                 Operation::Delete { ref value } => format!("[^'{}']", value),
@@ -894,21 +1095,25 @@ where
                 Operation::End => "X".to_owned(),
                 Operation::Invalid => "?!?".to_owned(),
             };
-            if let Some(ref origin) = node.origin {
-                write!(f, "{}|{} @ {}", origin, node.id, content)?;
-            } else {
-                write!(f, "{} @ {}", node.id, content)?;
+            match (&node.left_origin, &node.right_origin) {
+                (Some(l), Some(r)) => {
+                    write!(f, "<{}|{}|{}> @ {}", l, node.id, r, content)?;
+                }
+                (Some(l), None) => {
+                    write!(f, "<{}|{}|{}>", l, node.id, content)?;
+                }
+                (None, Some(r)) => {
+                    write!(f, "<{}|{}|{}>", content, node.id, r)?;
+                }
+                (None, None) => {
+                    write!(f, "!{} @ {}!", node.id, content)?;
+                }
             }
-            if !matches!(node.operation, Operation::End) {
+            if index + 1 < self.0.len() {
                 write!(f, " -> ")?;
             }
         }
-        write!(f, " }}")?;
-        write!(
-            f,
-            "[{} live values, {} live nodes]",
-            self.len, self.base.len
-        )
+        write!(f, " }}")
     }
 }
 
@@ -1062,7 +1267,7 @@ where
 /// A variant of an operation id that allows multiple ordered operations at the same time,
 /// without having to do explictly different operations for each.
 #[allow(unused)]
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IdWithIndex<Id> {
     pub id: Id,
     pub index: u16, // Probably sufficient for a single operation.
@@ -1254,7 +1459,8 @@ pub struct NodeIdRange<Id> {
 }
 impl<Id> NodeIdRange<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + 'static,
+    // TODO: Remove Display bounds again.
+    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
     ///
@@ -1265,7 +1471,8 @@ where
         data: &mut VecCoalescedLinearData<Id, Value>,
     ) -> Result<(), &'a IdWithIndexRange<Id>>
     where
-        Value: Composite + fmt::Debug + 'static,
+        // TODO: Remove Display bounds again.
+        Value: Composite + fmt::Debug + fmt::Display + 'static,
     {
         for id_range in self.contained.iter() {
             let start = id_range.first();

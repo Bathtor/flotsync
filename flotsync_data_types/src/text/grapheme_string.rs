@@ -1,6 +1,8 @@
+use std::cmp;
+
 use super::*;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GraphemeString {
     len: usize,
     base: String,
@@ -78,5 +80,25 @@ impl fmt::Debug for GraphemeString {
 impl fmt::Display for GraphemeString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.base)
+    }
+}
+impl cmp::Ord for GraphemeString {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        let self_graphemes = self.graphemes();
+        let other_graphemes = other.graphemes();
+        for (self_grapheme, other_grapheme) in self_graphemes.zip(other_graphemes) {
+            match self_grapheme.cmp(other_grapheme) {
+                cmp::Ordering::Less => return cmp::Ordering::Less,
+                cmp::Ordering::Equal => (), // continue
+                cmp::Ordering::Greater => return cmp::Ordering::Greater,
+            }
+        }
+        // Both are the same up to where they have the same length.
+        self.len.cmp(&other.len)
+    }
+}
+impl cmp::PartialOrd for GraphemeString {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }

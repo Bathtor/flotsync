@@ -210,10 +210,11 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Node<Id, Value> {
     id: Id,
-    origin: Option<Id>,
+    left_origin: Option<Id>,
+    right_origin: Option<Id>,
     operation: Operation<Value>,
 }
 impl<Id, Value> Node<Id, Value> {
@@ -291,7 +292,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum Operation<Value> {
     Insert {
         value: Value,
