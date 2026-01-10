@@ -258,6 +258,8 @@ pub(crate) mod tests {
     }
 
     mod linear_string {
+        use flotsync_utils::testing::BOOLEAN_DOMAIN;
+
         use super::*;
 
         #[test]
@@ -552,6 +554,73 @@ pub(crate) mod tests {
                 assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
                 empty_checks(&l);
             });
+        }
+
+        #[test]
+        fn illegal_deletes() {
+            let mut id_generator = TestIdGenerator::new();
+
+            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            linear.check_integrity();
+            assert_eq!(linear.to_string(), TEST_VALUES.join(""));
+
+            let next_id = id_generator.next().unwrap();
+            let next_next_id = id_generator.next().unwrap();
+
+            // All wrong.
+            {
+                let missing_ids = NodeIdRangeString(NodeIdRange {
+                    predecessor: IdWithIndex::zero(next_id),
+                    contained: vec![IdWithIndexRange::with_end(
+                        IdWithIndex::zero(next_id).increment(),
+                        5,
+                    )],
+                    successor: IdWithIndex::zero(next_next_id),
+                });
+                let res = missing_ids.delete(&mut linear);
+                assert!(res.is_err());
+            }
+
+            let real_ids = linear.ids_in_range(3..9).unwrap();
+
+            // Missing boundaries.
+            for wrong_predecessor in BOOLEAN_DOMAIN {
+                for wrong_successor in BOOLEAN_DOMAIN {
+                    let missing_ids = NodeIdRangeString(NodeIdRange {
+                        predecessor: if wrong_predecessor {
+                            IdWithIndex::zero(next_id)
+                        } else {
+                            real_ids.0.predecessor.clone()
+                        },
+                        contained: real_ids.0.contained.clone(),
+                        successor: if wrong_successor {
+                            IdWithIndex::zero(next_next_id)
+                        } else {
+                            real_ids.0.successor.clone()
+                        },
+                    });
+                    let res = missing_ids.delete(&mut linear);
+                    assert!(
+                        res.is_ok(),
+                        "Delete doesn't use boundaries, so this should succeeded despite: wrong_predecessor={wrong_predecessor}, wrong_successor={wrong_successor}"
+                    );
+                }
+            }
+            // Mixed content.
+            {
+                let mut contained = real_ids.0.contained.clone();
+                contained.push(IdWithIndexRange::with_end(
+                    IdWithIndex::zero(next_id).increment(),
+                    5,
+                ));
+                let missing_ids = NodeIdRangeString(NodeIdRange {
+                    predecessor: real_ids.0.predecessor.clone(),
+                    contained,
+                    successor: real_ids.0.successor.clone(),
+                });
+                let res = missing_ids.delete(&mut linear);
+                assert!(res.is_err());
+            }
         }
     }
 

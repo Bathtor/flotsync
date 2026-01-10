@@ -67,6 +67,8 @@ where
                 };
                 return ApplicationFailedSnafu { remaining_diff }.fail();
             }
+            // #[cfg(test)]
+            // target.check_integrity();
         }
 
         Ok(())
@@ -304,7 +306,7 @@ mod tests {
         linear_string::tests::TestIdGenerator,
         text_diff::tests::{SMALL_CHANGE_TEST_GROUPS, TEXT_A, TEXT_B},
     };
-    use flotsync_utils::debugging::DebugFormatting;
+    use flotsync_utils::{debugging::DebugFormatting, option_when, svec16, testing::SVec16};
     use itertools::Itertools;
 
     #[test]
@@ -645,5 +647,196 @@ mod tests {
             l1.debug_fmt(),
             l2.debug_fmt()
         );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct WriterSync {
+        writer: usize,
+        sync_from: SVec16<usize>,
+    }
+
+    struct SyncScenario {
+        sync_points: SVec16<(usize, WriterSync)>,
+    }
+    impl SyncScenario {
+        pub fn actions_at(&self, index: usize) -> SVec16<WriterSync> {
+            self.sync_points
+                .iter()
+                .filter_map(|(i, a)| option_when!(i == index, a))
+                .collect()
+        }
+    }
+
+    // Micro-manage formatting here a bit to keep the scenarios tighter.
+    #[rustfmt::skip]
+    static SYNC_SCENARIOS: [SyncScenario; 4] = {
+        // Make the entries a bit shorter.
+        type Sync = WriterSync;
+        [SyncScenario {
+            sync_points: svec16![
+                (3, Sync { writer: 0, sync_from: svec16![1] }),
+                (5, Sync { writer: 0, sync_from: svec16![2] }),
+            ],
+        },
+        // Trickier scenarios.
+        SyncScenario {
+            sync_points: svec16![
+                (3, Sync { writer: 0, sync_from: svec16![1] }),
+                (5, Sync { writer: 2, sync_from: svec16![1] }),
+                (8, Sync { writer: 1, sync_from: svec16![0, 2]}),
+            ],
+        },
+        SyncScenario {
+            sync_points: svec16![
+                (3, Sync { writer: 1, sync_from: svec16![0, 2] }),
+                (5, Sync { writer: 2, sync_from: svec16![0, 1] }),
+                (8, Sync { writer: 0, sync_from: svec16![1, 2]}),
+            ],
+        },
+        SyncScenario {
+            sync_points: svec16![
+                (4, Sync { writer: 1, sync_from: svec16![0, 2] }),
+                (5, Sync { writer: 2, sync_from: svec16![0, 1] }),
+                (6, Sync { writer: 0, sync_from: svec16![1, 2]}),
+            ],
+        }]
+    };
+
+    #[test]
+    fn test_multi_step_convergence_with_sync() {
+        // Treat the groups with 3 entries each as 3 indepdent writers.
+        // Have each of them make changes to its own string, recording the diffs in order.
+        // At predefined sync points, apply the diffs, then continue building new diffs from there.
+        // In the end (final sync), all writers must have converged to the same result.
+        let mut id_generator = TestIdGenerator::new();
+        // Begin and end nodes need to have the same ids, of course.
+        let shared_base = LinearString::new(&mut id_generator);
+        struct Writer {
+            id: usize,
+            linear: LinearString<u32>,
+            ops: Vec<LinearStringDiff<u32>>,
+            next_sync_for: [usize; 3],
+        }
+        let mut writers: [Writer; 3] = std::array::from_fn(|id| Writer {
+            id,
+            linear: shared_base.clone(),
+            ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
+            next_sync_for: [0; 3],
+        });
+
+        fn apply_diffs(
+            diffs: &[LinearStringDiff<u32>],
+            linear: &mut LinearString<u32>,
+        ) -> Result<(), ()> {
+            for op in diffs.iter() {
+                // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
+                op.clone().apply_to(linear).map_err(|_| ())?;
+                linear.check_integrity();
+                // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
+            }
+            Ok(())
+        }
+
+        'scenario_loop: for scenario in SYNC_SCENARIOS.iter() {
+            //println!("##########\n### Scenario #{scenario_index} ###\n#########");
+            for (group_index, group) in SMALL_CHANGE_TEST_GROUPS.iter().enumerate() {
+                //println!("### Starting write #{group_index} ###");
+                let actions = scenario.actions_at(group_index);
+                for writer_index in 0..writers.len() {
+                    //println!("#### Handling writer #{writer_index}");
+                    if let Some(sync) = actions.iter().find(|s| s.writer == writer_index) {
+                        for other_writer_index in sync.sync_from.iter() {
+                            assert_ne!(writer_index, other_writer_index);
+                            let next_sync_index =
+                                writers[writer_index].next_sync_for[other_writer_index];
+
+                            // println!(
+                            //     "Syncing state from writer #{other_writer_index} starting at {next_sync_index}"
+                            // );
+                            let [writer, other_writer] = &mut writers
+                                .get_disjoint_mut([writer_index, other_writer_index])
+                                .unwrap();
+                            let res = apply_diffs(
+                                &other_writer.ops[next_sync_index..],
+                                &mut writer.linear,
+                            );
+                            if res.is_err() {
+                                // This can happen due to missing dependencies.
+                                // println!(
+                                //     "###\n### Skipping the rest of the scenario, because some operation was not possible.###\n###"
+                                // );
+                                continue 'scenario_loop;
+                            }
+                            writers[writer_index].next_sync_for[other_writer_index] =
+                                other_writer.ops.len();
+                        }
+                    }
+                    let writer = &mut writers[writer_index];
+                    let op = linear_diff(&writer.linear, group[writer_index], &mut id_generator)
+                        .unwrap();
+                    // println!("Created diff:\n{op}");
+                    writer.ops.push(op.clone());
+                    op.apply_to(&mut writer.linear).unwrap();
+                    writer.linear.check_integrity();
+                    assert_eq!(writer.linear.to_string(), group[writer_index]);
+                }
+                // println!("### Finished write #{group_index} ###");
+            }
+            // println!("###\n### Beginning permutation replay ###\n###");
+            // for (writer_index, writer) in writers.iter().enumerate() {
+            //     println!(
+            //         "Writer {} has synced {:?} with state: {}",
+            //         writer_index, writer.next_sync_for, writer.linear
+            //     );
+            // }
+            let mut previous_result: Option<LinearString<u32>> = None;
+            'permutation_loop: for perm in writers.iter().enumerate().permutations(3) {
+                let permutation_str = perm.iter().map(|(_, w)| w.id).join(", ");
+                //println!("###\n### Checking writer order: {}\n###", permutation_str);
+                let (_, base_writer) = perm[0];
+                let mut linear = base_writer.linear.clone();
+                // println!(
+                //     "### Base is '{}':\n {}\nSync: {:?}",
+                //     linear,
+                //     linear.debug_fmt(),
+                //     base_writer.next_sync_for
+                // );
+                for (writer_index, writer) in &perm[1..] {
+                    let next_sync_for_writer = base_writer.next_sync_for[*writer_index];
+
+                    // println!(
+                    //     "#### Applying diffs for writer {writer_index} starting at {next_sync_for_writer}"
+                    // );
+                    let res = apply_diffs(&writer.ops[next_sync_for_writer..], &mut linear);
+                    if res.is_err() {
+                        // This can happen due to missing dependencies.
+                        // println!(
+                        //     "###\n### Skipping the rest of the permutation, because some operation was not possible.\n###"
+                        // );
+                        continue 'permutation_loop;
+                    }
+                }
+                if let Some(ref last_result) = previous_result {
+                    assert_eq!(
+                        last_result.to_string(),
+                        linear.to_string(),
+                        "Result strings did not match for permutation: {}",
+                        permutation_str
+                    );
+                    // They might structurally differ in delete splits.
+                    // assert_eq!(
+                    //     last_result,
+                    //     &linear,
+                    //     "Results did not match for permutation: {}\n  {}\n  {}",
+                    //     permutation_str,
+                    //     last_result.debug_fmt(),
+                    //     linear.debug_fmt()
+                    // );
+                }
+                // permutation_results.push(linear);
+                previous_result = Some(linear);
+            }
+            // println!("##########\n### Completed Scenario #{scenario_index} ###\n#########");
+        }
     }
 }

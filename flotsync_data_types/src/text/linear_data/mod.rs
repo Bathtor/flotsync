@@ -290,6 +290,10 @@ where
             index,
         })
     }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.operation, Operation::Delete { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -533,6 +533,7 @@ where
                 }
             }
         }
+        let node_is_deleted = target_node.is_deleted();
 
         // Construct a placeholder we can swap into place while we are splitting.
         let mut tmp_node = Node {
@@ -633,15 +634,21 @@ where
 
         match mode {
             SplitMode::Before => {
-                self.base.len += 1;
+                if !node_is_deleted {
+                    self.base.len += 1;
+                }
                 node_index + 1
             }
             SplitMode::After => {
-                self.base.len += 1;
+                if !node_is_deleted {
+                    self.base.len += 1;
+                }
                 node_index
             }
             SplitMode::BeforeAndAfter => {
-                self.base.len += 2;
+                if !node_is_deleted {
+                    self.base.len += 2;
+                }
                 node_index + 1
             }
         }
