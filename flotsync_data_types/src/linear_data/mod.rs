@@ -371,3 +371,39 @@ where
         Some(new_operation)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use crate::linear_data::IdWithIndex;
+
+    pub(crate) struct TestIdGenerator {
+        current: Option<u32>,
+    }
+    impl TestIdGenerator {
+        pub fn new() -> Self {
+            Self { current: Some(0) }
+        }
+
+        pub fn without_ids(existing_ids: impl Iterator<Item = u32>) -> Self {
+            let max_id = existing_ids.max().unwrap_or(0);
+            Self {
+                current: Some(max_id + 1),
+            }
+        }
+
+        pub fn next_with_zero_index(&mut self) -> Option<IdWithIndex<u32>> {
+            self.next().map(IdWithIndex::zero)
+        }
+    }
+    impl Iterator for TestIdGenerator {
+        type Item = u32;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let current = self.current.take();
+            if let Some(current) = current {
+                self.current = current.checked_add(1);
+            }
+            current
+        }
+    }
+}

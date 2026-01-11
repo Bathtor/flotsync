@@ -62,9 +62,8 @@ pub struct VecCoalescedLinearData<Id, Value> {
 }
 impl<BaseId, Value> VecCoalescedLinearData<BaseId, Value>
 where
-    // TODO: Remove Display bounds again.
-    BaseId: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
-    Value: Composite + fmt::Debug + fmt::Display + 'static,
+    BaseId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Value: Composite + fmt::Debug + 'static,
 {
     pub fn new<I>(id_generator: &mut I) -> Self
     where
@@ -694,9 +693,8 @@ where
 }
 impl<BaseId, Value> LinearData<Value, Value::Element> for VecCoalescedLinearData<BaseId, Value>
 where
-    // TODO: Remove the Display bounds again.
-    BaseId: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + PartialOrd + Ord + Hash + 'static,
-    Value: Composite + fmt::Debug + fmt::Display + 'static,
+    BaseId: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord + Hash + 'static,
+    Value: Composite + fmt::Debug + 'static,
 {
     type Id = IdWithIndex<BaseId>;
 
@@ -1466,8 +1464,7 @@ pub struct NodeIdRange<Id> {
 }
 impl<Id> NodeIdRange<Id>
 where
-    // TODO: Remove Display bounds again.
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
     ///
@@ -1478,8 +1475,7 @@ where
         data: &mut VecCoalescedLinearData<Id, Value>,
     ) -> Result<(), &'a IdWithIndexRange<Id>>
     where
-        // TODO: Remove Display bounds again.
-        Value: Composite + fmt::Debug + fmt::Display + 'static,
+        Value: Composite + fmt::Debug + 'static,
     {
         for id_range in self.contained.iter() {
             let start = id_range.first();

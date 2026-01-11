@@ -14,14 +14,56 @@ where
     }
 }
 
+/// A linear string CRDT with Yjs-style convergence.
+///
+/// `LinearString` stores text as a sequence of *items* identified by `Id`.
+/// The minimum item unit is a UTF-8 grapheme string.
+/// Concurrent inserts at the same position are deterministically ordered so that all replicas
+/// converge to the same linear text, independent of message arrival order,
+/// as long as direct dependencies are fulfilled.
+///
+/// ## Convergence model (Yjs-style)
+///
+/// Each inserted run of text is represented as an item with:
+///
+/// - a unique identifier `Id` (typically a Lamport-style `(client, clock)`),
+/// - a *left anchor* (the item that this one is inserted after),
+/// - optionally a *right anchor* (the next item that it is inserted before),
+/// - a payload `GraphemeString`, i.e. a sequence of UTF-8 graphemes represented as `String`.
+///
+/// When integrating a new item, `LinearString` finds the insertion gap described by
+/// its anchors and then places the item according to Yjs’ deterministic tie-breaking:
+/// concurrent items that target the same gap are ordered by their identifiers (and/or
+/// the same “conflicting subtree” rule), ensuring every replica computes the same final
+/// order.
+///
+/// In practice this means:
+///
+/// - Inserts commute under concurrency.
+/// - Integrating operations in different orders yields the same final visible string.
+/// - Deletes (tombstones) commute with inserts and other deletes (when applied to the
+///   same identifiers).
+/// - Insertion order must satisfy causality. That is, if a client A has seen update 5 from client,
+///   B before producing its own update 6, then A:5 must be applied before applying the diff for B:6
+///   at any other node.
+///
+/// ## Identifier requirements
+///
+/// `Id` must be globally unique per inserted item and must provide a deterministic total
+/// order used for conflict resolution. In most systems this is achieved by embedding a
+/// replica/client identifier plus a monotonically increasing counter.
+///
+/// ## Notes
+///
+/// `LinearString` is a *replicated data type*: it is intended to be updated by integrating
+/// operations produced locally and received from other replicas.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearString<Id> {
     data: VecCoalescedLinearData<Id, GraphemeString>,
 }
 impl<Id> LinearString<Id>
 where
-    // TODO: Remove Display bounds again.
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     pub fn new<I>(id_generator: &mut I) -> Self
     where
@@ -93,8 +135,7 @@ where
 }
 impl<Id> LinearData<String, str> for LinearString<Id>
 where
-    // TODO: Remove the Display bounds again.
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     type Id = IdWithIndex<Id>;
 
@@ -166,8 +207,7 @@ where
 pub struct NodeIdRangeString<Id>(NodeIdRange<Id>);
 impl<Id> NodeIdRangeString<Id>
 where
-    // TODO: Remove Display bounds again.
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
     ///
@@ -208,6 +248,7 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::linear_data::tests::TestIdGenerator;
     use flotsync_utils::testing::CloneExt;
 
     const TEST_VALUES: [&str; 8] = ["A", " ", "simple", " ", "test", " ", "string", "."];
@@ -226,41 +267,9 @@ pub(crate) mod tests {
         "𝟘𝟙𝟚",     // Mathematical bold digits (4-byte UTF-8)
     ];
 
-    pub(crate) struct TestIdGenerator {
-        current: Option<u32>,
-    }
-    impl TestIdGenerator {
-        pub fn new() -> Self {
-            Self { current: Some(0) }
-        }
-
-        pub fn without_ids(existing_ids: impl Iterator<Item = u32>) -> Self {
-            let max_id = existing_ids.max().unwrap_or(0);
-            Self {
-                current: Some(max_id + 1),
-            }
-        }
-
-        pub fn next_with_zero_index(&mut self) -> Option<IdWithIndex<u32>> {
-            self.next().map(IdWithIndex::zero)
-        }
-    }
-    impl Iterator for TestIdGenerator {
-        type Item = u32;
-
-        fn next(&mut self) -> Option<Self::Item> {
-            let current = self.current.take();
-            if let Some(current) = current {
-                self.current = current.checked_add(1);
-            }
-            current
-        }
-    }
-
     mod linear_string {
-        use flotsync_utils::testing::BOOLEAN_DOMAIN;
-
         use super::*;
+        use flotsync_utils::testing::BOOLEAN_DOMAIN;
 
         #[test]
         fn single_value_roundtrip() {

@@ -286,12 +286,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::text::{
-        LinearString,
-        LinearStringDiff,
-        linear_diff,
-        linear_string::tests::TestIdGenerator,
-        text_diff::tests::{SMALL_CHANGE_TEST_GROUPS, TEXT_A, TEXT_B},
+    use crate::{
+        linear_data::tests::TestIdGenerator,
+        text::{
+            LinearString,
+            LinearStringDiff,
+            linear_diff,
+            text_diff::tests::{SMALL_CHANGE_TEST_GROUPS, TEXT_A, TEXT_B},
+        },
     };
     use flotsync_utils::{debugging::DebugFormatting, option_when, svec16, testing::SVec16};
     use itertools::Itertools;
