@@ -1,44 +1,76 @@
 # FlotSync
 
-**FlotSync** is a peer-to-peer group synchronization library written in Rust. It provides a decentralized protocol for synchronizing state between multiple nodes in a group, without relying on a central authority.
+FlotSync is a Rust workspace for decentralized peer-to-peer group synchronization.
+It currently contains reusable crates for version tracking, discovery, wire messages, and replicated data types.
 
-## Getting Started
+## Current Status (as of 2026-02-14)
 
-### Requirements
+| Area | Status | Notes |
+| --- | --- | --- |
+| Core versioning and identifiers | Done | `flotsync_core` is implemented and tests pass. |
+| Message schemas and codegen | Done | `messages/proto` + `flotsync_messages` are in use and tested. |
+| Discovery service builds | Done | `flotsync_discovery/test_features.sh` passes all listed feature combinations. |
+| Text CRDT data type | Mostly done | Text diff/apply and convergence tests are present and largely passing. |
+| Latest-value-wins register (`any_data`) | In progress | Two tests currently fail in `flotsync_data_types`. |
+| Discovery CLI and browser surface | TODO | Non-mDNS path and browser pieces are not implemented yet. |
 
-- [Rust](https://www.rust-lang.org/tools/install) (latest stable version recommended)
+The detailed, line-referenced task list is tracked in [`docs/TODO_TRACKER.md`](docs/TODO_TRACKER.md).
 
-### Installation
+## Workspace Layout
 
-Add flotsync to your `Cargo.toml`:
+- `flotsync_core/`: Version vectors, group membership identifiers, and happened-before logic.
+- `flotsync_messages/`: Generated protobuf message bindings.
+- `messages/proto/`: Source `.proto` definitions for discovery and versions.
+- `flotsync_discovery/`: Discovery services (mDNS and custom UDP announcement building blocks).
+- `flotsync_discovery_cli/`: CLI entrypoint for discovery components.
+- `flotsync_data_types/`: Replicated data structures (text and latest-value-wins register).
+- `flotsync_utils/`: Shared utility helpers/macros used by other crates.
 
-```toml
-[dependencies]
-flotsync = { git = "https://github.com/Bathtor/flotsync.git" }
-```
+## Build and Test
 
-### Running Tests
+### Toolchain
 
-To run all tests:
+This workspace currently uses nightly-only features in source code (for example `#![feature(...)]` in
+`flotsync_core/src/lib.rs` and `flotsync_data_types/src/lib.rs`), so a nightly Rust toolchain is currently expected.
+
+### Commands
+
+Run the full workspace tests:
 
 ```bash
-cargo test
+cargo test --workspace
 ```
 
-## Project Structure
+Current known result: the workspace compiles, but there are two failing tests in `flotsync_data_types`:
 
--	`flotsync_core/` — Core synchronization logic and types
+- `any_data::tests::concurrent_updates_converge_independent_of_delivery_order`
+- `any_data::tests::applying_same_operation_twice_is_illegal`
 
-## Contributing
+Run discovery feature-matrix checks:
 
-Contributions, issues, and feature requests are welcome!
+```bash
+cd flotsync_discovery
+./test_features.sh
+```
 
-1.	Fork the repo
-2.	Create a feature branch (`git checkout -b my-feature`)
-3.	Commit your changes (`git commit -am 'Add new feature'`)
-4.	Push to the branch (`git push origin my-feature`)
-5.	Create a Pull Request
+## Roadmap
+
+### Near-Term
+
+1. Stabilize `LinearLatestValueWins` semantics and make the failing tests pass.
+2. Finish discovery CLI support for non-mDNS/custom announcement mode.
+3. Implement missing mDNS public/network handling and browser behavior.
+
+### Medium-Term
+
+1. Tighten data type convergence coverage with broader multi-replica scenarios.
+2. Improve discovery integration tests beyond build/clippy checks.
+3. Evaluate whether to keep, complete, or remove the alternate linked-list linear-data backend.
+
+## Repository Workflow
+
+This repository uses Jujutsu (`jj`) for history/workflow.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+This project is licensed under the MIT License. See `LICENSE.txt` for details.
