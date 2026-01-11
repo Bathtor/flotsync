@@ -1,5 +1,5 @@
 use super::*;
-use crate::text::grapheme_string::GraphemeString;
+use crate::{linear_data::*, text::grapheme_string::GraphemeString};
 use std::hash::Hash;
 
 pub type LinearWordString<Id> = VecLinearData<Id, String>;
@@ -144,8 +144,8 @@ where
 
     fn apply_operation(
         &mut self,
-        operation: linear_data::DataOperation<Self::Id, String>,
-    ) -> Result<(), linear_data::DataOperation<Self::Id, String>> {
+        operation: DataOperation<Self::Id, String>,
+    ) -> Result<(), DataOperation<Self::Id, String>> {
         let op = operation.map_value(GraphemeString::new);
         self.data
             .apply_operation(op)

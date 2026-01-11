@@ -655,7 +655,7 @@ where
     }
 
     #[cfg(test)]
-    pub(in crate::text) fn check_integrity(&self) {
+    pub(crate) fn check_integrity(&self) {
         use itertools::Itertools;
 
         self.base.check_integrity();

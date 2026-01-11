@@ -1,24 +1,20 @@
-use crate::InternalSnafu;
+use crate::{
+    InternalSnafu,
+    linear_data::{
+        Composite,
+        DataOperation,
+        IdGeneratorWithZeroIndex,
+        IdWithIndex,
+        LinearData,
+        LinkIds,
+        VecCoalescedLinearDataIter,
+    },
+};
 use flotsync_utils::{debugging::DebugFormatting, require};
 use snafu::prelude::*;
 use std::{collections::BTreeSet, fmt, hash::Hash, ops::RangeBounds};
 use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 
-mod linear_data;
-use linear_data::IdGeneratorWithZeroIndex;
-pub use linear_data::{
-    Composite,
-    DataOperation,
-    IdWithIndex,
-    IdWithIndexRange,
-    LinearData,
-    LinkIds,
-    NodeIdRange,
-    NodeIds,
-    VecCoalescedLinearData,
-    VecCoalescedLinearDataIter,
-    VecLinearData,
-};
 mod linear_string;
 pub use linear_string::{LinearString, LinearStringIter, NodeIdRangeString};
 mod grapheme_string;
@@ -175,15 +171,6 @@ where
     let mut id_with_index_generator = IdGeneratorWithZeroIndex::new(id_generator);
     let current_text = base.to_string();
     let basic_diff = text_diff::diff(&current_text, changed);
-    // TODO: For debugging. Remove later.
-    // println!(
-    //     "Text Diff:\n{}\n{}",
-    //     TextChangePrettyPrint {
-    //         from: &current_text,
-    //         changes: &basic_diff
-    //     },
-    //     basic_diff.iter().map(|diff| diff.to_string()).join("\n")
-    // );
 
     // Convert the TextChange to DataOperations over `base`.
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, String>> =

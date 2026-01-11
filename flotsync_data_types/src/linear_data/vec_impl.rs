@@ -193,7 +193,7 @@ where
     }
 
     #[cfg(test)]
-    pub(in crate::text) fn check_integrity(&self) {
+    pub(crate) fn check_integrity(&self) {
         let mut len = 0usize;
         for index in 0..self.nodes.len() {
             let current = &self.nodes[index];

@@ -6,6 +6,8 @@
 #![deny(clippy::dbg_macro)]
 use snafu::{Location, prelude::*};
 
+#[allow(unused, reason = "Might re-use some already implemented things later.")]
+mod linear_data;
 pub mod text;
 
 #[derive(Debug, Snafu)]
