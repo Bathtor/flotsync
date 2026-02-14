@@ -362,31 +362,6 @@ It seemed as though the ocean itself refused to let go. 🌊⚓🪝
         );
     }
 
-    //     #[test]
-    //     pub fn debug_me_test() {
-    //         let from = r#"
-    // # Harbor Log — Entry Ⅰ
-
-    // The **ancient** harbor lay silent beneath the pale morning light.
-    // Gulls 🕊 circling lazily above crooked masts—occasionally diving toward the dark water.
-    // Fishermen once gathered here at dawn:
-
-    // - Laughing as they prepared their nets 🎣
-    // "#;
-    //         let to = r#"
-    // # Harbour Log — Entry II
-
-    // The **old** harbour stood quiet under the dim morning glow.
-    // Seagulls drifting in slow circles above leaning masts—sometimes swooping toward the black waters.
-    // "#;
-
-    //         check_diff_and_apply(
-    //             from,
-    //             to,
-    //             &format!("Patching with large input:\n\"\n{from}\n\"\n ->\n\"\n{to}\n\""),
-    //         );
-    //     }
-
     fn check_diff_and_apply(from: &str, to: &str, error_context: &str) {
         let result = diff(from, to);
         assert_ne!(

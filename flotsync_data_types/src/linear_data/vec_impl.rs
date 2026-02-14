@@ -408,7 +408,18 @@ where
                                             // Insert before the first conflicting node and its local subtree.
                                             pred_index + 1
                                         } else if insert_index < conflicting_nodes.len() {
-                                            conflicting_nodes[insert_index].1
+                                            let (target_conflict_id, target_conflict_pos) =
+                                                conflicting_nodes[insert_index];
+                                            // Insert before the target conflicting node's local
+                                            // subtree, not just before the node itself.
+                                            // Otherwise the relative order of sibling subtrees can
+                                            // depend on delivery order.
+                                            ((pred_index + 1)..target_conflict_pos)
+                                                .find(|node_index| {
+                                                    let node = &self.nodes[*node_index];
+                                                    self.ends_in_right_tree(node, target_conflict_id)
+                                                })
+                                                .unwrap_or(target_conflict_pos)
                                         } else {
                                             // Insert before succ, to the right of all conflicting nodes.
                                             succ_index
