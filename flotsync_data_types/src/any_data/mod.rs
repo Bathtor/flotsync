@@ -129,10 +129,10 @@ mod tests {
     fn local_update_changes_content_and_tracks_history() {
         let mut reg = new_reg(0);
 
-        reg.update(1, 10);
+        reg.update(3, 10);
         assert_eq!(*reg.content(), 10);
 
-        reg.update(2, 11);
+        reg.update(4, 11);
         assert_eq!(*reg.content(), 11);
 
         // Newest to oldest.
@@ -146,7 +146,7 @@ mod tests {
         let mut a = base.clone();
         let mut b = base;
 
-        let op = a.update_operation(1, 7);
+        let op = a.update_operation(3, 7);
         a.apply_operation(op.clone()).unwrap();
 
         assert_eq!(*a.content(), 7);
@@ -168,8 +168,8 @@ mod tests {
         let b0 = base;
 
         // Two replicas create concurrent updates from the same base state.
-        let op_a = a0.update_operation(1, 10);
-        let op_b = b0.update_operation(2, 20);
+        let op_a = a0.update_operation(3, 10);
+        let op_b = b0.update_operation(4, 20);
 
         // Apply in opposite orders on two replicas.
         let mut r1 = new_reg(0);
@@ -183,18 +183,18 @@ mod tests {
         // Same final visible value and same history ordering.
         assert_eq!(r1, r2);
 
-        // With `u32` ids, the deterministic tie-breaker is `Ord` on the id.
-        // 2 > 1, so 20 must win.
-        assert_eq!(*r1.content(), 20);
+        // With `u32` ids, conflicting inserts are ordered by `Ord` on id.
+        // 3 < 4, so the value at id=3 appears first and wins.
+        assert_eq!(*r1.content(), 10);
 
         let vals: Vec<u64> = r1.all_values().copied().collect();
-        assert_eq!(vals, vec![20, 10, 0]);
+        assert_eq!(vals, vec![10, 20, 0]);
     }
 
     #[test]
     fn applying_same_operation_twice_is_illegal() {
         let base = new_reg(0);
-        let op = base.update_operation(1, 10);
+        let op = base.update_operation(3, 10);
 
         let mut reg = new_reg(0);
         reg.apply_operation(op.clone()).unwrap();

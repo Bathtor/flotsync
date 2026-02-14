@@ -325,7 +325,10 @@ where
     ) -> Result<(), DataOperation<Self::Id, Value>> {
         match operation {
             DataOperation::Insert {
-                ref pred, ref succ, ..
+                ref id,
+                ref pred,
+                ref succ,
+                ..
             } => {
                 let pred_index_opt = self
                     .nodes
@@ -333,10 +336,15 @@ where
                     .enumerate()
                     .find_map(|(index, node)| option_when!(node.id == *pred, index));
                 if let Some(pred_index) = pred_index_opt {
-                    let succ_index = pred_index + 1;
-                    if let Some(succ_node) = self.nodes.get(succ_index) {
-                        if succ_node.id == *succ {
-                            // Now we don't need the original operation anymore, so we can properly deconstruct it.
+                    let succ_index_opt = self
+                        .nodes
+                        .iter()
+                        .enumerate()
+                        .skip(pred_index)
+                        .find_map(|(index, node)| option_when!(node.id == *succ, index));
+                    if let Some(succ_index) = succ_index_opt {
+                        if pred_index + 1 == succ_index {
+                            // We can insert directly at the existing boundary.
                             if let DataOperation::Insert {
                                 id,
                                 pred,
@@ -358,7 +366,80 @@ where
                             } else {
                                 unreachable!("We *know* it's an Insert.");
                             }
+                        } else if pred_index < succ_index {
+                            // There is a gap between pred and succ that may contain concurrent inserts.
+                            let left_right_range = (pred_index + 1)..succ_index;
+                            let mut conflicting_nodes: Vec<(&Id, usize)> =
+                                Vec::with_capacity(left_right_range.len());
+                            // The right subtree is all nodes that have succ as successor,
+                            // and all nodes that can reach those nodes by following right_origin.
+                            let mut right_subtree_start_index_opt = None;
+                            for node_index in left_right_range {
+                                let node = &self.nodes[node_index];
+                                if node.left_origin.as_ref() == Some(pred)
+                                    && node.right_origin.as_ref() == Some(succ)
+                                {
+                                    conflicting_nodes.push((&node.id, node_index));
+                                }
+                                if right_subtree_start_index_opt.is_none()
+                                    && self.ends_in_right_tree(node, succ)
+                                {
+                                    right_subtree_start_index_opt = Some(node_index);
+                                }
+                            }
+                            let right_subtree_start_index =
+                                right_subtree_start_index_opt.unwrap_or(succ_index);
+
+                            let position = if conflicting_nodes.is_empty() {
+                                right_subtree_start_index
+                            } else {
+                                debug_assert!(
+                                    conflicting_nodes.is_sorted_by_key(|(one, _)| one),
+                                    "Conflict range should already be sorted by id, but was: {conflicting_nodes:?}"
+                                );
+                                match conflicting_nodes.binary_search_by(|&(probe, _)| probe.cmp(id))
+                                {
+                                    Ok(_found_index) => {
+                                        // Duplicate insert for the same conflict set.
+                                        return Err(operation);
+                                    }
+                                    Err(insert_index) => {
+                                        if insert_index == 0 {
+                                            // Insert before the first conflicting node and its local subtree.
+                                            pred_index + 1
+                                        } else if insert_index < conflicting_nodes.len() {
+                                            conflicting_nodes[insert_index].1
+                                        } else {
+                                            // Insert before succ, to the right of all conflicting nodes.
+                                            succ_index
+                                        }
+                                    }
+                                }
+                            };
+
+                            if let DataOperation::Insert {
+                                id,
+                                pred,
+                                succ,
+                                value,
+                            } = operation
+                            {
+                                self.nodes.insert(
+                                    position,
+                                    Node {
+                                        id,
+                                        left_origin: Some(pred),
+                                        right_origin: Some(succ),
+                                        operation: Operation::Insert { value },
+                                    },
+                                );
+                                self.len += 1;
+                                Ok(())
+                            } else {
+                                unreachable!("We *know* it's an Insert.");
+                            }
                         } else {
+                            // Successor cannot appear before predecessor in a valid operation.
                             Err(operation)
                         }
                     } else {
