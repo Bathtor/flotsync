@@ -397,7 +397,8 @@ where
                                     conflicting_nodes.is_sorted_by_key(|(one, _)| one),
                                     "Conflict range should already be sorted by id, but was: {conflicting_nodes:?}"
                                 );
-                                match conflicting_nodes.binary_search_by(|&(probe, _)| probe.cmp(id))
+                                match conflicting_nodes
+                                    .binary_search_by(|&(probe, _)| probe.cmp(id))
                                 {
                                     Ok(_found_index) => {
                                         // Duplicate insert for the same conflict set.
@@ -417,7 +418,10 @@ where
                                             ((pred_index + 1)..target_conflict_pos)
                                                 .find(|node_index| {
                                                     let node = &self.nodes[*node_index];
-                                                    self.ends_in_right_tree(node, target_conflict_id)
+                                                    self.ends_in_right_tree(
+                                                        node,
+                                                        target_conflict_id,
+                                                    )
                                                 })
                                                 .unwrap_or(target_conflict_pos)
                                         } else {
