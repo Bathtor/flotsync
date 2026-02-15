@@ -22,6 +22,10 @@ impl GraphemeString {
         self.base
     }
 
+    pub fn as_str(&self) -> &str {
+        self.base.as_str()
+    }
+
     fn graphemes(&self) -> Graphemes<'_> {
         self.base.graphemes(true)
     }

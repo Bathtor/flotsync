@@ -9,3 +9,6 @@ itertools = { workspace = true }
 similar = { version = "2.7", features = ["unicode"] }
 unicode-segmentation = "1"
 snafu = { workspace = true }
+
+[dev-dependencies]
+bytes = "1"

@@ -1,4 +1,7 @@
-use crate::linear_data::{DataOperation, LinearData, VecLinearData};
+use crate::{
+    linear_data::{DataOperation, LinearData, VecLinearData},
+    snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
+};
 use std::{fmt, hash::Hash};
 
 /// A single-slot *latest value wins* register with Yjs `ReplaceManager` semantics.
@@ -98,6 +101,25 @@ where
     /// Conceptually they are returned newest to oldest, accounting for concurrency.
     pub fn all_values(&self) -> impl Iterator<Item = &T> {
         self.data.iter_values()
+    }
+
+    /// Visit a stable, ordered snapshot stream of the current in-memory state.
+    pub fn visit_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
+    where
+        S: SnapshotSink<Id, T>,
+    {
+        self.data.visit_snapshot(sink, |x| x)
+    }
+
+    pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
+    where
+        I: IntoIterator<Item = Result<SnapshotNode<Id, T>, E>>,
+    {
+        let data = VecLinearData::from_snapshot_nodes(nodes)?;
+        if data.is_empty() {
+            return Err(SnapshotReadError::NoVisibleValues);
+        }
+        Ok(Self { data })
     }
 }
 

@@ -843,6 +843,7 @@ dependencies = [
 name = "flotsync_data_types"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "flotsync_utils",
  "itertools 0.14.0",
  "similar",

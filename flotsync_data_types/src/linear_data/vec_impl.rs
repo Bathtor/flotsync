@@ -1,4 +1,11 @@
 use super::*;
+use crate::snapshot::{
+    SnapshotHeader,
+    SnapshotNode,
+    SnapshotNodeRef,
+    SnapshotReadError,
+    SnapshotSink,
+};
 
 /// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
 ///
@@ -11,6 +18,149 @@ pub struct VecLinearData<Id, Value> {
     /// The number of Insert nodes in the linear data.
     pub(super) len: usize,
     pub(super) nodes: Vec<Node<Id, Value>>,
+}
+impl<Id, Value> VecLinearData<Id, Value> {
+    pub(crate) fn visit_snapshot<S, ValueRef: ?Sized, F>(
+        &self,
+        sink: &mut S,
+        mut map_value: F,
+    ) -> Result<(), S::Error>
+    where
+        S: SnapshotSink<Id, ValueRef>,
+        F: FnMut(&Value) -> &ValueRef,
+    {
+        sink.begin(SnapshotHeader {
+            node_count: self.nodes.len(),
+        })?;
+
+        let last_index = self.nodes.len().saturating_sub(1);
+        for (index, node) in self.nodes.iter().enumerate() {
+            let is_boundary = index == 0 || index == last_index;
+            let (deleted, value) = if is_boundary {
+                (false, None)
+            } else {
+                match &node.operation {
+                    Operation::Insert { value } => (false, Some(map_value(value))),
+                    Operation::Delete { value } => (true, Some(map_value(value))),
+                    Operation::Beginning | Operation::End => {
+                        panic!("Non-boundary node cannot be beginning/end.")
+                    }
+                    Operation::Invalid => panic!("Node is invalid."),
+                }
+            };
+
+            let node_ref = SnapshotNodeRef {
+                id: &node.id,
+                left: node.left_origin.as_ref(),
+                right: node.right_origin.as_ref(),
+                deleted,
+                value,
+            };
+            sink.node(index, node_ref)?;
+        }
+
+        sink.end()
+    }
+
+    pub(crate) fn from_snapshot_nodes<E, I>(
+        nodes: I,
+    ) -> Result<Self, SnapshotReadError<E>>
+    where
+        I: IntoIterator<Item = Result<SnapshotNode<Id, Value>, E>>,
+    {
+        let mut iter = nodes.into_iter();
+        let (lower, _) = iter.size_hint();
+
+        let Some(first) = iter.next() else {
+            return Err(SnapshotReadError::MissingBoundaryNodes);
+        };
+        let first = first.map_err(SnapshotReadError::from_source)?;
+        if first.left.is_some() {
+            return Err(SnapshotReadError::BoundaryNodeHasLeft { index: 0 });
+        }
+        if first.value.is_some() {
+            return Err(SnapshotReadError::BoundaryNodeHasValue { index: 0 });
+        }
+        if first.deleted {
+            return Err(SnapshotReadError::BoundaryNodeMarkedDeleted { index: 0 });
+        }
+
+        let Some(second) = iter.next() else {
+            return Err(SnapshotReadError::MissingBoundaryNodes);
+        };
+        let mut pending = second.map_err(SnapshotReadError::from_source)?;
+
+        let mut reconstructed_nodes = Vec::with_capacity(lower.max(2));
+        reconstructed_nodes.push(Node {
+            id: first.id,
+            left_origin: first.left,
+            right_origin: first.right,
+            operation: Operation::Beginning,
+        });
+
+        let mut len = 0usize;
+        let mut pending_index = 1usize;
+        for entry in iter {
+            let next = entry.map_err(SnapshotReadError::from_source)?;
+
+            let SnapshotNode {
+                id,
+                left,
+                right,
+                deleted,
+                value,
+            } = pending;
+
+            let left =
+                left.ok_or(SnapshotReadError::NonBoundaryNodeMissingLeft { index: pending_index })?;
+            let right = right
+                .ok_or(SnapshotReadError::NonBoundaryNodeMissingRight { index: pending_index })?;
+            let value = value
+                .ok_or(SnapshotReadError::NonBoundaryNodeMissingValue { index: pending_index })?;
+            let operation = if deleted {
+                Operation::Delete { value }
+            } else {
+                len += 1;
+                Operation::Insert { value }
+            };
+            reconstructed_nodes.push(Node {
+                id,
+                left_origin: Some(left),
+                right_origin: Some(right),
+                operation,
+            });
+
+            pending = next;
+            pending_index += 1;
+        }
+
+        if pending.right.is_some() {
+            return Err(SnapshotReadError::BoundaryNodeHasRight {
+                index: pending_index,
+            });
+        }
+        if pending.value.is_some() {
+            return Err(SnapshotReadError::BoundaryNodeHasValue {
+                index: pending_index,
+            });
+        }
+        if pending.deleted {
+            return Err(SnapshotReadError::BoundaryNodeMarkedDeleted {
+                index: pending_index,
+            });
+        }
+        reconstructed_nodes.push(Node {
+            id: pending.id,
+            left_origin: pending.left,
+            right_origin: pending.right,
+            operation: Operation::End,
+        });
+
+        Ok(Self {
+            len,
+            nodes: reconstructed_nodes,
+        })
+    }
 }
 impl<Id, Value> VecLinearData<Id, Value>
 where

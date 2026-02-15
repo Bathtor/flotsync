@@ -1,4 +1,5 @@
 use super::*;
+use crate::snapshot::SnapshotSink;
 use flotsync_utils::{debugging::DebugFormatting, require};
 use std::{hash::Hash, ops::RangeBounds};
 
@@ -65,6 +66,23 @@ where
     BaseId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     Value: Composite + fmt::Debug + 'static,
 {
+    pub(crate) fn visit_snapshot<S, ValueRef: ?Sized, F>(
+        &self,
+        sink: &mut S,
+        map_value: F,
+    ) -> Result<(), S::Error>
+    where
+        S: SnapshotSink<IdWithIndex<BaseId>, ValueRef>,
+        F: FnMut(&Value) -> &ValueRef,
+    {
+        self.base.visit_snapshot(sink, map_value)
+    }
+
+    pub(crate) fn from_base_snapshot(base: VecLinearData<IdWithIndex<BaseId>, Value>) -> Self {
+        let len = base.iter_values().map(|value| value.len()).sum();
+        Self { len, base }
+    }
+
     pub fn new<I>(id_generator: &mut I) -> Self
     where
         I: Iterator<Item = BaseId>,
