@@ -1022,9 +1022,9 @@ where
                                             // Insert just before succ.
                                             succ_index
                                         }
-                                        // TODO: It might be all or some of these also need to take
-                                        //       local subtrees into account.
-                                        //       Don't have a repro for that, yet, though.
+                                        // Unclear: It might be all or some of these also need to take
+                                        //          local subtrees into account.
+                                        //          Don't have a repro for that, yet, though.
                                     }
                                 }
                             };

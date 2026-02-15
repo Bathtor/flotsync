@@ -62,9 +62,7 @@ impl<Id, Value> VecLinearData<Id, Value> {
         sink.end()
     }
 
-    pub(crate) fn from_snapshot_nodes<E, I>(
-        nodes: I,
-    ) -> Result<Self, SnapshotReadError<E>>
+    pub(crate) fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
         I: IntoIterator<Item = Result<SnapshotNode<Id, Value>, E>>,
     {
@@ -111,12 +109,15 @@ impl<Id, Value> VecLinearData<Id, Value> {
                 value,
             } = pending;
 
-            let left =
-                left.ok_or(SnapshotReadError::NonBoundaryNodeMissingLeft { index: pending_index })?;
-            let right = right
-                .ok_or(SnapshotReadError::NonBoundaryNodeMissingRight { index: pending_index })?;
-            let value = value
-                .ok_or(SnapshotReadError::NonBoundaryNodeMissingValue { index: pending_index })?;
+            let left = left.ok_or(SnapshotReadError::NonBoundaryNodeMissingLeft {
+                index: pending_index,
+            })?;
+            let right = right.ok_or(SnapshotReadError::NonBoundaryNodeMissingRight {
+                index: pending_index,
+            })?;
+            let value = value.ok_or(SnapshotReadError::NonBoundaryNodeMissingValue {
+                index: pending_index,
+            })?;
             let operation = if deleted {
                 Operation::Delete { value }
             } else {
@@ -229,38 +230,6 @@ where
         let nodes = vec![begin_node, value_node, end_node];
         Self { len: 1, nodes }
     }
-
-    // TODO: Maybe remove this, if it's not needed.
-    // /// Find the index of the node that the `origin` field of the node at `node_index` points to.
-    // pub(super) fn find_origin_pos_for_node_at(
-    //     &self,
-    //     node_index: usize,
-    //     node_has_origin: impl Fn(&Node<Id, Value>, &Id) -> bool,
-    // ) -> Option<usize> {
-    //     let node = &self.nodes[node_index];
-    //     node.left_origin.as_ref().and_then(|origin_id| {
-    //         // Search backwards first, since in any correct list,
-    //         // the origin should occur before the node,
-    //         // most often right before if concurrency is low.
-    //         let mut next_index_opt = node_index.checked_sub(1);
-    //         while let Some(next_index) = next_index_opt {
-    //             if node_has_origin(&self.nodes[next_index], origin_id) {
-    //                 return Some(next_index);
-    //             } else {
-    //                 next_index_opt = next_index.checked_sub(1);
-    //             }
-    //         }
-    //         // Alright, this is already wrong, but let's see if it occurs in the rest of
-    //         // the structure to help debugging.
-    //         for (current_index, current_node) in self.nodes.iter().enumerate().skip(node_index) {
-    //             if &current_node.id == origin_id {
-    //                 return Some(current_index);
-    //             }
-    //         }
-    //         // Didn't occur anywhere, huh.
-    //         None
-    //     })
-    // }
 
     /// Returns `true` iff `node` is in the transitive right subtree that includes `boundary`.
     ///
