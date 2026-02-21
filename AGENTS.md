@@ -5,6 +5,7 @@
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical.
 - Prefer readable control flow over chained iterator side effects.
+- When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 
 ## Version Control Rules
 
@@ -22,4 +23,3 @@ bd show <id>          # View issue details
 bd update <id> --status in_progress  # Claim work
 bd close <id>         # Complete work
 ```
-

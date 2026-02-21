@@ -1,6 +1,9 @@
 use super::*;
-use crate::{linear_data::*, text::grapheme_string::GraphemeString};
-use crate::snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink};
+use crate::{
+    linear_data::*,
+    snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
+    text::grapheme_string::GraphemeString,
+};
 use std::hash::Hash;
 
 pub type LinearWordString<Id> = VecLinearData<Id, String>;

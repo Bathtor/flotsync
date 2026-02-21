@@ -1,17 +1,19 @@
-use crate::linear_data::{
-    Composite,
-    DataOperation,
-    IdWithIndex,
-    IdWithIndexRange,
-    LinearData,
-    LinkIds,
-    NodeIdRange,
-    NodeIds,
-    VecCoalescedLinearData,
-    VecCoalescedLinearDataIter,
-    VecLinearData,
+use crate::{
+    linear_data::{
+        Composite,
+        DataOperation,
+        IdWithIndex,
+        IdWithIndexRange,
+        LinearData,
+        LinkIds,
+        NodeIdRange,
+        NodeIds,
+        VecCoalescedLinearData,
+        VecCoalescedLinearDataIter,
+        VecLinearData,
+    },
+    snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
 };
-use crate::snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink};
 use std::{fmt, hash::Hash, ops::RangeBounds};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,7 +145,8 @@ where
     where
         S: SnapshotSink<IdWithIndex<Id>, [T]>,
     {
-        self.data.visit_snapshot(sink, |value| value.values.as_slice())
+        self.data
+            .visit_snapshot(sink, |value| value.values.as_slice())
     }
 
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>

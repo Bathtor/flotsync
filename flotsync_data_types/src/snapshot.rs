@@ -103,8 +103,7 @@ mod tests {
         encode_value: ValueEncoder,
         _marker: PhantomData<fn(&Id, &Value)>,
     }
-    impl<Id, Value: ?Sized, IdEncoder, ValueEncoder>
-        ByteBufSink<Id, Value, IdEncoder, ValueEncoder>
+    impl<Id, Value: ?Sized, IdEncoder, ValueEncoder> ByteBufSink<Id, Value, IdEncoder, ValueEncoder>
     where
         IdEncoder: Fn(&Id) -> Vec<u8>,
         ValueEncoder: Fn(&Value) -> Vec<u8>,
@@ -274,11 +273,12 @@ mod tests {
 
         let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_vec_i32);
         original.visit_snapshot(&mut sink).unwrap();
-        let nodes = parse_snapshot_nodes(sink.into_bytes(), decode_id_with_index_u32, decode_vec_i32)
-            .unwrap();
+        let nodes =
+            parse_snapshot_nodes(sink.into_bytes(), decode_id_with_index_u32, decode_vec_i32)
+                .unwrap();
 
-        let roundtrip = LinearList::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>))
-            .unwrap();
+        let roundtrip =
+            LinearList::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>)).unwrap();
         assert_eq!(roundtrip, original);
     }
 
@@ -315,16 +315,18 @@ mod tests {
         original.visit_snapshot(&mut sink).unwrap();
         let nodes = parse_snapshot_nodes(sink.into_bytes(), decode_u32, decode_u64).unwrap();
 
-        let roundtrip = LinearLatestValueWins::from_snapshot_nodes(
-            nodes.into_iter().map(Ok::<_, String>),
-        )
-        .unwrap();
+        let roundtrip =
+            LinearLatestValueWins::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>))
+                .unwrap();
         assert_eq!(roundtrip, original);
     }
 
     fn assert_node_invariants(parsed: ParsedSnapshot) {
         assert_eq!(parsed.node_count, parsed.nodes.len());
-        assert!(parsed.node_count >= 2, "snapshot must contain boundary nodes");
+        assert!(
+            parsed.node_count >= 2,
+            "snapshot must contain boundary nodes"
+        );
 
         for (expected_index, node) in parsed.nodes.iter().enumerate() {
             assert_eq!(node.index, expected_index);
@@ -396,7 +398,9 @@ mod tests {
         for expected_index in 0..node_count {
             let index: usize = read_u32(&mut bytes)?.try_into().unwrap();
             if index != expected_index {
-                return Err(format!("unexpected node index {index}, expected {expected_index}"));
+                return Err(format!(
+                    "unexpected node index {index}, expected {expected_index}"
+                ));
             }
             let flags = read_u8(&mut bytes)?;
 
