@@ -2,6 +2,7 @@ use flotsync_utils::option_when;
 use std::{assert_matches::assert_matches, fmt, vec};
 
 mod coalesced;
+pub(crate) mod snapshot;
 pub use coalesced::{
     Composite,
     IdGeneratorWithZeroIndex,

@@ -66,7 +66,7 @@ where
     BaseId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     Value: Composite + fmt::Debug + 'static,
 {
-    pub(crate) fn visit_snapshot<S, ValueRef: ?Sized, F>(
+    pub(crate) fn encode_snapshot<S, ValueRef: ?Sized, F>(
         &self,
         sink: &mut S,
         map_value: F,
@@ -75,7 +75,7 @@ where
         S: SnapshotSink<IdWithIndex<BaseId>, ValueRef>,
         F: FnMut(&Value) -> &ValueRef,
     {
-        self.base.visit_snapshot(sink, map_value)
+        self.base.encode_snapshot(sink, map_value)
     }
 
     pub(crate) fn from_base_snapshot(base: VecLinearData<IdWithIndex<BaseId>, Value>) -> Self {

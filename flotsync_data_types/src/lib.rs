@@ -12,8 +12,10 @@ pub mod any_data;
 #[allow(unused, reason = "Might re-use some already implemented things later.")]
 mod linear_data;
 pub mod schema;
-pub mod snapshot;
 pub mod text;
+pub mod snapshot {
+    pub use crate::linear_data::snapshot::*;
+}
 
 pub use linear_data::{DataOperation, IdWithIndex, IdWithIndexRange};
 

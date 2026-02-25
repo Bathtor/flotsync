@@ -3,6 +3,8 @@
 //! Serializers can consume snapshot nodes in canonical order via [[SnapshotSink]]
 //! without depending on internal storage types.
 
+use snafu::prelude::*;
+
 /// Snapshot stream header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotHeader {
@@ -39,22 +41,38 @@ pub struct SnapshotNode<Id, Value> {
 }
 
 /// Errors while reading/reconstructing snapshots.
-#[derive(Clone, Debug, PartialEq)]
-pub enum SnapshotReadError<E> {
-    Source(E),
+#[derive(Clone, Debug, PartialEq, Snafu)]
+pub enum SnapshotReadError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Snapshot source failed while reading nodes."))]
+    Source { source: E },
+    #[snafu(display("Snapshot is missing required boundary nodes."))]
     MissingBoundaryNodes,
+    #[snafu(display("Boundary node at index {index} has an unexpected left link."))]
     BoundaryNodeHasLeft { index: usize },
+    #[snafu(display("Boundary node at index {index} has an unexpected right link."))]
     BoundaryNodeHasRight { index: usize },
+    #[snafu(display("Boundary node at index {index} has an unexpected value payload."))]
     BoundaryNodeHasValue { index: usize },
+    #[snafu(display("Boundary node at index {index} is marked deleted."))]
     BoundaryNodeMarkedDeleted { index: usize },
+    #[snafu(display("Non-boundary node at index {index} is missing left link."))]
     NonBoundaryNodeMissingLeft { index: usize },
+    #[snafu(display("Non-boundary node at index {index} is missing right link."))]
     NonBoundaryNodeMissingRight { index: usize },
+    #[snafu(display("Non-boundary node at index {index} is missing value payload."))]
     NonBoundaryNodeMissingValue { index: usize },
+    #[snafu(display("Snapshot contains no visible values."))]
     NoVisibleValues,
 }
-impl<E> SnapshotReadError<E> {
+impl<E> SnapshotReadError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
     pub fn from_source(source: E) -> Self {
-        Self::Source(source)
+        Self::Source { source }
     }
 }
 
@@ -74,13 +92,9 @@ pub trait SnapshotSink<Id, Value: ?Sized> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod bytes_testkit {
     use super::*;
-    use crate::{
-        IdWithIndex,
-        any_data::{LinearLatestValueWins, list::LinearList},
-        text::LinearString,
-    };
+    use crate::IdWithIndex;
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use std::marker::PhantomData;
 
@@ -91,7 +105,7 @@ mod tests {
     const FLAG_HAS_VALUE: u8 = 1 << 2;
     const FLAG_DELETED: u8 = 1 << 3;
 
-    struct ByteBufSink<Id, Value: ?Sized, IdEncoder, ValueEncoder>
+    pub struct ByteBufSink<Id, Value: ?Sized, IdEncoder, ValueEncoder>
     where
         IdEncoder: Fn(&Id) -> Vec<u8>,
         ValueEncoder: Fn(&Value) -> Vec<u8>,
@@ -108,7 +122,7 @@ mod tests {
         IdEncoder: Fn(&Id) -> Vec<u8>,
         ValueEncoder: Fn(&Value) -> Vec<u8>,
     {
-        fn new(encode_id: IdEncoder, encode_value: ValueEncoder) -> Self {
+        pub fn new(encode_id: IdEncoder, encode_value: ValueEncoder) -> Self {
             Self {
                 bytes: BytesMut::new(),
                 expected_index: 0,
@@ -119,7 +133,7 @@ mod tests {
             }
         }
 
-        fn into_bytes(self) -> Bytes {
+        pub fn into_bytes(self) -> Bytes {
             self.bytes.freeze()
         }
     }
@@ -205,123 +219,20 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct ParsedSnapshot {
-        node_count: usize,
-        nodes: Vec<ParsedNode>,
+    pub struct ParsedSnapshot {
+        pub node_count: usize,
+        pub nodes: Vec<ParsedNode>,
     }
     #[derive(Debug)]
-    struct ParsedNode {
-        index: usize,
-        has_left: bool,
-        has_right: bool,
-        has_value: bool,
-        deleted: bool,
+    pub struct ParsedNode {
+        pub index: usize,
+        pub has_left: bool,
+        pub has_right: bool,
+        pub has_value: bool,
+        pub deleted: bool,
     }
 
-    #[test]
-    fn linear_list_snapshot_stream_has_expected_shape() {
-        let mut id_generator = 0u32..;
-        let mut list = LinearList::with_values(&mut id_generator, [10i32, 20, 30]);
-        list.append(IdWithIndex::zero(100), [40, 41]);
-        let _ = list.delete_at(1);
-
-        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_vec_i32);
-        list.visit_snapshot(&mut sink).unwrap();
-        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
-        assert!(parsed.nodes.iter().any(|n| n.deleted));
-
-        assert_node_invariants(parsed);
-    }
-
-    #[test]
-    fn linear_string_snapshot_stream_has_expected_shape() {
-        let mut id_generator = 0u32..;
-        let mut text = LinearString::with_value(&mut id_generator, "alpha beta".to_owned());
-        text.append(IdWithIndex::zero(100), " gamma".to_owned());
-        let range = text.ids_in_range(1..=5).unwrap();
-        range.delete(&mut text).unwrap();
-
-        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_utf8_str);
-        text.visit_snapshot(&mut sink).unwrap();
-        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
-        assert!(parsed.nodes.iter().any(|n| n.deleted));
-
-        assert_node_invariants(parsed);
-    }
-
-    #[test]
-    fn latest_value_snapshot_stream_has_expected_shape() {
-        let mut id_generator = 0u32..;
-        let mut reg = LinearLatestValueWins::new(&mut id_generator, 5u64);
-        reg.update(10, 6);
-        reg.update(11, 7);
-
-        let mut sink = ByteBufSink::new(encode_u32, encode_u64);
-        reg.visit_snapshot(&mut sink).unwrap();
-        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
-        assert!(parsed.nodes.iter().all(|n| !n.deleted));
-
-        assert_node_invariants(parsed);
-    }
-
-    #[test]
-    fn linear_list_snapshot_roundtrips_via_bytebuf() {
-        let mut id_generator = 0u32..;
-        let mut original = LinearList::with_values(&mut id_generator, [1i32, 2, 3, 4]);
-        original.append(IdWithIndex::zero(100), [8, 9]);
-        let _ = original.delete_at(2);
-
-        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_vec_i32);
-        original.visit_snapshot(&mut sink).unwrap();
-        let nodes =
-            parse_snapshot_nodes(sink.into_bytes(), decode_id_with_index_u32, decode_vec_i32)
-                .unwrap();
-
-        let roundtrip =
-            LinearList::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>)).unwrap();
-        assert_eq!(roundtrip, original);
-    }
-
-    #[test]
-    fn linear_string_snapshot_roundtrips_via_bytebuf() {
-        let mut id_generator = 0u32..;
-        let mut original = LinearString::with_value(&mut id_generator, "alpha".to_owned());
-        original.append(IdWithIndex::zero(100), " beta".to_owned());
-        let range = original.ids_in_range(1..=3).unwrap();
-        range.delete(&mut original).unwrap();
-
-        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_utf8_str);
-        original.visit_snapshot(&mut sink).unwrap();
-        let nodes = parse_snapshot_nodes(
-            sink.into_bytes(),
-            decode_id_with_index_u32,
-            decode_utf8_string,
-        )
-        .unwrap();
-
-        let roundtrip =
-            LinearString::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>)).unwrap();
-        assert_eq!(roundtrip, original);
-    }
-
-    #[test]
-    fn latest_value_snapshot_roundtrips_via_bytebuf() {
-        let mut id_generator = 0u32..;
-        let mut original = LinearLatestValueWins::new(&mut id_generator, 11u64);
-        original.update(10, 12);
-        original.update(20, 13);
-
-        let mut sink = ByteBufSink::new(encode_u32, encode_u64);
-        original.visit_snapshot(&mut sink).unwrap();
-        let nodes = parse_snapshot_nodes(sink.into_bytes(), decode_u32, decode_u64).unwrap();
-
-        let roundtrip =
-            LinearLatestValueWins::from_snapshot_nodes(nodes.into_iter().map(Ok::<_, String>))
-                .unwrap();
-        assert_eq!(roundtrip, original);
-    }
-
-    fn assert_node_invariants(parsed: ParsedSnapshot) {
+    pub fn assert_node_invariants(parsed: ParsedSnapshot) {
         assert_eq!(parsed.node_count, parsed.nodes.len());
         assert!(
             parsed.node_count >= 2,
@@ -349,7 +260,7 @@ mod tests {
         }
     }
 
-    fn parse_snapshot_shape(mut bytes: Bytes) -> Result<ParsedSnapshot, String> {
+    pub fn parse_snapshot_shape(mut bytes: Bytes) -> Result<ParsedSnapshot, String> {
         assert_magic(&mut bytes)?;
         let node_count: usize = read_u32(&mut bytes)?.try_into().unwrap();
 
@@ -382,7 +293,7 @@ mod tests {
         Ok(ParsedSnapshot { node_count, nodes })
     }
 
-    fn parse_snapshot_nodes<Id, Value, IdDecoder, ValueDecoder>(
+    pub fn parse_snapshot_nodes<Id, Value, IdDecoder, ValueDecoder>(
         mut bytes: Bytes,
         decode_id: IdDecoder,
         decode_value: ValueDecoder,
@@ -456,27 +367,27 @@ mod tests {
         Ok(())
     }
 
-    fn write_bytes(target: &mut BytesMut, bytes: &[u8]) -> Result<(), String> {
+    pub fn write_bytes(target: &mut BytesMut, bytes: &[u8]) -> Result<(), String> {
         target.put_u32_le(u32::try_from(bytes.len()).map_err(|_| "payload too large".to_owned())?);
         target.put_slice(bytes);
         Ok(())
     }
 
-    fn read_u8(input: &mut Bytes) -> Result<u8, String> {
+    pub fn read_u8(input: &mut Bytes) -> Result<u8, String> {
         if input.remaining() < 1 {
             return Err("unexpected end of snapshot".to_owned());
         }
         Ok(input.get_u8())
     }
 
-    fn read_u32(input: &mut Bytes) -> Result<u32, String> {
+    pub fn read_u32(input: &mut Bytes) -> Result<u32, String> {
         if input.remaining() < 4 {
             return Err("unexpected end of snapshot".to_owned());
         }
         Ok(input.get_u32_le())
     }
 
-    fn read_len_prefixed(input: &mut Bytes) -> Result<Bytes, String> {
+    pub fn read_len_prefixed(input: &mut Bytes) -> Result<Bytes, String> {
         let len: usize = read_u32(input)?.try_into().unwrap();
         if input.remaining() < len {
             return Err("unexpected end of snapshot".to_owned());
@@ -484,14 +395,14 @@ mod tests {
         Ok(input.copy_to_bytes(len))
     }
 
-    fn encode_id_with_index_u32(id: &IdWithIndex<u32>) -> Vec<u8> {
+    pub fn encode_id_with_index_u32(id: &IdWithIndex<u32>) -> Vec<u8> {
         let mut out = Vec::with_capacity(6);
         out.extend_from_slice(&id.id.to_le_bytes());
         out.extend_from_slice(&id.index.to_le_bytes());
         out
     }
 
-    fn decode_id_with_index_u32(bytes: &[u8]) -> Result<IdWithIndex<u32>, String> {
+    pub fn decode_id_with_index_u32(bytes: &[u8]) -> Result<IdWithIndex<u32>, String> {
         if bytes.len() != 6 {
             return Err("invalid IdWithIndex<u32> length".to_owned());
         }
@@ -500,7 +411,7 @@ mod tests {
         Ok(IdWithIndex { id, index })
     }
 
-    fn encode_vec_i32(value: &[i32]) -> Vec<u8> {
+    pub fn encode_vec_i32(value: &[i32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + value.len() * 4);
         out.extend_from_slice(&(value.len() as u32).to_le_bytes());
         for element in value {
@@ -509,7 +420,7 @@ mod tests {
         out
     }
 
-    fn decode_vec_i32(bytes: &[u8]) -> Result<Vec<i32>, String> {
+    pub fn decode_vec_i32(bytes: &[u8]) -> Result<Vec<i32>, String> {
         let mut input = Bytes::copy_from_slice(bytes);
         let len: usize = read_u32(&mut input)?.try_into().unwrap();
         if input.remaining() != len * 4 {
@@ -523,33 +434,151 @@ mod tests {
         Ok(values)
     }
 
-    fn encode_utf8_str(value: &str) -> Vec<u8> {
+    pub fn encode_utf8_str(value: &str) -> Vec<u8> {
         value.as_bytes().to_vec()
     }
 
-    fn decode_utf8_string(bytes: &[u8]) -> Result<String, String> {
+    pub fn decode_utf8_string(bytes: &[u8]) -> Result<String, String> {
         String::from_utf8(bytes.to_vec()).map_err(|_| "invalid utf8 value payload".to_owned())
     }
 
-    fn encode_u32(value: &u32) -> Vec<u8> {
+    pub fn encode_u32(value: &u32) -> Vec<u8> {
         value.to_le_bytes().to_vec()
     }
 
-    fn decode_u32(bytes: &[u8]) -> Result<u32, String> {
+    pub fn decode_u32(bytes: &[u8]) -> Result<u32, String> {
         if bytes.len() != 4 {
             return Err("invalid u32 payload length".to_owned());
         }
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    fn encode_u64(value: &u64) -> Vec<u8> {
+    pub fn encode_u64(value: &u64) -> Vec<u8> {
         value.to_le_bytes().to_vec()
     }
 
-    fn decode_u64(bytes: &[u8]) -> Result<u64, String> {
+    pub fn decode_u64(bytes: &[u8]) -> Result<u64, String> {
         if bytes.len() != 8 {
             return Err("invalid u64 payload length".to_owned());
         }
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bytes_testkit::*;
+    use crate::{
+        IdWithIndex,
+        any_data::{LinearLatestValueWins, list::LinearList},
+        text::LinearString,
+    };
+
+    #[test]
+    fn linear_list_snapshot_stream_has_expected_shape() {
+        let mut id_generator = 0u32..;
+        let mut list = LinearList::with_values(&mut id_generator, [10i32, 20, 30]);
+        list.append(IdWithIndex::zero(100), [40, 41]);
+        let _ = list.delete_at(1);
+
+        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_vec_i32);
+        list.encode_snapshot(&mut sink).unwrap();
+        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
+        assert!(parsed.nodes.iter().any(|n| n.deleted));
+
+        assert_node_invariants(parsed);
+    }
+
+    #[test]
+    fn linear_string_snapshot_stream_has_expected_shape() {
+        let mut id_generator = 0u32..;
+        let mut text = LinearString::with_value(&mut id_generator, "alpha beta".to_owned());
+        text.append(IdWithIndex::zero(100), " gamma".to_owned());
+        let range = text.ids_in_range(1..=5).unwrap();
+        range.delete(&mut text).unwrap();
+
+        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_utf8_str);
+        text.encode_snapshot(&mut sink).unwrap();
+        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
+        assert!(parsed.nodes.iter().any(|n| n.deleted));
+
+        assert_node_invariants(parsed);
+    }
+
+    #[test]
+    fn latest_value_snapshot_stream_has_expected_shape() {
+        let mut id_generator = 0u32..;
+        let mut reg = LinearLatestValueWins::new(&mut id_generator, 5u64);
+        reg.update(10, 6);
+        reg.update(11, 7);
+
+        let mut sink = ByteBufSink::new(encode_u32, encode_u64);
+        reg.encode_snapshot(&mut sink).unwrap();
+        let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
+        assert!(parsed.nodes.iter().all(|n| !n.deleted));
+
+        assert_node_invariants(parsed);
+    }
+
+    #[test]
+    fn linear_list_snapshot_roundtrips_via_bytebuf() {
+        let mut id_generator = 0u32..;
+        let mut original = LinearList::with_values(&mut id_generator, [1i32, 2, 3, 4]);
+        original.append(IdWithIndex::zero(100), [8, 9]);
+        let _ = original.delete_at(2);
+
+        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_vec_i32);
+        original.encode_snapshot(&mut sink).unwrap();
+        let nodes =
+            parse_snapshot_nodes(sink.into_bytes(), decode_id_with_index_u32, decode_vec_i32)
+                .unwrap();
+
+        let roundtrip = LinearList::from_snapshot_nodes(
+            nodes.into_iter().map(Ok::<_, std::convert::Infallible>),
+        )
+        .unwrap();
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    fn linear_string_snapshot_roundtrips_via_bytebuf() {
+        let mut id_generator = 0u32..;
+        let mut original = LinearString::with_value(&mut id_generator, "alpha".to_owned());
+        original.append(IdWithIndex::zero(100), " beta".to_owned());
+        let range = original.ids_in_range(1..=3).unwrap();
+        range.delete(&mut original).unwrap();
+
+        let mut sink = ByteBufSink::new(encode_id_with_index_u32, encode_utf8_str);
+        original.encode_snapshot(&mut sink).unwrap();
+        let nodes = parse_snapshot_nodes(
+            sink.into_bytes(),
+            decode_id_with_index_u32,
+            decode_utf8_string,
+        )
+        .unwrap();
+
+        let roundtrip = LinearString::from_snapshot_nodes(
+            nodes.into_iter().map(Ok::<_, std::convert::Infallible>),
+        )
+        .unwrap();
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    fn latest_value_snapshot_roundtrips_via_bytebuf() {
+        let mut id_generator = 0u32..;
+        let mut original = LinearLatestValueWins::new(&mut id_generator, 11u64);
+        original.update(10, 12);
+        original.update(20, 13);
+
+        let mut sink = ByteBufSink::new(encode_u32, encode_u64);
+        original.encode_snapshot(&mut sink).unwrap();
+        let nodes = parse_snapshot_nodes(sink.into_bytes(), decode_u32, decode_u64).unwrap();
+
+        let roundtrip = LinearLatestValueWins::from_snapshot_nodes(
+            nodes.into_iter().map(Ok::<_, std::convert::Infallible>),
+        )
+        .unwrap();
+        assert_eq!(roundtrip, original);
     }
 }

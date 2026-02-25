@@ -26,6 +26,7 @@ use super::{
 };
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
+use snafu::prelude::*;
 
 mod in_memory;
 mod operations;
@@ -228,63 +229,93 @@ impl CounterValueRef {
     }
 }
 /// Schema-level validation errors for collections of field payloads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub enum SchemaValueError {
-    UnknownField {
-        field_name: String,
-    },
-    DuplicateField {
-        field_name: String,
-    },
-    MissingField {
-        field_name: String,
-    },
+    #[snafu(display("Unknown field '{field_name}'."))]
+    UnknownField { field_name: String },
+    #[snafu(display("Field '{field_name}' was provided more than once."))]
+    DuplicateField { field_name: String },
+    #[snafu(display("Missing required field '{field_name}'."))]
+    MissingField { field_name: String },
+    #[snafu(display(
+        "Field '{field_name}' has a snapshot value that is incompatible with the schema data type."
+    ))]
     InvalidSnapshotFieldValue {
         field_name: String,
         source: DataModelValueError,
     },
+    #[snafu(display(
+        "Field '{field_name}' has an operation value that is incompatible with the schema data type."
+    ))]
     InvalidOperationFieldValue {
         field_name: String,
         source: DataModelValueError,
     },
 }
 
-#[derive(Debug)]
-pub enum SchemaVisitError<E> {
-    InvalidSchemaValue(SchemaValueError),
-    Visitor(E),
+#[derive(Debug, Snafu)]
+pub enum SchemaVisitError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Schema value validation failed."))]
+    InvalidSchemaValue { source: SchemaValueError },
+    #[snafu(display("Schema visitor failed."))]
+    Visitor { source: E },
 }
 /// Structural/schema validation errors for snapshot/operation payloads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub enum DataModelValueError {
+    #[snafu(display("Snapshot value does not match the schema data type."))]
     InvalidSnapshotValueForType,
+    #[snafu(display("Operation value does not match the schema data type."))]
     InvalidOperationValueForType,
+    #[snafu(display("Finite-state register schema is invalid."))]
     InvalidFiniteStateSchema,
+    #[snafu(display("Basic value type does not match the schema data type."))]
     BasicTypeMismatch,
+    #[snafu(display("Primitive value type mismatch: expected {expected:?}, got {actual:?}."))]
     PrimitiveTypeMismatch {
         expected: PrimitiveType,
         actual: PrimitiveType,
     },
+    #[snafu(display(
+        "Counter value type mismatch: expected small_range={expected_small_range}, got small_range={actual_small_range}."
+    ))]
     CounterTypeMismatch {
         expected_small_range: bool,
         actual_small_range: bool,
     },
+    #[snafu(display(
+        "Nullability mismatch: expected nullable={expected_nullable}, got nullable={actual_nullable}."
+    ))]
     NullabilityMismatch {
         expected_nullable: bool,
         actual_nullable: bool,
     },
+    #[snafu(display("Finite-state value is not part of the schema-defined state set."))]
     FiniteStateValueNotInSchema,
 }
-#[derive(Debug)]
-pub enum VisitError<E> {
-    InvalidValue(DataModelValueError),
-    Visitor(E),
+#[derive(Debug, Snafu)]
+pub enum VisitError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Value does not match the schema data type."))]
+    InvalidVisitedValue { source: DataModelValueError },
+    #[snafu(display("Value encoder failed."))]
+    VisitorSource { source: E },
 }
 
-#[derive(Debug)]
-pub enum DecodeError<E> {
-    InvalidValue(DataModelValueError),
-    Decoder(E),
+#[derive(Debug, Snafu)]
+pub enum DecodeError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Decoded value does not match the schema data type."))]
+    InvalidDecodedValue { source: DataModelValueError },
+    #[snafu(display("Value decoder failed."))]
+    DecoderSource { source: E },
 }
 fn ensure_basic_type(
     expected: &BasicDataType,

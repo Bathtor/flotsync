@@ -124,16 +124,17 @@ where
         self.data.iter_ids().map(|id| &id.id)
     }
 
-    /// Visit a stable, ordered snapshot stream of the current in-memory state.
-    pub fn visit_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
+    /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<IdWithIndex<Id>, str>,
     {
-        self.data.visit_snapshot(sink, |value| value.as_str())
+        self.data.encode_snapshot(sink, |value| value.as_str())
     }
 
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
+        E: snafu::Error + Send + Sync + 'static,
         I: IntoIterator<Item = Result<SnapshotNode<IdWithIndex<Id>, String>, E>>,
     {
         let mapped = nodes.into_iter().map(|entry| {

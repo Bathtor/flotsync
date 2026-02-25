@@ -1,12 +1,13 @@
 use super::*;
 use crate::{
+    IdWithIndex,
     any_data::{LinearLatestValueWins, list::LinearList},
+    snapshot::{SnapshotHeader, SnapshotNode, SnapshotNodeRef, SnapshotReadError, SnapshotSink},
     text::LinearString,
 };
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
-use snafu::prelude::*;
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, fmt, hash::Hash, marker::PhantomData};
 
 /// Storage-level, in-memory dataset for one schema.
 ///
@@ -194,6 +195,64 @@ impl<RowId> InMemoryData<RowId> {
             .zip(row.fields.iter()))
     }
 
+    /// Encode all rows as schema snapshots via a dataset-level encoder.
+    ///
+    /// Flow:
+    /// 1. `encoder.begin(row_count)`
+    /// 2. for each row: `begin_row` -> row snapshot encoding -> `end_row`
+    /// 3. `encoder.end()`
+    pub fn encode_data_snapshots<E>(
+        &self,
+        encoder: &mut E,
+    ) -> Result<(), InMemoryDataSnapshotEncodeError<E::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        E: DataSnapshotEncoder<RowId>,
+    {
+        encoder.begin(self.rows.len()).context(EncoderSnafu)?;
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            let mut row_encoder = encoder.begin_row(row_index).context(EncoderSnafu)?;
+            row.encode_snapshot(self.schema(), &self.field_names, &mut row_encoder)
+                .context(SchemaVisitSnafu)?;
+            drop(row_encoder);
+            encoder.end_row(row_index).context(EncoderSnafu)?;
+        }
+
+        encoder.end().context(EncoderSnafu)
+    }
+
+    /// Decode all rows from a dataset-level decoder into a new in-memory dataset.
+    ///
+    /// Each row is decoded lazily field-by-field and history-backed fields are reconstructed via
+    /// each CRDT's `from_snapshot_nodes` API.
+    pub fn decode_data_snapshots<D>(
+        schema: Cow<'static, Schema>,
+        decoder: &mut D,
+    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        D: DataSnapshotDecoder<RowId>,
+    {
+        let row_count = decoder.begin().context(DecoderSnafu)?;
+        let mut data = Self::new(schema);
+        data.rows.reserve(row_count);
+
+        for row_index in 0..row_count {
+            let mut row_decoder = decoder.begin_row(row_index).context(DecoderSnafu)?;
+            let row =
+                InMemoryRow::decode_snapshot(data.schema(), &data.field_names, &mut row_decoder)?;
+            drop(row_decoder);
+            decoder.end_row(row_index).context(DecoderSnafu)?;
+
+            data.validate_row_value(&row).context(InMemoryDataSnafu)?;
+            data.rows.push(row);
+        }
+
+        decoder.end().context(DecoderSnafu)?;
+        Ok(data)
+    }
+
     fn row_from_field_values(
         &self,
         fields: Vec<InMemoryFieldValue<RowId>>,
@@ -218,12 +277,11 @@ impl<RowId> InMemoryData<RowId> {
                 .columns
                 .get(field_name)
                 .expect("field index map and schema are in sync");
-            validate_in_memory_field_value(&schema_field.data_type, value).map_err(|source| {
-                InMemoryDataError::InvalidFieldValue {
+            validate_in_memory_field_value(&schema_field.data_type, value).context(
+                InvalidFieldValueSnafu {
                     field_name: field_name.to_owned(),
-                    source,
-                }
-            })?;
+                },
+            )?;
         }
 
         Ok(())
@@ -259,12 +317,11 @@ impl<RowId> InMemoryData<RowId> {
                 .columns
                 .get(field_name)
                 .expect("field index map and schema are in sync");
-            validate_in_memory_field_value(&schema_field.data_type, &value).map_err(|source| {
-                InMemoryDataError::InvalidFieldValue {
+            validate_in_memory_field_value(&schema_field.data_type, &value).context(
+                InvalidFieldValueSnafu {
                     field_name: field_name.to_owned(),
-                    source,
-                }
-            })?;
+                },
+            )?;
 
             row_slots[field_index] = Some(value);
         }
@@ -312,13 +369,51 @@ pub enum InMemoryDataError {
     ))]
     InvalidFieldValue {
         field_name: String,
-        #[snafu(source(false))]
         source: DataModelValueError,
     },
     #[snafu(display("Row has wrong number of fields: expected {expected}, got {actual}."))]
     FieldCountMismatch { expected: usize, actual: usize },
     #[snafu(display("Unknown row index {row_index}."))]
     UnknownRow { row_index: usize },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InMemoryDataSnapshotEncodeError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Failed to encode row snapshot fields against the schema: {source}"))]
+    SchemaVisit { source: SchemaVisitError<E> },
+    #[snafu(display("Dataset snapshot encoder failed."))]
+    Encoder { source: E },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InMemoryDataSnapshotDecodeError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Decoded row is invalid for the in-memory dataset."))]
+    InMemoryData { source: InMemoryDataError },
+    #[snafu(display("Decoded value does not match the schema data type."))]
+    InvalidValue { source: DataModelValueError },
+    #[snafu(display("Failed to read CRDT snapshot nodes while decoding a row."))]
+    SnapshotRead {
+        source: SnapshotReadError<InMemoryNodeDecodeError<E>>,
+    },
+    #[snafu(display("Dataset snapshot decoder failed."))]
+    Decoder { source: E },
+}
+
+#[derive(Debug, Snafu)]
+pub enum InMemoryNodeDecodeError<E>
+where
+    E: snafu::Error + Send + Sync + 'static,
+{
+    #[snafu(display("Snapshot node source failed while decoding history nodes."))]
+    Source { source: E },
+    #[snafu(display("Snapshot node value is incompatible with the schema data type."))]
+    InvalidNodeValue { source: DataModelValueError },
 }
 
 /// Storage-level in-memory representation for one row over an associated schema.
@@ -333,6 +428,70 @@ impl<RowId> InMemoryRow<RowId> {
 
     fn field_count(&self) -> usize {
         self.fields.len()
+    }
+
+    fn encode_snapshot<V>(
+        &self,
+        schema: &Schema,
+        field_names: &[String],
+        encoder: &mut V,
+    ) -> Result<(), SchemaVisitError<V::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        V: SchemaSnapshotEncoder<RowId>,
+    {
+        let mut writer = prepare_schema_snapshot_encoder(encoder, schema)?;
+        self.encode_snapshot_fields(field_names, &mut writer)?;
+        writer.end()
+    }
+
+    fn encode_snapshot_fields<V>(
+        &self,
+        field_names: &[String],
+        writer: &mut SchemaSnapshotEncodingWriter<'_, RowId, V>,
+    ) -> Result<(), SchemaVisitError<V::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        V: SchemaSnapshotEncoder<RowId>,
+    {
+        debug_assert_eq!(field_names.len(), self.fields.len());
+        for (field_name, field_value) in field_names
+            .iter()
+            .map(String::as_str)
+            .zip(self.fields.iter())
+        {
+            field_value.encode_snapshot_field(field_name, writer)?;
+        }
+        Ok(())
+    }
+
+    fn decode_snapshot<D>(
+        schema: &Schema,
+        field_names: &[String],
+        decoder: &mut D,
+    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        D: SchemaSnapshotDecoder<RowId>,
+    {
+        decoder.begin(field_names.len()).context(DecoderSnafu)?;
+
+        let mut fields = Vec::with_capacity(field_names.len());
+        for field_name in field_names {
+            let schema_field = schema
+                .columns
+                .get(field_name.as_str())
+                .expect("field names and schema are in sync");
+            let field_value = InMemoryFieldValue::decode_snapshot_field(
+                field_name.as_str(),
+                schema_field,
+                decoder,
+            )?;
+            fields.push(field_value);
+        }
+
+        decoder.end().context(DecoderSnafu)?;
+        Ok(Self { fields })
     }
 }
 
@@ -556,6 +715,391 @@ impl<RowId> LinearLatestValueWinsValue<RowId> {
             _ => false,
         }
     }
+
+    fn encode_snapshot<S, E>(&self, sink: &mut S) -> Result<(), E>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        S: for<'value> SnapshotSink<RowId, NullableBasicValueRef<'value>, Error = E>,
+    {
+        match self {
+            Self::String(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &String| {
+                        NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::String(value.as_str()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::UInt(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &u64| {
+                    NullableBasicValueRef::Value(BasicValueRef::Primitive(PrimitiveValueRef::UInt(
+                        *value,
+                    )))
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Int(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &i64| {
+                    NullableBasicValueRef::Value(BasicValueRef::Primitive(PrimitiveValueRef::Int(
+                        *value,
+                    )))
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Byte(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &u8| {
+                    NullableBasicValueRef::Value(BasicValueRef::Primitive(PrimitiveValueRef::Byte(
+                        *value,
+                    )))
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Float(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &OrderedFloat<f64>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Float(*value),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Boolean(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &bool| {
+                    NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                        PrimitiveValueRef::Boolean(*value),
+                    ))
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Binary(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<u8>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Binary(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Date(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &NaiveDate| {
+                        NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Date(*value),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Timestamp(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &UnixTimestamp| {
+                        NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Timestamp(*value),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::StringArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<String>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::String(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::UIntArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<u64>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::UInt(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::IntArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<i64>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Int(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::ByteArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<u8>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Byte(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::FloatArray(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Vec<OrderedFloat<f64>>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Float(value.as_slice()),
+                        ))
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::BooleanArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<bool>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Boolean(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::BinaryArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<Vec<u8>>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Binary(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::DateArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<NaiveDate>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Date(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::TimestampArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Vec<UnixTimestamp>| {
+                        NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Timestamp(value.as_slice()),
+                        ))
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableString(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<String>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                                PrimitiveValueRef::String(value.as_str()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableUInt(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<u64>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::UInt(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableInt(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<i64>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Int(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableByte(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<u8>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Byte(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableFloat(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<OrderedFloat<f64>>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Float(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableBoolean(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<bool>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Boolean(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableBinary(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<u8>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                                PrimitiveValueRef::Binary(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableDate(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<NaiveDate>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                                PrimitiveValueRef::Date(*value),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableTimestamp(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<UnixTimestamp>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Primitive(
+                            PrimitiveValueRef::Timestamp(*value),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableStringArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<String>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                                PrimitiveValueArrayRef::String(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableUIntArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<u64>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                                PrimitiveValueArrayRef::UInt(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableIntArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<i64>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                                PrimitiveValueArrayRef::Int(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableByteArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<u8>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                                PrimitiveValueArrayRef::Byte(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableFloatArray(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<Vec<OrderedFloat<f64>>>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Float(value.as_slice()),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableBooleanArray(value) => {
+                let mut adapter =
+                    LatestValueWinsSnapshotSinkAdapter::new(sink, |value: &Option<Vec<bool>>| {
+                        match value {
+                            Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                                PrimitiveValueArrayRef::Boolean(value.as_slice()),
+                            )),
+                            None => NullableBasicValueRef::Null,
+                        }
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableBinaryArray(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<Vec<Vec<u8>>>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Binary(value.as_slice()),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableDateArray(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<Vec<NaiveDate>>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Date(value.as_slice()),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::NullableTimestampArray(value) => {
+                let mut adapter = LatestValueWinsSnapshotSinkAdapter::new(
+                    sink,
+                    |value: &Option<Vec<UnixTimestamp>>| match value {
+                        Some(value) => NullableBasicValueRef::Value(BasicValueRef::Array(
+                            PrimitiveValueArrayRef::Timestamp(value.as_slice()),
+                        )),
+                        None => NullableBasicValueRef::Null,
+                    },
+                );
+                value.encode_snapshot(&mut adapter)
+            }
+        }
+    }
 }
 
 /// Specialized `LinearList` state variants by concrete primitive element type.
@@ -584,6 +1128,830 @@ impl<RowId> LinearListValue<RowId> {
             Self::Date(_) => PrimitiveType::Date,
             Self::Timestamp(_) => PrimitiveType::Timestamp,
         }
+    }
+
+    fn encode_snapshot<S, E>(&self, sink: &mut S) -> Result<(), E>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        S: for<'value> SnapshotSink<IdWithIndex<RowId>, PrimitiveValueArrayRef<'value>, Error = E>,
+    {
+        match self {
+            Self::String(value) => {
+                let mut adapter = LinearListSnapshotSinkAdapter::new(sink, |value: &[String]| {
+                    PrimitiveValueArrayRef::String(value)
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::UInt(value) => {
+                let mut adapter = LinearListSnapshotSinkAdapter::new(sink, |value: &[u64]| {
+                    PrimitiveValueArrayRef::UInt(value)
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Int(value) => {
+                let mut adapter = LinearListSnapshotSinkAdapter::new(sink, |value: &[i64]| {
+                    PrimitiveValueArrayRef::Int(value)
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Byte(value) => {
+                let mut adapter = LinearListSnapshotSinkAdapter::new(sink, |value: &[u8]| {
+                    PrimitiveValueArrayRef::Byte(value)
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Float(value) => {
+                let mut adapter =
+                    LinearListSnapshotSinkAdapter::new(sink, |value: &[OrderedFloat<f64>]| {
+                        PrimitiveValueArrayRef::Float(value)
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Boolean(value) => {
+                let mut adapter = LinearListSnapshotSinkAdapter::new(sink, |value: &[bool]| {
+                    PrimitiveValueArrayRef::Boolean(value)
+                });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Binary(value) => {
+                let mut adapter =
+                    LinearListSnapshotSinkAdapter::new(sink, |value: &[Vec<u8>]| {
+                        PrimitiveValueArrayRef::Binary(value)
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Date(value) => {
+                let mut adapter =
+                    LinearListSnapshotSinkAdapter::new(sink, |value: &[NaiveDate]| {
+                        PrimitiveValueArrayRef::Date(value)
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+            Self::Timestamp(value) => {
+                let mut adapter =
+                    LinearListSnapshotSinkAdapter::new(sink, |value: &[UnixTimestamp]| {
+                        PrimitiveValueArrayRef::Timestamp(value)
+                    });
+                value.encode_snapshot(&mut adapter)
+            }
+        }
+    }
+}
+
+impl<RowId> InMemoryFieldValue<RowId> {
+    fn encode_snapshot_field<V>(
+        &self,
+        field_name: &str,
+        writer: &mut SchemaSnapshotEncodingWriter<'_, RowId, V>,
+    ) -> Result<(), SchemaVisitError<V::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        V: SchemaSnapshotEncoder<RowId>,
+    {
+        match self {
+            Self::LatestValueWins(value) => {
+                let mut sink = writer.prepare_latest_value_wins_field(field_name)?;
+                value.encode_snapshot(&mut sink).context(VisitorSnafu)
+            }
+            Self::LinearString(value) => {
+                let mut sink = writer.prepare_linear_string_field(field_name)?;
+                value.encode_snapshot(&mut sink).context(VisitorSnafu)
+            }
+            Self::LinearList(value) => {
+                let mut sink = writer.prepare_linear_list_field(field_name)?;
+                value.encode_snapshot(&mut sink).context(VisitorSnafu)
+            }
+            Self::MonotonicCounter(value) => writer.state_field(
+                field_name,
+                SnapshotStateValueRef::MonotonicCounter(value.as_ref()),
+            ),
+            Self::TotalOrderRegister(value) => writer.state_field(
+                field_name,
+                SnapshotStateValueRef::TotalOrderRegister(value.as_ref()),
+            ),
+            Self::TotalOrderFiniteStateRegister(value) => writer.state_field(
+                field_name,
+                SnapshotStateValueRef::TotalOrderFiniteStateRegister(value.as_ref()),
+            ),
+        }
+    }
+
+    fn decode_snapshot_field<D>(
+        field_name: &str,
+        schema_field: &super::super::Field,
+        decoder: &mut D,
+    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    where
+        RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        D: SchemaSnapshotDecoder<RowId>,
+    {
+        match &schema_field.data_type {
+            ReplicatedDataType::LatestValueWins { value_type } => {
+                let mut source = decoder
+                    .prepare_latest_value_wins_field(field_name, value_type)
+                    .context(DecoderSnafu)?;
+                let nodes =
+                    SnapshotNodeSourceIter::<_, RowId, NullableBasicValue>::new(&mut source)
+                        .map(|result| result.context(SourceSnafu));
+                let value = decode_latest_value_wins_snapshot(value_type, nodes)
+                    .context(SnapshotReadSnafu)?;
+                Ok(Self::LatestValueWins(value))
+            }
+            ReplicatedDataType::LinearString => {
+                let mut source = decoder
+                    .prepare_linear_string_field(field_name)
+                    .context(DecoderSnafu)?;
+                let nodes =
+                    SnapshotNodeSourceIter::<_, IdWithIndex<RowId>, String>::new(&mut source)
+                        .map(|result| result.context(SourceSnafu));
+                let value = LinearString::from_snapshot_nodes(nodes).context(SnapshotReadSnafu)?;
+                Ok(Self::LinearString(value))
+            }
+            ReplicatedDataType::LinearList { value_type } => {
+                let mut source = decoder
+                    .prepare_linear_list_field(field_name, *value_type)
+                    .context(DecoderSnafu)?;
+                let nodes =
+                    SnapshotNodeSourceIter::<_, IdWithIndex<RowId>, PrimitiveValueArray>::new(
+                        &mut source,
+                    )
+                    .map(|result| result.context(SourceSnafu));
+                let value =
+                    decode_linear_list_snapshot(*value_type, nodes).context(SnapshotReadSnafu)?;
+                Ok(Self::LinearList(value))
+            }
+            ReplicatedDataType::MonotonicCounter { .. }
+            | ReplicatedDataType::TotalOrderRegister { .. }
+            | ReplicatedDataType::TotalOrderFiniteStateRegister { .. } => {
+                let state = decoder
+                    .decode_state_field(field_name, &schema_field.data_type)
+                    .context(DecoderSnafu)?;
+                decode_state_snapshot_field(&schema_field.data_type, state)
+                    .context(InvalidValueSnafu)
+            }
+        }
+    }
+}
+
+struct LatestValueWinsSnapshotSinkAdapter<'a, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value Value) -> NullableBasicValueRef<'value>,
+    for<'value> Sink: SnapshotSink<Id, NullableBasicValueRef<'value>>,
+{
+    sink: &'a mut Sink,
+    map_value: Mapper,
+    _marker: PhantomData<fn(Id, Value)>,
+}
+impl<'a, Id, Value, Sink, Mapper> LatestValueWinsSnapshotSinkAdapter<'a, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value Value) -> NullableBasicValueRef<'value>,
+    for<'value> Sink: SnapshotSink<Id, NullableBasicValueRef<'value>>,
+{
+    fn new(sink: &'a mut Sink, map_value: Mapper) -> Self {
+        Self {
+            sink,
+            map_value,
+            _marker: PhantomData,
+        }
+    }
+}
+impl<Id, Value, Sink, Mapper, E> SnapshotSink<Id, Value>
+    for LatestValueWinsSnapshotSinkAdapter<'_, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value Value) -> NullableBasicValueRef<'value>,
+    for<'value> Sink: SnapshotSink<Id, NullableBasicValueRef<'value>, Error = E>,
+{
+    type Error = E;
+
+    fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error> {
+        self.sink.begin(header)
+    }
+
+    fn node(
+        &mut self,
+        index: usize,
+        node: SnapshotNodeRef<'_, Id, Value>,
+    ) -> Result<(), Self::Error> {
+        let mapped_value = node.value.map(|value| (self.map_value)(value));
+        let mapped_node = SnapshotNodeRef {
+            id: node.id,
+            left: node.left,
+            right: node.right,
+            deleted: node.deleted,
+            value: mapped_value.as_ref(),
+        };
+        self.sink.node(index, mapped_node)
+    }
+
+    fn end(&mut self) -> Result<(), Self::Error> {
+        self.sink.end()
+    }
+}
+
+struct LinearListSnapshotSinkAdapter<'a, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value [Value]) -> PrimitiveValueArrayRef<'value>,
+    for<'value> Sink: SnapshotSink<IdWithIndex<Id>, PrimitiveValueArrayRef<'value>>,
+{
+    sink: &'a mut Sink,
+    map_value: Mapper,
+    _marker: PhantomData<fn(Id, Value)>,
+}
+impl<'a, Id, Value, Sink, Mapper> LinearListSnapshotSinkAdapter<'a, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value [Value]) -> PrimitiveValueArrayRef<'value>,
+    for<'value> Sink: SnapshotSink<IdWithIndex<Id>, PrimitiveValueArrayRef<'value>>,
+{
+    fn new(sink: &'a mut Sink, map_value: Mapper) -> Self {
+        Self {
+            sink,
+            map_value,
+            _marker: PhantomData,
+        }
+    }
+}
+impl<Id, Value, Sink, Mapper, E> SnapshotSink<IdWithIndex<Id>, [Value]>
+    for LinearListSnapshotSinkAdapter<'_, Id, Value, Sink, Mapper>
+where
+    Mapper: for<'value> Fn(&'value [Value]) -> PrimitiveValueArrayRef<'value>,
+    for<'value> Sink: SnapshotSink<IdWithIndex<Id>, PrimitiveValueArrayRef<'value>, Error = E>,
+{
+    type Error = E;
+
+    fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error> {
+        self.sink.begin(header)
+    }
+
+    fn node(
+        &mut self,
+        index: usize,
+        node: SnapshotNodeRef<'_, IdWithIndex<Id>, [Value]>,
+    ) -> Result<(), Self::Error> {
+        let mapped_value = node.value.map(|value| (self.map_value)(value));
+        let mapped_node = SnapshotNodeRef {
+            id: node.id,
+            left: node.left,
+            right: node.right,
+            deleted: node.deleted,
+            value: mapped_value.as_ref(),
+        };
+        self.sink.node(index, mapped_node)
+    }
+
+    fn end(&mut self) -> Result<(), Self::Error> {
+        self.sink.end()
+    }
+}
+
+fn decode_state_snapshot_field<RowId>(
+    data_type: &ReplicatedDataType,
+    value: SnapshotStateValue,
+) -> Result<InMemoryFieldValue<RowId>, DataModelValueError> {
+    match (data_type, value) {
+        (
+            ReplicatedDataType::MonotonicCounter { small_range },
+            SnapshotStateValue::MonotonicCounter(value),
+        ) => {
+            ensure_counter_type(*small_range, value.as_ref())?;
+            Ok(InMemoryFieldValue::MonotonicCounter(value))
+        }
+        (
+            ReplicatedDataType::TotalOrderRegister { value_type, .. },
+            SnapshotStateValue::TotalOrderRegister(value),
+        ) => {
+            ensure_primitive_type(*value_type, value.primitive_type())?;
+            Ok(InMemoryFieldValue::TotalOrderRegister(value))
+        }
+        (
+            ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
+            SnapshotStateValue::TotalOrderFiniteStateRegister(value),
+        ) => {
+            ensure_finite_state_value(*value_type, states, &value.as_ref())?;
+            Ok(InMemoryFieldValue::TotalOrderFiniteStateRegister(value))
+        }
+        _ => Err(DataModelValueError::InvalidSnapshotValueForType),
+    }
+}
+
+fn decode_latest_value_wins_snapshot<RowId, E, I>(
+    value_type: &NullableBasicDataType,
+    nodes: I,
+) -> Result<LinearLatestValueWinsValue<RowId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
+where
+    E: snafu::Error + Send + Sync + 'static,
+    RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    I: IntoIterator<
+        Item = Result<SnapshotNode<RowId, NullableBasicValue>, InMemoryNodeDecodeError<E>>,
+    >,
+{
+    match value_type {
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::String)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_string,
+            ))
+            .map(LinearLatestValueWinsValue::String)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::UInt)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_uint,
+            ))
+            .map(LinearLatestValueWinsValue::UInt)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Int)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_int,
+            ))
+            .map(LinearLatestValueWinsValue::Int)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Byte)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_byte,
+            ))
+            .map(LinearLatestValueWinsValue::Byte)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Float)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_float,
+            ))
+            .map(LinearLatestValueWinsValue::Float)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Boolean)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_boolean,
+            ))
+            .map(LinearLatestValueWinsValue::Boolean)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Binary)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_binary,
+            ))
+            .map(LinearLatestValueWinsValue::Binary)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Date)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_date,
+            ))
+            .map(LinearLatestValueWinsValue::Date)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Timestamp)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_required_timestamp,
+            ))
+            .map(LinearLatestValueWinsValue::Timestamp)
+        }
+        NullableBasicDataType::NonNull(BasicDataType::Array(array_type)) => {
+            match array_type.element_type {
+                PrimitiveType::String => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_string_array),
+                )
+                .map(LinearLatestValueWinsValue::StringArray),
+                PrimitiveType::UInt => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_uint_array),
+                )
+                .map(LinearLatestValueWinsValue::UIntArray),
+                PrimitiveType::Int => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_int_array),
+                )
+                .map(LinearLatestValueWinsValue::IntArray),
+                PrimitiveType::Byte => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_byte_array),
+                )
+                .map(LinearLatestValueWinsValue::ByteArray),
+                PrimitiveType::Float => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_float_array),
+                )
+                .map(LinearLatestValueWinsValue::FloatArray),
+                PrimitiveType::Boolean => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_boolean_array),
+                )
+                .map(LinearLatestValueWinsValue::BooleanArray),
+                PrimitiveType::Binary => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_binary_array),
+                )
+                .map(LinearLatestValueWinsValue::BinaryArray),
+                PrimitiveType::Date => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_date_array),
+                )
+                .map(LinearLatestValueWinsValue::DateArray),
+                PrimitiveType::Timestamp => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_required_timestamp_array),
+                )
+                .map(LinearLatestValueWinsValue::TimestampArray),
+            }
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::String)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_string,
+            ))
+            .map(LinearLatestValueWinsValue::NullableString)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::UInt)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_uint,
+            ))
+            .map(LinearLatestValueWinsValue::NullableUInt)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Int)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_int,
+            ))
+            .map(LinearLatestValueWinsValue::NullableInt)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Byte)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_byte,
+            ))
+            .map(LinearLatestValueWinsValue::NullableByte)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Float)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_float,
+            ))
+            .map(LinearLatestValueWinsValue::NullableFloat)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Boolean)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_boolean,
+            ))
+            .map(LinearLatestValueWinsValue::NullableBoolean)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Binary)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_binary,
+            ))
+            .map(LinearLatestValueWinsValue::NullableBinary)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Date)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_date,
+            ))
+            .map(LinearLatestValueWinsValue::NullableDate)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Timestamp)) => {
+            LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
+                nodes,
+                decode_optional_timestamp,
+            ))
+            .map(LinearLatestValueWinsValue::NullableTimestamp)
+        }
+        NullableBasicDataType::Nullable(BasicDataType::Array(array_type)) => {
+            match array_type.element_type {
+                PrimitiveType::String => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_string_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableStringArray),
+                PrimitiveType::UInt => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_uint_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableUIntArray),
+                PrimitiveType::Int => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_int_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableIntArray),
+                PrimitiveType::Byte => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_byte_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableByteArray),
+                PrimitiveType::Float => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_float_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableFloatArray),
+                PrimitiveType::Boolean => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_boolean_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableBooleanArray),
+                PrimitiveType::Binary => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_binary_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableBinaryArray),
+                PrimitiveType::Date => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_date_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableDateArray),
+                PrimitiveType::Timestamp => LinearLatestValueWins::from_snapshot_nodes(
+                    map_snapshot_nodes_value(nodes, decode_optional_timestamp_array),
+                )
+                .map(LinearLatestValueWinsValue::NullableTimestampArray),
+            }
+        }
+    }
+}
+
+fn decode_linear_list_snapshot<RowId, E, I>(
+    value_type: PrimitiveType,
+    nodes: I,
+) -> Result<LinearListValue<RowId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
+where
+    E: snafu::Error + Send + Sync + 'static,
+    RowId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    I: IntoIterator<
+        Item = Result<
+            SnapshotNode<IdWithIndex<RowId>, PrimitiveValueArray>,
+            InMemoryNodeDecodeError<E>,
+        >,
+    >,
+{
+    match value_type {
+        PrimitiveType::String => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_string))
+                .map(LinearListValue::String)
+        }
+        PrimitiveType::UInt => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_uint))
+                .map(LinearListValue::UInt)
+        }
+        PrimitiveType::Int => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_int))
+                .map(LinearListValue::Int)
+        }
+        PrimitiveType::Byte => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_byte))
+                .map(LinearListValue::Byte)
+        }
+        PrimitiveType::Float => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_float))
+                .map(LinearListValue::Float)
+        }
+        PrimitiveType::Boolean => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_boolean))
+                .map(LinearListValue::Boolean)
+        }
+        PrimitiveType::Binary => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_binary))
+                .map(LinearListValue::Binary)
+        }
+        PrimitiveType::Date => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_date))
+                .map(LinearListValue::Date)
+        }
+        PrimitiveType::Timestamp => {
+            LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_timestamp))
+                .map(LinearListValue::Timestamp)
+        }
+    }
+}
+
+fn map_snapshot_nodes_value<Id, InputValue, OutputValue, E, I, F>(
+    nodes: I,
+    map_value: F,
+) -> impl Iterator<Item = Result<SnapshotNode<Id, OutputValue>, InMemoryNodeDecodeError<E>>>
+where
+    E: snafu::Error + Send + Sync + 'static,
+    I: IntoIterator<Item = Result<SnapshotNode<Id, InputValue>, InMemoryNodeDecodeError<E>>>,
+    F: Fn(InputValue) -> Result<OutputValue, DataModelValueError> + Copy,
+{
+    nodes.into_iter().map(move |entry| {
+        let node = entry?;
+        let value = match node.value {
+            Some(value) => Some(map_value(value).context(InvalidNodeValueSnafu)?),
+            None => None,
+        };
+        Ok(SnapshotNode {
+            id: node.id,
+            left: node.left,
+            right: node.right,
+            deleted: node.deleted,
+            value,
+        })
+    })
+}
+
+macro_rules! define_nullable_basic_converters {
+    ($required_fn:ident, $optional_fn:ident, $out_ty:ty, $pattern:pat => $mapped:expr) => {
+        fn $required_fn(value: NullableBasicValue) -> Result<$out_ty, DataModelValueError> {
+            match value {
+                NullableBasicValue::Null => Err(DataModelValueError::NullabilityMismatch {
+                    expected_nullable: false,
+                    actual_nullable: true,
+                }),
+                NullableBasicValue::Value(value) => match value {
+                    $pattern => Ok($mapped),
+                    _ => Err(DataModelValueError::BasicTypeMismatch),
+                },
+            }
+        }
+
+        fn $optional_fn(value: NullableBasicValue) -> Result<Option<$out_ty>, DataModelValueError> {
+            match value {
+                NullableBasicValue::Null => Ok(None),
+                NullableBasicValue::Value(value) => match value {
+                    $pattern => Ok(Some($mapped)),
+                    _ => Err(DataModelValueError::BasicTypeMismatch),
+                },
+            }
+        }
+    };
+}
+
+define_nullable_basic_converters!(
+    decode_required_string,
+    decode_optional_string,
+    String,
+    BasicValue::Primitive(PrimitiveValue::String(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_uint,
+    decode_optional_uint,
+    u64,
+    BasicValue::Primitive(PrimitiveValue::UInt(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_int,
+    decode_optional_int,
+    i64,
+    BasicValue::Primitive(PrimitiveValue::Int(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_byte,
+    decode_optional_byte,
+    u8,
+    BasicValue::Primitive(PrimitiveValue::Byte(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_float,
+    decode_optional_float,
+    OrderedFloat<f64>,
+    BasicValue::Primitive(PrimitiveValue::Float(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_boolean,
+    decode_optional_boolean,
+    bool,
+    BasicValue::Primitive(PrimitiveValue::Boolean(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_binary,
+    decode_optional_binary,
+    Vec<u8>,
+    BasicValue::Primitive(PrimitiveValue::Binary(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_date,
+    decode_optional_date,
+    NaiveDate,
+    BasicValue::Primitive(PrimitiveValue::Date(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_timestamp,
+    decode_optional_timestamp,
+    UnixTimestamp,
+    BasicValue::Primitive(PrimitiveValue::Timestamp(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_string_array,
+    decode_optional_string_array,
+    Vec<String>,
+    BasicValue::Array(PrimitiveValueArray::String(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_uint_array,
+    decode_optional_uint_array,
+    Vec<u64>,
+    BasicValue::Array(PrimitiveValueArray::UInt(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_int_array,
+    decode_optional_int_array,
+    Vec<i64>,
+    BasicValue::Array(PrimitiveValueArray::Int(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_byte_array,
+    decode_optional_byte_array,
+    Vec<u8>,
+    BasicValue::Array(PrimitiveValueArray::Byte(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_float_array,
+    decode_optional_float_array,
+    Vec<OrderedFloat<f64>>,
+    BasicValue::Array(PrimitiveValueArray::Float(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_boolean_array,
+    decode_optional_boolean_array,
+    Vec<bool>,
+    BasicValue::Array(PrimitiveValueArray::Boolean(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_binary_array,
+    decode_optional_binary_array,
+    Vec<Vec<u8>>,
+    BasicValue::Array(PrimitiveValueArray::Binary(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_date_array,
+    decode_optional_date_array,
+    Vec<NaiveDate>,
+    BasicValue::Array(PrimitiveValueArray::Date(value)) => value
+);
+define_nullable_basic_converters!(
+    decode_required_timestamp_array,
+    decode_optional_timestamp_array,
+    Vec<UnixTimestamp>,
+    BasicValue::Array(PrimitiveValueArray::Timestamp(value)) => value
+);
+
+fn decode_list_string(value: PrimitiveValueArray) -> Result<Vec<String>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::String(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::String,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_uint(value: PrimitiveValueArray) -> Result<Vec<u64>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::UInt(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::UInt,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_int(value: PrimitiveValueArray) -> Result<Vec<i64>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Int(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Int,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_byte(value: PrimitiveValueArray) -> Result<Vec<u8>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Byte(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Byte,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_float(
+    value: PrimitiveValueArray,
+) -> Result<Vec<OrderedFloat<f64>>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Float(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Float,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_boolean(value: PrimitiveValueArray) -> Result<Vec<bool>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Boolean(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Boolean,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_binary(value: PrimitiveValueArray) -> Result<Vec<Vec<u8>>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Binary(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Binary,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_date(value: PrimitiveValueArray) -> Result<Vec<NaiveDate>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Date(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Date,
+            actual: actual.primitive_type(),
+        }),
+    }
+}
+fn decode_list_timestamp(
+    value: PrimitiveValueArray,
+) -> Result<Vec<UnixTimestamp>, DataModelValueError> {
+    match value {
+        PrimitiveValueArray::Timestamp(value) => Ok(value),
+        actual => Err(DataModelValueError::PrimitiveTypeMismatch {
+            expected: PrimitiveType::Timestamp,
+            actual: actual.primitive_type(),
+        }),
     }
 }
 

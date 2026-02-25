@@ -140,17 +140,18 @@ where
         }
     }
 
-    /// Visit a stable, ordered snapshot stream of the current in-memory state.
-    pub fn visit_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
+    /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<IdWithIndex<Id>, [T]>,
     {
         self.data
-            .visit_snapshot(sink, |value| value.values.as_slice())
+            .encode_snapshot(sink, |value| value.values.as_slice())
     }
 
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
+        E: snafu::Error + Send + Sync + 'static,
         I: IntoIterator<Item = Result<SnapshotNode<IdWithIndex<Id>, Vec<T>>, E>>,
     {
         let mapped = nodes.into_iter().map(|entry| {

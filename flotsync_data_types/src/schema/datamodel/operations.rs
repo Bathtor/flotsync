@@ -181,7 +181,7 @@ impl SchemaOperation {
 }
 /// Visitor for partial-schema operations.
 pub trait SchemaOperationVisitor {
-    type Error;
+    type Error: snafu::Error + Send + Sync + 'static;
 
     fn begin(&mut self, changed_field_count: usize) -> Result<(), Self::Error>;
 
@@ -201,17 +201,19 @@ where
 {
     let fields: Vec<OperationFieldValueRef<'a>> = fields.into_iter().collect();
     validate_schema_operation_fields(schema, fields.iter().cloned())
-        .map_err(SchemaVisitError::InvalidSchemaValue)?;
+        .map_err(|source| SchemaVisitError::InvalidSchemaValue { source })?;
 
     visitor
         .begin(fields.len())
-        .map_err(SchemaVisitError::Visitor)?;
+        .map_err(|source| SchemaVisitError::Visitor { source })?;
     for field in fields {
         visitor
             .field(field.field_name, field.value)
-            .map_err(SchemaVisitError::Visitor)?;
+            .map_err(|source| SchemaVisitError::Visitor { source })?;
     }
-    visitor.end().map_err(SchemaVisitError::Visitor)
+    visitor
+        .end()
+        .map_err(|source| SchemaVisitError::Visitor { source })
 }
 /// Validate partial operation field payloads against a schema.
 ///
@@ -329,63 +331,68 @@ pub fn visit_operation_value<V>(
 ) -> Result<(), VisitError<V::Error>>
 where
     V: OperationValueVisitor,
+    V::Error: snafu::Error + Send + Sync + 'static,
 {
     match (data_type, value) {
         (
             ReplicatedDataType::LatestValueWins { value_type },
             OperationValueRef::LatestValueWinsUpdate(v),
         ) => {
-            ensure_nullable_basic_type(value_type, &v).map_err(VisitError::InvalidValue)?;
+            ensure_nullable_basic_type(value_type, &v)
+                .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
                 .visit_latest_value_wins_update(value_type, v)
-                .map_err(VisitError::Visitor)
+                .map_err(|source| VisitError::VisitorSource { source })
         }
         (ReplicatedDataType::LinearString, OperationValueRef::LinearStringInsert(v)) => visitor
             .visit_linear_string_insert(v)
-            .map_err(VisitError::Visitor),
+            .map_err(|source| VisitError::VisitorSource { source }),
         (ReplicatedDataType::LinearString, OperationValueRef::LinearStringDelete) => visitor
             .visit_linear_string_delete()
-            .map_err(VisitError::Visitor),
+            .map_err(|source| VisitError::VisitorSource { source }),
         (ReplicatedDataType::LinearList { value_type }, OperationValueRef::LinearListInsert(v)) => {
             ensure_primitive_array_type(*value_type, v.primitive_type())
-                .map_err(VisitError::InvalidValue)?;
+                .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
                 .visit_linear_list_insert(*value_type, v)
-                .map_err(VisitError::Visitor)
+                .map_err(|source| VisitError::VisitorSource { source })
         }
         (ReplicatedDataType::LinearList { .. }, OperationValueRef::LinearListDelete) => visitor
             .visit_linear_list_delete()
-            .map_err(VisitError::Visitor),
+            .map_err(|source| VisitError::VisitorSource { source }),
         (
             ReplicatedDataType::MonotonicCounter { small_range },
             OperationValueRef::MonotonicCounterIncrement(v),
         ) => {
-            ensure_counter_type(*small_range, v).map_err(VisitError::InvalidValue)?;
+            ensure_counter_type(*small_range, v)
+                .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
                 .visit_monotonic_counter_increment(*small_range, v)
-                .map_err(VisitError::Visitor)
+                .map_err(|source| VisitError::VisitorSource { source })
         }
         (
             ReplicatedDataType::TotalOrderRegister { value_type, .. },
             OperationValueRef::TotalOrderRegisterSet(v),
         ) => {
-            ensure_primitive_type(*value_type, v.value_type()).map_err(VisitError::InvalidValue)?;
+            ensure_primitive_type(*value_type, v.value_type())
+                .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
                 .visit_total_order_register_set(*value_type, v)
-                .map_err(VisitError::Visitor)
+                .map_err(|source| VisitError::VisitorSource { source })
         }
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
             OperationValueRef::TotalOrderFiniteStateRegisterSet(v),
         ) => {
-            ensure_finite_state_value(*value_type, states, &v).map_err(VisitError::InvalidValue)?;
+            ensure_finite_state_value(*value_type, states, &v)
+                .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
                 .visit_total_order_finite_state_register_set(*value_type, states, v)
-                .map_err(VisitError::Visitor)
+                .map_err(|source| VisitError::VisitorSource { source })
         }
-        _ => Err(VisitError::InvalidValue(
-            DataModelValueError::InvalidOperationValueForType,
-        )),
+        _ => Err(VisitError::InvalidVisitedValue {
+            source: DataModelValueError::InvalidOperationValueForType,
+        }),
     }
 }
 
@@ -396,19 +403,20 @@ pub fn decode_operation_value<D>(
 ) -> Result<OperationValue, DecodeError<D::Error>>
 where
     D: OperationValueDecoder,
+    D::Error: snafu::Error + Send + Sync + 'static,
 {
     match data_type {
         ReplicatedDataType::LatestValueWins { value_type } => {
             let value = decoder
                 .decode_latest_value_wins_update(value_type)
-                .map_err(DecodeError::Decoder)?;
+                .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_nullable_basic_type(value_type, &value.as_ref())
-                .map_err(DecodeError::InvalidValue)?;
+                .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
             Ok(OperationValue::LatestValueWinsUpdate(value))
         }
         ReplicatedDataType::LinearString => match decoder
             .decode_linear_string_operation()
-            .map_err(DecodeError::Decoder)?
+            .map_err(|source| DecodeError::DecoderSource { source })?
         {
             LinearStringOperationValue::Insert(value) => {
                 Ok(OperationValue::LinearStringInsert(value))
@@ -418,11 +426,11 @@ where
         ReplicatedDataType::LinearList { value_type } => {
             match decoder
                 .decode_linear_list_operation(*value_type)
-                .map_err(DecodeError::Decoder)?
+                .map_err(|source| DecodeError::DecoderSource { source })?
             {
                 LinearListOperationValue::Insert(values) => {
                     ensure_primitive_array_type(*value_type, values.primitive_type())
-                        .map_err(DecodeError::InvalidValue)?;
+                        .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
                     Ok(OperationValue::LinearListInsert(values))
                 }
                 LinearListOperationValue::Delete => Ok(OperationValue::LinearListDelete),
@@ -431,24 +439,25 @@ where
         ReplicatedDataType::MonotonicCounter { small_range } => {
             let value = decoder
                 .decode_monotonic_counter_increment(*small_range)
-                .map_err(DecodeError::Decoder)?;
-            ensure_counter_type(*small_range, value.as_ref()).map_err(DecodeError::InvalidValue)?;
+                .map_err(|source| DecodeError::DecoderSource { source })?;
+            ensure_counter_type(*small_range, value.as_ref())
+                .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
             Ok(OperationValue::MonotonicCounterIncrement(value))
         }
         ReplicatedDataType::TotalOrderRegister { value_type, .. } => {
             let value = decoder
                 .decode_total_order_register_set(*value_type)
-                .map_err(DecodeError::Decoder)?;
+                .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_primitive_type(*value_type, value.primitive_type())
-                .map_err(DecodeError::InvalidValue)?;
+                .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
             Ok(OperationValue::TotalOrderRegisterSet(value))
         }
         ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states } => {
             let value = decoder
                 .decode_total_order_finite_state_register_set(*value_type, states)
-                .map_err(DecodeError::Decoder)?;
+                .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_finite_state_value(*value_type, states, &value.as_ref())
-                .map_err(DecodeError::InvalidValue)?;
+                .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
             Ok(OperationValue::TotalOrderFiniteStateRegisterSet(value))
         }
     }
@@ -460,8 +469,8 @@ fn validate_operation_value_for_type(
     let mut visitor = NoopOperationValueVisitor;
     match visit_operation_value(&mut visitor, data_type, value) {
         Ok(()) => Ok(()),
-        Err(VisitError::InvalidValue(error)) => Err(error),
-        Err(VisitError::Visitor(never)) => match never {},
+        Err(VisitError::InvalidVisitedValue { source }) => Err(source),
+        Err(VisitError::VisitorSource { source: never }) => match never {},
     }
 }
 struct NoopOperationValueVisitor;

@@ -20,7 +20,7 @@ pub struct VecLinearData<Id, Value> {
     pub(super) nodes: Vec<Node<Id, Value>>,
 }
 impl<Id, Value> VecLinearData<Id, Value> {
-    pub(crate) fn visit_snapshot<S, ValueRef: ?Sized, F>(
+    pub(crate) fn encode_snapshot<S, ValueRef: ?Sized, F>(
         &self,
         sink: &mut S,
         mut map_value: F,
@@ -64,6 +64,7 @@ impl<Id, Value> VecLinearData<Id, Value> {
 
     pub(crate) fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
+        E: snafu::Error + Send + Sync + 'static,
         I: IntoIterator<Item = Result<SnapshotNode<Id, Value>, E>>,
     {
         let mut iter = nodes.into_iter();

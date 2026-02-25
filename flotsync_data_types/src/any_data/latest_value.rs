@@ -103,16 +103,17 @@ where
         self.data.iter_values()
     }
 
-    /// Visit a stable, ordered snapshot stream of the current in-memory state.
-    pub fn visit_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
+    /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<Id, T>,
     {
-        self.data.visit_snapshot(sink, |x| x)
+        self.data.encode_snapshot(sink, |x| x)
     }
 
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
+        E: snafu::Error + Send + Sync + 'static,
         I: IntoIterator<Item = Result<SnapshotNode<Id, T>, E>>,
     {
         let data = VecLinearData::from_snapshot_nodes(nodes)?;
