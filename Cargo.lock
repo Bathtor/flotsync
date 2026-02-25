@@ -874,9 +874,11 @@ name = "flotsync_core"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "base64",
  "flotsync_utils",
  "itertools 0.14.0",
  "maplit",
+ "niceware",
  "proptest",
  "regex",
  "snafu",
@@ -1500,6 +1502,15 @@ dependencies = [
  "libc",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "niceware"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf548efd42438f60bf10f51e4d1c7f7bab7f3887db7fc5cf98b312ad5917fc3d"
+dependencies = [
+ "rand 0.8.5",
 ]
 
 [[package]]

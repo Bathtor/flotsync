@@ -36,7 +36,7 @@ impl<V> TrieMap<V> {
 
     pub fn insert(&mut self, key: Identifier, value: V) -> Option<V> {
         let mut node = &mut self.root;
-        for segment in key.segments {
+        for segment in key.segments() {
             node = node.children.entry(segment).or_insert_with(|| TrieNode {
                 value: None,
                 children: AHashMap::new(),
@@ -47,7 +47,7 @@ impl<V> TrieMap<V> {
 
     pub fn get(&self, key: &Identifier) -> Option<&V> {
         let mut node = &self.root;
-        for segment in &key.segments {
+        for segment in key.segments_iter() {
             node = node.children.get(segment)?;
         }
         node.value.as_ref()
@@ -55,7 +55,7 @@ impl<V> TrieMap<V> {
 
     pub fn get_mut(&mut self, key: &Identifier) -> Option<&mut V> {
         let mut node = &mut self.root;
-        for segment in &key.segments {
+        for segment in key.segments_iter() {
             node = node.children.get_mut(segment)?;
         }
         node.value.as_mut()
@@ -105,9 +105,7 @@ impl<'a, V> Iterator for TrieIter<'a, V> {
                     && let Some(ref value) = node.value
                 {
                     return Some((
-                        Identifier {
-                            segments: self.path.clone(),
-                        },
+                        Identifier::from_segments_unchecked(self.path.clone().into_boxed_slice()),
                         value,
                     ));
                 }

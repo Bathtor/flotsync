@@ -10,6 +10,8 @@ regex = "1"
 snafu = "0.8"
 uuid = { version = "1", features = ["v4"] }
 ahash = "0.8"
+base64 = "0.22"
+niceware = "1"
 
 [dev-dependencies]
 proptest = "1"
