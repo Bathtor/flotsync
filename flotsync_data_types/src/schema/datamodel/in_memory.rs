@@ -89,6 +89,7 @@ impl<RowId> InMemoryData<RowId> {
     /// Validate and append one row represented by positional field values.
     ///
     /// Returns the inserted row index on success.
+    #[allow(dead_code, reason = "Maybe remove this if it remains unused")]
     pub(crate) fn push_row_from_field_values(
         &mut self,
         fields: Vec<InMemoryFieldValue<RowId>>,

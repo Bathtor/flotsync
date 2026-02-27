@@ -1,8 +1,10 @@
 use crate::{
+    OperationError,
+    UnsupportedOperationVariantSnafu,
     linear_data::{DataOperation, LinearData, VecLinearData},
     snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
 };
-use std::{fmt, hash::Hash};
+use std::{borrow::Cow, fmt, hash::Hash};
 
 /// A single-slot *latest value wins* register with Yjs `ReplaceManager` semantics.
 ///
@@ -82,8 +84,9 @@ where
     /// replicas.
     pub fn update_operation(&self, id: Id, new_value: T) -> UpdateOperation<Id, T> {
         let ids = self.data.ids_after_head();
-        let data_op = ids.insert_operation(id, new_value);
-        UpdateOperation { op: data_op }
+        ids.insert_operation(id, new_value)
+            .try_into()
+            .expect("This must succeed")
     }
 
     /// Apply an update operation received from some replica (including ourselves).
@@ -92,8 +95,8 @@ where
         operation: UpdateOperation<Id, T>,
     ) -> Result<(), UpdateOperation<Id, T>> {
         self.data
-            .apply_operation(operation.op)
-            .map_err(|op| UpdateOperation { op })
+            .apply_operation(operation.into())
+            .map_err(|op| UpdateOperation::try_from(op).expect("This must succeed"))
     }
 
     /// Returns all values that we at some point part of this CRDT.
@@ -126,7 +129,35 @@ where
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpdateOperation<Id, T> {
-    op: DataOperation<Id, T>,
+    pub id: Id,
+    pub pred: Id,
+    pub succ: Id,
+    pub value: T,
+}
+impl<Id, T> TryFrom<DataOperation<Id, T>> for UpdateOperation<Id, T> {
+    type Error = OperationError;
+
+    fn try_from(value: DataOperation<Id, T>) -> Result<Self, Self::Error> {
+        match value {
+            DataOperation::Insert { id, pred, succ, value } => Ok(Self {
+            id,
+            pred,
+            succ,
+            value
+        }),
+            DataOperation::Delete { .. } => UnsupportedOperationVariantSnafu {explanation: Cow::Borrowed( "UpdateOperation can only be created from DataOperation::Insert variants, but got DataOperation::Delete")}.fail(),
+        }
+    }
+}
+impl<Id, T> From<UpdateOperation<Id, T>> for DataOperation<Id, T> {
+    fn from(val: UpdateOperation<Id, T>) -> Self {
+        DataOperation::Insert {
+            id: val.id,
+            pred: val.pred,
+            succ: val.succ,
+            value: val.value,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,12 +296,10 @@ mod tests {
         let before = reg.clone();
 
         let malformed = UpdateOperation {
-            op: DataOperation::Insert {
-                id: 42,
-                pred: 999,
-                succ: 1000,
-                value: 7,
-            },
+            id: 42,
+            pred: 999,
+            succ: 1000,
+            value: 7,
         };
 
         let res = reg.apply_operation(malformed.clone());

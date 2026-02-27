@@ -846,7 +846,7 @@ mod tests {
         target.put_u32_le(u32::try_from(fields.len()).map_err(|_| "too many fields".to_owned())?);
 
         let mut entries: Vec<(&String, &Bytes)> = fields.iter().collect();
-        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        entries.sort_by_key(|(l, _)| *l);
         for (field_name, payload) in entries {
             snapshot_bytes::write_bytes(target, field_name.as_bytes())?;
             snapshot_bytes::write_bytes(target, payload.as_ref())?;
