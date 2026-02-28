@@ -168,16 +168,7 @@ impl<Id, Value> VecLinearData<Id, Value>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq,
 {
-    pub fn new<I>(id_generator: &mut I) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
-        let begin_id = id_generator
-            .next()
-            .expect("The generator must produce sufficient ids.");
-        let end_id = id_generator
-            .next()
-            .expect("The generator must produce sufficient ids.");
+    pub fn new(begin_id: Id, end_id: Id) -> Self {
         let begin_node = Node {
             id: begin_id.clone(),
             left_origin: None,
@@ -194,20 +185,8 @@ where
         Self { len: 0, nodes }
     }
 
-    pub fn with_value<I>(id_generator: &mut I, initial_value: Value) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
-        let begin_id = id_generator
-            .next()
-            .expect("The generator must produce sufficient ids.");
-        let value_id = id_generator
-            .next()
-            .expect("The generator must produce sufficient ids.");
-        let end_id = id_generator
-            .next()
-            .expect("The generator must produce sufficient ids.");
-
+    pub fn with_value(initial_value: Value, ids: [Id; 3]) -> Self {
+        let [begin_id, value_id, end_id] = ids;
         let begin_node = Node {
             id: begin_id.clone(),
             left_origin: None,

@@ -83,86 +83,66 @@ where
         Self { len, base }
     }
 
-    pub fn new<I>(id_generator: &mut I) -> Self
-    where
-        I: Iterator<Item = BaseId>,
-    {
-        let mut sub_id_generator = IdGeneratorWithSubIndex::new(id_generator);
-        let base = VecLinearData::new(&mut sub_id_generator);
+    pub fn new(initial_id: BaseId) -> Self {
+        let begin_id = IdWithIndex::zero(initial_id);
+        let end_id = begin_id.increment();
+        let begin_node = Node {
+            id: begin_id.clone(),
+            left_origin: None,
+            right_origin: Some(end_id.clone()),
+            operation: Operation::Beginning,
+        };
+        let end_node = Node {
+            id: end_id,
+            left_origin: Some(begin_id),
+            right_origin: None,
+            operation: Operation::End,
+        };
+        let base = VecLinearData {
+            len: 0,
+            nodes: vec![begin_node, end_node],
+        };
         Self { len: 0, base }
     }
 
-    pub fn with_value<I>(id_generator: &mut I, initial_value: Value) -> Self
-    where
-        I: Iterator<Item = BaseId>,
-    {
+    pub fn with_value(initial_id: BaseId, initial_value: Value) -> Self {
         if initial_value.is_empty() {
-            return Self::new(id_generator);
+            return Self::new(initial_id);
         }
 
         let value_len = initial_value.len();
 
-        let begin_id = IdWithIndex::zero(
-            id_generator
-                .next()
-                .expect("The generator must produce sufficient ids."),
+        let begin_id = IdWithIndex::zero(initial_id);
+        let value_id = begin_id.increment();
+        assert!(
+            value_id.can_address(value_len),
+            "The id='{value_id:?}' cannot address all elements of the initial value."
         );
-        let mut next_id = begin_id.increment();
+        let end_id = value_id
+            .checked_next_after(value_len)
+            .expect("Initial value would require indices > u32::MAX");
 
         let begin_node = Node {
             id: begin_id.clone(),
             left_origin: None,
-            right_origin: Some(next_id.clone()),
+            right_origin: Some(value_id.clone()),
             operation: Operation::Beginning,
         };
-
-        let mut nodes = Vec::with_capacity(3);
-        nodes.push(begin_node);
-
-        let mut remaining_value_opt = Some(initial_value);
-        while let Some(remaining_value) = remaining_value_opt.take() {
-            let remaining_indices = next_id.addressable_len();
-            let (current_value, current_id) = if remaining_indices < remaining_value.len() {
-                let (head, remainder) = remaining_value.split_at(remaining_indices);
-                remaining_value_opt = Some(remainder);
-                let id = std::mem::replace(
-                    &mut next_id,
-                    IdWithIndex::zero(
-                        id_generator
-                            .next()
-                            .expect("The generator must produce sufficient ids."),
-                    ),
-                );
-                (head, id)
-            } else {
-                let mut id = &next_id
-                    + remaining_value
-                        .len()
-                        .try_into()
-                        .expect("Should fit into u16 now");
-                std::mem::swap(&mut id, &mut next_id);
-
-                (remaining_value, id)
-            };
-            let value_node = Node {
-                id: current_id,
-                left_origin: nodes.last().map(|n| n.last_id()),
-                right_origin: Some(next_id.clone()),
-                operation: Operation::Insert {
-                    value: current_value,
-                },
-            };
-            nodes.push(value_node);
-        }
-
-        let end_id = next_id;
+        let value_node = Node {
+            id: value_id.clone(),
+            left_origin: Some(begin_id.clone()),
+            right_origin: Some(end_id.clone()),
+            operation: Operation::Insert {
+                value: initial_value,
+            },
+        };
         let end_node = Node {
             id: end_id,
-            left_origin: nodes.last().map(|n| n.last_id()),
+            left_origin: Some(value_node.last_id()),
             right_origin: None,
             operation: Operation::End,
         };
-        nodes.push(end_node);
+        let nodes = vec![begin_node, value_node, end_node];
 
         let base = VecLinearData { len: 1, nodes };
         Self {
@@ -333,7 +313,7 @@ where
                     self.node_at_position(*position).map(|pos| {
                         let node = &self.base.nodes[pos.node_index];
                         // This must fit if position is actually within the node.
-                        let start_offset: u16 =
+                        let start_offset: u32 =
                             (position - pos.node_start_position).try_into().unwrap();
                         (pos, &node.id + start_offset, *position)
                     })?
@@ -511,7 +491,7 @@ where
 
     /// Splits the node at `node_index` according to `mode` around `split_index` and returns
     /// the node index of the new node with the id that matches `split_index`.
-    fn split_node(&mut self, node_index: usize, split_index: u16, mut mode: SplitMode) -> usize {
+    fn split_node(&mut self, node_index: usize, split_index: u32, mut mode: SplitMode) -> usize {
         let target_node = &mut self.base.nodes[node_index];
         assert!(
             split_index <= target_node.last_index(),
@@ -740,9 +720,9 @@ where
                 node_index: node_index_at_position,
                 node_start_position,
             } = self.node_at_position(position).unwrap();
-            let position_offset: u16 = (position - node_start_position)
+            let position_offset: u32 = (position - node_start_position)
                 .try_into()
-                .expect("Index offsets must fit into a u16");
+                .expect("Index offsets must fit into a u32");
 
             // All of these must exist if the list is valid.
             let current_node = &self.base.nodes[node_index_at_position];
@@ -835,8 +815,12 @@ where
                 ref id,
                 ref pred,
                 ref succ,
+                ref value,
                 ..
             } => {
+                if !id.can_address(value.len()) {
+                    return Err(operation);
+                }
                 //println!("Inserting {:?}", operation);
                 let pred_opt = self
                     .base
@@ -1227,82 +1211,22 @@ where
     }
 }
 
-struct IdGeneratorWithSubIndex<'a, I>
-where
-    I: Iterator,
-{
-    underlying: &'a mut I,
-    next_id: Option<I::Item>,
-    next_index: Option<u16>,
-}
-impl<'a, I> IdGeneratorWithSubIndex<'a, I>
-where
-    I: Iterator,
-{
-    pub fn new(underlying: &'a mut I) -> Self {
-        Self {
-            underlying,
-            next_id: None,
-            next_index: Some(0u16),
-        }
-    }
-}
-impl<'a, I> Iterator for IdGeneratorWithSubIndex<'a, I>
-where
-    I: Iterator,
-    I::Item: Clone,
-{
-    type Item = IdWithIndex<I::Item>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Make sure we polled this at least once.
-        if self.next_id.is_none() {
-            self.next_id = self.underlying.next();
-        }
-        if let Some(ref id) = self.next_id {
-            if let Some(index) = self.next_index {
-                self.next_index = index.checked_add(1);
-                Some(IdWithIndex {
-                    id: id.clone(),
-                    index,
-                })
-            } else {
-                // Try to get another id and start the indexing over.
-                self.next_id = self.underlying.next();
-                if let Some(ref id) = self.next_id {
-                    self.next_index = Some(1u16);
-                    Some(IdWithIndex {
-                        id: id.clone(),
-                        index: 0u16,
-                    })
-                } else {
-                    // We are empty.
-                    None
-                }
-            }
-        } else {
-            // We are definitely empty.
-            None
-        }
-    }
-}
-
 /// A variant of an operation id that allows multiple ordered operations at the same time,
 /// without having to do explictly different operations for each.
 #[allow(unused)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct IdWithIndex<Id> {
     pub id: Id,
-    pub index: u16, // Probably sufficient for a single operation.
+    pub index: u32,
 }
 #[allow(unused)]
 impl<Id> IdWithIndex<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq,
+    Id: Clone,
 {
     /// The maximum length of a single [[Composite]] addressed by an [[IdWithIndex]] starting
     /// at index 0.
-    pub const MAX_LENGTH: usize = u16::MAX as usize;
+    pub const MAX_LENGTH: usize = u32::MAX as usize;
 
     pub fn zero(id: Id) -> Self {
         IdWithIndex { id, index: 0 }
@@ -1314,15 +1238,13 @@ where
     /// - If there are no indices left.
     pub fn increment(&self) -> Self {
         self.checked_increment()
-            .expect("Cannot support more that 2^16 individual operations per id")
+            .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the next sub-id (i.e. the next `index`), if there is one left.
-    ///
-    /// Otherwise the caller needs to produce a new major `id`.
     pub fn checked_increment(&self) -> Option<Self> {
         let mut next = self.clone();
-        next.index.checked_add(1u16).map(|next_index| {
+        next.index.checked_add(1u32).map(|next_index| {
             next.index = next_index;
             next
         })
@@ -1334,13 +1256,13 @@ where
     /// - If index is 0.
     pub fn decrement(&self) -> Self {
         self.checked_decrement()
-            .expect("Cannot support more that 2^16 individual operations per id")
+            .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the previous sub-id (i.e. the previous `index`), if index is not 0.
     pub fn checked_decrement(&self) -> Option<Self> {
         let mut prev = self.clone();
-        prev.index.checked_sub(1u16).map(|prev_index| {
+        prev.index.checked_sub(1u32).map(|prev_index| {
             prev.index = prev_index;
             prev
         })
@@ -1350,17 +1272,27 @@ where
     /// if the first element is at `self.index`.
     #[inline]
     pub fn can_address(&self, num_elements: usize) -> bool {
-        self.addressable_len() >= num_elements
+        if num_elements == 0 {
+            return true;
+        }
+        let last_offset = match u32::try_from(num_elements - 1) {
+            Ok(last_offset) => last_offset,
+            Err(_) => return false,
+        };
+        self.index.checked_add(last_offset).is_some()
     }
 
     /// Returns the number of elements in a [[Composite]] that can at most be addressed by this id.
     #[inline]
     pub fn addressable_len(&self) -> usize {
-        Self::MAX_LENGTH - (self.index as usize)
+        (Self::MAX_LENGTH.saturating_sub(self.index as usize)).saturating_add(1)
     }
 
     /// Returns `true` iff `other` is the same as what `self.increment()` would return.
-    pub fn is_followed_by(&self, other: &Self) -> bool {
+    pub fn is_followed_by(&self, other: &Self) -> bool
+    where
+        Id: PartialEq,
+    {
         self.id == other.id
             && self
                 .index
@@ -1369,11 +1301,25 @@ where
                 .unwrap_or(false)
     }
 
-    fn index_diff(&self, other: &IdWithIndex<Id>) -> u16 {
-        assert_eq!(self.id, other.id);
+    fn index_diff(&self, other: &IdWithIndex<Id>) -> u32
+    where
+        Id: PartialEq,
+    {
+        assert!(self.id == other.id);
         self.index
             .checked_sub(other.index)
             .expect("Index different overflowed")
+    }
+
+    pub fn checked_next_after(&self, num_elements: usize) -> Option<Self> {
+        let offset = u32::try_from(num_elements).ok()?;
+        self.checked_add_offset(offset)
+    }
+
+    pub fn checked_add_offset(&self, rhs: u32) -> Option<Self> {
+        let mut next = self.clone();
+        next.index = next.index.checked_add(rhs)?;
+        Some(next)
     }
 
     /// Returns a new id where `id` is the the same as `self.id` and `index`` is the largest
@@ -1381,7 +1327,7 @@ where
     pub fn with_max_index(&self) -> Self {
         Self {
             id: self.id.clone(),
-            index: u16::MAX,
+            index: u32::MAX,
         }
     }
 
@@ -1394,28 +1340,26 @@ where
         }
     }
 }
-impl<Id> std::ops::Add<u16> for IdWithIndex<Id>
+impl<Id> std::ops::Add<u32> for IdWithIndex<Id>
 where
     Id: Clone,
 {
     type Output = Self;
 
-    fn add(mut self, rhs: u16) -> Self::Output {
-        self.index += rhs;
-        self
+    fn add(self, rhs: u32) -> Self::Output {
+        self.checked_add_offset(rhs)
+            .expect("Adding the offset would require indices > u32::MAX")
     }
 }
-impl<Id> std::ops::Add<u16> for &IdWithIndex<Id>
+impl<Id> std::ops::Add<u32> for &IdWithIndex<Id>
 where
     Id: Clone,
 {
     type Output = IdWithIndex<Id>;
 
-    fn add(self, rhs: u16) -> Self::Output {
-        IdWithIndex {
-            id: self.id.clone(),
-            index: self.index + rhs,
-        }
+    fn add(self, rhs: u32) -> Self::Output {
+        self.checked_add_offset(rhs)
+            .expect("Adding the offset would require indices > u32::MAX")
     }
 }
 impl<Id> fmt::Display for IdWithIndex<Id>
@@ -1433,14 +1377,14 @@ where
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdWithIndexRange<Id> {
     pub id: Id,
-    pub start_index: u16,
-    pub end_index: u16,
+    pub start_index: u32,
+    pub end_index: u32,
 }
 impl<Id> IdWithIndexRange<Id>
 where
     Id: Clone,
 {
-    pub fn with_end(id: IdWithIndex<Id>, end_index: u16) -> Self {
+    pub fn with_end(id: IdWithIndex<Id>, end_index: u32) -> Self {
         Self {
             id: id.id,
             start_index: id.index,
@@ -1452,7 +1396,7 @@ where
         self.start_index == self.end_index
     }
 
-    pub fn len(&self) -> u16 {
+    pub fn len(&self) -> u32 {
         assert!(self.start_index <= self.end_index);
         self.end_index - self.start_index
     }

@@ -6,7 +6,6 @@ use crate::{
         IdGeneratorWithZeroIndex,
         IdWithIndex,
         LinearData,
-        LinkIds,
         VecCoalescedLinearDataIter,
     },
 };
@@ -147,6 +146,8 @@ where
 pub enum DiffError {
     #[snafu(display("The id generator did not produce sufficient ids to complete the diff."))]
     IdsExhausted,
+    #[snafu(display("A single insert would require indices > u32::MAX."))]
+    IndexExhausted,
     #[snafu(transparent)]
     Internal { source: InternalError },
 }
@@ -157,9 +158,8 @@ pub enum DiffError {
 /// This uses a text diffing algorithm internally to produce a small set of text changes and then
 /// translate this into equivalent linear data operations using the `id_generator` to produce
 /// new node ids as required.
-/// (If the insertions are small enough it will try to use a single id only,
-/// but larger insertions could require more, so callers need to handle lazily producing additional
-/// ids.)
+/// Each inserted diff fragment uses a single major id and fails if its addressed indices would
+/// exceed `u32::MAX`.
 pub fn linear_diff<Id>(
     base: &LinearString<Id>,
     changed: &str,
@@ -175,7 +175,6 @@ where
     // Convert the TextChange to DataOperations over `base`.
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, String>> =
         Vec::with_capacity(basic_diff.len());
-    let mut active_insert_op_id: Option<IdWithIndex<Id>> = None;
     for change in basic_diff {
         match change {
             text_diff::TextChange::Insert { at, value } => {
@@ -209,65 +208,13 @@ where
                         }
                     }
                 };
-                let mut value_graphemes = GraphemeString::new(value);
-                let mut previous_op_end_id: Option<IdWithIndex<Id>> = None;
-                while !value_graphemes.is_empty() {
-                    // Set up ids for this operation.
-                    let op_id = if let Some(id) = active_insert_op_id.take() {
-                        id
-                    } else {
-                        id_with_index_generator.next().context(IdsExhaustedSnafu)?
-                    };
-                    require!(
-                        op_id.addressable_len() > 0,
-                        InternalSnafu {
-                            context: "There should have been some space left in the current id."
-                                .to_owned()
-                        }
-                        .build()
-                        .into()
-                    );
-                    let current_value = value_graphemes.take(op_id.addressable_len());
-
-                    let ids = if let Some(id) = previous_op_end_id.take() {
-                        // Update the predessor to the last id we inserted,
-                        // since by the time this operation executes,
-                        // that will be present in the target and the next operation should be
-                        // deterministically added after it and not accidentally sorted before it,
-                        // if it has different id (we don't know the sorting).
-                        LinkIds {
-                            predecessor: id,
-                            ..node_insert_ids.clone()
-                        }
-                    } else {
-                        node_insert_ids.clone()
-                    };
-                    let current_value_len = current_value.len();
-
-                    // Create operation.
-                    let op = ids.insert_operation(op_id.clone(), current_value.unwrap());
-                    operations.push(op);
-
-                    // Prepare upcoming ids.
-                    if current_value_len == op_id.addressable_len() {
-                        previous_op_end_id = Some(op_id.with_max_index());
-                        // Just leave active_insert_op_id as None
-                        // (which is after the take above anyway),
-                        // so that we only pull a new id from the generator,
-                        // if we really need another one.
-                    } else {
-                        let current_len: u16 = current_value_len.try_into().map_err(|e| InternalSnafu {
-                            context: format!("Failed to convert value length to u16, even though it was fit into addressable_len before: {e}")
-                        }.build())?;
-                        let diff_to_last_index =
-                            current_len.checked_sub(1).with_context(|| InternalSnafu {
-                                context: "current_len was 0 for a non-empty GraphemeString"
-                                    .to_owned(),
-                            })?;
-                        previous_op_end_id = Some(&op_id + diff_to_last_index);
-                        active_insert_op_id = Some(op_id + current_len);
-                    };
-                }
+                let value_graphemes = GraphemeString::new(value);
+                let op_id = id_with_index_generator.next().context(IdsExhaustedSnafu)?;
+                require!(
+                    op_id.can_address(value_graphemes.len()),
+                    IndexExhaustedSnafu.build().into()
+                );
+                operations.push(node_insert_ids.insert_operation(op_id, value_graphemes.unwrap()));
             }
             text_diff::TextChange::Delete { at, len } => {
                 let range_end = at + len;
@@ -302,7 +249,7 @@ mod tests {
     fn test_with_empty_string() {
         let mut id_generator = TestIdGenerator::new();
 
-        let mut linear = LinearString::new(&mut id_generator);
+        let mut linear = LinearString::new(id_generator.next().unwrap());
 
         let empty_diff = linear_diff(&linear, "", &mut id_generator).unwrap();
         assert!(empty_diff.is_empty());
@@ -360,7 +307,8 @@ mod tests {
                 let (from_index, from) = perm[0];
                 let (to_index, to) = perm[1];
                 let mut id_generator = TestIdGenerator::new();
-                let linear_from = LinearString::with_value(&mut id_generator, (*from).to_owned());
+                let linear_from =
+                    LinearString::with_value((*from).to_owned(), id_generator.next().unwrap());
                 check_diff_and_apply(
                     &linear_from,
                     to,
@@ -384,7 +332,8 @@ mod tests {
             let from = from_group[from_index];
             let to = to_group[to_index];
             let mut id_generator = TestIdGenerator::new();
-            let linear_from = LinearString::with_value(&mut id_generator, (*from).to_owned());
+            let linear_from =
+                LinearString::with_value((*from).to_owned(), id_generator.next().unwrap());
             check_diff_and_apply(
                 &linear_from,
                 to,
@@ -398,7 +347,8 @@ mod tests {
     #[test]
     fn diff_and_apply_larger_changes() {
         let mut id_generator = TestIdGenerator::new();
-        let linear_text_a = LinearString::with_value(&mut id_generator, TEXT_A.to_owned());
+        let linear_text_a =
+            LinearString::with_value(TEXT_A.to_owned(), id_generator.next().unwrap());
 
         check_diff_and_apply(
             &linear_text_a,
@@ -407,7 +357,8 @@ mod tests {
         );
 
         // And reverse.
-        let linear_text_b = LinearString::with_value(&mut id_generator, TEXT_B.to_owned());
+        let linear_text_b =
+            LinearString::with_value(TEXT_B.to_owned(), id_generator.next().unwrap());
         check_diff_and_apply(
             &linear_text_b,
             TEXT_A,
@@ -434,7 +385,7 @@ mod tests {
     #[test]
     fn test_sequence_of_changes() {
         let mut id_generator = TestIdGenerator::new();
-        let mut linear_from = LinearString::new(&mut id_generator);
+        let mut linear_from = LinearString::new(id_generator.next().unwrap());
 
         for to in SMALL_CHANGE_TEST_GROUPS.iter().flatten() {
             // let from = linear_from.to_string();
@@ -454,7 +405,7 @@ mod tests {
         for group in SMALL_CHANGE_TEST_GROUPS.iter() {
             // println!("### \n### Checking Group: {group:?}\n###");
             let mut id_generator = TestIdGenerator::new();
-            let base = LinearString::with_value(&mut id_generator, group[0].to_owned());
+            let base = LinearString::with_value(group[0].to_owned(), id_generator.next().unwrap());
 
             let diff_to_first = linear_diff(&base, group[1], &mut id_generator).unwrap();
             assert!(!diff_to_first.is_empty());
@@ -501,7 +452,7 @@ mod tests {
         // Ensure all results are the identical.
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
-        let shared_base = LinearString::new(&mut id_generator);
+        let shared_base = LinearString::new(id_generator.next().unwrap());
         struct Writer {
             id: usize,
             linear: LinearString<u32>,
@@ -574,7 +525,7 @@ mod tests {
     fn test_multi_step_repro() {
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
-        let shared_base = LinearString::new(&mut id_generator);
+        let shared_base = LinearString::new(id_generator.next().unwrap());
 
         // Writer A: "" -> "a" -> "Za" (second step references the id created in the first step).
         let mut a = shared_base.clone();
@@ -699,7 +650,7 @@ mod tests {
         // In the end (final sync), all writers must have converged to the same result.
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
-        let shared_base = LinearString::new(&mut id_generator);
+        let shared_base = LinearString::new(id_generator.next().unwrap());
         struct Writer {
             id: usize,
             linear: LinearString<u32>,

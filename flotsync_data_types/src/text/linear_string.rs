@@ -69,23 +69,17 @@ impl<Id> LinearString<Id>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
-    pub fn new<I>(id_generator: &mut I) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
-        let data = VecCoalescedLinearData::new(id_generator);
+    pub fn new(initial_id: Id) -> Self {
+        let data = VecCoalescedLinearData::new(initial_id);
         Self { data }
     }
 
-    pub fn with_value<I>(id_generator: &mut I, initial_value: String) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
+    pub fn with_value(initial_value: String, initial_id: Id) -> Self {
         if initial_value.is_empty() {
-            Self::new(id_generator)
+            Self::new(initial_id)
         } else {
             let wrapped_value = GraphemeString::new(initial_value);
-            let data = VecCoalescedLinearData::with_value(id_generator, wrapped_value);
+            let data = VecCoalescedLinearData::with_value(initial_id, wrapped_value);
             Self { data }
         }
     }
@@ -273,7 +267,7 @@ where
     S: Into<String>,
 {
     let s_owned: String = s.into();
-    VecLinearData::with_value(&mut std::iter::repeat(()), s_owned)
+    VecLinearData::with_value(s_owned, [(); 3])
 }
 
 #[cfg(test)]
@@ -305,7 +299,7 @@ pub(crate) mod tests {
         #[test]
         fn single_value_roundtrip() {
             let input = "A simple test string";
-            let linear = LinearString::with_value(&mut TestIdGenerator::new(), input.to_string());
+            let linear = LinearString::with_value(input.to_string(), 0u32);
             linear.check_integrity();
             assert_eq!(linear.to_string(), input);
         }
@@ -315,7 +309,7 @@ pub(crate) mod tests {
             let mut id_generator = TestIdGenerator::new();
 
             let mut reference = String::new();
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             assert_eq!(reference, linear.to_string());
             for s in TEST_VALUES {
                 reference.push_str(s);
@@ -331,7 +325,7 @@ pub(crate) mod tests {
             let mut id_generator = TestIdGenerator::new();
 
             let mut reference = String::new();
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             assert_eq!(reference, linear.to_string());
             for s in UNICODE_TEST_VALUES {
                 reference.push_str(s);
@@ -347,7 +341,7 @@ pub(crate) mod tests {
             let mut id_generator = TestIdGenerator::new();
 
             let mut reference = String::new();
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             assert_eq!(linear.to_string(), reference);
             for s in TEST_VALUES {
                 reference.push_str(s);
@@ -365,7 +359,7 @@ pub(crate) mod tests {
             let mut id_generator = TestIdGenerator::new();
 
             let mut reference = String::new();
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             assert_eq!(linear.to_string(), reference);
             for s in UNICODE_TEST_VALUES {
                 reference.push_str(s);
@@ -384,7 +378,7 @@ pub(crate) mod tests {
 
             // Setup both strings to be the same.
             let mut reference = TEST_VALUES.join("");
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             linear.append(
                 IdWithIndex::zero(id_generator.next().unwrap()),
                 reference.clone(),
@@ -445,7 +439,7 @@ pub(crate) mod tests {
 
             // Setup both strings to be the same.
             let mut reference = UNICODE_TEST_VALUES.join("");
-            let mut linear = LinearString::new(&mut id_generator);
+            let mut linear = LinearString::new(id_generator.next().unwrap());
             linear.append(
                 IdWithIndex::zero(id_generator.next().unwrap()),
                 reference.clone(),
@@ -509,7 +503,8 @@ pub(crate) mod tests {
         fn single_char_deletes() {
             let mut id_generator = TestIdGenerator::new();
 
-            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            let mut linear =
+                LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
             linear.check_integrity();
 
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
@@ -546,7 +541,8 @@ pub(crate) mod tests {
         fn range_deletes() {
             let mut id_generator = TestIdGenerator::new();
 
-            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            let mut linear =
+                LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
             linear.check_integrity();
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
@@ -600,7 +596,8 @@ pub(crate) mod tests {
         fn illegal_deletes() {
             let mut id_generator = TestIdGenerator::new();
 
-            let mut linear = LinearString::with_value(&mut id_generator, TEST_VALUES.join(""));
+            let mut linear =
+                LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
             linear.check_integrity();
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
@@ -677,10 +674,8 @@ pub(crate) mod tests {
 
         #[test]
         fn appends() {
-            let mut id_generator = &mut std::iter::repeat(());
-
             let mut reference = String::new();
-            let mut linear = LinearWordStringUntracked::new(&mut id_generator);
+            let mut linear = LinearWordStringUntracked::new((), ());
             assert_eq!(reference, linear.to_string());
             for s in TEST_VALUES {
                 reference.push_str(s);
@@ -692,10 +687,8 @@ pub(crate) mod tests {
 
         #[test]
         fn prepends() {
-            let mut id_generator = &mut std::iter::repeat(());
-
             let mut reference = String::new();
-            let mut linear = LinearWordStringUntracked::new(&mut id_generator);
+            let mut linear = LinearWordStringUntracked::new((), ());
             assert_eq!(linear.to_string(), reference);
             for s in TEST_VALUES {
                 reference.push_str(s);
@@ -713,7 +706,8 @@ pub(crate) mod tests {
 
             // Setup both strings to be the same.
             let mut reference = String::new();
-            let mut linear = LinearWordString::new(&mut id_generator);
+            let mut linear =
+                LinearWordString::new(id_generator.next().unwrap(), id_generator.next().unwrap());
             assert_eq!(linear.to_string(), reference);
             for s in TEST_VALUES {
                 reference.push_str(s);
@@ -770,7 +764,8 @@ pub(crate) mod tests {
         fn deletes() {
             let mut id_generator = TestIdGenerator::new();
 
-            let mut linear = LinearWordString::new(&mut id_generator);
+            let mut linear =
+                LinearWordString::new(id_generator.next().unwrap(), id_generator.next().unwrap());
             for s in TEST_VALUES {
                 linear.append(id_generator.next().unwrap(), s.to_string());
                 linear.check_integrity();

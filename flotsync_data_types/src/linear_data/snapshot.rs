@@ -396,18 +396,18 @@ pub(crate) mod bytes_testkit {
     }
 
     pub fn encode_id_with_index_u32(id: &IdWithIndex<u32>) -> Vec<u8> {
-        let mut out = Vec::with_capacity(6);
+        let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&id.id.to_le_bytes());
         out.extend_from_slice(&id.index.to_le_bytes());
         out
     }
 
     pub fn decode_id_with_index_u32(bytes: &[u8]) -> Result<IdWithIndex<u32>, String> {
-        if bytes.len() != 6 {
+        if bytes.len() != 8 {
             return Err("invalid IdWithIndex<u32> length".to_owned());
         }
         let id = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let index = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         Ok(IdWithIndex { id, index })
     }
 
@@ -473,11 +473,12 @@ mod tests {
         any_data::{LinearLatestValueWins, list::LinearList},
         text::LinearString,
     };
+    use itertools::Itertools;
 
     #[test]
     fn linear_list_snapshot_stream_has_expected_shape() {
         let mut id_generator = 0u32..;
-        let mut list = LinearList::with_values(&mut id_generator, [10i32, 20, 30]);
+        let mut list = LinearList::with_values([10i32, 20, 30], id_generator.next().unwrap());
         list.append(IdWithIndex::zero(100), [40, 41]);
         let _ = list.delete_at(1);
 
@@ -491,8 +492,7 @@ mod tests {
 
     #[test]
     fn linear_string_snapshot_stream_has_expected_shape() {
-        let mut id_generator = 0u32..;
-        let mut text = LinearString::with_value(&mut id_generator, "alpha beta".to_owned());
+        let mut text = LinearString::with_value("alpha beta".to_owned(), 0u32);
         text.append(IdWithIndex::zero(100), " gamma".to_owned());
         let range = text.ids_in_range(1..=5).unwrap();
         range.delete(&mut text).unwrap();
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn latest_value_snapshot_stream_has_expected_shape() {
         let mut id_generator = 0u32..;
-        let mut reg = LinearLatestValueWins::new(&mut id_generator, 5u64);
+        let mut reg = LinearLatestValueWins::new(5u64, id_generator.next_array().unwrap());
         reg.update(10, 6);
         reg.update(11, 7);
 
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn linear_list_snapshot_roundtrips_via_bytebuf() {
         let mut id_generator = 0u32..;
-        let mut original = LinearList::with_values(&mut id_generator, [1i32, 2, 3, 4]);
+        let mut original = LinearList::with_values([1i32, 2, 3, 4], id_generator.next().unwrap());
         original.append(IdWithIndex::zero(100), [8, 9]);
         let _ = original.delete_at(2);
 
@@ -542,8 +542,7 @@ mod tests {
 
     #[test]
     fn linear_string_snapshot_roundtrips_via_bytebuf() {
-        let mut id_generator = 0u32..;
-        let mut original = LinearString::with_value(&mut id_generator, "alpha".to_owned());
+        let mut original = LinearString::with_value("alpha".to_owned(), 0u32);
         original.append(IdWithIndex::zero(100), " beta".to_owned());
         let range = original.ids_in_range(1..=3).unwrap();
         range.delete(&mut original).unwrap();
@@ -567,7 +566,7 @@ mod tests {
     #[test]
     fn latest_value_snapshot_roundtrips_via_bytebuf() {
         let mut id_generator = 0u32..;
-        let mut original = LinearLatestValueWins::new(&mut id_generator, 11u64);
+        let mut original = LinearLatestValueWins::new(11u64, id_generator.next_array().unwrap());
         original.update(10, 12);
         original.update(20, 13);
 

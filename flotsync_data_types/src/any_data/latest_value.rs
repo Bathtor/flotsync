@@ -55,11 +55,8 @@ where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     T: Clone + fmt::Debug,
 {
-    pub fn new<I>(id_generator: &mut I, initial_value: T) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
-        let data = VecLinearData::with_value(id_generator, initial_value);
+    pub fn new(initial_value: T, ids: [Id; 3]) -> Self {
+        let data = VecLinearData::with_value(initial_value, ids);
         Self { data }
     }
 
@@ -170,7 +167,7 @@ mod tests {
 
     fn new_reg(initial: u64) -> LinearLatestValueWins<Id, u64> {
         let mut id_generator = TestIdGenerator::new();
-        LinearLatestValueWins::new(&mut id_generator, initial)
+        LinearLatestValueWins::new(initial, id_generator.next_array().unwrap())
     }
 
     #[test]

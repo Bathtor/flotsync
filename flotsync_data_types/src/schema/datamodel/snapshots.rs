@@ -820,6 +820,7 @@ mod tests {
     };
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use chrono::Datelike;
+    use itertools::Itertools;
     use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 
     const TAG_NULL: u8 = 0;
@@ -2415,18 +2416,21 @@ mod tests {
         let schema = &*TEST_SCHEMA;
 
         let mut lvw_id_generator = 0u32..;
-        let mut latest = LinearLatestValueWins::new(&mut lvw_id_generator, Some(1u64));
+        let mut latest =
+            LinearLatestValueWins::new(Some(1u64), lvw_id_generator.next_array().unwrap());
         latest.update(100, None);
         latest.update(101, Some(99));
 
         let mut title_id_generator = 1000u32..;
-        let mut title = LinearString::with_value(&mut title_id_generator, "alpha".to_owned());
+        let mut title =
+            LinearString::with_value("alpha".to_owned(), title_id_generator.next().unwrap());
         title.append(IdWithIndex::zero(55), " beta".to_owned());
         let title_range = title.ids_in_range(1..=2).unwrap();
         title_range.delete(&mut title).unwrap();
 
         let mut numbers_id_generator = 2000u32..;
-        let mut numbers = LinearList::with_values(&mut numbers_id_generator, [10i64, 20, 30]);
+        let mut numbers =
+            LinearList::with_values([10i64, 20, 30], numbers_id_generator.next().unwrap());
         numbers.append(IdWithIndex::zero(77), [40, 50]);
         let _ = numbers.delete_at(1);
 

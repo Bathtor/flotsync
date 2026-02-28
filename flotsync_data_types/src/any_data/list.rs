@@ -74,8 +74,7 @@ impl<T> Composite for ListChunk<T> {
 /// ```rust
 /// use flotsync_data_types::any_data::list::LinearList;
 ///
-/// let mut id_generator = 0u32..;
-/// let list = LinearList::with_values(&mut id_generator, [10, 20, 30]);
+/// let list = LinearList::with_values([10, 20, 30], 0u32);
 ///
 /// let values: Vec<i32> = list.iter().copied().collect();
 /// assert_eq!(values, vec![10, 20, 30]);
@@ -90,11 +89,8 @@ where
     T: fmt::Debug + 'static,
 {
     /// Create an empty list.
-    pub fn new<I>(id_generator: &mut I) -> Self
-    where
-        I: Iterator<Item = Id>,
-    {
-        let data = VecCoalescedLinearData::new(id_generator);
+    pub fn new(initial_id: Id) -> Self {
+        let data = VecCoalescedLinearData::new(initial_id);
         Self { data }
     }
 
@@ -107,19 +103,17 @@ where
     /// ```rust
     /// use flotsync_data_types::any_data::list::LinearList;
     ///
-    /// let mut id_generator = 0u32..;
-    /// let list = LinearList::with_values(&mut id_generator, ["a", "b", "c"]);
+    /// let list = LinearList::with_values(["a", "b", "c"], 0u32);
     ///
     /// let values: Vec<&str> = list.iter().copied().collect();
     /// assert_eq!(values, vec!["a", "b", "c"]);
     /// ```
-    pub fn with_values<I, Values>(id_generator: &mut I, initial_values: Values) -> Self
+    pub fn with_values<Values>(initial_values: Values, initial_id: Id) -> Self
     where
-        I: Iterator<Item = Id>,
         Values: IntoIterator<Item = T>,
     {
         let values = initial_values.into_iter().collect();
-        let data = VecCoalescedLinearData::with_value(id_generator, ListChunk::new(values));
+        let data = VecCoalescedLinearData::with_value(initial_id, ListChunk::new(values));
         Self { data }
     }
 
@@ -175,7 +169,7 @@ where
     /// # Example
     ///
     /// ```ignore
-    /// let mut list = LinearList::new(&mut id_generator);
+    /// let mut list = LinearList::new(id_generator.next().unwrap());
     /// list.append(next_id_with_index(), [1, 2, 3]);
     /// ```
     pub fn append<Values>(&mut self, id: IdWithIndex<Id>, values: Values)
@@ -531,8 +525,7 @@ mod tests {
     type Value = i32;
 
     fn new_list(initial: impl IntoIterator<Item = Value>) -> LinearList<Id, Value> {
-        let mut id_generator = TestIdGenerator::new();
-        LinearList::with_values(&mut id_generator, initial)
+        LinearList::with_values(initial, 0u32)
     }
 
     #[test]
@@ -546,7 +539,7 @@ mod tests {
     #[test]
     fn supports_chunk_and_single_item_operations() {
         let mut id_generator = TestIdGenerator::new();
-        let mut list = LinearList::new(&mut id_generator);
+        let mut list = LinearList::new(id_generator.next().unwrap());
 
         list.append(id_generator.next_with_zero_index().unwrap(), [2, 3]);
         list.prepend(id_generator.next_with_zero_index().unwrap(), [0, 1]);
@@ -592,7 +585,7 @@ mod tests {
     #[test]
     fn operation_roundtrip_converges_between_replicas() {
         let mut id_generator = TestIdGenerator::new();
-        let base = LinearList::with_values(&mut id_generator, [1, 2, 3]);
+        let base = LinearList::with_values([1, 2, 3], id_generator.next().unwrap());
         let mut a = base.clone();
         let mut b = base;
 

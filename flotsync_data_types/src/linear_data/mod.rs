@@ -263,12 +263,12 @@ where
         }
     }
 
-    pub fn last_index(&self) -> u16 {
+    pub fn last_index(&self) -> u32 {
         let node_len = self.node_len();
         if node_len == 0 || node_len == 1 {
             self.id.index
         } else {
-            let last_offset: u16 = (node_len - 1)
+            let last_offset: u32 = (node_len - 1)
                 .try_into()
                 .expect("Nodes must not be longer than can be addressed");
             self.id
@@ -350,14 +350,15 @@ where
     ///
     /// Only supported for Insert/Delete with values of sufficient length.
     /// Returns `None` if unsupported.
-    fn split_off(&mut self, at: u16) -> Option<Self> {
+    fn split_off(&mut self, at: u32) -> Option<Self> {
         let is_insert = match self {
             Operation::Insert { .. } => true,
             Operation::Delete { .. } => false,
             Operation::Beginning | Operation::End | Operation::Invalid => return None,
         };
         let value = self.take_value().unwrap();
-        let (remaining_self_value, new_value) = value.split_at(at as usize);
+        let split_index: usize = at.try_into().expect("split index must fit into usize");
+        let (remaining_self_value, new_value) = value.split_at(split_index);
         let new_operation = if is_insert {
             *self = Operation::Insert {
                 value: remaining_self_value,

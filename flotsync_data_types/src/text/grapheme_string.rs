@@ -13,6 +13,7 @@ impl GraphemeString {
         Self { len, base }
     }
 
+    #[allow(dead_code)]
     pub const EMPTY: Self = Self {
         len: 0,
         base: String::new(),
@@ -30,6 +31,7 @@ impl GraphemeString {
         self.base.graphemes(true)
     }
 
+    #[allow(dead_code)]
     pub fn take(&mut self, max_elements: usize) -> GraphemeString {
         if self.len <= max_elements {
             std::mem::replace(self, Self::EMPTY)
