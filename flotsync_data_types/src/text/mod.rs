@@ -212,7 +212,7 @@ where
                 let op_id = id_with_index_generator.next().context(IdsExhaustedSnafu)?;
                 require!(
                     op_id.can_address(value_graphemes.len()),
-                    IndexExhaustedSnafu.build().into()
+                    IndexExhaustedSnafu.build()
                 );
                 operations.push(node_insert_ids.insert_operation(op_id, value_graphemes.unwrap()));
             }

@@ -40,10 +40,10 @@ pub const EXHAUSTIVE_SCHEMA_FIELD_COUNT: usize = 84;
 pub const EXHAUSTIVE_SCHEMA_OPERATION_COUNT: usize = 88;
 
 /// The minimum number of IDs required by [`exhaustive_schema_operation`].
-pub const EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT: usize = 138;
+pub const EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT: usize = 139;
 
 /// The minimum number of IDs required by [`exhaustive_schema_operations`].
-pub const EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT: usize = 143;
+pub const EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT: usize = 231;
 
 /// Errors constructing exhaustive example operations.
 #[derive(Debug, Snafu)]
@@ -179,6 +179,7 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            ids.next_id()?,
             lvw_field_name(false, false, primitive_type),
             latest_value_wins_operation(
                 &mut ids,
@@ -186,6 +187,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            ids.next_id()?,
             lvw_field_name(true, false, primitive_type),
             latest_value_wins_operation(
                 &mut ids,
@@ -193,6 +195,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            ids.next_id()?,
             lvw_field_name(false, true, primitive_type),
             latest_value_wins_operation(
                 &mut ids,
@@ -200,6 +203,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            ids.next_id()?,
             lvw_field_name(true, true, primitive_type),
             latest_value_wins_operation(
                 &mut ids,
@@ -209,32 +213,38 @@ pub fn exhaustive_schema_operations<Id>(
     }
 
     operations.push(single_field_operation(
+        ids.next_id()?,
         "linear_string".to_owned(),
         linear_string_insert(&mut ids, "example linear string".to_owned())?,
     ));
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            ids.next_id()?,
             linear_list_field_name(primitive_type),
             linear_list_insert(&mut ids, primitive_value_array(primitive_type))?,
         ));
     }
 
     operations.push(single_field_operation(
+        ids.next_id()?,
         "monotonic_counter_byte".to_owned(),
         OperationValue::MonotonicCounterIncrement(CounterValue::Byte(7)),
     ));
     operations.push(single_field_operation(
+        ids.next_id()?,
         "monotonic_counter_uint".to_owned(),
         OperationValue::MonotonicCounterIncrement(CounterValue::UInt(42)),
     ));
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            ids.next_id()?,
             total_order_register_field_name(Direction::Ascending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
         operations.push(single_field_operation(
+            ids.next_id()?,
             total_order_register_field_name(Direction::Descending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
@@ -242,12 +252,14 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            ids.next_id()?,
             finite_state_register_field_name(false, primitive_type),
             OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Value(
                 finite_state_value(primitive_type),
             )),
         ));
         operations.push(single_field_operation(
+            ids.next_id()?,
             finite_state_register_field_name(true, primitive_type),
             OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Value(
                 finite_state_value(primitive_type),
@@ -256,18 +268,22 @@ pub fn exhaustive_schema_operations<Id>(
     }
 
     operations.push(single_field_operation(
+        ids.next_id()?,
         lvw_field_name(true, false, PrimitiveType::String),
         latest_value_wins_operation(&mut ids, NullableBasicValue::Null)?,
     ));
     operations.push(single_field_operation(
+        ids.next_id()?,
         "linear_string".to_owned(),
         linear_string_delete(&mut ids)?,
     ));
     operations.push(single_field_operation(
+        ids.next_id()?,
         linear_list_field_name(PrimitiveType::String),
         linear_list_delete(&mut ids)?,
     ));
     operations.push(single_field_operation(
+        ids.next_id()?,
         finite_state_register_field_name(true, PrimitiveType::String),
         OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Null),
     ));
@@ -287,6 +303,7 @@ pub fn exhaustive_schema_operation<Id>(
         "exhaustive_schema_operation",
         EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT,
     );
+    let change_id = ids.next_id()?;
     let mut fields = Vec::with_capacity(EXHAUSTIVE_SCHEMA_FIELD_COUNT);
 
     for primitive_type in primitive_types() {
@@ -368,7 +385,7 @@ pub fn exhaustive_schema_operation<Id>(
     }
 
     debug_assert_eq!(fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
-    Ok(SchemaOperation { fields })
+    Ok(SchemaOperation { change_id, fields })
 }
 
 fn insert_field(columns: &mut HashMap<String, Field>, name: String, data_type: ReplicatedDataType) {
@@ -390,10 +407,12 @@ fn field<Id>(field_name: String, value: OperationValue<Id>) -> OperationFieldVal
 }
 
 fn single_field_operation<Id>(
+    change_id: Id,
     field_name: String,
     value: OperationValue<Id>,
 ) -> SchemaOperation<'static, Id> {
     SchemaOperation {
+        change_id,
         fields: vec![field(field_name, value)],
     }
 }
@@ -420,12 +439,12 @@ fn linear_string_insert<Id, Ids>(
 where
     Ids: Iterator<Item = Id>,
 {
-    Ok(OperationValue::LinearString(DataOperation::Insert {
+    Ok(OperationValue::LinearString(vec![DataOperation::Insert {
         id: indexed_id(ids.next_id()?),
         pred: indexed_id(ids.next_id()?),
         succ: indexed_id(ids.next_id()?),
         value,
-    }))
+    }]))
 }
 
 fn linear_string_delete<Id, Ids>(
@@ -434,10 +453,10 @@ fn linear_string_delete<Id, Ids>(
 where
     Ids: Iterator<Item = Id>,
 {
-    Ok(OperationValue::LinearString(DataOperation::Delete {
+    Ok(OperationValue::LinearString(vec![DataOperation::Delete {
         start: indexed_id(ids.next_id()?),
         end: None,
-    }))
+    }]))
 }
 
 fn linear_list_insert<Id, Ids>(
@@ -447,12 +466,12 @@ fn linear_list_insert<Id, Ids>(
 where
     Ids: Iterator<Item = Id>,
 {
-    Ok(OperationValue::LinearList(DataOperation::Insert {
+    Ok(OperationValue::LinearList(vec![DataOperation::Insert {
         id: indexed_id(ids.next_id()?),
         pred: indexed_id(ids.next_id()?),
         succ: indexed_id(ids.next_id()?),
         value,
-    }))
+    }]))
 }
 
 fn linear_list_delete<Id, Ids>(
@@ -461,10 +480,10 @@ fn linear_list_delete<Id, Ids>(
 where
     Ids: Iterator<Item = Id>,
 {
-    Ok(OperationValue::LinearList(DataOperation::Delete {
+    Ok(OperationValue::LinearList(vec![DataOperation::Delete {
         start: indexed_id(ids.next_id()?),
         end: None,
-    }))
+    }]))
 }
 
 fn indexed_id<Id>(id: Id) -> IdWithIndex<Id> {
@@ -875,6 +894,20 @@ mod tests {
         }
     }
 
+    fn classify_linear_operation_batch<Id, Value>(
+        values: &[DataOperation<Id, Value>],
+    ) -> &DataOperation<Id, Value> {
+        let first = values.first().expect("expected non-empty linear operation batch");
+        let first_is_insert = matches!(first, DataOperation::Insert { .. });
+        assert!(
+            values
+                .iter()
+                .all(|value| matches!(value, DataOperation::Insert { .. }) == first_is_insert),
+            "expected homogeneous linear operation batch in coverage example"
+        );
+        first
+    }
+
     fn schema_coverage_key(data_type: &ReplicatedDataType) -> SchemaCoverageKey {
         match data_type {
             ReplicatedDataType::LatestValueWins { value_type } => {
@@ -932,14 +965,14 @@ mod tests {
                     },
                 }
             }
-            (ReplicatedDataType::LinearString, OperationValue::LinearString(value)) => {
-                match value {
+            (ReplicatedDataType::LinearString, OperationValue::LinearString(values)) => {
+                match classify_linear_operation_batch(values) {
                     DataOperation::Insert { .. } => OperationCoverageKey::LinearStringInsert,
                     DataOperation::Delete { .. } => OperationCoverageKey::LinearStringDelete,
                 }
             }
-            (ReplicatedDataType::LinearList { value_type }, OperationValue::LinearList(value)) => {
-                match value {
+            (ReplicatedDataType::LinearList { value_type }, OperationValue::LinearList(values)) => {
+                match classify_linear_operation_batch(values) {
                     DataOperation::Insert { .. } => OperationCoverageKey::LinearListInsert {
                         value_type: primitive_coverage_key(*value_type),
                     },

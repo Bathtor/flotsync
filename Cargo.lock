@@ -935,6 +935,7 @@ dependencies = [
 name = "flotsync_messages"
 version = "0.1.0"
 dependencies = [
+ "flotsync_core",
  "protobuf",
  "protobuf-codegen",
 ]

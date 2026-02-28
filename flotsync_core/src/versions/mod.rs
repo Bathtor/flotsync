@@ -2,11 +2,28 @@
 //! It has entries for the local version at each group member, which may however be collapsed to save space when they are all the same.
 
 mod happened_before;
+use core::fmt;
+
 pub use happened_before::*;
 mod flat_vector;
 pub use flat_vector::*;
 mod group_vector;
 pub use group_vector::*;
+
+/// The id of a concrete update from a single node at `node_index` in the group member object.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UpdateId {
+    /// The version of this update at this node. E.g. the first update of every node is version = 0.
+    pub version: u64,
+    /// The index of the not in the replication group. This is shorter than encoding the actual
+    /// node id and updates are bound to a fixed group instance with fixed membership.
+    pub node_index: u32,
+}
+impl fmt::Display for UpdateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "v{}@{}", self.version, self.node_index)
+    }
+}
 
 #[cfg(test)]
 mod tests {

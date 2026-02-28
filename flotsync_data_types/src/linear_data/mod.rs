@@ -19,12 +19,20 @@ pub use vec_impl::VecLinearData;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataOperation<Id, Value> {
+    /// Insert `value` as the content associated with `id` between `pred` and `succ`.
     Insert {
         id: Id,
         pred: Id,
         succ: Id,
         value: Value,
     },
+    /// Delete the content at `start`, optionally extending the deletion through `end`.
+    ///
+    /// The range is inclusive when `end` is present.
+    ///
+    /// For chunk-addressed ids such as [`IdWithIndex`], `end` must refer to the same logical
+    /// update as `start` and may only differ in the trailing chunk/index component. In other
+    /// words, a valid delete range must not cross update-id boundaries.
     Delete {
         start: Id,
         end: Option<Id>,

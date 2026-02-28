@@ -270,6 +270,8 @@ pub enum DataModelValueError {
     InvalidSnapshotValueForType,
     #[snafu(display("Operation value does not match the schema data type."))]
     InvalidOperationValueForType,
+    #[snafu(display("Linear operation batches must contain at least one action."))]
+    EmptyLinearOperationBatch,
     #[snafu(display("Finite-state register schema is invalid."))]
     InvalidFiniteStateSchema,
     #[snafu(display("Basic value type does not match the schema data type."))]
