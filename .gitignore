@@ -3,3 +3,7 @@ target/
 .DS_Store
 
 *.code-workspace
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
