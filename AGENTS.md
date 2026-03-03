@@ -7,6 +7,7 @@
 - Prefer readable control flow over chained iterator side effects.
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
+- Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 
 ## Version Control Rules
 

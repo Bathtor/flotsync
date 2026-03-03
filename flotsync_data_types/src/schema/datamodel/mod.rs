@@ -253,6 +253,17 @@ pub enum SchemaValueError {
         source: DataModelValueError,
     },
 }
+impl SchemaValueError {
+    pub fn unknown_field_err<I>(field_name: I) -> Result<(), Self>
+    where
+        I: Into<String>,
+    {
+        UnknownFieldSnafu {
+            field_name: field_name.into(),
+        }
+        .fail()
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum SchemaVisitError<E>

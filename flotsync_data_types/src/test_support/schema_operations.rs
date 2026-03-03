@@ -18,7 +18,6 @@ use crate::{
             OperationFieldValue,
             OperationValue,
             SchemaOperation,
-            validate_schema_operation_fields,
         },
         values::{
             NullablePrimitiveValue,
@@ -743,6 +742,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::datamodel::validate_schema_operation_fields;
     use std::collections::BTreeSet;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
