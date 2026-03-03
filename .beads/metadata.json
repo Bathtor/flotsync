@@ -2,5 +2,5 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
-  "dolt_database": "beads_flotsync"
+  "dolt_database": "flotsync_git"
 }
