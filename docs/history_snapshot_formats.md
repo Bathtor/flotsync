@@ -1,19 +1,21 @@
-# HistorySnapshot Format Evaluation
+# HistorySnapshot Benchmark Baseline
 
-This compares the current node-oriented protobuf `HistorySnapshot` with the experimental
-`ExperimentalColumnarHistorySnapshot` format.
+This document records the current benchmark baseline for the canonical protobuf
+[`HistorySnapshot`](../messages/proto/datamodel.proto) format.
 
-In the current experimental shape:
-- `LatestValueWins` and `LinearList` use a dense `primitive_values` buffer
-- `LinearString` uses one concatenated `string_values` buffer plus UTF-8 byte slicing metadata
+It is no longer an experiment comparison document. The purpose of this benchmark is to catch
+performance and encoded-size regressions in the shipped columnar history transport.
+
+Transport details and compatibility expectations are documented in
+[protobuf_datamodel_transport.md](protobuf_datamodel_transport.md).
 
 ## Method
 
 - Command: `cargo bench -p flotsync_messages --bench history_snapshot_formats`
 - Criterion config:
-  - `sample_size = 10`
+  - `sample_size = 30`
   - `warm_up_time = 500 ms`
-  - `measurement_time = 1 s`
+  - `measurement_time = 2 s`
 - Measurements include:
   - encode to protobuf bytes
   - parse + decode from protobuf bytes
@@ -23,68 +25,41 @@ In the current experimental shape:
 
 - `lvw_array_medium`
   - `LatestValueWins<[Int]>`
-  - 256 updates
+  - 128 updates
   - rotates through `null`, empty arrays, and short non-empty arrays
 - `lvw_array_large`
   - same shape as above
-  - 2048 updates
+  - 1024 updates
 - `linear_string_tombstone_medium`
-  - 256 fixed-width string chunks
-  - delete every 3rd chunk in reverse order
+  - 128 fixed-width string chunks
+  - delete every 5th chunk in reverse order
 - `linear_string_tombstone_large`
   - 1024 fixed-width string chunks
-  - delete every 2nd chunk in reverse order
+  - delete every 6th chunk in reverse order
 - `linear_list_tombstone_medium`
-  - 256 chunks of 4 `Int` values
-  - delete every 3rd chunk in reverse order
+  - 96 chunks of 4 `Int` values
+  - delete every 5th chunk in reverse order
 - `linear_list_tombstone_large`
-  - 1024 chunks of 4 `Int` values
-  - delete every 2nd chunk in reverse order
+  - 256 chunks of 8 `Int` values
+  - delete every 6th chunk in reverse order
 
-## Results
+## Recorded Results
 
-| Fixture | Baseline bytes | Columnar bytes | Size delta | Encode median | Columnar encode | Decode median | Columnar decode | Decode+reconstruct | Columnar decode+reconstruct |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `lvw_array_medium` | 7278 | 5039 | -30.76% | 46.977 us | 15.859 us | 50.988 us | 23.170 us | 53.768 us | 25.920 us |
-| `lvw_array_large` | 60012 | 42753 | -28.76% | 379.37 us | 114.29 us | 405.96 us | 174.02 us | 422.53 us | 193.31 us |
-| `linear_string_tombstone_medium` | 9733 | 7976 | -18.05% | 47.182 us | 18.531 us | 54.230 us | 37.150 us | 242.03 us | 223.08 us |
-| `linear_string_tombstone_large` | 39331 | 32418 | -17.58% | 189.04 us | 68.709 us | 217.45 us | 136.67 us | 3.0267 ms | 2.9578 ms |
-| `linear_list_tombstone_medium` | 11520 | 9257 | -19.64% | 50.771 us | 22.446 us | 56.489 us | 40.053 us | 235.20 us | 217.59 us |
-| `linear_list_tombstone_large` | 46496 | 37541 | -19.26% | 205.29 us | 83.768 us | 222.97 us | 154.63 us | 3.0286 ms | 2.9291 ms |
+Results below were recorded on March 3, 2026 from the current canonical format.
 
-## Interpretation
+| Fixture | Encoded bytes | Encode median | Decode median | Decode+reconstruct median |
+| --- | ---: | ---: | ---: | ---: |
+| `lvw_array_medium` | 2171 | 6.508 us | 10.548 us | 11.639 us |
+| `lvw_array_large` | 19241 | 51.521 us | 80.698 us | 91.499 us |
+| `linear_string_tombstone_medium` | 3574 | 7.397 us | 13.590 us | 62.790 us |
+| `linear_string_tombstone_large` | 28696 | 56.165 us | 108.980 us | 2.804 ms |
+| `linear_list_tombstone_medium` | 3155 | 7.271 us | 11.684 us | 37.338 us |
+| `linear_list_tombstone_large` | 10485 | 23.799 us | 33.642 us | 344.000 us |
 
-- The columnar format reduced encoded size in every measured case.
-- The size win is strongest for `LatestValueWins` histories, around 29% to 31%.
-- The dedicated concatenated string buffer materially improved `LinearString`; the size win for
-  tombstone-heavy string histories is now around 18%.
-- The size win for tombstone-heavy `LinearList<Int>` histories is around 19% to 20%.
-- Encode cost improved materially across the board.
-- Decode cost also improved in every measured case.
-- Full decode+reconstruct gains are strongest for `LatestValueWins` and now clearly positive for
-  both string and list,
-  which suggests the remaining time there is dominated more by CRDT reconstruction than by the
-  protobuf layout itself.
+## Notes
 
-## Recommendation
-
-Keep the columnar format and iterate toward making it the primary history snapshot representation.
-
-Reasoning:
-
-- It is strictly smaller on all tested workloads.
-- It is strictly faster to encode on all tested workloads.
-- It is also faster to decode on all tested workloads.
-- There were no measured regressions.
-- The strongest wins appear on the most value-heavy case (`LatestValueWins`), which is exactly
-  where lifting payloads out of repeated node messages should help.
-- The `LinearString` specialization to a concatenated `string_values` buffer closed most of the
-  remaining gap for string-heavy histories.
-
-Follow-up:
-
-1. Replace the current `HistorySnapshot` transport with the columnar layout, or support both
-   during a short migration window if wire compatibility matters.
-2. If we keep iterating before switching, the next likely optimization target is metadata
-   overhead itself, since the value-buffer side is now pulling its weight across all three
-   history families.
+- Criterion will report changes relative to the last local benchmark baseline in `target/criterion`.
+- Small encode-side improvements and decode-side regressions are expected to show up here as the
+  transport implementation changes.
+- Encoded byte counts are often the most stable signal when comparing changes across different
+  machines.
