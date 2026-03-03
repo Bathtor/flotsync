@@ -117,27 +117,20 @@ message CounterValue {
 // - LinearString: `chunk_index` must be present and `value` must be a non-null string when present.
 // - LinearList: `chunk_index` must be present and `value` must be a non-null array when present.
 // - Boundary nodes omit `value`; begin/end nodes also omit one side link.
-message HistoryNode {
-    HistoryId id = 1;
-    HistoryId left = 2;
-    HistoryId right = 3;
-    bool deleted = 4;
-    NullableBasicValue value = 5;
-}
-
-message HistorySnapshot {
-    repeated HistoryNode nodes = 1;
-}
-
-// Experimental benchmark-only alternative to `HistorySnapshot`.
 //
-// This stores fixed-schema node metadata separately from a dense value buffer. The exact
-// interpretation of `values` depends on the surrounding field schema:
-// - scalar payloads consume one primitive at `value_offset`
-// - array payloads consume `value_len` primitives starting at `value_offset`
-// - explicit nulls use `value_is_null = true` with no offset
-// - boundary nodes have no offset and `value_is_null = false`
-message ExperimentalColumnarHistoryNodeMeta {
+// History snapshots intentionally use a split metadata/value layout instead of a simple repeated
+// `HistoryNode` message. Benchmarking showed that the row-oriented shape paid substantial per-node
+// protobuf overhead, while this layout is materially smaller and faster to encode/decode on the
+// workloads we care about. The extra complexity is therefore deliberate transport optimization.
+//
+// The exact interpretation of `HistorySnapshot.values` depends on the surrounding field schema:
+// - `primitive_values` stores scalar/array payloads for non-LinearString histories
+// - payloads are consumed sequentially in node order, so `value_offset` is intentionally omitted
+// - scalar payloads consume one primitive; array payloads consume `value_len` primitives
+// - `string_values` stores concatenated LinearString payloads, sliced by UTF-8 byte lengths
+// - explicit nulls use `value_is_null = true` and consume zero buffer entries
+// - boundary nodes are identified by a missing side link and must have `value_len = 0`
+message HistoryNodeMeta {
     uint64 version = 1;
     uint32 node_index = 2;
     optional uint32 chunk_index = 3;
@@ -151,14 +144,16 @@ message ExperimentalColumnarHistoryNodeMeta {
     optional uint32 origin_right_chunk_index = 9;
 
     bool deleted = 10;
-    optional uint32 value_offset = 11;
-    uint32 value_len = 12;
-    bool value_is_null = 13;
+    uint32 value_len = 11;
+    bool value_is_null = 12;
 }
 
-message ExperimentalColumnarHistorySnapshot {
-    repeated ExperimentalColumnarHistoryNodeMeta nodes = 1;
-    PrimitiveArrayValue values = 2;
+message HistorySnapshot {
+    repeated HistoryNodeMeta nodes = 1;
+    oneof values {
+        PrimitiveArrayValue primitive_values = 2;
+        string string_values = 3;
+    }
 }
 
 message SnapshotField {

@@ -3,6 +3,10 @@
 This compares the current node-oriented protobuf `HistorySnapshot` with the experimental
 `ExperimentalColumnarHistorySnapshot` format.
 
+In the current experimental shape:
+- `LatestValueWins` and `LinearList` use a dense `primitive_values` buffer
+- `LinearString` uses one concatenated `string_values` buffer plus UTF-8 byte slicing metadata
+
 ## Method
 
 - Command: `cargo bench -p flotsync_messages --bench history_snapshot_formats`
@@ -41,22 +45,24 @@ This compares the current node-oriented protobuf `HistorySnapshot` with the expe
 
 | Fixture | Baseline bytes | Columnar bytes | Size delta | Encode median | Columnar encode | Decode median | Columnar decode | Decode+reconstruct | Columnar decode+reconstruct |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `lvw_array_medium` | 7278 | 5039 | -30.76% | 49.140 us | 16.424 us | 52.062 us | 23.915 us | 55.152 us | 26.727 us |
-| `lvw_array_large` | 60012 | 42753 | -28.76% | 393.91 us | 115.89 us | 412.97 us | 177.87 us | 430.26 us | 200.15 us |
-| `linear_string_tombstone_medium` | 9733 | 8395 | -13.75% | 48.782 us | 30.055 us | 55.367 us | 46.689 us | 248.73 us | 239.14 us |
-| `linear_string_tombstone_large` | 39331 | 34373 | -12.61% | 196.06 us | 114.21 us | 221.31 us | 177.54 us | 3.1325 ms | 3.0852 ms |
-| `linear_list_tombstone_medium` | 11520 | 9257 | -19.64% | 52.900 us | 23.733 us | 58.484 us | 41.556 us | 242.31 us | 225.42 us |
-| `linear_list_tombstone_large` | 46496 | 37541 | -19.26% | 210.82 us | 90.713 us | 231.03 us | 157.89 us | 3.1091 ms | 3.0235 ms |
+| `lvw_array_medium` | 7278 | 5039 | -30.76% | 46.977 us | 15.859 us | 50.988 us | 23.170 us | 53.768 us | 25.920 us |
+| `lvw_array_large` | 60012 | 42753 | -28.76% | 379.37 us | 114.29 us | 405.96 us | 174.02 us | 422.53 us | 193.31 us |
+| `linear_string_tombstone_medium` | 9733 | 7976 | -18.05% | 47.182 us | 18.531 us | 54.230 us | 37.150 us | 242.03 us | 223.08 us |
+| `linear_string_tombstone_large` | 39331 | 32418 | -17.58% | 189.04 us | 68.709 us | 217.45 us | 136.67 us | 3.0267 ms | 2.9578 ms |
+| `linear_list_tombstone_medium` | 11520 | 9257 | -19.64% | 50.771 us | 22.446 us | 56.489 us | 40.053 us | 235.20 us | 217.59 us |
+| `linear_list_tombstone_large` | 46496 | 37541 | -19.26% | 205.29 us | 83.768 us | 222.97 us | 154.63 us | 3.0286 ms | 2.9291 ms |
 
 ## Interpretation
 
 - The columnar format reduced encoded size in every measured case.
 - The size win is strongest for `LatestValueWins` histories, around 29% to 31%.
-- The size win for tombstone-heavy `LinearString` histories is smaller, around 13%.
+- The dedicated concatenated string buffer materially improved `LinearString`; the size win for
+  tombstone-heavy string histories is now around 18%.
 - The size win for tombstone-heavy `LinearList<Int>` histories is around 19% to 20%.
 - Encode cost improved materially across the board.
 - Decode cost also improved in every measured case.
-- Full decode+reconstruct gains are strongest for `LatestValueWins` and modest for string/list,
+- Full decode+reconstruct gains are strongest for `LatestValueWins` and now clearly positive for
+  both string and list,
   which suggests the remaining time there is dominated more by CRDT reconstruction than by the
   protobuf layout itself.
 
@@ -72,10 +78,13 @@ Reasoning:
 - There were no measured regressions.
 - The strongest wins appear on the most value-heavy case (`LatestValueWins`), which is exactly
   where lifting payloads out of repeated node messages should help.
+- The `LinearString` specialization to a concatenated `string_values` buffer closed most of the
+  remaining gap for string-heavy histories.
 
 Follow-up:
 
 1. Replace the current `HistorySnapshot` transport with the columnar layout, or support both
    during a short migration window if wire compatibility matters.
 2. If we keep iterating before switching, the next likely optimization target is metadata
-   overhead for tombstone-heavy string histories, where the current win is real but smaller.
+   overhead itself, since the value-buffer side is now pulling its weight across all three
+   history families.
