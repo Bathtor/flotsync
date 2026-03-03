@@ -1,0 +1,22 @@
+[package]
+name = "flotsync_messages"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flotsync_core = { path = "../flotsync_core" }
+flotsync_data_types = { path = "../flotsync_data_types" }
+ordered-float = { workspace = true }
+protobuf = "3"
+snafu = { workspace = true }
+
+[build-dependencies]
+protobuf-codegen = "3"
+
+[dev-dependencies]
+criterion = "0.5"
+flotsync_data_types = { path = "../flotsync_data_types", features = ["test-support"] }
+
+[[bench]]
+name = "history_snapshot_formats"
+harness = false
