@@ -936,8 +936,11 @@ name = "flotsync_messages"
 version = "0.1.0"
 dependencies = [
  "flotsync_core",
+ "flotsync_data_types",
+ "ordered-float",
  "protobuf",
  "protobuf-codegen",
+ "snafu",
 ]
 
 [[package]]

@@ -1,4 +1,9 @@
-use super::*;
+#[cfg(test)]
+use super::validation::{ensure_nullable_basic_type, ensure_primitive_array_type};
+use super::{
+    validation::{ensure_counter_type, ensure_finite_state_value, ensure_primitive_type},
+    *,
+};
 use crate::{
     IdWithIndex,
     snapshot::{SnapshotNode, SnapshotSink},

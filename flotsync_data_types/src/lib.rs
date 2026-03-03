@@ -17,7 +17,7 @@ pub mod snapshot {
     pub use crate::linear_data::snapshot::*;
 }
 
-pub use linear_data::{DataOperation, IdWithIndex, IdWithIndexRange};
+pub use linear_data::{DataOperation, IdWithIndex, IdWithIndexRange, IntegrityError};
 
 #[derive(Debug, Snafu)]
 #[snafu(display("The diff could not be applied due to a logic error at {location}: {context}"))]

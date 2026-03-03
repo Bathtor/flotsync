@@ -651,12 +651,13 @@ where
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn check_integrity(&self) {
-        use itertools::Itertools;
-
-        self.base.check_integrity();
-        let value_len = self
+    /// Validate the internal node structure, cached visible length, and id-range uniqueness.
+    ///
+    /// This is primarily useful after reconstructing a value from an external snapshot or other
+    /// untrusted input.
+    pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
+        self.base.validate_integrity()?;
+        let actual_len = self
             .base
             .nodes
             .iter()
@@ -665,28 +666,31 @@ where
                 _ => None,
             })
             .sum();
-        assert_eq!(self.len, value_len);
-        // Check that all the id ranges are non-overlapping.
-        // This check is a bit expensive, but for now it's acceptable in testing.
-        // Maybe turn it off if the tests are getting too slow.
-        for pair in self.base.nodes.iter().combinations(2) {
-            if let [left, right] = pair.as_slice() {
+        ensure!(
+            self.len == actual_len,
+            VisibleLengthMismatchSnafu {
+                expected: self.len,
+                actual: actual_len,
+            }
+        );
+
+        for left_index in 0..self.base.nodes.len() {
+            let left = &self.base.nodes[left_index];
+            for right_index in (left_index + 1)..self.base.nodes.len() {
+                let right = &self.base.nodes[right_index];
                 for id in left.ids() {
-                    assert!(
+                    ensure!(
                         !right.contains(&id),
-                        "Duplicate id detected. Node {right:?} contains {id:?} from node {left:?}."
+                        DuplicateIdSnafu {
+                            left_index,
+                            right_index,
+                        }
                     );
                 }
-                for id in right.ids() {
-                    assert!(
-                        !left.contains(&id),
-                        "Duplicate id detected. Node {left:?} contains {id:?} from node {right:?}."
-                    );
-                }
-            } else {
-                unreachable!("combinations should always produce 2-sized vectors.")
             }
         }
+
+        Ok(())
     }
 }
 impl<BaseId, Value> LinearData<Value, Value::Element> for VecCoalescedLinearData<BaseId, Value>

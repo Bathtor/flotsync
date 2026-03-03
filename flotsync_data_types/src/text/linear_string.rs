@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    IntegrityError,
     linear_data::*,
     snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
     text::grapheme_string::GraphemeString,
@@ -145,9 +146,12 @@ where
         Ok(Self { data })
     }
 
-    #[cfg(test)]
-    pub(in crate::text) fn check_integrity(&self) {
-        self.data.check_integrity();
+    /// Validate the internal CRDT structure and chunk/id invariants.
+    ///
+    /// This is primarily useful after reconstructing a value from an external snapshot or other
+    /// untrusted input.
+    pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
+        self.data.validate_integrity()
     }
 }
 impl<Id> fmt::Display for LinearString<Id>
@@ -300,7 +304,7 @@ pub(crate) mod tests {
         fn single_value_roundtrip() {
             let input = "A simple test string";
             let linear = LinearString::with_value(input.to_string(), 0u32);
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), input);
         }
 
@@ -314,7 +318,7 @@ pub(crate) mod tests {
             for s in TEST_VALUES {
                 reference.push_str(s);
                 linear.append(id_generator.next_with_zero_index().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 assert_eq!(linear.to_string(), reference);
                 assert_eq!(linear.len(), reference.len());
             }
@@ -330,7 +334,7 @@ pub(crate) mod tests {
             for s in UNICODE_TEST_VALUES {
                 reference.push_str(s);
                 linear.append(id_generator.next_with_zero_index().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 assert_eq!(linear.to_string(), reference);
                 assert_eq!(linear.len(), reference.graphemes(true).count());
             }
@@ -348,7 +352,7 @@ pub(crate) mod tests {
             }
             for s in TEST_VALUES.iter().rev() {
                 linear.prepend(id_generator.next_with_zero_index().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
             assert_eq!(linear.to_string(), reference);
             assert_eq!(linear.len(), reference.len());
@@ -366,7 +370,7 @@ pub(crate) mod tests {
             }
             for s in UNICODE_TEST_VALUES.iter().rev() {
                 linear.prepend(id_generator.next_with_zero_index().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
             assert_eq!(linear.to_string(), reference);
             assert_eq!(linear.len(), reference.graphemes(true).count());
@@ -383,7 +387,7 @@ pub(crate) mod tests {
                 IdWithIndex::zero(id_generator.next().unwrap()),
                 reference.clone(),
             );
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an insertion.
@@ -401,7 +405,7 @@ pub(crate) mod tests {
                     INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
@@ -415,7 +419,7 @@ pub(crate) mod tests {
                     FRONT_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
@@ -429,7 +433,7 @@ pub(crate) mod tests {
                     END_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
         }
 
@@ -444,7 +448,7 @@ pub(crate) mod tests {
                 IdWithIndex::zero(id_generator.next().unwrap()),
                 reference.clone(),
             );
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an insertion.
@@ -467,7 +471,7 @@ pub(crate) mod tests {
                     INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
@@ -481,7 +485,7 @@ pub(crate) mod tests {
                     FRONT_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
@@ -495,7 +499,7 @@ pub(crate) mod tests {
                     END_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
         }
 
@@ -505,23 +509,23 @@ pub(crate) mod tests {
 
             let mut linear =
                 LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
 
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
             let ids_at_three = linear.ids_at_pos(3).unwrap();
             assert_eq!(ids_at_three.delete(&mut linear), Some("i"));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "A smple test string.");
             // Doing it again should be fine but change nothing.
             assert_eq!(ids_at_three.delete(&mut linear), Some("i"));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "A smple test string.");
 
             // Delete the space.
             let ids_at_one = linear.ids_at_pos(1).unwrap();
             assert_eq!(ids_at_one.delete(&mut linear), Some(" "));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "Asmple test string.");
 
             // Delete everything.
@@ -530,7 +534,7 @@ pub(crate) mod tests {
                 current_id_at_head
                     .delete(&mut linear)
                     .expect("failed to delete");
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
             assert_eq!(linear.ids_at_pos(0), None);
             assert_eq!(linear.len(), 0);
@@ -543,28 +547,28 @@ pub(crate) mod tests {
 
             let mut linear =
                 LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
             let ids_for_simple = linear.ids_in_range(2..=7).unwrap();
             assert_eq!(ids_for_simple.delete(&mut linear), Ok(()));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "A  test string.");
 
             // Doing it again should be fine but change nothing.
             assert_eq!(ids_for_simple.delete(&mut linear), Ok(()));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "A  test string.");
 
             // Delete the space that's now at this position.
             let ids_for_space = linear.ids_in_range(2..=2).unwrap();
             assert_eq!(ids_for_space.delete(&mut linear), Ok(()));
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string().as_str(), "A test string.");
 
             // Delete everything (in various ways).
             fn empty_checks(l: &LinearString<u32>) {
-                l.check_integrity();
+                l.validate_integrity().unwrap();
                 assert_eq!(l.ids_at_pos(0), None);
                 assert_eq!(l.ids_in_range(0..=0), None);
                 assert_eq!(l.len(), 0);
@@ -598,7 +602,7 @@ pub(crate) mod tests {
 
             let mut linear =
                 LinearString::with_value(TEST_VALUES.join(""), id_generator.next().unwrap());
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));
 
             let next_id = id_generator.next().unwrap();
@@ -668,7 +672,7 @@ pub(crate) mod tests {
         fn single_value_roundtrip() {
             let input = "A simple test string";
             let linear = linear_word_string(input);
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), input);
         }
 
@@ -680,7 +684,7 @@ pub(crate) mod tests {
             for s in TEST_VALUES {
                 reference.push_str(s);
                 linear.append((), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 assert_eq!(linear.to_string(), reference);
             }
         }
@@ -695,7 +699,7 @@ pub(crate) mod tests {
             }
             for s in TEST_VALUES.iter().rev() {
                 linear.prepend((), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
             assert_eq!(linear.to_string(), reference);
         }
@@ -712,7 +716,7 @@ pub(crate) mod tests {
             for s in TEST_VALUES {
                 reference.push_str(s);
                 linear.append(id_generator.next().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
             assert_eq!(linear.to_string(), reference);
 
@@ -728,7 +732,7 @@ pub(crate) mod tests {
                     INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
@@ -742,7 +746,7 @@ pub(crate) mod tests {
                     FRONT_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
@@ -756,7 +760,7 @@ pub(crate) mod tests {
                     END_INSERT_STR.to_string(),
                 )
                 .expect("failed to insert");
-            linear.check_integrity();
+            linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
         }
 
@@ -768,7 +772,7 @@ pub(crate) mod tests {
                 LinearWordString::new(id_generator.next().unwrap(), id_generator.next().unwrap());
             for s in TEST_VALUES {
                 linear.append(id_generator.next().unwrap(), s.to_string());
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
             }
 
             assert_eq!(linear.to_string(), TEST_VALUES.join(""));

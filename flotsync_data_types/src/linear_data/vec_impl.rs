@@ -291,21 +291,42 @@ where
         self.len += 1;
     }
 
-    #[cfg(test)]
-    pub(crate) fn check_integrity(&self) {
-        let mut len = 0usize;
-        for index in 0..self.nodes.len() {
-            let current = &self.nodes[index];
-            assert!(current.operation.is_valid());
-            if index == 0 {
-                assert!(matches!(current.operation, Operation::Beginning));
-            } else if index == self.nodes.len() {
-                assert!(matches!(current.operation, Operation::End));
-            } else if matches!(current.operation, Operation::Insert { .. }) {
-                len += 1;
+    /// Validate the internal node structure and cached visible length.
+    ///
+    /// This is primarily useful after reconstructing a value from an external snapshot or other
+    /// untrusted input.
+    pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
+        let Some(first) = self.nodes.first() else {
+            return MissingBeginningBoundarySnafu.fail();
+        };
+        if !matches!(first.operation, Operation::Beginning) {
+            return MissingBeginningBoundarySnafu.fail();
+        }
+
+        let Some(last) = self.nodes.last() else {
+            return MissingEndBoundarySnafu.fail();
+        };
+        if !matches!(last.operation, Operation::End) {
+            return MissingEndBoundarySnafu.fail();
+        }
+
+        let mut actual_len = 0usize;
+        for (index, current) in self.nodes.iter().enumerate() {
+            ensure!(current.operation.is_valid(), InvalidNodeSnafu { index });
+            if matches!(current.operation, Operation::Insert { .. }) {
+                actual_len += 1;
             }
         }
-        assert_eq!(self.len, len);
+
+        ensure!(
+            self.len == actual_len,
+            VisibleLengthMismatchSnafu {
+                expected: self.len,
+                actual: actual_len,
+            }
+        );
+
+        Ok(())
     }
 
     pub(super) fn iter_inserts(&self) -> impl Iterator<Item = (usize, &Node<Id, Value>)> {

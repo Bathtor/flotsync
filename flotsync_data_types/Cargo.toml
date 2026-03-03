@@ -14,7 +14,7 @@ similar = { version = "2.7", features = ["unicode"] }
 unicode-segmentation = "1"
 snafu = { workspace = true }
 chrono = "0.4"
-ordered-float = { version = "5.0", default-features = false }
+ordered-float = { workspace = true }
 
 [dev-dependencies]
 bytes = "1"

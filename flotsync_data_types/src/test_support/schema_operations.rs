@@ -897,7 +897,9 @@ mod tests {
     fn classify_linear_operation_batch<Id, Value>(
         values: &[DataOperation<Id, Value>],
     ) -> &DataOperation<Id, Value> {
-        let first = values.first().expect("expected non-empty linear operation batch");
+        let first = values
+            .first()
+            .expect("expected non-empty linear operation batch");
         let first_is_insert = matches!(first, DataOperation::Insert { .. });
         assert!(
             values

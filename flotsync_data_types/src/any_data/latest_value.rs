@@ -1,4 +1,5 @@
 use crate::{
+    IntegrityError,
     OperationError,
     UnsupportedOperationVariantSnafu,
     linear_data::{DataOperation, LinearData, VecLinearData},
@@ -121,6 +122,14 @@ where
             return Err(SnapshotReadError::NoVisibleValues);
         }
         Ok(Self { data })
+    }
+
+    /// Validate the internal CRDT structure and cached visible-value invariants.
+    ///
+    /// This is primarily useful after reconstructing a value from an external snapshot or other
+    /// untrusted input.
+    pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
+        self.data.validate_integrity()
     }
 }
 

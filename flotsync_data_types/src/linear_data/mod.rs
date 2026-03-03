@@ -1,4 +1,5 @@
 use flotsync_utils::option_when;
+use snafu::prelude::*;
 use std::{assert_matches, fmt, vec};
 
 mod coalesced;
@@ -17,6 +18,27 @@ pub use coalesced::{
 mod vec_impl;
 pub use vec_impl::VecLinearData;
 
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+pub enum IntegrityError {
+    #[snafu(display("The first node is not a beginning boundary."))]
+    MissingBeginningBoundary,
+    #[snafu(display("The last node is not an end boundary."))]
+    MissingEndBoundary,
+    #[snafu(display("Node at index {index} is structurally invalid."))]
+    InvalidNode { index: usize },
+    #[snafu(display(
+        "Visible length mismatch: stored length is {expected}, but recomputed length is {actual}."
+    ))]
+    VisibleLengthMismatch { expected: usize, actual: usize },
+    #[snafu(display(
+        "Duplicate logical ids were found between node {left_index} and node {right_index}."
+    ))]
+    DuplicateId {
+        left_index: usize,
+        right_index: usize,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataOperation<Id, Value> {
     /// Insert `value` as the content associated with `id` between `pred` and `succ`.
@@ -33,10 +55,7 @@ pub enum DataOperation<Id, Value> {
     /// For chunk-addressed ids such as [`IdWithIndex`], `end` must refer to the same logical
     /// update as `start` and may only differ in the trailing chunk/index component. In other
     /// words, a valid delete range must not cross update-id boundaries.
-    Delete {
-        start: Id,
-        end: Option<Id>,
-    },
+    Delete { start: Id, end: Option<Id> },
 }
 impl<Id, Value> DataOperation<Id, Value> {
     pub fn map_value<Output, F>(self, mapper: F) -> DataOperation<Id, Output>

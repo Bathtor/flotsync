@@ -1,4 +1,5 @@
 use crate::{
+    IntegrityError,
     linear_data::{
         Composite,
         DataOperation,
@@ -160,6 +161,14 @@ where
         let base = VecLinearData::from_snapshot_nodes(mapped)?;
         let data = VecCoalescedLinearData::from_base_snapshot(base);
         Ok(Self { data })
+    }
+
+    /// Validate the internal CRDT structure and chunk/id invariants.
+    ///
+    /// This is primarily useful after reconstructing a value from an external snapshot or other
+    /// untrusted input.
+    pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
+        self.data.validate_integrity()
     }
 
     /// Append one chunk of values at the end.

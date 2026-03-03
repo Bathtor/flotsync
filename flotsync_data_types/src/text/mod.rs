@@ -63,7 +63,7 @@ where
                 return ApplicationFailedSnafu { remaining_diff }.fail();
             }
             // #[cfg(test)]
-            // target.check_integrity();
+            // target.validate_integrity().unwrap();
         }
 
         Ok(())
@@ -378,7 +378,7 @@ mod tests {
         // println!("Applying diff:\n{}", diff);
         let mut target = from.clone();
         diff.apply_to(&mut target).expect(error_context);
-        from.check_integrity();
+        from.validate_integrity().unwrap();
         assert_eq!(target.to_string(), to, "{error_context}");
     }
 
@@ -393,7 +393,7 @@ mod tests {
             let diff = linear_diff(&linear_from, to, &mut id_generator).unwrap();
             //println!("Applying diff:\n{}\n to {}", diff, linear_from.debug_fmt());
             diff.apply_to(&mut linear_from).unwrap();
-            linear_from.check_integrity();
+            linear_from.validate_integrity().unwrap();
             assert_eq!(linear_from.to_string(), *to);
         }
     }
@@ -415,10 +415,10 @@ mod tests {
             let first_then_second = {
                 let mut linear = base.clone();
                 diff_to_first.clone().apply_to(&mut linear).unwrap();
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 assert_eq!(linear.to_string(), group[1]);
                 diff_to_second.clone().apply_to(&mut linear).unwrap();
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 linear
             };
 
@@ -426,10 +426,10 @@ mod tests {
             let second_then_first = {
                 let mut linear = base.clone();
                 diff_to_second.apply_to(&mut linear).unwrap();
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 assert_eq!(linear.to_string(), group[2]);
                 diff_to_first.apply_to(&mut linear).unwrap();
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 linear
             };
             assert_eq!(first_then_second.to_string(), second_then_first.to_string());
@@ -469,7 +469,7 @@ mod tests {
                     linear_diff(&writer.linear, group[writer_index], &mut id_generator).unwrap();
                 writer.ops.push(op.clone());
                 op.apply_to(&mut writer.linear).unwrap();
-                writer.linear.check_integrity();
+                writer.linear.validate_integrity().unwrap();
                 assert_eq!(writer.linear.to_string(), group[writer_index]);
             }
         }
@@ -484,7 +484,7 @@ mod tests {
                 for op in writer.ops.iter() {
                     //println!("### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
                     op.clone().apply_to(&mut linear).unwrap();
-                    linear.check_integrity();
+                    linear.validate_integrity().unwrap();
                     //println!("### Got '{}':\n {}", linear, linear.debug_fmt());
                 }
             }
@@ -532,46 +532,46 @@ mod tests {
         let a1 = linear_diff(&a, "a", &mut id_generator).unwrap();
         //println!("a1:{}", a1);
         a1.clone().apply_to(&mut a).unwrap();
-        a.check_integrity();
+        a.validate_integrity().unwrap();
         let a2 = linear_diff(&a, "Za", &mut id_generator).unwrap();
         //println!("a2:{}", a2);
         a2.clone().apply_to(&mut a).unwrap();
-        a.check_integrity();
+        a.validate_integrity().unwrap();
 
         // Writer B: "" -> "ab" -> "aXb" (forces an insertion inside a multi-grapheme node).
         let mut b = shared_base.clone();
         let b1 = linear_diff(&b, "ab", &mut id_generator).unwrap();
         //println!("b1:{}", b1);
         b1.clone().apply_to(&mut b).unwrap();
-        b.check_integrity();
+        b.validate_integrity().unwrap();
         let b2 = linear_diff(&b, "aXb", &mut id_generator).unwrap();
         //println!("b2:{}", b2);
         b2.clone().apply_to(&mut b).unwrap();
-        b.check_integrity();
+        b.validate_integrity().unwrap();
 
         // Apply A then B (respecting each writer's internal ordering).
         //println!("### Applying a1, a2, b1, b2");
         let mut l1 = shared_base.clone();
         a1.clone().apply_to(&mut l1).unwrap();
-        l1.check_integrity();
+        l1.validate_integrity().unwrap();
         a2.clone().apply_to(&mut l1).unwrap();
-        l1.check_integrity();
+        l1.validate_integrity().unwrap();
         b1.clone().apply_to(&mut l1).unwrap();
-        l1.check_integrity();
+        l1.validate_integrity().unwrap();
         b2.clone().apply_to(&mut l1).unwrap();
-        l1.check_integrity();
+        l1.validate_integrity().unwrap();
 
         // Apply B then A (still respects each writer's internal ordering).
         //println!("### Applying b1, b2, a1, a2");
         let mut l2 = shared_base.clone();
         b1.apply_to(&mut l2).unwrap();
-        l2.check_integrity();
+        l2.validate_integrity().unwrap();
         b2.apply_to(&mut l2).unwrap();
-        l2.check_integrity();
+        l2.validate_integrity().unwrap();
         a1.apply_to(&mut l2).unwrap();
-        l2.check_integrity();
+        l2.validate_integrity().unwrap();
         a2.apply_to(&mut l2).unwrap();
-        l2.check_integrity();
+        l2.validate_integrity().unwrap();
 
         assert_eq!(
             l1.to_string(),
@@ -671,7 +671,7 @@ mod tests {
             for op in diffs.iter() {
                 // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
                 op.clone().apply_to(linear).map_err(|_| ())?;
-                linear.check_integrity();
+                linear.validate_integrity().unwrap();
                 // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
             }
             Ok(())
@@ -717,7 +717,7 @@ mod tests {
                     // println!("Created diff:\n{op}");
                     writer.ops.push(op.clone());
                     op.apply_to(&mut writer.linear).unwrap();
-                    writer.linear.check_integrity();
+                    writer.linear.validate_integrity().unwrap();
                     assert_eq!(writer.linear.to_string(), group[writer_index]);
                 }
                 // println!("### Finished write #{group_index} ###");
