@@ -9,6 +9,7 @@ flotsync_data_types = { path = "../flotsync_data_types" }
 ordered-float = { workspace = true }
 protobuf = "3"
 snafu = { workspace = true }
+uuid = { workspace = true }
 
 [build-dependencies]
 protobuf-codegen = "3"

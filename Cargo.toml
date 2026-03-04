@@ -6,3 +6,4 @@ resolver = "3"
 snafu = "0.8"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
+uuid = "1"

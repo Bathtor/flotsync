@@ -116,6 +116,10 @@ where
             DataOperation::Delete { .. } => None,
         })
     }
+
+    pub(crate) fn into_operations(self) -> Vec<DataOperation<IdWithIndex<Id>, String>> {
+        self.operations
+    }
 }
 impl<Id> fmt::Display for LinearStringDiff<Id>
 where

@@ -98,7 +98,11 @@ impl SnapshotStateValueRef<'_> {
 pub trait SchemaSnapshotEncoder<Id> {
     type Error: snafu::Error + Send + Sync + 'static;
 
-    type LatestValueWinsFieldSink<'a>: for<'value> SnapshotSink<Id, NullableBasicValueRef<'value>, Error = Self::Error>
+    type LatestValueWinsFieldSink<'a>: for<'value> SnapshotSink<
+            IdWithIndex<Id>,
+            NullableBasicValueRef<'value>,
+            Error = Self::Error,
+        >
     where
         Self: 'a,
         Id: 'a;
@@ -179,7 +183,7 @@ pub trait SchemaSnapshotEncoder<Id> {
 /// // CRDT encode_snapshot on that adapter.
 /// snapshot.end()?;
 /// ```
-pub(super) struct SchemaSnapshotEncodingWriter<'a, Id, V>
+pub(crate) struct SchemaSnapshotEncodingWriter<'a, Id, V>
 where
     V: SchemaSnapshotEncoder<Id>,
 {
@@ -352,7 +356,7 @@ where
 /// - only known schema fields can be emitted
 /// - no duplicate fields
 /// - complete snapshots (`end` fails if any field is missing)
-pub(super) fn prepare_schema_snapshot_encoder<'a, Id, V>(
+pub(crate) fn prepare_schema_snapshot_encoder<'a, Id, V>(
     visitor: &'a mut V,
     schema: &'a Schema,
 ) -> Result<SchemaSnapshotEncodingWriter<'a, Id, V>, SchemaVisitError<V::Error>>
@@ -381,7 +385,7 @@ pub trait SnapshotNodeSource<Id, Value> {
 }
 
 /// Iterator adapter over a `SnapshotNodeSource`.
-pub(super) struct SnapshotNodeSourceIter<'a, Source, Id, Value>
+pub(crate) struct SnapshotNodeSourceIter<'a, Source, Id, Value>
 where
     Source: SnapshotNodeSource<Id, Value>,
 {
@@ -392,7 +396,7 @@ impl<'a, Source, Id, Value> SnapshotNodeSourceIter<'a, Source, Id, Value>
 where
     Source: SnapshotNodeSource<Id, Value>,
 {
-    pub(super) fn new(source: &'a mut Source) -> Self {
+    pub(crate) fn new(source: &'a mut Source) -> Self {
         Self {
             source,
             _marker: PhantomData,
@@ -424,7 +428,7 @@ where
 pub trait SchemaSnapshotDecoder<Id> {
     type Error: snafu::Error + Send + Sync + 'static;
 
-    type LatestValueWinsFieldSource<'a>: SnapshotNodeSource<Id, NullableBasicValue, Error = Self::Error>
+    type LatestValueWinsFieldSource<'a>: SnapshotNodeSource<IdWithIndex<Id>, NullableBasicValue, Error = Self::Error>
     where
         Self: 'a,
         Id: 'a;
@@ -825,7 +829,6 @@ mod tests {
     };
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use chrono::Datelike;
-    use itertools::Itertools;
     use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
 
     const TAG_NULL: u8 = 0;
@@ -1491,8 +1494,12 @@ mod tests {
         fn(&IdWithIndex<u32>) -> Vec<u8>,
         fn(&[u8]) -> Vec<u8>,
     >;
-    type RawLvwHistorySink =
-        snapshot_bytes::ByteBufSink<u32, [u8], fn(&u32) -> Vec<u8>, fn(&[u8]) -> Vec<u8>>;
+    type RawLvwHistorySink = snapshot_bytes::ByteBufSink<
+        IdWithIndex<u32>,
+        [u8],
+        fn(&IdWithIndex<u32>) -> Vec<u8>,
+        fn(&[u8]) -> Vec<u8>,
+    >;
 
     fn encode_raw_bytes(value: &[u8]) -> Vec<u8> {
         value.to_vec()
@@ -1506,7 +1513,7 @@ mod tests {
     }
     fn new_raw_lvw_history_sink() -> RawLvwHistorySink {
         snapshot_bytes::ByteBufSink::new(
-            snapshot_bytes::encode_u32,
+            snapshot_bytes::encode_id_with_index_u32,
             encode_raw_bytes as fn(&[u8]) -> Vec<u8>,
         )
     }
@@ -1537,7 +1544,7 @@ mod tests {
                 .ok_or_else(|| "field sink already closed".to_owned())
         }
     }
-    impl<'a, 'value> SnapshotSink<u32, NullableBasicValueRef<'value>>
+    impl<'a, 'value> SnapshotSink<IdWithIndex<u32>, NullableBasicValueRef<'value>>
         for LatestValueWinsHistoryBytesSink<'a>
     {
         type Error = TestError;
@@ -1549,7 +1556,7 @@ mod tests {
         fn node(
             &mut self,
             index: usize,
-            node: SnapshotNodeRef<'_, u32, NullableBasicValueRef<'value>>,
+            node: SnapshotNodeRef<'_, IdWithIndex<u32>, NullableBasicValueRef<'value>>,
         ) -> Result<(), Self::Error> {
             let data_type = ReplicatedDataType::LatestValueWins {
                 value_type: self.value_type.clone(),
@@ -2031,7 +2038,7 @@ mod tests {
         type Error = TestError;
 
         type LatestValueWinsFieldSource<'a>
-            = VecSnapshotNodeSource<u32, NullableBasicValue>
+            = VecSnapshotNodeSource<IdWithIndex<u32>, NullableBasicValue>
         where
             Self: 'a;
 
@@ -2080,7 +2087,7 @@ mod tests {
             };
             let nodes = snapshot_bytes::parse_snapshot_nodes(
                 bytes,
-                snapshot_bytes::decode_u32,
+                snapshot_bytes::decode_id_with_index_u32,
                 |payload| match decode_node_payload(&data_type, payload)? {
                     SnapshotNodeValue::LatestValueWins(value) => Ok(value),
                     _ => Err("expected latest value wins node value".to_owned()),
@@ -2421,10 +2428,14 @@ mod tests {
         let schema = &*TEST_SCHEMA;
 
         let mut lvw_id_generator = 0u32..;
-        let mut latest =
-            LinearLatestValueWins::new(Some(1u64), lvw_id_generator.next_array().unwrap());
-        latest.update(100, None);
-        latest.update(101, Some(99));
+        let latest_initial_ids = [
+            IdWithIndex::zero(lvw_id_generator.next().unwrap()),
+            IdWithIndex::zero(lvw_id_generator.next().unwrap()),
+            IdWithIndex::zero(lvw_id_generator.next().unwrap()),
+        ];
+        let mut latest = LinearLatestValueWins::new(Some(1u64), latest_initial_ids);
+        latest.update(IdWithIndex::zero(100), None);
+        latest.update(IdWithIndex::zero(101), Some(99));
 
         let mut title_id_generator = 1000u32..;
         let mut title =
@@ -2443,7 +2454,7 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data = InMemoryData::with_owned_schema(schema.clone());
+        let mut data: InMemoryData<(), u32> = InMemoryData::with_owned_schema(schema.clone());
         data.push_row_from_named_fields([
             (
                 "latest",

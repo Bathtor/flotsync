@@ -2,12 +2,21 @@
 
 // Re-export protobuf, so we use a consistent version.
 pub use protobuf;
+pub use uuid::Uuid;
 
 pub mod codecs;
 pub mod snapshots;
 
 // Export the generated modules.
 include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
+
+pub type InMemoryData =
+    flotsync_data_types::schema::datamodel::InMemoryData<Uuid, flotsync_core::versions::UpdateId>;
+pub type SchemaOperation<'a> = flotsync_data_types::schema::datamodel::SchemaOperation<
+    'a,
+    Uuid,
+    flotsync_core::versions::UpdateId,
+>;
 
 #[cfg(test)]
 mod tests {

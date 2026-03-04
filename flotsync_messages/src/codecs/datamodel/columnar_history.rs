@@ -1,6 +1,5 @@
 use super::*;
 use crate::datamodel as proto;
-use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
     schema::{
         BasicDataType,
@@ -308,16 +307,16 @@ impl ColumnarValueBuffer {
 
 /// Encode a columnar history snapshot for a LatestValueWins field.
 pub fn encode_columnar_latest_value_wins_history_snapshot(
-    nodes: &[SnapshotNode<UpdateId, ModelNullableBasicValue>],
+    nodes: &[SnapshotNode<UpdateIdWithIndex, ModelNullableBasicValue>],
     value_type: &NullableBasicDataType,
 ) -> ColumnarResult<proto::HistorySnapshot> {
     let data_type = ReplicatedDataType::LatestValueWins {
         value_type: value_type.clone(),
     };
     let records = nodes.iter().map(|node| ColumnarHistoryNodeRecord {
-        id: encode_update_id(node.id),
-        left: node.left.map(encode_update_id),
-        right: node.right.map(encode_update_id),
+        id: encode_indexed_update_id(&node.id),
+        left: node.left.as_ref().map(encode_indexed_update_id),
+        right: node.right.as_ref().map(encode_indexed_update_id),
         deleted: node.deleted,
         value: node
             .value
@@ -331,9 +330,9 @@ pub fn encode_columnar_latest_value_wins_history_snapshot(
 pub fn decode_columnar_latest_value_wins_history_snapshot(
     snapshot: proto::HistorySnapshot,
     value_type: NullableBasicDataType,
-) -> ColumnarResult<Vec<SnapshotNode<UpdateId, ModelNullableBasicValue>>> {
+) -> ColumnarResult<Vec<SnapshotNode<UpdateIdWithIndex, ModelNullableBasicValue>>> {
     let data_type = ReplicatedDataType::LatestValueWins { value_type };
-    let decoded = decode_columnar_history_snapshot(&data_type, snapshot, decode_update_id)?;
+    let decoded = decode_columnar_history_snapshot(&data_type, snapshot, decode_indexed_update_id)?;
     decoded
         .into_iter()
         .map(|node| match node.value {
@@ -774,7 +773,7 @@ fn set_origin_left_fields(meta: &mut proto::HistoryNodeMeta, id: Option<proto::H
     if let Some(id) = id {
         meta.origin_left_version = Some(id.version);
         meta.origin_left_node_index = Some(id.node_index);
-        meta.origin_left_chunk_index = id.chunk_index;
+        meta.origin_left_chunk_index = Some(id.chunk_index);
     }
 }
 
@@ -782,7 +781,7 @@ fn set_origin_right_fields(meta: &mut proto::HistoryNodeMeta, id: Option<proto::
     if let Some(id) = id {
         meta.origin_right_version = Some(id.version);
         meta.origin_right_node_index = Some(id.node_index);
-        meta.origin_right_chunk_index = id.chunk_index;
+        meta.origin_right_chunk_index = Some(id.chunk_index);
     }
 }
 
@@ -806,7 +805,7 @@ fn decode_optional_origin_id<Id>(
         (Some(version), Some(node_index)) => decode_id(proto::HistoryId {
             version,
             node_index,
-            chunk_index,
+            chunk_index: chunk_index.unwrap_or(0),
             ..proto::HistoryId::new()
         })
         .context(CodecSnafu)
@@ -966,16 +965,18 @@ fn array_ref_len(values: &ModelPrimitiveValueArrayRef<'_>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotsync_core::versions::UpdateId;
     use flotsync_data_types::{
         any_data::{LinearLatestValueWins, list::LinearList},
         schema::{ArrayType, BasicDataType, NullableBasicDataType},
         snapshot::{SnapshotHeader, SnapshotNodeRef, SnapshotSink},
         text::LinearString,
     };
+    use std::assert_matches;
 
     fn latest_value_wins_array_fixture() -> (
         NullableBasicDataType,
-        Vec<SnapshotNode<UpdateId, ModelNullableBasicValue>>,
+        Vec<SnapshotNode<UpdateIdWithIndex, ModelNullableBasicValue>>,
     ) {
         let value_type =
             NullableBasicDataType::Nullable(BasicDataType::Array(Box::new(ArrayType {
@@ -986,34 +987,34 @@ mod tests {
                 vec![1, 2, 3],
             ))),
             [
-                UpdateId {
+                IdWithIndex::zero(UpdateId {
                     version: 1,
                     node_index: 0,
-                },
-                UpdateId {
+                }),
+                IdWithIndex::zero(UpdateId {
                     version: 1,
                     node_index: 1,
-                },
-                UpdateId {
+                }),
+                IdWithIndex::zero(UpdateId {
                     version: 1,
                     node_index: 2,
-                },
+                }),
             ],
         );
         latest.update(
-            UpdateId {
+            IdWithIndex::zero(UpdateId {
                 version: 2,
                 node_index: 0,
-            },
+            }),
             ModelNullableBasicValue::Value(ModelBasicValue::Array(ModelPrimitiveValueArray::Int(
                 Vec::new(),
             ))),
         );
         latest.update(
-            UpdateId {
+            IdWithIndex::zero(UpdateId {
                 version: 3,
                 node_index: 0,
-            },
+            }),
             ModelNullableBasicValue::Null,
         );
 
@@ -1267,11 +1268,13 @@ mod tests {
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 1,
             node_index: 0,
-            chunk_index: None,
+            chunk_index: 0,
             origin_left_version: Some(0),
             origin_left_node_index: Some(0),
+            origin_left_chunk_index: Some(0),
             origin_right_version: Some(2),
             origin_right_node_index: Some(0),
+            origin_right_chunk_index: Some(0),
             deleted: false,
             value_len: 1,
             value_is_null: true,
@@ -1280,10 +1283,7 @@ mod tests {
 
         let err =
             decode_columnar_latest_value_wins_history_snapshot(snapshot, value_type).unwrap_err();
-        assert!(matches!(
-            err,
-            ColumnarHistoryCodecError::InvalidNodeMeta { .. }
-        ));
+        assert_matches!(err, ColumnarHistoryCodecError::InvalidNodeMeta { .. });
     }
 
     #[test]
@@ -1292,10 +1292,10 @@ mod tests {
         let snapshot =
             encode_columnar_latest_value_wins_history_snapshot(&nodes, &value_type).unwrap();
 
-        assert!(matches!(
+        assert_matches!(
             snapshot.values,
             Some(proto::history_snapshot::Values::PrimitiveValues(_))
-        ));
+        );
 
         assert_eq!(
             snapshot
@@ -1351,7 +1351,7 @@ mod tests {
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 1,
             node_index: 0,
-            chunk_index: Some(0),
+            chunk_index: 0,
             deleted: false,
             origin_right_version: Some(2),
             origin_right_node_index: Some(0),
@@ -1363,7 +1363,7 @@ mod tests {
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 2,
             node_index: 0,
-            chunk_index: Some(0),
+            chunk_index: 0,
             origin_left_version: Some(1),
             origin_left_node_index: Some(0),
             origin_left_chunk_index: Some(0),
@@ -1378,7 +1378,7 @@ mod tests {
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 3,
             node_index: 0,
-            chunk_index: Some(1),
+            chunk_index: 1,
             origin_left_version: Some(2),
             origin_left_node_index: Some(0),
             origin_left_chunk_index: Some(0),
@@ -1393,7 +1393,7 @@ mod tests {
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 4,
             node_index: 0,
-            chunk_index: Some(0),
+            chunk_index: 0,
             deleted: false,
             origin_left_version: Some(3),
             origin_left_node_index: Some(0),
@@ -1404,10 +1404,7 @@ mod tests {
         });
 
         let err = decode_columnar_linear_string_history_snapshot(snapshot).unwrap_err();
-        assert!(matches!(
-            err,
-            ColumnarHistoryCodecError::InvalidStringSpan { .. }
-        ));
+        assert_matches!(err, ColumnarHistoryCodecError::InvalidStringSpan { .. });
     }
 
     #[test]

@@ -485,6 +485,15 @@ where
 pub struct ListOperation<Id, T> {
     op: DataOperation<IdWithIndex<Id>, Vec<T>>,
 }
+impl<Id, T> ListOperation<Id, T> {
+    pub(crate) fn from_operation(op: DataOperation<IdWithIndex<Id>, Vec<T>>) -> Self {
+        Self { op }
+    }
+
+    pub(crate) fn into_operation(self) -> DataOperation<IdWithIndex<Id>, Vec<T>> {
+        self.op
+    }
+}
 
 /// Convenience wrapper around [[NodeIdRange]] when using it with [[LinearList]].
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1023,6 +1023,7 @@ dependencies = [
  "protobuf",
  "protobuf-codegen",
  "snafu",
+ "uuid",
 ]
 
 [[package]]

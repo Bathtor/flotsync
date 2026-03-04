@@ -17,6 +17,7 @@ use crate::{
             NullableBasicValue,
             OperationFieldValue,
             OperationValue,
+            RowOperation,
             SchemaOperation,
         },
         values::{
@@ -165,12 +166,23 @@ pub fn exhaustive_schema() -> Schema {
 
 /// Build one partial schema operation per example payload shape.
 ///
-/// The iterator must yield at least [`EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT`] IDs.
-pub fn exhaustive_schema_operations<Id>(
-    ids: impl Iterator<Item = Id>,
-) -> Result<Vec<SchemaOperation<'static, Id>>, ExampleBuildError> {
+/// The `change_ids` iterator must yield at least [`EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT`]
+/// ids and `row_ids` must yield at least [`EXHAUSTIVE_SCHEMA_OPERATION_COUNT`] ids.
+pub fn exhaustive_schema_operations<RowId, ChangeId>(
+    row_ids: impl Iterator<Item = RowId>,
+    change_ids: impl Iterator<Item = ChangeId>,
+) -> Result<Vec<SchemaOperation<'static, RowId, ChangeId>>, ExampleBuildError>
+where
+    RowId: Clone,
+    ChangeId: Clone,
+{
+    let mut row_ids = IdSource::new(
+        row_ids,
+        "exhaustive_schema_operations(row_ids)",
+        EXHAUSTIVE_SCHEMA_OPERATION_COUNT,
+    );
     let mut ids = IdSource::new(
-        ids,
+        change_ids,
         "exhaustive_schema_operations",
         EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT,
     );
@@ -178,6 +190,7 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             lvw_field_name(false, false, primitive_type),
             latest_value_wins_operation(
@@ -186,6 +199,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             lvw_field_name(true, false, primitive_type),
             latest_value_wins_operation(
@@ -194,6 +208,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             lvw_field_name(false, true, primitive_type),
             latest_value_wins_operation(
@@ -202,6 +217,7 @@ pub fn exhaustive_schema_operations<Id>(
             )?,
         ));
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             lvw_field_name(true, true, primitive_type),
             latest_value_wins_operation(
@@ -212,6 +228,7 @@ pub fn exhaustive_schema_operations<Id>(
     }
 
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         "linear_string".to_owned(),
         linear_string_insert(&mut ids, "example linear string".to_owned())?,
@@ -219,6 +236,7 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             linear_list_field_name(primitive_type),
             linear_list_insert(&mut ids, primitive_value_array(primitive_type))?,
@@ -226,11 +244,13 @@ pub fn exhaustive_schema_operations<Id>(
     }
 
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         "monotonic_counter_byte".to_owned(),
         OperationValue::MonotonicCounterIncrement(CounterValue::Byte(7)),
     ));
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         "monotonic_counter_uint".to_owned(),
         OperationValue::MonotonicCounterIncrement(CounterValue::UInt(42)),
@@ -238,11 +258,13 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             total_order_register_field_name(Direction::Ascending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             total_order_register_field_name(Direction::Descending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
@@ -251,6 +273,7 @@ pub fn exhaustive_schema_operations<Id>(
 
     for primitive_type in primitive_types() {
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             finite_state_register_field_name(false, primitive_type),
             OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Value(
@@ -258,6 +281,7 @@ pub fn exhaustive_schema_operations<Id>(
             )),
         ));
         operations.push(single_field_operation(
+            row_ids.next_id()?,
             ids.next_id()?,
             finite_state_register_field_name(true, primitive_type),
             OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Value(
@@ -267,21 +291,25 @@ pub fn exhaustive_schema_operations<Id>(
     }
 
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         lvw_field_name(true, false, PrimitiveType::String),
         latest_value_wins_operation(&mut ids, NullableBasicValue::Null)?,
     ));
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         "linear_string".to_owned(),
         linear_string_delete(&mut ids)?,
     ));
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         linear_list_field_name(PrimitiveType::String),
         linear_list_delete(&mut ids)?,
     ));
     operations.push(single_field_operation(
+        row_ids.next_id()?,
         ids.next_id()?,
         finite_state_register_field_name(true, PrimitiveType::String),
         OperationValue::TotalOrderFiniteStateRegisterSet(NullablePrimitiveValue::Null),
@@ -294,9 +322,13 @@ pub fn exhaustive_schema_operations<Id>(
 /// Build one combined schema operation containing one field update for every field in [`exhaustive_schema`].
 ///
 /// The iterator must yield at least [`EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT`] IDs.
-pub fn exhaustive_schema_operation<Id>(
-    ids: impl Iterator<Item = Id>,
-) -> Result<SchemaOperation<'static, Id>, ExampleBuildError> {
+pub fn exhaustive_schema_operation<RowId, ChangeId>(
+    row_id: RowId,
+    ids: impl Iterator<Item = ChangeId>,
+) -> Result<SchemaOperation<'static, RowId, ChangeId>, ExampleBuildError>
+where
+    ChangeId: Clone,
+{
     let mut ids = IdSource::new(
         ids,
         "exhaustive_schema_operation",
@@ -384,7 +416,10 @@ pub fn exhaustive_schema_operation<Id>(
     }
 
     debug_assert_eq!(fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
-    Ok(SchemaOperation { change_id, fields })
+    Ok(SchemaOperation {
+        change_id,
+        operation: RowOperation::Update { row_id, fields },
+    })
 }
 
 fn insert_field(columns: &mut HashMap<String, Field>, name: String, data_type: ReplicatedDataType) {
@@ -405,14 +440,21 @@ fn field<Id>(field_name: String, value: OperationValue<Id>) -> OperationFieldVal
     }
 }
 
-fn single_field_operation<Id>(
-    change_id: Id,
+fn single_field_operation<RowId, ChangeId>(
+    row_id: RowId,
+    change_id: ChangeId,
     field_name: String,
-    value: OperationValue<Id>,
-) -> SchemaOperation<'static, Id> {
+    value: OperationValue<ChangeId>,
+) -> SchemaOperation<'static, RowId, ChangeId>
+where
+    ChangeId: Clone,
+{
     SchemaOperation {
         change_id,
-        fields: vec![field(field_name, value)],
+        operation: RowOperation::Update {
+            row_id,
+            fields: vec![field(field_name, value)],
+        },
     }
 }
 
@@ -424,9 +466,9 @@ where
     Ids: Iterator<Item = Id>,
 {
     Ok(OperationValue::LatestValueWins(UpdateOperation {
-        id: ids.next_id()?,
-        pred: ids.next_id()?,
-        succ: ids.next_id()?,
+        id: indexed_id(ids.next_id()?),
+        pred: indexed_id(ids.next_id()?),
+        succ: indexed_id(ids.next_id()?),
         value,
     }))
 }
@@ -743,7 +785,7 @@ where
 mod tests {
     use super::*;
     use crate::schema::datamodel::validate_schema_operation_fields;
-    use std::collections::BTreeSet;
+    use std::{assert_matches, collections::BTreeSet};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum PrimitiveCoverageKey {
@@ -1129,14 +1171,16 @@ mod tests {
     #[test]
     fn exhaustive_schema_operations_validate_against_exhaustive_schema() {
         let schema = exhaustive_schema();
-        let operations = exhaustive_schema_operations(0u32..).unwrap();
+        let operations = exhaustive_schema_operations(0u32.., 10_000u32..).unwrap();
 
         assert_eq!(operations.len(), EXHAUSTIVE_SCHEMA_OPERATION_COUNT);
         for (index, operation) in operations.iter().enumerate() {
-            validate_schema_operation_fields(&schema, &operation.fields).unwrap_or_else(|error| {
+            let RowOperation::Update { fields, .. } = &operation.operation else {
+                panic!("expected single-field update operation");
+            };
+            validate_schema_operation_fields(&schema, fields).unwrap_or_else(|error| {
                 panic!(
-                    "single-field operation {index} failed validation: {error:?}; fields={:?}",
-                    operation.fields
+                    "single-field operation {index} failed validation: {error:?}; fields={fields:?}"
                 )
             });
         }
@@ -1145,11 +1189,14 @@ mod tests {
     #[test]
     fn exhaustive_schema_operations_cover_all_supported_operation_shapes() {
         let schema = exhaustive_schema();
-        let operations = exhaustive_schema_operations(0u32..).unwrap();
+        let operations = exhaustive_schema_operations(0u32.., 10_000u32..).unwrap();
         let actual = operations
             .iter()
             .map(|operation| {
-                let [field] = operation.fields.as_slice() else {
+                let RowOperation::Update { fields, .. } = &operation.operation else {
+                    panic!("expected single-field update operation");
+                };
+                let [field] = fields.as_slice() else {
                     panic!("expected single-field operation");
                 };
                 let data_type = &schema
@@ -1167,64 +1214,64 @@ mod tests {
     #[test]
     fn exhaustive_schema_operation_validates_against_exhaustive_schema() {
         let schema = exhaustive_schema();
-        let operation = exhaustive_schema_operation(0u32..).unwrap();
+        let operation = exhaustive_schema_operation(7u32, 10_000u32..).unwrap();
 
-        assert_eq!(operation.fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
+        let RowOperation::Update { fields, .. } = &operation.operation else {
+            panic!("expected combined update operation");
+        };
+        assert_eq!(fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
         operation
             .validate_against_schema(&schema)
             .unwrap_or_else(|error| {
-                panic!(
-                    "combined operation failed validation: {error:?}; fields={:?}",
-                    operation.fields
-                )
+                panic!("combined operation failed validation: {error:?}; fields={fields:?}")
             });
     }
 
     #[test]
     fn exhaustive_schema_operation_accepts_exact_minimum_id_count() {
-        let operation =
-            exhaustive_schema_operation(0u32..EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32)
-                .unwrap();
-        assert_eq!(operation.fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
+        let ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32;
+        let operation = exhaustive_schema_operation(7u32, ids).unwrap();
+        let RowOperation::Update { fields, .. } = &operation.operation else {
+            panic!("expected combined update operation");
+        };
+        assert_eq!(fields.len(), EXHAUSTIVE_SCHEMA_FIELD_COUNT);
     }
 
     #[test]
     fn exhaustive_schema_operations_accept_exact_minimum_id_count() {
-        let operations =
-            exhaustive_schema_operations(0u32..EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32)
-                .unwrap();
+        let row_ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_COUNT as u32;
+        let change_ids = 10_000u32..10_000u32 + EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32;
+        let operations = exhaustive_schema_operations(row_ids, change_ids).unwrap();
         assert_eq!(operations.len(), EXHAUSTIVE_SCHEMA_OPERATION_COUNT);
     }
 
     #[test]
     fn exhaustive_schema_operation_reports_insufficient_ids() {
-        let err = exhaustive_schema_operation(
-            0u32..(EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32 - 1),
-        )
-        .unwrap_err();
-        assert!(matches!(
+        let ids = 0u32..(EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32 - 1);
+        let err = exhaustive_schema_operation(7u32, ids).unwrap_err();
+        assert_matches!(
             err,
             ExampleBuildError::InsufficientIds {
                 builder: "exhaustive_schema_operation",
                 required_minimum: EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT,
                 ..
             }
-        ));
+        );
     }
 
     #[test]
     fn exhaustive_schema_operations_report_insufficient_ids() {
-        let err = exhaustive_schema_operations(
-            0u32..(EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32 - 1),
-        )
-        .unwrap_err();
-        assert!(matches!(
+        let row_ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_COUNT as u32;
+        let change_ids =
+            10_000u32..10_000u32 + (EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32 - 1);
+        let err = exhaustive_schema_operations(row_ids, change_ids).unwrap_err();
+        assert_matches!(
             err,
             ExampleBuildError::InsufficientIds {
                 builder: "exhaustive_schema_operations",
                 required_minimum: EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT,
                 ..
             }
-        ));
+        );
     }
 }

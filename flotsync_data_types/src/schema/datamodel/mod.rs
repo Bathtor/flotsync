@@ -119,6 +119,33 @@ impl BasicValue {
     }
 }
 
+impl<T> From<T> for BasicValue
+where
+    PrimitiveValue: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self::Primitive(value.into())
+    }
+}
+
+impl<T> From<Vec<T>> for BasicValue
+where
+    PrimitiveValueArray: From<Vec<T>>,
+{
+    fn from(value: Vec<T>) -> Self {
+        Self::Array(value.into())
+    }
+}
+
+impl<T> From<Box<[T]>> for BasicValue
+where
+    PrimitiveValueArray: From<Box<[T]>>,
+{
+    fn from(value: Box<[T]>) -> Self {
+        Self::Array(value.into())
+    }
+}
+
 /// An owned nullable basic value for `LatestValueWins` payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NullableBasicValue {
@@ -135,6 +162,27 @@ impl NullableBasicValue {
 
     pub fn matches_type(&self, expected: &NullableBasicDataType) -> bool {
         self.as_ref().matches_type(expected)
+    }
+}
+
+impl<T> From<T> for NullableBasicValue
+where
+    BasicValue: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self::Value(value.into())
+    }
+}
+
+impl<T> From<Option<T>> for NullableBasicValue
+where
+    BasicValue: From<T>,
+{
+    fn from(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Self::Value(value.into()),
+            None => Self::Null,
+        }
     }
 }
 

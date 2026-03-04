@@ -3,6 +3,7 @@ use crate::{
         CodecError,
         ColumnarHistoryCodecError,
         StateSnapshotWireValue,
+        UpdateIdWithIndex,
         decode_columnar_latest_value_wins_history_snapshot,
         decode_columnar_linear_list_history_snapshot,
         decode_columnar_linear_string_history_snapshot,
@@ -16,13 +17,15 @@ use crate::{
 };
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
-    IdWithIndex,
     schema::{
         NullableBasicDataType,
         PrimitiveType,
         ReplicatedDataType,
         Schema,
         datamodel::{
+            NullableBasicValue,
+            NullableBasicValueRef,
+            PrimitiveValueArrayRef,
             SchemaSnapshotDecoder,
             SchemaSnapshotEncoder,
             SnapshotNodeSource,
@@ -410,14 +413,13 @@ pub struct LatestValueWinsHistoryFieldSink<'schema, 'row> {
         HistoryFieldEncoderState<
             'schema,
             'row,
-            SnapshotNode<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValue>,
+            SnapshotNode<UpdateIdWithIndex, NullableBasicValue>,
         >,
     >,
     value_type: &'schema NullableBasicDataType,
 }
 
-impl<'schema, 'row, 'value>
-    SnapshotSink<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValueRef<'value>>
+impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRef<'value>>
     for LatestValueWinsHistoryFieldSink<'schema, 'row>
 {
     type Error = SnapshotAdapterError;
@@ -432,11 +434,7 @@ impl<'schema, 'row, 'value>
     fn node(
         &mut self,
         index: usize,
-        node: SnapshotNodeRef<
-            '_,
-            UpdateId,
-            flotsync_data_types::schema::datamodel::NullableBasicValueRef<'value>,
-        >,
+        node: SnapshotNodeRef<'_, UpdateIdWithIndex, NullableBasicValueRef<'value>>,
     ) -> Result<(), Self::Error> {
         self.state
             .as_mut()
@@ -455,12 +453,10 @@ impl<'schema, 'row, 'value>
 
 /// Streaming sink for one `LinearString` history field.
 pub struct LinearStringHistoryFieldSink<'schema, 'row> {
-    state: Option<
-        HistoryFieldEncoderState<'schema, 'row, SnapshotNode<IdWithIndex<UpdateId>, String>>,
-    >,
+    state: Option<HistoryFieldEncoderState<'schema, 'row, SnapshotNode<UpdateIdWithIndex, String>>>,
 }
 
-impl<'schema, 'row> SnapshotSink<IdWithIndex<UpdateId>, str>
+impl<'schema, 'row> SnapshotSink<UpdateIdWithIndex, str>
     for LinearStringHistoryFieldSink<'schema, 'row>
 {
     type Error = SnapshotAdapterError;
@@ -475,7 +471,7 @@ impl<'schema, 'row> SnapshotSink<IdWithIndex<UpdateId>, str>
     fn node(
         &mut self,
         index: usize,
-        node: SnapshotNodeRef<'_, IdWithIndex<UpdateId>, str>,
+        node: SnapshotNodeRef<'_, UpdateIdWithIndex, str>,
     ) -> Result<(), Self::Error> {
         self.state
             .as_mut()
@@ -497,17 +493,14 @@ pub struct LinearListHistoryFieldSink<'schema, 'row> {
         HistoryFieldEncoderState<
             'schema,
             'row,
-            SnapshotNode<IdWithIndex<UpdateId>, PrimitiveValueArray>,
+            SnapshotNode<UpdateIdWithIndex, PrimitiveValueArray>,
         >,
     >,
     value_type: PrimitiveType,
 }
 
-impl<'schema, 'row, 'value>
-    SnapshotSink<
-        IdWithIndex<UpdateId>,
-        flotsync_data_types::schema::datamodel::PrimitiveValueArrayRef<'value>,
-    > for LinearListHistoryFieldSink<'schema, 'row>
+impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayRef<'value>>
+    for LinearListHistoryFieldSink<'schema, 'row>
 {
     type Error = SnapshotAdapterError;
 
@@ -521,11 +514,7 @@ impl<'schema, 'row, 'value>
     fn node(
         &mut self,
         index: usize,
-        node: SnapshotNodeRef<
-            '_,
-            IdWithIndex<UpdateId>,
-            flotsync_data_types::schema::datamodel::PrimitiveValueArrayRef<'_>,
-        >,
+        node: SnapshotNodeRef<'_, UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>,
     ) -> Result<(), Self::Error> {
         self.state
             .as_mut()
@@ -760,37 +749,32 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
 
 /// Lazy node source for a `LatestValueWins` history field decoded from protobuf.
 pub struct LatestValueWinsHistoryFieldSource {
-    nodes: std::vec::IntoIter<
-        SnapshotNode<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValue>,
-    >,
+    nodes: std::vec::IntoIter<SnapshotNode<UpdateIdWithIndex, NullableBasicValue>>,
 }
 
-impl SnapshotNodeSource<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValue>
+impl SnapshotNodeSource<UpdateIdWithIndex, NullableBasicValue>
     for LatestValueWinsHistoryFieldSource
 {
     type Error = SnapshotAdapterError;
 
     fn next_node(
         &mut self,
-    ) -> Result<
-        Option<SnapshotNode<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValue>>,
-        Self::Error,
-    > {
+    ) -> Result<Option<SnapshotNode<UpdateIdWithIndex, NullableBasicValue>>, Self::Error> {
         Ok(self.nodes.next())
     }
 }
 
 /// Lazy node source for a `LinearString` history field decoded from protobuf.
 pub struct LinearStringHistoryFieldSource {
-    nodes: std::vec::IntoIter<SnapshotNode<IdWithIndex<UpdateId>, String>>,
+    nodes: std::vec::IntoIter<SnapshotNode<UpdateIdWithIndex, String>>,
 }
 
-impl SnapshotNodeSource<IdWithIndex<UpdateId>, String> for LinearStringHistoryFieldSource {
+impl SnapshotNodeSource<UpdateIdWithIndex, String> for LinearStringHistoryFieldSource {
     type Error = SnapshotAdapterError;
 
     fn next_node(
         &mut self,
-    ) -> Result<Option<SnapshotNode<IdWithIndex<UpdateId>, String>>, Self::Error> {
+    ) -> Result<Option<SnapshotNode<UpdateIdWithIndex, String>>, Self::Error> {
         Ok(self.nodes.next())
     }
 }
@@ -800,11 +784,9 @@ pub struct LinearListHistoryFieldSource {
     nodes: std::vec::IntoIter<PrimitiveValueArrayNode>,
 }
 
-type PrimitiveValueArrayNode = SnapshotNode<IdWithIndex<UpdateId>, PrimitiveValueArray>;
+type PrimitiveValueArrayNode = SnapshotNode<UpdateIdWithIndex, PrimitiveValueArray>;
 
-impl SnapshotNodeSource<IdWithIndex<UpdateId>, PrimitiveValueArray>
-    for LinearListHistoryFieldSource
-{
+impl SnapshotNodeSource<UpdateIdWithIndex, PrimitiveValueArray> for LinearListHistoryFieldSource {
     type Error = SnapshotAdapterError;
 
     fn next_node(&mut self) -> Result<Option<PrimitiveValueArrayNode>, Self::Error> {
@@ -813,24 +795,20 @@ impl SnapshotNodeSource<IdWithIndex<UpdateId>, PrimitiveValueArray>
 }
 
 fn owned_latest_value_wins_node(
-    node: SnapshotNodeRef<
-        '_,
-        UpdateId,
-        flotsync_data_types::schema::datamodel::NullableBasicValueRef<'_>,
-    >,
-) -> SnapshotNode<UpdateId, flotsync_data_types::schema::datamodel::NullableBasicValue> {
+    node: SnapshotNodeRef<'_, UpdateIdWithIndex, NullableBasicValueRef<'_>>,
+) -> SnapshotNode<UpdateIdWithIndex, NullableBasicValue> {
     SnapshotNode {
-        id: *node.id,
-        left: node.left.copied(),
-        right: node.right.copied(),
+        id: node.id.clone(),
+        left: node.left.cloned(),
+        right: node.right.cloned(),
         deleted: node.deleted,
         value: node.value.map(|value| value.clone().into_owned()),
     }
 }
 
 fn owned_linear_string_node(
-    node: SnapshotNodeRef<'_, IdWithIndex<UpdateId>, str>,
-) -> SnapshotNode<IdWithIndex<UpdateId>, String> {
+    node: SnapshotNodeRef<'_, UpdateIdWithIndex, str>,
+) -> SnapshotNode<UpdateIdWithIndex, String> {
     SnapshotNode {
         id: node.id.clone(),
         left: node.left.cloned(),
@@ -841,11 +819,7 @@ fn owned_linear_string_node(
 }
 
 fn owned_linear_list_node(
-    node: SnapshotNodeRef<
-        '_,
-        IdWithIndex<UpdateId>,
-        flotsync_data_types::schema::datamodel::PrimitiveValueArrayRef<'_>,
-    >,
+    node: SnapshotNodeRef<'_, UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>,
 ) -> PrimitiveValueArrayNode {
     SnapshotNode {
         id: node.id.clone(),
@@ -1157,13 +1131,13 @@ mod tests {
     use super::*;
     use crate::protobuf::Message;
     use flotsync_data_types::{
+        NULL,
         any_data::{LinearLatestValueWins, list::LinearList},
         schema::{
             BasicDataType,
             Direction,
             Field,
             NullableBasicDataType,
-            NullablePrimitiveType,
             datamodel::{
                 DataSnapshotDecoder,
                 InMemoryData,
@@ -1171,11 +1145,11 @@ mod tests {
                 LinearLatestValueWinsValue,
                 LinearListValue,
             },
-            values::{NullablePrimitiveValue, NullablePrimitiveValueArray, PrimitiveValue},
+            values::{NullablePrimitiveValue, PrimitiveValue},
         },
         text::LinearString,
     };
-    use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
+    use std::{assert_matches, borrow::Cow, sync::LazyLock};
 
     fn update_id(version: u64, node_index: u32) -> UpdateId {
         UpdateId {
@@ -1184,8 +1158,8 @@ mod tests {
         }
     }
 
-    fn indexed(version: u64, node_index: u32, chunk_index: u32) -> IdWithIndex<UpdateId> {
-        IdWithIndex {
+    fn indexed(version: u64, node_index: u32, chunk_index: u32) -> UpdateIdWithIndex {
+        UpdateIdWithIndex {
             id: update_id(version, node_index),
             index: chunk_index,
         }
@@ -1200,76 +1174,18 @@ mod tests {
     }
 
     static TEST_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
-        let mut columns = HashMap::new();
-        columns.insert(
-            "latest".to_owned(),
-            Field {
-                name: "latest".to_owned(),
-                data_type: ReplicatedDataType::LatestValueWins {
-                    value_type: NullableBasicDataType::Nullable(BasicDataType::Primitive(
-                        PrimitiveType::UInt,
-                    )),
-                },
-                metadata: HashMap::new(),
-            },
-        );
-        columns.insert(
-            "title".to_owned(),
-            Field {
-                name: "title".to_owned(),
-                data_type: ReplicatedDataType::LinearString,
-                metadata: HashMap::new(),
-            },
-        );
-        columns.insert(
-            "numbers".to_owned(),
-            Field {
-                name: "numbers".to_owned(),
-                data_type: ReplicatedDataType::LinearList {
-                    value_type: PrimitiveType::Int,
-                },
-                metadata: HashMap::new(),
-            },
-        );
-        columns.insert(
-            "counter".to_owned(),
-            Field {
-                name: "counter".to_owned(),
-                data_type: ReplicatedDataType::MonotonicCounter { small_range: false },
-                metadata: HashMap::new(),
-            },
-        );
-        columns.insert(
-            "priority".to_owned(),
-            Field {
-                name: "priority".to_owned(),
-                data_type: ReplicatedDataType::TotalOrderRegister {
-                    value_type: PrimitiveType::UInt,
-                    direction: Direction::Ascending,
-                },
-                metadata: HashMap::new(),
-            },
-        );
-        columns.insert(
-            "status".to_owned(),
-            Field {
-                name: "status".to_owned(),
-                data_type: ReplicatedDataType::TotalOrderFiniteStateRegister {
-                    value_type: NullablePrimitiveType::Nullable(PrimitiveType::String),
-                    states: NullablePrimitiveValueArray::Nullable {
-                        values: flotsync_data_types::schema::values::PrimitiveValueArray::String(
-                            vec!["draft".to_owned(), "published".to_owned()],
-                        ),
-                        null_index: 1,
-                    },
-                },
-                metadata: HashMap::new(),
-            },
-        );
-        Schema {
-            columns,
-            metadata: HashMap::new(),
-        }
+        Schema::from_fields([
+            Field::latest_value_wins(
+                "latest",
+                NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::UInt)),
+            ),
+            Field::linear_string("title"),
+            Field::linear_list("numbers", PrimitiveType::Int),
+            Field::monotonic_counter("counter"),
+            Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending),
+            Field::finite_state_register("status", ["draft".into(), NULL, "published".into()])
+                .unwrap(),
+        ])
     });
 
     #[test]
@@ -1278,10 +1194,10 @@ mod tests {
 
         let mut latest = LinearLatestValueWins::new(
             Some(1u64),
-            [update_id(1, 0), update_id(1, 1), update_id(1, 2)],
+            [indexed(1, 0, 0), indexed(1, 1, 0), indexed(1, 2, 0)],
         );
-        latest.update(update_id(2, 0), None);
-        latest.update(update_id(3, 0), Some(99));
+        latest.update(indexed(2, 0, 0), None);
+        latest.update(indexed(3, 0, 0), Some(99));
 
         let mut title = LinearString::with_value("alpha".to_owned(), update_id(10, 0));
         title.append(indexed(11, 0, 0), " beta".to_owned());
@@ -1296,7 +1212,7 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data = InMemoryData::with_owned_schema(schema.clone());
+        let mut data: InMemoryData<(), UpdateId> = InMemoryData::with_owned_schema(schema.clone());
         data.push_row_from_named_fields([
             (
                 "latest",
@@ -1358,10 +1274,10 @@ mod tests {
         };
 
         let err = ProtoSchemaSnapshotDecoder::new(row).unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             SnapshotAdapterError::DuplicateField { field_name } if field_name == "counter"
-        ));
+        );
     }
 
     #[test]
@@ -1382,7 +1298,7 @@ mod tests {
                 &ReplicatedDataType::MonotonicCounter { small_range: false },
             )
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             SnapshotAdapterError::UnexpectedFieldKind {
                 field_name,
@@ -1391,7 +1307,7 @@ mod tests {
             } if field_name == "counter"
                 && expected == "monotonic_counter"
                 && actual == "linear_string"
-        ));
+        );
     }
 
     #[test]
@@ -1435,10 +1351,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             SnapshotAdapterError::MissingField { field_name } if field_name == "priority"
-        ));
+        );
     }
 
     #[test]
@@ -1474,11 +1390,11 @@ mod tests {
             .unwrap();
 
         let err = decoder.end().unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             SnapshotAdapterError::RemainingFields { field_names }
                 if field_names == vec!["extra".to_owned()]
-        ));
+        );
     }
 
     #[test]
@@ -1491,9 +1407,9 @@ mod tests {
         let row_count = decoder.begin().unwrap();
         assert_eq!(row_count, 1);
         let err = decoder.end().unwrap_err();
-        assert!(matches!(
+        assert_matches!(
             err,
             SnapshotAdapterError::RemainingRows { row_indices } if row_indices == vec![0]
-        ));
+        );
     }
 }

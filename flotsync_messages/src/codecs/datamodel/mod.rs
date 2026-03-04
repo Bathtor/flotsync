@@ -47,10 +47,6 @@ pub enum CodecError {
     },
     #[snafu(display("Protobuf oneof '{name}' has no selected value."))]
     MissingOneof { name: &'static str },
-    #[snafu(display("HistoryId.chunk_index must be absent for unindexed ids."))]
-    UnexpectedChunkIndex,
-    #[snafu(display("HistoryId.chunk_index is required for indexed ids."))]
-    MissingChunkIndex,
     #[snafu(display("Byte value {value} does not fit into u8."))]
     ByteOutOfRange { value: u32 },
     #[snafu(display("Date {year:04}-{month:02}-{day:02} is not a valid calendar date."))]
@@ -72,36 +68,34 @@ pub fn encode_update_id(id: UpdateId) -> proto::HistoryId {
     proto::HistoryId {
         version: id.version,
         node_index: id.node_index,
-        chunk_index: None,
+        chunk_index: 0,
         ..proto::HistoryId::new()
     }
 }
 
 pub fn decode_update_id(id: proto::HistoryId) -> Result<UpdateId, CodecError> {
-    ensure!(id.chunk_index.is_none(), UnexpectedChunkIndexSnafu);
     Ok(UpdateId {
         version: id.version,
         node_index: id.node_index,
     })
 }
 
-pub fn encode_indexed_update_id(id: &IdWithIndex<UpdateId>) -> proto::HistoryId {
+pub fn encode_indexed_update_id(id: &UpdateIdWithIndex) -> proto::HistoryId {
     proto::HistoryId {
         version: id.id.version,
         node_index: id.id.node_index,
-        chunk_index: Some(id.index),
+        chunk_index: id.index,
         ..proto::HistoryId::new()
     }
 }
 
-pub fn decode_indexed_update_id(id: proto::HistoryId) -> Result<IdWithIndex<UpdateId>, CodecError> {
-    let index = id.chunk_index.context(MissingChunkIndexSnafu)?;
+pub fn decode_indexed_update_id(id: proto::HistoryId) -> Result<UpdateIdWithIndex, CodecError> {
     Ok(IdWithIndex {
         id: UpdateId {
             version: id.version,
             node_index: id.node_index,
         },
-        index,
+        index: id.chunk_index,
     })
 }
 
@@ -432,6 +426,7 @@ mod tests {
         datamodel::{SnapshotStateValue, SnapshotStateValueRef},
         values::NullablePrimitiveValueArray,
     };
+    use std::assert_matches;
 
     #[test]
     fn shared_value_codecs_roundtrip() {
@@ -523,11 +518,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(
+        assert_matches!(
             err,
             CodecError::InvalidSnapshotValue {
                 source: DataModelValueError::CounterTypeMismatch { .. },
             }
-        ));
+        );
     }
 }

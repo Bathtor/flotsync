@@ -1,10 +1,15 @@
 //! The flotsync data model is based around strict [[Schema]]s which specify both
 //! the underlying storage type and value domain as well as the resolution semantics under
 //! concurrent modification.
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, ops::Index};
+
+use crate::FieldOperations;
 
 pub mod datamodel;
+mod public_api;
 pub mod values;
+pub use public_api::*;
+pub use values::{NULL, OrderedValue, OrderedValueError};
 
 /// A schema a collection of named, and typed columns.
 ///
@@ -16,6 +21,37 @@ pub struct Schema {
     /// A map containing information about this schema.
     pub metadata: HashMap<String, String>,
 }
+impl Schema {
+    pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
+        let mut columns = HashMap::with_capacity(N);
+        for field in fields {
+            if let Some(existing_field) = columns.insert(field.name.to_string(), field) {
+                panic!("Duplicate field name: {}", existing_field.name);
+            }
+        }
+        Schema {
+            columns,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn borrow(&self) -> Cow<'_, Schema> {
+        Cow::Borrowed(self)
+    }
+
+    pub fn field(&self, field_name: &str) -> Option<&Field> {
+        self.columns.get(field_name)
+    }
+}
+impl Index<&str> for Schema {
+    type Output = Field;
+
+    fn index(&self, index: &str) -> &Self::Output {
+        self.columns
+            .get(index)
+            .unwrap_or_else(|| panic!("Unknown schema field: {index}"))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Field {
@@ -25,6 +61,111 @@ pub struct Field {
     pub data_type: ReplicatedDataType,
     /// A map containing information about this column.
     pub metadata: HashMap<String, String>,
+}
+impl Field {
+    pub fn latest_value_wins<S: Into<String>>(name: S, value_type: NullableBasicDataType) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::LatestValueWins { value_type },
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn linear_string<S: Into<String>>(name: S) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::LinearString,
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn linear_list<S: Into<String>>(name: S, value_type: PrimitiveType) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::LinearList { value_type },
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn monotonic_counter<S: Into<String>>(name: S) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::MonotonicCounter { small_range: false },
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn small_monotonic_counter<S: Into<String>>(name: S) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::MonotonicCounter { small_range: true },
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn total_order_register<S: Into<String>>(
+        name: S,
+        value_type: PrimitiveType,
+        direction: Direction,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::TotalOrderRegister {
+                value_type,
+                direction,
+            },
+            metadata: HashMap::new(),
+        }
+    }
+
+    pub fn finite_state_register<S, I, V>(
+        name: S,
+        states: I,
+    ) -> Result<Self, values::OrderedValueError>
+    where
+        S: Into<String>,
+        I: IntoIterator<Item = V>,
+        V: Into<values::OrderedValue>,
+    {
+        let states = values::NullablePrimitiveValueArray::ordered(states)?;
+        let value_type = states.value_type();
+        Ok(Self {
+            name: name.into(),
+            data_type: ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
+            metadata: HashMap::new(),
+        })
+    }
+}
+impl<OperationId> FieldOperations<OperationId> for Field {
+    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a crate::InMemoryFieldValue<OperationId>
+    where
+        R: crate::RowOperations<OperationId>,
+    {
+        row.get_field(&self.name)
+            .expect("The row had a different schema than expected by this field.")
+    }
+
+    fn get_value<'a, R, T>(
+        &self,
+        row: &'a R,
+    ) -> Result<std::borrow::Cow<'a, T>, crate::DecodeValueError>
+    where
+        R: crate::RowOperations<OperationId>,
+        T: ?Sized + crate::Decode<OperationId>,
+    {
+        row.get_field_value(&self.name)
+    }
+
+    fn get_nullable_value<'a, T, R>(
+        &self,
+        row: &'a R,
+    ) -> Result<Option<std::borrow::Cow<'a, T>>, crate::DecodeValueError>
+    where
+        R: crate::RowOperations<OperationId>,
+        T: ?Sized + crate::Decode<OperationId>,
+    {
+        row.get_nullable_field_value(&self.name)
+    }
 }
 
 /// A data type with a particular set of resolution semantics under concurrent modification.

@@ -1,23 +1,17 @@
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
     IdWithIndex,
+    NULL,
     any_data::{LinearLatestValueWins, list::LinearList},
     schema::{
         BasicDataType,
         Direction,
         Field,
         NullableBasicDataType,
-        NullablePrimitiveType,
         PrimitiveType,
-        ReplicatedDataType,
         Schema,
-        datamodel::{
-            InMemoryData,
-            InMemoryFieldValue,
-            LinearLatestValueWinsValue,
-            LinearListValue,
-        },
-        values::{NullablePrimitiveValue, NullablePrimitiveValueArray, PrimitiveValue},
+        datamodel::{InMemoryFieldValue, LinearLatestValueWinsValue, LinearListValue},
+        values::{NullablePrimitiveValue, PrimitiveValue},
     },
     test_support::schema_operations::{
         exhaustive_schema,
@@ -27,12 +21,14 @@ use flotsync_data_types::{
     text::LinearString,
 };
 use flotsync_messages::{
+    InMemoryData,
+    Uuid,
     codecs::datamodel::{decode_schema_operation, encode_schema_operation},
     datamodel as proto,
     protobuf::Message,
     snapshots::datamodel::{ProtoDataSnapshotDecoder, ProtoDataSnapshotEncoder},
 };
-use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
+use std::{assert_matches, borrow::Cow, sync::LazyLock};
 
 fn update_id(version: u64, node_index: u32) -> UpdateId {
     UpdateId {
@@ -41,13 +37,19 @@ fn update_id(version: u64, node_index: u32) -> UpdateId {
     }
 }
 
-type TestUnused = ();
-
 fn indexed(version: u64, node_index: u32, chunk_index: u32) -> IdWithIndex<UpdateId> {
     IdWithIndex {
         id: update_id(version, node_index),
         index: chunk_index,
     }
+}
+
+fn row_id(value: u128) -> Uuid {
+    Uuid::from_u128(value)
+}
+
+fn row_ids() -> impl Iterator<Item = Uuid> {
+    (1u128..).map(row_id)
 }
 
 fn operation_ids() -> impl Iterator<Item = UpdateId> {
@@ -58,77 +60,17 @@ fn operation_ids() -> impl Iterator<Item = UpdateId> {
 }
 
 static PUBLIC_TEST_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
-    let mut columns = HashMap::new();
-    columns.insert(
-        "latest".to_owned(),
-        Field {
-            name: "latest".to_owned(),
-            data_type: ReplicatedDataType::LatestValueWins {
-                value_type: NullableBasicDataType::Nullable(BasicDataType::Primitive(
-                    PrimitiveType::UInt,
-                )),
-            },
-            metadata: HashMap::new(),
-        },
-    );
-    columns.insert(
-        "title".to_owned(),
-        Field {
-            name: "title".to_owned(),
-            data_type: ReplicatedDataType::LinearString,
-            metadata: HashMap::new(),
-        },
-    );
-    columns.insert(
-        "numbers".to_owned(),
-        Field {
-            name: "numbers".to_owned(),
-            data_type: ReplicatedDataType::LinearList {
-                value_type: PrimitiveType::Int,
-            },
-            metadata: HashMap::new(),
-        },
-    );
-    columns.insert(
-        "counter".to_owned(),
-        Field {
-            name: "counter".to_owned(),
-            data_type: ReplicatedDataType::MonotonicCounter { small_range: false },
-            metadata: HashMap::new(),
-        },
-    );
-    columns.insert(
-        "priority".to_owned(),
-        Field {
-            name: "priority".to_owned(),
-            data_type: ReplicatedDataType::TotalOrderRegister {
-                value_type: PrimitiveType::UInt,
-                direction: Direction::Ascending,
-            },
-            metadata: HashMap::new(),
-        },
-    );
-    columns.insert(
-        "status".to_owned(),
-        Field {
-            name: "status".to_owned(),
-            data_type: ReplicatedDataType::TotalOrderFiniteStateRegister {
-                value_type: NullablePrimitiveType::Nullable(PrimitiveType::String),
-                states: NullablePrimitiveValueArray::Nullable {
-                    values: flotsync_data_types::schema::values::PrimitiveValueArray::String(vec![
-                        "draft".to_owned(),
-                        "published".to_owned(),
-                    ]),
-                    null_index: 1,
-                },
-            },
-            metadata: HashMap::new(),
-        },
-    );
-    Schema {
-        columns,
-        metadata: HashMap::new(),
-    }
+    Schema::from_fields([
+        Field::latest_value_wins(
+            "latest",
+            NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::UInt)),
+        ),
+        Field::linear_string("title"),
+        Field::linear_list("numbers", PrimitiveType::Int),
+        Field::monotonic_counter("counter"),
+        Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending),
+        Field::finite_state_register("status", ["draft".into(), NULL, "published".into()]).unwrap(),
+    ])
 });
 
 #[test]
@@ -137,10 +79,10 @@ fn public_snapshot_transport_roundtrips_dataset() {
 
     let mut latest = LinearLatestValueWins::new(
         Some(1u64),
-        [update_id(1, 0), update_id(1, 1), update_id(1, 2)],
+        [indexed(1, 0, 0), indexed(1, 1, 0), indexed(1, 2, 0)],
     );
-    latest.update(update_id(2, 0), None);
-    latest.update(update_id(3, 0), Some(99));
+    latest.update(indexed(2, 0, 0), None);
+    latest.update(indexed(3, 0, 0), Some(99));
 
     let mut title = LinearString::with_value("alpha".to_owned(), update_id(10, 0));
     title.append(indexed(11, 0, 0), " beta".to_owned());
@@ -153,7 +95,7 @@ fn public_snapshot_transport_roundtrips_dataset() {
 
     let counter = flotsync_data_types::schema::datamodel::CounterValue::UInt(12);
     let priority = PrimitiveValue::UInt(7);
-    let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
+    let status = NullablePrimitiveValue::Null;
 
     let mut data = InMemoryData::with_owned_schema(schema.clone());
     data.push_row_from_named_fields([
@@ -194,10 +136,10 @@ fn public_snapshot_transport_roundtrips_dataset() {
 #[test]
 fn public_operation_transport_roundtrips_exhaustive_examples() {
     let schema = exhaustive_schema();
-    let operations = exhaustive_schema_operations(operation_ids()).unwrap();
+    let operations = exhaustive_schema_operations(row_ids(), operation_ids()).unwrap();
 
     for operation in operations {
-        let encoded = encode_schema_operation(&operation).unwrap();
+        let encoded = encode_schema_operation(&operation, &schema).unwrap();
         let bytes = encoded.write_to_bytes().unwrap();
         let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
         let decoded = decode_schema_operation(encoded, &schema).unwrap();
@@ -208,9 +150,9 @@ fn public_operation_transport_roundtrips_exhaustive_examples() {
 #[test]
 fn public_operation_transport_roundtrips_exhaustive_multi_field_example() {
     let schema = exhaustive_schema();
-    let operation = exhaustive_schema_operation(operation_ids()).unwrap();
+    let operation = exhaustive_schema_operation(row_id(999), operation_ids()).unwrap();
 
-    let encoded = encode_schema_operation(&operation).unwrap();
+    let encoded = encode_schema_operation(&operation, &schema).unwrap();
     let bytes = encoded.write_to_bytes().unwrap();
     let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
     let decoded = decode_schema_operation(encoded, &schema).unwrap();
