@@ -100,3 +100,5 @@
 {"actor":"Lars Kroll","comment":null,"created_at":"2026-03-04T16:06:44Z","event_type":"created","id":100,"issue_id":"flotsync-3ec","new_value":"","old_value":""}
 {"actor":"Lars Kroll","comment":null,"created_at":"2026-03-04T16:06:44Z","event_type":"created","id":101,"issue_id":"flotsync-21v","new_value":"","old_value":""}
 {"actor":"Lars Kroll","comment":null,"created_at":"2026-03-04T17:29:42Z","event_type":"closed","id":102,"issue_id":"flotsync-3ec","new_value":"Resolved by switching LatestValueWins operation ids to IdWithIndex, allowing insert_row to synthesize the initial LVW ids from one operation id.","old_value":""}
+{"actor":"Lars Kroll","comment":null,"created_at":"2026-03-04T17:29:53Z","event_type":"closed","id":103,"issue_id":"flotsync-6vh","new_value":"Completed TableOperations public API, in-memory row operation helpers, protobuf row-operation wiring, UUID row ids, indexed LVW ids, tombstoned deletes, ergonomic field builders/macros, and public API tests.","old_value":""}
+{"actor":"Lars Kroll","comment":null,"created_at":"2026-03-04T18:23:21Z","event_type":"created","id":104,"issue_id":"flotsync-nad","new_value":"","old_value":""}
