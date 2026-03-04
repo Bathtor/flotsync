@@ -1,5 +1,6 @@
 {"created_at":"2026-02-25T17:13:29Z","created_by":"Lars Kroll","depends_on_id":"flotsync-s02","issue_id":"flotsync-bk0","type":"blocks"}
 {"created_at":"2026-02-25T17:13:29Z","created_by":"Lars Kroll","depends_on_id":"flotsync-8hn","issue_id":"flotsync-s02","type":"blocks"}
+{"created_at":"2026-03-04T16:06:36Z","created_by":"Lars Kroll","depends_on_id":"flotsync-6vh","issue_id":"flotsync-ve8","type":"discovered-from"}
 {"created_at":"2026-02-25T17:13:30Z","created_by":"Lars Kroll","depends_on_id":"flotsync-bk0","issue_id":"flotsync-vrt","type":"blocks"}
 {"created_at":"2026-03-02T18:42:38Z","created_by":"Lars Kroll","depends_on_id":"flotsync-vrt.1","issue_id":"flotsync-vrt","type":"blocks"}
 {"created_at":"2026-03-02T18:41:28Z","created_by":"Lars Kroll","depends_on_id":"flotsync-vrt","issue_id":"flotsync-vrt.1","type":"parent-child"}
