@@ -1,4 +1,6 @@
 {"issue_id":"flotsync-0mi","label":"area:discovery-udp-announcement"}
+{"issue_id":"flotsync-0za","label":"area:datamodel"}
+{"issue_id":"flotsync-0za","label":"area:replication"}
 {"issue_id":"flotsync-2ss","label":"area:discovery-mdns"}
 {"issue_id":"flotsync-4lo","label":"area:linear-data-backend"}
 {"issue_id":"flotsync-54v","label":"area:coalesced-linear-data"}

@@ -3,18 +3,24 @@
 FlotSync is a Rust workspace for decentralized peer-to-peer group synchronization.
 It currently contains reusable crates for version tracking, discovery, wire messages, and replicated data types.
 
-## Current Status (as of 2026-02-14)
+## Current Status (as of 2026-03-05)
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Core versioning and identifiers | Done | `flotsync_core` is implemented and tests pass. |
-| Message schemas and codegen | Done | `messages/proto` + `flotsync_messages` are in use and tested. |
-| Discovery service builds | Done | `flotsync_discovery/test_features.sh` passes all listed feature combinations. |
-| Text CRDT data type | Mostly done | Text diff/apply and convergence tests are present and largely passing. |
-| Latest-value-wins register (`any_data`) | In progress | Two tests currently fail in `flotsync_data_types`. |
-| Discovery CLI and browser surface | TODO | Non-mDNS path and browser pieces are not implemented yet. |
+| Core versioning and identifiers | Implemented | `flotsync_core` provides version vectors, group membership identifiers, and ordering logic. |
+| Datamodel wire transport | Implemented (operations/snapshots) | `flotsync_messages` supports protobuf codecs for schema operations and snapshots. |
+| Schema definition transport | Planned | Schema definitions are still agreed out-of-band and need first-class transport support. |
+| In-memory schema datamodel | In progress | Local table operations exist; inbound operation application remains to be added. |
+| Discovery stack | In progress | Core components exist, with remaining open work on browser/public handling and non-mDNS active mode. |
+| Persistence abstraction | Planned | Storage interface for schema operations and snapshots is still pending. |
 
-The detailed, line-referenced task list is tracked in [`docs/TODO_TRACKER.md`](docs/TODO_TRACKER.md).
+## Issue Tracking
+
+This repository uses `bd` (beads) as the source of truth for tasks and dependencies.
+
+- Check ready work: `bd ready --json`
+- Inspect an issue: `bd show <issue-id> --json`
+- Create new work: `bd create "Title" --description "..." -t task|feature|bug --json`
 
 ## Workspace Layout
 
@@ -41,11 +47,6 @@ Run the full workspace tests:
 cargo test --workspace
 ```
 
-Current known result: the workspace compiles, but there are two failing tests in `flotsync_data_types`:
-
-- `any_data::tests::concurrent_updates_converge_independent_of_delivery_order`
-- `any_data::tests::applying_same_operation_twice_is_illegal`
-
 Run discovery feature-matrix checks:
 
 ```bash
@@ -57,15 +58,15 @@ cd flotsync_discovery
 
 ### Near-Term
 
-1. Stabilize `LinearLatestValueWins` semantics and make the failing tests pass.
-2. Finish discovery CLI support for non-mDNS/custom announcement mode.
-3. Implement missing mDNS public/network handling and browser behavior.
+1. Apply inbound schema operations to `InMemoryData` with thorough test coverage.
+2. Define a storage abstraction for persisting and retrieving schema operations/snapshots.
+3. Close outstanding discovery P1 gaps (non-mDNS active mode, mDNS public/network handling, browser module).
 
 ### Medium-Term
 
-1. Tighten data type convergence coverage with broader multi-replica scenarios.
-2. Improve discovery integration tests beyond build/clippy checks.
-3. Evaluate whether to keep, complete, or remove the alternate linked-list linear-data backend.
+1. Add transport serialization/deserialization for schema definitions.
+2. Design database-level APIs and replication group semantics.
+3. Tighten convergence/integration coverage for multi-replica, multi-schema scenarios.
 
 ## Repository Workflow
 
