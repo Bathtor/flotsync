@@ -694,7 +694,7 @@ fn fmt_primitive_value_from_array(
 
 fn fmt_primitive_value(value: &PrimitiveValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match value {
-        PrimitiveValue::String(value) => write!(f, "{value:?}"),
+        PrimitiveValue::String(value) => fmt_single_quoted_string(value, f),
         PrimitiveValue::UInt(value) => write!(f, "{value}"),
         PrimitiveValue::Int(value) => write!(f, "{value}"),
         PrimitiveValue::Byte(value) => write!(f, "{value}"),
@@ -704,6 +704,18 @@ fn fmt_primitive_value(value: &PrimitiveValue, f: &mut fmt::Formatter<'_>) -> fm
         PrimitiveValue::Date(value) => write!(f, "{value}"),
         PrimitiveValue::Timestamp(value) => write!(f, "{value}"),
     }
+}
+
+fn fmt_single_quoted_string(value: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("'")?;
+    for ch in value.chars() {
+        if ch == '\'' {
+            f.write_str("''")?;
+        } else {
+            write!(f, "{ch}")?;
+        }
+    }
+    f.write_str("'")
 }
 
 #[cfg(test)]
@@ -727,7 +739,7 @@ mod tests {
                 null_index: 1,
             }
         );
-        assert_eq!(states.to_string(), "[\"draft\", NULL, \"published\"]");
+        assert_eq!(states.to_string(), "['draft', NULL, 'published']");
     }
 
     #[test]
