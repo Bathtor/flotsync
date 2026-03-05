@@ -66,6 +66,8 @@ pub enum OperationError {
     },
     #[snafu(display("The requested linear string change could not be represented."))]
     LinearStringDiff { source: text::DiffError },
+    #[snafu(display("The requested linear list change could not be represented."))]
+    LinearListDiff { source: any_data::list::DiffError },
     #[snafu(display("The operation failed due to a logic error at {location}: {context}"))]
     InternalOperation {
         context: String,

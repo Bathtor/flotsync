@@ -13,11 +13,11 @@ use crate::{
     any_data::{
         LinearLatestValueWins,
         UpdateOperation,
-        list::{LinearList, ListOperation},
+        list::{LinearList, ListOperation, linear_diff as linear_list_diff},
     },
     linear_data::LinearData,
     snapshot::{SnapshotHeader, SnapshotNode, SnapshotNodeRef, SnapshotReadError, SnapshotSink},
-    text::{LinearString, linear_diff},
+    text::{LinearString, linear_diff as linear_string_diff},
 };
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
@@ -1458,7 +1458,7 @@ where
                 return Ok(None);
             }
             let mut id_generator = std::iter::once(operation_id);
-            let diff = linear_diff(current, &target, &mut id_generator)
+            let diff = linear_string_diff(current, &target, &mut id_generator)
                 .context(crate::LinearStringDiffSnafu)?;
             let operations = diff.into_operations();
             if operations.is_empty() {
@@ -1588,15 +1588,12 @@ where
     macro_rules! build_linear_list_op {
         ($current:expr, $target:expr, $decode:ident) => {{
             let target_values = $decode($target).map_err(operation_invalid_value)?;
-            let current_values: Vec<_> = $current.iter().cloned().collect();
-            if current_values == target_values {
+            let diff = linear_list_diff($current, &target_values, operation_id.clone())
+                .context(crate::LinearListDiffSnafu)?;
+            let operations = diff.into_operations();
+            if operations.is_empty() {
                 Ok(None)
             } else {
-                let operations = build_full_replace_list_operations(
-                    $current,
-                    target_values,
-                    operation_id.clone(),
-                )?;
                 Ok(Some(
                     operations
                         .into_iter()
@@ -1628,51 +1625,6 @@ where
             build_linear_list_op!(current, target, decode_list_timestamp)
         }
     }
-}
-
-fn build_full_replace_list_operations<OperationId, T>(
-    current: &LinearList<OperationId, T>,
-    target: Vec<T>,
-    operation_id: OperationId,
-) -> crate::OperationResult<Vec<DataOperation<IdWithIndex<OperationId>, Vec<T>>>>
-where
-    OperationId:
-        Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
-    T: Clone + fmt::Debug + 'static,
-{
-    let mut operations = Vec::new();
-    if !current.is_empty() {
-        let range = current.ids_in_range(0..current.len()).ok_or_else(|| {
-            crate::OperationError::InternalOperation {
-                context: "Could not resolve the full visible range of a LinearList during replace."
-                    .to_owned(),
-                location: snafu::Location::default(),
-            }
-        })?;
-        operations.extend(range.delete_operations().map(|op| op.into_operation()));
-    }
-
-    if !target.is_empty() {
-        let insert_id = IdWithIndex {
-            id: operation_id,
-            index: 0,
-        };
-        if !insert_id.can_address(target.len()) {
-            return crate::InternalOperationSnafu {
-                context: format!(
-                    "Operation id {:?} cannot address {} inserted list values.",
-                    insert_id.id,
-                    target.len()
-                ),
-            }
-            .fail();
-        }
-        if let Some(operation) = current.append_operation(insert_id, target) {
-            operations.push(operation.into_operation());
-        }
-    }
-
-    Ok(operations)
 }
 
 fn map_data_operation_value<Id, InputValue, OutputValue, E>(

@@ -1,5 +1,7 @@
 use crate::{
     IntegrityError,
+    InternalError,
+    InternalSnafu,
     linear_data::{
         Composite,
         DataOperation,
@@ -15,7 +17,243 @@ use crate::{
     },
     snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
 };
+use similar::{Algorithm, DiffOp, capture_diff_slices};
+use snafu::prelude::*;
 use std::{fmt, hash::Hash, ops::RangeBounds};
+
+#[derive(Debug, Snafu)]
+pub enum DiffError {
+    #[snafu(display(
+        "A single row update cannot address the required list inserts with one operation id."
+    ))]
+    IndexExhausted,
+    #[snafu(transparent)]
+    Internal { source: InternalError },
+}
+
+/// A set of list changes that can be applied to a [[LinearList]].
+#[derive(Clone, Debug, PartialEq)]
+pub struct LinearListDiff<Id, T> {
+    operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
+}
+impl<Id, T> LinearListDiff<Id, T> {
+    /// Returns `true` iff this diff is empty, i.e. a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    /// Returns how many individual operations there are in this diff.
+    pub fn num_operations(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Returns how many operations in this diff are inserts.
+    pub fn num_insert_operations(&self) -> usize {
+        self.operations
+            .iter()
+            .filter(|op| matches!(op, DataOperation::Insert { .. }))
+            .count()
+    }
+
+    /// Returns how many operations in this diff are deletes.
+    pub fn num_delete_operations(&self) -> usize {
+        self.operations
+            .iter()
+            .filter(|op| matches!(op, DataOperation::Delete { .. }))
+            .count()
+    }
+
+    /// Returns the inserted chunks in this diff.
+    pub fn values_inserted(&self) -> impl Iterator<Item = &[T]> {
+        self.operations.iter().filter_map(|op| match op {
+            DataOperation::Insert { value, .. } => Some(value.as_slice()),
+            DataOperation::Delete { .. } => None,
+        })
+    }
+
+    pub(crate) fn into_operations(self) -> Vec<DataOperation<IdWithIndex<Id>, Vec<T>>> {
+        self.operations
+    }
+}
+
+/// Compute the operations that need to be applied to `base` such that its list output is the same
+/// as `changed`.
+///
+/// This uses slice diffing internally and translates those segments into equivalent linear list
+/// operations. All inserts in one diff share `operation_id` and consume consecutive index space.
+pub fn linear_diff<Id, T>(
+    base: &LinearList<Id, T>,
+    changed: &[T],
+    operation_id: Id,
+) -> Result<LinearListDiff<Id, T>, DiffError>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: Clone + fmt::Debug + Eq + Hash + Ord + 'static,
+{
+    let current_values: Vec<_> = base.iter().cloned().collect();
+    let basic_diff = capture_diff_slices(Algorithm::Myers, current_values.as_slice(), changed);
+
+    let mut operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>> =
+        Vec::with_capacity(basic_diff.len());
+    let mut next_insert_index: u32 = 0;
+
+    for change in basic_diff {
+        match change {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Delete {
+                old_index, old_len, ..
+            } => {
+                append_delete_operations(base, old_index, old_len, &mut operations)?;
+            }
+            DiffOp::Insert {
+                old_index,
+                new_index,
+                new_len,
+            } => {
+                let insert_end = new_index + new_len;
+                let insert_values = changed[new_index..insert_end].to_vec();
+                append_insert_operation(
+                    base,
+                    old_index,
+                    insert_values,
+                    &operation_id,
+                    &mut next_insert_index,
+                    &mut operations,
+                )?;
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                append_delete_operations(base, old_index, old_len, &mut operations)?;
+
+                let insert_end = new_index + new_len;
+                let insert_values = changed[new_index..insert_end].to_vec();
+                let insert_at = old_index + old_len;
+                append_insert_operation(
+                    base,
+                    insert_at,
+                    insert_values,
+                    &operation_id,
+                    &mut next_insert_index,
+                    &mut operations,
+                )?;
+            }
+        }
+    }
+
+    Ok(LinearListDiff { operations })
+}
+
+fn append_delete_operations<Id, T>(
+    base: &LinearList<Id, T>,
+    old_index: usize,
+    old_len: usize,
+    operations: &mut Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
+) -> Result<(), DiffError>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: fmt::Debug + 'static,
+{
+    if old_len == 0 {
+        return Ok(());
+    }
+
+    let range_end = old_index + old_len;
+    let range = old_index..range_end;
+    let range_ids = base
+        .ids_in_range(range.clone())
+        .with_context(|| InternalSnafu {
+            context: format!(
+                "Delete range [{}, {}) did not exist in base list.",
+                range.start, range.end
+            ),
+        })?;
+    operations.extend(range_ids.delete_operations().map(|op| op.into_operation()));
+    Ok(())
+}
+
+fn append_insert_operation<Id, T>(
+    base: &LinearList<Id, T>,
+    position: usize,
+    values: Vec<T>,
+    operation_id: &Id,
+    next_insert_index: &mut u32,
+    operations: &mut Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
+) -> Result<(), DiffError>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: fmt::Debug + 'static,
+{
+    if values.is_empty() {
+        return Ok(());
+    }
+
+    let insert_id = reserve_insert_id(operation_id, next_insert_index, values.len())?;
+    let link_ids = resolve_insert_link_ids(base, position)?;
+    operations.push(link_ids.insert_operation(insert_id, values));
+    Ok(())
+}
+
+fn reserve_insert_id<Id>(
+    operation_id: &Id,
+    next_insert_index: &mut u32,
+    value_count: usize,
+) -> Result<IdWithIndex<Id>, DiffError>
+where
+    Id: Clone,
+{
+    let insert_id = IdWithIndex {
+        id: operation_id.clone(),
+        index: *next_insert_index,
+    };
+    ensure!(insert_id.can_address(value_count), IndexExhaustedSnafu);
+
+    let consumed = u32::try_from(value_count).map_err(|_| DiffError::IndexExhausted)?;
+    let next_index = next_insert_index
+        .checked_add(consumed)
+        .ok_or(DiffError::IndexExhausted)?;
+    *next_insert_index = next_index;
+
+    Ok(insert_id)
+}
+
+fn resolve_insert_link_ids<Id, T>(
+    base: &LinearList<Id, T>,
+    position: usize,
+) -> Result<LinkIds<IdWithIndex<Id>>, DiffError>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: fmt::Debug + 'static,
+{
+    if base.is_empty() {
+        if position != 0 {
+            return InternalSnafu {
+                context: format!(
+                    "When base list is empty inserts must be at position 0, but was {position}."
+                ),
+            }
+            .fail()
+            .map_err(DiffError::from);
+        }
+        return Ok(base.ids_after_head());
+    }
+
+    if let Some(node_ids) = base.ids_at_pos(position) {
+        return Ok(node_ids.before());
+    }
+    if position == base.len() {
+        return Ok(base.ids_before_end());
+    }
+
+    InternalSnafu {
+        context: format!("Insert position {position} did not exist in base list."),
+    }
+    .fail()
+    .map_err(DiffError::from)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct ListChunk<T> {
@@ -552,6 +790,62 @@ mod tests {
         assert_eq!(list.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
         assert_eq!(list.len(), 4);
         assert!(!list.is_empty());
+    }
+
+    #[test]
+    fn linear_diff_noop_is_empty() {
+        let base = new_list([1, 2, 3]);
+        let diff = linear_diff(&base, &[1, 2, 3], 99).unwrap();
+
+        assert!(diff.is_empty());
+        assert_eq!(diff.num_operations(), 0);
+        assert_eq!(diff.num_insert_operations(), 0);
+        assert_eq!(diff.num_delete_operations(), 0);
+        assert_eq!(diff.values_inserted().count(), 0);
+    }
+
+    #[test]
+    fn linear_diff_updates_only_changed_middle_segment() {
+        let base = new_list([1, 2, 3, 4]);
+        let diff = linear_diff(&base, &[1, 9, 3, 4], 42).unwrap();
+
+        assert_eq!(diff.num_operations(), 2);
+        assert_eq!(diff.num_insert_operations(), 1);
+        assert_eq!(diff.num_delete_operations(), 1);
+        assert_eq!(
+            diff.values_inserted()
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![9]]
+        );
+
+        let mut updated = base.clone();
+        for operation in diff.into_operations() {
+            let operation = ListOperation::from_operation(operation);
+            updated.apply_operation(operation).unwrap();
+        }
+        assert_eq!(
+            updated.iter().copied().collect::<Vec<_>>(),
+            vec![1, 9, 3, 4]
+        );
+    }
+
+    #[test]
+    fn linear_diff_multiple_insert_hunks_allocate_distinct_indices() {
+        let base = new_list([1, 2, 3]);
+        let diff = linear_diff(&base, &[0, 1, 2, 3, 4], 17).unwrap();
+
+        let mut insert_indices: Vec<_> = diff
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect();
+        insert_indices.sort_unstable();
+
+        assert_eq!(insert_indices, vec![0, 1]);
     }
 
     #[test]

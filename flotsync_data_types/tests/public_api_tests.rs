@@ -1,4 +1,5 @@
 use flotsync_data_types::{
+    DataOperation,
     FieldOperations,
     OperationError,
     OperationOutcome,
@@ -9,7 +10,8 @@ use flotsync_data_types::{
         Direction,
         Field,
         PrimitiveType,
-        datamodel::{InMemoryData, RowOperation, SchemaValueError},
+        datamodel::{InMemoryData, OperationValue, RowOperation, SchemaValueError},
+        values::PrimitiveValueArray,
     },
     update_values,
 };
@@ -133,6 +135,72 @@ fn table_operations_insert_modify_and_delete_rows() {
         },
     );
     assert_matches!(deleted_update, Err(OperationError::ModifyDeletedRow { .. }));
+}
+
+#[test]
+fn modify_row_linear_list_emits_targeted_diff_operations() {
+    let schema = &*TEST_SCHEMA;
+    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+
+    data.insert_row(
+        100,
+        7,
+        initial_values! {
+            schema["title"] => "t",
+            schema["numbers"] => vec![1i64, 2, 3, 4],
+            schema["counter"] => 0u64,
+            schema["priority"] => 0u64,
+        },
+    )
+    .unwrap();
+
+    let update = data
+        .modify_row(
+            101,
+            7,
+            update_values! {
+                schema["numbers"] => vec![1i64, 9, 3, 4],
+            },
+        )
+        .unwrap();
+    let update = match update {
+        OperationOutcome::Applied(operation) => operation,
+        OperationOutcome::NoChanges => panic!("expected an update operation"),
+    };
+
+    let fields = match update.operation {
+        RowOperation::Update { fields, .. } => fields,
+        _ => panic!("expected row update operation"),
+    };
+    assert_eq!(fields.len(), 1);
+
+    let numbers_field = fields
+        .iter()
+        .find(|field| field.field_name.as_ref() == "numbers")
+        .expect("numbers field should be present");
+    let operations = match &numbers_field.value {
+        OperationValue::LinearList(operations) => operations,
+        _ => panic!("numbers field should contain a linear list operation"),
+    };
+
+    assert_eq!(operations.len(), 2);
+    let delete_count = operations
+        .iter()
+        .filter(|operation| matches!(operation, DataOperation::Delete { .. }))
+        .count();
+    assert_eq!(delete_count, 1);
+
+    let inserted_chunks: Vec<Vec<i64>> = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            DataOperation::Insert { value, .. } => match value {
+                PrimitiveValueArray::Int(values) => Some(values.clone()),
+                _ => panic!("numbers field should encode int list insert payloads"),
+            },
+            DataOperation::Delete { .. } => None,
+        })
+        .collect();
+    assert_eq!(inserted_chunks, vec![vec![9]]);
 }
 
 #[test]
