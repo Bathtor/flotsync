@@ -49,6 +49,35 @@ impl<RowId, ChangeId> SchemaOperation<'_, RowId, ChangeId> {
         self.operation.validate_against_schema(schema)
     }
 }
+impl<RowId, ChangeId> SchemaOperation<'_, RowId, ChangeId> {
+    /// Materialize this operation into an owned `'static` representation.
+    pub fn into_owned(self) -> SchemaOperation<'static, RowId, ChangeId>
+    where
+        ChangeId: Clone,
+    {
+        let operation = match self.operation {
+            RowOperation::Insert { row_id, snapshot } => RowOperation::Insert {
+                row_id,
+                snapshot: snapshot.into_owned(),
+            },
+            RowOperation::Update { row_id, fields } => RowOperation::Update {
+                row_id,
+                fields: fields
+                    .into_iter()
+                    .map(|field| OperationFieldValue {
+                        field_name: Cow::Owned(field.field_name.into_owned()),
+                        value: field.value,
+                    })
+                    .collect(),
+            },
+            RowOperation::Delete { row_id } => RowOperation::Delete { row_id },
+        };
+        SchemaOperation {
+            change_id: self.change_id,
+            operation,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowOperation<'a, RowId, ChangeId> {
@@ -105,6 +134,29 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     pub fn from_owned_fields(fields: Vec<(String, InMemoryFieldValue<ChangeId>)>) -> Self {
         Self {
             repr: RowSnapshotRepr::Owned { fields },
+        }
+    }
+
+    /// Materialize this snapshot into an owned `'static` representation.
+    pub fn into_owned(self) -> RowSnapshot<'static, ChangeId>
+    where
+        ChangeId: Clone,
+    {
+        RowSnapshot::from_owned_fields(self.into_owned_fields())
+    }
+
+    /// Materialize this snapshot as owned `(field_name, value)` pairs.
+    pub fn into_owned_fields(self) -> Vec<(String, InMemoryFieldValue<ChangeId>)>
+    where
+        ChangeId: Clone,
+    {
+        match self.repr {
+            RowSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
+                .iter()
+                .cloned()
+                .zip(row.fields.iter().cloned())
+                .collect(),
+            RowSnapshotRepr::Owned { fields } => fields,
         }
     }
 

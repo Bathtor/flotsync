@@ -29,6 +29,13 @@ static TEST_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
 type RowId = u64;
 type OperationId = u32;
 
+fn expect_applied<T>(outcome: OperationOutcome<T>) -> T {
+    match outcome {
+        OperationOutcome::Applied(operation) => operation,
+        OperationOutcome::NoChanges => panic!("expected an applied operation"),
+    }
+}
+
 #[test]
 fn table_operations_insert_modify_and_delete_rows() {
     let schema = &*TEST_SCHEMA;
@@ -226,4 +233,332 @@ fn insert_row_requires_explicit_values_for_all_fields() {
             source: SchemaValueError::MissingField { ref field_name }
         } if field_name == "priority"
     );
+}
+
+#[test]
+fn apply_schema_operation_roundtrips_insert_update_delete() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+
+    let insert = source
+        .insert_row(
+            200,
+            9,
+            initial_values! {
+                schema["title"] => "hello",
+                schema["numbers"] => vec![1i64, 2],
+                schema["counter"] => 1u64,
+                schema["priority"] => 3u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let update = expect_applied(
+        source
+            .modify_row(
+                201,
+                9,
+                update_values! {
+                    schema["title"] => "hello world",
+                    schema["numbers"] => vec![5i64, 8],
+                    schema["counter"] => 9u64,
+                    schema["priority"] => 10u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+    let delete = source.delete_row(202, 9).unwrap().into_owned();
+
+    let target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(insert)
+        .unwrap()
+        .apply_schema_operation(update)
+        .unwrap()
+        .apply_schema_operation(delete)
+        .unwrap();
+
+    assert_eq!(target, source);
+}
+
+#[test]
+fn apply_schema_operation_rejects_duplicate_insert_and_unknown_rows() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let insert = source
+        .insert_row(
+            210,
+            5,
+            initial_values! {
+                schema["title"] => "value",
+                schema["numbers"] => vec![1i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 0u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let update = expect_applied(
+        source
+            .modify_row(
+                211,
+                5,
+                update_values! {
+                    schema["priority"] => 7u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+    let delete = source.delete_row(212, 5).unwrap().into_owned();
+
+    let empty_target: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let update_err = empty_target.clone().apply_schema_operation(update.clone());
+    assert_matches!(update_err, Err(OperationError::UnknownRowId { .. }));
+
+    let delete_err = empty_target.apply_schema_operation(delete.clone());
+    assert_matches!(delete_err, Err(OperationError::UnknownRowId { .. }));
+
+    let applied_once = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(insert.clone())
+        .unwrap();
+    let duplicate_insert = applied_once.apply_schema_operation(insert);
+    assert_matches!(duplicate_insert, Err(OperationError::DuplicateRowId { .. }));
+}
+
+#[test]
+fn apply_schema_operation_update_on_deleted_row_applies_and_repeated_delete_is_ok() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let insert = source
+        .insert_row(
+            220,
+            8,
+            initial_values! {
+                schema["title"] => "draft",
+                schema["numbers"] => vec![1i64, 2],
+                schema["counter"] => 0u64,
+                schema["priority"] => 1u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let update = expect_applied(
+        source
+            .modify_row(
+                221,
+                8,
+                update_values! {
+                    schema["priority"] => 42u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+    let delete = source.delete_row(222, 8).unwrap().into_owned();
+
+    let target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(insert)
+        .unwrap()
+        .apply_schema_operation(delete.clone())
+        .unwrap()
+        .apply_schema_operation(update)
+        .unwrap();
+
+    assert_eq!(target.num_active_rows(), 0);
+    let row = target.get_row(&8).expect("row should still be addressable");
+    let priority_value: Cow<'_, u64> = schema["priority"].get_value(&row).unwrap();
+    assert_eq!(*priority_value, 42);
+
+    let before_repeat_delete = target.clone();
+    let after_repeat_delete = target.apply_schema_operation(delete).unwrap();
+    assert_eq!(after_repeat_delete, before_repeat_delete);
+}
+
+#[test]
+fn apply_schema_operation_schema_validation_rejects_unknown_fields() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let insert = source
+        .insert_row(
+            230,
+            3,
+            initial_values! {
+                schema["title"] => "v",
+                schema["numbers"] => vec![9i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 1u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let mut update = expect_applied(
+        source
+            .modify_row(
+                231,
+                3,
+                update_values! {
+                    schema["priority"] => 4u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+    let RowOperation::Update { fields, .. } = &mut update.operation else {
+        panic!("expected update operation");
+    };
+    fields[0].field_name = Cow::Borrowed("unknown_field");
+
+    let target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(insert)
+        .unwrap();
+    let err = target.apply_schema_operation(update);
+    assert_matches!(
+        err,
+        Err(OperationError::SchemaValue {
+            source: SchemaValueError::UnknownField { .. }
+        })
+    );
+}
+
+#[test]
+fn apply_schema_operation_enforces_causal_order_for_linear_string_updates() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let insert = source
+        .insert_row(
+            240,
+            6,
+            initial_values! {
+                schema["title"] => "a",
+                schema["numbers"] => vec![0i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 0u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let update_1 = expect_applied(
+        source
+            .modify_row(
+                241,
+                6,
+                update_values! {
+                    schema["title"] => "ab",
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+    let update_2 = expect_applied(
+        source
+            .modify_row(
+                242,
+                6,
+                update_values! {
+                    schema["title"] => "abc",
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+
+    let target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(insert)
+        .unwrap();
+
+    let before_out_of_order = target.clone();
+    let out_of_order = target.clone().apply_schema_operation(update_2.clone());
+    assert_matches!(out_of_order, Err(OperationError::InternalOperation { .. }));
+    assert_eq!(target, before_out_of_order);
+
+    let converged = target
+        .apply_schema_operation(update_1)
+        .unwrap()
+        .apply_schema_operation(update_2)
+        .unwrap();
+    let row = converged.get_row(&6).unwrap();
+    let title_value: Cow<'_, str> = schema["title"].get_value(&row).unwrap();
+    assert_eq!(title_value.as_ref(), "abc");
+}
+
+#[test]
+fn apply_schema_operation_duplicate_updates_can_succeed_or_fail_by_field_type() {
+    let schema = &*TEST_SCHEMA;
+
+    let mut register_source: InMemoryData<RowId, OperationId> =
+        InMemoryData::with_static_schema(schema);
+    let register_insert = register_source
+        .insert_row(
+            250,
+            11,
+            initial_values! {
+                schema["title"] => "x",
+                schema["numbers"] => vec![1i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 1u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let register_update = expect_applied(
+        register_source
+            .modify_row(
+                251,
+                11,
+                update_values! {
+                    schema["priority"] => 9u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+
+    let register_target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(register_insert)
+        .unwrap()
+        .apply_schema_operation(register_update.clone())
+        .unwrap()
+        .apply_schema_operation(register_update)
+        .unwrap();
+    let register_row = register_target.get_row(&11).unwrap();
+    let register_value: Cow<'_, u64> = schema["priority"].get_value(&register_row).unwrap();
+    assert_eq!(*register_value, 9);
+
+    let mut string_source: InMemoryData<RowId, OperationId> =
+        InMemoryData::with_static_schema(schema);
+    let string_insert = string_source
+        .insert_row(
+            260,
+            12,
+            initial_values! {
+                schema["title"] => "a",
+                schema["numbers"] => vec![1i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 0u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let string_update = expect_applied(
+        string_source
+            .modify_row(
+                261,
+                12,
+                update_values! {
+                    schema["title"] => "ab",
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+
+    let string_target = InMemoryData::with_static_schema(schema)
+        .apply_schema_operation(string_insert)
+        .unwrap()
+        .apply_schema_operation(string_update.clone())
+        .unwrap();
+    let retry = string_target.clone().apply_schema_operation(string_update);
+    assert_matches!(retry, Err(OperationError::InternalOperation { .. }));
+    assert_eq!(string_target.num_active_rows(), 1);
 }

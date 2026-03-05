@@ -364,6 +364,79 @@ where
             .get_mut(row_index)
             .ok_or(InMemoryDataError::UnknownRow { row_index })
     }
+
+    /// Apply a replicated schema operation to this dataset.
+    ///
+    /// The method consumes `self` and only returns an updated instance if the full operation
+    /// applies successfully.
+    pub fn apply_schema_operation(
+        mut self,
+        operation: SchemaOperation<'_, RowId, OperationId>,
+    ) -> crate::OperationResult<Self>
+    where
+        OperationId:
+            Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+        RowId: Clone + fmt::Display,
+    {
+        operation
+            .validate_against_schema(self.schema())
+            .context(crate::SchemaValueSnafu)?;
+
+        match operation.operation {
+            RowOperation::Insert { row_id, snapshot } => {
+                if self.row_id_map.contains_key(&row_id) {
+                    return crate::DuplicateRowIdSnafu {
+                        row_id: row_id.to_string(),
+                    }
+                    .fail();
+                }
+
+                let row = self
+                    .row_from_named_fields(snapshot.into_owned_fields())
+                    .context(crate::InMemoryDataSnafu)?;
+                let index = self.rows.len();
+                self.rows.push(row);
+                self.row_id_map.insert(row_id, index);
+            }
+            RowOperation::Update { row_id, fields } => {
+                let row_index = *self.row_id_map.get(&row_id).ok_or_else(|| {
+                    crate::OperationError::UnknownRowId {
+                        row_id: row_id.to_string(),
+                    }
+                })?;
+
+                let mut indexed_fields = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let field_name = field.field_name.into_owned();
+                    let field_index = self.field_index(field_name.as_str()).ok_or_else(|| {
+                        crate::OperationError::SchemaValue {
+                            source: SchemaValueError::UnknownField {
+                                field_name: field_name.clone(),
+                            },
+                        }
+                    })?;
+                    indexed_fields.push((field_index, field.value));
+                }
+
+                let row = self.row_mut(row_index).context(crate::InMemoryDataSnafu)?;
+                for (field_index, operation_value) in indexed_fields {
+                    apply_operation_value(&mut row.fields[field_index], operation_value)?;
+                }
+            }
+            RowOperation::Delete { row_id } => {
+                let row_index = *self.row_id_map.get(&row_id).ok_or_else(|| {
+                    crate::OperationError::UnknownRowId {
+                        row_id: row_id.to_string(),
+                    }
+                })?;
+                if !self.rows[row_index].deleted {
+                    self.rows[row_index].deleted = true;
+                }
+            }
+        }
+
+        Ok(self)
+    }
 }
 impl<RowId, OperationId> TableOperations<RowId, OperationId> for InMemoryData<RowId, OperationId>
 where
@@ -491,7 +564,7 @@ where
             };
             apply_operation_value(
                 &mut self.rows[row_index].fields[field_index],
-                &operation_value,
+                operation_value.clone(),
             )?;
             fields.push(OperationFieldValue {
                 field_name: Cow::Owned(field_name),
@@ -1649,7 +1722,7 @@ fn map_data_operation_value<Id, InputValue, OutputValue, E>(
 
 fn apply_operation_value<OperationId>(
     field_value: &mut InMemoryFieldValue<OperationId>,
-    operation_value: &OperationValue<OperationId>,
+    operation_value: OperationValue<OperationId>,
 ) -> crate::OperationResult<()>
 where
     OperationId:
@@ -1658,10 +1731,10 @@ where
     macro_rules! apply_lww_operation {
         ($current:expr, $operation:expr, $decode:ident) => {{
             let operation = UpdateOperation {
-                id: $operation.id.clone(),
-                pred: $operation.pred.clone(),
-                succ: $operation.succ.clone(),
-                value: $decode($operation.value.clone()).map_err(operation_invalid_value)?,
+                id: $operation.id,
+                pred: $operation.pred,
+                succ: $operation.succ,
+                value: $decode($operation.value).map_err(operation_invalid_value)?,
             };
             $current.apply_operation(operation).map_err(|_| {
                 crate::OperationError::InternalOperation {
@@ -1674,7 +1747,7 @@ where
 
     macro_rules! apply_list_operations {
         ($current:expr, $operations:expr, $decode:ident) => {{
-            for operation in $operations.iter().cloned() {
+            for operation in $operations {
                 let operation = map_data_operation_value(operation, $decode)
                     .map_err(operation_invalid_value)?;
                 let operation = ListOperation::from_operation(operation);
@@ -1863,7 +1936,7 @@ where
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_timestamp_array),
         (InMemoryFieldValue::LinearString(current), OperationValue::LinearString(operations)) => {
-            for operation in operations.iter().cloned() {
+            for operation in operations {
                 if current.apply_operation(operation).is_err() {
                     return crate::InternalOperationSnafu {
                         context: "Applying a generated LinearString operation failed.".to_owned(),
@@ -1915,10 +1988,10 @@ where
         ) => {
             match (current, delta) {
                 (CounterValue::Byte(current), CounterValue::Byte(delta)) => {
-                    *current = current.saturating_add(*delta)
+                    *current = current.saturating_add(delta)
                 }
                 (CounterValue::UInt(current), CounterValue::UInt(delta)) => {
-                    *current = current.saturating_add(*delta)
+                    *current = current.saturating_add(delta)
                 }
                 _ => {
                     return crate::InternalOperationSnafu {
@@ -1933,14 +2006,14 @@ where
             InMemoryFieldValue::TotalOrderRegister(current),
             OperationValue::TotalOrderRegisterSet(value),
         ) => {
-            *current = value.clone();
+            *current = value;
             Ok(())
         }
         (
             InMemoryFieldValue::TotalOrderFiniteStateRegister(current),
             OperationValue::TotalOrderFiniteStateRegisterSet(value),
         ) => {
-            *current = value.clone();
+            *current = value;
             Ok(())
         }
         _ => crate::InternalOperationSnafu {

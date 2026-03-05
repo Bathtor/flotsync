@@ -1,8 +1,12 @@
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
+    FieldOperations,
     IdWithIndex,
     NULL,
+    OperationOutcome,
+    TableOperations,
     any_data::{LinearLatestValueWins, list::LinearList},
+    initial_values,
     schema::{
         BasicDataType,
         Direction,
@@ -19,6 +23,7 @@ use flotsync_data_types::{
         exhaustive_schema_operations,
     },
     text::LinearString,
+    update_values,
 };
 use flotsync_messages::{
     InMemoryData,
@@ -28,7 +33,7 @@ use flotsync_messages::{
     protobuf::Message,
     snapshots::datamodel::{ProtoDataSnapshotDecoder, ProtoDataSnapshotEncoder},
 };
-use std::{assert_matches, borrow::Cow, sync::LazyLock};
+use std::{borrow::Cow, sync::LazyLock};
 
 fn update_id(version: u64, node_index: u32) -> UpdateId {
     UpdateId {
@@ -158,4 +163,73 @@ fn public_operation_transport_roundtrips_exhaustive_multi_field_example() {
     let decoded = decode_schema_operation(encoded, &schema).unwrap();
 
     assert_eq!(decoded, operation);
+}
+
+#[test]
+fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
+    let schema = &*PUBLIC_TEST_SCHEMA;
+    let row_id = row_id(4242);
+
+    let mut source = InMemoryData::with_owned_schema(schema.clone());
+    let decoded_insert = {
+        let insert = source
+            .insert_row(
+                update_id(100, 0),
+                row_id,
+                initial_values! {
+                    schema["latest"] => 1u64,
+                    schema["title"] => "draft",
+                    schema["numbers"] => vec![1i64, 2, 3],
+                    schema["counter"] => 0u64,
+                    schema["priority"] => 1u64,
+                    schema["status"] => "draft",
+                },
+            )
+            .unwrap();
+        let encoded = encode_schema_operation(&insert, schema).unwrap();
+        let bytes = encoded.write_to_bytes().unwrap();
+        let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+        decode_schema_operation(encoded, schema).unwrap()
+    };
+    let decoded_update = match source
+        .modify_row(
+            update_id(101, 0),
+            row_id,
+            update_values! {
+                schema["priority"] => 9u64,
+            },
+        )
+        .unwrap()
+    {
+        OperationOutcome::Applied(operation) => {
+            let encoded = encode_schema_operation(&operation, schema).unwrap();
+            let bytes = encoded.write_to_bytes().unwrap();
+            let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+            decode_schema_operation(encoded, schema).unwrap()
+        }
+        OperationOutcome::NoChanges => panic!("expected an update operation"),
+    };
+    let decoded_delete = {
+        let delete = source.delete_row(update_id(102, 0), row_id).unwrap();
+        let encoded = encode_schema_operation(&delete, schema).unwrap();
+        let bytes = encoded.write_to_bytes().unwrap();
+        let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+        decode_schema_operation(encoded, schema).unwrap()
+    };
+
+    let target = InMemoryData::with_owned_schema(schema.clone())
+        .apply_schema_operation(decoded_insert)
+        .unwrap()
+        .apply_schema_operation(decoded_delete)
+        .unwrap()
+        .apply_schema_operation(decoded_update)
+        .unwrap();
+
+    assert_eq!(target.num_active_rows(), 0);
+    let row = target
+        .get_row(&row_id)
+        .expect("row should remain addressable");
+    let priority: Cow<'_, u64> = schema["priority"].get_value(&row).unwrap();
+    assert_eq!(*priority, 9);
+    assert_eq!(target, source);
 }
