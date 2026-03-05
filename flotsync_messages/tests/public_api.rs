@@ -28,7 +28,10 @@ use flotsync_data_types::{
 use flotsync_messages::{
     InMemoryData,
     Uuid,
-    codecs::datamodel::{decode_schema_operation, encode_schema_operation},
+    codecs::{
+        datamodel::{decode_schema_operation, encode_schema_operation},
+        schema::{decode_schema_definition, encode_schema_definition},
+    },
     datamodel as proto,
     protobuf::Message,
     snapshots::datamodel::{ProtoDataSnapshotDecoder, ProtoDataSnapshotEncoder},
@@ -136,6 +139,27 @@ fn public_snapshot_transport_roundtrips_dataset() {
         InMemoryData::decode_data_snapshots(Cow::Borrowed(schema), &mut decoder).unwrap();
 
     assert_eq!(roundtrip, data);
+}
+
+#[test]
+fn public_schema_transport_roundtrips_exhaustive_schema() {
+    let mut schema = exhaustive_schema();
+    schema
+        .metadata
+        .insert("schema-meta".to_owned(), "present".to_owned());
+    schema
+        .columns
+        .get_mut("linear_string")
+        .expect("exhaustive schema must contain linear_string")
+        .metadata
+        .insert("field-meta".to_owned(), "present".to_owned());
+
+    let encoded = encode_schema_definition(&schema).unwrap();
+    let bytes = encoded.write_to_bytes().unwrap();
+    let encoded = proto::SchemaDefinition::parse_from_bytes(&bytes).unwrap();
+    let decoded = decode_schema_definition(encoded).unwrap();
+
+    assert_eq!(decoded, schema);
 }
 
 #[test]

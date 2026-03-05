@@ -271,3 +271,88 @@ message SchemaOperation {
         DeleteRowOperation delete = 4;
     }
 }
+
+enum PrimitiveType {
+    PRIMITIVE_TYPE_UNSPECIFIED = 0;
+    PRIMITIVE_TYPE_STRING = 1;
+    PRIMITIVE_TYPE_UINT = 2;
+    PRIMITIVE_TYPE_INT = 3;
+    PRIMITIVE_TYPE_BYTE = 4;
+    PRIMITIVE_TYPE_FLOAT = 5;
+    PRIMITIVE_TYPE_BOOLEAN = 6;
+    PRIMITIVE_TYPE_BINARY = 7;
+    PRIMITIVE_TYPE_DATE = 8;
+    PRIMITIVE_TYPE_TIMESTAMP = 9;
+}
+
+enum Direction {
+    DIRECTION_UNSPECIFIED = 0;
+    DIRECTION_ASCENDING = 1;
+    DIRECTION_DESCENDING = 2;
+}
+
+enum ReplicatedDataTypeKind {
+    REPLICATED_DATA_TYPE_KIND_UNSPECIFIED = 0;
+    REPLICATED_DATA_TYPE_KIND_LATEST_VALUE_WINS = 1;
+    REPLICATED_DATA_TYPE_KIND_LINEAR_STRING = 2;
+    REPLICATED_DATA_TYPE_KIND_LINEAR_LIST = 3;
+    REPLICATED_DATA_TYPE_KIND_MONOTONIC_COUNTER = 4;
+    REPLICATED_DATA_TYPE_KIND_TOTAL_ORDER_REGISTER = 5;
+    REPLICATED_DATA_TYPE_KIND_TOTAL_ORDER_FINITE_STATE_REGISTER = 6;
+}
+
+message BasicDataType {
+    oneof value {
+        PrimitiveType primitive = 1;
+        PrimitiveType primitive_array = 2;
+    }
+}
+
+message NullableBasicDataType {
+    oneof value {
+        BasicDataType non_null = 1;
+        BasicDataType nullable = 2;
+    }
+}
+
+message NullablePrimitiveType {
+    oneof value {
+        PrimitiveType non_null = 1;
+        PrimitiveType nullable = 2;
+    }
+}
+
+// Nullable primitive state list with optional null insertion point.
+//
+// `null_index` is interpreted relative to `values` after dropping null:
+// it may range from 0 to `values.len()` inclusive.
+message NullablePrimitiveValueArray {
+    PrimitiveArrayValue values = 1;
+    optional uint32 null_index = 2;
+}
+
+// Details are validated against `kind` by transport codecs.
+message ReplicatedDataType {
+    ReplicatedDataTypeKind kind = 1;
+
+    oneof detail {
+        NullableBasicDataType nullable_basic_value_type = 2;
+        PrimitiveType primitive_value_type = 3;
+        bool monotonic_counter_small_range = 4;
+        NullablePrimitiveValueArray finite_state_states = 5;
+    }
+
+    optional Direction total_order_direction = 6;
+    NullablePrimitiveType finite_state_value_type = 7;
+}
+
+message FieldDefinition {
+    string name = 1;
+    ReplicatedDataType data_type = 2;
+    map<string, string> metadata = 3;
+}
+
+message SchemaDefinition {
+    repeated FieldDefinition fields = 1;
+    map<string, string> metadata = 2;
+}
