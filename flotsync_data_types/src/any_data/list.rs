@@ -861,4 +861,47 @@ mod tests {
         target.apply_operation(op2).unwrap();
         assert_eq!(target.iter().copied().collect::<Vec<_>>(), vec![0, 10, 11]);
     }
+
+    #[test]
+    fn sibling_insert_with_existing_local_subtree_converges() {
+        let base = new_list([0]);
+
+        let op_a = base
+            .insert_operation_at(1, IdWithIndex::zero(3), [10])
+            .unwrap()
+            .unwrap();
+        let op_b = base
+            .insert_operation_at(1, IdWithIndex::zero(5), [20])
+            .unwrap()
+            .unwrap();
+        let op_d = base
+            .insert_operation_at(1, IdWithIndex::zero(4), [40])
+            .unwrap()
+            .unwrap();
+
+        let mut writer_b = base.clone();
+        writer_b.apply_operation(op_b.clone()).unwrap();
+        let op_c = writer_b
+            .insert_operation_at(1, IdWithIndex::zero(6), [30])
+            .unwrap()
+            .unwrap();
+
+        let mut r1 = new_list([0]);
+        r1.apply_operation(op_a.clone()).unwrap();
+        r1.apply_operation(op_b.clone()).unwrap();
+        r1.apply_operation(op_c.clone()).unwrap();
+        r1.apply_operation(op_d.clone()).unwrap();
+
+        let mut r2 = new_list([0]);
+        r2.apply_operation(op_a).unwrap();
+        r2.apply_operation(op_b).unwrap();
+        r2.apply_operation(op_d).unwrap();
+        r2.apply_operation(op_c).unwrap();
+
+        assert_eq!(r1, r2);
+        assert_eq!(
+            r1.iter().copied().collect::<Vec<_>>(),
+            r2.iter().copied().collect::<Vec<_>>()
+        );
+    }
 }

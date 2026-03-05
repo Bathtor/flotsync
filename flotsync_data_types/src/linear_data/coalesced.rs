@@ -1,4 +1,4 @@
-use super::*;
+use super::{vec_impl::RightTreeTraversalMemo, *};
 use crate::snapshot::SnapshotSink;
 use flotsync_utils::{debugging::DebugFormatting, require};
 use std::{hash::Hash, ops::RangeBounds};
@@ -943,17 +943,14 @@ where
                             // everything before us has an origin to the right of us
                             // or has the same origin but a lower Id.
 
-                            // let node_has_origin_id =
-                            //     |node: &Node<Self::Id, Value>, origin_id: &Self::Id| -> bool {
-                            //         node.contains(origin_id)
-                            //     };
-
                             let left_right_range = (pred_index + 1)..succ_index;
                             let mut conflicting_nodes: Vec<(&BaseId, usize)> =
                                 Vec::with_capacity(left_right_range.len());
                             // The right subtree is all the nodes that have succ as their successor,
                             // and all node that can reach those nodes by following right_origin.
                             let mut right_subtree_start_index_opt = None;
+                            let mut right_tree_memo =
+                                RightTreeTraversalMemo::new(&self.base.nodes, succ);
                             for node_index in left_right_range {
                                 let node = &self.base.nodes[node_index];
                                 if node.left_origin.as_ref() == Some(pred)
@@ -961,10 +958,9 @@ where
                                 {
                                     conflicting_nodes.push((&node.id.id, node_index));
                                 }
-                                // TODO: Memoize!
                                 // Don't overwrite this with a later node.
                                 if right_subtree_start_index_opt.is_none()
-                                    && self.base.ends_in_right_tree(node, succ)
+                                    && right_tree_memo.reaches_boundary(node_index)
                                 {
                                     right_subtree_start_index_opt = Some(node_index);
                                 }
@@ -1004,15 +1000,30 @@ where
                                             // because they might all have anchored off that first conflicting node.
                                             pred_index + 1
                                         } else if insert_index < conflicting_nodes.len() {
-                                            conflicting_nodes[insert_index].1
+                                            let target_conflict_pos =
+                                                conflicting_nodes[insert_index].1;
+                                            let target_conflict_id =
+                                                &self.base.nodes[target_conflict_pos].id;
+                                            // Insert before the target conflicting node's local
+                                            // subtree, not just before the node itself.
+                                            // Otherwise sibling subtree order can depend on
+                                            // delivery order.
+                                            let mut target_tree_memo = right_tree_memo
+                                                .with_new_boundary(target_conflict_id);
+                                            let mut subtree_start = target_conflict_pos;
+                                            for node_index in (pred_index + 1)..target_conflict_pos
+                                            {
+                                                if target_tree_memo.reaches_boundary(node_index) {
+                                                    subtree_start = node_index;
+                                                    break;
+                                                }
+                                            }
+                                            subtree_start
                                         } else {
                                             // It has to be right of all the conflicting nodes.
                                             // Insert just before succ.
                                             succ_index
                                         }
-                                        // Unclear: It might be all or some of these also need to take
-                                        //          local subtrees into account.
-                                        //          Don't have a repro for that, yet, though.
                                     }
                                 }
                             };

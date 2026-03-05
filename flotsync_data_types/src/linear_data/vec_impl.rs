@@ -6,6 +6,7 @@ use crate::snapshot::{
     SnapshotReadError,
     SnapshotSink,
 };
+use std::{collections::HashMap, hash::Hash};
 
 /// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
 ///
@@ -19,6 +20,118 @@ pub struct VecLinearData<Id, Value> {
     pub(super) len: usize,
     pub(super) nodes: Vec<Node<Id, Value>>,
 }
+
+/// Per-operation memoized traversal helper for right-origin chains.
+///
+/// This is used during conflict-position calculation to avoid repeating the same transitive
+/// right-origin traversals for multiple candidate nodes.
+pub(super) struct RightTreeTraversalMemo<'a, Id, Value> {
+    nodes: &'a [Node<Id, Value>],
+    boundary: &'a Id,
+    node_index_by_id: HashMap<&'a Id, usize>,
+    reaches_boundary_cache: Vec<Option<bool>>,
+}
+impl<'a, Id, Value> RightTreeTraversalMemo<'a, Id, Value>
+where
+    Id: PartialEq + Eq + Hash + fmt::Debug,
+{
+    pub fn new(nodes: &'a [Node<Id, Value>], boundary: &'a Id) -> Self {
+        Self {
+            nodes,
+            boundary,
+            node_index_by_id: HashMap::new(),
+            reaches_boundary_cache: vec![None; nodes.len()],
+        }
+    }
+
+    pub fn with_new_boundary(mut self, boundary: &'a Id) -> Self {
+        if self.boundary != boundary {
+            self.boundary = boundary;
+            self.reaches_boundary_cache.fill(None);
+        }
+        self
+    }
+
+    /// Returns `true` iff the node at `start_index` is in the transitive right subtree that
+    /// includes `boundary`.
+    ///
+    /// In other words, if you follow `right_origin` anchors starting from this node, you hit the
+    /// node with `id = boundary` before you find a `None`.
+    pub fn reaches_boundary(&mut self, start_index: usize) -> bool {
+        if let Some(reaches) = self.reaches_boundary_cache[start_index] {
+            return reaches;
+        }
+
+        let mut path = Vec::new();
+        let mut current_index = start_index;
+        loop {
+            if let Some(reaches) = self.reaches_boundary_cache[current_index] {
+                self.cache_path(&path, reaches);
+                return reaches;
+            }
+
+            path.push(current_index);
+            let node = &self.nodes[current_index];
+            self.node_index_by_id
+                .entry(&node.id)
+                .or_insert(current_index);
+
+            if &node.id == self.boundary {
+                self.cache_path(&path, true);
+                return true;
+            }
+
+            let Some(next_id) = node.right_origin.as_ref() else {
+                self.cache_path(&path, false);
+                return false;
+            };
+
+            current_index = self.resolve_index(current_index, next_id);
+        }
+    }
+
+    fn cache_path(&mut self, path: &[usize], reaches: bool) {
+        for node_index in path.iter().copied() {
+            self.reaches_boundary_cache[node_index] = Some(reaches);
+        }
+    }
+
+    fn resolve_index(&mut self, current_index: usize, id: &Id) -> usize {
+        if let Some(index) = self.node_index_by_id.get(id).copied() {
+            if index > current_index {
+                return index;
+            }
+
+            panic!(
+                "Invalid right_origin chain: id={id:?} resolves to index={index}, \
+                 which is not to the right of current_index={current_index}"
+            );
+        }
+
+        let search_start = current_index + 1;
+        if let Some(offset) = self.nodes[search_start..]
+            .iter()
+            .position(|node| &node.id == id)
+        {
+            let index = search_start + offset;
+            self.node_index_by_id.insert(&self.nodes[index].id, index);
+            return index;
+        }
+
+        if let Some(index) = self.nodes[..=current_index]
+            .iter()
+            .position(|node| &node.id == id)
+        {
+            panic!(
+                "Invalid right_origin chain: id={id:?} resolves to index={index}, \
+                 which is not to the right of current_index={current_index}"
+            );
+        }
+
+        panic!("For every origin a node should exist (missing id={id:?})");
+    }
+}
+
 impl<Id, Value> VecLinearData<Id, Value> {
     pub(crate) fn encode_snapshot<S, ValueRef: ?Sized, F>(
         &self,
@@ -210,32 +323,6 @@ where
         let nodes = vec![begin_node, value_node, end_node];
         Self { len: 1, nodes }
     }
-
-    /// Returns `true` iff `node` is in the transitive right subtree that includes `boundary`.
-    ///
-    /// In other words, if you follow `right_origin` anchors starting from node, you hit the
-    /// node with `id = boundary` before you find a `None`.
-    pub(super) fn ends_in_right_tree<'a>(
-        &'a self,
-        mut node: &'a Node<Id, Value>,
-        boundary: &Id,
-    ) -> bool {
-        loop {
-            if &node.id == boundary {
-                return true;
-            }
-
-            if let Some(ref right) = node.right_origin {
-                node = self
-                    .nodes
-                    .iter()
-                    .find(|n| &n.id == right)
-                    .expect("For every origin a node should exist");
-            } else {
-                return false;
-            };
-        }
-    }
 }
 impl<Id, Value> VecLinearData<Id, Value>
 where
@@ -349,7 +436,7 @@ where
 }
 impl<Id, Value> LinearData<Value> for VecLinearData<Id, Value>
 where
-    Id: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     Value: fmt::Debug,
 {
     type Id = Id;
@@ -494,6 +581,8 @@ where
                             // The right subtree is all nodes that have succ as successor,
                             // and all nodes that can reach those nodes by following right_origin.
                             let mut right_subtree_start_index_opt = None;
+                            let mut right_tree_memo =
+                                RightTreeTraversalMemo::new(&self.nodes, succ);
                             for node_index in left_right_range {
                                 let node = &self.nodes[node_index];
                                 if node.left_origin.as_ref() == Some(pred)
@@ -502,7 +591,7 @@ where
                                     conflicting_nodes.push((&node.id, node_index));
                                 }
                                 if right_subtree_start_index_opt.is_none()
-                                    && self.ends_in_right_tree(node, succ)
+                                    && right_tree_memo.reaches_boundary(node_index)
                                 {
                                     right_subtree_start_index_opt = Some(node_index);
                                 }
@@ -535,15 +624,17 @@ where
                                             // subtree, not just before the node itself.
                                             // Otherwise the relative order of sibling subtrees can
                                             // depend on delivery order.
-                                            ((pred_index + 1)..target_conflict_pos)
-                                                .find(|node_index| {
-                                                    let node = &self.nodes[*node_index];
-                                                    self.ends_in_right_tree(
-                                                        node,
-                                                        target_conflict_id,
-                                                    )
-                                                })
-                                                .unwrap_or(target_conflict_pos)
+                                            let mut target_tree_memo = right_tree_memo
+                                                .with_new_boundary(target_conflict_id);
+                                            let mut subtree_start = target_conflict_pos;
+                                            for node_index in (pred_index + 1)..target_conflict_pos
+                                            {
+                                                if target_tree_memo.reaches_boundary(node_index) {
+                                                    subtree_start = node_index;
+                                                    break;
+                                                }
+                                            }
+                                            subtree_start
                                         } else {
                                             // Insert before succ, to the right of all conflicting nodes.
                                             succ_index

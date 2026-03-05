@@ -12,7 +12,7 @@ pub type LinearWordString<Id> = VecLinearData<Id, String>;
 pub type LinearWordStringUntracked = LinearWordString<()>;
 impl<Id> fmt::Display for LinearWordString<Id>
 where
-    Id: Clone + fmt::Debug + PartialEq + Eq + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.iter_values().try_for_each(|s| f.write_str(s))
@@ -663,6 +663,41 @@ pub(crate) mod tests {
                 assert!(res.is_err());
             }
         }
+
+        #[test]
+        fn sibling_insert_with_existing_local_subtree_converges() {
+            let mut base = LinearString::new(0u32);
+            base.append(IdWithIndex::zero(2), "0".to_owned());
+
+            let ids_before_end = base.ids_before_end();
+            let op_a = ids_before_end
+                .clone()
+                .insert_operation(IdWithIndex::zero(3), "a".to_owned());
+            let op_b = ids_before_end
+                .clone()
+                .insert_operation(IdWithIndex::zero(5), "b".to_owned());
+            let op_d = ids_before_end.insert_operation(IdWithIndex::zero(4), "d".to_owned());
+
+            let mut writer_b = base.clone();
+            writer_b.apply_operation(op_b.clone()).unwrap();
+            let ids_before_b = writer_b.ids_at_pos(1).unwrap().before();
+            let op_c = ids_before_b.insert_operation(IdWithIndex::zero(6), "c".to_owned());
+
+            let mut r1 = base.clone();
+            r1.apply_operation(op_a.clone()).unwrap();
+            r1.apply_operation(op_b.clone()).unwrap();
+            r1.apply_operation(op_c.clone()).unwrap();
+            r1.apply_operation(op_d.clone()).unwrap();
+
+            let mut r2 = base;
+            r2.apply_operation(op_a).unwrap();
+            r2.apply_operation(op_b).unwrap();
+            r2.apply_operation(op_d).unwrap();
+            r2.apply_operation(op_c).unwrap();
+
+            assert_eq!(r1, r2);
+            assert_eq!(r1.to_string(), r2.to_string());
+        }
     }
 
     mod linear_word_string {
@@ -808,6 +843,37 @@ pub(crate) mod tests {
             assert_eq!(linear.ids_at_pos(0), None);
             assert_eq!(linear.len(), 0);
             assert_eq!(linear.to_string().as_str(), "");
+        }
+
+        #[test]
+        fn sibling_insert_with_existing_local_subtree_converges() {
+            let mut base = LinearWordString::<u32>::new(0, 1);
+            base.append(2, "0".to_owned());
+
+            let ids_before_end = base.ids_before_end();
+            let op_a = ids_before_end.clone().insert_operation(3, "a".to_owned());
+            let op_b = ids_before_end.clone().insert_operation(5, "b".to_owned());
+            let op_d = ids_before_end.insert_operation(4, "d".to_owned());
+
+            let mut writer_b = base.clone();
+            writer_b.apply_operation(op_b.clone()).unwrap();
+            let ids_before_b = writer_b.ids_at_pos(1).unwrap().before();
+            let op_c = ids_before_b.insert_operation(6, "c".to_owned());
+
+            let mut r1 = base.clone();
+            r1.apply_operation(op_a.clone()).unwrap();
+            r1.apply_operation(op_b.clone()).unwrap();
+            r1.apply_operation(op_c.clone()).unwrap();
+            r1.apply_operation(op_d.clone()).unwrap();
+
+            let mut r2 = base;
+            r2.apply_operation(op_a).unwrap();
+            r2.apply_operation(op_b).unwrap();
+            r2.apply_operation(op_d).unwrap();
+            r2.apply_operation(op_c).unwrap();
+
+            assert_eq!(r1, r2);
+            assert_eq!(r1.to_string(), r2.to_string());
         }
     }
 }
