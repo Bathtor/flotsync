@@ -11,3 +11,4 @@ target/
 *.log
 *.activity
 *.port
+*.lock
