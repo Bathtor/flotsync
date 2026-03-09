@@ -187,7 +187,8 @@ pub trait TableOperations<RowId, OperationId> {
 
     /// Insert a fresh row identified by `row_id` and with the `initial_values`.
     ///
-    /// All fields declared in the schema *must* have initial values or the insert will be rejected.
+    /// Any field omitted from `initial_values` will use its schema-level default when defined.
+    /// If a field is omitted and has no schema default, the insert will be rejected.
     /// If any field has more than one value provided, the last one will be used.
     ///
     /// It is crucial to ensure that `operation_id` is globally unique to prevent insert/insert type

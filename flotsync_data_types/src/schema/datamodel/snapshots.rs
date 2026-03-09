@@ -2273,6 +2273,7 @@ mod tests {
                         PrimitiveType::UInt,
                     )),
                 },
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );
@@ -2281,6 +2282,7 @@ mod tests {
             Field {
                 name: "title".to_owned(),
                 data_type: ReplicatedDataType::LinearString,
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );
@@ -2291,6 +2293,7 @@ mod tests {
                 data_type: ReplicatedDataType::LinearList {
                     value_type: PrimitiveType::Int,
                 },
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );
@@ -2299,6 +2302,7 @@ mod tests {
             Field {
                 name: "counter".to_owned(),
                 data_type: ReplicatedDataType::MonotonicCounter { small_range: false },
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );
@@ -2310,6 +2314,7 @@ mod tests {
                     value_type: PrimitiveType::UInt,
                     direction: Direction::Ascending,
                 },
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );
@@ -2327,6 +2332,7 @@ mod tests {
                         null_index: 1,
                     },
                 },
+                default_value: None,
                 metadata: HashMap::new(),
             },
         );

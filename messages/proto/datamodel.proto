@@ -350,6 +350,7 @@ message FieldDefinition {
     string name = 1;
     ReplicatedDataType data_type = 2;
     map<string, string> metadata = 3;
+    NullableBasicValue default_value = 4;
 }
 
 message SchemaDefinition {

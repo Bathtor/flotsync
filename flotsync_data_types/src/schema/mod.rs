@@ -25,6 +25,11 @@ impl Schema {
     pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
         let mut columns = HashMap::with_capacity(N);
         for field in fields {
+            if let Some(default_value) = field.default_value.clone() {
+                if let Err(source) = field.initial(default_value) {
+                    panic!("Invalid default value for field '{}': {source}", field.name);
+                }
+            }
             if let Some(existing_field) = columns.insert(field.name.to_string(), field) {
                 panic!("Duplicate field name: {}", existing_field.name);
             }
@@ -98,6 +103,8 @@ pub struct Field {
     pub name: String,
     /// The data type of this field.
     pub data_type: ReplicatedDataType,
+    /// Optional default value materialized on insert when no explicit value is provided.
+    pub default_value: Option<datamodel::NullableBasicValue>,
     /// A map containing information about this column.
     pub metadata: HashMap<String, String>,
 }
@@ -106,6 +113,7 @@ impl Field {
         Self {
             name: name.into(),
             data_type: ReplicatedDataType::LatestValueWins { value_type },
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -114,6 +122,7 @@ impl Field {
         Self {
             name: name.into(),
             data_type: ReplicatedDataType::LinearString,
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -122,6 +131,7 @@ impl Field {
         Self {
             name: name.into(),
             data_type: ReplicatedDataType::LinearList { value_type },
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -130,6 +140,7 @@ impl Field {
         Self {
             name: name.into(),
             data_type: ReplicatedDataType::MonotonicCounter { small_range: false },
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -138,6 +149,7 @@ impl Field {
         Self {
             name: name.into(),
             data_type: ReplicatedDataType::MonotonicCounter { small_range: true },
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -153,6 +165,7 @@ impl Field {
                 value_type,
                 direction,
             },
+            default_value: None,
             metadata: HashMap::new(),
         }
     }
@@ -171,6 +184,7 @@ impl Field {
         Ok(Self {
             name: name.into(),
             data_type: ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
+            default_value: None,
             metadata: HashMap::new(),
         })
     }
@@ -656,5 +670,14 @@ mod tests {
             data_type.to_string(),
             "STRING USING TOTAL_ORDER_FSM(['in''review', NULL])"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid default value for field 'priority'")]
+    fn schema_from_fields_rejects_invalid_defaults() {
+        let mut field =
+            Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending);
+        field.default_value = Some("wrong-type".into());
+        let _schema = Schema::from_fields([field]);
     }
 }

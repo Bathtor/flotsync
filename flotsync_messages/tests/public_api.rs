@@ -163,6 +163,71 @@ fn public_schema_transport_roundtrips_exhaustive_schema() {
 }
 
 #[test]
+fn public_schema_transport_roundtrips_field_defaults() {
+    let schema = Schema::from_fields([
+        Field::linear_string("title")
+            .with_default("untitled")
+            .unwrap(),
+        Field::linear_list("numbers", PrimitiveType::Int)
+            .with_default(vec![1i64, 2, 3])
+            .unwrap(),
+        Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending)
+            .with_default(9u64)
+            .unwrap(),
+    ]);
+
+    let encoded = encode_schema_definition(&schema).unwrap();
+    let bytes = encoded.write_to_bytes().unwrap();
+    let encoded = proto::SchemaDefinition::parse_from_bytes(&bytes).unwrap();
+    let decoded = decode_schema_definition(encoded).unwrap();
+
+    assert_eq!(decoded, schema);
+}
+
+#[test]
+fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
+    let old_schema = Schema::from_fields([Field::linear_string("title")]);
+    let new_schema = Schema::from_fields([
+        Field::linear_string("title"),
+        Field::linear_string("subtitle")
+            .with_default("generated subtitle")
+            .unwrap(),
+        Field::linear_list("numbers", PrimitiveType::Int)
+            .with_default(vec![4i64, 5])
+            .unwrap(),
+    ]);
+    let row_id = row_id(7777);
+
+    let mut source = InMemoryData::with_owned_schema(old_schema.clone());
+    let insert = source
+        .insert_row(
+            update_id(700, 1),
+            row_id,
+            initial_values! {
+                old_schema["title"] => "legacy title",
+            },
+        )
+        .unwrap();
+    let encoded = encode_schema_operation(&insert, &old_schema).unwrap();
+    let bytes = encoded.write_to_bytes().unwrap();
+    let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+    let decoded = decode_schema_operation(encoded, &new_schema).unwrap();
+
+    let target = InMemoryData::with_owned_schema(new_schema.clone())
+        .apply_schema_operation(decoded)
+        .unwrap();
+    let row = target
+        .get_row(&row_id)
+        .expect("row should be available after insert");
+    let title: Cow<'_, str> = new_schema["title"].get_value(&row).unwrap();
+    let subtitle: Cow<'_, str> = new_schema["subtitle"].get_value(&row).unwrap();
+    let numbers: Cow<'_, [i64]> = new_schema["numbers"].get_value(&row).unwrap();
+    assert_eq!(title.as_ref(), "legacy title");
+    assert_eq!(subtitle.as_ref(), "generated subtitle");
+    assert_eq!(numbers.as_ref(), &[4, 5]);
+}
+
+#[test]
 fn public_operation_transport_roundtrips_exhaustive_examples() {
     let schema = exhaustive_schema();
     let operations = exhaustive_schema_operations(row_ids(), operation_ids()).unwrap();

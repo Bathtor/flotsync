@@ -82,6 +82,31 @@ pub(crate) enum FieldTargetValue {
 }
 
 impl Field {
+    pub fn with_default<V>(mut self, value: V) -> Result<Self, FieldValueBuildError>
+    where
+        V: Into<NullableBasicValue>,
+    {
+        let value = value.into();
+        self.normalize_field_value(value.clone())?;
+        self.default_value = Some(value);
+        Ok(self)
+    }
+
+    pub fn without_default(mut self) -> Self {
+        self.default_value = None;
+        self
+    }
+
+    pub(crate) fn default_target_value(
+        &self,
+    ) -> Result<Option<FieldTargetValue>, FieldValueBuildError> {
+        let Some(value) = self.default_value.as_ref() else {
+            return Ok(None);
+        };
+        let target_value = self.normalize_field_value(value.clone())?;
+        Ok(Some(target_value))
+    }
+
     pub fn initial<'a, V>(&'a self, value: V) -> Result<InitialFieldValue<'a>, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,

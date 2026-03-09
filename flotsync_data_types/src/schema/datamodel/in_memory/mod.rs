@@ -350,6 +350,84 @@ where
         Ok(InMemoryRow::new(fields))
     }
 
+    fn row_from_snapshot_with_defaults(
+        &self,
+        fields: Vec<(String, InMemoryFieldValue<OperationId>)>,
+        change_id: &OperationId,
+    ) -> crate::OperationResult<InMemoryRow<OperationId>>
+    where
+        OperationId:
+            Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        let mut row_slots: Vec<Option<InMemoryFieldValue<OperationId>>> =
+            std::iter::repeat_with(|| None)
+                .take(self.field_names.len())
+                .collect();
+
+        for (field_name, value) in fields {
+            let Some(field_index) = self.field_index(field_name.as_str()) else {
+                return Err(crate::OperationError::SchemaValue {
+                    source: SchemaValueError::UnknownField { field_name },
+                });
+            };
+            if row_slots[field_index].is_some() {
+                return Err(crate::OperationError::SchemaValue {
+                    source: SchemaValueError::DuplicateField { field_name },
+                });
+            }
+
+            let schema_field = self
+                .schema
+                .columns
+                .get(field_name.as_str())
+                .expect("field_names and schema are in sync");
+            validate_in_memory_field_value(&schema_field.data_type, &value).map_err(|source| {
+                crate::OperationError::SchemaValue {
+                    source: SchemaValueError::InvalidSnapshotFieldValue {
+                        field_name: field_name.clone(),
+                        source,
+                    },
+                }
+            })?;
+
+            row_slots[field_index] = Some(value);
+        }
+
+        for (field_index, row_slot) in row_slots.iter_mut().enumerate() {
+            if row_slot.is_some() {
+                continue;
+            }
+
+            let field_name = self.field_names[field_index].as_str();
+            let schema_field = self
+                .schema
+                .columns
+                .get(field_name)
+                .expect("field_names and schema are in sync");
+            let default_value = materialize_default_target_value(field_name, schema_field)?;
+            let Some(default_value) = default_value else {
+                return Err(crate::OperationError::SchemaValue {
+                    source: SchemaValueError::MissingField {
+                        field_name: field_name.to_owned(),
+                    },
+                });
+            };
+            let field_value = build_initial_field_value(
+                field_name,
+                &schema_field.data_type,
+                &default_value,
+                change_id,
+            )?;
+            *row_slot = Some(field_value);
+        }
+
+        let fields = row_slots
+            .into_iter()
+            .map(|slot| slot.expect("all row slots are resolved after default materialization"))
+            .collect();
+        Ok(InMemoryRow::new(fields))
+    }
+
     fn row(&self, row_index: usize) -> Result<&InMemoryRow<OperationId>, InMemoryDataError> {
         self.rows
             .get(row_index)
@@ -382,7 +460,11 @@ where
             .validate_against_schema(self.schema())
             .context(crate::SchemaValueSnafu)?;
 
-        match operation.operation {
+        let SchemaOperation {
+            change_id,
+            operation: row_operation,
+        } = operation;
+        match row_operation {
             RowOperation::Insert { row_id, snapshot } => {
                 if self.row_id_map.contains_key(&row_id) {
                     return crate::DuplicateRowIdSnafu {
@@ -391,9 +473,8 @@ where
                     .fail();
                 }
 
-                let row = self
-                    .row_from_named_fields(snapshot.into_owned_fields())
-                    .context(crate::InMemoryDataSnafu)?;
+                let row =
+                    self.row_from_snapshot_with_defaults(snapshot.into_owned_fields(), &change_id)?;
                 let index = self.rows.len();
                 self.rows.push(row);
                 self.row_id_map.insert(row_id, index);
@@ -632,7 +713,30 @@ fn collect_initial_values<'a>(
         }
         collected.insert(field_name.to_owned(), initial_value.value().clone());
     }
+    for (field_name, schema_field) in &schema.columns {
+        if collected.contains_key(field_name.as_str()) {
+            continue;
+        }
+        let default_value = materialize_default_target_value(field_name.as_str(), schema_field)?;
+        if let Some(default_value) = default_value {
+            collected.insert(field_name.clone(), default_value);
+        }
+    }
     Ok(collected)
+}
+
+fn materialize_default_target_value(
+    field_name: &str,
+    schema_field: &crate::schema::Field,
+) -> crate::OperationResult<Option<super::super::public_api::FieldTargetValue>> {
+    schema_field
+        .default_target_value()
+        .map_err(|_| crate::OperationError::SchemaValue {
+            source: SchemaValueError::InvalidSnapshotFieldValue {
+                field_name: field_name.to_owned(),
+                source: DataModelValueError::InvalidSnapshotValueForType,
+            },
+        })
 }
 
 fn collect_pending_updates<'a>(

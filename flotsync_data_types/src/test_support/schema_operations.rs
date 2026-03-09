@@ -158,6 +158,33 @@ pub fn exhaustive_schema() -> Schema {
         );
     }
 
+    set_field_default(
+        &mut columns,
+        lvw_field_name(false, false, PrimitiveType::String),
+        nullable_basic_value(false, false, PrimitiveType::String),
+    );
+    set_field_default(
+        &mut columns,
+        "linear_string".to_owned(),
+        "default-linear-string",
+    );
+    set_field_default(
+        &mut columns,
+        linear_list_field_name(PrimitiveType::Int),
+        vec![-7i64, 0, 9],
+    );
+    set_field_default(&mut columns, "monotonic_counter_uint".to_owned(), 42u64);
+    set_field_default(
+        &mut columns,
+        total_order_register_field_name(Direction::Ascending, PrimitiveType::UInt),
+        42u64,
+    );
+    set_field_default(
+        &mut columns,
+        finite_state_register_field_name(true, PrimitiveType::String),
+        "review",
+    );
+
     Schema {
         columns,
         metadata: HashMap::new(),
@@ -428,9 +455,23 @@ fn insert_field(columns: &mut HashMap<String, Field>, name: String, data_type: R
         Field {
             name,
             data_type,
+            default_value: None,
             metadata: HashMap::new(),
         },
     );
+}
+
+fn set_field_default<V>(columns: &mut HashMap<String, Field>, field_name: String, value: V)
+where
+    V: Into<NullableBasicValue>,
+{
+    let field = columns
+        .remove(field_name.as_str())
+        .expect("field must exist when assigning exhaustive defaults");
+    let field = field
+        .with_default(value)
+        .expect("exhaustive defaults must be type-compatible");
+    columns.insert(field_name, field);
 }
 
 fn field<Id>(field_name: String, value: OperationValue<Id>) -> OperationFieldValue<'static, Id> {

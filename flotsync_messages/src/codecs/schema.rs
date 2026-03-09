@@ -1,4 +1,7 @@
-use crate::datamodel as proto;
+use crate::{
+    codecs::datamodel::{CodecError, decode_nullable_basic_value, encode_nullable_basic_value},
+    datamodel as proto,
+};
 use flotsync_data_types::{
     chrono::{Datelike, NaiveDate},
     schema::{
@@ -6,6 +9,7 @@ use flotsync_data_types::{
         BasicDataType,
         Direction,
         Field,
+        FieldValueBuildError,
         NullableBasicDataType,
         NullablePrimitiveType,
         PrimitiveType,
@@ -103,6 +107,15 @@ pub enum SchemaCodecError {
     },
     #[snafu(display("Date {year:04}-{month:02}-{day:02} is not a valid calendar date."))]
     InvalidDate { year: i32, month: u32, day: u32 },
+    #[snafu(display("Shared datamodel protobuf codec failed."))]
+    Codec { source: CodecError },
+    #[snafu(display(
+        "Field '{field_name}' has a default value incompatible with its schema data type."
+    ))]
+    InvalidFieldDefault {
+        field_name: String,
+        source: FieldValueBuildError,
+    },
 }
 
 /// Encode a `Schema` into its protobuf schema transport form.
@@ -138,6 +151,10 @@ fn encode_field_definition(field: &Field) -> SchemaResult<proto::FieldDefinition
     let mut encoded = proto::FieldDefinition::new();
     encoded.name = field.name.clone();
     encoded.data_type = MessageField::some(encode_replicated_data_type(&field.data_type)?);
+    if let Some(default_value) = field.default_value.as_ref() {
+        encoded.default_value =
+            MessageField::some(encode_nullable_basic_value(default_value.as_ref()));
+    }
     encoded.metadata = field.metadata.clone();
     Ok(encoded)
 }
@@ -147,11 +164,26 @@ fn decode_field_definition(mut field: proto::FieldDefinition) -> SchemaResult<Fi
         .data_type
         .take_required("FieldDefinition", "data_type")
         .and_then(decode_replicated_data_type)?;
-    Ok(Field {
+    let default_value = field
+        .default_value
+        .take()
+        .map(|value| decode_nullable_basic_value(value).context(CodecSnafu))
+        .transpose()?;
+
+    let decoded_field = Field {
         name: field.name,
         data_type,
+        default_value,
         metadata: field.metadata,
-    })
+    };
+    if let Some(default_value) = decoded_field.default_value.clone() {
+        decoded_field
+            .initial(default_value)
+            .context(InvalidFieldDefaultSnafu {
+                field_name: decoded_field.name.clone(),
+            })?;
+    }
+    Ok(decoded_field)
 }
 
 fn encode_replicated_data_type(

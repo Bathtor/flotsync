@@ -893,6 +893,7 @@ mod tests {
             Field {
                 name: name.to_owned(),
                 data_type,
+                default_value: None,
                 metadata: HashMap::new(),
             },
         )

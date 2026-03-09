@@ -285,7 +285,11 @@ fn validate_schema_snapshot<ChangeId>(
         }
     }
 
-    if let Some(field_name) = missing_fields.into_iter().next() {
+    let missing_required_field = missing_fields.into_iter().find(|field_name| {
+        let field = schema.columns.get(field_name.as_str());
+        field.is_none_or(|field| field.default_value.is_none())
+    });
+    if let Some(field_name) = missing_required_field {
         return MissingFieldSnafu { field_name }.fail();
     }
 
@@ -418,6 +422,7 @@ mod tests {
                 Field {
                     name: field_name.to_owned(),
                     data_type,
+                    default_value: None,
                     metadata: HashMap::new(),
                 },
             )]),
@@ -495,6 +500,7 @@ mod tests {
                     Field {
                         name: "name".to_owned(),
                         data_type: ReplicatedDataType::LinearString,
+                        default_value: None,
                         metadata: HashMap::new(),
                     },
                 ),
@@ -506,6 +512,7 @@ mod tests {
                             value_type: PrimitiveType::UInt,
                             direction: Direction::Ascending,
                         },
+                        default_value: None,
                         metadata: HashMap::new(),
                     },
                 ),
@@ -526,6 +533,44 @@ mod tests {
             err,
             SchemaValueError::MissingField { field_name } if field_name == "priority"
         );
+    }
+
+    #[test]
+    fn insert_snapshot_allows_missing_fields_with_defaults() {
+        let schema = Schema {
+            columns: HashMap::from([
+                (
+                    "name".to_owned(),
+                    Field {
+                        name: "name".to_owned(),
+                        data_type: ReplicatedDataType::LinearString,
+                        default_value: None,
+                        metadata: HashMap::new(),
+                    },
+                ),
+                (
+                    "priority".to_owned(),
+                    Field::total_order_register(
+                        "priority",
+                        PrimitiveType::UInt,
+                        Direction::Ascending,
+                    )
+                    .with_default(7u64)
+                    .unwrap(),
+                ),
+            ]),
+            metadata: HashMap::new(),
+        };
+
+        let snapshot = RowSnapshot::from_owned_fields(vec![(
+            "name".to_owned(),
+            InMemoryFieldValue::LinearString(crate::text::LinearString::with_value(
+                "hello".to_owned(),
+                1u32,
+            )),
+        )]);
+
+        validate_schema_snapshot(&schema, &snapshot).unwrap();
     }
 
     #[test]

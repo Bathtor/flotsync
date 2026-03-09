@@ -20,7 +20,7 @@ use flotsync_data_types::{
 };
 use protobuf::MessageField;
 use snafu::prelude::*;
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashSet};
 use uuid::Uuid;
 
 type OperationResult<T> = Result<T, OperationCodecError>;
@@ -160,8 +160,43 @@ fn decode_row_snapshot(
     snapshot: proto::RowSnapshot,
     schema: &Schema,
 ) -> OperationResult<model::RowSnapshot<'static, UpdateId>> {
+    let mut seen_fields = HashSet::<String>::new();
+    let mut decoded_fields = Vec::with_capacity(snapshot.fields.len());
+    for field in snapshot.fields {
+        let field_name = field.field_name.clone();
+        if !seen_fields.insert(field_name.clone()) {
+            return Err(OperationCodecError::InvalidSchemaOperation {
+                source: model::SchemaValueError::DuplicateField { field_name },
+            });
+        }
+        let Some(schema_field) = schema.columns.get(field_name.as_str()) else {
+            return Err(OperationCodecError::InvalidSchemaOperation {
+                source: model::SchemaValueError::UnknownField { field_name },
+            });
+        };
+        let field_value = decode_single_row_snapshot_field(field, schema_field)?;
+        decoded_fields.push((schema_field.name.clone(), field_value));
+    }
+
+    Ok(model::RowSnapshot::from_owned_fields(decoded_fields))
+}
+
+fn decode_single_row_snapshot_field(
+    field: proto::SnapshotField,
+    schema_field: &flotsync_data_types::schema::Field,
+) -> OperationResult<model::InMemoryFieldValue<UpdateId>> {
+    let single_field_schema = Schema::from_fields([schema_field.clone()]);
+    let mut snapshot = proto::RowSnapshot::new();
+    snapshot.fields.push(field);
+
     let mut decoder = ProtoSchemaSnapshotDecoder::new(snapshot).context(SnapshotAdapterSnafu)?;
-    model::RowSnapshot::decode_snapshot(schema, &mut decoder).context(SnapshotDecodeSnafu)
+    let decoded_snapshot = model::RowSnapshot::decode_snapshot(&single_field_schema, &mut decoder)
+        .context(SnapshotDecodeSnafu)?;
+    let mut fields = decoded_snapshot.into_owned_fields();
+    let (_, field_value) = fields
+        .pop()
+        .expect("single-field snapshot decoding must produce exactly one field");
+    Ok(field_value)
 }
 
 fn decode_insert_row_operation(

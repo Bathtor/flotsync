@@ -236,6 +236,91 @@ fn insert_row_requires_explicit_values_for_all_fields() {
 }
 
 #[test]
+fn insert_row_uses_schema_defaults_for_omitted_fields() {
+    let schema = Schema::from_fields([
+        Field::linear_string("title")
+            .with_default("untitled")
+            .unwrap(),
+        Field::linear_list("numbers", PrimitiveType::Int)
+            .with_default(vec![7i64, 9])
+            .unwrap(),
+        Field::monotonic_counter("counter")
+            .with_default(5u64)
+            .unwrap(),
+        Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending)
+            .with_default(11u64)
+            .unwrap(),
+    ]);
+    let mut data: InMemoryData<RowId, OperationId> =
+        InMemoryData::with_owned_schema(schema.clone());
+
+    let operation = data
+        .insert_row(
+            30,
+            4,
+            initial_values! {
+                schema["title"] => "provided",
+            },
+        )
+        .unwrap()
+        .into_owned();
+
+    let row = data.get_row(&4).expect("row should exist");
+    let title: Cow<'_, str> = schema["title"].get_value(&row).unwrap();
+    let numbers: Cow<'_, [i64]> = schema["numbers"].get_value(&row).unwrap();
+    let counter: Cow<'_, u64> = schema["counter"].get_value(&row).unwrap();
+    let priority: Cow<'_, u64> = schema["priority"].get_value(&row).unwrap();
+    assert_eq!(title.as_ref(), "provided");
+    assert_eq!(numbers.as_ref(), &[7, 9]);
+    assert_eq!(*counter, 5);
+    assert_eq!(*priority, 11);
+
+    let RowOperation::Insert { snapshot, .. } = operation.operation else {
+        panic!("insert operation must carry a row snapshot");
+    };
+    assert_eq!(snapshot.into_owned_fields().len(), schema.columns.len());
+}
+
+#[test]
+fn apply_insert_materializes_defaults_for_missing_fields() {
+    let old_schema = Schema::from_fields([Field::linear_string("title")]);
+    let new_schema = Schema::from_fields([
+        Field::linear_string("title"),
+        Field::linear_string("subtitle")
+            .with_default("default subtitle")
+            .unwrap(),
+        Field::linear_list("numbers", PrimitiveType::Int)
+            .with_default(vec![3i64, 4])
+            .unwrap(),
+    ]);
+
+    let mut source: InMemoryData<RowId, OperationId> =
+        InMemoryData::with_owned_schema(old_schema.clone());
+    let insert = source
+        .insert_row(
+            300,
+            12,
+            initial_values! {
+                old_schema["title"] => "legacy row",
+            },
+        )
+        .unwrap()
+        .into_owned();
+
+    let target = InMemoryData::with_owned_schema(new_schema.clone())
+        .apply_schema_operation(insert)
+        .unwrap();
+
+    let row = target.get_row(&12).expect("row should exist");
+    let title: Cow<'_, str> = new_schema["title"].get_value(&row).unwrap();
+    let subtitle: Cow<'_, str> = new_schema["subtitle"].get_value(&row).unwrap();
+    let numbers: Cow<'_, [i64]> = new_schema["numbers"].get_value(&row).unwrap();
+    assert_eq!(title.as_ref(), "legacy row");
+    assert_eq!(subtitle.as_ref(), "default subtitle");
+    assert_eq!(numbers.as_ref(), &[3, 4]);
+}
+
+#[test]
 fn apply_schema_operation_roundtrips_insert_update_delete() {
     let schema = &*TEST_SCHEMA;
     let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
