@@ -1027,6 +1027,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotsync_replication"
+version = "0.1.0"
+dependencies = [
+ "flotsync_core",
+ "flotsync_data_types",
+ "flotsync_utils",
+ "smallvec",
+ "snafu",
+ "uuid",
+]
+
+[[package]]
 name = "flotsync_utils"
 version = "0.1.0"
 dependencies = [

@@ -1,5 +1,5 @@
 [workspace]
-members = ["flotsync_core", "flotsync_messages", "flotsync_discovery", "flotsync_discovery_cli", "flotsync_data_types", "flotsync_utils"]
+members = ["flotsync_core", "flotsync_messages", "flotsync_discovery", "flotsync_discovery_cli", "flotsync_data_types", "flotsync_utils", "flotsync_replication"]
 resolver = "3"
 
 [workspace.dependencies]

@@ -1,8 +1,11 @@
-use std::fmt;
+use std::{fmt, future::Future, pin::Pin};
 
 pub mod debugging;
 pub mod err;
 pub mod testing;
+
+/// Heap-allocated, `Send` future used by dyn-friendly async APIs.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait OptionExt<T> {
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;

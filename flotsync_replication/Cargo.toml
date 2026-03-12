@@ -1,0 +1,12 @@
+[package]
+name = "flotsync_replication"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flotsync_core = { path = "../flotsync_core" }
+flotsync_data_types = { path = "../flotsync_data_types" }
+flotsync_utils = { path = "../flotsync_utils" }
+smallvec = "1"
+snafu = { workspace = true }
+uuid = { workspace = true }
