@@ -27,5 +27,5 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", default-features = false }
 zeroconf = { version = "0.15", optional = true }
 zeroconf-tokio = { version = "0.2", optional = true }
-kompact = { version = "0.11", optional = true }
+kompact = { workspace = true, optional = true }
 async-trait = { version = "0.1", optional = true }

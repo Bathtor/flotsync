@@ -1,0 +1,10 @@
+[package]
+name = "flotsync_io"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1"
+kompact = { workspace = true }
+mio = { version = "1", features = ["net", "os-poll"] }
+snafu = { workspace = true }

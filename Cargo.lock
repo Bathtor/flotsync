@@ -1013,6 +1013,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotsync_io"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "kompact",
+ "mio 1.0.4",
+ "snafu",
+]
+
+[[package]]
 name = "flotsync_messages"
 version = "0.1.0"
 dependencies = [
@@ -1619,6 +1629,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.59.0",
 ]
