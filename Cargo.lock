@@ -1017,8 +1017,12 @@ name = "flotsync_io"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crossbeam-channel",
+ "futures-channel",
  "kompact",
+ "log",
  "mio 1.0.4",
+ "simple_logger",
  "snafu",
 ]
 

@@ -23,7 +23,7 @@ pub mod prelude {
             UdpEvent,
             UdpPort,
         },
-        driver::{DriverCommand, DriverConfig, DriverEvent, DriverToken, IoDriver},
+        driver::{DriverCommand, DriverConfig, DriverEvent, DriverRequest, DriverToken, IoDriver},
         errors::{Error, Result},
         kompact::{IoBridge, IoDriverComponent},
     };

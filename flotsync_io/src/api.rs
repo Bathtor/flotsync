@@ -2,7 +2,7 @@
 
 use ::kompact::prelude::{ChunkLease, Port};
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr};
 
 /// Typed Kompact port for TCP-oriented freeform I/O.
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +49,21 @@ pub struct SocketId(pub usize);
 /// `KompactSystem` and must not be treated as a stable wire or persistence identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TransmissionId(pub usize);
+
+macro_rules! impl_local_id_display {
+    ($id_type:ident, $label:literal) => {
+        impl fmt::Display for $id_type {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!($label, "#{:x}"), self.0)
+            }
+        }
+    };
+}
+
+impl_local_id_display!(ListenerId, "listener");
+impl_local_id_display!(ConnectionId, "connection");
+impl_local_id_display!(SocketId, "socket");
+impl_local_id_display!(TransmissionId, "tx");
 
 /// Payload container for freeform I/O operations.
 ///
