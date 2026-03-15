@@ -11,6 +11,7 @@ use crate::{
         Result,
         SpawnDriverThreadSnafu,
     },
+    pool::{EgressPool, IngressPool, IoBufferConfig, IoBufferPools},
 };
 use mio::{Events, Poll, Token, Waker};
 use snafu::ResultExt;
@@ -41,6 +42,8 @@ pub type DriverToken = Token;
 pub struct DriverConfig {
     /// Human-readable thread name used for the dedicated driver thread.
     pub thread_name: Cow<'static, str>,
+    /// Shared ingress and egress pool configuration owned by this driver instance.
+    pub buffer_config: IoBufferConfig,
     /// Maximum number of readiness events buffered per `poll` call.
     pub events_capacity: usize,
     /// Optional timeout passed to `mio::Poll::poll`.
@@ -54,6 +57,7 @@ impl Default for DriverConfig {
     fn default() -> Self {
         Self {
             thread_name: Cow::Borrowed(DEFAULT_THREAD_NAME),
+            buffer_config: IoBufferConfig::default(),
             events_capacity: DEFAULT_EVENTS_CAPACITY,
             poll_timeout: None,
         }
@@ -116,6 +120,7 @@ impl<T> Future for DriverRequest<T> {
 /// Shared handle for the dedicated mio driver thread.
 pub struct IoDriver {
     config: DriverConfig,
+    buffers: IoBufferPools,
     command_tx: crossbeam_channel::Sender<ControlCommand>,
     event_rx: crossbeam_channel::Receiver<DriverEvent>,
     waker: Arc<Waker>,
@@ -139,6 +144,7 @@ impl IoDriver {
             config.thread_name
         );
 
+        let buffers = IoBufferPools::new(config.buffer_config.clone())?;
         let poll = Poll::new().context(CreateDriverPollSnafu)?;
         let waker = Waker::new(poll.registry(), WAKE_TOKEN).context(CreateDriverWakerSnafu)?;
         let shared_waker = Arc::new(waker);
@@ -163,6 +169,7 @@ impl IoDriver {
 
         Ok(Self {
             config,
+            buffers,
             command_tx,
             event_rx,
             waker: runtime_waker,
@@ -173,6 +180,21 @@ impl IoDriver {
     /// Returns the runtime configuration used by this driver instance.
     pub fn config(&self) -> &DriverConfig {
         &self.config
+    }
+
+    /// Returns the shared ingress and egress pool handles owned by this driver instance.
+    pub fn buffers(&self) -> &IoBufferPools {
+        &self.buffers
+    }
+
+    /// Returns the shared ingress pool handle owned by this driver instance.
+    pub fn ingress_pool(&self) -> IngressPool {
+        self.buffers.ingress()
+    }
+
+    /// Returns the shared egress pool handle owned by this driver instance.
+    pub fn egress_pool(&self) -> EgressPool {
+        self.buffers.egress()
     }
 
     /// Queues a listener-handle reservation on the driver thread.
@@ -871,21 +893,12 @@ impl From<&DriverCommand> for CommandTrace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{IoPayload, TransmissionId};
-    use bytes::Bytes;
-    use std::{
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        sync::OnceLock,
+    use crate::{
+        api::{IoPayload, TransmissionId},
+        test_support::init_test_logger,
     };
-
-    fn init_test_logger() {
-        static LOGGER: OnceLock<()> = OnceLock::new();
-        LOGGER.get_or_init(|| {
-            let _ = simple_logger::SimpleLogger::new()
-                .with_level(log::LevelFilter::Trace)
-                .init();
-        });
-    }
+    use bytes::Bytes;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))

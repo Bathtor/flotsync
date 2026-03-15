@@ -1,6 +1,7 @@
 //! Typed command and event surfaces shared between the driver core and Kompact bridges.
 
-use ::kompact::prelude::{ChunkLease, Port};
+use crate::pool::IoLease;
+use ::kompact::prelude::Port;
 use bytes::Bytes;
 use std::{fmt, net::SocketAddr};
 
@@ -67,26 +68,16 @@ impl_local_id_display!(TransmissionId, "tx");
 
 /// Payload container for freeform I/O operations.
 ///
-/// v1 keeps both a lease-backed fast path and an owned-bytes compatibility path.
-///
-/// Cloning a lease-backed payload materialises it into [`bytes::Bytes`] because
-/// [`ChunkLease`] itself is uniquely owned while Kompact port traffic must be cloneable.
-#[derive(Debug)]
+/// v1 keeps both a lease-backed fast path and an owned-bytes compatibility path. Lease-backed
+/// payloads share their underlying memory across clones and use independent read cursors when
+/// consumed.
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum IoPayload {
-    /// Uses a Kompact-managed pooled buffer lease for zero-copy or low-copy transport.
-    Lease(ChunkLease),
+    /// Uses an immutable lease-backed payload for low-copy transport.
+    Lease(IoLease),
     /// Uses owned byte storage for compatibility with callers outside the pool-based path.
     Bytes(Bytes),
-}
-
-impl Clone for IoPayload {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Lease(chunk) => Self::Bytes(chunk.create_byte_clone()),
-            Self::Bytes(bytes) => Self::Bytes(bytes.clone()),
-        }
-    }
 }
 
 /// Explains why a requested send could not be accepted or completed.
