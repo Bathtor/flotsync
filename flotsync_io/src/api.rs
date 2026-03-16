@@ -184,6 +184,12 @@ pub enum TcpEvent {
         connection_id: ConnectionId,
         peer_addr: SocketAddr,
     },
+    /// Reports that an outbound TCP connection attempt failed before the stream became usable.
+    ConnectFailed {
+        connection_id: ConnectionId,
+        remote_addr: SocketAddr,
+        error_kind: io::ErrorKind,
+    },
     /// Reports that a requested TCP listener is now bound and accepting connections.
     Listening {
         listener_id: ListenerId,

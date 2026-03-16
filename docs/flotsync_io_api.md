@@ -88,6 +88,7 @@ pub enum IoPayload {
 ## TCP v1
 
 - Outbound connect.
+- Explicit connect-failed event for outbound connects.
 - Listener bind/accept.
 - Read/write raw bytes.
 - Graceful close and abort semantics.

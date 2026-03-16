@@ -24,6 +24,12 @@ pub enum Error {
     #[snafu(display("failed to wake flotsync_io driver thread"))]
     DriverWake { source: std::io::Error },
 
+    #[snafu(display("failed to update mio interest for TCP connection {connection_id}"))]
+    UpdateTcpInterest {
+        connection_id: ConnectionId,
+        source: std::io::Error,
+    },
+
     #[snafu(display("flotsync_io driver command channel is closed"))]
     DriverCommandChannelClosed,
 

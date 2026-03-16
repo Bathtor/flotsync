@@ -7,10 +7,8 @@ use super::{
     thread::send_reply,
     udp::{UdpRuntimeState, emit_udp_event},
 };
-#[cfg(test)]
-use crate::api::TcpCommand;
 use crate::{
-    api::{ConnectionId, ListenerId, SocketId, UdpCommand},
+    api::{ConnectionId, ListenerId, SocketId, TcpCommand, UdpCommand},
     errors::Result,
 };
 use mio::Registry;
@@ -119,8 +117,12 @@ impl DriverRuntimeState {
         Ok(())
     }
 
-    pub(super) fn release_connection(&mut self, connection_id: ConnectionId) -> Result<()> {
-        let entry = self.tcp.release_connection(connection_id)?;
+    pub(super) fn release_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+    ) -> Result<()> {
+        let entry = self.tcp.release_connection(connection_id, registry)?;
         self.release_readiness(entry.token);
         Ok(())
     }
@@ -176,6 +178,39 @@ impl DriverRuntimeState {
             .resume_suspended_reads(registry, ingress_pool, event_tx)
     }
 
+    pub(super) fn handle_tcp_ready(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+        ingress_pool: &crate::pool::IngressPool,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        is_readable: bool,
+        is_writable: bool,
+    ) -> Result<()> {
+        let closed_record = self.tcp.handle_ready(
+            connection_id,
+            registry,
+            ingress_pool,
+            event_tx,
+            is_readable,
+            is_writable,
+        )?;
+        if let Some(record) = closed_record {
+            self.release_readiness(record.token);
+        }
+        Ok(())
+    }
+
+    pub(super) fn resume_suspended_tcp_reads(
+        &mut self,
+        registry: &Registry,
+        ingress_pool: &crate::pool::IngressPool,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        self.tcp
+            .resume_suspended_reads(registry, ingress_pool, event_tx)
+    }
+
     /// Returns `true` when command processing requested that the driver thread stop.
     pub(super) fn drain_commands(
         &mut self,
@@ -201,7 +236,55 @@ impl DriverRuntimeState {
                         .processed_commands
                         .push(CommandTrace::from(&command));
                     match command {
-                        DriverCommand::Tcp(command) => self.tcp.handle_command(command),
+                        DriverCommand::Tcp(command) => match command {
+                            TcpCommand::Connect {
+                                connection_id,
+                                remote_addr,
+                            } => {
+                                self.tcp.handle_connect(
+                                    connection_id,
+                                    remote_addr,
+                                    registry,
+                                    event_tx,
+                                )?;
+                            }
+                            TcpCommand::Listen { listener_id, .. } => {
+                                log::debug!(
+                                    "flotsync_io TCP listener support is not implemented yet; dropping listen command for {}",
+                                    listener_id
+                                );
+                            }
+                            TcpCommand::Send {
+                                connection_id,
+                                transmission_id,
+                                payload,
+                            } => {
+                                let closed_record = self.tcp.handle_send(
+                                    connection_id,
+                                    transmission_id,
+                                    payload,
+                                    registry,
+                                    event_tx,
+                                )?;
+                                if let Some(record) = closed_record {
+                                    self.release_readiness(record.token);
+                                }
+                            }
+                            TcpCommand::Close {
+                                connection_id,
+                                abort,
+                            } => {
+                                let closed_record = self.tcp.handle_close(
+                                    connection_id,
+                                    abort,
+                                    registry,
+                                    event_tx,
+                                )?;
+                                if let Some(record) = closed_record {
+                                    self.release_readiness(record.token);
+                                }
+                            }
+                        },
                         DriverCommand::Udp(command) => match command {
                             UdpCommand::Bind {
                                 socket_id,
@@ -277,7 +360,7 @@ impl DriverRuntimeState {
                     connection_id,
                     reply_tx,
                 } => {
-                    let result = self.release_connection(connection_id);
+                    let result = self.release_connection(connection_id, registry);
                     send_reply(reply_tx, result, "connection release");
                 }
                 ControlCommand::ReleaseSocket {

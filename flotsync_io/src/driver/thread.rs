@@ -37,7 +37,7 @@ pub(super) fn run_driver_thread(
         log::warn!("flotsync_io driver startup receiver was dropped before readiness signal");
     }
 
-    'poll_loop: loop {
+    loop {
         #[cfg(test)]
         {
             state.test_state.poll_iterations += 1;
@@ -58,11 +58,12 @@ pub(super) fn run_driver_thread(
                     &event_tx,
                     &mut udp_send_scratch,
                 )?;
-                state.resume_suspended_udp_reads(poll.registry(), &ingress_pool, &event_tx)?;
                 if should_stop {
                     log::info!("flotsync_io driver thread leaving poll loop");
-                    break 'poll_loop Ok(());
+                    return Ok(());
                 }
+                state.resume_suspended_udp_reads(poll.registry(), &ingress_pool, &event_tx)?;
+                state.resume_suspended_tcp_reads(poll.registry(), &ingress_pool, &event_tx)?;
                 continue 'event_loop;
             }
 
@@ -70,8 +71,18 @@ pub(super) fn run_driver_thread(
             let Some(key) = state.readiness_key(event.token()) else {
                 continue 'event_loop;
             };
-            if event.is_readable() {
-                if let ResourceKey::Socket(socket_id) = key {
+            match key {
+                ResourceKey::Connection(connection_id) => {
+                    state.handle_tcp_ready(
+                        connection_id,
+                        poll.registry(),
+                        &ingress_pool,
+                        &event_tx,
+                        event.is_readable(),
+                        event.is_writable(),
+                    )?;
+                }
+                ResourceKey::Socket(socket_id) if event.is_readable() => {
                     state.handle_udp_readable(
                         socket_id,
                         poll.registry(),
@@ -79,6 +90,7 @@ pub(super) fn run_driver_thread(
                         &event_tx,
                     )?;
                 }
+                ResourceKey::Listener(_) | ResourceKey::Socket(_) => {}
             }
         }
     }
