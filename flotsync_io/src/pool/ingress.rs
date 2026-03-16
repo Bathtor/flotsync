@@ -4,7 +4,7 @@ use super::{
     IoPoolConfig,
     LeaseRecycler,
     LeaseSegment,
-    PoolRequest,
+    PoolAvailabilityNotifier,
     PooledChunk,
 };
 use crate::errors::{Error, Result};
@@ -18,10 +18,13 @@ pub struct IngressPool {
 }
 
 impl IngressPool {
-    pub(super) fn new(config: IoPoolConfig) -> Self {
+    pub(super) fn new(
+        config: IoPoolConfig,
+        availability_notifier: PoolAvailabilityNotifier,
+    ) -> Self {
         let state = IngressPoolState {
             chunks: ChunkPoolState::new(config.clone()),
-            waiters: Vec::new(),
+            availability_notifier,
         };
         Self {
             config,
@@ -44,35 +47,14 @@ impl IngressPool {
         }))
     }
 
-    /// Returns a request that resolves once ingress capacity may be available again.
-    pub fn wait_for_available(&self) -> Result<PoolRequest<()>> {
-        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
-        let mut reply_tx = Some(reply_tx);
-        let send_now = {
-            let mut state = self.lock_state()?;
-            if state.has_available_chunk() {
-                true
-            } else {
-                state
-                    .waiters
-                    .push(reply_tx.take().expect("reply sender already taken"));
-                false
-            }
-        };
-
-        if send_now {
-            let _ = reply_tx
-                .take()
-                .expect("reply sender missing for immediate wake")
-                .send(Ok(()));
-        }
-
-        Ok(PoolRequest::new(reply_rx))
-    }
-
     /// Returns the configuration used by this pool.
     pub fn config(&self) -> IoPoolConfig {
         self.config.clone()
+    }
+
+    pub(crate) fn has_available_capacity(&self) -> Result<bool> {
+        let state = self.lock_state()?;
+        Ok(state.has_available_chunk())
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, IngressPoolState>> {
@@ -84,24 +66,28 @@ impl IngressPool {
 
 /// Internal ingress-side state guarded by [`IngressPool::inner`].
 ///
-/// `waiters` holds tasks that want a notification when at least one chunk becomes available again.
+/// `availability_notifier` wakes the owning driver when ingress capacity transitions from
+/// exhausted back to available.
 #[derive(Debug)]
 pub(super) struct IngressPoolState {
     pub(super) chunks: ChunkPoolState,
-    waiters: Vec<futures_channel::oneshot::Sender<Result<()>>>,
+    availability_notifier: PoolAvailabilityNotifier,
 }
 
 impl IngressPoolState {
+    /// Returns whether one chunk can currently be reserved without allocating beyond the limit.
     fn has_available_chunk(&self) -> bool {
         self.chunks.can_reserve_chunks(1)
     }
 
-    fn return_chunks(
-        &mut self,
-        chunks: Vec<PooledChunk>,
-    ) -> Vec<futures_channel::oneshot::Sender<Result<()>>> {
+    /// Returns `true` when this return operation transitions the pool from exhausted to available.
+    ///
+    /// The caller must notify `availability_notifier` after dropping the mutex if this returns
+    /// `true`.
+    fn return_chunks(&mut self, chunks: Vec<PooledChunk>) -> bool {
+        let had_available_capacity = self.has_available_chunk();
         self.chunks.return_chunks(chunks);
-        std::mem::take(&mut self.waiters)
+        !had_available_capacity && self.has_available_chunk()
     }
 
     pub(super) fn return_chunks_from_weak(inner: &Weak<Mutex<Self>>, chunks: Vec<PooledChunk>) {
@@ -109,17 +95,20 @@ impl IngressPoolState {
             return;
         };
 
-        let waiters = match inner.lock() {
-            Ok(mut state) => state.return_chunks(chunks),
+        match inner.lock() {
+            Ok(mut state) => {
+                let should_notify = state.return_chunks(chunks);
+                if should_notify {
+                    let notifier = state.availability_notifier.clone();
+                    // Drop the lock before notifying listeners to avoid immediate contention.
+                    drop(state);
+                    notifier.notify();
+                }
+            }
             Err(_) => {
                 log::error!("ingress pool state is poisoned; dropping returned chunks");
-                return;
             }
         };
-
-        for waiter in waiters {
-            let _ = waiter.send(Ok(()));
-        }
     }
 }
 

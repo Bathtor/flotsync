@@ -50,6 +50,8 @@ bd update bd-42 --priority 1 --json
 bd close bd-42 --reason "Completed" --json
 ```
 
+_Note:_ Do _not_ close issues until I have reviewed the changes made and agreed that the issue is indeed completed. Ask if uncertain.
+
 ### Issue Types
 
 - `bug` - Something broken

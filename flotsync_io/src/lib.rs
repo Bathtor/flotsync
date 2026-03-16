@@ -16,6 +16,7 @@ pub mod prelude {
             ConnectionId,
             IoPayload,
             ListenerId,
+            MAX_UDP_PAYLOAD_BYTES,
             SendFailureReason,
             SocketId,
             TcpCommand,

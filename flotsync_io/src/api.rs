@@ -3,7 +3,7 @@
 use crate::pool::IoLease;
 use ::kompact::prelude::Port;
 use bytes::Bytes;
-use std::{fmt, net::SocketAddr};
+use std::{fmt, io, net::SocketAddr};
 
 /// Typed Kompact port for TCP-oriented freeform I/O.
 #[derive(Clone, Copy, Debug)]
@@ -66,6 +66,12 @@ impl_local_id_display!(ConnectionId, "connection");
 impl_local_id_display!(SocketId, "socket");
 impl_local_id_display!(TransmissionId, "tx");
 
+/// Conservative UDP payload budget used by the current driver and default pool sizing.
+///
+/// `1472` bytes fits within a typical Ethernet MTU of `1500` without IPv4 fragmentation
+/// (`1500 - 20 byte IPv4 header - 8 byte UDP header`).
+pub const MAX_UDP_PAYLOAD_BYTES: usize = 1472;
+
 /// Payload container for freeform I/O operations.
 ///
 /// v1 keeps both a lease-backed fast path and an owned-bytes compatibility path. Lease-backed
@@ -80,6 +86,21 @@ pub enum IoPayload {
     Bytes(Bytes),
 }
 
+impl IoPayload {
+    /// Returns the total readable payload length in bytes.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Lease(lease) => lease.len(),
+            Self::Bytes(bytes) => bytes.len(),
+        }
+    }
+
+    /// Returns whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Explains why a requested send could not be accepted or completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -88,8 +109,31 @@ pub enum SendFailureReason {
     Backpressure,
     /// The target socket or connection was already closed when the send was processed.
     Closed,
+    /// The target socket or connection is not in a state where the requested send is valid.
+    InvalidState,
+    /// An unconnected UDP socket was asked to send without an explicit datagram target.
+    MissingTargetForUnconnectedSocket,
+    /// A connected UDP socket was asked to send with an explicit datagram target.
+    UnexpectedTargetForConnectedSocket,
+    /// The payload exceeds the maximum datagram size currently supported by the transport path.
+    MessageTooLarge,
+    /// The operating system rejected the send for a transport-specific reason other than closure.
+    IoError,
     /// The shared driver was unavailable, for example during startup failure or shutdown.
     DriverUnavailable,
+}
+
+impl From<&io::Error> for SendFailureReason {
+    fn from(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::WouldBlock => Self::Backpressure,
+            io::ErrorKind::NotConnected => Self::InvalidState,
+            io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset => Self::Closed,
+            _ => Self::IoError,
+        }
+    }
 }
 
 /// Explains why a transport endpoint transitioned into a closed state.
@@ -187,6 +231,13 @@ pub enum UdpCommand {
         socket_id: SocketId,
         local_addr: SocketAddr,
     },
+    /// Creates a connected UDP socket, optionally binding it first, and associates it with the
+    /// provided local socket handle.
+    Connect {
+        socket_id: SocketId,
+        remote_addr: SocketAddr,
+        local_addr: Option<SocketAddr>,
+    },
     /// Requests transmission of a UDP datagram, optionally to an explicit target for unconnected sockets.
     Send {
         socket_id: SocketId,
@@ -206,6 +257,25 @@ pub enum UdpEvent {
     Bound {
         socket_id: SocketId,
         local_addr: SocketAddr,
+    },
+    /// Reports that a requested UDP socket bind failed before the socket became usable.
+    BindFailed {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        error_kind: io::ErrorKind,
+    },
+    /// Reports that a requested UDP socket connect completed successfully.
+    Connected {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    },
+    /// Reports that a requested UDP socket connect failed before the socket became usable.
+    ConnectFailed {
+        socket_id: SocketId,
+        local_addr: Option<SocketAddr>,
+        remote_addr: SocketAddr,
+        error_kind: io::ErrorKind,
     },
     /// Delivers an inbound UDP datagram together with its source address.
     Received {

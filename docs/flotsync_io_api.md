@@ -52,10 +52,13 @@ pub struct TransmissionId(pub usize);
 
 ```rust
 pub enum IoPayload {
-    Lease(ChunkLease),
+    Lease(IoLease),
     Bytes(bytes::Bytes), // compatibility/edge path
 }
 ```
+
+- `IoLease` is an immutable, cloneable shared payload handle.
+- Reading is done via a separate `IoCursor`, so the same payload can be replayed many times.
 
 ## Backpressure Semantics
 
@@ -77,8 +80,10 @@ pub enum IoPayload {
 
 - Bind/unbind.
 - Connected and unconnected send/receive.
+- Explicit connected-mode command/event path, not just `Send { target: None }`.
 - Broadcast.
 - Multicast join/leave (+ interface/ttl/loop controls).
+- Datagram size is currently bounded by the configured pool chunk size.
 
 ## TCP v1
 

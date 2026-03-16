@@ -13,7 +13,10 @@
 //! Reading is modeled separately through [`IoCursor`]. An `IoLease` is immutable and cheaply
 //! cloneable, while each `IoCursor` tracks one consumer's read progress independently.
 
-use crate::errors::{Error, Result};
+use crate::{
+    api::MAX_UDP_PAYLOAD_BYTES,
+    errors::{Error, Result},
+};
 use ::kompact::prelude::{ChunkLease, ChunkRef};
 use bytes::{Buf, Bytes};
 use std::{
@@ -94,9 +97,9 @@ impl IoPoolConfig {
 impl Default for IoPoolConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 128 * 1024,
-            initial_chunk_count: 2,
-            max_chunk_count: 1024,
+            chunk_size: MAX_UDP_PAYLOAD_BYTES,
+            initial_chunk_count: 100,
+            max_chunk_count: 100_000,
             encode_buf_min_free_space: 64,
         }
     }
@@ -131,9 +134,19 @@ pub struct IoBufferPools {
 impl IoBufferPools {
     /// Creates the shared ingress and egress pools.
     pub fn new(config: IoBufferConfig) -> Result<Self> {
+        let ingress_notifier = PoolAvailabilityNotifier::new(|| {});
+        Self::new_with_ingress_notifier(config, ingress_notifier)
+    }
+
+    /// Creates the shared ingress and egress pools, wiring a driver wakeup callback into the
+    /// ingress side for exhausted -> available transitions.
+    pub(crate) fn new_with_ingress_notifier(
+        config: IoBufferConfig,
+        ingress_notifier: PoolAvailabilityNotifier,
+    ) -> Result<Self> {
         config.validate()?;
 
-        let ingress = IngressPool::new(config.ingress.clone());
+        let ingress = IngressPool::new(config.ingress.clone(), ingress_notifier);
         let egress = EgressPool::new(config.egress.clone());
 
         Ok(Self {
@@ -189,6 +202,33 @@ impl<T> Future for PoolRequest<T> {
             TaskPoll::Ready(Err(_)) => TaskPoll::Ready(Err(Error::IoBufferRequestChannelClosed)),
             TaskPoll::Pending => TaskPoll::Pending,
         }
+    }
+}
+
+/// Driver-internal callback invoked when a pool transitions from exhausted to available again.
+///
+/// The current use-site is ingress read resumption: a dropped lease can return capacity from any
+/// thread, so the driver needs an out-of-band wakeup that does not rely on further socket traffic.
+#[derive(Clone)]
+pub(crate) struct PoolAvailabilityNotifier {
+    callback: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+impl PoolAvailabilityNotifier {
+    pub(crate) fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Arc::new(callback),
+        }
+    }
+
+    fn notify(&self) {
+        (self.callback)();
+    }
+}
+
+impl fmt::Debug for PoolAvailabilityNotifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PoolAvailabilityNotifier(..)")
     }
 }
 
@@ -501,6 +541,7 @@ impl ChunkPoolState {
         }
     }
 
+    /// Returns whether the pool can currently satisfy `chunk_count` chunk reservations.
     fn can_reserve_chunks(&self, chunk_count: usize) -> bool {
         let free_chunks = self.available.len();
         let allocatable_chunks = self.config.max_chunk_count - self.allocated;
@@ -565,14 +606,21 @@ mod tests {
     }
 
     #[test]
-    fn ingress_waiter_resolves_after_last_shared_lease_drop() {
+    fn ingress_notifier_fires_after_last_shared_lease_drop() {
         init_test_logger();
+        let notifications = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notifications_clone = std::sync::Arc::clone(&notifications);
 
         let config = IoPoolConfig {
             max_chunk_count: 1,
             ..tiny_config()
         };
-        let pool = IngressPool::new(config);
+        let pool = IngressPool::new(
+            config,
+            PoolAvailabilityNotifier::new(move || {
+                notifications_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }),
+        );
         let mut buffer = pool
             .try_acquire()
             .expect("ingress pool lock")
@@ -581,17 +629,14 @@ mod tests {
         let lease = buffer.commit(4).expect("commit ingress buffer");
         let lease_clone = lease.clone();
 
-        let mut waiter = pool
-            .wait_for_available()
-            .expect("wait for ingress capacity");
-        assert!(waiter.try_receive().expect("waiter pending").is_none());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         drop(lease);
-        assert!(waiter.try_receive().expect("still pending").is_none());
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         drop(lease_clone);
 
-        wait_for_request(waiter).expect("waiter resolves after last shared lease drops");
+        assert_eq!(notifications.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -602,7 +647,7 @@ mod tests {
             max_chunk_count: 1,
             ..tiny_config()
         };
-        let pool = IngressPool::new(config);
+        let pool = IngressPool::new(config, PoolAvailabilityNotifier::new(|| {}));
 
         let mut buffer = pool
             .try_acquire()

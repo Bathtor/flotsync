@@ -1,7 +1,18 @@
 //! Single-threaded mio driver core and control plane.
 
 use crate::{
-    api::{ConnectionId, ListenerId, SocketId, TcpCommand, TcpEvent, UdpCommand, UdpEvent},
+    api::{
+        ConnectionId,
+        IoPayload,
+        ListenerId,
+        MAX_UDP_PAYLOAD_BYTES,
+        SendFailureReason,
+        SocketId,
+        TcpCommand,
+        TcpEvent,
+        UdpCommand,
+        UdpEvent,
+    },
     errors::{
         CreateDriverPollSnafu,
         CreateDriverWakerSnafu,
@@ -11,14 +22,19 @@ use crate::{
         Result,
         SpawnDriverThreadSnafu,
     },
-    pool::{EgressPool, IngressPool, IoBufferConfig, IoBufferPools},
+    pool::{EgressPool, IngressPool, IoBufferConfig, IoBufferPools, PoolAvailabilityNotifier},
 };
-use mio::{Events, Poll, Token, Waker};
+use bytes::Buf;
+use flotsync_utils::option_when;
+use mio::{Events, Interest, Poll, Registry, Token, Waker, net::UdpSocket as MioUdpSocket};
 use snafu::ResultExt;
 use std::{
     borrow::Cow,
     fmt,
     future::Future,
+    io,
+    io::ErrorKind,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll as TaskPoll},
@@ -144,11 +160,24 @@ impl IoDriver {
             config.thread_name
         );
 
-        let buffers = IoBufferPools::new(config.buffer_config.clone())?;
         let poll = Poll::new().context(CreateDriverPollSnafu)?;
         let waker = Waker::new(poll.registry(), WAKE_TOKEN).context(CreateDriverWakerSnafu)?;
         let shared_waker = Arc::new(waker);
         let runtime_waker = Arc::clone(&shared_waker);
+        let notifier_waker = Arc::clone(&shared_waker);
+        let buffers = IoBufferPools::new_with_ingress_notifier(
+            config.buffer_config.clone(),
+            PoolAvailabilityNotifier::new(move || {
+                let wake_result = notifier_waker.wake();
+                if let Err(error) = wake_result {
+                    log::error!(
+                        "failed to wake flotsync_io driver thread after ingress capacity returned: {}",
+                        error
+                    );
+                }
+            }),
+        )?;
+        let runner_ingress_pool = buffers.ingress();
 
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -157,7 +186,16 @@ impl IoDriver {
         let thread_config = DriverThreadConfig::from(&config);
         let builder = thread::Builder::new().name(config.thread_name.to_string());
         let handle = builder
-            .spawn(move || run_driver_thread(thread_config, poll, command_rx, event_tx, startup_tx))
+            .spawn(move || {
+                run_driver_thread(
+                    thread_config,
+                    poll,
+                    command_rx,
+                    event_tx,
+                    startup_tx,
+                    runner_ingress_pool,
+                )
+            })
             .context(SpawnDriverThreadSnafu)?;
 
         let startup = startup_rx
@@ -452,6 +490,34 @@ impl ResourceRecord {
     }
 }
 
+#[derive(Debug)]
+struct UdpSocketEntry {
+    record: ResourceRecord,
+    socket: Option<MioUdpSocket>,
+    local_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
+    read_suspended: bool,
+    registered: bool,
+}
+
+impl UdpSocketEntry {
+    fn new(record: ResourceRecord) -> Self {
+        Self {
+            record,
+            socket: None,
+            local_addr: None,
+            remote_addr: None,
+            read_suspended: false,
+            registered: false,
+        }
+    }
+
+    /// Returns whether this entry currently owns a live OS UDP socket handle.
+    fn is_open(&self) -> bool {
+        self.socket.is_some()
+    }
+}
+
 /// Dense slot registry backed by a vector plus a LIFO free-list.
 ///
 /// Released slots are pushed onto `free` and reused from the top, so this behaves like a stack of
@@ -534,12 +600,10 @@ impl<T> SlotRegistry<T> {
 struct DriverRuntimeState {
     listeners: SlotRegistry<ResourceRecord>,
     connections: SlotRegistry<ResourceRecord>,
-    sockets: SlotRegistry<ResourceRecord>,
+    sockets: SlotRegistry<UdpSocketEntry>,
     readiness_keys: SlotRegistry<ResourceKey>,
-    wakeup_count: usize,
-    poll_iterations: usize,
     #[cfg(test)]
-    processed_commands: Vec<CommandTrace>,
+    test_state: DriverTestState,
 }
 
 impl DriverRuntimeState {
@@ -562,7 +626,9 @@ impl DriverRuntimeState {
     fn reserve_socket(&mut self) -> SocketId {
         let socket_id = SocketId(self.sockets.next_slot());
         let token = self.reserve_readiness(ResourceKey::Socket(socket_id));
-        let slot = self.sockets.reserve(ResourceRecord::new(token));
+        let slot = self
+            .sockets
+            .reserve(UdpSocketEntry::new(ResourceRecord::new(token)));
         debug_assert_eq!(slot, socket_id.0);
         socket_id
     }
@@ -585,16 +651,28 @@ impl DriverRuntimeState {
         Ok(())
     }
 
-    fn release_socket(&mut self, socket_id: SocketId) -> Result<()> {
+    fn release_socket(&mut self, socket_id: SocketId, registry: &Registry) -> Result<()> {
         let entry = self
             .sockets
             .remove(socket_id.0)
             .ok_or(Error::UnknownSocket { socket_id })?;
-        self.release_readiness(entry.token);
+        if let Some(mut socket) = entry.socket {
+            if entry.registered {
+                let deregister_result = registry.deregister(&mut socket);
+                if let Err(error) = deregister_result {
+                    log::warn!(
+                        "failed to deregister UDP socket {} during release: {}",
+                        socket_id,
+                        error
+                    );
+                }
+            }
+        }
+        self.release_readiness(entry.record.token);
         Ok(())
     }
 
-    fn handle_ready(&mut self, token: DriverToken) {
+    fn record_ready_hit(&mut self, token: DriverToken) {
         let Some(key) = self.readiness_key(token) else {
             log::warn!(
                 "received readiness for unknown flotsync_io token {}",
@@ -616,15 +694,483 @@ impl DriverRuntimeState {
             }
             ResourceKey::Socket(socket_id) => {
                 if let Some(entry) = self.sockets.get_mut(socket_id.0) {
-                    entry.readiness_hits += 1;
+                    entry.record.readiness_hits += 1;
                 }
             }
         }
     }
 
+    fn handle_udp_bind(
+        &mut self,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        registry: &Registry,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::BindFailed {
+                    socket_id,
+                    local_addr,
+                    error_kind: ErrorKind::NotFound,
+                },
+            );
+        };
+
+        if entry.is_open() {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::BindFailed {
+                    socket_id,
+                    local_addr,
+                    error_kind: ErrorKind::AlreadyExists,
+                },
+            );
+        }
+
+        let mut socket = match bind_udp_socket(local_addr) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return emit_udp_event(
+                    event_tx,
+                    UdpEvent::BindFailed {
+                        socket_id,
+                        local_addr,
+                        error_kind: error.kind(),
+                    },
+                );
+            }
+        };
+
+        let register_result =
+            registry.register(&mut socket, entry.record.token, Interest::READABLE);
+        if let Err(error) = register_result {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::BindFailed {
+                    socket_id,
+                    local_addr,
+                    error_kind: error.kind(),
+                },
+            );
+        }
+
+        let actual_local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                log::warn!(
+                    "failed to query local address for UDP socket {} after bind: {}",
+                    socket_id,
+                    error
+                );
+                local_addr
+            }
+        };
+
+        entry.socket = Some(socket);
+        entry.local_addr = Some(actual_local_addr);
+        entry.remote_addr = None;
+        entry.read_suspended = false;
+        entry.registered = true;
+
+        emit_udp_event(
+            event_tx,
+            UdpEvent::Bound {
+                socket_id,
+                local_addr: actual_local_addr,
+            },
+        )
+    }
+
+    fn handle_udp_connect(
+        &mut self,
+        socket_id: SocketId,
+        remote_addr: SocketAddr,
+        local_addr: Option<SocketAddr>,
+        registry: &Registry,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::ConnectFailed {
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                    error_kind: ErrorKind::NotFound,
+                },
+            );
+        };
+
+        if entry.is_open() {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::ConnectFailed {
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                    error_kind: ErrorKind::AlreadyExists,
+                },
+            );
+        }
+
+        let bind_addr = local_addr.unwrap_or_else(|| default_udp_bind_addr(remote_addr));
+        let mut socket = match bind_udp_socket(bind_addr) {
+            Ok(socket) => socket,
+            Err(error) => {
+                return emit_udp_event(
+                    event_tx,
+                    UdpEvent::ConnectFailed {
+                        socket_id,
+                        local_addr,
+                        remote_addr,
+                        error_kind: error.kind(),
+                    },
+                );
+            }
+        };
+
+        let connect_result = socket.connect(remote_addr);
+        if let Err(error) = connect_result {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::ConnectFailed {
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                    error_kind: error.kind(),
+                },
+            );
+        }
+
+        let register_result =
+            registry.register(&mut socket, entry.record.token, Interest::READABLE);
+        if let Err(error) = register_result {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::ConnectFailed {
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                    error_kind: error.kind(),
+                },
+            );
+        }
+
+        let actual_local_addr = match socket.local_addr() {
+            Ok(addr) => addr,
+            Err(error) => {
+                log::warn!(
+                    "failed to query local address for connected UDP socket {}: {}",
+                    socket_id,
+                    error
+                );
+                bind_addr
+            }
+        };
+
+        entry.socket = Some(socket);
+        entry.local_addr = Some(actual_local_addr);
+        entry.remote_addr = Some(remote_addr);
+        entry.read_suspended = false;
+        entry.registered = true;
+
+        emit_udp_event(
+            event_tx,
+            UdpEvent::Connected {
+                socket_id,
+                local_addr: actual_local_addr,
+                remote_addr,
+            },
+        )
+    }
+
+    fn handle_udp_send(
+        &mut self,
+        socket_id: SocketId,
+        transmission_id: crate::api::TransmissionId,
+        payload: IoPayload,
+        target: Option<SocketAddr>,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        udp_send_scratch: &mut [u8],
+    ) -> Result<()> {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::SendNack {
+                    transmission_id,
+                    reason: SendFailureReason::Closed,
+                },
+            );
+        };
+
+        if !entry.is_open() {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::SendNack {
+                    transmission_id,
+                    reason: SendFailureReason::InvalidState,
+                },
+            );
+        }
+
+        let send_target = match (entry.remote_addr, target) {
+            (Some(_), Some(_)) => {
+                return emit_udp_event(
+                    event_tx,
+                    UdpEvent::SendNack {
+                        transmission_id,
+                        reason: SendFailureReason::UnexpectedTargetForConnectedSocket,
+                    },
+                );
+            }
+            (Some(_), None) => UdpSendTarget::Connected,
+            (None, Some(target)) => UdpSendTarget::Unconnected(target),
+            (None, None) => {
+                return emit_udp_event(
+                    event_tx,
+                    UdpEvent::SendNack {
+                        transmission_id,
+                        reason: SendFailureReason::MissingTargetForUnconnectedSocket,
+                    },
+                );
+            }
+        };
+
+        let payload_len = payload.len();
+        if payload_len > MAX_UDP_PAYLOAD_BYTES {
+            return emit_udp_event(
+                event_tx,
+                UdpEvent::SendNack {
+                    transmission_id,
+                    reason: SendFailureReason::MessageTooLarge,
+                },
+            );
+        }
+
+        let send_result = {
+            let socket = entry
+                .socket
+                .as_mut()
+                .expect("open UDP socket missing handle");
+            send_udp_payload(socket, payload, send_target, udp_send_scratch)
+        };
+        match send_result {
+            Ok(bytes_sent) if bytes_sent == payload_len => {
+                emit_udp_event(event_tx, UdpEvent::SendAck { transmission_id })
+            }
+            Ok(bytes_sent) => {
+                log::error!(
+                    "UDP socket {} sent {} of {} requested bytes for transmission {}",
+                    socket_id,
+                    bytes_sent,
+                    payload_len,
+                    transmission_id
+                );
+                emit_udp_event(
+                    event_tx,
+                    UdpEvent::SendNack {
+                        transmission_id,
+                        reason: SendFailureReason::IoError,
+                    },
+                )
+            }
+            Err(error) => emit_udp_event(
+                event_tx,
+                UdpEvent::SendNack {
+                    transmission_id,
+                    reason: SendFailureReason::from(&error),
+                },
+            ),
+        }
+    }
+
+    fn handle_udp_close(
+        &mut self,
+        socket_id: SocketId,
+        registry: &Registry,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        if self.release_socket(socket_id, registry).is_err() {
+            log::warn!("ignored UDP close for unknown socket {}", socket_id);
+            return Ok(());
+        }
+
+        emit_udp_event(event_tx, UdpEvent::Closed { socket_id })
+    }
+
+    fn handle_udp_readable(
+        &mut self,
+        socket_id: SocketId,
+        registry: &Registry,
+        ingress_pool: &IngressPool,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        loop {
+            let mut ingress_buffer = match ingress_pool.try_acquire()? {
+                Some(buffer) => buffer,
+                None => {
+                    let suspended = self.suspend_udp_read(socket_id, registry);
+                    if suspended {
+                        emit_udp_event(event_tx, UdpEvent::ReadSuspended { socket_id })?;
+                    }
+                    return Ok(());
+                }
+            };
+
+            let recv_result = {
+                let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+                    log::debug!(
+                        "ignoring stale UDP readability for unknown socket {}",
+                        socket_id
+                    );
+                    return Ok(());
+                };
+                let Some(socket) = entry.socket.as_mut() else {
+                    log::debug!(
+                        "ignoring stale UDP readability for socket {} without OS handle",
+                        socket_id
+                    );
+                    return Ok(());
+                };
+                if let Some(remote_addr) = entry.remote_addr {
+                    let recv_result = socket.recv(ingress_buffer.writable());
+                    recv_result.map(|bytes_read| (bytes_read, remote_addr))
+                } else {
+                    socket.recv_from(ingress_buffer.writable())
+                }
+            };
+
+            match recv_result {
+                Ok((0, source)) => {
+                    drop(ingress_buffer);
+                    emit_udp_event(
+                        event_tx,
+                        UdpEvent::Received {
+                            socket_id,
+                            source,
+                            payload: IoPayload::Bytes(bytes::Bytes::new()),
+                        },
+                    )?;
+                }
+                Ok((bytes_read, source)) => {
+                    let lease = ingress_buffer.commit(bytes_read)?;
+                    emit_udp_event(
+                        event_tx,
+                        UdpEvent::Received {
+                            socket_id,
+                            source,
+                            payload: IoPayload::Lease(lease),
+                        },
+                    )?;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    return Ok(());
+                }
+                Err(error) => {
+                    log::error!("UDP socket {} recv failed: {}", socket_id, error);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Returns `true` when the socket transitioned from readable to driver-suspended.
+    fn suspend_udp_read(&mut self, socket_id: SocketId, registry: &Registry) -> bool {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            return false;
+        };
+        if entry.read_suspended || !entry.registered {
+            return false;
+        }
+
+        let Some(socket) = entry.socket.as_mut() else {
+            return false;
+        };
+
+        let deregister_result = registry.deregister(socket);
+        if let Err(error) = deregister_result {
+            log::error!(
+                "failed to suspend UDP socket {} by deregistering it: {}",
+                socket_id,
+                error
+            );
+            return false;
+        }
+
+        entry.read_suspended = true;
+        entry.registered = false;
+        true
+    }
+
+    fn resume_suspended_udp_reads(
+        &mut self,
+        registry: &Registry,
+        ingress_pool: &IngressPool,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    ) -> Result<()> {
+        if !ingress_pool.has_available_capacity()? {
+            return Ok(());
+        }
+
+        let suspended_sockets: Vec<SocketId> = self
+            .sockets
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry_opt)| {
+                entry_opt.as_ref().and_then(|entry| {
+                    option_when!(entry.read_suspended && entry.is_open(), SocketId(slot))
+                })
+            })
+            .collect();
+
+        for socket_id in suspended_sockets {
+            let resumed = self.resume_udp_read(socket_id, registry);
+            if resumed {
+                emit_udp_event(event_tx, UdpEvent::ReadResumed { socket_id })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Returns `true` when the socket transitioned from driver-suspended back to readable.
+    fn resume_udp_read(&mut self, socket_id: SocketId, registry: &Registry) -> bool {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            return false;
+        };
+        if !entry.read_suspended {
+            return false;
+        }
+
+        let Some(socket) = entry.socket.as_mut() else {
+            return false;
+        };
+
+        let register_result = registry.register(socket, entry.record.token, Interest::READABLE);
+        if let Err(error) = register_result {
+            log::error!(
+                "failed to resume UDP socket {} by re-registering it: {}",
+                socket_id,
+                error
+            );
+            return false;
+        }
+
+        entry.read_suspended = false;
+        entry.registered = true;
+        true
+    }
+
+    /// Returns `true` when command processing requested that the driver thread stop.
     fn drain_commands(
         &mut self,
         command_rx: &crossbeam_channel::Receiver<ControlCommand>,
+        registry: &Registry,
+        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        udp_send_scratch: &mut [u8],
     ) -> Result<bool> {
         loop {
             let control = match command_rx.try_recv() {
@@ -639,9 +1185,56 @@ impl DriverRuntimeState {
             match control {
                 ControlCommand::Dispatch(command) => {
                     #[cfg(test)]
-                    self.processed_commands.push(CommandTrace::from(&command));
-                    #[cfg(not(test))]
-                    let _ = command;
+                    self.test_state
+                        .processed_commands
+                        .push(CommandTrace::from(&command));
+                    match command {
+                        DriverCommand::Tcp(command) => {
+                            log::debug!(
+                                "UDP core does not yet implement TCP command {:?}",
+                                command
+                            );
+                        }
+                        DriverCommand::Udp(command) => match command {
+                            UdpCommand::Bind {
+                                socket_id,
+                                local_addr,
+                            } => {
+                                self.handle_udp_bind(socket_id, local_addr, registry, event_tx)?;
+                            }
+                            UdpCommand::Connect {
+                                socket_id,
+                                remote_addr,
+                                local_addr,
+                            } => {
+                                self.handle_udp_connect(
+                                    socket_id,
+                                    remote_addr,
+                                    local_addr,
+                                    registry,
+                                    event_tx,
+                                )?;
+                            }
+                            UdpCommand::Send {
+                                socket_id,
+                                transmission_id,
+                                payload,
+                                target,
+                            } => {
+                                self.handle_udp_send(
+                                    socket_id,
+                                    transmission_id,
+                                    payload,
+                                    target,
+                                    event_tx,
+                                    udp_send_scratch,
+                                )?;
+                            }
+                            UdpCommand::Close { socket_id } => {
+                                self.handle_udp_close(socket_id, registry, event_tx)?;
+                            }
+                        },
+                    }
                 }
                 ControlCommand::ReserveListener { reply_tx } => {
                     let listener_id = self.reserve_listener();
@@ -673,7 +1266,7 @@ impl DriverRuntimeState {
                     socket_id,
                     reply_tx,
                 } => {
-                    let result = self.release_socket(socket_id);
+                    let result = self.release_socket(socket_id, registry);
                     send_reply(reply_tx, result, "socket release");
                 }
                 #[cfg(test)]
@@ -709,8 +1302,8 @@ impl DriverRuntimeState {
     #[cfg(test)]
     fn snapshot(&self) -> DriverSnapshot {
         DriverSnapshot {
-            wakeup_count: self.wakeup_count,
-            poll_iterations: self.poll_iterations,
+            wakeup_count: self.test_state.wakeup_count,
+            poll_iterations: self.test_state.poll_iterations,
             listeners: self
                 .listeners
                 .iter()
@@ -734,12 +1327,90 @@ impl DriverRuntimeState {
                 .iter()
                 .map(|(slot, entry)| ResourceSnapshot {
                     slot,
-                    token: entry.token,
-                    readiness_hits: entry.readiness_hits,
+                    token: entry.record.token,
+                    readiness_hits: entry.record.readiness_hits,
                 })
                 .collect(),
-            processed_commands: self.processed_commands.clone(),
+            processed_commands: self.test_state.processed_commands.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DriverTestState {
+    wakeup_count: usize,
+    poll_iterations: usize,
+    processed_commands: Vec<CommandTrace>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UdpSendTarget {
+    Connected,
+    Unconnected(SocketAddr),
+}
+
+fn default_udp_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
+    match remote_addr {
+        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
+    }
+}
+
+fn emit_udp_event(
+    event_tx: &crossbeam_channel::Sender<DriverEvent>,
+    event: UdpEvent,
+) -> Result<()> {
+    let send_result = event_tx.send(DriverEvent::Udp(event));
+    if send_result.is_err() {
+        return Err(Error::DriverEventChannelClosed);
+    }
+    Ok(())
+}
+
+fn bind_udp_socket(local_addr: SocketAddr) -> io::Result<MioUdpSocket> {
+    MioUdpSocket::bind(local_addr)
+}
+
+fn send_udp_payload(
+    socket: &mut MioUdpSocket,
+    payload: IoPayload,
+    target: UdpSendTarget,
+    udp_send_scratch: &mut [u8],
+) -> io::Result<usize> {
+    match payload {
+        IoPayload::Bytes(bytes) => send_udp_slice(socket, bytes.as_ref(), target),
+        IoPayload::Lease(lease) => {
+            let mut cursor = lease.cursor();
+            if cursor.chunk().len() == cursor.remaining() {
+                return send_udp_slice(socket, cursor.chunk(), target);
+            }
+
+            // mio UDP sends only accept a single contiguous slice, so multi-segment payloads are
+            // linearised into a fixed driver-owned scratch buffer before the syscall.
+            let mut written = 0;
+            while cursor.remaining() > 0 {
+                let chunk = cursor.chunk();
+                let chunk_len = chunk.len();
+                let next_written = written + chunk_len;
+                debug_assert!(next_written <= udp_send_scratch.len());
+                udp_send_scratch[written..next_written].copy_from_slice(chunk);
+                cursor.advance(chunk_len);
+                written = next_written;
+            }
+            send_udp_slice(socket, &udp_send_scratch[..written], target)
+        }
+    }
+}
+
+fn send_udp_slice(
+    socket: &mut MioUdpSocket,
+    bytes: &[u8],
+    target: UdpSendTarget,
+) -> io::Result<usize> {
+    match target {
+        UdpSendTarget::Connected => socket.send(bytes),
+        UdpSendTarget::Unconnected(target) => socket.send_to(bytes, target),
     }
 }
 
@@ -747,11 +1418,17 @@ fn run_driver_thread(
     config: DriverThreadConfig,
     mut poll: Poll,
     command_rx: crossbeam_channel::Receiver<ControlCommand>,
-    _event_tx: crossbeam_channel::Sender<DriverEvent>,
+    event_tx: crossbeam_channel::Sender<DriverEvent>,
     startup_tx: std::sync::mpsc::SyncSender<Result<()>>,
+    ingress_pool: IngressPool,
 ) -> Result<()> {
     let mut state = DriverRuntimeState::default();
     let mut events = Events::with_capacity(config.events_capacity.max(1));
+    // This scratch buffer is stack-allocated on purpose: 1472 bytes is small for a dedicated
+    // driver thread stack, avoids a permanent heap allocation in the hot path, and matches the
+    // current conservative UDP payload cap. Revisit this if we raise the payload ceiling
+    // materially or add jumbo-frame support.
+    let mut udp_send_scratch = [0_u8; MAX_UDP_PAYLOAD_BYTES];
 
     log::debug!(
         "flotsync_io driver thread entering poll loop with event capacity {}",
@@ -763,23 +1440,48 @@ fn run_driver_thread(
     }
 
     loop {
-        state.poll_iterations += 1;
+        #[cfg(test)]
+        {
+            state.test_state.poll_iterations += 1;
+        }
 
         poll.poll(&mut events, config.poll_timeout)
             .context(DriverPollSnafu)?;
 
-        for event in &events {
+        'event_loop: for event in &events {
             if event.token() == WAKE_TOKEN {
-                state.wakeup_count += 1;
-                let should_stop = state.drain_commands(&command_rx)?;
+                #[cfg(test)]
+                {
+                    state.test_state.wakeup_count += 1;
+                }
+                let should_stop = state.drain_commands(
+                    &command_rx,
+                    poll.registry(),
+                    &event_tx,
+                    &mut udp_send_scratch,
+                )?;
+                state.resume_suspended_udp_reads(poll.registry(), &ingress_pool, &event_tx)?;
                 if should_stop {
                     log::info!("flotsync_io driver thread leaving poll loop");
                     return Ok(());
                 }
-                continue;
+                continue 'event_loop;
             }
 
-            state.handle_ready(event.token());
+            state.record_ready_hit(event.token());
+            let Some(key) = state.readiness_key(event.token()) else {
+                continue 'event_loop;
+            };
+            if event.is_readable() {
+                if let ResourceKey::Socket(socket_id) = key {
+                    state.handle_udp_readable(
+                        socket_id,
+                        poll.registry(),
+                        &ingress_pool,
+                        &event_tx,
+                    )?;
+                }
+            }
         }
     }
 }
@@ -863,6 +1565,7 @@ enum CommandTrace {
     TcpSend(ConnectionId),
     TcpClose(ConnectionId),
     UdpBind(SocketId),
+    UdpConnect(SocketId),
     UdpSend(SocketId),
     UdpClose(SocketId),
 }
@@ -884,6 +1587,9 @@ impl From<&DriverCommand> for CommandTrace {
                 Self::TcpClose(*connection_id)
             }
             DriverCommand::Udp(UdpCommand::Bind { socket_id, .. }) => Self::UdpBind(*socket_id),
+            DriverCommand::Udp(UdpCommand::Connect { socket_id, .. }) => {
+                Self::UdpConnect(*socket_id)
+            }
             DriverCommand::Udp(UdpCommand::Send { socket_id, .. }) => Self::UdpSend(*socket_id),
             DriverCommand::Udp(UdpCommand::Close { socket_id }) => Self::UdpClose(*socket_id),
         }
@@ -894,11 +1600,15 @@ impl From<&DriverCommand> for CommandTrace {
 mod tests {
     use super::*;
     use crate::{
-        api::{IoPayload, TransmissionId},
+        api::{IoPayload, MAX_UDP_PAYLOAD_BYTES, SendFailureReason, TransmissionId, UdpEvent},
+        pool::{IoBufferConfig, IoPoolConfig},
         test_support::init_test_logger,
     };
     use bytes::Bytes;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::{
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        time::{Duration, Instant},
+    };
 
     fn localhost(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
@@ -907,6 +1617,55 @@ mod tests {
     fn resolve_request<T>(request: Result<DriverRequest<T>>) -> T {
         let request = request.expect("enqueue driver request");
         wait_for_request(request).expect("resolve driver request")
+    }
+
+    fn wait_for_event(driver: &IoDriver) -> DriverEvent {
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        loop {
+            let event = driver.try_next_event().expect("read driver event");
+            if let Some(event) = event {
+                return event;
+            }
+
+            if Instant::now() >= deadline {
+                panic!("timed out waiting for flotsync_io driver event");
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn payload_bytes(payload: IoPayload) -> Bytes {
+        match payload {
+            IoPayload::Lease(lease) => lease.create_byte_clone(),
+            IoPayload::Bytes(bytes) => bytes,
+        }
+    }
+
+    fn bind_udp_socket(driver: &IoDriver, socket_id: SocketId) -> SocketAddr {
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Bind {
+                socket_id,
+                local_addr: localhost(0),
+            }))
+            .expect("dispatch UDP bind");
+
+        loop {
+            let event = wait_for_event(driver);
+            match event {
+                DriverEvent::Udp(UdpEvent::Bound {
+                    socket_id: bound_socket_id,
+                    local_addr,
+                }) if bound_socket_id == socket_id => return local_addr,
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for bind: {:?}",
+                        other
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -997,6 +1756,367 @@ mod tests {
                 CommandTrace::UdpClose(socket_id),
             ]
         );
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_unconnected_bind_send_and_receive_work() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let receiver_id = resolve_request(driver.reserve_socket());
+        let sender_id = resolve_request(driver.reserve_socket());
+
+        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+        let sender_addr = bind_udp_socket(&driver, sender_id);
+        let transmission_id = TransmissionId(1);
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id,
+                payload: IoPayload::Bytes(Bytes::from_static(b"hello")),
+                target: Some(receiver_addr),
+            }))
+            .expect("dispatch UDP send");
+
+        let mut saw_ack = false;
+        let mut received_payload = None;
+        while !saw_ack || received_payload.is_none() {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::SendAck {
+                    transmission_id: ack_id,
+                }) if ack_id == transmission_id => {
+                    saw_ack = true;
+                }
+                DriverEvent::Udp(UdpEvent::Received {
+                    socket_id,
+                    source,
+                    payload,
+                }) if socket_id == receiver_id => {
+                    assert_eq!(source, sender_addr);
+                    received_payload = Some(payload_bytes(payload));
+                }
+                other => {
+                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                }
+            }
+        }
+
+        assert_eq!(received_payload.expect("received payload"), b"hello"[..]);
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_connected_send_and_receive_work() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let receiver_id = resolve_request(driver.reserve_socket());
+        let sender_id = resolve_request(driver.reserve_socket());
+
+        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Connect {
+                socket_id: sender_id,
+                remote_addr: receiver_addr,
+                local_addr: None,
+            }))
+            .expect("dispatch UDP connect");
+
+        let sender_addr = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Connected {
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                }) if socket_id == sender_id => {
+                    assert_eq!(remote_addr, receiver_addr);
+                    break local_addr;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP connect: {:?}",
+                        other
+                    );
+                }
+            }
+        };
+
+        let transmission_id = TransmissionId(2);
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id,
+                payload: IoPayload::Bytes(Bytes::from_static(b"world")),
+                target: None,
+            }))
+            .expect("dispatch connected UDP send");
+
+        let mut saw_ack = false;
+        let mut received_payload = None;
+        while !saw_ack || received_payload.is_none() {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::SendAck {
+                    transmission_id: ack_id,
+                }) if ack_id == transmission_id => {
+                    saw_ack = true;
+                }
+                DriverEvent::Udp(UdpEvent::Received {
+                    socket_id,
+                    source,
+                    payload,
+                }) if socket_id == receiver_id => {
+                    assert_eq!(source, sender_addr);
+                    received_payload = Some(payload_bytes(payload));
+                }
+                other => {
+                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                }
+            }
+        }
+
+        assert_eq!(received_payload.expect("received payload"), b"world"[..]);
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_missing_target_for_unconnected_socket_is_nacked() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_id = resolve_request(driver.reserve_socket());
+        bind_udp_socket(&driver, socket_id);
+
+        let transmission_id = TransmissionId(3);
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id,
+                transmission_id,
+                payload: IoPayload::Bytes(Bytes::from_static(b"oops")),
+                target: None,
+            }))
+            .expect("dispatch invalid UDP send");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::SendNack {
+                    transmission_id: nack_id,
+                    reason,
+                }) if nack_id == transmission_id => {
+                    assert_eq!(reason, SendFailureReason::MissingTargetForUnconnectedSocket);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_unexpected_target_for_connected_socket_is_nacked() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let receiver_id = resolve_request(driver.reserve_socket());
+        let sender_id = resolve_request(driver.reserve_socket());
+
+        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Connect {
+                socket_id: sender_id,
+                remote_addr: receiver_addr,
+                local_addr: None,
+            }))
+            .expect("dispatch UDP connect");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Connected { socket_id, .. })
+                    if socket_id == sender_id =>
+                {
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP connect: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        let transmission_id = TransmissionId(4);
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id,
+                payload: IoPayload::Bytes(Bytes::from_static(b"oops")),
+                target: Some(receiver_addr),
+            }))
+            .expect("dispatch invalid connected UDP send");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::SendNack {
+                    transmission_id: nack_id,
+                    reason,
+                }) if nack_id == transmission_id => {
+                    assert_eq!(
+                        reason,
+                        SendFailureReason::UnexpectedTargetForConnectedSocket
+                    );
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_read_suspends_and_resumes_when_ingress_capacity_returns() {
+        init_test_logger();
+
+        let pool_config = IoPoolConfig {
+            chunk_size: MAX_UDP_PAYLOAD_BYTES,
+            initial_chunk_count: 1,
+            max_chunk_count: 2,
+            encode_buf_min_free_space: 64,
+        };
+        let driver_config = DriverConfig {
+            buffer_config: IoBufferConfig {
+                ingress: pool_config.clone(),
+                egress: pool_config,
+            },
+            ..DriverConfig::default()
+        };
+        let driver = IoDriver::start(driver_config).expect("driver starts");
+        let receiver_id = resolve_request(driver.reserve_socket());
+        let sender_id = resolve_request(driver.reserve_socket());
+
+        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+        bind_udp_socket(&driver, sender_id);
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id: TransmissionId(10),
+                payload: IoPayload::Bytes(Bytes::from_static(b"first")),
+                target: Some(receiver_addr),
+            }))
+            .expect("dispatch first UDP send");
+
+        let first_lease = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Received {
+                    socket_id,
+                    payload: IoPayload::Lease(lease),
+                    ..
+                }) if socket_id == receiver_id => break lease,
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for first UDP receive: {:?}",
+                        other
+                    );
+                }
+            }
+        };
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id: TransmissionId(11),
+                payload: IoPayload::Bytes(Bytes::from_static(b"second")),
+                target: Some(receiver_addr),
+            }))
+            .expect("dispatch second UDP send");
+
+        let second_lease = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Received {
+                    socket_id,
+                    payload: IoPayload::Lease(lease),
+                    ..
+                }) if socket_id == receiver_id => break lease,
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for second UDP receive: {:?}",
+                        other
+                    );
+                }
+            }
+        };
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Send {
+                socket_id: sender_id,
+                transmission_id: TransmissionId(12),
+                payload: IoPayload::Bytes(Bytes::from_static(b"third")),
+                target: Some(receiver_addr),
+            }))
+            .expect("dispatch third UDP send");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::ReadSuspended { socket_id })
+                    if socket_id == receiver_id =>
+                {
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for ReadSuspended: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        drop(first_lease);
+        drop(second_lease);
+
+        let mut saw_resume = false;
+        let mut third_payload = None;
+        while !saw_resume || third_payload.is_none() {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::ReadResumed { socket_id })
+                    if socket_id == receiver_id =>
+                {
+                    saw_resume = true;
+                }
+                DriverEvent::Udp(UdpEvent::Received {
+                    socket_id, payload, ..
+                }) if socket_id == receiver_id => {
+                    third_payload = Some(payload_bytes(payload));
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for ReadResumed/Received: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        assert_eq!(third_payload.expect("third payload"), b"third"[..]);
 
         driver.shutdown().expect("driver shuts down");
     }
