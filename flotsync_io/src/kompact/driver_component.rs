@@ -1,5 +1,6 @@
 use super::{
     bridge::IoBridgeMessage,
+    listener::{TcpListenerDriverEvent, TcpListenerMessage},
     session::TcpSessionMessage,
     types::{OpenFailureReason, TcpSessionEvent, UdpIndication, UdpSendResult},
 };
@@ -7,6 +8,7 @@ use crate::{
     api::{
         CloseReason,
         ConnectionId,
+        ListenerId,
         SendFailureReason,
         SocketId,
         TcpCommand,
@@ -30,11 +32,23 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 pub enum IoDriverComponentMessage {
     ReserveUdpSocket(Ask<ActorRefStrong<IoBridgeMessage>, Result<SocketId>>),
     ReleaseUdpSocket(Ask<SocketId, Result<()>>),
+    OpenTcpListener(Ask<OpenTcpListenerRegistration, Result<ListenerId>>),
+    ReleaseTcpListener(Ask<ListenerId, Result<()>>),
     OpenTcpSession(Ask<OpenTcpSessionRegistration, Result<ConnectionId>>),
     ReleaseTcpSession(Ask<ConnectionId, Result<()>>),
+    AdoptAcceptedTcpSession(Ask<AdoptAcceptedTcpSessionRegistration, Result<()>>),
+    RejectPendingTcpSession(Ask<ConnectionId, Result<()>>),
     DispatchUdp(UdpCommand),
     DispatchTcp(TcpCommand),
     DriverEvent(DriverEvent),
+}
+
+/// Registration payload used while opening one inbound TCP listener.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct OpenTcpListenerRegistration {
+    pub(crate) listener: ActorRefStrong<TcpListenerMessage>,
+    pub(crate) local_addr: SocketAddr,
 }
 
 /// Registration payload used while opening one outbound TCP session.
@@ -47,6 +61,14 @@ pub struct OpenTcpSessionRegistration {
     pub(crate) session: ActorRefStrong<TcpSessionMessage>,
     pub(crate) remote_addr: SocketAddr,
     pub(crate) local_addr: Option<SocketAddr>,
+}
+
+/// Registration payload used while adopting one previously accepted inbound TCP connection.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AdoptAcceptedTcpSessionRegistration {
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) session: ActorRefStrong<TcpSessionMessage>,
 }
 
 /// Strong local handle for talking to the shared driver component.
@@ -107,10 +129,67 @@ impl DriverComponentRef {
         future
     }
 
+    pub(crate) fn open_tcp_listener(
+        &self,
+        listener: ActorRefStrong<TcpListenerMessage>,
+        local_addr: SocketAddr,
+    ) -> KFuture<Result<ListenerId>> {
+        let request = OpenTcpListenerRegistration {
+            listener,
+            local_addr,
+        };
+        let (promise, future) = promise::<Result<ListenerId>>();
+        self.actor
+            .tell(IoDriverComponentMessage::OpenTcpListener(Ask::new(
+                promise, request,
+            )));
+        future
+    }
+
     pub(crate) fn release_tcp_session(&self, connection_id: ConnectionId) -> KFuture<Result<()>> {
         let (promise, future) = promise::<Result<()>>();
         self.actor
             .tell(IoDriverComponentMessage::ReleaseTcpSession(Ask::new(
+                promise,
+                connection_id,
+            )));
+        future
+    }
+
+    pub(crate) fn release_tcp_listener(&self, listener_id: ListenerId) -> KFuture<Result<()>> {
+        let (promise, future) = promise::<Result<()>>();
+        self.actor
+            .tell(IoDriverComponentMessage::ReleaseTcpListener(Ask::new(
+                promise,
+                listener_id,
+            )));
+        future
+    }
+
+    pub(crate) fn adopt_accepted_tcp_session(
+        &self,
+        session: ActorRefStrong<TcpSessionMessage>,
+        connection_id: ConnectionId,
+    ) -> KFuture<Result<()>> {
+        let request = AdoptAcceptedTcpSessionRegistration {
+            connection_id,
+            session,
+        };
+        let (promise, future) = promise::<Result<()>>();
+        self.actor
+            .tell(IoDriverComponentMessage::AdoptAcceptedTcpSession(Ask::new(
+                promise, request,
+            )));
+        future
+    }
+
+    pub(crate) fn reject_pending_tcp_session(
+        &self,
+        connection_id: ConnectionId,
+    ) -> KFuture<Result<()>> {
+        let (promise, future) = promise::<Result<()>>();
+        self.actor
+            .tell(IoDriverComponentMessage::RejectPendingTcpSession(Ask::new(
                 promise,
                 connection_id,
             )));
@@ -152,6 +231,7 @@ pub struct IoDriverComponent {
     config: DriverConfig,
     driver: Option<IoDriver>,
     udp_routes: HashMap<SocketId, ActorRefStrong<IoBridgeMessage>>,
+    tcp_listener_routes: HashMap<ListenerId, ActorRefStrong<TcpListenerMessage>>,
     tcp_routes: HashMap<ConnectionId, ActorRefStrong<TcpSessionMessage>>,
 }
 
@@ -166,6 +246,7 @@ impl IoDriverComponent {
             config,
             driver: None,
             udp_routes: HashMap::new(),
+            tcp_listener_routes: HashMap::new(),
             tcp_routes: HashMap::new(),
         }
     }
@@ -194,6 +275,36 @@ impl IoDriverComponent {
             driver.release_socket(socket_id)?
         };
         request.await
+    }
+
+    async fn open_tcp_listener_inner(
+        &mut self,
+        listener: ActorRefStrong<TcpListenerMessage>,
+        local_addr: SocketAddr,
+    ) -> Result<ListenerId> {
+        let reserve_request = {
+            let driver = self.driver_ref()?;
+            driver.reserve_listener()?
+        };
+        let listener_id = reserve_request.await?;
+        self.tcp_listener_routes.insert(listener_id, listener);
+
+        let dispatch_result = {
+            let driver = self.driver_ref()?;
+            driver.dispatch(DriverCommand::Tcp(TcpCommand::Listen {
+                listener_id,
+                local_addr,
+            }))
+        };
+        if let Err(error) = dispatch_result {
+            self.tcp_listener_routes.remove(&listener_id);
+            if let Ok(release_request) = self.driver_ref()?.release_listener(listener_id) {
+                let _ = release_request.await;
+            }
+            return Err(error);
+        }
+
+        Ok(listener_id)
     }
 
     async fn open_tcp_session_inner(
@@ -226,6 +337,50 @@ impl IoDriverComponent {
         }
 
         Ok(connection_id)
+    }
+
+    async fn adopt_accepted_tcp_session_inner(
+        &mut self,
+        session: ActorRefStrong<TcpSessionMessage>,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
+        self.tcp_routes.insert(connection_id, session);
+
+        let dispatch_result = {
+            let driver = self.driver_ref()?;
+            driver.dispatch(DriverCommand::Tcp(TcpCommand::AdoptAccepted {
+                connection_id,
+            }))
+        };
+        if let Err(error) = dispatch_result {
+            self.tcp_routes.remove(&connection_id);
+            if let Ok(release_request) = self.driver_ref()?.release_connection(connection_id) {
+                let _ = release_request.await;
+            }
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    async fn reject_pending_tcp_session_inner(
+        &mut self,
+        connection_id: ConnectionId,
+    ) -> Result<()> {
+        let request = {
+            let driver = self.driver_ref()?;
+            driver.release_connection(connection_id)?
+        };
+        request.await
+    }
+
+    async fn release_tcp_listener_inner(&mut self, listener_id: ListenerId) -> Result<()> {
+        self.tcp_listener_routes.remove(&listener_id);
+        let request = {
+            let driver = self.driver_ref()?;
+            driver.release_listener(listener_id)?
+        };
+        request.await
     }
 
     async fn release_tcp_session_inner(&mut self, connection_id: ConnectionId) -> Result<()> {
@@ -298,17 +453,56 @@ impl IoDriverComponent {
     }
 
     fn handle_tcp_driver_event(&mut self, event: TcpEvent) {
-        let (connection_id, session_event, terminal) = tcp_session_event_from_raw(event);
-        if let Some(route) = self.tcp_routes.get(&connection_id) {
-            route.tell(TcpSessionMessage::DriverEvent(session_event));
-        } else {
-            warn!(
-                self.log(),
-                "dropping TCP session event for unknown routed connection {}", connection_id
-            );
-        }
-        if terminal {
-            self.tcp_routes.remove(&connection_id);
+        match event {
+            TcpEvent::Listening {
+                listener_id,
+                local_addr,
+            } => {
+                self.route_tcp_listener_event(
+                    listener_id,
+                    TcpListenerDriverEvent::Listening { local_addr },
+                );
+            }
+            TcpEvent::ListenFailed {
+                listener_id,
+                local_addr,
+                error_kind,
+            } => {
+                self.route_tcp_listener_event(
+                    listener_id,
+                    TcpListenerDriverEvent::ListenFailed {
+                        local_addr,
+                        reason: OpenFailureReason::Io(error_kind),
+                    },
+                );
+                self.tcp_listener_routes.remove(&listener_id);
+            }
+            TcpEvent::Accepted {
+                listener_id,
+                connection_id,
+                peer_addr,
+            } => {
+                self.route_tcp_listener_incoming(listener_id, connection_id, peer_addr);
+            }
+            TcpEvent::ListenerClosed { listener_id } => {
+                self.route_tcp_listener_event(listener_id, TcpListenerDriverEvent::Closed);
+                self.tcp_listener_routes.remove(&listener_id);
+            }
+            other => {
+                let (connection_id, session_event, terminal) = tcp_session_event_from_raw(other);
+                if let Some(route) = self.tcp_routes.get(&connection_id) {
+                    route.tell(TcpSessionMessage::DriverEvent(session_event));
+                } else {
+                    warn!(
+                        self.log(),
+                        "dropping TCP session event for unknown routed connection {}",
+                        connection_id
+                    );
+                }
+                if terminal {
+                    self.tcp_routes.remove(&connection_id);
+                }
+            }
         }
     }
 
@@ -391,7 +585,29 @@ impl IoDriverComponent {
                 );
                 self.tcp_routes.remove(&connection_id);
             }
-            TcpCommand::Listen { .. } => {}
+            TcpCommand::Listen {
+                listener_id,
+                local_addr,
+            } => {
+                self.route_tcp_listener_event(
+                    listener_id,
+                    TcpListenerDriverEvent::ListenFailed {
+                        local_addr,
+                        reason: OpenFailureReason::DriverUnavailable,
+                    },
+                );
+                self.tcp_listener_routes.remove(&listener_id);
+            }
+            TcpCommand::AdoptAccepted { connection_id } => {
+                self.route_tcp_session_event(
+                    connection_id,
+                    TcpSessionEvent::Closed {
+                        reason: CloseReason::DriverShutdown,
+                    },
+                );
+                self.tcp_routes.remove(&connection_id);
+            }
+            TcpCommand::RejectAccepted { .. } => {}
             TcpCommand::Send {
                 connection_id,
                 transmission_id,
@@ -411,6 +627,10 @@ impl IoDriverComponent {
                     },
                 );
                 self.tcp_routes.remove(&connection_id);
+            }
+            TcpCommand::CloseListener { listener_id } => {
+                self.route_tcp_listener_event(listener_id, TcpListenerDriverEvent::Closed);
+                self.tcp_listener_routes.remove(&listener_id);
             }
         }
     }
@@ -448,13 +668,57 @@ impl IoDriverComponent {
         }
     }
 
+    fn route_tcp_listener_event(&self, listener_id: ListenerId, event: TcpListenerDriverEvent) {
+        if let Some(route) = self.tcp_listener_routes.get(&listener_id) {
+            route.tell(TcpListenerMessage::DriverEvent(event));
+        } else {
+            warn!(
+                self.log(),
+                "dropping TCP listener event for unknown routed listener {}", listener_id
+            );
+        }
+    }
+
+    fn route_tcp_listener_incoming(
+        &self,
+        listener_id: ListenerId,
+        connection_id: ConnectionId,
+        peer_addr: SocketAddr,
+    ) {
+        if let Some(route) = self.tcp_listener_routes.get(&listener_id) {
+            route.tell(TcpListenerMessage::DriverEvent(
+                TcpListenerDriverEvent::Incoming {
+                    peer_addr,
+                    connection_id,
+                },
+            ));
+        } else {
+            warn!(
+                self.log(),
+                "dropping pending TCP connection {} for unknown listener {}",
+                connection_id,
+                listener_id
+            );
+        }
+    }
+
     fn handle_local_message(&mut self, msg: IoDriverComponentMessage) -> Handled {
         match msg {
             IoDriverComponentMessage::ReserveUdpSocket(ask) => self.handle_reserve_udp_socket(ask),
             IoDriverComponentMessage::ReleaseUdpSocket(ask) => self.handle_release_udp_socket(ask),
+            IoDriverComponentMessage::OpenTcpListener(ask) => self.handle_open_tcp_listener(ask),
+            IoDriverComponentMessage::ReleaseTcpListener(ask) => {
+                self.handle_release_tcp_listener(ask)
+            }
             IoDriverComponentMessage::OpenTcpSession(ask) => self.handle_open_tcp_session(ask),
             IoDriverComponentMessage::ReleaseTcpSession(ask) => {
                 self.handle_release_tcp_session(ask)
+            }
+            IoDriverComponentMessage::AdoptAcceptedTcpSession(ask) => {
+                self.handle_adopt_accepted_tcp_session(ask)
+            }
+            IoDriverComponentMessage::RejectPendingTcpSession(ask) => {
+                self.handle_reject_pending_tcp_session(ask)
             }
             IoDriverComponentMessage::DispatchUdp(command) => {
                 self.handle_dispatch_udp(command);
@@ -509,12 +773,67 @@ impl IoDriverComponent {
         })
     }
 
+    fn handle_open_tcp_listener(
+        &mut self,
+        ask: Ask<OpenTcpListenerRegistration, Result<ListenerId>>,
+    ) -> Handled {
+        let (promise, request) = ask.take();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = async_self
+                .open_tcp_listener_inner(request.listener, request.local_addr)
+                .await;
+            if promise.fulfil(reply).is_err() {
+                debug!(async_self.log(), "dropping TCP listener open reply");
+            }
+        })
+    }
+
     fn handle_release_tcp_session(&mut self, ask: Ask<ConnectionId, Result<()>>) -> Handled {
         let (promise, connection_id) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self.release_tcp_session_inner(connection_id).await;
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP session release reply");
+            }
+        })
+    }
+
+    fn handle_release_tcp_listener(&mut self, ask: Ask<ListenerId, Result<()>>) -> Handled {
+        let (promise, listener_id) = ask.take();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = async_self.release_tcp_listener_inner(listener_id).await;
+            if promise.fulfil(reply).is_err() {
+                debug!(async_self.log(), "dropping TCP listener release reply");
+            }
+        })
+    }
+
+    fn handle_adopt_accepted_tcp_session(
+        &mut self,
+        ask: Ask<AdoptAcceptedTcpSessionRegistration, Result<()>>,
+    ) -> Handled {
+        let (promise, request) = ask.take();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = async_self
+                .adopt_accepted_tcp_session_inner(request.session, request.connection_id)
+                .await;
+            if promise.fulfil(reply).is_err() {
+                debug!(async_self.log(), "dropping TCP session adoption reply");
+            }
+        })
+    }
+
+    fn handle_reject_pending_tcp_session(&mut self, ask: Ask<ConnectionId, Result<()>>) -> Handled {
+        let (promise, connection_id) = ask.take();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = async_self
+                .reject_pending_tcp_session_inner(connection_id)
+                .await;
+            if promise.fulfil(reply).is_err() {
+                debug!(
+                    async_self.log(),
+                    "dropping TCP pending-session reject reply"
+                );
             }
         })
     }
@@ -568,6 +887,7 @@ fn shutdown_driver_component(component: &mut IoDriverComponent) -> Handled {
         return Handled::Ok;
     };
     component.udp_routes.clear();
+    component.tcp_listener_routes.clear();
     component.tcp_routes.clear();
     let shutdown = component.spawn_off(async move { driver.shutdown() });
     Handled::block_on(component, move |async_self| async move {
@@ -729,7 +1049,10 @@ fn tcp_session_event_from_raw(event: TcpEvent) -> (ConnectionId, TcpSessionEvent
             connection_id,
             reason,
         } => (connection_id, TcpSessionEvent::Closed { reason }, true),
-        TcpEvent::Listening { listener_id, .. } | TcpEvent::Accepted { listener_id, .. } => {
+        TcpEvent::ListenFailed { listener_id, .. }
+        | TcpEvent::Listening { listener_id, .. }
+        | TcpEvent::Accepted { listener_id, .. }
+        | TcpEvent::ListenerClosed { listener_id } => {
             unreachable!(
                 "listener-related TCP events must not be routed through the TCP session adapter for {}",
                 listener_id

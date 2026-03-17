@@ -16,6 +16,8 @@
 {"created_at":"2026-03-11T13:45:20Z","created_by":"Lars Kroll","depends_on_id":"flotsync-ca7","issue_id":"flotsync-7jb","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-04T18:38:44Z","created_by":"Lars Kroll","depends_on_id":"flotsync-nad","issue_id":"flotsync-88o","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-10T09:33:06Z","created_by":"Lars Kroll","depends_on_id":"flotsync-pzi","issue_id":"flotsync-8lf","metadata":"{}","type":"discovered-from"}
+{"created_at":"2026-03-17T16:57:08Z","created_by":"Lars Kroll","depends_on_id":"flotsync-0w3","issue_id":"flotsync-8zk","metadata":"{}","type":"blocked-by"}
+{"created_at":"2026-03-17T16:57:08Z","created_by":"Lars Kroll","depends_on_id":"flotsync-mi2","issue_id":"flotsync-8zk","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-10T09:32:21Z","created_by":"Lars Kroll","depends_on_id":"flotsync-pzi","issue_id":"flotsync-94d","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-04T19:01:01Z","created_by":"Lars Kroll","depends_on_id":"flotsync-88o","issue_id":"flotsync-9dm","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-04T18:27:59Z","created_by":"Lars Kroll","depends_on_id":"flotsync-nad","issue_id":"flotsync-a07","metadata":"{}","type":"discovered-from"}
@@ -36,6 +38,8 @@
 {"created_at":"2026-03-16T19:59:36Z","created_by":"Lars Kroll","depends_on_id":"flotsync-ztx","issue_id":"flotsync-hn4","metadata":"{}","type":"blocks"}
 {"created_at":"2026-03-04T18:23:21Z","created_by":"Lars Kroll","depends_on_id":"flotsync-6vh","issue_id":"flotsync-nad","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-10T09:32:31Z","created_by":"Lars Kroll","depends_on_id":"flotsync-pzi","issue_id":"flotsync-opy","metadata":"{}","type":"discovered-from"}
+{"created_at":"2026-03-17T16:57:08Z","created_by":"Lars Kroll","depends_on_id":"flotsync-0w3","issue_id":"flotsync-p8n","metadata":"{}","type":"blocked-by"}
+{"created_at":"2026-03-17T16:57:08Z","created_by":"Lars Kroll","depends_on_id":"flotsync-mi2","issue_id":"flotsync-p8n","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-10T09:32:14Z","created_by":"Lars Kroll","depends_on_id":"flotsync-pzi","issue_id":"flotsync-pcv","metadata":"{}","type":"discovered-from"}
 {"created_at":"2026-03-05T15:29:53Z","created_by":"Lars Kroll","depends_on_id":"flotsync-bj9","issue_id":"flotsync-pzi","metadata":"{}","type":"blocks"}
 {"created_at":"2026-03-12T16:55:17Z","created_by":"Lars Kroll","depends_on_id":"flotsync-bhj","issue_id":"flotsync-qzw","metadata":"{}","type":"blocked-by"}

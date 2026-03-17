@@ -10,7 +10,8 @@ v1 adds Kompact-native freeform network I/O for raw bytes over UDP and TCP.
 - Single driver thread for correctness-first behavior.
 - Shared ingress and egress buffer pools with drop-based lease return.
 - Explicit backpressure signaling (ack/nack/suspend/resume), not bounded queues.
-- Listener-owned accepted TCP connections remain a separate step after the first Kompact bridge.
+- Inbound TCP listener acceptance must remain application-directed; accepted sockets may not start
+  delivering bytes before the application chooses a session owner or rejects them.
 
 ## Non-Goals (v1)
 
@@ -51,10 +52,14 @@ something that fits Kompact semantics better.
 - `IoBridge`
   - one lightweight per-client Kompact component
   - provides shared UDP capability via typed ports
-  - acts as TCP manager for opening outbound sessions
+  - acts as TCP manager for opening listeners and outbound sessions
+
+- `TcpListener`
+  - one Kompact actor/component endpoint per open TCP listener
+  - emits pending inbound-session decisions instead of pre-owned session actors
 
 - `TcpSession`
-  - one Kompact actor/component endpoint per established outbound TCP connection
+  - one Kompact actor/component endpoint per live TCP connection
   - represents the session identity instead of repeatedly passing `ConnectionId`
 
 ## Raw Core API Shape
@@ -241,7 +246,76 @@ message.
 
 ### Surface
 
-The bridge acts as a TCP session manager.
+The bridge acts as a TCP manager for both outbound sessions and inbound listeners.
+
+```rust
+pub struct OpenTcpListener {
+    pub local_addr: SocketAddr,
+    pub incoming_to: Recipient<TcpListenerEvent>,
+}
+```
+
+Opening a listener is an actor request/response operation:
+
+```rust
+bridge_ref.ask(OpenTcpListener {
+    local_addr,
+    incoming_to,
+}) -> Result<TcpListenerRef>
+```
+
+`TcpListenerRef` is then used for listener-local control:
+
+- it is a strong local listener handle
+- `tell(TcpListenerRequest::Close)` is the normal fast path
+- accepted inbound sockets are reported via `TcpListenerEvent::Incoming`
+- the listener does not decide session ownership by itself; application logic must do that
+
+```rust
+pub enum TcpListenerRequest {
+    Close,
+}
+
+pub enum TcpListenerEvent {
+    Listening {
+        local_addr: SocketAddr,
+    },
+    ListenFailed {
+        local_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Incoming {
+        peer_addr: SocketAddr,
+        pending: PendingTcpSession,
+    },
+    Closed,
+}
+```
+
+```rust
+impl PendingTcpSession {
+    pub fn accept(
+        self,
+        events_to: Recipient<TcpSessionEvent>,
+    ) -> KFuture<Result<TcpSessionRef>>;
+
+    pub fn reject(self) -> KFuture<Result<()>>;
+}
+```
+
+`PendingTcpSession` is non-cloneable and auto-rejects on `Drop`.
+
+This is the key inbound-TCP semantic:
+
+- the raw driver may accept the OS socket
+- but normal TCP session I/O stays paused
+- application logic inspects the incoming connection
+- then it either:
+  - accepts it into a session and chooses the session event recipient
+  - rejects it
+  - or drops the pending handle and lets it auto-reject
+
+Only `accept(...)` turns the pending socket into a live `TcpSessionRef`.
 
 ```rust
 pub struct OpenTcpSession {
@@ -312,7 +386,11 @@ pub enum TcpSessionEvent {
 - Session identity is represented by the Kompact session endpoint, not by repeatedly exposing
   `ConnectionId` to the client.
 - `TransmissionId` only needs to be meaningful within one session.
-- Later accepted inbound TCP connections can naturally reuse the same `TcpSessionRef` model.
+- Inbound listeners expose pending decisions first; they do not auto-spawn session owners.
+- Accepted inbound sessions reuse the same `TcpSessionRef` model as outbound sessions once the
+  application accepts them.
+- Accepted inbound sessions do not emit a separate `Connected` event; the listener's `Incoming`
+  event is the establishment signal for that path.
 
 ## Backpressure Semantics
 
@@ -358,9 +436,11 @@ just to block on an event channel and relay the result into Kompact.
 
 - Outbound connect.
 - Explicit connect-failed event for outbound connects.
+- Listener bind/listen/close.
+- Accepted inbound connections start in a paused pending-adoption state.
+- Pending inbound connections can be accepted into a session or rejected.
 - Read/write raw bytes.
 - Graceful close and abort semantics.
-- Listener bind/accept remains a later step than the first Kompact bridge.
 
 ## Extensibility Notes
 
@@ -368,4 +448,4 @@ just to block on an event channel and relay the result into Kompact.
 - Keep payload abstraction flexible for future zero-copy/file-backed variants.
 - The Kompact layer intentionally has different abstractions for UDP and TCP; that difference is a
   feature, not an inconsistency.
-- Accepted-connection transfer and listener-owned session bridging remain follow-up work.
+- Further session cleanup/GC after the last external session handle drops remains follow-up work.

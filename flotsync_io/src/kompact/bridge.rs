@@ -1,10 +1,13 @@
 use super::{
     driver_component::DriverComponentRef,
+    listener::{TcpListener, TcpListenerMessage},
     resolve_kfuture,
     session::{TcpSession, TcpSessionMessage},
     types::{
         OpenFailureReason,
+        OpenTcpListener,
         OpenTcpSession,
+        TcpListenerRef,
         TcpSessionRef,
         UdpIndication,
         UdpPort,
@@ -33,6 +36,7 @@ use std::{
 pub enum IoBridgeMessage {
     ReserveUdpSocket(Ask<(), Result<SocketId>>),
     ReleaseUdpSocket(Ask<SocketId, Result<()>>),
+    OpenTcpListener(Ask<OpenTcpListener, Result<TcpListenerRef>>),
     OpenTcpSession(Ask<OpenTcpSession, Result<TcpSessionRef>>),
     UdpIndication(UdpIndication),
     UdpSendResult(UdpSendResult),
@@ -139,6 +143,14 @@ impl IoBridgeHandle {
         let (promise, future) = promise::<Result<TcpSessionRef>>();
         self.actor
             .tell(IoBridgeMessage::OpenTcpSession(Ask::new(promise, request)));
+        future
+    }
+
+    /// Opens one inbound TCP listener managed by this bridge.
+    pub fn open_tcp_listener(&self, request: OpenTcpListener) -> KFuture<Result<TcpListenerRef>> {
+        let (promise, future) = promise::<Result<TcpListenerRef>>();
+        self.actor
+            .tell(IoBridgeMessage::OpenTcpListener(Ask::new(promise, request)));
         future
     }
 }
@@ -318,6 +330,7 @@ impl IoBridge {
         match msg {
             IoBridgeMessage::ReserveUdpSocket(ask) => self.handle_reserve_udp_socket(ask),
             IoBridgeMessage::ReleaseUdpSocket(ask) => self.handle_release_udp_socket(ask),
+            IoBridgeMessage::OpenTcpListener(ask) => self.handle_open_tcp_listener(ask),
             IoBridgeMessage::OpenTcpSession(ask) => self.handle_open_tcp_session(ask),
             IoBridgeMessage::UdpIndication(indication) => {
                 self.handle_udp_indication(indication);
@@ -402,6 +415,45 @@ impl IoBridge {
                     async_self.ctx.system().kill(session_component);
                     if promise.fulfil(Err(error)).is_err() {
                         debug!(async_self.log(), "dropping TCP session open reply");
+                    }
+                }
+            }
+        })
+    }
+
+    fn handle_open_tcp_listener(
+        &mut self,
+        ask: Ask<OpenTcpListener, Result<TcpListenerRef>>,
+    ) -> Handled {
+        let (promise, request) = ask.take();
+        let driver = self.driver.clone();
+        Handled::block_on(self, move |async_self| async move {
+            let listener_component = async_self
+                .ctx
+                .system()
+                .create(|| TcpListener::new(driver.clone(), request.incoming_to.clone()));
+            let listener_strong = listener_component
+                .actor_ref()
+                .hold()
+                .expect("newly created TCP listener must be live");
+            let listener_ref = TcpListenerRef::new(listener_strong.clone());
+            async_self.ctx.system().start(&listener_component);
+
+            let reply = async_self
+                .driver
+                .open_tcp_listener(listener_strong.clone(), request.local_addr);
+            let reply = resolve_kfuture(reply).await;
+            match reply {
+                Ok(listener_id) => {
+                    listener_strong.tell(TcpListenerMessage::Attach(listener_id));
+                    if promise.fulfil(Ok(listener_ref)).is_err() {
+                        debug!(async_self.log(), "dropping TCP listener open reply");
+                    }
+                }
+                Err(error) => {
+                    async_self.ctx.system().kill(listener_component);
+                    if promise.fulfil(Err(error)).is_err() {
+                        debug!(async_self.log(), "dropping TCP listener open reply");
                     }
                 }
             }

@@ -144,12 +144,25 @@ pub enum TcpCommand {
         listener_id: ListenerId,
         local_addr: SocketAddr,
     },
+    /// Activates a previously accepted inbound TCP connection after its owning adapter installed
+    /// the session routing needed to receive future events.
+    ///
+    /// Accepted connections start in a paused state so inbound bytes cannot race ahead of their
+    /// eventual Kompact session owner.
+    AdoptAccepted { connection_id: ConnectionId },
+    /// Rejects a previously accepted inbound TCP connection before any session adopts it.
+    ///
+    /// This closes the pending connection and releases its local driver-owned resources without
+    /// transitioning it into a normal session event stream.
+    RejectAccepted { connection_id: ConnectionId },
     /// Requests transmission of raw payload bytes on an established TCP connection.
     Send {
         connection_id: ConnectionId,
         transmission_id: TransmissionId,
         payload: IoPayload,
     },
+    /// Closes a TCP listener and releases its driver-owned resources.
+    CloseListener { listener_id: ListenerId },
     /// Closes a TCP connection; `abort = true` requests an abortive close, `false` a graceful close.
     Close {
         connection_id: ConnectionId,
@@ -172,12 +185,23 @@ pub enum TcpEvent {
         remote_addr: SocketAddr,
         error_kind: io::ErrorKind,
     },
+    /// Reports that a requested listener bind/listen step failed before the listening socket became
+    /// usable.
+    ListenFailed {
+        listener_id: ListenerId,
+        local_addr: SocketAddr,
+        error_kind: io::ErrorKind,
+    },
     /// Reports that a requested TCP listener is now bound and accepting connections.
     Listening {
         listener_id: ListenerId,
         local_addr: SocketAddr,
     },
-    /// Reports that a listener accepted a new inbound TCP connection that it now owns.
+    /// Reports that a listener accepted a new inbound TCP connection.
+    ///
+    /// The accepted connection is still paused at this point. Adapters must decide whether to
+    /// [`TcpCommand::AdoptAccepted`] or [`TcpCommand::RejectAccepted`] it before any session I/O
+    /// begins.
     Accepted {
         listener_id: ListenerId,
         connection_id: ConnectionId,
@@ -207,6 +231,8 @@ pub enum TcpEvent {
     WriteSuspended { connection_id: ConnectionId },
     /// Reports that write-side progress resumed and sends may be attempted again.
     WriteResumed { connection_id: ConnectionId },
+    /// Reports that the listener closed and released its driver-owned state.
+    ListenerClosed { listener_id: ListenerId },
     /// Reports that the TCP connection closed and explains the close mode.
     Closed {
         connection_id: ConnectionId,

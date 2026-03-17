@@ -16,7 +16,11 @@ use crate::{
 };
 use bytes::{Buf, Bytes};
 use flotsync_utils::option_when;
-use mio::{Interest, Registry, net::TcpStream as MioTcpStream};
+use mio::{
+    Interest,
+    Registry,
+    net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
+};
 use snafu::ResultExt;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
@@ -28,16 +32,51 @@ use std::{
 /// TCP-side runtime state owned by the shared driver.
 #[derive(Debug, Default)]
 pub(super) struct TcpRuntimeState {
-    listeners: SlotRegistry<ResourceRecord>,
+    listeners: SlotRegistry<TcpListenerEntry>,
     connections: SlotRegistry<TcpConnectionEntry>,
 }
 
+/// Driver-owned listener state for one reserved TCP listener handle.
+///
+/// Listener handles are reserved before any OS socket exists. Once `Listen` succeeds, `listener`
+/// and `local_addr` become live and the entry owns one registered `mio::net::TcpListener`.
+#[derive(Debug)]
+struct TcpListenerEntry {
+    record: ResourceRecord,
+    listener: Option<MioTcpListener>,
+    local_addr: Option<SocketAddr>,
+    registered: bool,
+}
+
+impl TcpListenerEntry {
+    fn new(record: ResourceRecord) -> Self {
+        Self {
+            record,
+            listener: None,
+            local_addr: None,
+            registered: false,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.listener.is_some()
+    }
+}
+
+/// Driver-owned connection state for one reserved TCP connection handle.
+///
+/// In addition to normal outbound/open connections, the same entry type also represents accepted
+/// inbound connections that are waiting for their Kompact owner to decide whether to accept or
+/// reject them. While `pending_adoption` is set the connection has a live socket but deliberately
+/// exposes no readiness interest, so no inbound bytes can outrun session routing.
 #[derive(Debug)]
 struct TcpConnectionEntry {
     record: ResourceRecord,
     stream: Option<MioTcpStream>,
     remote_addr: Option<SocketAddr>,
+    accepted_from: Option<ListenerId>,
     connect_pending: bool,
+    pending_adoption: bool,
     read_suspended: bool,
     registered: bool,
     pending_send: Option<PendingTcpSend>,
@@ -50,7 +89,29 @@ impl TcpConnectionEntry {
             record,
             stream: None,
             remote_addr: None,
+            accepted_from: None,
             connect_pending: false,
+            pending_adoption: false,
+            read_suspended: false,
+            registered: false,
+            pending_send: None,
+            close_after_flush: false,
+        }
+    }
+
+    fn new_pending_accepted(
+        record: ResourceRecord,
+        listener_id: ListenerId,
+        stream: MioTcpStream,
+        peer_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            record,
+            stream: Some(stream),
+            remote_addr: Some(peer_addr),
+            accepted_from: Some(listener_id),
+            connect_pending: false,
+            pending_adoption: true,
             read_suspended: false,
             registered: false,
             pending_send: None,
@@ -65,6 +126,9 @@ impl TcpConnectionEntry {
         if self.connect_pending {
             return Some(Interest::WRITABLE);
         }
+        if self.pending_adoption {
+            return None;
+        }
 
         match (self.read_suspended, self.pending_send.is_some()) {
             (false, false) => Some(Interest::READABLE),
@@ -77,7 +141,9 @@ impl TcpConnectionEntry {
     fn reset_to_reserved(&mut self) {
         self.stream = None;
         self.remote_addr = None;
+        self.accepted_from = None;
         self.connect_pending = false;
+        self.pending_adoption = false;
         self.read_suspended = false;
         self.registered = false;
         self.pending_send = None;
@@ -87,6 +153,24 @@ impl TcpConnectionEntry {
     fn is_open(&self) -> bool {
         self.stream.is_some()
     }
+
+    fn is_pending_accepted(&self) -> bool {
+        self.pending_adoption && self.accepted_from.is_some()
+    }
+}
+
+/// Newly accepted inbound TCP stream that is not yet associated with a connection slot.
+#[derive(Debug)]
+pub(super) struct AcceptedTcpConnection {
+    pub(super) stream: MioTcpStream,
+    pub(super) peer_addr: SocketAddr,
+}
+
+/// Listener cleanup result used by the shared runtime to release readiness tokens.
+#[derive(Debug)]
+pub(super) struct ReleasedTcpListener {
+    pub(super) listener_record: ResourceRecord,
+    pub(super) pending_connection_records: Vec<ResourceRecord>,
 }
 
 #[derive(Debug)]
@@ -159,7 +243,9 @@ impl TcpRuntimeState {
     }
 
     pub(super) fn reserve_listener(&mut self, listener_id: ListenerId, token: DriverToken) {
-        let slot = self.listeners.reserve(ResourceRecord::new(token));
+        let slot = self
+            .listeners
+            .reserve(TcpListenerEntry::new(ResourceRecord::new(token)));
         debug_assert_eq!(slot, listener_id.0);
     }
 
@@ -170,10 +256,40 @@ impl TcpRuntimeState {
         debug_assert_eq!(slot, connection_id.0);
     }
 
-    pub(super) fn release_listener(&mut self, listener_id: ListenerId) -> Result<ResourceRecord> {
-        self.listeners
+    pub(super) fn release_listener(
+        &mut self,
+        listener_id: ListenerId,
+        registry: &Registry,
+    ) -> Result<ReleasedTcpListener> {
+        let entry = self
+            .listeners
             .remove(listener_id.0)
-            .ok_or(Error::UnknownListener { listener_id })
+            .ok_or(Error::UnknownListener { listener_id })?;
+        let mut listener = entry.listener;
+        if let Some(listener) = listener.as_mut() {
+            if entry.registered {
+                let deregister_result = registry.deregister(listener);
+                if let Err(error) = deregister_result {
+                    log::warn!(
+                        "failed to deregister TCP listener {} during release: {}",
+                        listener_id,
+                        error
+                    );
+                }
+            }
+        }
+
+        let pending_connection_ids = self.pending_connections_for_listener(listener_id);
+        let mut pending_connection_records = Vec::with_capacity(pending_connection_ids.len());
+        for connection_id in pending_connection_ids {
+            let record = self.release_pending_connection(connection_id, registry)?;
+            pending_connection_records.push(record);
+        }
+
+        Ok(ReleasedTcpListener {
+            listener_record: entry.record,
+            pending_connection_records,
+        })
     }
 
     pub(super) fn release_connection(
@@ -203,7 +319,7 @@ impl TcpRuntimeState {
 
     pub(super) fn record_listener_readiness_hit(&mut self, listener_id: ListenerId) {
         if let Some(entry) = self.listeners.get_mut(listener_id.0) {
-            entry.readiness_hits += 1;
+            entry.record.readiness_hits += 1;
         }
     }
 
@@ -291,6 +407,195 @@ impl TcpRuntimeState {
         Ok(())
     }
 
+    pub(super) fn handle_listen(
+        &mut self,
+        listener_id: ListenerId,
+        local_addr: SocketAddr,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        let Some(entry) = self.listeners.get_mut(listener_id.0) else {
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenFailed {
+                listener_id,
+                local_addr,
+                error_kind: ErrorKind::NotFound,
+            }))?;
+            return Ok(());
+        };
+        if entry.is_open() {
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenFailed {
+                listener_id,
+                local_addr,
+                error_kind: ErrorKind::AlreadyExists,
+            }))?;
+            return Ok(());
+        }
+
+        let listener_result = MioTcpListener::bind(local_addr);
+        let mut listener = match listener_result {
+            Ok(listener) => listener,
+            Err(error) => {
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenFailed {
+                    listener_id,
+                    local_addr,
+                    error_kind: error.kind(),
+                }))?;
+                return Ok(());
+            }
+        };
+        let bound_addr = match listener.local_addr() {
+            Ok(bound_addr) => bound_addr,
+            Err(error) => {
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenFailed {
+                    listener_id,
+                    local_addr,
+                    error_kind: error.kind(),
+                }))?;
+                return Ok(());
+            }
+        };
+        let register_result =
+            registry.register(&mut listener, entry.record.token, Interest::READABLE);
+        if let Err(error) = register_result {
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenFailed {
+                listener_id,
+                local_addr,
+                error_kind: error.kind(),
+            }))?;
+            return Ok(());
+        }
+
+        entry.listener = Some(listener);
+        entry.local_addr = Some(bound_addr);
+        entry.registered = true;
+        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Listening {
+            listener_id,
+            local_addr: bound_addr,
+        }))?;
+        Ok(())
+    }
+
+    pub(super) fn close_listener(
+        &mut self,
+        listener_id: ListenerId,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<Option<ReleasedTcpListener>> {
+        let release_result = self.release_listener(listener_id, registry);
+        let released = match release_result {
+            Ok(released) => released,
+            Err(Error::UnknownListener { .. }) => {
+                log::warn!(
+                    "ignored TCP listener close for unknown listener {}",
+                    listener_id
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ListenerClosed {
+            listener_id,
+        }))?;
+        Ok(Some(released))
+    }
+
+    pub(super) fn accept_next(
+        &mut self,
+        listener_id: ListenerId,
+    ) -> Result<Option<AcceptedTcpConnection>> {
+        let Some(entry) = self.listeners.get_mut(listener_id.0) else {
+            log::debug!(
+                "ignoring stale TCP listener readiness for unknown listener {}",
+                listener_id
+            );
+            return Ok(None);
+        };
+        let Some(listener) = entry.listener.as_mut() else {
+            log::debug!(
+                "ignoring stale TCP listener readiness for listener {} without OS handle",
+                listener_id
+            );
+            return Ok(None);
+        };
+
+        let accept_result = listener.accept();
+        match accept_result {
+            Ok((stream, peer_addr)) => Ok(Some(AcceptedTcpConnection { stream, peer_addr })),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(error) => {
+                log::error!("TCP listener {} accept failed: {}", listener_id, error);
+                Ok(None)
+            }
+        }
+    }
+
+    pub(super) fn install_accepted_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        listener_id: ListenerId,
+        accepted: AcceptedTcpConnection,
+    ) -> Result<()> {
+        let Some(entry) = self.connections.get_mut(connection_id.0) else {
+            return Err(Error::UnknownConnection { connection_id });
+        };
+
+        let record = entry.record;
+        *entry = TcpConnectionEntry::new_pending_accepted(
+            record,
+            listener_id,
+            accepted.stream,
+            accepted.peer_addr,
+        );
+        Ok(())
+    }
+
+    pub(super) fn adopt_accepted_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+    ) -> Result<()> {
+        let Some(entry) = self.connections.get_mut(connection_id.0) else {
+            return Err(Error::UnknownConnection { connection_id });
+        };
+        if !entry.is_pending_accepted() {
+            log::warn!(
+                "ignored TCP adopt for connection {} that is not pending adoption",
+                connection_id
+            );
+            return Ok(());
+        }
+
+        entry.pending_adoption = false;
+        entry.accepted_from = None;
+        let update_interest_result = apply_connection_interest(entry, registry);
+        update_interest_result.context(UpdateTcpInterestSnafu { connection_id })?;
+        Ok(())
+    }
+
+    pub(super) fn reject_accepted_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+    ) -> Result<Option<ResourceRecord>> {
+        let Some(entry) = self.connections.get(connection_id.0) else {
+            log::warn!(
+                "ignored TCP reject for unknown pending connection {}",
+                connection_id
+            );
+            return Ok(None);
+        };
+        if !entry.is_pending_accepted() {
+            log::warn!(
+                "ignored TCP reject for connection {} that is not pending adoption",
+                connection_id
+            );
+            return Ok(None);
+        }
+
+        let record = self.release_connection(connection_id, registry)?;
+        Ok(Some(record))
+    }
+
     pub(super) fn handle_send(
         &mut self,
         connection_id: ConnectionId,
@@ -315,7 +620,7 @@ impl TcpRuntimeState {
             }))?;
             return Ok(None);
         }
-        if entry.connect_pending {
+        if entry.connect_pending || entry.pending_adoption {
             event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
                 connection_id,
                 transmission_id,
@@ -360,6 +665,10 @@ impl TcpRuntimeState {
             log::warn!("ignored TCP close for unknown connection {}", connection_id);
             return Ok(None);
         };
+        if entry.pending_adoption {
+            let record = self.release_connection(connection_id, registry)?;
+            return Ok(Some(record));
+        }
 
         if entry.pending_send.is_some() {
             entry.close_after_flush = true;
@@ -424,7 +733,10 @@ impl TcpRuntimeState {
             .filter_map(|(slot, entry_opt)| {
                 entry_opt.as_ref().and_then(|entry| {
                     option_when!(
-                        entry.read_suspended && entry.is_open() && !entry.connect_pending,
+                        entry.read_suspended
+                            && entry.is_open()
+                            && !entry.connect_pending
+                            && !entry.pending_adoption,
                         ConnectionId(slot)
                     )
                 })
@@ -449,8 +761,8 @@ impl TcpRuntimeState {
             .iter()
             .map(|(slot, entry)| ResourceSnapshot {
                 slot,
-                token: entry.token,
-                readiness_hits: entry.readiness_hits,
+                token: entry.record.token,
+                readiness_hits: entry.record.readiness_hits,
             })
             .collect()
     }
@@ -746,6 +1058,46 @@ impl TcpRuntimeState {
         }))?;
         Ok(record)
     }
+
+    fn pending_connections_for_listener(&self, listener_id: ListenerId) -> Vec<ConnectionId> {
+        self.connections
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry_opt)| {
+                let entry = entry_opt.as_ref()?;
+                option_when!(
+                    entry.pending_adoption && entry.accepted_from == Some(listener_id),
+                    ConnectionId(slot)
+                )
+            })
+            .collect()
+    }
+
+    fn release_pending_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        registry: &Registry,
+    ) -> Result<ResourceRecord> {
+        let entry = self
+            .connections
+            .remove(connection_id.0)
+            .ok_or(Error::UnknownConnection { connection_id })?;
+        let mut stream = entry.stream;
+        if let Some(stream) = stream.as_mut() {
+            if entry.registered {
+                let deregister_result = registry.deregister(stream);
+                if let Err(error) = deregister_result {
+                    log::warn!(
+                        "failed to deregister pending TCP connection {} during release: {}",
+                        connection_id,
+                        error
+                    );
+                }
+            }
+        }
+        Ok(entry.record)
+    }
 }
 
 fn apply_connection_interest(
@@ -869,7 +1221,7 @@ mod tests {
         test_support::init_test_logger,
     };
     use std::{
-        net::TcpListener,
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
         sync::mpsc,
         time::{Duration, Instant},
     };
@@ -877,6 +1229,10 @@ mod tests {
     fn resolve_request<T>(request: Result<DriverRequest<T>>) -> T {
         let request = request.expect("enqueue driver request");
         wait_for_request(request).expect("resolve driver request")
+    }
+
+    fn localhost(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     }
 
     fn wait_for_event(driver: &IoDriver) -> DriverEvent {
@@ -896,11 +1252,212 @@ mod tests {
         }
     }
 
+    fn assert_no_event(driver: &IoDriver, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            let event = driver.try_next_event().expect("read driver event");
+            if let Some(event) = event {
+                panic!("unexpected flotsync_io driver event: {event:?}");
+            }
+
+            if Instant::now() >= deadline {
+                return;
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn payload_bytes(payload: IoPayload) -> Bytes {
         match payload {
             IoPayload::Lease(lease) => lease.create_byte_clone(),
             IoPayload::Bytes(bytes) => bytes,
         }
+    }
+
+    #[test]
+    fn tcp_listen_failure_is_reported() {
+        init_test_logger();
+
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("bind occupied TCP listener");
+        let local_addr = occupied.local_addr().expect("occupied listener addr");
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let listener_id = resolve_request(driver.reserve_listener());
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Listen {
+                listener_id,
+                local_addr,
+            }))
+            .expect("dispatch TCP listen");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::ListenFailed {
+                    listener_id: failed_id,
+                    local_addr: failed_addr,
+                    ..
+                }) if failed_id == listener_id => {
+                    assert_eq!(failed_addr, local_addr);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP listen failure: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn tcp_listener_accept_requires_adoption_before_reads() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let listener_id = resolve_request(driver.reserve_listener());
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Listen {
+                listener_id,
+                local_addr: localhost(0),
+            }))
+            .expect("dispatch TCP listen");
+
+        let listener_addr = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Listening {
+                    listener_id: listening_id,
+                    local_addr,
+                }) if listening_id == listener_id => {
+                    break local_addr;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP listening event: {:?}",
+                        other
+                    );
+                }
+            }
+        };
+
+        let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
+        let accepted_connection_id = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Accepted {
+                    listener_id: accepted_listener_id,
+                    connection_id,
+                    ..
+                }) if accepted_listener_id == listener_id => {
+                    break connection_id;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP accepted event: {:?}",
+                        other
+                    );
+                }
+            }
+        };
+
+        client
+            .write_all(b"pending")
+            .expect("write pending TCP payload");
+        assert_no_event(&driver, Duration::from_millis(50));
+
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::AdoptAccepted {
+                connection_id: accepted_connection_id,
+            }))
+            .expect("dispatch TCP adopt accepted");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Received {
+                    connection_id,
+                    payload,
+                }) if connection_id == accepted_connection_id => {
+                    assert_eq!(payload_bytes(payload), b"pending"[..]);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for adopted TCP payload: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        drop(client);
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn tcp_listener_reject_closes_pending_connection() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let listener_id = resolve_request(driver.reserve_listener());
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Listen {
+                listener_id,
+                local_addr: localhost(0),
+            }))
+            .expect("dispatch TCP listen");
+
+        let listener_addr = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Listening {
+                    listener_id: listening_id,
+                    local_addr,
+                }) if listening_id == listener_id => {
+                    break local_addr;
+                }
+                _ => {}
+            }
+        };
+
+        let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
+        let accepted_connection_id = loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Accepted {
+                    listener_id: accepted_listener_id,
+                    connection_id,
+                    ..
+                }) if accepted_listener_id == listener_id => {
+                    break connection_id;
+                }
+                _ => {}
+            }
+        };
+
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::RejectAccepted {
+                connection_id: accepted_connection_id,
+            }))
+            .expect("dispatch TCP reject accepted");
+
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = [0_u8; 1];
+        let read_result = client.read(&mut buf);
+        match read_result {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("unexpected client read result after reject: {other:?}"),
+        }
+        assert_no_event(&driver, Duration::from_millis(50));
+
+        driver.shutdown().expect("driver shuts down");
     }
 
     #[test]

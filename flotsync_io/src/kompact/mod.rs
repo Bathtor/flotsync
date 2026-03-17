@@ -6,6 +6,7 @@
 
 mod bridge;
 mod driver_component;
+mod listener;
 mod session;
 mod types;
 
@@ -16,7 +17,12 @@ pub use bridge::{IoBridge, IoBridgeHandle};
 pub use driver_component::IoDriverComponent;
 pub use types::{
     OpenFailureReason,
+    OpenTcpListener,
     OpenTcpSession,
+    PendingTcpSession,
+    TcpListenerEvent,
+    TcpListenerRef,
+    TcpListenerRequest,
     TcpSessionEvent,
     TcpSessionRef,
     TcpSessionRequest,

@@ -1,6 +1,12 @@
-use super::session::TcpSessionMessage;
-use crate::api::{CloseReason, IoPayload, SendFailureReason, SocketId, TransmissionId};
-use ::kompact::prelude::{ActorRefStrong, Port, Receiver, Recipient};
+use super::{
+    listener::{AcceptPendingTcpSession, TcpListenerMessage},
+    session::TcpSessionMessage,
+};
+use crate::{
+    api::{CloseReason, ConnectionId, IoPayload, SendFailureReason, SocketId, TransmissionId},
+    errors::Result,
+};
+use ::kompact::prelude::{ActorRefStrong, KFuture, Port, Receiver, Recipient, promise};
 use std::{io, net::SocketAddr};
 
 /// Describes why an open-style operation could not make the requested socket or session usable.
@@ -126,6 +132,154 @@ pub enum UdpSendResult {
         transmission_id: TransmissionId,
         reason: SendFailureReason,
     },
+}
+
+/// Request used with the TCP listener manager side of an [`IoBridge`](super::IoBridge).
+///
+/// Sending this request asks the bridge to allocate one inbound TCP listener endpoint, start an
+/// asynchronous listen attempt, and route future listener events to `incoming_to`.
+#[derive(Clone, Debug)]
+pub struct OpenTcpListener {
+    /// Local TCP socket address to bind and listen on.
+    pub local_addr: SocketAddr,
+    /// Recipient that will receive listener lifecycle and pending incoming-session events.
+    pub incoming_to: Recipient<TcpListenerEvent>,
+}
+
+/// Requests accepted by one Kompact TCP listener endpoint.
+#[derive(Clone, Debug)]
+pub enum TcpListenerRequest {
+    /// Closes the listener and stops accepting new inbound connections.
+    Close,
+}
+
+/// Events emitted for one Kompact TCP listener.
+#[derive(Debug)]
+pub enum TcpListenerEvent {
+    /// Reports that the listener is now bound and accepting inbound TCP connections.
+    Listening { local_addr: SocketAddr },
+    /// Reports that the requested listener could not be made usable.
+    ListenFailed {
+        local_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    /// Reports one newly accepted inbound TCP connection that is waiting for application logic to
+    /// decide whether to accept or reject it.
+    ///
+    /// The contained [`PendingTcpSession`] is deliberately not cloneable. Exactly one decision
+    /// owns the accepted socket: accept it into a session, reject it, or drop the handle and let
+    /// it auto-reject.
+    Incoming {
+        peer_addr: SocketAddr,
+        pending: PendingTcpSession,
+    },
+    /// Reports that the listener reached a terminal closed state.
+    Closed,
+}
+
+/// Strong request endpoint for one Kompact TCP listener.
+///
+/// The bridge returns this handle when opening a listener. All requests sent through it are
+/// implicitly associated with that listener; callers do not have to keep or repeat a
+/// `ListenerId`.
+#[derive(Clone, Debug)]
+pub struct TcpListenerRef {
+    actor: ActorRefStrong<TcpListenerMessage>,
+}
+
+impl TcpListenerRef {
+    pub(crate) fn new(actor: ActorRefStrong<TcpListenerMessage>) -> Self {
+        Self { actor }
+    }
+
+    /// Sends one request to the underlying TCP listener endpoint.
+    pub fn tell(&self, request: TcpListenerRequest) {
+        self.actor.tell(TcpListenerMessage::Request(request));
+    }
+
+    /// Returns a narrowed recipient for this listener.
+    pub fn recipient(&self) -> Recipient<TcpListenerRequest> {
+        self.actor.recipient()
+    }
+}
+
+/// Pending inbound TCP session that still needs an application-level accept/reject decision.
+///
+/// The raw driver already accepted the operating-system socket, but it has not yet enabled normal
+/// session I/O. Callers must either accept or reject the pending connection. Dropping the value
+/// without making a decision triggers a best-effort reject so pending accepted sockets do not
+/// linger forever.
+#[derive(Debug)]
+pub struct PendingTcpSession {
+    inner: Option<PendingTcpSessionInner>,
+}
+
+#[derive(Debug)]
+struct PendingTcpSessionInner {
+    listener: ActorRefStrong<TcpListenerMessage>,
+    connection_id: ConnectionId,
+}
+
+impl PendingTcpSession {
+    pub(crate) fn new(
+        listener: ActorRefStrong<TcpListenerMessage>,
+        connection_id: ConnectionId,
+    ) -> Self {
+        Self {
+            inner: Some(PendingTcpSessionInner {
+                listener,
+                connection_id,
+            }),
+        }
+    }
+
+    /// Accepts the inbound connection and attaches it to a new TCP session endpoint.
+    ///
+    /// `events_to` receives all future lifecycle and I/O events for the accepted session. The
+    /// returned future resolves once the session actor exists, owns the accepted connection, and
+    /// the raw driver has enabled normal session readiness.
+    pub fn accept(
+        mut self,
+        events_to: Recipient<TcpSessionEvent>,
+    ) -> KFuture<Result<TcpSessionRef>> {
+        let inner = self.take_inner();
+        let request = AcceptPendingTcpSession {
+            connection_id: inner.connection_id,
+            events_to,
+        };
+        let (promise, future) = promise::<Result<TcpSessionRef>>();
+        inner.listener.tell(TcpListenerMessage::AcceptPending(
+            ::kompact::prelude::Ask::new(promise, request),
+        ));
+        future
+    }
+
+    /// Rejects the inbound connection and releases its driver-owned resources.
+    pub fn reject(mut self) -> KFuture<Result<()>> {
+        let inner = self.take_inner();
+        let (promise, future) = promise::<Result<()>>();
+        inner.listener.tell(TcpListenerMessage::RejectPending(
+            ::kompact::prelude::Ask::new(promise, inner.connection_id),
+        ));
+        future
+    }
+
+    fn take_inner(&mut self) -> PendingTcpSessionInner {
+        self.inner.take().unwrap_or_else(|| {
+            panic!("pending TCP session decision handle may only be consumed once")
+        })
+    }
+}
+
+impl Drop for PendingTcpSession {
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        inner
+            .listener
+            .tell(TcpListenerMessage::DropPending(inner.connection_id));
+    }
 }
 
 /// Request used with the TCP manager side of an [`IoBridge`](super::IoBridge).

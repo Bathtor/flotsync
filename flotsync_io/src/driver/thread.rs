@@ -80,6 +80,13 @@ pub(super) fn run_driver_thread(
                 continue 'event_loop;
             };
             match key {
+                ResourceKey::Listener(listener_id) if event.is_readable() => {
+                    state.handle_tcp_listener_ready(
+                        listener_id,
+                        poll.registry(),
+                        event_sink.as_ref(),
+                    )?;
+                }
                 ResourceKey::Connection(connection_id) => {
                     state.handle_tcp_ready(
                         connection_id,

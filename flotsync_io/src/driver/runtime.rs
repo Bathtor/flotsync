@@ -3,12 +3,12 @@ use super::{
     DriverEventSink,
     DriverToken,
     registry::{SlotRegistry, readiness_slot_to_token, token_to_readiness_slot},
-    tcp::TcpRuntimeState,
+    tcp::{ReleasedTcpListener, TcpRuntimeState},
     thread::send_reply,
     udp::UdpRuntimeState,
 };
 use crate::{
-    api::{ConnectionId, ListenerId, SocketId, TcpCommand, UdpCommand},
+    api::{ConnectionId, ListenerId, SocketId, TcpCommand, TcpEvent, UdpCommand},
     errors::Result,
 };
 use mio::Registry;
@@ -111,9 +111,13 @@ impl DriverRuntimeState {
         socket_id
     }
 
-    pub(super) fn release_listener(&mut self, listener_id: ListenerId) -> Result<()> {
-        let entry = self.tcp.release_listener(listener_id)?;
-        self.release_readiness(entry.token);
+    pub(super) fn release_listener(
+        &mut self,
+        listener_id: ListenerId,
+        registry: &Registry,
+    ) -> Result<()> {
+        let released = self.tcp.release_listener(listener_id, registry)?;
+        self.release_listener_readiness(released);
         Ok(())
     }
 
@@ -166,6 +170,42 @@ impl DriverRuntimeState {
     ) -> Result<()> {
         self.udp
             .handle_readable(socket_id, registry, ingress_pool, event_sink)
+    }
+
+    pub(super) fn handle_tcp_listener_ready(
+        &mut self,
+        listener_id: ListenerId,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        loop {
+            let accepted = self.tcp.accept_next(listener_id)?;
+            let Some(accepted) = accepted else {
+                return Ok(());
+            };
+
+            let connection_id = self.reserve_connection();
+            let peer_addr = accepted.peer_addr;
+            let install_result =
+                self.tcp
+                    .install_accepted_connection(connection_id, listener_id, accepted);
+            if let Err(error) = install_result {
+                log::error!(
+                    "failed to install accepted TCP connection {} for listener {}: {}",
+                    connection_id,
+                    listener_id,
+                    error
+                );
+                self.release_connection(connection_id, registry)?;
+                continue;
+            }
+
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Accepted {
+                listener_id,
+                connection_id,
+                peer_addr,
+            }))?;
+        }
     }
 
     pub(super) fn resume_suspended_udp_reads(
@@ -250,11 +290,28 @@ impl DriverRuntimeState {
                                     event_sink,
                                 )?;
                             }
-                            TcpCommand::Listen { listener_id, .. } => {
-                                log::debug!(
-                                    "flotsync_io TCP listener support is not implemented yet; dropping listen command for {}",
-                                    listener_id
-                                );
+                            TcpCommand::Listen {
+                                listener_id,
+                                local_addr,
+                            } => {
+                                self.tcp.handle_listen(
+                                    listener_id,
+                                    local_addr,
+                                    registry,
+                                    event_sink,
+                                )?;
+                            }
+                            TcpCommand::AdoptAccepted { connection_id } => {
+                                self.tcp
+                                    .adopt_accepted_connection(connection_id, registry)?;
+                            }
+                            TcpCommand::RejectAccepted { connection_id } => {
+                                let closed_record = self
+                                    .tcp
+                                    .reject_accepted_connection(connection_id, registry)?;
+                                if let Some(record) = closed_record {
+                                    self.release_readiness(record.token);
+                                }
                             }
                             TcpCommand::Send {
                                 connection_id,
@@ -284,6 +341,13 @@ impl DriverRuntimeState {
                                 )?;
                                 if let Some(record) = closed_record {
                                     self.release_readiness(record.token);
+                                }
+                            }
+                            TcpCommand::CloseListener { listener_id } => {
+                                let closed_listener =
+                                    self.tcp.close_listener(listener_id, registry, event_sink)?;
+                                if let Some(closed_listener) = closed_listener {
+                                    self.release_listener_readiness(closed_listener);
                                 }
                             }
                         },
@@ -354,7 +418,7 @@ impl DriverRuntimeState {
                     listener_id,
                     reply_tx,
                 } => {
-                    let result = self.release_listener(listener_id);
+                    let result = self.release_listener(listener_id, registry);
                     send_reply(reply_tx, result, "listener release");
                 }
                 ControlCommand::ReleaseConnection {
@@ -399,6 +463,13 @@ impl DriverRuntimeState {
             return;
         };
         let _ = self.readiness_keys.remove(readiness_slot);
+    }
+
+    fn release_listener_readiness(&mut self, released: ReleasedTcpListener) {
+        self.release_readiness(released.listener_record.token);
+        for record in released.pending_connection_records {
+            self.release_readiness(record.token);
+        }
     }
 
     #[cfg(test)]
@@ -446,7 +517,10 @@ pub(super) struct ResourceSnapshot {
 pub(super) enum CommandTrace {
     TcpConnect(ConnectionId),
     TcpListen(ListenerId),
+    TcpAdopt(ConnectionId),
+    TcpReject(ConnectionId),
     TcpSend(ConnectionId),
+    TcpCloseListener(ListenerId),
     TcpClose(ConnectionId),
     UdpBind(SocketId),
     UdpConnect(SocketId),
@@ -464,8 +538,17 @@ impl From<&DriverCommand> for CommandTrace {
             DriverCommand::Tcp(TcpCommand::Listen { listener_id, .. }) => {
                 Self::TcpListen(*listener_id)
             }
+            DriverCommand::Tcp(TcpCommand::AdoptAccepted { connection_id }) => {
+                Self::TcpAdopt(*connection_id)
+            }
+            DriverCommand::Tcp(TcpCommand::RejectAccepted { connection_id }) => {
+                Self::TcpReject(*connection_id)
+            }
             DriverCommand::Tcp(TcpCommand::Send { connection_id, .. }) => {
                 Self::TcpSend(*connection_id)
+            }
+            DriverCommand::Tcp(TcpCommand::CloseListener { listener_id }) => {
+                Self::TcpCloseListener(*listener_id)
             }
             DriverCommand::Tcp(TcpCommand::Close { connection_id, .. }) => {
                 Self::TcpClose(*connection_id)

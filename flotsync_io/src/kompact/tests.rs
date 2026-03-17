@@ -2,7 +2,9 @@ use super::{
     IoBridge,
     IoBridgeHandle,
     IoDriverComponent,
+    OpenTcpListener,
     OpenTcpSession,
+    TcpListenerEvent,
     TcpSessionEvent,
     TcpSessionRequest,
     UdpIndication,
@@ -128,6 +130,38 @@ impl Actor for TcpSessionEventProbe {
 
     fn receive_network(&mut self, _msg: NetMessage) -> Handled {
         unimplemented!("TCP session probe does not use network actor messages")
+    }
+}
+
+#[derive(ComponentDefinition)]
+struct TcpListenerEventProbe {
+    ctx: ComponentContext<Self>,
+    events: mpsc::Sender<TcpListenerEvent>,
+}
+
+impl TcpListenerEventProbe {
+    fn new(events: mpsc::Sender<TcpListenerEvent>) -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            events,
+        }
+    }
+}
+
+ignore_lifecycle!(TcpListenerEventProbe);
+
+impl Actor for TcpListenerEventProbe {
+    type Message = TcpListenerEvent;
+
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        self.events
+            .send(msg)
+            .expect("TCP listener event receiver must be live during test");
+        Handled::Ok
+    }
+
+    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
+        unimplemented!("TCP listener probe does not use network actor messages")
     }
 }
 
@@ -463,6 +497,181 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     drop(session_ref);
     drop(bridge_handle);
     kill_component(&system, event_probe);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
+fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
+    init_test_logger();
+
+    let system = KompactConfig::default().build().expect("KompactSystem");
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (listener_events_tx, listener_events_rx) = mpsc::channel();
+    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_events_tx));
+    let (session_events_tx, session_events_rx) = mpsc::channel();
+    let session_probe = system.create(move || TcpSessionEventProbe::new(session_events_tx));
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &listener_probe);
+    start_component(&system, &session_probe);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let listener_ref = bridge_handle
+        .open_tcp_listener(OpenTcpListener {
+            local_addr: localhost(0),
+            incoming_to: listener_probe.actor_ref().recipient(),
+        })
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("TCP listener open future")
+        .expect("TCP listener open");
+
+    let listener_addr = match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Listening { .. })
+    }) {
+        TcpListenerEvent::Listening { local_addr } => local_addr,
+        other => unreachable!("filtered to TCP listener Listening, got {other:?}"),
+    };
+
+    let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
+    let pending = match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Incoming { .. })
+    }) {
+        TcpListenerEvent::Incoming { pending, .. } => pending,
+        other => unreachable!("filtered to TCP listener Incoming, got {other:?}"),
+    };
+
+    client
+        .write_all(b"hello")
+        .expect("write pending TCP payload");
+    assert!(
+        session_events_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err()
+    );
+
+    let session_ref = pending
+        .accept(session_probe.actor_ref().recipient())
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("pending TCP session accept future")
+        .expect("pending TCP session accept");
+
+    match recv_until(&session_events_rx, |_| true) {
+        TcpSessionEvent::Received { payload } => {
+            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+        }
+        other => {
+            panic!("expected accepted TCP session to start with Received, got {other:?}");
+        }
+    }
+
+    session_ref.tell(TcpSessionRequest::Close { abort: false });
+    match recv_until(&session_events_rx, |event| {
+        matches!(event, TcpSessionEvent::Closed { .. })
+    }) {
+        TcpSessionEvent::Closed { reason } => {
+            assert!(matches!(
+                reason,
+                CloseReason::Graceful | CloseReason::Aborted
+            ));
+        }
+        other => unreachable!("filtered to TCP session Closed, got {other:?}"),
+    }
+
+    listener_ref.tell(super::TcpListenerRequest::Close);
+    match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Closed)
+    }) {
+        TcpListenerEvent::Closed => {}
+        other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
+    }
+
+    drop(client);
+    drop(session_ref);
+    drop(listener_ref);
+    drop(bridge_handle);
+    kill_component(&system, session_probe);
+    kill_component(&system, listener_probe);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
+fn dropping_pending_tcp_session_rejects_the_connection() {
+    init_test_logger();
+
+    let system = KompactConfig::default().build().expect("KompactSystem");
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (listener_events_tx, listener_events_rx) = mpsc::channel();
+    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_events_tx));
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &listener_probe);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let listener_ref = bridge_handle
+        .open_tcp_listener(OpenTcpListener {
+            local_addr: localhost(0),
+            incoming_to: listener_probe.actor_ref().recipient(),
+        })
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("TCP listener open future")
+        .expect("TCP listener open");
+
+    let listener_addr = match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Listening { .. })
+    }) {
+        TcpListenerEvent::Listening { local_addr } => local_addr,
+        other => unreachable!("filtered to TCP listener Listening, got {other:?}"),
+    };
+
+    let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set client read timeout");
+    let pending = match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Incoming { .. })
+    }) {
+        TcpListenerEvent::Incoming { pending, .. } => pending,
+        other => unreachable!("filtered to TCP listener Incoming, got {other:?}"),
+    };
+
+    drop(pending);
+
+    let mut buf = [0_u8; 1];
+    let read_result = client.read(&mut buf);
+    match read_result {
+        Ok(0) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        other => panic!("unexpected client read result after dropping pending session: {other:?}"),
+    }
+
+    listener_ref.tell(super::TcpListenerRequest::Close);
+    match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Closed)
+    }) {
+        TcpListenerEvent::Closed => {}
+        other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
+    }
+
+    drop(client);
+    drop(listener_ref);
+    drop(bridge_handle);
+    kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
     system.shutdown().expect("Kompact shutdown");
