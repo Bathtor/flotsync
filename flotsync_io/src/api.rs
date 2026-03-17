@@ -1,27 +1,8 @@
-//! Typed command and event surfaces shared between the driver core and Kompact bridges.
+//! Raw transport command and event surfaces shared by the driver core and adapter layers.
 
 use crate::pool::IoLease;
-use ::kompact::prelude::Port;
 use bytes::Bytes;
 use std::{fmt, io, net::SocketAddr};
-
-/// Typed Kompact port for TCP-oriented freeform I/O.
-#[derive(Clone, Copy, Debug)]
-pub struct TcpPort;
-
-impl Port for TcpPort {
-    type Request = TcpCommand;
-    type Indication = TcpEvent;
-}
-
-/// Typed Kompact port for UDP-oriented freeform I/O.
-#[derive(Clone, Copy, Debug)]
-pub struct UdpPort;
-
-impl Port for UdpPort {
-    type Request = UdpCommand;
-    type Indication = UdpEvent;
-}
 
 /// Driver-local handle for a listening TCP socket.
 ///
@@ -155,6 +136,7 @@ pub enum TcpCommand {
     /// Initiates an outbound TCP connection associated with the provided local handle.
     Connect {
         connection_id: ConnectionId,
+        local_addr: Option<SocketAddr>,
         remote_addr: SocketAddr,
     },
     /// Binds and starts listening on a local TCP socket associated with the provided listener handle.
@@ -206,10 +188,14 @@ pub enum TcpEvent {
         connection_id: ConnectionId,
         payload: IoPayload,
     },
-    /// Confirms that a previously requested send was accepted and completed.
-    SendAck { transmission_id: TransmissionId },
+    /// Confirms that a previously requested send on the identified TCP connection completed.
+    SendAck {
+        connection_id: ConnectionId,
+        transmission_id: TransmissionId,
+    },
     /// Reports that a previously requested send could not be accepted or completed.
     SendNack {
+        connection_id: ConnectionId,
         transmission_id: TransmissionId,
         reason: SendFailureReason,
     },
@@ -289,10 +275,14 @@ pub enum UdpEvent {
         source: SocketAddr,
         payload: IoPayload,
     },
-    /// Confirms that a previously requested datagram send was accepted and completed.
-    SendAck { transmission_id: TransmissionId },
+    /// Confirms that a previously requested datagram send on the identified UDP socket completed.
+    SendAck {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+    },
     /// Reports that a previously requested datagram send could not be accepted or completed.
     SendNack {
+        socket_id: SocketId,
         transmission_id: TransmissionId,
         reason: SendFailureReason,
     },

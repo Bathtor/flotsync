@@ -40,6 +40,31 @@ const WAKE_TOKEN: Token = Token(0);
 const DEFAULT_EVENTS_CAPACITY: usize = 1024;
 const DEFAULT_THREAD_NAME: &str = "flotsync-io-driver";
 
+/// Delivery target for transport events emitted by the raw driver thread.
+///
+/// The default test-oriented path uses a crossbeam channel sink, but Kompact integration can
+/// provide an actor-backed sink so driver events enter Kompact-land directly without an extra
+/// forwarding thread.
+pub trait DriverEventSink: Send + Sync + 'static {
+    /// Publishes a raw driver event to the configured consumer.
+    fn publish(&self, event: DriverEvent) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct ChannelDriverEventSink {
+    sender: crossbeam_channel::Sender<DriverEvent>,
+}
+
+impl DriverEventSink for ChannelDriverEventSink {
+    fn publish(&self, event: DriverEvent) -> Result<()> {
+        let send_result = self.sender.send(event);
+        if send_result.is_err() {
+            return Err(Error::DriverEventChannelClosed);
+        }
+        Ok(())
+    }
+}
+
 /// Driver-owned registration token space reserved for mio resources.
 ///
 /// `Token(0)` is reserved for the driver's internal [`mio::Waker`]. Resource registrations start
@@ -131,7 +156,7 @@ pub struct IoDriver {
     config: DriverConfig,
     buffers: IoBufferPools,
     command_tx: crossbeam_channel::Sender<ControlCommand>,
-    event_rx: crossbeam_channel::Receiver<DriverEvent>,
+    event_rx: Option<crossbeam_channel::Receiver<DriverEvent>>,
     waker: Arc<Waker>,
     handle: Option<JoinHandle<Result<()>>>,
 }
@@ -148,6 +173,19 @@ impl fmt::Debug for IoDriver {
 impl IoDriver {
     /// Starts the dedicated mio driver thread and waits until the runtime is ready.
     pub fn start(config: DriverConfig) -> Result<Self> {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let event_sink: Arc<dyn DriverEventSink> =
+            Arc::new(ChannelDriverEventSink { sender: event_tx });
+        let mut driver = Self::start_with_event_sink(config, event_sink)?;
+        driver.event_rx = Some(event_rx);
+        Ok(driver)
+    }
+
+    /// Starts the dedicated mio driver thread and publishes raw events to the supplied sink.
+    pub fn start_with_event_sink(
+        config: DriverConfig,
+        event_sink: Arc<dyn DriverEventSink>,
+    ) -> Result<Self> {
         log::info!(
             "starting flotsync_io driver thread '{}'",
             config.thread_name
@@ -173,7 +211,6 @@ impl IoDriver {
         let runner_ingress_pool = buffers.ingress();
 
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
-        let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
 
         let thread_config = DriverThreadConfig::from(&config);
@@ -184,7 +221,7 @@ impl IoDriver {
                     thread_config,
                     poll,
                     command_rx,
-                    event_tx,
+                    event_sink,
                     startup_tx,
                     runner_ingress_pool,
                 )
@@ -202,7 +239,7 @@ impl IoDriver {
             config,
             buffers,
             command_tx,
-            event_rx,
+            event_rx: None,
             waker: runtime_waker,
             handle: Some(handle),
         })
@@ -298,7 +335,11 @@ impl IoDriver {
 
     /// Attempts to retrieve the next emitted transport event without blocking.
     pub fn try_next_event(&self) -> Result<Option<DriverEvent>> {
-        match self.event_rx.try_recv() {
+        let Some(event_rx) = &self.event_rx else {
+            return Err(Error::DriverEventReceiverUnavailable);
+        };
+
+        match event_rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -528,6 +569,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr: localhost(9001),
             }))
             .expect("dispatch connect");

@@ -1,5 +1,5 @@
 use super::{
-    DriverEvent,
+    DriverEventSink,
     DriverThreadConfig,
     WAKE_TOKEN,
     runtime::{DriverRuntimeState, ResourceKey},
@@ -16,7 +16,7 @@ pub(super) fn run_driver_thread(
     config: DriverThreadConfig,
     mut poll: Poll,
     command_rx: crossbeam_channel::Receiver<super::runtime::ControlCommand>,
-    event_tx: crossbeam_channel::Sender<DriverEvent>,
+    event_sink: std::sync::Arc<dyn DriverEventSink>,
     startup_tx: std::sync::mpsc::SyncSender<Result<()>>,
     ingress_pool: IngressPool,
 ) -> Result<()> {
@@ -55,15 +55,23 @@ pub(super) fn run_driver_thread(
                 let should_stop = state.drain_commands(
                     &command_rx,
                     poll.registry(),
-                    &event_tx,
+                    event_sink.as_ref(),
                     &mut udp_send_scratch,
                 )?;
                 if should_stop {
                     log::info!("flotsync_io driver thread leaving poll loop");
                     return Ok(());
                 }
-                state.resume_suspended_udp_reads(poll.registry(), &ingress_pool, &event_tx)?;
-                state.resume_suspended_tcp_reads(poll.registry(), &ingress_pool, &event_tx)?;
+                state.resume_suspended_udp_reads(
+                    poll.registry(),
+                    &ingress_pool,
+                    event_sink.as_ref(),
+                )?;
+                state.resume_suspended_tcp_reads(
+                    poll.registry(),
+                    &ingress_pool,
+                    event_sink.as_ref(),
+                )?;
                 continue 'event_loop;
             }
 
@@ -77,7 +85,7 @@ pub(super) fn run_driver_thread(
                         connection_id,
                         poll.registry(),
                         &ingress_pool,
-                        &event_tx,
+                        event_sink.as_ref(),
                         event.is_readable(),
                         event.is_writable(),
                     )?;
@@ -87,7 +95,7 @@ pub(super) fn run_driver_thread(
                         socket_id,
                         poll.registry(),
                         &ingress_pool,
-                        &event_tx,
+                        event_sink.as_ref(),
                     )?;
                 }
                 ResourceKey::Listener(_) | ResourceKey::Socket(_) => {}

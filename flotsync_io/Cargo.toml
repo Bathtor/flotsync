@@ -11,6 +11,7 @@ futures-channel = "0.3"
 kompact = { workspace = true }
 log = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
+socket2 = "0.5"
 snafu = { workspace = true }
 
 [dev-dependencies]

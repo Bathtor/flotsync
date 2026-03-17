@@ -1025,6 +1025,7 @@ dependencies = [
  "mio 1.0.4",
  "simple_logger",
  "snafu",
+ "socket2",
 ]
 
 [[package]]

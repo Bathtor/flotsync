@@ -8,40 +8,58 @@ v1 adds Kompact-native freeform network I/O for raw bytes over UDP and TCP.
 
 - Backend is `mio` (no Tokio runtime dependency).
 - Single driver thread for correctness-first behavior.
-- Kompact-facing API uses typed ports/channels.
-- Explicit backpressure signaling (ack/nack/suspend/resume), not bounded queues.
 - Shared ingress and egress buffer pools with drop-based lease return.
-- Listener bridge owns accepted TCP connections in v1.
+- Explicit backpressure signaling (ack/nack/suspend/resume), not bounded queues.
+- Listener-owned accepted TCP connections remain a separate step after the first Kompact bridge.
 
 ## Non-Goals (v1)
 
 - HTTP.
 - Multi-threaded I/O sharding.
 - `WriteFile`/sendfile support (API should stay extensible for this).
+- Making the raw core API and the Kompact-facing API identical.
+
+## Layering
+
+`flotsync_io` deliberately has two API layers:
+
+1. Raw core API
+   - transport-oriented
+   - local-handle based (`SocketId`, `ConnectionId`, `ListenerId`)
+   - suitable for the internal `mio` driver and non-Kompact tests
+
+2. Kompact-facing API
+   - shaped around Kompact communication patterns
+   - UDP uses typed ports
+   - TCP uses manager/session actor-style communication
+
+The raw core API is not the user-facing Kompact API. The Kompact layer adapts the driver to
+something that fits Kompact semantics better.
 
 ## High-Level Model
 
-- `IoDriver`: one heavy shared component per `KompactSystem`.
-  - Owns `mio::Poll`, socket tables, multicast state, and shared pools.
-- `IoBridge`: lightweight per-client bridge component.
-  - Exposes typed ports to client components.
-  - Routes commands/events between client and `IoDriver`.
+- Raw `IoDriver`
+  - owns `mio::Poll`, socket tables, readiness state, and shared pools
+  - runs on a dedicated OS thread
+  - emits transport events through a pluggable event sink
 
-## API Shape (Sketch)
+- `IoDriverComponent`
+  - one heavy shared Kompact component per `KompactSystem`
+  - owns the raw `IoDriver`
+  - owns bridge/session routing state inside Kompact-land
 
-```rust
-pub struct TcpPort;
-impl Port for TcpPort {
-    type Request = TcpCommand;
-    type Indication = TcpEvent;
-}
+- `IoBridge`
+  - one lightweight per-client Kompact component
+  - provides shared UDP capability via typed ports
+  - acts as TCP manager for opening outbound sessions
 
-pub struct UdpPort;
-impl Port for UdpPort {
-    type Request = UdpCommand;
-    type Indication = UdpEvent;
-}
-```
+- `TcpSession`
+  - one Kompact actor/component endpoint per established outbound TCP connection
+  - represents the session identity instead of repeatedly passing `ConnectionId`
+
+## Raw Core API Shape
+
+The raw core API remains close to the current driver-facing types:
 
 ```rust
 pub struct ListenerId(pub usize);
@@ -53,48 +71,301 @@ pub struct TransmissionId(pub usize);
 ```rust
 pub enum IoPayload {
     Lease(IoLease),
-    Bytes(bytes::Bytes), // compatibility/edge path
+    Bytes(bytes::Bytes),
 }
 ```
 
 - `IoLease` is an immutable, cloneable shared payload handle.
 - Reading is done via a separate `IoCursor`, so the same payload can be replayed many times.
 
+### Raw Send Outcome Semantics
+
+Raw driver send outcomes must always carry the local socket/connection handle in addition to the
+`TransmissionId`.
+
+This avoids any requirement that multiple clients coordinate `TransmissionId` values globally.
+
+Recommended shape:
+
+```rust
+TcpEvent::SendAck {
+    connection_id: ConnectionId,
+    transmission_id: TransmissionId,
+}
+
+TcpEvent::SendNack {
+    connection_id: ConnectionId,
+    transmission_id: TransmissionId,
+    reason: SendFailureReason,
+}
+
+UdpEvent::SendAck {
+    socket_id: SocketId,
+    transmission_id: TransmissionId,
+}
+
+UdpEvent::SendNack {
+    socket_id: SocketId,
+    transmission_id: TransmissionId,
+    reason: SendFailureReason,
+}
+```
+
+## Kompact UDP API
+
+UDP is modeled as a shared capability and therefore maps well to a typed `Port`.
+
+### Surface
+
+```rust
+pub struct UdpPort;
+impl Port for UdpPort {
+    type Request = UdpRequest;
+    type Indication = UdpIndication;
+}
+```
+
+```rust
+pub enum UdpRequest {
+    Bind {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    },
+    Connect {
+        socket_id: SocketId,
+        remote_addr: SocketAddr,
+        local_addr: Option<SocketAddr>,
+    },
+    Send {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+        target: Option<SocketAddr>,
+        reply_to: Recipient<UdpSendResult>,
+    },
+    Close {
+        socket_id: SocketId,
+    },
+}
+```
+
+```rust
+pub enum OpenFailureReason {
+    Io(io::ErrorKind),
+    InvalidHandle,
+    DriverUnavailable,
+}
+```
+
+```rust
+pub enum UdpIndication {
+    Bound {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    },
+    BindFailed {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Connected {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    },
+    ConnectFailed {
+        socket_id: SocketId,
+        local_addr: Option<SocketAddr>,
+        remote_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Received {
+        socket_id: SocketId,
+        source: SocketAddr,
+        payload: IoPayload,
+    },
+    ReadSuspended {
+        socket_id: SocketId,
+    },
+    ReadResumed {
+        socket_id: SocketId,
+    },
+    WriteSuspended {
+        socket_id: SocketId,
+    },
+    WriteResumed {
+        socket_id: SocketId,
+    },
+    Closed {
+        socket_id: SocketId,
+    },
+}
+```
+
+```rust
+pub enum UdpSendResult {
+    Ack {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+    },
+    Nack {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+        reason: SendFailureReason,
+    },
+}
+```
+
+### Semantics
+
+- A single `IoBridge` provides one shared UDP capability to its connected components.
+- Multiple local components may observe the same socket's `Received` and lifecycle indications.
+- UDP bind/connect failures are broadcast as port indications because they describe the shared socket capability state.
+- UDP send outcomes are **not** broadcast as port indications.
+- Every UDP `Send` request must carry a `reply_to: Recipient<UdpSendResult>`.
+- `Ack` / `Nack` is delivered only to that recipient.
+- Unconnected UDP still routes send outcomes by the local `socket_id`; the per-send `target`
+  belongs to the command, not to the socket identity.
+
+This split is deliberate:
+
+- shared socket activity (`Received`, `Closed`, suspension/resume) is broadcast via the port
+- per-send completion is point-to-point via the supplied `Recipient`
+
+That keeps UDP's shared capability model while avoiding useless broadcast of send completion.
+
+## Kompact TCP API
+
+TCP is modeled as a manager/session API rather than a raw port carrying `ConnectionId` on every
+message.
+
+### Surface
+
+The bridge acts as a TCP session manager.
+
+```rust
+pub struct OpenTcpSession {
+    pub remote_addr: SocketAddr,
+    pub local_addr: Option<SocketAddr>,
+    pub events_to: Recipient<TcpSessionEvent>,
+}
+```
+
+Opening a session is an actor request/response operation:
+
+```rust
+bridge_ref.ask(OpenTcpSession {
+    remote_addr,
+    local_addr,
+}) -> Result<TcpSessionRef>
+```
+
+`TcpSessionRef` is then used for all traffic on that session:
+
+- it is a strong local session handle, not just a narrowed `Recipient`
+- `tell(TcpSessionRequest)` is the normal fast path
+- `recipient()` can still be derived when a `Recipient<TcpSessionRequest>` is specifically needed
+- session cleanup remains explicit and lifecycle-driven; dropping a `TcpSessionRef` does not by
+  itself define socket teardown semantics
+
+```rust
+pub enum TcpSessionRequest {
+    Send {
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+    },
+    Close {
+        abort: bool,
+    },
+}
+
+pub enum TcpSessionEvent {
+    Connected {
+        peer_addr: SocketAddr,
+    },
+    ConnectFailed {
+        remote_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Received {
+        payload: IoPayload,
+    },
+    SendAck {
+        transmission_id: TransmissionId,
+    },
+    SendNack {
+        transmission_id: TransmissionId,
+        reason: SendFailureReason,
+    },
+    ReadSuspended,
+    ReadResumed,
+    WriteSuspended,
+    WriteResumed,
+    Closed {
+        reason: CloseReason,
+    },
+}
+```
+
+### Semantics
+
+- Session identity is represented by the Kompact session endpoint, not by repeatedly exposing
+  `ConnectionId` to the client.
+- `TransmissionId` only needs to be meaningful within one session.
+- Later accepted inbound TCP connections can naturally reuse the same `TcpSessionRef` model.
+
 ## Backpressure Semantics
 
 - Every write carries a `TransmissionId`.
-- Driver emits `SendAck { transmission_id }` or `SendNack { transmission_id, reason }`.
-- Driver may emit `WriteSuspended { target }` and `WriteResumed { target }`.
+- UDP `SendAck` / `SendNack` is sent only to the per-send `Recipient`.
+- TCP `SendAck` / `SendNack` stays on the session event stream.
+- Driver may emit `WriteSuspended` / `WriteResumed`.
 - Inbound reads are push-based.
 - Inbound payload memory is lease-backed; dropping a lease returns capacity.
 - If read-side pool capacity is exhausted, read interest is disabled and `ReadSuspended` is emitted.
 - Reads resume automatically once capacity returns, then emit `ReadResumed`.
 
+## Driver Event Delivery
+
+The raw driver should not be hardwired to a crossbeam event receiver as its only output path.
+
+Instead, event delivery should be pluggable:
+
+- test path: channel-backed sink
+- Kompact path: actor-backed sink
+
+The driver thread already exists; the Kompact integration should not add another forwarding thread
+just to block on an event channel and relay the result into Kompact.
+
 ## Handle Type Choice
 
-- v1 uses `usize` for local handle identifiers because these are in-process runtime handles, not wire/persistence identifiers.
-- This maps naturally to index-based internal registries (for example slab-like tables) with minimal conversion overhead.
-- If we later need architecture-independent identifiers for cross-process/wire/state formats, we can introduce separate stable ID types at that boundary (for example `u64`).
+- v1 uses `usize` for local handle identifiers because these are in-process runtime handles, not
+  wire/persistence identifiers.
+- This maps naturally to index-based internal registries (for example slab-like tables) with
+  minimal conversion overhead.
+- If we later need architecture-independent identifiers for cross-process/wire/state formats, we
+  can introduce separate stable ID types at that boundary (for example `u64`).
 
 ## UDP v1
 
 - Bind/unbind.
 - Connected and unconnected send/receive.
 - Explicit connected-mode command/event path, not just `Send { target: None }`.
-- Broadcast.
-- Multicast join/leave (+ interface/ttl/loop controls).
+- Broadcast and multicast remain a later step than the first Kompact bridge.
 - Datagram size is currently bounded by the configured pool chunk size.
 
 ## TCP v1
 
 - Outbound connect.
 - Explicit connect-failed event for outbound connects.
-- Listener bind/accept.
 - Read/write raw bytes.
 - Graceful close and abort semantics.
+- Listener bind/accept remains a later step than the first Kompact bridge.
 
 ## Extensibility Notes
 
-- Keep command/event enums non-exhaustive internally so `WriteFile` can be added later.
+- Keep raw command/event enums extensible so `WriteFile` can be added later.
 - Keep payload abstraction flexible for future zero-copy/file-backed variants.
-- Add bridge-to-bridge accepted-connection transfer after v1 (TODO).
+- The Kompact layer intentionally has different abstractions for UDP and TCP; that difference is a
+  feature, not an inconsistency.
+- Accepted-connection transfer and listener-owned session bridging remain follow-up work.

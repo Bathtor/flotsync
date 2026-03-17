@@ -1,6 +1,6 @@
 #[cfg(test)]
 use super::runtime::ResourceSnapshot;
-use super::{DriverEvent, DriverToken, registry::SlotRegistry, runtime::ResourceRecord};
+use super::{DriverEventSink, DriverToken, registry::SlotRegistry, runtime::ResourceRecord};
 use crate::{
     api::{
         CloseReason,
@@ -18,10 +18,11 @@ use bytes::{Buf, Bytes};
 use flotsync_utils::option_when;
 use mio::{Interest, Registry, net::TcpStream as MioTcpStream};
 use snafu::ResultExt;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     io,
     io::{ErrorKind, Read, Write},
-    net::SocketAddr,
+    net::{SocketAddr, TcpStream as StdTcpStream},
 };
 
 /// TCP-side runtime state owned by the shared driver.
@@ -215,43 +216,38 @@ impl TcpRuntimeState {
     pub(super) fn handle_connect(
         &mut self,
         connection_id: ConnectionId,
+        local_addr: Option<SocketAddr>,
         remote_addr: SocketAddr,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
-            return emit_tcp_event(
-                event_tx,
-                TcpEvent::ConnectFailed {
-                    connection_id,
-                    remote_addr,
-                    error_kind: ErrorKind::NotFound,
-                },
-            );
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                connection_id,
+                remote_addr,
+                error_kind: ErrorKind::NotFound,
+            }))?;
+            return Ok(());
         };
         if entry.is_open() {
-            return emit_tcp_event(
-                event_tx,
-                TcpEvent::ConnectFailed {
-                    connection_id,
-                    remote_addr,
-                    error_kind: ErrorKind::AlreadyExists,
-                },
-            );
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                connection_id,
+                remote_addr,
+                error_kind: ErrorKind::AlreadyExists,
+            }))?;
+            return Ok(());
         }
 
-        let stream_result = MioTcpStream::connect(remote_addr);
+        let stream_result = connect_tcp_stream(local_addr, remote_addr);
         let stream = match stream_result {
             Ok(stream) => stream,
             Err(error) => {
-                return emit_tcp_event(
-                    event_tx,
-                    TcpEvent::ConnectFailed {
-                        connection_id,
-                        remote_addr,
-                        error_kind: error.kind(),
-                    },
-                );
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                    connection_id,
+                    remote_addr,
+                    error_kind: error.kind(),
+                }))?;
+                return Ok(());
             }
         };
 
@@ -259,14 +255,12 @@ impl TcpRuntimeState {
             Ok(true) => false,
             Ok(false) => true,
             Err(error_kind) => {
-                return emit_tcp_event(
-                    event_tx,
-                    TcpEvent::ConnectFailed {
-                        connection_id,
-                        remote_addr,
-                        error_kind,
-                    },
-                );
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                    connection_id,
+                    remote_addr,
+                    error_kind,
+                }))?;
+                return Ok(());
             }
         };
 
@@ -279,24 +273,19 @@ impl TcpRuntimeState {
         let apply_result = apply_connection_interest(entry, registry);
         if let Err(error) = apply_result {
             entry.reset_to_reserved();
-            return emit_tcp_event(
-                event_tx,
-                TcpEvent::ConnectFailed {
-                    connection_id,
-                    remote_addr,
-                    error_kind: error.kind(),
-                },
-            );
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                connection_id,
+                remote_addr,
+                error_kind: error.kind(),
+            }))?;
+            return Ok(());
         }
 
         if !connect_pending {
-            emit_tcp_event(
-                event_tx,
-                TcpEvent::Connected {
-                    connection_id,
-                    peer_addr: remote_addr,
-                },
-            )?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Connected {
+                connection_id,
+                peer_addr: remote_addr,
+            }))?;
         }
 
         Ok(())
@@ -308,55 +297,50 @@ impl TcpRuntimeState {
         transmission_id: TransmissionId,
         payload: IoPayload,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
-            emit_tcp_event(
-                event_tx,
-                TcpEvent::SendNack {
-                    transmission_id,
-                    reason: SendFailureReason::Closed,
-                },
-            )?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                connection_id,
+                transmission_id,
+                reason: SendFailureReason::Closed,
+            }))?;
             return Ok(None);
         };
         if !entry.is_open() {
-            emit_tcp_event(
-                event_tx,
-                TcpEvent::SendNack {
-                    transmission_id,
-                    reason: SendFailureReason::InvalidState,
-                },
-            )?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                connection_id,
+                transmission_id,
+                reason: SendFailureReason::InvalidState,
+            }))?;
             return Ok(None);
         }
         if entry.connect_pending {
-            emit_tcp_event(
-                event_tx,
-                TcpEvent::SendNack {
-                    transmission_id,
-                    reason: SendFailureReason::InvalidState,
-                },
-            )?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                connection_id,
+                transmission_id,
+                reason: SendFailureReason::InvalidState,
+            }))?;
             return Ok(None);
         }
         if entry.pending_send.is_some() {
-            emit_tcp_event(
-                event_tx,
-                TcpEvent::SendNack {
-                    transmission_id,
-                    reason: SendFailureReason::Backpressure,
-                },
-            )?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                connection_id,
+                transmission_id,
+                reason: SendFailureReason::Backpressure,
+            }))?;
             return Ok(None);
         }
         if payload.is_empty() {
-            emit_tcp_event(event_tx, TcpEvent::SendAck { transmission_id })?;
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendAck {
+                connection_id,
+                transmission_id,
+            }))?;
             return Ok(None);
         }
 
         entry.pending_send = Some(PendingTcpSend::new(transmission_id, payload));
-        self.flush_pending_send(connection_id, registry, event_tx)
+        self.flush_pending_send(connection_id, registry, event_sink)
     }
 
     pub(super) fn handle_close(
@@ -364,11 +348,11 @@ impl TcpRuntimeState {
         connection_id: ConnectionId,
         abort: bool,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         if abort {
             let record =
-                self.close_connection(connection_id, registry, CloseReason::Aborted, event_tx)?;
+                self.close_connection(connection_id, registry, CloseReason::Aborted, event_sink)?;
             return Ok(Some(record));
         }
 
@@ -385,7 +369,7 @@ impl TcpRuntimeState {
         }
 
         let record =
-            self.close_connection(connection_id, registry, CloseReason::Graceful, event_tx)?;
+            self.close_connection(connection_id, registry, CloseReason::Graceful, event_sink)?;
         Ok(Some(record))
     }
 
@@ -394,7 +378,7 @@ impl TcpRuntimeState {
         connection_id: ConnectionId,
         registry: &Registry,
         ingress_pool: &IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
         is_readable: bool,
         is_writable: bool,
     ) -> Result<Option<ResourceRecord>> {
@@ -403,20 +387,20 @@ impl TcpRuntimeState {
             None => false,
         };
         if should_complete_connect {
-            let closed_record = self.finish_connect(connection_id, registry, event_tx)?;
+            let closed_record = self.finish_connect(connection_id, registry, event_sink)?;
             if closed_record.is_some() {
                 return Ok(closed_record);
             }
         }
 
         if is_writable {
-            let closed_record = self.flush_pending_send(connection_id, registry, event_tx)?;
+            let closed_record = self.flush_pending_send(connection_id, registry, event_sink)?;
             if closed_record.is_some() {
                 return Ok(closed_record);
             }
         }
         if is_readable {
-            return self.handle_readable(connection_id, registry, ingress_pool, event_tx);
+            return self.handle_readable(connection_id, registry, ingress_pool, event_sink);
         }
 
         Ok(None)
@@ -426,7 +410,7 @@ impl TcpRuntimeState {
         &mut self,
         registry: &Registry,
         ingress_pool: &IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
         if !ingress_pool.has_available_capacity()? {
             return Ok(());
@@ -450,7 +434,9 @@ impl TcpRuntimeState {
         for connection_id in suspended_connections {
             let resumed = self.resume_read(connection_id, registry)?;
             if resumed {
-                emit_tcp_event(event_tx, TcpEvent::ReadResumed { connection_id })?;
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadResumed {
+                    connection_id,
+                }))?;
             }
         }
 
@@ -485,7 +471,7 @@ impl TcpRuntimeState {
         &mut self,
         connection_id: ConnectionId,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
             log::debug!(
@@ -514,13 +500,10 @@ impl TcpRuntimeState {
                 entry.connect_pending = false;
                 let update_interest_result = apply_connection_interest(entry, registry);
                 update_interest_result.context(UpdateTcpInterestSnafu { connection_id })?;
-                emit_tcp_event(
-                    event_tx,
-                    TcpEvent::Connected {
-                        connection_id,
-                        peer_addr: remote_addr,
-                    },
-                )?;
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Connected {
+                    connection_id,
+                    peer_addr: remote_addr,
+                }))?;
                 Ok(None)
             }
             Err(error_kind) => {
@@ -532,14 +515,11 @@ impl TcpRuntimeState {
                         error
                     );
                 }
-                emit_tcp_event(
-                    event_tx,
-                    TcpEvent::ConnectFailed {
-                        connection_id,
-                        remote_addr,
-                        error_kind,
-                    },
-                )?;
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                    connection_id,
+                    remote_addr,
+                    error_kind,
+                }))?;
                 Ok(None)
             }
         }
@@ -549,7 +529,7 @@ impl TcpRuntimeState {
         &mut self,
         connection_id: ConnectionId,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
             log::debug!(
@@ -582,18 +562,16 @@ impl TcpRuntimeState {
                         .as_ref()
                         .expect("TCP pending send missing for zero-length write")
                         .transmission_id;
-                    emit_tcp_event(
-                        event_tx,
-                        TcpEvent::SendNack {
-                            transmission_id,
-                            reason: SendFailureReason::Closed,
-                        },
-                    )?;
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                        connection_id,
+                        transmission_id,
+                        reason: SendFailureReason::Closed,
+                    }))?;
                     let record = self.close_connection(
                         connection_id,
                         registry,
                         CloseReason::Aborted,
-                        event_tx,
+                        event_sink,
                     )?;
                     return Ok(Some(record));
                 }
@@ -606,13 +584,16 @@ impl TcpRuntimeState {
                     if pending_send.remaining() == 0 {
                         let transmission_id = pending_send.transmission_id;
                         entry.pending_send = None;
-                        emit_tcp_event(event_tx, TcpEvent::SendAck { transmission_id })?;
+                        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendAck {
+                            connection_id,
+                            transmission_id,
+                        }))?;
                         if entry.close_after_flush {
                             let record = self.close_connection(
                                 connection_id,
                                 registry,
                                 CloseReason::Graceful,
-                                event_tx,
+                                event_sink,
                             )?;
                             return Ok(Some(record));
                         }
@@ -632,18 +613,16 @@ impl TcpRuntimeState {
                         .as_ref()
                         .expect("TCP pending send missing after write error")
                         .transmission_id;
-                    emit_tcp_event(
-                        event_tx,
-                        TcpEvent::SendNack {
-                            transmission_id,
-                            reason: SendFailureReason::from(&error),
-                        },
-                    )?;
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
+                        connection_id,
+                        transmission_id,
+                        reason: SendFailureReason::from(&error),
+                    }))?;
                     let record = self.close_connection(
                         connection_id,
                         registry,
                         CloseReason::Aborted,
-                        event_tx,
+                        event_sink,
                     )?;
                     return Ok(Some(record));
                 }
@@ -656,7 +635,7 @@ impl TcpRuntimeState {
         connection_id: ConnectionId,
         registry: &Registry,
         ingress_pool: &IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         loop {
             let mut ingress_buffer = match ingress_pool.try_acquire()? {
@@ -664,7 +643,9 @@ impl TcpRuntimeState {
                 None => {
                     let suspended = self.suspend_read(connection_id, registry)?;
                     if suspended {
-                        emit_tcp_event(event_tx, TcpEvent::ReadSuspended { connection_id })?;
+                        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadSuspended {
+                            connection_id,
+                        }))?;
                     }
                     return Ok(None);
                 }
@@ -695,19 +676,16 @@ impl TcpRuntimeState {
                         connection_id,
                         registry,
                         CloseReason::Graceful,
-                        event_tx,
+                        event_sink,
                     )?;
                     return Ok(Some(record));
                 }
                 Ok(bytes_read) => {
                     let lease = ingress_buffer.commit(bytes_read)?;
-                    emit_tcp_event(
-                        event_tx,
-                        TcpEvent::Received {
-                            connection_id,
-                            payload: IoPayload::Lease(lease),
-                        },
-                    )?;
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Received {
+                        connection_id,
+                        payload: IoPayload::Lease(lease),
+                    }))?;
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     return Ok(None);
@@ -718,7 +696,7 @@ impl TcpRuntimeState {
                         connection_id,
                         registry,
                         CloseReason::Aborted,
-                        event_tx,
+                        event_sink,
                     )?;
                     return Ok(Some(record));
                 }
@@ -759,16 +737,13 @@ impl TcpRuntimeState {
         connection_id: ConnectionId,
         registry: &Registry,
         reason: CloseReason,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<ResourceRecord> {
         let record = self.release_connection(connection_id, registry)?;
-        emit_tcp_event(
-            event_tx,
-            TcpEvent::Closed {
-                connection_id,
-                reason,
-            },
-        )?;
+        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Closed {
+            connection_id,
+            reason,
+        }))?;
         Ok(record)
     }
 }
@@ -816,6 +791,15 @@ fn reset_connection_after_failure(
     Ok(())
 }
 
+/// Checks non-blocking TCP connect completion according to `mio::TcpStream::connect` semantics.
+///
+/// `mio` requires callers to:
+/// 1. inspect `take_error()` first
+/// 2. then inspect `peer_addr()`
+/// 3. treat `ErrorKind::NotConnected` from `peer_addr()` as \"still pending\"
+///
+/// The helper returns `Ok(true)` when the stream is connected, `Ok(false)` when it is still
+/// pending, and `Err(kind)` when the connect attempt has failed.
 fn check_tcp_connect_result(stream: &MioTcpStream) -> std::result::Result<bool, ErrorKind> {
     let take_error_result = stream.take_error();
     let pending_error = match take_error_result {
@@ -833,22 +817,54 @@ fn check_tcp_connect_result(stream: &MioTcpStream) -> std::result::Result<bool, 
     }
 }
 
-fn emit_tcp_event(
-    event_tx: &crossbeam_channel::Sender<DriverEvent>,
-    event: TcpEvent,
-) -> Result<()> {
-    let send_result = event_tx.send(DriverEvent::Tcp(event));
-    if send_result.is_err() {
-        return Err(Error::DriverEventChannelClosed);
+fn connect_tcp_stream(
+    local_addr: Option<SocketAddr>,
+    remote_addr: SocketAddr,
+) -> io::Result<MioTcpStream> {
+    if let Some(local_addr) = local_addr {
+        return connect_tcp_stream_with_local_addr(local_addr, remote_addr);
     }
-    Ok(())
+    MioTcpStream::connect(remote_addr)
+}
+
+/// Connects one TCP stream after first binding it to a caller-selected local address.
+///
+/// `mio` does not currently expose this path directly, so the implementation uses `socket2` and
+/// converts the resulting non-blocking `std::net::TcpStream` back into `mio`.
+fn connect_tcp_stream_with_local_addr(
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+) -> io::Result<MioTcpStream> {
+    let domain = match remote_addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(local_addr))?;
+
+    match socket.connect(&SockAddr::from(remote_addr)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+        Err(error) => return Err(error),
+    }
+
+    let stream: StdTcpStream = socket.into();
+    Ok(MioTcpStream::from_std(stream))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        driver::{DriverCommand, DriverConfig, DriverRequest, IoDriver, wait_for_request},
+        driver::{
+            DriverCommand,
+            DriverConfig,
+            DriverEvent,
+            DriverRequest,
+            IoDriver,
+            wait_for_request,
+        },
         prelude::Result,
         test_support::init_test_logger,
     };
@@ -908,6 +924,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr,
             }))
             .expect("dispatch TCP connect");
@@ -944,6 +961,7 @@ mod tests {
         while !saw_ack || received_payload.is_none() {
             match wait_for_event(&driver) {
                 DriverEvent::Tcp(TcpEvent::SendAck {
+                    connection_id: _,
                     transmission_id: ack_id,
                 }) if ack_id == transmission_id => {
                     saw_ack = true;
@@ -981,6 +999,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr,
             }))
             .expect("dispatch failing TCP connect");
@@ -1023,6 +1042,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr,
             }))
             .expect("dispatch TCP connect");
@@ -1058,6 +1078,7 @@ mod tests {
         loop {
             match wait_for_event(&driver) {
                 DriverEvent::Tcp(TcpEvent::SendNack {
+                    connection_id: _,
                     transmission_id,
                     reason,
                 }) if transmission_id == TransmissionId(11) => {
@@ -1096,6 +1117,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr,
             }))
             .expect("dispatch TCP connect");
@@ -1132,6 +1154,7 @@ mod tests {
         while !saw_ack || !saw_closed {
             match wait_for_event(&driver) {
                 DriverEvent::Tcp(TcpEvent::SendAck {
+                    connection_id: _,
                     transmission_id: ack_id,
                 }) if ack_id == transmission_id => {
                     saw_ack = true;
@@ -1189,6 +1212,7 @@ mod tests {
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
                 connection_id,
+                local_addr: None,
                 remote_addr,
             }))
             .expect("dispatch TCP connect");

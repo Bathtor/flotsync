@@ -39,6 +39,12 @@ pub enum Error {
     #[snafu(display("flotsync_io driver event channel is closed"))]
     DriverEventChannelClosed,
 
+    #[snafu(display("flotsync_io driver is unavailable"))]
+    DriverUnavailable,
+
+    #[snafu(display("flotsync_io driver event receiver is unavailable for this driver instance"))]
+    DriverEventReceiverUnavailable,
+
     #[snafu(display("flotsync_io buffer-pool request channel is closed"))]
     IoBufferRequestChannelClosed,
 

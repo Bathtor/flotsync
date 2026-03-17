@@ -8,6 +8,7 @@
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
+- Add developer-facing docs or comments to non-public Rust types, fields, and helper functions when their role, invariants, or lifecycle are not obvious from local context.
 
 <!-- BEGIN BEADS INTEGRATION -->
 

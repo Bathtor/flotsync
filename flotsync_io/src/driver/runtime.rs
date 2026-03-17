@@ -1,11 +1,11 @@
 use super::{
     DriverCommand,
-    DriverEvent,
+    DriverEventSink,
     DriverToken,
     registry::{SlotRegistry, readiness_slot_to_token, token_to_readiness_slot},
     tcp::TcpRuntimeState,
     thread::send_reply,
-    udp::{UdpRuntimeState, emit_udp_event},
+    udp::UdpRuntimeState,
 };
 use crate::{
     api::{ConnectionId, ListenerId, SocketId, TcpCommand, UdpCommand},
@@ -162,20 +162,20 @@ impl DriverRuntimeState {
         socket_id: SocketId,
         registry: &Registry,
         ingress_pool: &crate::pool::IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
         self.udp
-            .handle_readable(socket_id, registry, ingress_pool, event_tx)
+            .handle_readable(socket_id, registry, ingress_pool, event_sink)
     }
 
     pub(super) fn resume_suspended_udp_reads(
         &mut self,
         registry: &Registry,
         ingress_pool: &crate::pool::IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
         self.udp
-            .resume_suspended_reads(registry, ingress_pool, event_tx)
+            .resume_suspended_reads(registry, ingress_pool, event_sink)
     }
 
     pub(super) fn handle_tcp_ready(
@@ -183,7 +183,7 @@ impl DriverRuntimeState {
         connection_id: ConnectionId,
         registry: &Registry,
         ingress_pool: &crate::pool::IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
         is_readable: bool,
         is_writable: bool,
     ) -> Result<()> {
@@ -191,7 +191,7 @@ impl DriverRuntimeState {
             connection_id,
             registry,
             ingress_pool,
-            event_tx,
+            event_sink,
             is_readable,
             is_writable,
         )?;
@@ -205,10 +205,10 @@ impl DriverRuntimeState {
         &mut self,
         registry: &Registry,
         ingress_pool: &crate::pool::IngressPool,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
         self.tcp
-            .resume_suspended_reads(registry, ingress_pool, event_tx)
+            .resume_suspended_reads(registry, ingress_pool, event_sink)
     }
 
     /// Returns `true` when command processing requested that the driver thread stop.
@@ -216,7 +216,7 @@ impl DriverRuntimeState {
         &mut self,
         command_rx: &crossbeam_channel::Receiver<ControlCommand>,
         registry: &Registry,
-        event_tx: &crossbeam_channel::Sender<DriverEvent>,
+        event_sink: &dyn DriverEventSink,
         udp_send_scratch: &mut [u8],
     ) -> Result<bool> {
         loop {
@@ -239,13 +239,15 @@ impl DriverRuntimeState {
                         DriverCommand::Tcp(command) => match command {
                             TcpCommand::Connect {
                                 connection_id,
+                                local_addr,
                                 remote_addr,
                             } => {
                                 self.tcp.handle_connect(
                                     connection_id,
+                                    local_addr,
                                     remote_addr,
                                     registry,
-                                    event_tx,
+                                    event_sink,
                                 )?;
                             }
                             TcpCommand::Listen { listener_id, .. } => {
@@ -264,7 +266,7 @@ impl DriverRuntimeState {
                                     transmission_id,
                                     payload,
                                     registry,
-                                    event_tx,
+                                    event_sink,
                                 )?;
                                 if let Some(record) = closed_record {
                                     self.release_readiness(record.token);
@@ -278,7 +280,7 @@ impl DriverRuntimeState {
                                     connection_id,
                                     abort,
                                     registry,
-                                    event_tx,
+                                    event_sink,
                                 )?;
                                 if let Some(record) = closed_record {
                                     self.release_readiness(record.token);
@@ -291,7 +293,7 @@ impl DriverRuntimeState {
                                 local_addr,
                             } => {
                                 self.udp
-                                    .handle_bind(socket_id, local_addr, registry, event_tx)?;
+                                    .handle_bind(socket_id, local_addr, registry, event_sink)?;
                             }
                             UdpCommand::Connect {
                                 socket_id,
@@ -303,7 +305,7 @@ impl DriverRuntimeState {
                                     remote_addr,
                                     local_addr,
                                     registry,
-                                    event_tx,
+                                    event_sink,
                                 )?;
                             }
                             UdpCommand::Send {
@@ -317,7 +319,7 @@ impl DriverRuntimeState {
                                     transmission_id,
                                     payload,
                                     target,
-                                    event_tx,
+                                    event_sink,
                                     udp_send_scratch,
                                 )?;
                             }
@@ -328,10 +330,9 @@ impl DriverRuntimeState {
                                         socket_id
                                     );
                                 } else {
-                                    emit_udp_event(
-                                        event_tx,
+                                    event_sink.publish(super::DriverEvent::Udp(
                                         crate::api::UdpEvent::Closed { socket_id },
-                                    )?;
+                                    ))?;
                                 }
                             }
                         },
