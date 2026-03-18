@@ -440,7 +440,14 @@ pub enum TcpSessionEvent {
 - Every write carries a `TransmissionId`.
 - UDP `SendAck` / `SendNack` is sent only to the per-send `Recipient`.
 - TCP `SendAck` / `SendNack` stays on the session event stream.
-- Driver may emit `WriteSuspended` / `WriteResumed`.
+- TCP emits `WriteSuspended` when a non-blocking flush leaves bytes pending and the session stops
+  accepting new sends without internal queuing.
+- TCP emits `WriteResumed` once that pending transmission drains and the session starts accepting
+  new sends again.
+- UDP emits `WriteSuspended` when a datagram send hits kernel backpressure (`WouldBlock`); the
+  triggering datagram still receives `SendNack { Backpressure }`.
+- While a UDP socket is write-suspended, later sends are rejected immediately with
+  `SendNack { Backpressure }` until the socket emits `WriteResumed`.
 - Inbound reads are push-based.
 - Inbound payload memory is lease-backed; dropping a lease returns capacity.
 - If read-side pool capacity is exhausted, read interest is disabled and `ReadSuspended` is emitted.

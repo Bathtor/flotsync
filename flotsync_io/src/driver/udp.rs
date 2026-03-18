@@ -37,6 +37,7 @@ struct UdpSocketEntry {
     local_addr: Option<SocketAddr>,
     remote_addr: Option<SocketAddr>,
     read_suspended: bool,
+    write_suspended: bool,
     registered: bool,
 }
 
@@ -48,6 +49,7 @@ impl UdpSocketEntry {
             local_addr: None,
             remote_addr: None,
             read_suspended: false,
+            write_suspended: false,
             registered: false,
         }
     }
@@ -55,6 +57,38 @@ impl UdpSocketEntry {
     /// Returns whether this entry currently owns a live OS UDP socket handle.
     fn is_open(&self) -> bool {
         self.socket.is_some()
+    }
+
+    /// Returns the readiness interests required for the socket's current suspension state.
+    fn desired_interest(&self) -> Option<Interest> {
+        if self.socket.is_none() {
+            return None;
+        }
+
+        match (self.read_suspended, self.write_suspended) {
+            (false, false) => Some(Interest::READABLE),
+            (false, true) => Some(Interest::READABLE.add(Interest::WRITABLE)),
+            (true, false) => None,
+            (true, true) => Some(Interest::WRITABLE),
+        }
+    }
+
+    /// Returns `true` when the socket transitioned into write-suspended state.
+    fn suspend_write(&mut self) -> bool {
+        if self.write_suspended {
+            return false;
+        }
+        self.write_suspended = true;
+        true
+    }
+
+    /// Returns `true` when the socket transitioned back to accepting new sends.
+    fn resume_write(&mut self) -> bool {
+        if !self.write_suspended {
+            return false;
+        }
+        self.write_suspended = false;
+        true
     }
 }
 
@@ -131,7 +165,7 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let mut socket = match bind_udp_socket(local_addr) {
+        let socket = match bind_udp_socket(local_addr) {
             Ok(socket) => socket,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
@@ -142,17 +176,6 @@ impl UdpRuntimeState {
                 return Ok(());
             }
         };
-
-        let register_result =
-            registry.register(&mut socket, entry.record.token, Interest::READABLE);
-        if let Err(error) = register_result {
-            event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
-                socket_id,
-                local_addr,
-                error_kind: error.kind(),
-            }))?;
-            return Ok(());
-        }
 
         let actual_local_addr = match socket.local_addr() {
             Ok(addr) => addr,
@@ -170,7 +193,19 @@ impl UdpRuntimeState {
         entry.local_addr = Some(actual_local_addr);
         entry.remote_addr = None;
         entry.read_suspended = false;
-        entry.registered = true;
+        entry.write_suspended = false;
+        entry.registered = false;
+
+        let register_result = apply_socket_interest(entry, registry);
+        if let Err(error) = register_result {
+            reset_socket_after_failure(entry, registry);
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
+                socket_id,
+                local_addr,
+                error_kind: error.kind(),
+            }))?;
+            return Ok(());
+        }
 
         event_sink.publish(super::DriverEvent::Udp(UdpEvent::Bound {
             socket_id,
@@ -207,7 +242,7 @@ impl UdpRuntimeState {
         }
 
         let bind_addr = local_addr.unwrap_or_else(|| default_udp_bind_addr(remote_addr));
-        let mut socket = match bind_udp_socket(bind_addr) {
+        let socket = match bind_udp_socket(bind_addr) {
             Ok(socket) => socket,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
@@ -222,18 +257,6 @@ impl UdpRuntimeState {
 
         let connect_result = socket.connect(remote_addr);
         if let Err(error) = connect_result {
-            event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
-                socket_id,
-                local_addr,
-                remote_addr,
-                error_kind: error.kind(),
-            }))?;
-            return Ok(());
-        }
-
-        let register_result =
-            registry.register(&mut socket, entry.record.token, Interest::READABLE);
-        if let Err(error) = register_result {
             event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
                 socket_id,
                 local_addr,
@@ -259,7 +282,20 @@ impl UdpRuntimeState {
         entry.local_addr = Some(actual_local_addr);
         entry.remote_addr = Some(remote_addr);
         entry.read_suspended = false;
-        entry.registered = true;
+        entry.write_suspended = false;
+        entry.registered = false;
+
+        let register_result = apply_socket_interest(entry, registry);
+        if let Err(error) = register_result {
+            reset_socket_after_failure(entry, registry);
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
+                socket_id,
+                local_addr,
+                remote_addr,
+                error_kind: error.kind(),
+            }))?;
+            return Ok(());
+        }
 
         event_sink.publish(super::DriverEvent::Udp(UdpEvent::Connected {
             socket_id,
@@ -274,6 +310,7 @@ impl UdpRuntimeState {
         transmission_id: TransmissionId,
         payload: IoPayload,
         target: Option<SocketAddr>,
+        registry: &Registry,
         event_sink: &dyn DriverEventSink,
         udp_send_scratch: &mut [u8],
     ) -> Result<()> {
@@ -291,6 +328,14 @@ impl UdpRuntimeState {
                 socket_id,
                 transmission_id,
                 reason: SendFailureReason::InvalidState,
+            }))?;
+            return Ok(());
+        }
+        if entry.write_suspended {
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::SendNack {
+                socket_id,
+                transmission_id,
+                reason: SendFailureReason::Backpressure,
             }))?;
             return Ok(());
         }
@@ -353,6 +398,19 @@ impl UdpRuntimeState {
                     transmission_id,
                     reason: SendFailureReason::IoError,
                 }))
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                event_sink.publish(super::DriverEvent::Udp(UdpEvent::SendNack {
+                    socket_id,
+                    transmission_id,
+                    reason: SendFailureReason::Backpressure,
+                }))?;
+                if suspend_write(entry, socket_id, registry) {
+                    event_sink.publish(super::DriverEvent::Udp(UdpEvent::WriteSuspended {
+                        socket_id,
+                    }))?;
+                }
+                Ok(())
             }
             Err(error) => event_sink.publish(super::DriverEvent::Udp(UdpEvent::SendNack {
                 socket_id,
@@ -474,6 +532,21 @@ impl UdpRuntimeState {
         }
     }
 
+    pub(super) fn handle_writable(
+        &mut self,
+        socket_id: SocketId,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        let resumed = resume_write(self, socket_id, registry);
+        if resumed {
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::WriteResumed {
+                socket_id,
+            }))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn resume_suspended_reads(
         &mut self,
         registry: &Registry,
@@ -511,26 +584,24 @@ impl UdpRuntimeState {
         let Some(entry) = self.sockets.get_mut(socket_id.0) else {
             return false;
         };
-        if entry.read_suspended || !entry.registered {
+        if entry.read_suspended {
+            return false;
+        }
+        if entry.socket.is_none() {
             return false;
         }
 
-        let Some(socket) = entry.socket.as_mut() else {
-            return false;
-        };
-
-        let deregister_result = registry.deregister(socket);
-        if let Err(error) = deregister_result {
+        entry.read_suspended = true;
+        let update_result = apply_socket_interest(entry, registry);
+        if let Err(error) = update_result {
+            entry.read_suspended = false;
             log::error!(
-                "failed to suspend UDP socket {} by deregistering it: {}",
+                "failed to suspend UDP socket {} by updating readiness interest: {}",
                 socket_id,
                 error
             );
             return false;
         }
-
-        entry.read_suspended = true;
-        entry.registered = false;
         true
     }
 
@@ -542,23 +613,21 @@ impl UdpRuntimeState {
         if !entry.read_suspended {
             return false;
         }
-
-        let Some(socket) = entry.socket.as_mut() else {
+        if entry.socket.is_none() {
             return false;
-        };
+        }
 
-        let register_result = registry.register(socket, entry.record.token, Interest::READABLE);
-        if let Err(error) = register_result {
+        entry.read_suspended = false;
+        let update_result = apply_socket_interest(entry, registry);
+        if let Err(error) = update_result {
+            entry.read_suspended = true;
             log::error!(
-                "failed to resume UDP socket {} by re-registering it: {}",
+                "failed to resume UDP socket {} by updating readiness interest: {}",
                 socket_id,
                 error
             );
             return false;
         }
-
-        entry.read_suspended = false;
-        entry.registered = true;
         true
     }
 
@@ -595,6 +664,95 @@ fn default_udp_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
 
 fn bind_udp_socket(local_addr: SocketAddr) -> io::Result<MioUdpSocket> {
     MioUdpSocket::bind(local_addr)
+}
+
+fn apply_socket_interest(entry: &mut UdpSocketEntry, registry: &Registry) -> io::Result<()> {
+    let desired_interest = entry.desired_interest();
+    let Some(socket) = entry.socket.as_mut() else {
+        entry.registered = false;
+        return Ok(());
+    };
+
+    match desired_interest {
+        Some(interest) => {
+            if entry.registered {
+                registry.reregister(socket, entry.record.token, interest)?;
+            } else {
+                registry.register(socket, entry.record.token, interest)?;
+                entry.registered = true;
+            }
+        }
+        None => {
+            if entry.registered {
+                registry.deregister(socket)?;
+                entry.registered = false;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn reset_socket_after_failure(entry: &mut UdpSocketEntry, registry: &Registry) {
+    if let Some(socket) = entry.socket.as_mut() {
+        if entry.registered {
+            let deregister_result = registry.deregister(socket);
+            if let Err(error) = deregister_result {
+                log::warn!(
+                    "failed to deregister UDP socket {} while resetting failed bind/connect state: {}",
+                    entry.record.token.0,
+                    error
+                );
+            }
+        }
+    }
+    entry.socket = None;
+    entry.local_addr = None;
+    entry.remote_addr = None;
+    entry.read_suspended = false;
+    entry.write_suspended = false;
+    entry.registered = false;
+}
+
+fn suspend_write(entry: &mut UdpSocketEntry, socket_id: SocketId, registry: &Registry) -> bool {
+    if !entry.suspend_write() {
+        return false;
+    }
+
+    let update_result = apply_socket_interest(entry, registry);
+    if let Err(error) = update_result {
+        entry.write_suspended = false;
+        log::error!(
+            "failed to suspend UDP socket {} by updating readiness interest: {}",
+            socket_id,
+            error
+        );
+        return false;
+    }
+
+    true
+}
+
+fn resume_write(state: &mut UdpRuntimeState, socket_id: SocketId, registry: &Registry) -> bool {
+    let Some(entry) = state.sockets.get_mut(socket_id.0) else {
+        return false;
+    };
+    if !entry.resume_write() {
+        return false;
+    }
+
+    let update_result = apply_socket_interest(entry, registry);
+    if let Err(error) = update_result {
+        entry.write_suspended = true;
+        log::error!(
+            "failed to resume UDP socket {} by updating readiness interest: {}",
+            socket_id,
+            error
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Applies one shared socket option directly to a live UDP socket.
@@ -695,8 +853,10 @@ mod tests {
         test_support::init_test_logger,
     };
     use bytes::Bytes;
+    use mio::{Poll, Token};
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        sync::Mutex,
         time::{Duration, Instant},
     };
 
@@ -707,6 +867,24 @@ mod tests {
     fn resolve_request<T>(request: Result<DriverRequest<T>>) -> T {
         let request = request.expect("enqueue driver request");
         wait_for_request(request).expect("resolve driver request")
+    }
+
+    #[derive(Default)]
+    struct RecordingEventSink {
+        events: Mutex<Vec<DriverEvent>>,
+    }
+
+    impl RecordingEventSink {
+        fn take_events(&self) -> Vec<DriverEvent> {
+            std::mem::take(&mut self.events.lock().expect("recording sink lock"))
+        }
+    }
+
+    impl DriverEventSink for RecordingEventSink {
+        fn publish(&self, event: DriverEvent) -> Result<()> {
+            self.events.lock().expect("recording sink lock").push(event);
+            Ok(())
+        }
     }
 
     fn wait_for_event(driver: &IoDriver) -> DriverEvent {
@@ -1240,5 +1418,92 @@ mod tests {
         assert_eq!(third_payload.expect("third payload"), b"third"[..]);
 
         driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_write_resumes_after_suspended_socket_becomes_writable() {
+        init_test_logger();
+
+        let poll = Poll::new().expect("create mio poll");
+        let mut state = UdpRuntimeState::default();
+        let event_sink = RecordingEventSink::default();
+        let socket_id = SocketId(0);
+        let transmission_id = TransmissionId(20);
+        let resumed_transmission_id = TransmissionId(21);
+        let receiver = std::net::UdpSocket::bind(localhost(0)).expect("bind UDP receiver");
+        let receiver_addr = receiver.local_addr().expect("receiver addr");
+
+        state.reserve_socket(socket_id, Token(1));
+        state
+            .handle_bind(socket_id, localhost(0), poll.registry(), &event_sink)
+            .expect("bind UDP socket");
+        let _ = event_sink.take_events();
+
+        {
+            let entry = state
+                .sockets
+                .get_mut(socket_id.0)
+                .expect("reserved UDP socket entry");
+            assert!(suspend_write(entry, socket_id, poll.registry()));
+        }
+
+        let mut udp_send_scratch = [0_u8; MAX_UDP_PAYLOAD_BYTES];
+        state
+            .handle_send(
+                socket_id,
+                transmission_id,
+                IoPayload::Bytes(Bytes::from_static(b"blocked")),
+                Some(receiver_addr),
+                poll.registry(),
+                &event_sink,
+                &mut udp_send_scratch,
+            )
+            .expect("send while suspended");
+
+        let events = event_sink.take_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            DriverEvent::Udp(UdpEvent::SendNack {
+                socket_id: observed_socket_id,
+                transmission_id: observed_transmission_id,
+                reason: SendFailureReason::Backpressure,
+            }) if *observed_socket_id == socket_id
+                && *observed_transmission_id == transmission_id
+        ));
+
+        state
+            .handle_writable(socket_id, poll.registry(), &event_sink)
+            .expect("resume suspended UDP writes");
+        let events = event_sink.take_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            DriverEvent::Udp(UdpEvent::WriteResumed {
+                socket_id: observed_socket_id,
+            }) if *observed_socket_id == socket_id
+        ));
+
+        state
+            .handle_send(
+                socket_id,
+                resumed_transmission_id,
+                IoPayload::Bytes(Bytes::from_static(b"resumed")),
+                Some(receiver_addr),
+                poll.registry(),
+                &event_sink,
+                &mut udp_send_scratch,
+            )
+            .expect("send after write resume");
+        let events = event_sink.take_events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            DriverEvent::Udp(UdpEvent::SendAck {
+                socket_id: observed_socket_id,
+                transmission_id: observed_transmission_id,
+            }) if *observed_socket_id == socket_id
+                && *observed_transmission_id == resumed_transmission_id
+        ));
     }
 }

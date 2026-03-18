@@ -78,6 +78,7 @@ struct TcpConnectionEntry {
     connect_pending: bool,
     pending_adoption: bool,
     read_suspended: bool,
+    write_suspended: bool,
     registered: bool,
     pending_send: Option<PendingTcpSend>,
     close_after_flush: bool,
@@ -93,6 +94,7 @@ impl TcpConnectionEntry {
             connect_pending: false,
             pending_adoption: false,
             read_suspended: false,
+            write_suspended: false,
             registered: false,
             pending_send: None,
             close_after_flush: false,
@@ -113,6 +115,7 @@ impl TcpConnectionEntry {
             connect_pending: false,
             pending_adoption: true,
             read_suspended: false,
+            write_suspended: false,
             registered: false,
             pending_send: None,
             close_after_flush: false,
@@ -145,6 +148,7 @@ impl TcpConnectionEntry {
         self.connect_pending = false;
         self.pending_adoption = false;
         self.read_suspended = false;
+        self.write_suspended = false;
         self.registered = false;
         self.pending_send = None;
         self.close_after_flush = false;
@@ -156,6 +160,24 @@ impl TcpConnectionEntry {
 
     fn is_pending_accepted(&self) -> bool {
         self.pending_adoption && self.accepted_from.is_some()
+    }
+
+    /// Returns `true` when the connection transitioned into write-suspended state.
+    fn suspend_write(&mut self) -> bool {
+        if self.write_suspended {
+            return false;
+        }
+        self.write_suspended = true;
+        true
+    }
+
+    /// Returns `true` when the connection transitioned back to accepting new sends.
+    fn resume_write(&mut self) -> bool {
+        if !self.write_suspended {
+            return false;
+        }
+        self.write_suspended = false;
+        true
     }
 }
 
@@ -629,6 +651,11 @@ impl TcpRuntimeState {
             return Ok(None);
         }
         if entry.pending_send.is_some() {
+            if entry.suspend_write() {
+                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::WriteSuspended {
+                    connection_id,
+                }))?;
+            }
             event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
                 connection_id,
                 transmission_id,
@@ -900,6 +927,7 @@ impl TcpRuntimeState {
                             connection_id,
                             transmission_id,
                         }))?;
+                        let write_resumed = entry.resume_write();
                         if entry.close_after_flush {
                             let record = self.close_connection(
                                 connection_id,
@@ -909,12 +937,22 @@ impl TcpRuntimeState {
                             )?;
                             return Ok(Some(record));
                         }
+                        if write_resumed {
+                            event_sink.publish(super::DriverEvent::Tcp(
+                                TcpEvent::WriteResumed { connection_id },
+                            ))?;
+                        }
                         apply_connection_interest(entry, registry)
                             .context(UpdateTcpInterestSnafu { connection_id })?;
                         return Ok(None);
                     }
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if entry.suspend_write() {
+                        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::WriteSuspended {
+                            connection_id,
+                        }))?;
+                    }
                     apply_connection_interest(entry, registry)
                         .context(UpdateTcpInterestSnafu { connection_id })?;
                     return Ok(None);
@@ -1632,19 +1670,125 @@ mod tests {
             }))
             .expect("dispatch second TCP send");
 
-        loop {
+        let mut saw_write_suspended = false;
+        let mut saw_backpressure_nack = false;
+        // This send sequence is only complete once we have seen both the
+        // connection-level suspension signal and the rejected second send.
+        while !saw_write_suspended || !saw_backpressure_nack {
             match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::WriteSuspended {
+                    connection_id: suspended_id,
+                }) if suspended_id == connection_id => {
+                    saw_write_suspended = true;
+                }
                 DriverEvent::Tcp(TcpEvent::SendNack {
                     connection_id: _,
                     transmission_id,
                     reason,
                 }) if transmission_id == TransmissionId(11) => {
                     assert_eq!(reason, SendFailureReason::Backpressure);
+                    saw_backpressure_nack = true;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP write suspension/backpressure nack: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        server.join().expect("join server thread");
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn tcp_write_resumes_after_pending_send_drains() {
+        init_test_logger();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let remote_addr = listener.local_addr().expect("listener addr");
+        let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept TCP stream");
+            start_read_rx.recv().expect("wait for read signal");
+            let mut remaining = 4 * 1024 * 1024;
+            let mut buf = vec![0_u8; 64 * 1024];
+            while remaining > 0 {
+                let next_len = remaining.min(buf.len());
+                stream
+                    .read_exact(&mut buf[..next_len])
+                    .expect("read exact TCP payload");
+                remaining -= next_len;
+            }
+        });
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let connection_id = resolve_request(driver.reserve_connection());
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
+                connection_id,
+                local_addr: None,
+                remote_addr,
+            }))
+            .expect("dispatch TCP connect");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Connected {
+                    connection_id: connected_id,
+                    ..
+                }) if connected_id == connection_id => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Send {
+                connection_id,
+                transmission_id: TransmissionId(12),
+                payload: IoPayload::Bytes(Bytes::from(vec![b'y'; 4 * 1024 * 1024])),
+            }))
+            .expect("dispatch large TCP send");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::WriteSuspended {
+                    connection_id: suspended_id,
+                }) if suspended_id == connection_id => {
                     break;
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP backpressure nack: {:?}",
+                        "ignoring unrelated event while waiting for TCP WriteSuspended: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        start_read_tx.send(()).expect("signal server to read");
+
+        let mut saw_ack = false;
+        let mut saw_resume = false;
+        while !saw_ack || !saw_resume {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::SendAck {
+                    connection_id: ack_id,
+                    transmission_id,
+                }) if ack_id == connection_id && transmission_id == TransmissionId(12) => {
+                    saw_ack = true;
+                }
+                DriverEvent::Tcp(TcpEvent::WriteResumed {
+                    connection_id: resumed_id,
+                }) if resumed_id == connection_id => {
+                    saw_resume = true;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP SendAck/WriteResumed: {:?}",
                         other
                     );
                 }

@@ -97,12 +97,14 @@ pub(super) fn run_driver_thread(
                         event.is_writable(),
                     )?;
                 }
-                ResourceKey::Socket(socket_id) if event.is_readable() => {
-                    state.handle_udp_readable(
+                ResourceKey::Socket(socket_id) if event.is_readable() || event.is_writable() => {
+                    state.handle_udp_ready(
                         socket_id,
                         poll.registry(),
                         &ingress_pool,
                         event_sink.as_ref(),
+                        event.is_readable(),
+                        event.is_writable(),
                     )?;
                 }
                 ResourceKey::Listener(_) | ResourceKey::Socket(_) => {}

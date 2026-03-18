@@ -161,15 +161,23 @@ impl DriverRuntimeState {
         }
     }
 
-    pub(super) fn handle_udp_readable(
+    pub(super) fn handle_udp_ready(
         &mut self,
         socket_id: SocketId,
         registry: &Registry,
         ingress_pool: &crate::pool::IngressPool,
         event_sink: &dyn DriverEventSink,
+        is_readable: bool,
+        is_writable: bool,
     ) -> Result<()> {
-        self.udp
-            .handle_readable(socket_id, registry, ingress_pool, event_sink)
+        if is_writable {
+            self.udp.handle_writable(socket_id, registry, event_sink)?;
+        }
+        if is_readable {
+            self.udp
+                .handle_readable(socket_id, registry, ingress_pool, event_sink)?;
+        }
+        Ok(())
     }
 
     pub(super) fn handle_tcp_listener_ready(
@@ -383,6 +391,7 @@ impl DriverRuntimeState {
                                     transmission_id,
                                     payload,
                                     target,
+                                    registry,
                                     event_sink,
                                     udp_send_scratch,
                                 )?;
