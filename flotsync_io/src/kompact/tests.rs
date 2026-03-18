@@ -13,7 +13,7 @@ use super::{
     UdpSendResult,
 };
 use crate::{
-    api::{CloseReason, IoPayload, TransmissionId},
+    api::{CloseReason, IoPayload, TransmissionId, UdpSocketOption},
     driver::DriverConfig,
     test_support::init_test_logger,
 };
@@ -390,6 +390,117 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     drop(_bridge_to_observer2);
     kill_component(&system, reply1);
     kill_component(&system, reply2);
+    kill_component(&system, observer1);
+    kill_component(&system, observer2);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
+fn udp_bridge_broadcasts_socket_configuration_indications() {
+    init_test_logger();
+
+    let system = KompactConfig::default().build().expect("KompactSystem");
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+
+    let (observer1_tx, observer1_rx) = mpsc::channel();
+    let observer1 = system.create(move || UdpObserver::new(observer1_tx));
+    let (observer2_tx, observer2_rx) = mpsc::channel();
+    let observer2 = system.create(move || UdpObserver::new(observer2_tx));
+
+    let _bridge_to_observer1 = biconnect_components::<UdpPort, _, _>(&bridge, &observer1)
+        .expect("bridge/observer1 connection");
+    let _bridge_to_observer2 = biconnect_components::<UdpPort, _, _>(&bridge, &observer2)
+        .expect("bridge/observer2 connection");
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &observer1);
+    start_component(&system, &observer2);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let socket_id = bridge_handle
+        .reserve_udp_socket()
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("socket reservation future")
+        .expect("socket reservation");
+
+    observer1.on_definition(|component| {
+        component.udp.trigger(UdpRequest::Bind {
+            socket_id,
+            local_addr: localhost(0),
+        });
+    });
+    recv_until(&observer1_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Bound {
+                socket_id: observed_socket_id,
+                ..
+            } if *observed_socket_id == socket_id
+        )
+    });
+    recv_until(&observer2_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Bound {
+                socket_id: observed_socket_id,
+                ..
+            } if *observed_socket_id == socket_id
+        )
+    });
+
+    let option = UdpSocketOption::Broadcast(true);
+    observer1.on_definition(|component| {
+        component
+            .udp
+            .trigger(UdpRequest::Configure { socket_id, option });
+    });
+
+    match recv_until(&observer1_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Configured {
+                socket_id: observed_socket_id,
+                option: observed_option,
+            } if *observed_socket_id == socket_id && *observed_option == option
+        )
+    }) {
+        UdpIndication::Configured {
+            socket_id: observed_socket_id,
+            option: observed_option,
+        } => {
+            assert_eq!(observed_socket_id, socket_id);
+            assert_eq!(observed_option, option);
+        }
+        other => unreachable!("filtered to UDP Configured, got {other:?}"),
+    }
+    match recv_until(&observer2_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Configured {
+                socket_id: observed_socket_id,
+                option: observed_option,
+            } if *observed_socket_id == socket_id && *observed_option == option
+        )
+    }) {
+        UdpIndication::Configured {
+            socket_id: observed_socket_id,
+            option: observed_option,
+        } => {
+            assert_eq!(observed_socket_id, socket_id);
+            assert_eq!(observed_option, option);
+        }
+        other => unreachable!("filtered to UDP Configured, got {other:?}"),
+    }
+
+    drop(bridge_handle);
+    drop(_bridge_to_observer1);
+    drop(_bridge_to_observer2);
     kill_component(&system, observer1);
     kill_component(&system, observer2);
     kill_component(&system, bridge);

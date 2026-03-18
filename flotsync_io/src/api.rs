@@ -2,7 +2,11 @@
 
 use crate::pool::IoLease;
 use bytes::Bytes;
-use std::{fmt, io, net::SocketAddr};
+use std::{
+    fmt,
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 /// Driver-local handle for a listening TCP socket.
 ///
@@ -240,6 +244,62 @@ pub enum TcpEvent {
     },
 }
 
+/// Shared UDP socket-configuration options.
+///
+/// Shared socket-configuration changes are modeled explicitly via [`UdpCommand::Configure`]
+/// because they affect the capability exposed by one local socket rather than one particular
+/// datagram send operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UdpSocketOption {
+    /// Enables or disables IPv4 broadcast transmission on the socket.
+    ///
+    /// This is required before sending to IPv4 broadcast destinations such as
+    /// `255.255.255.255` or per-interface subnet broadcast addresses.
+    Broadcast(bool),
+    /// Enables or disables IPv4 multicast loopback.
+    ///
+    /// When enabled, datagrams sent by this socket to an IPv4 multicast group may also be
+    /// received back locally if the socket joined that group.
+    MulticastLoopV4(bool),
+    /// Enables or disables IPv6 multicast loopback.
+    ///
+    /// When enabled, datagrams sent by this socket to an IPv6 multicast group may also be
+    /// received back locally if the socket joined that group.
+    MulticastLoopV6(bool),
+    /// Sets the IPv4 multicast TTL used for future outbound multicast datagrams.
+    ///
+    /// This affects only IPv4 multicast sends, not ordinary unicast UDP traffic.
+    MulticastTtlV4(u32),
+    /// Sets the IPv6 multicast hop limit used for future outbound multicast datagrams.
+    ///
+    /// This affects only IPv6 multicast sends, not ordinary unicast UDP traffic.
+    MulticastHopsV6(u32),
+    /// Selects the IPv4 interface used for future outbound multicast datagrams.
+    ///
+    /// The supplied address must identify a local IPv4 interface on the current host.
+    MulticastInterfaceV4(Ipv4Addr),
+    /// Selects the IPv6 interface used for future outbound multicast datagrams.
+    ///
+    /// The supplied value is the operating-system interface index used by IPv6 multicast socket
+    /// APIs.
+    MulticastInterfaceV6(u32),
+    /// Joins one IPv4 multicast group on the specified local IPv4 interface.
+    JoinMulticastV4 {
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    },
+    /// Leaves one IPv4 multicast group on the specified local IPv4 interface.
+    LeaveMulticastV4 {
+        group: Ipv4Addr,
+        interface: Ipv4Addr,
+    },
+    /// Joins one IPv6 multicast group on the specified local interface index.
+    JoinMulticastV6 { group: Ipv6Addr, interface: u32 },
+    /// Leaves one IPv6 multicast group on the specified local interface index.
+    LeaveMulticastV6 { group: Ipv6Addr, interface: u32 },
+}
+
 /// Commands issued against the UDP freeform I/O surface.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -262,6 +322,15 @@ pub enum UdpCommand {
         transmission_id: TransmissionId,
         payload: IoPayload,
         target: Option<SocketAddr>,
+    },
+    /// Applies one shared socket-configuration change to an already open UDP socket.
+    ///
+    /// The requested configuration affects the socket capability itself. Success or failure is
+    /// therefore reported through the shared UDP event stream rather than through a private reply
+    /// path.
+    Configure {
+        socket_id: SocketId,
+        option: UdpSocketOption,
     },
     /// Closes the UDP socket and releases its driver-owned resources.
     Close { socket_id: SocketId },
@@ -311,6 +380,17 @@ pub enum UdpEvent {
         socket_id: SocketId,
         transmission_id: TransmissionId,
         reason: SendFailureReason,
+    },
+    /// Reports that one shared UDP socket option was applied successfully.
+    Configured {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+    },
+    /// Reports that a requested shared UDP socket option could not be applied.
+    ConfigureFailed {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+        error_kind: io::ErrorKind,
     },
     /// Reports that read interest was disabled because inbound buffer capacity was exhausted.
     ReadSuspended { socket_id: SocketId },

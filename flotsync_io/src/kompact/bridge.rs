@@ -4,6 +4,7 @@ use super::{
     resolve_kfuture,
     session::{TcpSession, TcpSessionMessage},
     types::{
+        ConfigureFailureReason,
         OpenFailureReason,
         OpenTcpListener,
         OpenTcpSession,
@@ -16,7 +17,7 @@ use super::{
     },
 };
 use crate::{
-    api::{SendFailureReason, SocketId, TransmissionId, UdpCommand},
+    api::{SendFailureReason, SocketId, TransmissionId, UdpCommand, UdpSocketOption},
     errors::Result,
 };
 use ::kompact::prelude::*;
@@ -208,6 +209,9 @@ impl IoBridge {
             } => {
                 self.handle_udp_send_request(socket_id, transmission_id, payload, target, reply_to)
             }
+            UdpRequest::Configure { socket_id, option } => {
+                self.handle_udp_configure_request(socket_id, option)
+            }
             UdpRequest::Close { socket_id } => self.handle_udp_close_request(socket_id),
         }
     }
@@ -282,6 +286,19 @@ impl IoBridge {
             payload,
             target,
         });
+    }
+
+    fn handle_udp_configure_request(&mut self, socket_id: SocketId, option: UdpSocketOption) {
+        if !self.owns_socket(socket_id) {
+            self.udp.trigger(UdpIndication::ConfigureFailed {
+                socket_id,
+                option,
+                reason: ConfigureFailureReason::InvalidHandle,
+            });
+            return;
+        }
+        self.driver
+            .dispatch_udp(UdpCommand::Configure { socket_id, option });
     }
 
     fn handle_udp_close_request(&mut self, socket_id: SocketId) {

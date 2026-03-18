@@ -16,6 +16,7 @@ use ::kompact::prelude::KFuture;
 pub use bridge::{IoBridge, IoBridgeHandle};
 pub use driver_component::IoDriverComponent;
 pub use types::{
+    ConfigureFailureReason,
     OpenFailureReason,
     OpenTcpListener,
     OpenTcpSession,

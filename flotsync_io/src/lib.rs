@@ -24,6 +24,7 @@ pub mod prelude {
             TransmissionId,
             UdpCommand,
             UdpEvent,
+            UdpSocketOption,
         },
         driver::{
             DriverCommand,
@@ -36,6 +37,7 @@ pub mod prelude {
         },
         errors::{Error, Result},
         kompact::{
+            ConfigureFailureReason,
             IoBridge,
             IoBridgeHandle,
             IoDriverComponent,

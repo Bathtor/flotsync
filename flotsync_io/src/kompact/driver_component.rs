@@ -2,7 +2,13 @@ use super::{
     bridge::IoBridgeMessage,
     listener::{TcpListenerDriverEvent, TcpListenerMessage},
     session::TcpSessionMessage,
-    types::{OpenFailureReason, TcpSessionEvent, UdpIndication, UdpSendResult},
+    types::{
+        ConfigureFailureReason,
+        OpenFailureReason,
+        TcpSessionEvent,
+        UdpIndication,
+        UdpSendResult,
+    },
 };
 use crate::{
     api::{
@@ -553,6 +559,14 @@ impl IoDriverComponent {
                     reason: SendFailureReason::DriverUnavailable,
                 },
             ),
+            UdpCommand::Configure { socket_id, option } => self.route_udp_indication(
+                socket_id,
+                UdpIndication::ConfigureFailed {
+                    socket_id,
+                    option,
+                    reason: ConfigureFailureReason::DriverUnavailable,
+                },
+            ),
             UdpCommand::Close { socket_id } => {
                 self.route_udp_indication(socket_id, UdpIndication::Closed { socket_id });
                 self.udp_routes.remove(&socket_id);
@@ -966,6 +980,21 @@ fn udp_indication_from_raw(event: UdpEvent) -> (SocketId, UdpIndication) {
                 socket_id,
                 source,
                 payload,
+            },
+        ),
+        UdpEvent::Configured { socket_id, option } => {
+            (socket_id, UdpIndication::Configured { socket_id, option })
+        }
+        UdpEvent::ConfigureFailed {
+            socket_id,
+            option,
+            error_kind,
+        } => (
+            socket_id,
+            UdpIndication::ConfigureFailed {
+                socket_id,
+                option,
+                reason: ConfigureFailureReason::Io(error_kind),
             },
         ),
         UdpEvent::ReadSuspended { socket_id } => {

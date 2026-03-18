@@ -9,6 +9,7 @@ use crate::{
         SocketId,
         TransmissionId,
         UdpEvent,
+        UdpSocketOption,
     },
     errors::{Error, Result},
     pool::IngressPool,
@@ -16,6 +17,7 @@ use crate::{
 use bytes::Buf;
 use flotsync_utils::option_when;
 use mio::{Interest, Registry, net::UdpSocket as MioUdpSocket};
+use socket2::SockRef;
 use std::{
     io,
     io::ErrorKind,
@@ -360,6 +362,46 @@ impl UdpRuntimeState {
         }
     }
 
+    pub(super) fn handle_configure(
+        &mut self,
+        socket_id: SocketId,
+        option: UdpSocketOption,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<()> {
+        let Some(entry) = self.sockets.get_mut(socket_id.0) else {
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConfigureFailed {
+                socket_id,
+                option,
+                error_kind: ErrorKind::NotFound,
+            }))?;
+            return Ok(());
+        };
+
+        let Some(socket) = entry.socket.as_ref() else {
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConfigureFailed {
+                socket_id,
+                option,
+                error_kind: ErrorKind::InvalidInput,
+            }))?;
+            return Ok(());
+        };
+
+        let configure_result = apply_udp_socket_option(socket, option);
+        if let Err(error) = configure_result {
+            event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConfigureFailed {
+                socket_id,
+                option,
+                error_kind: error.kind(),
+            }))?;
+            return Ok(());
+        }
+
+        event_sink.publish(super::DriverEvent::Udp(UdpEvent::Configured {
+            socket_id,
+            option,
+        }))
+    }
+
     pub(super) fn handle_readable(
         &mut self,
         socket_id: SocketId,
@@ -535,13 +577,62 @@ impl UdpRuntimeState {
 
 fn default_udp_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
     match remote_addr {
+        // On this macOS host, and especially while a VPN is active, connected IPv4 UDP sends to
+        // loopback can fail with `EADDRNOTAVAIL` if we bind the local side to `0.0.0.0:0` first.
+        // Binding to the loopback interface directly avoids that failure while keeping the normal
+        // wildcard bind behavior for non-loopback peers. This is an observed Darwin/network-state
+        // quirk rather than an assumed cross-platform rule.
+        SocketAddr::V4(remote_addr) if remote_addr.ip().is_loopback() => {
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        }
         SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(remote_addr) if remote_addr.ip().is_loopback() => {
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
+        }
         SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
     }
 }
 
 fn bind_udp_socket(local_addr: SocketAddr) -> io::Result<MioUdpSocket> {
     MioUdpSocket::bind(local_addr)
+}
+
+/// Applies one shared socket option directly to a live UDP socket.
+///
+/// `mio` exposes most UDP broadcast and multicast operations itself. A few socket options,
+/// notably explicit multicast interface selection and IPv6 multicast hop configuration, still
+/// require dropping to `socket2::SockRef` for access to the underlying OS socket API.
+fn apply_udp_socket_option(socket: &MioUdpSocket, option: UdpSocketOption) -> io::Result<()> {
+    match option {
+        UdpSocketOption::Broadcast(enabled) => socket.set_broadcast(enabled),
+        UdpSocketOption::MulticastLoopV4(enabled) => socket.set_multicast_loop_v4(enabled),
+        UdpSocketOption::MulticastLoopV6(enabled) => socket.set_multicast_loop_v6(enabled),
+        UdpSocketOption::MulticastTtlV4(ttl) => socket.set_multicast_ttl_v4(ttl),
+        UdpSocketOption::MulticastHopsV6(hops) => {
+            let socket_ref = SockRef::from(socket);
+            socket_ref.set_multicast_hops_v6(hops)
+        }
+        UdpSocketOption::MulticastInterfaceV4(interface) => {
+            let socket_ref = SockRef::from(socket);
+            socket_ref.set_multicast_if_v4(&interface)
+        }
+        UdpSocketOption::MulticastInterfaceV6(interface) => {
+            let socket_ref = SockRef::from(socket);
+            socket_ref.set_multicast_if_v6(interface)
+        }
+        UdpSocketOption::JoinMulticastV4 { group, interface } => {
+            socket.join_multicast_v4(&group, &interface)
+        }
+        UdpSocketOption::LeaveMulticastV4 { group, interface } => {
+            socket.leave_multicast_v4(&group, &interface)
+        }
+        UdpSocketOption::JoinMulticastV6 { group, interface } => {
+            socket.join_multicast_v6(&group, interface)
+        }
+        UdpSocketOption::LeaveMulticastV6 { group, interface } => {
+            socket.leave_multicast_v6(&group, interface)
+        }
+    }
 }
 
 fn send_udp_payload(
@@ -642,11 +733,15 @@ mod tests {
         }
     }
 
-    fn bind_udp_socket(driver: &IoDriver, socket_id: SocketId) -> SocketAddr {
+    fn bind_udp_socket_at(
+        driver: &IoDriver,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) -> SocketAddr {
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Bind {
                 socket_id,
-                local_addr: localhost(0),
+                local_addr,
             }))
             .expect("dispatch UDP bind");
 
@@ -665,6 +760,10 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn bind_udp_socket(driver: &IoDriver, socket_id: SocketId) -> SocketAddr {
+        bind_udp_socket_at(driver, socket_id, localhost(0))
     }
 
     #[test]
@@ -893,6 +992,117 @@ mod tests {
                 other => {
                     log::debug!(
                         "ignoring unrelated event while waiting for UDP SendNack: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_broadcast_configuration_is_reported() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_id = resolve_request(driver.reserve_socket());
+        bind_udp_socket(&driver, socket_id);
+        let option = UdpSocketOption::Broadcast(true);
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Configure {
+                socket_id,
+                option,
+            }))
+            .expect("dispatch UDP configure");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Configured {
+                    socket_id: configured_socket_id,
+                    option: configured_option,
+                }) if configured_socket_id == socket_id => {
+                    assert_eq!(configured_option, option);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP configure: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn udp_ipv4_multicast_membership_configuration_is_reported() {
+        init_test_logger();
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_id = resolve_request(driver.reserve_socket());
+        bind_udp_socket_at(
+            &driver,
+            socket_id,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+        );
+        let group = Ipv4Addr::new(224, 0, 0, 251);
+        let join_option = UdpSocketOption::JoinMulticastV4 {
+            group,
+            interface: Ipv4Addr::UNSPECIFIED,
+        };
+
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Configure {
+                socket_id,
+                option: join_option,
+            }))
+            .expect("dispatch UDP multicast join");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Configured {
+                    socket_id: configured_socket_id,
+                    option,
+                }) if configured_socket_id == socket_id => {
+                    assert_eq!(option, join_option);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP multicast join: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        let leave_option = UdpSocketOption::LeaveMulticastV4 {
+            group,
+            interface: Ipv4Addr::UNSPECIFIED,
+        };
+        driver
+            .dispatch(DriverCommand::Udp(UdpCommand::Configure {
+                socket_id,
+                option: leave_option,
+            }))
+            .expect("dispatch UDP multicast leave");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Udp(UdpEvent::Configured {
+                    socket_id: configured_socket_id,
+                    option,
+                }) if configured_socket_id == socket_id => {
+                    assert_eq!(option, leave_option);
+                    break;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for UDP multicast leave: {:?}",
                         other
                     );
                 }

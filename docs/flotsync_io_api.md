@@ -148,6 +148,10 @@ pub enum UdpRequest {
         target: Option<SocketAddr>,
         reply_to: Recipient<UdpSendResult>,
     },
+    Configure {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+    },
     Close {
         socket_id: SocketId,
     },
@@ -159,6 +163,30 @@ pub enum OpenFailureReason {
     Io(io::ErrorKind),
     InvalidHandle,
     DriverUnavailable,
+}
+```
+
+```rust
+pub enum ConfigureFailureReason {
+    Io(io::ErrorKind),
+    InvalidHandle,
+    DriverUnavailable,
+}
+```
+
+```rust
+pub enum UdpSocketOption {
+    Broadcast(bool),
+    MulticastLoopV4(bool),
+    MulticastLoopV6(bool),
+    MulticastTtlV4(u32),
+    MulticastHopsV6(u32),
+    MulticastInterfaceV4(Ipv4Addr),
+    MulticastInterfaceV6(u32),
+    JoinMulticastV4 { group: Ipv4Addr, interface: Ipv4Addr },
+    LeaveMulticastV4 { group: Ipv4Addr, interface: Ipv4Addr },
+    JoinMulticastV6 { group: Ipv6Addr, interface: u32 },
+    LeaveMulticastV6 { group: Ipv6Addr, interface: u32 },
 }
 ```
 
@@ -188,6 +216,15 @@ pub enum UdpIndication {
         socket_id: SocketId,
         source: SocketAddr,
         payload: IoPayload,
+    },
+    Configured {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+    },
+    ConfigureFailed {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+        reason: ConfigureFailureReason,
     },
     ReadSuspended {
         socket_id: SocketId,
@@ -226,15 +263,21 @@ pub enum UdpSendResult {
 - A single `IoBridge` provides one shared UDP capability to its connected components.
 - Multiple local components may observe the same socket's `Received` and lifecycle indications.
 - UDP bind/connect failures are broadcast as port indications because they describe the shared socket capability state.
+- UDP socket-configuration changes are also broadcast as port indications because they mutate the
+  shared socket capability seen by every local consumer on that bridge.
 - UDP send outcomes are **not** broadcast as port indications.
 - Every UDP `Send` request must carry a `reply_to: Recipient<UdpSendResult>`.
 - `Ack` / `Nack` is delivered only to that recipient.
 - Unconnected UDP still routes send outcomes by the local `socket_id`; the per-send `target`
   belongs to the command, not to the socket identity.
+- `Configure { option }` changes shared socket state. Multiple local components sharing one UDP
+  socket must therefore coordinate option changes such as broadcast enablement or multicast
+  membership. v1 does not add bridge-local membership reference counting.
 
 This split is deliberate:
 
 - shared socket activity (`Received`, `Closed`, suspension/resume) is broadcast via the port
+- shared socket configuration (`Configured`, `ConfigureFailed`) is broadcast via the port
 - per-send completion is point-to-point via the supplied `Recipient`
 
 That keeps UDP's shared capability model while avoiding useless broadcast of send completion.

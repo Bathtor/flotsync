@@ -387,6 +387,9 @@ impl DriverRuntimeState {
                                     udp_send_scratch,
                                 )?;
                             }
+                            UdpCommand::Configure { socket_id, option } => {
+                                self.udp.handle_configure(socket_id, option, event_sink)?;
+                            }
                             UdpCommand::Close { socket_id } => {
                                 if self.release_socket(socket_id, registry).is_err() {
                                     log::warn!(
@@ -525,6 +528,7 @@ pub(super) enum CommandTrace {
     UdpBind(SocketId),
     UdpConnect(SocketId),
     UdpSend(SocketId),
+    UdpConfigure(SocketId),
     UdpClose(SocketId),
 }
 
@@ -558,6 +562,9 @@ impl From<&DriverCommand> for CommandTrace {
                 Self::UdpConnect(*socket_id)
             }
             DriverCommand::Udp(UdpCommand::Send { socket_id, .. }) => Self::UdpSend(*socket_id),
+            DriverCommand::Udp(UdpCommand::Configure { socket_id, .. }) => {
+                Self::UdpConfigure(*socket_id)
+            }
             DriverCommand::Udp(UdpCommand::Close { socket_id }) => Self::UdpClose(*socket_id),
         }
     }

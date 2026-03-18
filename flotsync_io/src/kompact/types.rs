@@ -3,7 +3,15 @@ use super::{
     session::TcpSessionMessage,
 };
 use crate::{
-    api::{CloseReason, ConnectionId, IoPayload, SendFailureReason, SocketId, TransmissionId},
+    api::{
+        CloseReason,
+        ConnectionId,
+        IoPayload,
+        SendFailureReason,
+        SocketId,
+        TransmissionId,
+        UdpSocketOption,
+    },
     errors::Result,
 };
 use ::kompact::prelude::{ActorRefStrong, KFuture, Port, Receiver, Recipient, promise};
@@ -17,6 +25,17 @@ pub enum OpenFailureReason {
     /// The caller referred to a local handle that is not owned by this bridge or no longer live.
     InvalidHandle,
     /// The shared driver infrastructure was unavailable before the operation could run.
+    DriverUnavailable,
+}
+
+/// Describes why a shared UDP socket-configuration request could not be applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigureFailureReason {
+    /// The operating system rejected the configuration while touching the real socket.
+    Io(io::ErrorKind),
+    /// The caller referred to a local socket handle that is not owned by this bridge.
+    InvalidHandle,
+    /// The shared driver infrastructure was unavailable before the configuration could run.
     DriverUnavailable,
 }
 
@@ -58,6 +77,15 @@ pub enum UdpRequest {
         payload: IoPayload,
         target: Option<SocketAddr>,
         reply_to: Recipient<UdpSendResult>,
+    },
+    /// Applies one shared UDP socket-configuration change.
+    ///
+    /// Configuration affects the shared socket capability rather than one send attempt, so success
+    /// and failure are broadcast as [`UdpIndication`] values to every local consumer connected to
+    /// this bridge.
+    Configure {
+        socket_id: SocketId,
+        option: UdpSocketOption,
     },
     /// Closes the identified UDP socket and releases its driver-owned resources.
     Close { socket_id: SocketId },
@@ -102,6 +130,17 @@ pub enum UdpIndication {
         socket_id: SocketId,
         source: SocketAddr,
         payload: IoPayload,
+    },
+    /// Reports that one shared UDP socket option was applied successfully.
+    Configured {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+    },
+    /// Reports that one shared UDP socket option could not be applied.
+    ConfigureFailed {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+        reason: ConfigureFailureReason,
     },
     /// Reports that read interest was disabled because ingress capacity was exhausted.
     ReadSuspended { socket_id: SocketId },
