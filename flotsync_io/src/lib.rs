@@ -5,8 +5,8 @@ pub mod driver;
 pub mod errors;
 pub mod kompact;
 pub mod pool;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 /// Common imports for consumers of the flotsync_io API surface.
 pub mod prelude {

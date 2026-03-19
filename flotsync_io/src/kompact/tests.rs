@@ -15,203 +15,36 @@ use super::{
 use crate::{
     api::{CloseReason, IoPayload, TransmissionId, UdpSocketOption},
     driver::DriverConfig,
-    test_support::init_test_logger,
+    test_support::{
+        TcpListenerEventProbe,
+        TcpSessionEventProbe,
+        UdpObserver,
+        UdpSendResultProbe,
+        WAIT_TIMEOUT,
+        build_test_kompact_system,
+        init_test_logger,
+        kill_component,
+        localhost,
+        payload_bytes,
+        recv_until,
+        start_component,
+    },
 };
 use ::kompact::prelude::*;
 use bytes::Bytes;
 use std::{
     io::{Read, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener},
+    net::{Ipv4Addr, TcpListener},
     sync::mpsc,
     thread,
     time::Duration,
 };
 
-const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(ComponentDefinition)]
-struct UdpObserver {
-    ctx: ComponentContext<Self>,
-    udp: RequiredPort<UdpPort>,
-    indications: mpsc::Sender<UdpIndication>,
-}
-
-impl UdpObserver {
-    fn new(indications: mpsc::Sender<UdpIndication>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            udp: RequiredPort::uninitialised(),
-            indications,
-        }
-    }
-}
-
-ignore_lifecycle!(UdpObserver);
-
-impl Require<UdpPort> for UdpObserver {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
-        self.indications
-            .send(indication)
-            .expect("UDP indication receiver must be live during test");
-        Handled::Ok
-    }
-}
-
-impl Actor for UdpObserver {
-    type Message = Never;
-
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
-        unreachable!("Never type is empty")
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("UDP observer test component does not use network actor messages")
-    }
-}
-
-#[derive(ComponentDefinition)]
-struct UdpSendResultProbe {
-    ctx: ComponentContext<Self>,
-    results: mpsc::Sender<UdpSendResult>,
-}
-
-impl UdpSendResultProbe {
-    fn new(results: mpsc::Sender<UdpSendResult>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            results,
-        }
-    }
-}
-
-ignore_lifecycle!(UdpSendResultProbe);
-
-impl Actor for UdpSendResultProbe {
-    type Message = UdpSendResult;
-
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
-        self.results
-            .send(msg)
-            .expect("UDP send result receiver must be live during test");
-        Handled::Ok
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("UDP send result probe does not use network actor messages")
-    }
-}
-
-#[derive(ComponentDefinition)]
-struct TcpSessionEventProbe {
-    ctx: ComponentContext<Self>,
-    events: mpsc::Sender<TcpSessionEvent>,
-}
-
-impl TcpSessionEventProbe {
-    fn new(events: mpsc::Sender<TcpSessionEvent>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            events,
-        }
-    }
-}
-
-ignore_lifecycle!(TcpSessionEventProbe);
-
-impl Actor for TcpSessionEventProbe {
-    type Message = TcpSessionEvent;
-
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
-        self.events
-            .send(msg)
-            .expect("TCP session event receiver must be live during test");
-        Handled::Ok
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP session probe does not use network actor messages")
-    }
-}
-
-#[derive(ComponentDefinition)]
-struct TcpListenerEventProbe {
-    ctx: ComponentContext<Self>,
-    events: mpsc::Sender<TcpListenerEvent>,
-}
-
-impl TcpListenerEventProbe {
-    fn new(events: mpsc::Sender<TcpListenerEvent>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            events,
-        }
-    }
-}
-
-ignore_lifecycle!(TcpListenerEventProbe);
-
-impl Actor for TcpListenerEventProbe {
-    type Message = TcpListenerEvent;
-
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
-        self.events
-            .send(msg)
-            .expect("TCP listener event receiver must be live during test");
-        Handled::Ok
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP listener probe does not use network actor messages")
-    }
-}
-
-fn localhost(port: u16) -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-}
-
-fn payload_bytes(payload: IoPayload) -> Bytes {
-    match payload {
-        IoPayload::Lease(lease) => lease.create_byte_clone(),
-        IoPayload::Bytes(bytes) => bytes,
-    }
-}
-
-fn recv_until<T>(rx: &mpsc::Receiver<T>, mut predicate: impl FnMut(&T) -> bool) -> T {
-    loop {
-        let value = rx
-            .recv_timeout(WAIT_TIMEOUT)
-            .expect("timed out waiting for Kompact test event");
-        if predicate(&value) {
-            return value;
-        }
-    }
-}
-
-fn start_component<C>(system: &KompactSystem, component: &std::sync::Arc<Component<C>>)
-where
-    C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
-{
-    system
-        .start_notify(component)
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("component start");
-}
-
-fn kill_component<C>(system: &KompactSystem, component: std::sync::Arc<Component<C>>)
-where
-    C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
-{
-    system
-        .kill_notify(component)
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("component kill");
-}
-
 #[test]
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     init_test_logger();
 
-    let system = KompactConfig::default().build().expect("KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -402,7 +235,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
 fn udp_bridge_broadcasts_socket_configuration_indications() {
     init_test_logger();
 
-    let system = KompactConfig::default().build().expect("KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -524,7 +357,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
         stream.write_all(b"world").expect("write TCP response");
     });
 
-    let system = KompactConfig::default().build().expect("KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -617,7 +450,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
 fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     init_test_logger();
 
-    let system = KompactConfig::default().build().expect("KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -716,7 +549,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 fn dropping_pending_tcp_session_rejects_the_connection() {
     init_test_logger();
 
-    let system = KompactConfig::default().build().expect("KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));

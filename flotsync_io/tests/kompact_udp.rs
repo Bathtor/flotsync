@@ -1,27 +1,26 @@
-mod support;
-
 use bytes::Bytes;
-use flotsync_io::prelude::*;
+use flotsync_io::{
+    prelude::*,
+    test_support::{
+        UdpObserver,
+        UdpSendResultProbe,
+        build_test_kompact_system,
+        init_test_logger,
+        kill_component,
+        localhost,
+        payload_bytes,
+        recv_until,
+        start_component,
+    },
+};
 use kompact::prelude::*;
 use std::{sync::mpsc, time::Duration};
-use support::{
-    UdpObserver,
-    UdpSendResultProbe,
-    init_test_logger,
-    kill_component,
-    localhost,
-    payload_bytes,
-    recv_until,
-    start_component,
-};
 
 #[test]
 fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     init_test_logger();
 
-    let system = KompactConfig::default()
-        .build()
-        .expect("build KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -237,9 +236,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
 fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     init_test_logger();
 
-    let system = KompactConfig::default()
-        .build()
-        .expect("build KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     start_component(&system, &driver_component);
 

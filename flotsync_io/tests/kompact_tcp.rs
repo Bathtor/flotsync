@@ -1,7 +1,18 @@
-mod support;
-
 use bytes::Bytes;
-use flotsync_io::prelude::*;
+use flotsync_io::{
+    prelude::*,
+    test_support::{
+        TcpListenerEventProbe,
+        TcpSessionEventProbe,
+        build_test_kompact_system,
+        init_test_logger,
+        kill_component,
+        localhost,
+        payload_bytes,
+        recv_until,
+        start_component,
+    },
+};
 use kompact::prelude::*;
 use std::{
     io::{Read, Write},
@@ -9,16 +20,6 @@ use std::{
     sync::mpsc,
     thread,
     time::Duration,
-};
-use support::{
-    TcpListenerEventProbe,
-    TcpSessionEventProbe,
-    init_test_logger,
-    kill_component,
-    localhost,
-    payload_bytes,
-    recv_until,
-    start_component,
 };
 
 #[test]
@@ -43,9 +44,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
         stream.write_all(b"world").expect("write TCP response");
     });
 
-    let system = KompactConfig::default()
-        .build()
-        .expect("build KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -165,9 +164,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
  {
     init_test_logger();
 
-    let system = KompactConfig::default()
-        .build()
-        .expect("build KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -294,9 +291,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
 fn dropping_pending_tcp_session_auto_rejects_the_connection() {
     init_test_logger();
 
-    let system = KompactConfig::default()
-        .build()
-        .expect("build KompactSystem");
+    let system = build_test_kompact_system();
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));

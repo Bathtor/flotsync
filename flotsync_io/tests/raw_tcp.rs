@@ -1,21 +1,21 @@
-mod support;
-
 use bytes::Bytes;
-use flotsync_io::prelude::*;
+use flotsync_io::{
+    prelude::*,
+    test_support::{
+        assert_no_driver_event,
+        init_test_logger,
+        localhost,
+        payload_bytes,
+        wait_for_driver_event,
+        wait_for_driver_request,
+    },
+};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::Duration,
-};
-use support::{
-    assert_no_driver_event,
-    init_test_logger,
-    localhost,
-    payload_bytes,
-    wait_for_driver_event,
-    wait_for_driver_request,
 };
 
 fn reserve_connection(driver: &IoDriver) -> ConnectionId {
