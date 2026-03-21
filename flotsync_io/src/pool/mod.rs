@@ -16,6 +16,7 @@
 use crate::{
     api::MAX_UDP_PAYLOAD_BYTES,
     errors::{Error, Result},
+    logging::{RuntimeLogger, default_runtime_logger},
 };
 use ::kompact::prelude::{ChunkLease, ChunkRef};
 use bytes::{Buf, Bytes};
@@ -129,30 +130,42 @@ pub struct IoBufferPools {
     config: IoBufferConfig,
     ingress: IngressPool,
     egress: EgressPool,
+    ingress_notifier: PoolAvailabilityNotifier,
 }
 
 impl IoBufferPools {
     /// Creates the shared ingress and egress pools.
     pub fn new(config: IoBufferConfig) -> Result<Self> {
-        let ingress_notifier = PoolAvailabilityNotifier::new(|| {});
-        Self::new_with_ingress_notifier(config, ingress_notifier)
+        Self::new_with_logger(config, default_runtime_logger())
     }
 
-    /// Creates the shared ingress and egress pools, wiring a driver wakeup callback into the
-    /// ingress side for exhausted -> available transitions.
-    pub(crate) fn new_with_ingress_notifier(
+    /// Creates the shared ingress and egress pools using the supplied runtime logger.
+    pub(crate) fn new_with_logger(config: IoBufferConfig, logger: RuntimeLogger) -> Result<Self> {
+        let ingress_notifier = PoolAvailabilityNotifier::new(|| {});
+        Self::new_with_logger_and_ingress_notifier(config, logger, ingress_notifier)
+    }
+
+    /// Creates the shared ingress and egress pools using the supplied runtime logger and ingress
+    /// availability notifier.
+    pub(crate) fn new_with_logger_and_ingress_notifier(
         config: IoBufferConfig,
+        logger: RuntimeLogger,
         ingress_notifier: PoolAvailabilityNotifier,
     ) -> Result<Self> {
         config.validate()?;
 
-        let ingress = IngressPool::new(config.ingress.clone(), ingress_notifier);
-        let egress = EgressPool::new(config.egress.clone());
+        let ingress = IngressPool::new(
+            config.ingress.clone(),
+            logger.clone(),
+            ingress_notifier.clone(),
+        );
+        let egress = EgressPool::new(config.egress.clone(), logger);
 
         Ok(Self {
             config,
             ingress,
             egress,
+            ingress_notifier,
         })
     }
 
@@ -169,6 +182,16 @@ impl IoBufferPools {
     /// Returns the shared egress pool handle.
     pub fn egress(&self) -> EgressPool {
         self.egress.clone()
+    }
+
+    pub(crate) fn replace_ingress_notifier(&self, callback: impl Fn() + Send + Sync + 'static) {
+        self.ingress_notifier.replace(callback);
+    }
+
+    pub(crate) fn replace_runtime_logger(&self, logger: RuntimeLogger) -> Result<()> {
+        self.ingress.replace_logger(logger.clone())?;
+        self.egress.replace_logger(logger)?;
+        Ok(())
     }
 }
 
@@ -211,18 +234,34 @@ impl<T> Future for PoolRequest<T> {
 /// thread, so the driver needs an out-of-band wakeup that does not rely on further socket traffic.
 #[derive(Clone)]
 pub(crate) struct PoolAvailabilityNotifier {
-    callback: Arc<dyn Fn() + Send + Sync + 'static>,
+    callback: Arc<Mutex<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 impl PoolAvailabilityNotifier {
     pub(crate) fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
-            callback: Arc::new(callback),
+            callback: Arc::new(Mutex::new(Arc::new(callback))),
+        }
+    }
+
+    pub(crate) fn replace(&self, callback: impl Fn() + Send + Sync + 'static) {
+        let callback = Arc::new(callback);
+        match self.callback.lock() {
+            Ok(mut current) => {
+                *current = callback;
+            }
+            Err(poisoned) => {
+                *poisoned.into_inner() = callback;
+            }
         }
     }
 
     fn notify(&self) {
-        (self.callback)();
+        let callback = match self.callback.lock() {
+            Ok(current) => Arc::clone(&current),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        (callback)();
     }
 }
 
@@ -594,7 +633,7 @@ pub(super) fn wait_for_request<T>(mut request: PoolRequest<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::init_test_logger;
+    use crate::{logging::default_runtime_logger, test_support::init_test_logger};
 
     fn tiny_config() -> IoPoolConfig {
         IoPoolConfig {
@@ -608,8 +647,8 @@ mod tests {
     #[test]
     fn ingress_notifier_fires_after_last_shared_lease_drop() {
         init_test_logger();
-        let notifications = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let notifications_clone = std::sync::Arc::clone(&notifications);
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notifications_clone = Arc::clone(&notifications);
 
         let config = IoPoolConfig {
             max_chunk_count: 1,
@@ -617,6 +656,7 @@ mod tests {
         };
         let pool = IngressPool::new(
             config,
+            default_runtime_logger(),
             PoolAvailabilityNotifier::new(move || {
                 notifications_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }),
@@ -647,7 +687,11 @@ mod tests {
             max_chunk_count: 1,
             ..tiny_config()
         };
-        let pool = IngressPool::new(config, PoolAvailabilityNotifier::new(|| {}));
+        let pool = IngressPool::new(
+            config,
+            default_runtime_logger(),
+            PoolAvailabilityNotifier::new(|| {}),
+        );
 
         let mut buffer = pool
             .try_acquire()
@@ -671,7 +715,7 @@ mod tests {
             max_chunk_count: 1,
             ..tiny_config()
         };
-        let pool = EgressPool::new(config);
+        let pool = EgressPool::new(config, default_runtime_logger());
 
         let first =
             wait_for_request(pool.reserve(64).expect("reserve first")).expect("first ready");
@@ -699,7 +743,7 @@ mod tests {
     fn io_lease_cursors_are_independent() {
         init_test_logger();
 
-        let pool = EgressPool::new(tiny_config());
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
         let reservation =
             wait_for_request(pool.reserve(5).expect("reserve payload")).expect("payload ready");
         let lease = reservation.copy_bytes(b"hello").expect("write payload");
@@ -728,7 +772,7 @@ mod tests {
             max_chunk_count: 2,
             encode_buf_min_free_space: 8,
         };
-        let pool = EgressPool::new(config);
+        let pool = EgressPool::new(config, default_runtime_logger());
 
         let first =
             wait_for_request(pool.reserve(256).expect("reserve first")).expect("first ready");

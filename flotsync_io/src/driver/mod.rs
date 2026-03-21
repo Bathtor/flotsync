@@ -10,9 +10,11 @@ use crate::{
         Result,
         SpawnDriverThreadSnafu,
     },
-    pool::{EgressPool, IngressPool, IoBufferConfig, IoBufferPools, PoolAvailabilityNotifier},
+    logging::{RuntimeLogger, default_runtime_logger},
+    pool::{EgressPool, IngressPool, IoBufferConfig, IoBufferPools},
 };
 use mio::{Poll, Token, Waker};
+use slog::{debug, error, info};
 use snafu::ResultExt;
 use std::{
     borrow::Cow,
@@ -154,6 +156,7 @@ impl<T> Future for DriverRequest<T> {
 /// Shared handle for the dedicated mio driver thread.
 pub struct IoDriver {
     config: DriverConfig,
+    logger: RuntimeLogger,
     buffers: IoBufferPools,
     command_tx: crossbeam_channel::Sender<ControlCommand>,
     event_rx: Option<crossbeam_channel::Receiver<DriverEvent>>,
@@ -173,10 +176,15 @@ impl fmt::Debug for IoDriver {
 impl IoDriver {
     /// Starts the dedicated mio driver thread and waits until the runtime is ready.
     pub fn start(config: DriverConfig) -> Result<Self> {
+        Self::start_with_logger(config, default_runtime_logger())
+    }
+
+    /// Starts the dedicated mio driver thread with the supplied runtime logger.
+    pub fn start_with_logger(config: DriverConfig, logger: RuntimeLogger) -> Result<Self> {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let event_sink: Arc<dyn DriverEventSink> =
             Arc::new(ChannelDriverEventSink { sender: event_tx });
-        let mut driver = Self::start_with_event_sink(config, event_sink)?;
+        let mut driver = Self::start_with_logger_and_event_sink(config, logger, event_sink)?;
         driver.event_rx = Some(event_rx);
         Ok(driver)
     }
@@ -186,28 +194,48 @@ impl IoDriver {
         config: DriverConfig,
         event_sink: Arc<dyn DriverEventSink>,
     ) -> Result<Self> {
-        log::info!(
-            "starting flotsync_io driver thread '{}'",
-            config.thread_name
+        Self::start_with_logger_and_event_sink(config, default_runtime_logger(), event_sink)
+    }
+
+    /// Starts the dedicated mio driver thread with explicit runtime logger and event sink.
+    pub fn start_with_logger_and_event_sink(
+        config: DriverConfig,
+        logger: RuntimeLogger,
+        event_sink: Arc<dyn DriverEventSink>,
+    ) -> Result<Self> {
+        let buffers = IoBufferPools::new_with_logger(config.buffer_config.clone(), logger.clone())?;
+        Self::start_with_logger_buffers_and_event_sink(config, logger, buffers, event_sink)
+    }
+
+    pub(crate) fn start_with_logger_buffers_and_event_sink(
+        config: DriverConfig,
+        logger: RuntimeLogger,
+        buffers: IoBufferPools,
+        event_sink: Arc<dyn DriverEventSink>,
+    ) -> Result<Self> {
+        info!(
+            logger,
+            "starting flotsync_io driver thread '{}'", config.thread_name
         );
+
+        buffers.replace_runtime_logger(logger.clone())?;
 
         let poll = Poll::new().context(CreateDriverPollSnafu)?;
         let waker = Waker::new(poll.registry(), WAKE_TOKEN).context(CreateDriverWakerSnafu)?;
         let shared_waker = Arc::new(waker);
         let runtime_waker = Arc::clone(&shared_waker);
         let notifier_waker = Arc::clone(&shared_waker);
-        let buffers = IoBufferPools::new_with_ingress_notifier(
-            config.buffer_config.clone(),
-            PoolAvailabilityNotifier::new(move || {
-                let wake_result = notifier_waker.wake();
-                if let Err(error) = wake_result {
-                    log::error!(
-                        "failed to wake flotsync_io driver thread after ingress capacity returned: {}",
-                        error
-                    );
-                }
-            }),
-        )?;
+        let notifier_logger = logger.clone();
+        buffers.replace_ingress_notifier(move || {
+            let wake_result = notifier_waker.wake();
+            if let Err(error) = wake_result {
+                error!(
+                    notifier_logger,
+                    "failed to wake flotsync_io driver thread after ingress capacity returned: {}",
+                    error
+                );
+            }
+        });
         let runner_ingress_pool = buffers.ingress();
 
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
@@ -215,10 +243,12 @@ impl IoDriver {
 
         let thread_config = DriverThreadConfig::from(&config);
         let builder = std::thread::Builder::new().name(config.thread_name.to_string());
+        let thread_logger = logger.clone();
         let handle = builder
             .spawn(move || {
                 run_driver_thread(
                     thread_config,
+                    thread_logger,
                     poll,
                     command_rx,
                     event_sink,
@@ -233,10 +263,14 @@ impl IoDriver {
             .map_err(|_| Error::DriverResponseChannelClosed)?;
         startup?;
 
-        log::info!("flotsync_io driver thread '{}' started", config.thread_name);
+        info!(
+            logger,
+            "flotsync_io driver thread '{}' started", config.thread_name
+        );
 
         Ok(Self {
             config,
+            logger,
             buffers,
             command_tx,
             event_rx: None,
@@ -356,19 +390,18 @@ impl IoDriver {
     fn send_control(&self, command: ControlCommand) -> Result<()> {
         let send_result = self.command_tx.send(command);
         if send_result.is_err() {
-            log::error!(
-                "flotsync_io driver thread '{}' command channel is closed",
-                self.config.thread_name
+            error!(
+                self.logger,
+                "flotsync_io driver thread '{}' command channel is closed", self.config.thread_name
             );
             return Err(Error::DriverCommandChannelClosed);
         }
 
         let wake_result = self.waker.wake().context(DriverWakeSnafu);
         if let Err(error) = &wake_result {
-            log::error!(
-                "failed to wake flotsync_io driver thread '{}': {}",
-                self.config.thread_name,
-                error
+            error!(
+                self.logger,
+                "failed to wake flotsync_io driver thread '{}': {}", self.config.thread_name, error
             );
         }
         wake_result
@@ -389,9 +422,9 @@ impl IoDriver {
             return Ok(());
         };
 
-        log::info!(
-            "shutting down flotsync_io driver thread '{}'",
-            self.config.thread_name
+        info!(
+            self.logger,
+            "shutting down flotsync_io driver thread '{}'", self.config.thread_name
         );
 
         let stop_result = self.send_control(ControlCommand::Stop);
@@ -400,14 +433,15 @@ impl IoDriver {
         match join_result {
             Ok(Ok(())) => {
                 stop_result?;
-                log::info!(
-                    "flotsync_io driver thread '{}' stopped cleanly",
-                    self.config.thread_name
+                info!(
+                    self.logger,
+                    "flotsync_io driver thread '{}' stopped cleanly", self.config.thread_name
                 );
                 Ok(())
             }
             Ok(Err(error)) => {
-                log::error!(
+                error!(
+                    self.logger,
                     "flotsync_io driver thread '{}' exited with error: {}",
                     self.config.thread_name,
                     error
@@ -416,10 +450,9 @@ impl IoDriver {
             }
             Err(payload) => {
                 let message = panic_payload_to_string(payload);
-                log::error!(
-                    "flotsync_io driver thread '{}' panicked: {}",
-                    self.config.thread_name,
-                    message
+                error!(
+                    self.logger,
+                    "flotsync_io driver thread '{}' panicked: {}", self.config.thread_name, message
                 );
                 Err(Error::DriverThreadPanicked)
             }
@@ -437,13 +470,15 @@ impl Drop for IoDriver {
     fn drop(&mut self) {
         match self.shutdown_inner() {
             Ok(()) => {
-                log::debug!(
+                debug!(
+                    self.logger,
                     "flotsync_io driver '{}' drop completed with a clean shutdown",
                     self.config.thread_name
                 );
             }
             Err(error) => {
-                log::error!(
+                error!(
+                    self.logger,
                     "flotsync_io driver '{}' drop failed during shutdown: {}",
                     self.config.thread_name,
                     error

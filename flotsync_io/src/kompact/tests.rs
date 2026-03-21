@@ -13,7 +13,7 @@ use super::{
     UdpSendResult,
 };
 use crate::{
-    api::{CloseReason, IoPayload, TransmissionId, UdpSocketOption},
+    api::{CloseReason, IoPayload, TransmissionId, UdpLocalBind, UdpSocketOption},
     driver::DriverConfig,
     test_support::{
         TcpListenerEventProbe,
@@ -85,7 +85,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id: receiver_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     let receiver_addr = match recv_until(&observer1_rx, |event| {
@@ -128,7 +128,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id: sender_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     recv_until(&observer1_rx, |event| {
@@ -265,7 +265,7 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     recv_until(&observer1_rx, |event| {

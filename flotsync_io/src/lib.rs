@@ -4,6 +4,7 @@ pub mod api;
 pub mod driver;
 pub mod errors;
 pub mod kompact;
+mod logging;
 pub mod pool;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -22,8 +23,10 @@ pub mod prelude {
             TcpCommand,
             TcpEvent,
             TransmissionId,
+            UdpCloseReason,
             UdpCommand,
             UdpEvent,
+            UdpLocalBind,
             UdpSocketOption,
         },
         driver::{

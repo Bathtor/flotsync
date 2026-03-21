@@ -116,6 +116,24 @@ UdpEvent::SendNack {
 }
 ```
 
+## Bridge Control Surface
+
+The Kompact bridge keeps transport control and payload allocation on one narrow shared surface:
+
+```rust
+impl IoBridgeHandle {
+    pub fn reserve_udp_socket(&self) -> KFuture<Result<SocketId>>;
+    pub fn release_udp_socket(&self, socket_id: SocketId) -> KFuture<Result<()>>;
+    pub fn open_tcp_session(&self, request: OpenTcpSession) -> KFuture<Result<TcpSessionRef>>;
+    pub fn open_tcp_listener(&self, request: OpenTcpListener) -> KFuture<Result<TcpListenerRef>>;
+    pub fn egress_pool(&self) -> &EgressPool;
+}
+```
+
+`egress_pool()` is the transport-agnostic payload-allocation hook. Any component that can send
+payloads can clone the shared egress pool through the same bridge handle and serialise into
+lease-backed `IoPayload::Lease` values instead of allocating ad hoc `Bytes` payloads.
+
 ## Kompact UDP API
 
 UDP is modeled as a shared capability and therefore maps well to a typed `Port`.
@@ -131,10 +149,17 @@ impl Port for UdpPort {
 ```
 
 ```rust
+pub enum UdpLocalBind {
+    Exact(SocketAddr),
+    ForPeer(SocketAddr),
+}
+```
+
+```rust
 pub enum UdpRequest {
     Bind {
         socket_id: SocketId,
-        local_addr: SocketAddr,
+        bind: UdpLocalBind,
     },
     Connect {
         socket_id: SocketId,
@@ -191,6 +216,13 @@ pub enum UdpSocketOption {
 ```
 
 ```rust
+pub enum UdpCloseReason {
+    Requested,
+    Disconnected,
+}
+```
+
+```rust
 pub enum UdpIndication {
     Bound {
         socket_id: SocketId,
@@ -240,6 +272,8 @@ pub enum UdpIndication {
     },
     Closed {
         socket_id: SocketId,
+        remote_addr: Option<SocketAddr>,
+        reason: UdpCloseReason,
     },
 }
 ```
@@ -262,6 +296,10 @@ pub enum UdpSendResult {
 
 - A single `IoBridge` provides one shared UDP capability to its connected components.
 - Multiple local components may observe the same socket's `Received` and lifecycle indications.
+- `UdpLocalBind::ForPeer(peer)` lets the driver own the default local-bind policy for unconnected
+  UDP sockets. The concrete local address is still reported by `Bound` / `BindFailed`.
+- `UdpLocalBind::resolve_local_addr()` exposes that policy explicitly for callers that need to
+  reason about the concrete bind address before opening the socket.
 - UDP bind/connect failures are broadcast as port indications because they describe the shared socket capability state.
 - UDP socket-configuration changes are also broadcast as port indications because they mutate the
   shared socket capability seen by every local consumer on that bridge.
@@ -430,6 +468,9 @@ pub enum TcpSessionEvent {
   `ConnectionId` to the client.
 - `TransmissionId` only needs to be meaningful within one session.
 - Inbound listeners expose pending decisions first; they do not auto-spawn session owners.
+- Connected UDP may close with `UdpCloseReason::Disconnected` when the platform surfaces a remote
+  unreachable/connection-refused condition. That is a best-effort connected-UDP signal, not a
+  protocol guarantee like TCP close.
 - Accepted inbound sessions reuse the same `TcpSessionRef` model as outbound sessions once the
   application accepts them.
 - Accepted inbound sessions do not emit a separate `Connected` event; the listener's `Incoming`

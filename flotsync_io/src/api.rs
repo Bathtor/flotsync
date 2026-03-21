@@ -133,6 +133,60 @@ pub enum CloseReason {
     DriverShutdown,
 }
 
+/// Explains why a UDP socket transitioned into a closed state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UdpCloseReason {
+    /// The socket was closed because local code requested closure explicitly.
+    Requested,
+    /// The connected UDP peer became unreachable and the platform surfaced that via
+    /// `ConnectionRefused` on the socket.
+    Disconnected,
+}
+
+/// Describes how the driver should choose the local bind address for an unconnected UDP socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UdpLocalBind {
+    /// Bind exactly the supplied local socket address.
+    Exact(SocketAddr),
+    /// Choose a suitable ephemeral local bind address for future traffic to the supplied peer.
+    ///
+    /// This keeps the socket unconnected, but lets the driver apply transport-specific policy
+    /// when selecting the local address family and interface affinity. The resulting concrete
+    /// local address is still reported through [`UdpEvent::Bound`].
+    ForPeer(SocketAddr),
+}
+
+impl UdpLocalBind {
+    /// Resolves this bind policy into the concrete local address the raw driver will attempt.
+    ///
+    /// This is primarily useful for callers that need to predict the local bind address reported
+    /// by failure paths such as [`UdpEvent::BindFailed`] before the socket is actually opened.
+    ///
+    /// The resolution is platform-sensitive. In particular, loopback peers resolve to loopback
+    /// ephemeral local addresses, while other peers resolve to wildcard ephemeral local addresses
+    /// in the same address family.
+    pub fn resolve_local_addr(self) -> SocketAddr {
+        match self {
+            Self::Exact(local_addr) => local_addr,
+            Self::ForPeer(peer_addr) => {
+                if peer_addr.ip().is_loopback() {
+                    match peer_addr {
+                        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+                    }
+                } else {
+                    match peer_addr {
+                        SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                        SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Commands issued against the TCP freeform I/O surface.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -304,10 +358,10 @@ pub enum UdpSocketOption {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum UdpCommand {
-    /// Binds a UDP socket to a local address using the provided local socket handle.
+    /// Binds a UDP socket using the provided local socket handle.
     Bind {
         socket_id: SocketId,
-        local_addr: SocketAddr,
+        bind: UdpLocalBind,
     },
     /// Creates a connected UDP socket, optionally binding it first, and associates it with the
     /// provided local socket handle.
@@ -401,5 +455,9 @@ pub enum UdpEvent {
     /// Reports that write-side progress resumed and sends may be attempted again.
     WriteResumed { socket_id: SocketId },
     /// Reports that the UDP socket closed and released its driver-owned state.
-    Closed { socket_id: SocketId },
+    Closed {
+        socket_id: SocketId,
+        remote_addr: Option<SocketAddr>,
+        reason: UdpCloseReason,
+    },
 }

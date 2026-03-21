@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use flotsync_io::{
+    api::UdpCloseReason,
     prelude::*,
     test_support::{
         assert_no_driver_event,
@@ -24,7 +25,7 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
     driver
         .dispatch(DriverCommand::Udp(UdpCommand::Bind {
             socket_id,
-            local_addr,
+            bind: UdpLocalBind::Exact(local_addr),
         }))
         .expect("dispatch UDP bind");
 
@@ -168,11 +169,18 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
             event,
             DriverEvent::Udp(UdpEvent::Closed {
                 socket_id: observed_socket_id,
+                ..
             }) if *observed_socket_id == connected_sender_id
         )
     }) {
-        DriverEvent::Udp(UdpEvent::Closed { socket_id }) => {
+        DriverEvent::Udp(UdpEvent::Closed {
+            socket_id,
+            remote_addr,
+            reason,
+        }) => {
             assert_eq!(socket_id, connected_sender_id);
+            assert_eq!(remote_addr, Some(receiver_addr));
+            assert_eq!(reason, UdpCloseReason::Requested);
         }
         other => unreachable!("filtered to UDP Closed event, got {other:?}"),
     }
@@ -223,7 +231,7 @@ fn udp_driver_reports_bind_failures_and_socket_configuration_changes() {
     driver
         .dispatch(DriverCommand::Udp(UdpCommand::Bind {
             socket_id: failed_socket_id,
-            local_addr: occupied_addr,
+            bind: UdpLocalBind::Exact(occupied_addr),
         }))
         .expect("dispatch UDP bind that should fail");
 
@@ -419,11 +427,18 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
             event,
             DriverEvent::Udp(UdpEvent::Closed {
                 socket_id: observed_socket_id,
+                ..
             }) if *observed_socket_id == receiver_id
         )
     }) {
-        DriverEvent::Udp(UdpEvent::Closed { socket_id }) => {
+        DriverEvent::Udp(UdpEvent::Closed {
+            socket_id,
+            remote_addr,
+            reason,
+        }) => {
             assert_eq!(socket_id, receiver_id);
+            assert_eq!(remote_addr, None);
+            assert_eq!(reason, UdpCloseReason::Requested);
         }
         other => unreachable!("filtered to UDP Closed event, got {other:?}"),
     }

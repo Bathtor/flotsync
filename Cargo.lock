@@ -1033,6 +1033,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flotsync_io_examples"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "flotsync_io",
+ "kompact",
+ "log",
+ "slog",
+ "slog-scope",
+ "slog-stdlog",
+ "slog-term",
+ "snafu",
+]
+
+[[package]]
 name = "flotsync_messages"
 version = "0.1.0"
 dependencies = [

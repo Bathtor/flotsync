@@ -7,7 +7,11 @@ use super::{
     PoolAvailabilityNotifier,
     PooledChunk,
 };
-use crate::errors::{Error, Result};
+use crate::{
+    errors::{Error, Result},
+    logging::RuntimeLogger,
+};
+use slog::error;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// Shared ingress pool used for inbound reads.
@@ -20,10 +24,12 @@ pub struct IngressPool {
 impl IngressPool {
     pub(super) fn new(
         config: IoPoolConfig,
+        logger: RuntimeLogger,
         availability_notifier: PoolAvailabilityNotifier,
     ) -> Self {
         let state = IngressPoolState {
             chunks: ChunkPoolState::new(config.clone()),
+            logger,
             availability_notifier,
         };
         Self {
@@ -57,6 +63,12 @@ impl IngressPool {
         Ok(state.has_available_chunk())
     }
 
+    pub(crate) fn replace_logger(&self, logger: RuntimeLogger) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.logger = logger;
+        Ok(())
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, IngressPoolState>> {
         self.inner.lock().map_err(|_| Error::IoBufferStatePoisoned {
             pool_kind: "ingress",
@@ -71,6 +83,7 @@ impl IngressPool {
 #[derive(Debug)]
 pub(super) struct IngressPoolState {
     pub(super) chunks: ChunkPoolState,
+    logger: RuntimeLogger,
     availability_notifier: PoolAvailabilityNotifier,
 }
 
@@ -105,8 +118,12 @@ impl IngressPoolState {
                     notifier.notify();
                 }
             }
-            Err(_) => {
-                log::error!("ingress pool state is poisoned; dropping returned chunks");
+            Err(poisoned) => {
+                let logger = poisoned.into_inner().logger.clone();
+                error!(
+                    logger,
+                    "ingress pool state is poisoned; dropping returned chunks"
+                );
             }
         };
     }

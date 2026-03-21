@@ -7,20 +7,24 @@ use super::{
 use crate::{
     api::MAX_UDP_PAYLOAD_BYTES,
     errors::{DriverPollSnafu, Result},
+    logging::RuntimeLogger,
     pool::IngressPool,
 };
 use mio::{Events, Poll};
+use slog::{debug, info, warn};
 use snafu::ResultExt;
+use std::sync::Arc;
 
 pub(super) fn run_driver_thread(
     config: DriverThreadConfig,
+    logger: RuntimeLogger,
     mut poll: Poll,
     command_rx: crossbeam_channel::Receiver<super::runtime::ControlCommand>,
-    event_sink: std::sync::Arc<dyn DriverEventSink>,
+    event_sink: Arc<dyn DriverEventSink>,
     startup_tx: std::sync::mpsc::SyncSender<Result<()>>,
     ingress_pool: IngressPool,
 ) -> Result<()> {
-    let mut state = DriverRuntimeState::default();
+    let mut state = DriverRuntimeState::new(logger.clone());
     let mut events = Events::with_capacity(config.events_capacity.max(1));
     // This scratch buffer is stack-allocated on purpose: 1472 bytes is small for a dedicated
     // driver thread stack, avoids a permanent heap allocation in the hot path, and matches the
@@ -28,13 +32,17 @@ pub(super) fn run_driver_thread(
     // materially or add jump-frame support with tighter stack budgets.
     let mut udp_send_scratch = [0_u8; MAX_UDP_PAYLOAD_BYTES];
 
-    log::debug!(
+    debug!(
+        logger,
         "flotsync_io driver thread entering poll loop with event capacity {}",
         events.capacity()
     );
 
     if startup_tx.send(Ok(())).is_err() {
-        log::warn!("flotsync_io driver startup receiver was dropped before readiness signal");
+        warn!(
+            logger,
+            "flotsync_io driver startup receiver was dropped before readiness signal"
+        );
     }
 
     loop {
@@ -59,7 +67,7 @@ pub(super) fn run_driver_thread(
                     &mut udp_send_scratch,
                 )?;
                 if should_stop {
-                    log::info!("flotsync_io driver thread leaving poll loop");
+                    info!(logger, "flotsync_io driver thread leaving poll loop");
                     return Ok(());
                 }
                 state.resume_suspended_udp_reads(
@@ -114,14 +122,15 @@ pub(super) fn run_driver_thread(
 }
 
 pub(super) fn send_reply<T>(
+    logger: &RuntimeLogger,
     reply_tx: futures_channel::oneshot::Sender<Result<T>>,
     reply: Result<T>,
     operation: &str,
 ) {
     if reply_tx.send(reply).is_err() {
-        log::debug!(
-            "dropping flotsync_io {} reply because the receiver was already gone",
-            operation
+        debug!(
+            logger,
+            "dropping flotsync_io {} reply because the receiver was already gone", operation
         );
     }
 }

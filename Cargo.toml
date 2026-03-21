@@ -8,6 +8,7 @@ members = [
     "flotsync_utils",
     "flotsync_replication",
     "flotsync_io",
+    "flotsync_io_examples",
 ]
 resolver = "3"
 

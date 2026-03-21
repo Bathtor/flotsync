@@ -8,8 +8,12 @@ use super::{
     PooledChunk,
     chunks_for_bytes,
 };
-use crate::errors::{Error, Result};
+use crate::{
+    errors::{Error, Result},
+    logging::RuntimeLogger,
+};
 use bytes::{BufMut, buf::UninitSlice};
+use slog::{error, warn};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// Shared egress pool used for outbound serialisation.
@@ -20,9 +24,10 @@ pub struct EgressPool {
 }
 
 impl EgressPool {
-    pub(super) fn new(config: IoPoolConfig) -> Self {
+    pub(super) fn new(config: IoPoolConfig, logger: RuntimeLogger) -> Self {
         let state = EgressPoolState {
             chunks: ChunkPoolState::new(config.clone()),
+            logger,
             waiters: std::collections::VecDeque::new(),
         };
         Self {
@@ -48,15 +53,17 @@ impl EgressPool {
         }
 
         let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
-        let ready = {
+        let (ready, logger) = {
             let mut state = self.lock_state()?;
             state.waiters.push_back(EgressWaiter {
                 requested_bytes,
                 reply_tx,
             });
-            state.dispatch_waiters(&self.inner)
+            let ready = state.dispatch_waiters(&self.inner);
+            let logger = state.logger.clone();
+            (ready, logger)
         };
-        EgressPoolState::deliver_ready(ready);
+        EgressPoolState::deliver_ready(&logger, ready);
 
         Ok(PoolRequest::new(reply_rx))
     }
@@ -64,6 +71,12 @@ impl EgressPool {
     /// Returns the configuration used by this pool.
     pub fn config(&self) -> IoPoolConfig {
         self.config.clone()
+    }
+
+    pub(crate) fn replace_logger(&self, logger: RuntimeLogger) -> Result<()> {
+        let mut state = self.lock_state()?;
+        state.logger = logger;
+        Ok(())
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, EgressPoolState>> {
@@ -80,6 +93,7 @@ impl EgressPool {
 #[derive(Debug)]
 pub(super) struct EgressPoolState {
     pub(super) chunks: ChunkPoolState,
+    logger: RuntimeLogger,
     waiters: std::collections::VecDeque<EgressWaiter>,
 }
 
@@ -119,6 +133,7 @@ impl EgressPoolState {
     }
 
     fn deliver_ready(
+        logger: &RuntimeLogger,
         ready: Vec<(
             futures_channel::oneshot::Sender<Result<EgressReservation>>,
             EgressReservation,
@@ -126,7 +141,10 @@ impl EgressPoolState {
     ) {
         for (reply_tx, reservation) in ready {
             if reply_tx.send(Ok(reservation)).is_err() {
-                log::warn!("dropping egress reservation because the waiter was already gone");
+                warn!(
+                    logger,
+                    "dropping egress reservation because the waiter was already gone"
+                );
             }
         }
     }
@@ -136,18 +154,24 @@ impl EgressPoolState {
             return;
         };
 
-        let ready = match inner.lock() {
+        let (ready, logger) = match inner.lock() {
             Ok(mut state) => {
                 state.return_chunks(chunks);
-                state.dispatch_waiters(&inner)
+                let ready = state.dispatch_waiters(&inner);
+                let logger = state.logger.clone();
+                (ready, logger)
             }
-            Err(_) => {
-                log::error!("egress pool state is poisoned; dropping returned chunks");
+            Err(poisoned) => {
+                let logger = poisoned.into_inner().logger.clone();
+                error!(
+                    logger,
+                    "egress pool state is poisoned; dropping returned chunks"
+                );
                 return;
             }
         };
 
-        Self::deliver_ready(ready);
+        Self::deliver_ready(&logger, ready);
     }
 }
 

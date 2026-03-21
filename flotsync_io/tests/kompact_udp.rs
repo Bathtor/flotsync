@@ -61,7 +61,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id: receiver_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     let receiver_addr = match recv_until(&observer1_rx, |event| {
@@ -104,7 +104,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id: sender_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     let _ = recv_until(&observer1_rx, |event| {
@@ -259,7 +259,7 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id,
-            local_addr: localhost(0),
+            bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
     let bound_addr = match recv_until(&observer1_rx, |event| {
@@ -299,7 +299,7 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             socket_id: rebound_socket_id,
-            local_addr: bound_addr,
+            bind: UdpLocalBind::Exact(bound_addr),
         });
     });
     match recv_until(&observer2_rx, |event| {

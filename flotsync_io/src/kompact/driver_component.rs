@@ -19,11 +19,14 @@ use crate::{
         SocketId,
         TcpCommand,
         TcpEvent,
+        UdpCloseReason,
         UdpCommand,
         UdpEvent,
     },
     driver::{DriverCommand, DriverConfig, DriverEvent, DriverEventSink, IoDriver},
     errors::{Error, Result},
+    logging::erased_runtime_logger,
+    pool::{EgressPool, IoBufferPools},
 };
 use ::kompact::prelude::*;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -235,6 +238,7 @@ impl DriverEventSink for ActorBackedDriverEventSink {
 pub struct IoDriverComponent {
     ctx: ComponentContext<Self>,
     config: DriverConfig,
+    buffers: IoBufferPools,
     driver: Option<IoDriver>,
     udp_routes: HashMap<SocketId, ActorRefStrong<IoBridgeMessage>>,
     tcp_listener_routes: HashMap<ListenerId, ActorRefStrong<TcpListenerMessage>>,
@@ -247,14 +251,24 @@ impl IoDriverComponent {
     /// A typical Kompact system creates exactly one instance and then passes it to one or more
     /// [`IoBridge`](super::IoBridge) components.
     pub fn new(config: DriverConfig) -> Self {
-        Self {
+        Self::try_new(config).expect("IoDriverComponent buffer configuration must be valid")
+    }
+
+    pub fn try_new(config: DriverConfig) -> Result<Self> {
+        let buffers = IoBufferPools::new(config.buffer_config.clone())?;
+        Ok(Self {
             ctx: ComponentContext::uninitialised(),
             config,
+            buffers,
             driver: None,
             udp_routes: HashMap::new(),
             tcp_listener_routes: HashMap::new(),
             tcp_routes: HashMap::new(),
-        }
+        })
+    }
+
+    pub(crate) fn egress_pool(&self) -> EgressPool {
+        self.buffers.egress()
     }
 
     fn driver_ref(&self) -> Result<&IoDriver> {
@@ -523,14 +537,11 @@ impl IoDriverComponent {
         }
 
         match command {
-            UdpCommand::Bind {
-                socket_id,
-                local_addr,
-            } => self.route_udp_indication(
+            UdpCommand::Bind { socket_id, bind } => self.route_udp_indication(
                 socket_id,
                 UdpIndication::BindFailed {
                     socket_id,
-                    local_addr,
+                    local_addr: bind.resolve_local_addr(),
                     reason: OpenFailureReason::DriverUnavailable,
                 },
             ),
@@ -568,7 +579,14 @@ impl IoDriverComponent {
                 },
             ),
             UdpCommand::Close { socket_id } => {
-                self.route_udp_indication(socket_id, UdpIndication::Closed { socket_id });
+                self.route_udp_indication(
+                    socket_id,
+                    UdpIndication::Closed {
+                        socket_id,
+                        remote_addr: None,
+                        reason: UdpCloseReason::Requested,
+                    },
+                );
                 self.udp_routes.remove(&socket_id);
             }
         }
@@ -860,7 +878,13 @@ impl ComponentLifecycle for IoDriverComponent {
             .hold()
             .expect("IoDriverComponent must be live during startup");
         let sink: Arc<dyn DriverEventSink> = Arc::new(ActorBackedDriverEventSink { target: actor });
-        match IoDriver::start_with_event_sink(self.config.clone(), sink) {
+        let logger = erased_runtime_logger(self.log());
+        match IoDriver::start_with_logger_buffers_and_event_sink(
+            self.config.clone(),
+            logger,
+            self.buffers.clone(),
+            sink,
+        ) {
             Ok(driver) => {
                 self.driver = Some(driver);
                 Handled::Ok
@@ -1009,7 +1033,18 @@ fn udp_indication_from_raw(event: UdpEvent) -> (SocketId, UdpIndication) {
         UdpEvent::WriteResumed { socket_id } => {
             (socket_id, UdpIndication::WriteResumed { socket_id })
         }
-        UdpEvent::Closed { socket_id } => (socket_id, UdpIndication::Closed { socket_id }),
+        UdpEvent::Closed {
+            socket_id,
+            remote_addr,
+            reason,
+        } => (
+            socket_id,
+            UdpIndication::Closed {
+                socket_id,
+                remote_addr,
+                reason,
+            },
+        ),
         UdpEvent::SendAck { .. } | UdpEvent::SendNack { .. } => {
             unreachable!("send outcomes are handled separately")
         }

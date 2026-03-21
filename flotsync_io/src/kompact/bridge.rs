@@ -17,8 +17,9 @@ use super::{
     },
 };
 use crate::{
-    api::{SendFailureReason, SocketId, TransmissionId, UdpCommand, UdpSocketOption},
+    api::{SendFailureReason, SocketId, TransmissionId, UdpCommand, UdpLocalBind, UdpSocketOption},
     errors::Result,
+    pool::EgressPool,
 };
 use ::kompact::prelude::*;
 use std::{
@@ -110,6 +111,7 @@ impl UdpSendReplyTable {
 #[derive(Clone, Debug)]
 pub struct IoBridgeHandle {
     actor: ActorRefStrong<IoBridgeMessage>,
+    egress_pool: EgressPool,
 }
 
 impl IoBridgeHandle {
@@ -119,7 +121,8 @@ impl IoBridgeHandle {
             .actor_ref()
             .hold()
             .expect("IoBridge must still be live when creating a control handle");
-        Self { actor }
+        let egress_pool = component.on_definition(|bridge| bridge.egress_pool.clone());
+        Self { actor, egress_pool }
     }
 
     /// Reserves one UDP socket handle owned by this bridge.
@@ -137,6 +140,11 @@ impl IoBridgeHandle {
             promise, socket_id,
         )));
         future
+    }
+
+    /// Returns the shared egress pool used by the underlying raw driver instance.
+    pub fn egress_pool(&self) -> &EgressPool {
+        &self.egress_pool
     }
 
     /// Opens one outbound TCP session managed by this bridge.
@@ -162,6 +170,7 @@ pub struct IoBridge {
     ctx: ComponentContext<Self>,
     udp: ProvidedPort<UdpPort>,
     driver: DriverComponentRef,
+    egress_pool: EgressPool,
     owned_sockets: HashSet<SocketId>,
     udp_send_replies: UdpSendReplyTable,
 }
@@ -172,14 +181,17 @@ impl IoBridge {
     /// The bridge owns any UDP socket handles reserved through its [`IoBridgeHandle`] and routes
     /// all raw driver events back into Kompact-native UDP port indications or TCP session events.
     pub fn new(driver_component: &Arc<Component<super::IoDriverComponent>>) -> Self {
-        Self::with_driver(DriverComponentRef::from_component(driver_component))
+        let driver = DriverComponentRef::from_component(driver_component);
+        let egress_pool = driver_component.on_definition(|component| component.egress_pool());
+        Self::with_driver(driver, egress_pool)
     }
 
-    pub(crate) fn with_driver(driver: DriverComponentRef) -> Self {
+    pub(crate) fn with_driver(driver: DriverComponentRef, egress_pool: EgressPool) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             udp: ProvidedPort::uninitialised(),
             driver,
+            egress_pool,
             owned_sockets: HashSet::new(),
             udp_send_replies: UdpSendReplyTable::default(),
         }
@@ -191,10 +203,7 @@ impl IoBridge {
 
     fn handle_udp_request(&mut self, request: UdpRequest) {
         match request {
-            UdpRequest::Bind {
-                socket_id,
-                local_addr,
-            } => self.handle_udp_bind_request(socket_id, local_addr),
+            UdpRequest::Bind { socket_id, bind } => self.handle_udp_bind_request(socket_id, bind),
             UdpRequest::Connect {
                 socket_id,
                 remote_addr,
@@ -216,19 +225,17 @@ impl IoBridge {
         }
     }
 
-    fn handle_udp_bind_request(&mut self, socket_id: SocketId, local_addr: SocketAddr) {
+    fn handle_udp_bind_request(&mut self, socket_id: SocketId, bind: UdpLocalBind) {
         if !self.owns_socket(socket_id) {
             self.udp.trigger(UdpIndication::BindFailed {
                 socket_id,
-                local_addr,
+                local_addr: bind.resolve_local_addr(),
                 reason: OpenFailureReason::InvalidHandle,
             });
             return;
         }
-        self.driver.dispatch_udp(UdpCommand::Bind {
-            socket_id,
-            local_addr,
-        });
+        self.driver
+            .dispatch_udp(UdpCommand::Bind { socket_id, bind });
     }
 
     fn handle_udp_connect_request(
@@ -309,11 +316,11 @@ impl IoBridge {
     }
 
     fn handle_udp_indication(&mut self, indication: UdpIndication) {
-        if let UdpIndication::Closed { socket_id } = indication {
+        if let UdpIndication::Closed { socket_id, .. } = indication {
             self.owned_sockets.remove(&socket_id);
             self.udp_send_replies
                 .fail_socket(socket_id, SendFailureReason::Closed);
-            self.udp.trigger(UdpIndication::Closed { socket_id });
+            self.udp.trigger(indication);
             return;
         }
         self.udp.trigger(indication);

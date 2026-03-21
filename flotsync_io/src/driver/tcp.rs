@@ -12,6 +12,7 @@ use crate::{
         TransmissionId,
     },
     errors::{Error, Result, UpdateTcpInterestSnafu},
+    logging::RuntimeLogger,
     pool::IngressPool,
 };
 use bytes::{Buf, Bytes};
@@ -21,6 +22,7 @@ use mio::{
     Registry,
     net::{TcpListener as MioTcpListener, TcpStream as MioTcpStream},
 };
+use slog::{debug, error, warn};
 use snafu::ResultExt;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
@@ -30,8 +32,9 @@ use std::{
 };
 
 /// TCP-side runtime state owned by the shared driver.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct TcpRuntimeState {
+    logger: RuntimeLogger,
     listeners: SlotRegistry<TcpListenerEntry>,
     connections: SlotRegistry<TcpConnectionEntry>,
 }
@@ -256,6 +259,14 @@ impl PendingSendBuffer {
 }
 
 impl TcpRuntimeState {
+    pub(super) fn new(logger: RuntimeLogger) -> Self {
+        Self {
+            logger,
+            listeners: SlotRegistry::default(),
+            connections: SlotRegistry::default(),
+        }
+    }
+
     pub(super) fn next_listener_slot(&self) -> usize {
         self.listeners.next_slot()
     }
@@ -292,7 +303,8 @@ impl TcpRuntimeState {
             if entry.registered {
                 let deregister_result = registry.deregister(listener);
                 if let Err(error) = deregister_result {
-                    log::warn!(
+                    warn!(
+                        self.logger,
                         "failed to deregister TCP listener {} during release: {}",
                         listener_id,
                         error
@@ -328,7 +340,8 @@ impl TcpRuntimeState {
             if entry.registered {
                 let deregister_result = registry.deregister(stream);
                 if let Err(error) = deregister_result {
-                    log::warn!(
+                    warn!(
+                        self.logger,
                         "failed to deregister TCP connection {} during release: {}",
                         connection_id,
                         error
@@ -507,9 +520,9 @@ impl TcpRuntimeState {
         let released = match release_result {
             Ok(released) => released,
             Err(Error::UnknownListener { .. }) => {
-                log::warn!(
-                    "ignored TCP listener close for unknown listener {}",
-                    listener_id
+                warn!(
+                    self.logger,
+                    "ignored TCP listener close for unknown listener {}", listener_id
                 );
                 return Ok(None);
             }
@@ -526,14 +539,15 @@ impl TcpRuntimeState {
         listener_id: ListenerId,
     ) -> Result<Option<AcceptedTcpConnection>> {
         let Some(entry) = self.listeners.get_mut(listener_id.0) else {
-            log::debug!(
-                "ignoring stale TCP listener readiness for unknown listener {}",
-                listener_id
+            debug!(
+                self.logger,
+                "ignoring stale TCP listener readiness for unknown listener {}", listener_id
             );
             return Ok(None);
         };
         let Some(listener) = entry.listener.as_mut() else {
-            log::debug!(
+            debug!(
+                self.logger,
                 "ignoring stale TCP listener readiness for listener {} without OS handle",
                 listener_id
             );
@@ -545,7 +559,10 @@ impl TcpRuntimeState {
             Ok((stream, peer_addr)) => Ok(Some(AcceptedTcpConnection { stream, peer_addr })),
             Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
             Err(error) => {
-                log::error!("TCP listener {} accept failed: {}", listener_id, error);
+                error!(
+                    self.logger,
+                    "TCP listener {} accept failed: {}", listener_id, error
+                );
                 Ok(None)
             }
         }
@@ -580,9 +597,9 @@ impl TcpRuntimeState {
             return Err(Error::UnknownConnection { connection_id });
         };
         if !entry.is_pending_accepted() {
-            log::warn!(
-                "ignored TCP adopt for connection {} that is not pending adoption",
-                connection_id
+            warn!(
+                self.logger,
+                "ignored TCP adopt for connection {} that is not pending adoption", connection_id
             );
             return Ok(());
         }
@@ -600,16 +617,16 @@ impl TcpRuntimeState {
         registry: &Registry,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get(connection_id.0) else {
-            log::warn!(
-                "ignored TCP reject for unknown pending connection {}",
-                connection_id
+            warn!(
+                self.logger,
+                "ignored TCP reject for unknown pending connection {}", connection_id
             );
             return Ok(None);
         };
         if !entry.is_pending_accepted() {
-            log::warn!(
-                "ignored TCP reject for connection {} that is not pending adoption",
-                connection_id
+            warn!(
+                self.logger,
+                "ignored TCP reject for connection {} that is not pending adoption", connection_id
             );
             return Ok(None);
         }
@@ -689,7 +706,10 @@ impl TcpRuntimeState {
         }
 
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
-            log::warn!("ignored TCP close for unknown connection {}", connection_id);
+            warn!(
+                self.logger,
+                "ignored TCP close for unknown connection {}", connection_id
+            );
             return Ok(None);
         };
         if entry.pending_adoption {
@@ -813,9 +833,9 @@ impl TcpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
-            log::debug!(
-                "ignoring stale TCP readiness for unknown connection {}",
-                connection_id
+            debug!(
+                self.logger,
+                "ignoring stale TCP readiness for unknown connection {}", connection_id
             );
             return Ok(None);
         };
@@ -848,7 +868,8 @@ impl TcpRuntimeState {
             Err(error_kind) => {
                 let reset_error = reset_connection_after_failure(entry, registry);
                 if let Err(error) = reset_error {
-                    log::warn!(
+                    warn!(
+                        self.logger,
                         "failed to reset TCP connection {} after connect failure: {}",
                         connection_id,
                         error
@@ -871,9 +892,9 @@ impl TcpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
-            log::debug!(
-                "ignoring stale TCP writability for unknown connection {}",
-                connection_id
+            debug!(
+                self.logger,
+                "ignoring stale TCP writability for unknown connection {}", connection_id
             );
             return Ok(None);
         };
@@ -1003,14 +1024,15 @@ impl TcpRuntimeState {
 
             let read_result = {
                 let Some(entry) = self.connections.get_mut(connection_id.0) else {
-                    log::debug!(
-                        "ignoring stale TCP readability for unknown connection {}",
-                        connection_id
+                    debug!(
+                        self.logger,
+                        "ignoring stale TCP readability for unknown connection {}", connection_id
                     );
                     return Ok(None);
                 };
                 let Some(stream) = entry.stream.as_mut() else {
-                    log::debug!(
+                    debug!(
+                        self.logger,
                         "ignoring stale TCP readability for connection {} without OS handle",
                         connection_id
                     );
@@ -1041,7 +1063,10 @@ impl TcpRuntimeState {
                     return Ok(None);
                 }
                 Err(error) => {
-                    log::error!("TCP connection {} recv failed: {}", connection_id, error);
+                    error!(
+                        self.logger,
+                        "TCP connection {} recv failed: {}", connection_id, error
+                    );
                     let record = self.close_connection(
                         connection_id,
                         registry,
@@ -1126,7 +1151,8 @@ impl TcpRuntimeState {
             if entry.registered {
                 let deregister_result = registry.deregister(stream);
                 if let Err(error) = deregister_result {
-                    log::warn!(
+                    warn!(
+                        self.logger,
                         "failed to deregister pending TCP connection {} during release: {}",
                         connection_id,
                         error

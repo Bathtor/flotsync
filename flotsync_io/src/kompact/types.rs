@@ -10,6 +10,8 @@ use crate::{
         SendFailureReason,
         SocketId,
         TransmissionId,
+        UdpCloseReason,
+        UdpLocalBind,
         UdpSocketOption,
     },
     errors::Result,
@@ -55,10 +57,10 @@ impl Port for UdpPort {
 /// Requests that can be issued against the Kompact-facing UDP bridge.
 #[derive(Clone, Debug)]
 pub enum UdpRequest {
-    /// Binds the identified local UDP socket handle to the provided local address.
+    /// Binds the identified local UDP socket handle according to the provided bind policy.
     Bind {
         socket_id: SocketId,
-        local_addr: SocketAddr,
+        bind: UdpLocalBind,
     },
     /// Creates or reconfigures the identified UDP socket as a connected UDP socket.
     Connect {
@@ -151,7 +153,11 @@ pub enum UdpIndication {
     /// Reports that write-side progress resumed for the socket.
     WriteResumed { socket_id: SocketId },
     /// Reports that the socket closed and released its driver-owned state.
-    Closed { socket_id: SocketId },
+    Closed {
+        socket_id: SocketId,
+        remote_addr: Option<SocketAddr>,
+        reason: UdpCloseReason,
+    },
 }
 
 /// Private reply channel outcome for one UDP send operation.

@@ -10,8 +10,10 @@ use super::{
 use crate::{
     api::{ConnectionId, ListenerId, SocketId, TcpCommand, TcpEvent, UdpCommand},
     errors::Result,
+    logging::RuntimeLogger,
 };
 use mio::Registry;
+use slog::{error, info, warn};
 
 /// Commands passed across the control plane into the dedicated driver thread.
 #[derive(Debug)]
@@ -80,8 +82,9 @@ impl ResourceRecord {
 /// The readiness slot is converted into a public `mio::Token` by adding `1`, because `Token(0)`
 /// is reserved for the driver's internal waker. Handle ids and readiness slots may happen to
 /// share the same integer value, but that is incidental and never relied on.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct DriverRuntimeState {
+    logger: RuntimeLogger,
     readiness_keys: SlotRegistry<ResourceKey>,
     tcp: TcpRuntimeState,
     udp: UdpRuntimeState,
@@ -90,6 +93,17 @@ pub(super) struct DriverRuntimeState {
 }
 
 impl DriverRuntimeState {
+    pub(super) fn new(logger: RuntimeLogger) -> Self {
+        Self {
+            logger: logger.clone(),
+            readiness_keys: SlotRegistry::default(),
+            tcp: TcpRuntimeState::new(logger.clone()),
+            udp: UdpRuntimeState::new(logger),
+            #[cfg(test)]
+            test_state: DriverTestState::default(),
+        }
+    }
+
     pub(super) fn reserve_listener(&mut self) -> ListenerId {
         let listener_id = ListenerId(self.tcp.next_listener_slot());
         let token = self.reserve_readiness(ResourceKey::Listener(listener_id));
@@ -137,15 +151,15 @@ impl DriverRuntimeState {
         registry: &Registry,
     ) -> Result<()> {
         let entry = self.udp.release_socket(socket_id, registry)?;
-        self.release_readiness(entry.token);
+        self.release_readiness(entry.record.token);
         Ok(())
     }
 
     pub(super) fn record_ready_hit(&mut self, token: DriverToken) {
         let Some(key) = self.readiness_key(token) else {
-            log::warn!(
-                "received readiness for unknown flotsync_io token {}",
-                token.0
+            warn!(
+                self.logger,
+                "received readiness for unknown flotsync_io token {}", token.0
             );
             return;
         };
@@ -174,8 +188,12 @@ impl DriverRuntimeState {
             self.udp.handle_writable(socket_id, registry, event_sink)?;
         }
         if is_readable {
-            self.udp
-                .handle_readable(socket_id, registry, ingress_pool, event_sink)?;
+            let closed_socket =
+                self.udp
+                    .handle_readable(socket_id, registry, ingress_pool, event_sink)?;
+            if let Some(closed_socket) = closed_socket {
+                self.release_readiness(closed_socket.record.token);
+            }
         }
         Ok(())
     }
@@ -198,7 +216,8 @@ impl DriverRuntimeState {
                 self.tcp
                     .install_accepted_connection(connection_id, listener_id, accepted);
             if let Err(error) = install_result {
-                log::error!(
+                error!(
+                    self.logger,
                     "failed to install accepted TCP connection {} for listener {}: {}",
                     connection_id,
                     listener_id,
@@ -272,7 +291,10 @@ impl DriverRuntimeState {
                 Ok(control) => control,
                 Err(crossbeam_channel::TryRecvError::Empty) => return Ok(false),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    log::info!("flotsync_io control channel disconnected; stopping driver loop");
+                    info!(
+                        self.logger,
+                        "flotsync_io control channel disconnected; stopping driver loop"
+                    );
                     return Ok(true);
                 }
             };
@@ -360,12 +382,9 @@ impl DriverRuntimeState {
                             }
                         },
                         DriverCommand::Udp(command) => match command {
-                            UdpCommand::Bind {
-                                socket_id,
-                                local_addr,
-                            } => {
+                            UdpCommand::Bind { socket_id, bind } => {
                                 self.udp
-                                    .handle_bind(socket_id, local_addr, registry, event_sink)?;
+                                    .handle_bind(socket_id, bind, registry, event_sink)?;
                             }
                             UdpCommand::Connect {
                                 socket_id,
@@ -400,15 +419,23 @@ impl DriverRuntimeState {
                                 self.udp.handle_configure(socket_id, option, event_sink)?;
                             }
                             UdpCommand::Close { socket_id } => {
-                                if self.release_socket(socket_id, registry).is_err() {
-                                    log::warn!(
-                                        "ignored UDP close for unknown socket {}",
-                                        socket_id
-                                    );
-                                } else {
-                                    event_sink.publish(super::DriverEvent::Udp(
-                                        crate::api::UdpEvent::Closed { socket_id },
-                                    ))?;
+                                match self.udp.release_socket(socket_id, registry) {
+                                    Err(_) => {
+                                        warn!(
+                                            self.logger,
+                                            "ignored UDP close for unknown socket {}", socket_id
+                                        );
+                                    }
+                                    Ok(closed_socket) => {
+                                        self.release_readiness(closed_socket.record.token);
+                                        event_sink.publish(super::DriverEvent::Udp(
+                                            crate::api::UdpEvent::Closed {
+                                                socket_id,
+                                                remote_addr: closed_socket.remote_addr,
+                                                reason: crate::api::UdpCloseReason::Requested,
+                                            },
+                                        ))?;
+                                    }
                                 }
                             }
                         },
@@ -416,44 +443,54 @@ impl DriverRuntimeState {
                 }
                 ControlCommand::ReserveListener { reply_tx } => {
                     let listener_id = self.reserve_listener();
-                    send_reply(reply_tx, Ok(listener_id), "listener reservation");
+                    send_reply(
+                        &self.logger,
+                        reply_tx,
+                        Ok(listener_id),
+                        "listener reservation",
+                    );
                 }
                 ControlCommand::ReserveConnection { reply_tx } => {
                     let connection_id = self.reserve_connection();
-                    send_reply(reply_tx, Ok(connection_id), "connection reservation");
+                    send_reply(
+                        &self.logger,
+                        reply_tx,
+                        Ok(connection_id),
+                        "connection reservation",
+                    );
                 }
                 ControlCommand::ReserveSocket { reply_tx } => {
                     let socket_id = self.reserve_socket();
-                    send_reply(reply_tx, Ok(socket_id), "socket reservation");
+                    send_reply(&self.logger, reply_tx, Ok(socket_id), "socket reservation");
                 }
                 ControlCommand::ReleaseListener {
                     listener_id,
                     reply_tx,
                 } => {
                     let result = self.release_listener(listener_id, registry);
-                    send_reply(reply_tx, result, "listener release");
+                    send_reply(&self.logger, reply_tx, result, "listener release");
                 }
                 ControlCommand::ReleaseConnection {
                     connection_id,
                     reply_tx,
                 } => {
                     let result = self.release_connection(connection_id, registry);
-                    send_reply(reply_tx, result, "connection release");
+                    send_reply(&self.logger, reply_tx, result, "connection release");
                 }
                 ControlCommand::ReleaseSocket {
                     socket_id,
                     reply_tx,
                 } => {
                     let result = self.release_socket(socket_id, registry);
-                    send_reply(reply_tx, result, "socket release");
+                    send_reply(&self.logger, reply_tx, result, "socket release");
                 }
                 #[cfg(test)]
                 ControlCommand::Snapshot { reply_tx } => {
                     let snapshot = self.snapshot();
-                    send_reply(reply_tx, Ok(snapshot), "driver snapshot");
+                    send_reply(&self.logger, reply_tx, Ok(snapshot), "driver snapshot");
                 }
                 ControlCommand::Stop => {
-                    log::info!("flotsync_io driver received stop command");
+                    info!(self.logger, "flotsync_io driver received stop command");
                     return Ok(true);
                 }
             }
