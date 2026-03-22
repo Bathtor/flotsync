@@ -18,6 +18,7 @@ use crate::{
 };
 use ::kompact::prelude::{ActorRefStrong, KFuture, Port, Receiver, Recipient, promise};
 use std::{io, net::SocketAddr};
+use uuid::Uuid;
 
 /// Describes why an open-style operation could not make the requested socket or session usable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,16 +58,24 @@ impl Port for UdpPort {
 /// Requests that can be issued against the Kompact-facing UDP bridge.
 #[derive(Clone, Debug)]
 pub enum UdpRequest {
-    /// Binds the identified local UDP socket handle according to the provided bind policy.
+    /// Opens one new unconnected UDP socket according to the provided bind policy.
+    ///
+    /// The driver assigns the resulting `SocketId` and reports it back on the shared UDP
+    /// indication stream. `request_id` exists only so the original requester can match the
+    /// eventual success or failure indication to this open attempt.
     Bind {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         bind: UdpLocalBind,
     },
-    /// Creates or reconfigures the identified UDP socket as a connected UDP socket.
+    /// Opens one new connected UDP socket.
+    ///
+    /// The driver assigns the resulting `SocketId` and reports it back on the shared UDP
+    /// indication stream. `request_id` exists only so the original requester can match the
+    /// eventual success or failure indication to this open attempt.
     Connect {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
-        local_addr: Option<SocketAddr>,
+        bind: UdpLocalBind,
     },
     /// Sends one datagram through the identified UDP socket.
     ///
@@ -105,25 +114,27 @@ pub enum UdpIndication {
     /// Bind/connect failures are reported as port indications because they affect the
     /// shared socket capability itself rather than one specific send request.
     Bound {
+        request_id: UdpOpenRequestId,
         socket_id: SocketId,
         local_addr: SocketAddr,
     },
     /// Reports that a requested bind could not make the socket usable.
     BindFailed {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         local_addr: SocketAddr,
         reason: OpenFailureReason,
     },
     /// Reports that the socket was connected successfully.
     Connected {
+        request_id: UdpOpenRequestId,
         socket_id: SocketId,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     },
     /// Reports that a requested connect could not make the socket usable.
     ConnectFailed {
-        socket_id: SocketId,
-        local_addr: Option<SocketAddr>,
+        request_id: UdpOpenRequestId,
+        local_addr: SocketAddr,
         remote_addr: SocketAddr,
         reason: OpenFailureReason,
     },
@@ -179,6 +190,21 @@ pub enum UdpSendResult {
     },
 }
 
+/// Correlates one UDP open request with the later shared indication that reports its outcome.
+///
+/// UDP open requests are broadcast through a shared port, so Kompact does not preserve which local
+/// component originated a given bind/connect operation. The requester therefore supplies one
+/// globally unique correlation id and matches it against the echoed indication later on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UdpOpenRequestId(pub Uuid);
+
+impl UdpOpenRequestId {
+    /// Allocates one fresh UDP open-request correlation id.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 /// Request used with the TCP listener manager side of an [`IoBridge`](super::IoBridge).
 ///
 /// Sending this request asks the bridge to allocate one inbound TCP listener endpoint, start an
@@ -191,6 +217,15 @@ pub struct OpenTcpListener {
     pub incoming_to: Recipient<TcpListenerEvent>,
 }
 
+/// Successful outcome of opening one TCP listener.
+#[derive(Clone, Debug)]
+pub struct OpenedTcpListener {
+    /// Strong request endpoint for the newly opened listener.
+    pub listener: TcpListenerRef,
+    /// Concrete local address the listener is bound to.
+    pub local_addr: SocketAddr,
+}
+
 /// Requests accepted by one Kompact TCP listener endpoint.
 #[derive(Clone, Debug)]
 pub enum TcpListenerRequest {
@@ -201,13 +236,6 @@ pub enum TcpListenerRequest {
 /// Events emitted for one Kompact TCP listener.
 #[derive(Debug)]
 pub enum TcpListenerEvent {
-    /// Reports that the listener is now bound and accepting inbound TCP connections.
-    Listening { local_addr: SocketAddr },
-    /// Reports that the requested listener could not be made usable.
-    ListenFailed {
-        local_addr: SocketAddr,
-        reason: OpenFailureReason,
-    },
     /// Reports one newly accepted inbound TCP connection that is waiting for application logic to
     /// decide whether to accept or reject it.
     ///
@@ -341,6 +369,15 @@ pub struct OpenTcpSession {
     pub events_to: Recipient<TcpSessionEvent>,
 }
 
+/// Successful outcome of opening one outbound TCP session.
+#[derive(Clone, Debug)]
+pub struct OpenedTcpSession {
+    /// Strong request endpoint for the newly opened TCP session.
+    pub session: TcpSessionRef,
+    /// Remote peer address for the established session.
+    pub peer_addr: SocketAddr,
+}
+
 /// Requests accepted by one Kompact TCP session endpoint.
 #[derive(Clone, Debug)]
 pub enum TcpSessionRequest {
@@ -356,13 +393,6 @@ pub enum TcpSessionRequest {
 /// Events emitted for one Kompact TCP session.
 #[derive(Clone, Debug)]
 pub enum TcpSessionEvent {
-    /// Reports that the outbound connect attempt completed successfully.
-    Connected { peer_addr: SocketAddr },
-    /// Reports that the outbound connect attempt failed before the session became usable.
-    ConnectFailed {
-        remote_addr: SocketAddr,
-        reason: OpenFailureReason,
-    },
     /// Delivers inbound TCP bytes for this session.
     Received { payload: IoPayload },
     /// Confirms that a previously requested send completed.

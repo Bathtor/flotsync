@@ -99,7 +99,6 @@ struct TcpListenConfig {
 /// Lifecycle of one outbound TCP session owned by the example.
 #[derive(Clone, Debug)]
 enum TcpConnectState {
-    Opening(TcpSessionRef),
     Ready(TcpSessionRef),
     Closing(TcpSessionRef),
     Closed,
@@ -108,7 +107,7 @@ enum TcpConnectState {
 impl TcpConnectState {
     fn session(&self) -> Option<&TcpSessionRef> {
         match self {
-            Self::Opening(session) | Self::Ready(session) | Self::Closing(session) => Some(session),
+            Self::Ready(session) | Self::Closing(session) => Some(session),
             Self::Closed => None,
         }
     }
@@ -117,7 +116,6 @@ impl TcpConnectState {
 /// Lifecycle of the listener endpoint in listener mode.
 #[derive(Clone, Debug)]
 enum TcpListenerState {
-    Opening(TcpListenerRef),
     Ready(TcpListenerRef),
     Closing(TcpListenerRef),
     Closed,
@@ -126,9 +124,7 @@ enum TcpListenerState {
 impl TcpListenerState {
     fn listener(&self) -> Option<&TcpListenerRef> {
         match self {
-            Self::Opening(listener) | Self::Ready(listener) | Self::Closing(listener) => {
-                Some(listener)
-            }
+            Self::Ready(listener) | Self::Closing(listener) => Some(listener),
             Self::Closed => None,
         }
     }
@@ -254,21 +250,6 @@ impl TcpConnectNetcat {
 
     fn handle_session_event(&mut self, event: TcpSessionEvent) -> Handled {
         match event {
-            TcpSessionEvent::Connected { peer_addr } => {
-                let Some(session) = self.state.session().cloned() else {
-                    return Handled::Ok;
-                };
-                self.state = TcpConnectState::Ready(session);
-                log::info!("TCP connected to {peer_addr}");
-                self.start_next_send();
-            }
-            TcpSessionEvent::ConnectFailed {
-                remote_addr,
-                reason,
-            } => {
-                return self
-                    .fail_and_die(format!("TCP connect to {remote_addr} failed: {reason:?}"));
-            }
             TcpSessionEvent::Received { payload } => {
                 log::debug!("TCP recv");
                 print_payload(payload);
@@ -438,12 +419,15 @@ impl ComponentLifecycle for TcpConnectNetcat {
                 }
             };
             match session_reply {
-                Ok(session) => {
-                    async_self.state = TcpConnectState::Opening(session);
+                Ok(opened) => {
+                    log::info!("TCP connected to {}", opened.peer_addr);
+                    async_self.state = TcpConnectState::Ready(opened.session);
+                    async_self.start_next_send();
                     Handled::Ok
                 }
                 Err(error) => {
-                    return async_self.fail_and_die(format!("failed to open TCP session: {error}"));
+                    return async_self
+                        .fail_and_die(format!("failed to open TCP session: {error:?}"));
                 }
             }
         })
@@ -534,43 +518,19 @@ impl TcpListenNetcat {
 
     fn handle_listener_event(&mut self, event: TcpListenerEvent) -> Handled {
         match event {
-            TcpListenerEvent::Listening { local_addr } => {
-                let Some(listener) = self.listener_state.listener().cloned() else {
-                    return Handled::Ok;
-                };
-                self.listener_state = TcpListenerState::Ready(listener);
-                log::info!("TCP listening on {local_addr}");
-            }
-            TcpListenerEvent::ListenFailed { local_addr, reason } => {
-                return self.fail_and_die(format!("TCP listen on {local_addr} failed: {reason:?}"));
-            }
             TcpListenerEvent::Incoming { peer_addr, pending } => {
-                return self.handle_pending_session(peer_addr, pending);
+                self.handle_pending_session(peer_addr, pending)
             }
             TcpListenerEvent::Closed => {
                 self.listener_state = TcpListenerState::Closed;
                 log::info!("TCP listener closed");
-                return self.finish_if_terminal();
+                self.finish_if_terminal()
             }
         }
-
-        self.set_shutdown_timer_if_idle();
-        Handled::Ok
     }
 
     fn handle_session_event(&mut self, event: TcpSessionEvent) -> Handled {
         match event {
-            TcpSessionEvent::Connected { peer_addr } => {
-                log::debug!("accepted TCP session reported Connected for {peer_addr}");
-            }
-            TcpSessionEvent::ConnectFailed {
-                remote_addr,
-                reason,
-            } => {
-                return self.fail_and_die(format!(
-                    "accepted TCP session reported ConnectFailed for {remote_addr}: {reason:?}"
-                ));
-            }
             TcpSessionEvent::Received { payload } => {
                 log::debug!("TCP recv");
                 print_payload(payload);
@@ -728,7 +688,6 @@ impl TcpListenNetcat {
             && self.queued_lines.is_empty()
             && !self.pending_send
             && !matches!(self.session_state, TcpAcceptedSessionState::Accepting)
-            && !matches!(self.listener_state, TcpListenerState::Opening(_))
     }
 
     fn clear_shutdown_timer(&mut self) {
@@ -819,12 +778,13 @@ impl ComponentLifecycle for TcpListenNetcat {
                 }
             };
             match listener_reply {
-                Ok(listener) => {
-                    async_self.listener_state = TcpListenerState::Opening(listener);
+                Ok(opened) => {
+                    log::info!("TCP listening on {}", opened.local_addr);
+                    async_self.listener_state = TcpListenerState::Ready(opened.listener);
                 }
                 Err(error) => {
                     return async_self
-                        .fail_and_die(format!("failed to open TCP listener: {error}"));
+                        .fail_and_die(format!("failed to open TCP listener: {error:?}"));
                 }
             }
             Handled::Ok

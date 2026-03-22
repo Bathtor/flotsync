@@ -8,9 +8,10 @@ use super::{
         OpenFailureReason,
         OpenTcpListener,
         OpenTcpSession,
-        TcpListenerRef,
-        TcpSessionRef,
+        OpenedTcpListener,
+        OpenedTcpSession,
         UdpIndication,
+        UdpOpenRequestId,
         UdpPort,
         UdpRequest,
         UdpSendResult,
@@ -18,7 +19,7 @@ use super::{
 };
 use crate::{
     api::{SendFailureReason, SocketId, TransmissionId, UdpCommand, UdpLocalBind, UdpSocketOption},
-    errors::Result,
+    errors::Error,
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
@@ -36,12 +37,81 @@ use std::{
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum IoBridgeMessage {
-    ReserveUdpSocket(Ask<(), Result<SocketId>>),
-    ReleaseUdpSocket(Ask<SocketId, Result<()>>),
-    OpenTcpListener(Ask<OpenTcpListener, Result<TcpListenerRef>>),
-    OpenTcpSession(Ask<OpenTcpSession, Result<TcpSessionRef>>),
-    UdpIndication(UdpIndication),
-    UdpSendResult(UdpSendResult),
+    OpenTcpListener(
+        Ask<OpenTcpListener, std::result::Result<OpenedTcpListener, OpenFailureReason>>,
+    ),
+    OpenTcpSession(Ask<OpenTcpSession, std::result::Result<OpenedTcpSession, OpenFailureReason>>),
+    UdpEvent(UdpBridgeEvent),
+}
+
+/// Internal UDP event routed from the shared driver component to one bridge.
+///
+/// The public UDP indication stream carries bridge-local `UdpOpenRequestId` values for open
+/// correlation, while the raw driver knows only about `SocketId`. The bridge therefore receives
+/// these raw-ish events, reattaches the pending open correlation id where needed, and only then
+/// triggers the public port indication or private send result.
+#[derive(Clone, Debug)]
+pub enum UdpBridgeEvent {
+    Bound {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    },
+    BindFailed {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Connected {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    },
+    ConnectFailed {
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+        reason: OpenFailureReason,
+    },
+    Received {
+        socket_id: SocketId,
+        source: SocketAddr,
+        payload: crate::api::IoPayload,
+    },
+    SendAck {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+    },
+    SendNack {
+        socket_id: SocketId,
+        transmission_id: TransmissionId,
+        reason: SendFailureReason,
+    },
+    Configured {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+    },
+    ConfigureFailed {
+        socket_id: SocketId,
+        option: UdpSocketOption,
+        reason: ConfigureFailureReason,
+    },
+    ReadSuspended {
+        socket_id: SocketId,
+    },
+    ReadResumed {
+        socket_id: SocketId,
+    },
+    WriteSuspended {
+        socket_id: SocketId,
+    },
+    WriteResumed {
+        socket_id: SocketId,
+    },
+    Closed {
+        socket_id: SocketId,
+        remote_addr: Option<SocketAddr>,
+        reason: crate::api::UdpCloseReason,
+    },
 }
 
 /// Tracks private UDP send-completion recipients per owned socket.
@@ -105,9 +175,9 @@ impl UdpSendReplyTable {
 
 /// Helper handle for the bridge's actor-style control surface.
 ///
-/// Use this handle for local resource-management operations such as reserving UDP socket ids and
-/// opening TCP sessions. The actual UDP traffic surface remains a typed Kompact port on the
-/// component itself.
+/// Use this handle for local resource-management operations such as opening TCP sessions and
+/// listeners. The actual UDP traffic surface remains a typed Kompact port on the component
+/// itself.
 #[derive(Clone, Debug)]
 pub struct IoBridgeHandle {
     actor: ActorRefStrong<IoBridgeMessage>,
@@ -125,39 +195,30 @@ impl IoBridgeHandle {
         Self { actor, egress_pool }
     }
 
-    /// Reserves one UDP socket handle owned by this bridge.
-    pub fn reserve_udp_socket(&self) -> KFuture<Result<SocketId>> {
-        let (promise, future) = promise::<Result<SocketId>>();
-        self.actor
-            .tell(IoBridgeMessage::ReserveUdpSocket(Ask::new(promise, ())));
-        future
-    }
-
-    /// Releases one previously reserved UDP socket handle.
-    pub fn release_udp_socket(&self, socket_id: SocketId) -> KFuture<Result<()>> {
-        let (promise, future) = promise::<Result<()>>();
-        self.actor.tell(IoBridgeMessage::ReleaseUdpSocket(Ask::new(
-            promise, socket_id,
-        )));
-        future
-    }
-
     /// Returns the shared egress pool used by the underlying raw driver instance.
     pub fn egress_pool(&self) -> &EgressPool {
         &self.egress_pool
     }
 
     /// Opens one outbound TCP session managed by this bridge.
-    pub fn open_tcp_session(&self, request: OpenTcpSession) -> KFuture<Result<TcpSessionRef>> {
-        let (promise, future) = promise::<Result<TcpSessionRef>>();
+    pub fn open_tcp_session(
+        &self,
+        request: OpenTcpSession,
+    ) -> KFuture<std::result::Result<OpenedTcpSession, OpenFailureReason>> {
+        let (promise, future) =
+            promise::<std::result::Result<OpenedTcpSession, OpenFailureReason>>();
         self.actor
             .tell(IoBridgeMessage::OpenTcpSession(Ask::new(promise, request)));
         future
     }
 
     /// Opens one inbound TCP listener managed by this bridge.
-    pub fn open_tcp_listener(&self, request: OpenTcpListener) -> KFuture<Result<TcpListenerRef>> {
-        let (promise, future) = promise::<Result<TcpListenerRef>>();
+    pub fn open_tcp_listener(
+        &self,
+        request: OpenTcpListener,
+    ) -> KFuture<std::result::Result<OpenedTcpListener, OpenFailureReason>> {
+        let (promise, future) =
+            promise::<std::result::Result<OpenedTcpListener, OpenFailureReason>>();
         self.actor
             .tell(IoBridgeMessage::OpenTcpListener(Ask::new(promise, request)));
         future
@@ -172,14 +233,16 @@ pub struct IoBridge {
     driver: DriverComponentRef,
     egress_pool: EgressPool,
     owned_sockets: HashSet<SocketId>,
+    pending_udp_opens: HashMap<SocketId, UdpOpenRequestId>,
     udp_send_replies: UdpSendReplyTable,
 }
 
 impl IoBridge {
     /// Creates one bridge bound to the given shared driver component.
     ///
-    /// The bridge owns any UDP socket handles reserved through its [`IoBridgeHandle`] and routes
-    /// all raw driver events back into Kompact-native UDP port indications or TCP session events.
+    /// The bridge owns any UDP socket handles it opens on behalf of local UDP port requests and
+    /// routes all raw driver events back into Kompact-native UDP port indications or TCP session
+    /// events.
     pub fn new(driver_component: &Arc<Component<super::IoDriverComponent>>) -> Self {
         let driver = DriverComponentRef::from_component(driver_component);
         let egress_pool = driver_component.on_definition(|component| component.egress_pool());
@@ -193,6 +256,7 @@ impl IoBridge {
             driver,
             egress_pool,
             owned_sockets: HashSet::new(),
+            pending_udp_opens: HashMap::new(),
             udp_send_replies: UdpSendReplyTable::default(),
         }
     }
@@ -201,14 +265,14 @@ impl IoBridge {
         self.owned_sockets.contains(&socket_id)
     }
 
-    fn handle_udp_request(&mut self, request: UdpRequest) {
+    fn handle_udp_request(&mut self, request: UdpRequest) -> Handled {
         match request {
-            UdpRequest::Bind { socket_id, bind } => self.handle_udp_bind_request(socket_id, bind),
+            UdpRequest::Bind { request_id, bind } => self.handle_udp_bind_request(request_id, bind),
             UdpRequest::Connect {
-                socket_id,
+                request_id,
                 remote_addr,
-                local_addr,
-            } => self.handle_udp_connect_request(socket_id, remote_addr, local_addr),
+                bind,
+            } => self.handle_udp_connect_request(request_id, remote_addr, bind),
             UdpRequest::Send {
                 socket_id,
                 transmission_id,
@@ -216,48 +280,86 @@ impl IoBridge {
                 target,
                 reply_to,
             } => {
-                self.handle_udp_send_request(socket_id, transmission_id, payload, target, reply_to)
+                self.handle_udp_send_request(socket_id, transmission_id, payload, target, reply_to);
+                Handled::Ok
             }
             UdpRequest::Configure { socket_id, option } => {
-                self.handle_udp_configure_request(socket_id, option)
+                self.handle_udp_configure_request(socket_id, option);
+                Handled::Ok
             }
-            UdpRequest::Close { socket_id } => self.handle_udp_close_request(socket_id),
+            UdpRequest::Close { socket_id } => {
+                self.handle_udp_close_request(socket_id);
+                Handled::Ok
+            }
         }
     }
 
-    fn handle_udp_bind_request(&mut self, socket_id: SocketId, bind: UdpLocalBind) {
-        if !self.owns_socket(socket_id) {
-            self.udp.trigger(UdpIndication::BindFailed {
-                socket_id,
-                local_addr: bind.resolve_local_addr(),
-                reason: OpenFailureReason::InvalidHandle,
-            });
-            return;
-        }
-        self.driver
-            .dispatch_udp(UdpCommand::Bind { socket_id, bind });
+    fn handle_udp_bind_request(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        bind: UdpLocalBind,
+    ) -> Handled {
+        let owner = self
+            .actor_ref()
+            .hold()
+            .expect("IoBridge must be live while opening a UDP socket");
+        let local_addr = bind.resolve_local_addr();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = resolve_kfuture(async_self.driver.reserve_udp_socket(owner)).await;
+            let socket_id = match reply {
+                Ok(socket_id) => socket_id,
+                Err(error) => {
+                    async_self.udp.trigger(UdpIndication::BindFailed {
+                        request_id,
+                        local_addr,
+                        reason: open_failure_from_error(&error),
+                    });
+                    return Handled::Ok;
+                }
+            };
+            async_self.owned_sockets.insert(socket_id);
+            async_self.pending_udp_opens.insert(socket_id, request_id);
+            async_self
+                .driver
+                .dispatch_udp(UdpCommand::Bind { socket_id, bind });
+            Handled::Ok
+        })
     }
 
     fn handle_udp_connect_request(
         &mut self,
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
-        local_addr: Option<SocketAddr>,
-    ) {
-        if !self.owns_socket(socket_id) {
-            self.udp.trigger(UdpIndication::ConnectFailed {
+        bind: UdpLocalBind,
+    ) -> Handled {
+        let owner = self
+            .actor_ref()
+            .hold()
+            .expect("IoBridge must be live while opening a UDP socket");
+        let local_addr = bind.resolve_local_addr();
+        Handled::block_on(self, move |mut async_self| async move {
+            let reply = resolve_kfuture(async_self.driver.reserve_udp_socket(owner)).await;
+            let socket_id = match reply {
+                Ok(socket_id) => socket_id,
+                Err(error) => {
+                    async_self.udp.trigger(UdpIndication::ConnectFailed {
+                        request_id,
+                        local_addr,
+                        remote_addr,
+                        reason: open_failure_from_error(&error),
+                    });
+                    return Handled::Ok;
+                }
+            };
+            async_self.owned_sockets.insert(socket_id);
+            async_self.pending_udp_opens.insert(socket_id, request_id);
+            async_self.driver.dispatch_udp(UdpCommand::Connect {
                 socket_id,
-                local_addr,
                 remote_addr,
-                reason: OpenFailureReason::InvalidHandle,
+                bind,
             });
-            return;
-        }
-        self.driver.dispatch_udp(UdpCommand::Connect {
-            socket_id,
-            remote_addr,
-            local_addr,
-        });
+            Handled::Ok
+        })
     }
 
     fn handle_udp_send_request(
@@ -315,111 +417,212 @@ impl IoBridge {
         self.driver.dispatch_udp(UdpCommand::Close { socket_id });
     }
 
-    fn handle_udp_indication(&mut self, indication: UdpIndication) {
-        if let UdpIndication::Closed { socket_id, .. } = indication {
-            self.owned_sockets.remove(&socket_id);
-            self.udp_send_replies
-                .fail_socket(socket_id, SendFailureReason::Closed);
-            self.udp.trigger(indication);
-            return;
-        }
-        self.udp.trigger(indication);
-    }
-
-    fn handle_udp_send_result(&mut self, result: UdpSendResult) {
-        let (socket_id, transmission_id) = match &result {
-            UdpSendResult::Ack {
+    fn handle_udp_event(&mut self, event: UdpBridgeEvent) {
+        match event {
+            UdpBridgeEvent::Bound {
                 socket_id,
-                transmission_id,
+                local_addr,
+            } => {
+                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP bound indication for socket {} without a pending open request",
+                        socket_id
+                    );
+                    return;
+                };
+                self.udp.trigger(UdpIndication::Bound {
+                    request_id,
+                    socket_id,
+                    local_addr,
+                });
             }
-            | UdpSendResult::Nack {
+            UdpBridgeEvent::BindFailed {
+                socket_id,
+                local_addr,
+                reason,
+            } => {
+                self.owned_sockets.remove(&socket_id);
+                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP bind failure for socket {} without a pending open request",
+                        socket_id
+                    );
+                    return;
+                };
+                self.udp.trigger(UdpIndication::BindFailed {
+                    request_id,
+                    local_addr,
+                    reason,
+                });
+            }
+            UdpBridgeEvent::Connected {
+                socket_id,
+                local_addr,
+                remote_addr,
+            } => {
+                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP connected indication for socket {} without a pending open request",
+                        socket_id
+                    );
+                    return;
+                };
+                self.udp.trigger(UdpIndication::Connected {
+                    request_id,
+                    socket_id,
+                    local_addr,
+                    remote_addr,
+                });
+            }
+            UdpBridgeEvent::ConnectFailed {
+                socket_id,
+                local_addr,
+                remote_addr,
+                reason,
+            } => {
+                self.owned_sockets.remove(&socket_id);
+                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP connect failure for socket {} without a pending open request",
+                        socket_id
+                    );
+                    return;
+                };
+                self.udp.trigger(UdpIndication::ConnectFailed {
+                    request_id,
+                    local_addr,
+                    remote_addr,
+                    reason,
+                });
+            }
+            UdpBridgeEvent::Received {
+                socket_id,
+                source,
+                payload,
+            } => {
+                self.udp.trigger(UdpIndication::Received {
+                    socket_id,
+                    source,
+                    payload,
+                });
+            }
+            UdpBridgeEvent::SendAck {
                 socket_id,
                 transmission_id,
-                ..
-            } => (*socket_id, *transmission_id),
-        };
-        let Some(reply_to) = self.udp_send_replies.take(socket_id, transmission_id) else {
-            warn!(
-                self.log(),
-                "dropping UDP send result for socket {} transmission {} without a waiting recipient",
+            } => {
+                let Some(reply_to) = self.udp_send_replies.take(socket_id, transmission_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP send ack for socket {} transmission {} without a waiting recipient",
+                        socket_id,
+                        transmission_id
+                    );
+                    return;
+                };
+                reply_to.tell(UdpSendResult::Ack {
+                    socket_id,
+                    transmission_id,
+                });
+            }
+            UdpBridgeEvent::SendNack {
                 socket_id,
-                transmission_id
-            );
-            return;
-        };
-        reply_to.tell(result);
+                transmission_id,
+                reason,
+            } => {
+                let Some(reply_to) = self.udp_send_replies.take(socket_id, transmission_id) else {
+                    warn!(
+                        self.log(),
+                        "dropping UDP send nack for socket {} transmission {} without a waiting recipient",
+                        socket_id,
+                        transmission_id
+                    );
+                    return;
+                };
+                reply_to.tell(UdpSendResult::Nack {
+                    socket_id,
+                    transmission_id,
+                    reason,
+                });
+            }
+            UdpBridgeEvent::Configured { socket_id, option } => {
+                self.udp
+                    .trigger(UdpIndication::Configured { socket_id, option });
+            }
+            UdpBridgeEvent::ConfigureFailed {
+                socket_id,
+                option,
+                reason,
+            } => {
+                self.udp.trigger(UdpIndication::ConfigureFailed {
+                    socket_id,
+                    option,
+                    reason,
+                });
+            }
+            UdpBridgeEvent::ReadSuspended { socket_id } => {
+                self.udp.trigger(UdpIndication::ReadSuspended { socket_id });
+            }
+            UdpBridgeEvent::ReadResumed { socket_id } => {
+                self.udp.trigger(UdpIndication::ReadResumed { socket_id });
+            }
+            UdpBridgeEvent::WriteSuspended { socket_id } => {
+                self.udp
+                    .trigger(UdpIndication::WriteSuspended { socket_id });
+            }
+            UdpBridgeEvent::WriteResumed { socket_id } => {
+                self.udp.trigger(UdpIndication::WriteResumed { socket_id });
+            }
+            UdpBridgeEvent::Closed {
+                socket_id,
+                remote_addr,
+                reason,
+            } => {
+                self.owned_sockets.remove(&socket_id);
+                self.pending_udp_opens.remove(&socket_id);
+                self.udp_send_replies
+                    .fail_socket(socket_id, SendFailureReason::Closed);
+                self.udp.trigger(UdpIndication::Closed {
+                    socket_id,
+                    remote_addr,
+                    reason,
+                });
+            }
+        }
     }
 
     fn handle_local_message(&mut self, msg: IoBridgeMessage) -> Handled {
         match msg {
-            IoBridgeMessage::ReserveUdpSocket(ask) => self.handle_reserve_udp_socket(ask),
-            IoBridgeMessage::ReleaseUdpSocket(ask) => self.handle_release_udp_socket(ask),
             IoBridgeMessage::OpenTcpListener(ask) => self.handle_open_tcp_listener(ask),
             IoBridgeMessage::OpenTcpSession(ask) => self.handle_open_tcp_session(ask),
-            IoBridgeMessage::UdpIndication(indication) => {
-                self.handle_udp_indication(indication);
-                Handled::Ok
-            }
-            IoBridgeMessage::UdpSendResult(result) => {
-                self.handle_udp_send_result(result);
+            IoBridgeMessage::UdpEvent(event) => {
+                self.handle_udp_event(event);
                 Handled::Ok
             }
         }
     }
 
-    fn handle_reserve_udp_socket(&mut self, ask: Ask<(), Result<SocketId>>) -> Handled {
-        let (promise, ()) = ask.take();
-        let owner = self
-            .actor_ref()
-            .hold()
-            .expect("IoBridge must be live while reserving a socket");
-        Handled::block_on(self, move |mut async_self| async move {
-            let reply = resolve_kfuture(async_self.driver.reserve_udp_socket(owner)).await;
-            match reply {
-                Ok(socket_id) => {
-                    async_self.owned_sockets.insert(socket_id);
-                    if promise.fulfil(Ok(socket_id)).is_err() {
-                        debug!(async_self.log(), "dropping UDP socket reservation reply");
-                    }
-                }
-                Err(error) => {
-                    if promise.fulfil(Err(error)).is_err() {
-                        debug!(async_self.log(), "dropping UDP socket reservation reply");
-                    }
-                }
-            }
-        })
-    }
-
-    fn handle_release_udp_socket(&mut self, ask: Ask<SocketId, Result<()>>) -> Handled {
-        let (promise, socket_id) = ask.take();
-        self.owned_sockets.remove(&socket_id);
-        self.udp_send_replies
-            .fail_socket(socket_id, SendFailureReason::Closed);
-        Handled::block_on(self, move |async_self| async move {
-            let reply = resolve_kfuture(async_self.driver.release_udp_socket(socket_id)).await;
-            if promise.fulfil(reply).is_err() {
-                debug!(async_self.log(), "dropping UDP socket release reply");
-            }
-        })
-    }
-
     fn handle_open_tcp_session(
         &mut self,
-        ask: Ask<OpenTcpSession, Result<TcpSessionRef>>,
+        ask: Ask<OpenTcpSession, std::result::Result<OpenedTcpSession, OpenFailureReason>>,
     ) -> Handled {
         let (promise, request) = ask.take();
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
-            let session_component = async_self
-                .ctx
-                .system()
-                .create(|| TcpSession::new(driver.clone(), request.events_to.clone()));
+            let session_component = async_self.ctx.system().create(|| {
+                TcpSession::with_open_promise(
+                    driver.clone(),
+                    request.events_to.clone(),
+                    Some(promise),
+                )
+            });
             let session_strong = session_component
                 .actor_ref()
                 .hold()
                 .expect("newly created TCP session must be live");
-            let session_ref = TcpSessionRef::new(session_strong.clone());
             async_self.ctx.system().start(&session_component);
 
             let reply = async_self.driver.open_tcp_session(
@@ -427,60 +630,46 @@ impl IoBridge {
                 request.remote_addr,
                 request.local_addr,
             );
-            let reply = resolve_kfuture(reply).await;
-            match reply {
-                Ok(connection_id) => {
-                    session_strong.tell(TcpSessionMessage::Attach(connection_id));
-                    if promise.fulfil(Ok(session_ref)).is_err() {
-                        debug!(async_self.log(), "dropping TCP session open reply");
-                    }
-                }
-                Err(error) => {
-                    async_self.ctx.system().kill(session_component);
-                    if promise.fulfil(Err(error)).is_err() {
-                        debug!(async_self.log(), "dropping TCP session open reply");
-                    }
-                }
+            let submit_result = resolve_kfuture(reply).await;
+            if let Err(error) = submit_result {
+                session_strong.tell(TcpSessionMessage::DriverEvent(
+                    super::session::TcpSessionDriverEvent::OpenFailed {
+                        reason: open_failure_from_error(&error),
+                    },
+                ));
             }
+            Handled::Ok
         })
     }
 
     fn handle_open_tcp_listener(
         &mut self,
-        ask: Ask<OpenTcpListener, Result<TcpListenerRef>>,
+        ask: Ask<OpenTcpListener, std::result::Result<OpenedTcpListener, OpenFailureReason>>,
     ) -> Handled {
         let (promise, request) = ask.take();
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
-            let listener_component = async_self
-                .ctx
-                .system()
-                .create(|| TcpListener::new(driver.clone(), request.incoming_to.clone()));
+            let listener_component = async_self.ctx.system().create(|| {
+                TcpListener::new(driver.clone(), request.incoming_to.clone(), Some(promise))
+            });
             let listener_strong = listener_component
                 .actor_ref()
                 .hold()
                 .expect("newly created TCP listener must be live");
-            let listener_ref = TcpListenerRef::new(listener_strong.clone());
             async_self.ctx.system().start(&listener_component);
 
             let reply = async_self
                 .driver
                 .open_tcp_listener(listener_strong.clone(), request.local_addr);
-            let reply = resolve_kfuture(reply).await;
-            match reply {
-                Ok(listener_id) => {
-                    listener_strong.tell(TcpListenerMessage::Attach(listener_id));
-                    if promise.fulfil(Ok(listener_ref)).is_err() {
-                        debug!(async_self.log(), "dropping TCP listener open reply");
-                    }
-                }
-                Err(error) => {
-                    async_self.ctx.system().kill(listener_component);
-                    if promise.fulfil(Err(error)).is_err() {
-                        debug!(async_self.log(), "dropping TCP listener open reply");
-                    }
-                }
+            let submit_result = resolve_kfuture(reply).await;
+            if let Err(error) = submit_result {
+                listener_strong.tell(TcpListenerMessage::DriverEvent(
+                    super::listener::TcpListenerDriverEvent::ListenFailed {
+                        reason: open_failure_from_error(&error),
+                    },
+                ));
             }
+            Handled::Ok
         })
     }
 }
@@ -497,8 +686,7 @@ impl ComponentLifecycle for IoBridge {
 
 impl Provide<UdpPort> for IoBridge {
     fn handle(&mut self, request: <UdpPort as Port>::Request) -> Handled {
-        self.handle_udp_request(request);
-        Handled::Ok
+        self.handle_udp_request(request)
     }
 }
 
@@ -516,11 +704,13 @@ impl Actor for IoBridge {
 
 fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
     if bridge.owned_sockets.is_empty() {
+        bridge.pending_udp_opens.clear();
         bridge.udp_send_replies.clear();
         return Handled::Ok;
     }
 
     let sockets: Vec<SocketId> = bridge.owned_sockets.drain().collect();
+    bridge.pending_udp_opens.clear();
     for socket_id in &sockets {
         bridge
             .udp_send_replies
@@ -542,4 +732,17 @@ fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
             }
         }
     })
+}
+
+fn open_failure_from_error(error: &Error) -> OpenFailureReason {
+    match error {
+        Error::DriverUnavailable
+        | Error::DriverCommandChannelClosed
+        | Error::DriverResponseChannelClosed
+        | Error::DriverEventChannelClosed => OpenFailureReason::DriverUnavailable,
+        Error::UnknownConnection { .. }
+        | Error::UnknownListener { .. }
+        | Error::UnknownSocket { .. } => OpenFailureReason::InvalidHandle,
+        _ => OpenFailureReason::DriverUnavailable,
+    }
 }

@@ -22,11 +22,7 @@ use flotsync_utils::option_when;
 use mio::{Interest, Registry, net::UdpSocket as MioUdpSocket};
 use slog::{debug, error, warn};
 use socket2::SockRef;
-use std::{
-    io,
-    io::ErrorKind,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-};
+use std::{io, io::ErrorKind, net::SocketAddr};
 
 /// UDP-side runtime state owned by the shared driver.
 #[derive(Debug)]
@@ -240,10 +236,11 @@ impl UdpRuntimeState {
         &mut self,
         socket_id: SocketId,
         remote_addr: SocketAddr,
-        local_addr: Option<SocketAddr>,
+        bind: UdpLocalBind,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
+        let local_addr = bind.resolve_local_addr();
         let Some(entry) = self.sockets.get_mut(socket_id.0) else {
             event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
                 socket_id,
@@ -264,8 +261,7 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let bind_addr = local_addr.unwrap_or_else(|| default_udp_bind_addr(remote_addr));
-        let socket = match bind_udp_socket(bind_addr) {
+        let socket = match bind_udp_socket(local_addr) {
             Ok(socket) => socket,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
@@ -298,7 +294,7 @@ impl UdpRuntimeState {
                     socket_id,
                     error
                 );
-                bind_addr
+                local_addr
             }
         };
 
@@ -695,24 +691,6 @@ impl UdpRuntimeState {
     }
 }
 
-fn default_udp_bind_addr(remote_addr: SocketAddr) -> SocketAddr {
-    match remote_addr {
-        // On this macOS host, and especially while a VPN is active, connected IPv4 UDP sends to
-        // loopback can fail with `EADDRNOTAVAIL` if we bind the local side to `0.0.0.0:0` first.
-        // Binding to the loopback interface directly avoids that failure while keeping the normal
-        // wildcard bind behavior for non-loopback peers. This is an observed Darwin/network-state
-        // quirk rather than an assumed cross-platform rule.
-        SocketAddr::V4(remote_addr) if remote_addr.ip().is_loopback() => {
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
-        }
-        SocketAddr::V4(_) => SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
-        SocketAddr::V6(remote_addr) if remote_addr.ip().is_loopback() => {
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0))
-        }
-        SocketAddr::V6(_) => SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
-    }
-}
-
 fn bind_udp_socket(local_addr: SocketAddr) -> io::Result<MioUdpSocket> {
     MioUdpSocket::bind(local_addr)
 }
@@ -1068,7 +1046,7 @@ mod tests {
             .dispatch(DriverCommand::Udp(UdpCommand::Connect {
                 socket_id: sender_id,
                 remote_addr: receiver_addr,
-                local_addr: None,
+                bind: UdpLocalBind::ForPeer(receiver_addr),
             }))
             .expect("dispatch UDP connect");
 
@@ -1184,7 +1162,7 @@ mod tests {
             .dispatch(DriverCommand::Udp(UdpCommand::Connect {
                 socket_id: sender_id,
                 remote_addr: receiver_addr,
-                local_addr: None,
+                bind: UdpLocalBind::ForPeer(receiver_addr),
             }))
             .expect("dispatch UDP connect");
 

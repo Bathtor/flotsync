@@ -99,7 +99,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
         .dispatch(DriverCommand::Udp(UdpCommand::Connect {
             socket_id: connected_sender_id,
             remote_addr: receiver_addr,
-            local_addr: None,
+            bind: UdpLocalBind::ForPeer(receiver_addr),
         }))
         .expect("dispatch connected UDP open");
 

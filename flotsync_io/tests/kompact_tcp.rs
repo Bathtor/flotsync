@@ -59,7 +59,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
     start_component(&system, &session_probe2);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let session_ref = bridge_handle
+    let opened_session = bridge_handle
         .open_tcp_session(OpenTcpSession {
             remote_addr,
             local_addr: None,
@@ -68,15 +68,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
         .wait_timeout(Duration::from_secs(2))
         .expect("open TCP session future")
         .expect("open TCP session");
-
-    match recv_until(&session1_rx, |event| {
-        matches!(event, TcpSessionEvent::Connected { .. })
-    }) {
-        TcpSessionEvent::Connected { peer_addr } => {
-            assert_eq!(peer_addr, remote_addr);
-        }
-        other => unreachable!("filtered to TCP Connected session event, got {other:?}"),
-    }
+    assert_eq!(opened_session.peer_addr, remote_addr);
     assert!(
         session2_rx
             .recv_timeout(Duration::from_millis(100))
@@ -84,11 +76,11 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
         "unrelated TCP session event probe must stay silent"
     );
 
-    session_ref.tell(TcpSessionRequest::Send {
+    opened_session.session.tell(TcpSessionRequest::Send {
         transmission_id: TransmissionId(10),
         payload: IoPayload::Bytes(Bytes::from(vec![b'x'; 4 * 1024 * 1024])),
     });
-    session_ref.tell(TcpSessionRequest::Send {
+    opened_session.session.tell(TcpSessionRequest::Send {
         transmission_id: TransmissionId(11),
         payload: IoPayload::Bytes(Bytes::from_static(b"second")),
     });
@@ -138,7 +130,9 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
         }
     }
 
-    session_ref.tell(TcpSessionRequest::Close { abort: false });
+    opened_session
+        .session
+        .tell(TcpSessionRequest::Close { abort: false });
     let _ = recv_until(&session1_rx, |event| {
         matches!(event, TcpSessionEvent::Closed { .. })
     });
@@ -150,7 +144,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
     );
 
     server.join().expect("join server thread");
-    drop(session_ref);
+    drop(opened_session);
     drop(bridge_handle);
     kill_component(&system, session_probe1);
     kill_component(&system, session_probe2);
@@ -179,7 +173,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
     start_component(&system, &session_probe);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let listener_ref = bridge_handle
+    let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
             local_addr: localhost(0),
             incoming_to: listener_probe.actor_ref().recipient(),
@@ -187,13 +181,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         .wait_timeout(Duration::from_secs(2))
         .expect("open TCP listener future")
         .expect("open TCP listener");
-
-    let listener_addr = match recv_until(&listener_rx, |event| {
-        matches!(event, TcpListenerEvent::Listening { .. })
-    }) {
-        TcpListenerEvent::Listening { local_addr } => local_addr,
-        other => unreachable!("filtered to TCP listener Listening event, got {other:?}"),
-    };
+    let listener_addr = opened_listener.local_addr;
 
     let mut accepted_client = TcpStream::connect(listener_addr).expect("connect accepted client");
     accepted_client
@@ -252,7 +240,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         other => panic!("unexpected rejected-client read result: {other:?}"),
     }
 
-    listener_ref.tell(TcpListenerRequest::Close);
+    opened_listener.listener.tell(TcpListenerRequest::Close);
     match recv_until(&listener_rx, |event| {
         matches!(event, TcpListenerEvent::Closed)
     }) {
@@ -278,7 +266,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
     });
 
     drop(session_ref);
-    drop(listener_ref);
+    drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, session_probe);
     kill_component(&system, listener_probe);
@@ -303,7 +291,7 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
     start_component(&system, &listener_probe);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let listener_ref = bridge_handle
+    let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
             local_addr: localhost(0),
             incoming_to: listener_probe.actor_ref().recipient(),
@@ -311,13 +299,7 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
         .wait_timeout(Duration::from_secs(2))
         .expect("open TCP listener future")
         .expect("open TCP listener");
-
-    let listener_addr = match recv_until(&listener_rx, |event| {
-        matches!(event, TcpListenerEvent::Listening { .. })
-    }) {
-        TcpListenerEvent::Listening { local_addr } => local_addr,
-        other => unreachable!("filtered to TCP listener Listening event, got {other:?}"),
-    };
+    let listener_addr = opened_listener.local_addr;
 
     let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
     client
@@ -347,12 +329,12 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
         other => panic!("unexpected client read result after dropping pending session: {other:?}"),
     }
 
-    listener_ref.tell(TcpListenerRequest::Close);
+    opened_listener.listener.tell(TcpListenerRequest::Close);
     let _ = recv_until(&listener_rx, |event| {
         matches!(event, TcpListenerEvent::Closed)
     });
 
-    drop(listener_ref);
+    drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);

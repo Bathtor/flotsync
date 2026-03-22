@@ -1,13 +1,53 @@
 use super::{
     driver_component::DriverComponentRef,
     resolve_kfuture,
-    types::{TcpSessionEvent, TcpSessionRequest},
+    types::{
+        OpenFailureReason,
+        OpenedTcpSession,
+        TcpSessionEvent,
+        TcpSessionRef,
+        TcpSessionRequest,
+    },
 };
 use crate::{
     api::{CloseReason, ConnectionId, SendFailureReason, TcpCommand},
     errors::Error,
 };
 use ::kompact::prelude::*;
+use std::net::SocketAddr;
+
+/// Internal session-directed event routed from the shared driver component.
+///
+/// The Kompact public session event stream intentionally omits establishment events. The session
+/// component therefore receives these richer internal events, resolves its open promise if it has
+/// one, and forwards only the steady-state session events to `events_to`.
+#[derive(Clone, Debug)]
+pub(crate) enum TcpSessionDriverEvent {
+    Opened {
+        connection_id: ConnectionId,
+        peer_addr: SocketAddr,
+    },
+    OpenFailed {
+        reason: OpenFailureReason,
+    },
+    Received {
+        payload: crate::api::IoPayload,
+    },
+    SendAck {
+        transmission_id: crate::api::TransmissionId,
+    },
+    SendNack {
+        transmission_id: crate::api::TransmissionId,
+        reason: SendFailureReason,
+    },
+    ReadSuspended,
+    ReadResumed,
+    WriteSuspended,
+    WriteResumed,
+    Closed {
+        reason: CloseReason,
+    },
+}
 
 /// Internal mailbox for one TCP session component.
 ///
@@ -16,8 +56,7 @@ use ::kompact::prelude::*;
 #[derive(Debug)]
 pub(crate) enum TcpSessionMessage {
     Request(TcpSessionRequest),
-    Attach(ConnectionId),
-    DriverEvent(TcpSessionEvent),
+    DriverEvent(TcpSessionDriverEvent),
 }
 
 impl From<TcpSessionRequest> for TcpSessionMessage {
@@ -37,16 +76,41 @@ pub(crate) struct TcpSession {
     driver: DriverComponentRef,
     events_to: Recipient<TcpSessionEvent>,
     connection_id: Option<ConnectionId>,
+    open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
+    opened: bool,
     terminal: bool,
 }
 
 impl TcpSession {
-    pub(crate) fn new(driver: DriverComponentRef, events_to: Recipient<TcpSessionEvent>) -> Self {
+    pub(crate) fn attached(
+        driver: DriverComponentRef,
+        events_to: Recipient<TcpSessionEvent>,
+        connection_id: ConnectionId,
+    ) -> Self {
+        Self::with_connection_and_open_promise(driver, events_to, Some(connection_id), None)
+    }
+
+    pub(crate) fn with_open_promise(
+        driver: DriverComponentRef,
+        events_to: Recipient<TcpSessionEvent>,
+        open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
+    ) -> Self {
+        Self::with_connection_and_open_promise(driver, events_to, None, open_promise)
+    }
+
+    fn with_connection_and_open_promise(
+        driver: DriverComponentRef,
+        events_to: Recipient<TcpSessionEvent>,
+        connection_id: Option<ConnectionId>,
+        open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
+    ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             driver,
             events_to,
-            connection_id: None,
+            connection_id,
+            open_promise,
+            opened: connection_id.is_some(),
             terminal: false,
         }
     }
@@ -91,9 +155,12 @@ impl TcpSession {
 
     fn handle_close_request(&mut self, abort: bool) -> Handled {
         let Some(connection_id) = self.connection_id else {
-            self.events_to.tell(TcpSessionEvent::Closed {
-                reason: CloseReason::DriverShutdown,
-            });
+            self.fulfil_open_failure(OpenFailureReason::DriverUnavailable);
+            if self.opened {
+                self.events_to.tell(TcpSessionEvent::Closed {
+                    reason: CloseReason::DriverShutdown,
+                });
+            }
             self.terminal = true;
             self.ctx.suicide();
             return Handled::Ok;
@@ -109,17 +176,91 @@ impl TcpSession {
         Handled::Ok
     }
 
-    fn handle_driver_event(&mut self, event: TcpSessionEvent) -> Handled {
-        let terminal = matches!(
-            event,
-            TcpSessionEvent::ConnectFailed { .. } | TcpSessionEvent::Closed { .. }
-        );
-        self.events_to.tell(event);
-        if terminal {
-            self.terminal = true;
-            self.ctx.suicide();
+    fn handle_driver_event(&mut self, event: TcpSessionDriverEvent) -> Handled {
+        match event {
+            TcpSessionDriverEvent::Opened {
+                connection_id,
+                peer_addr,
+            } => {
+                self.connection_id = Some(connection_id);
+                self.opened = true;
+                self.fulfil_open_success(peer_addr);
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::OpenFailed { reason } => {
+                self.fulfil_open_failure(reason);
+                self.terminal = true;
+                self.ctx.suicide();
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::Received { payload } => {
+                self.events_to.tell(TcpSessionEvent::Received { payload });
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::SendAck { transmission_id } => {
+                self.events_to
+                    .tell(TcpSessionEvent::SendAck { transmission_id });
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::SendNack {
+                transmission_id,
+                reason,
+            } => {
+                self.events_to.tell(TcpSessionEvent::SendNack {
+                    transmission_id,
+                    reason,
+                });
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::ReadSuspended => {
+                self.events_to.tell(TcpSessionEvent::ReadSuspended);
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::ReadResumed => {
+                self.events_to.tell(TcpSessionEvent::ReadResumed);
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::WriteSuspended => {
+                self.events_to.tell(TcpSessionEvent::WriteSuspended);
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::WriteResumed => {
+                self.events_to.tell(TcpSessionEvent::WriteResumed);
+                Handled::Ok
+            }
+            TcpSessionDriverEvent::Closed { reason } => {
+                self.events_to.tell(TcpSessionEvent::Closed { reason });
+                self.terminal = true;
+                self.ctx.suicide();
+                Handled::Ok
+            }
         }
-        Handled::Ok
+    }
+
+    fn fulfil_open_success(&mut self, peer_addr: SocketAddr) {
+        let Some(promise) = self.open_promise.take() else {
+            return;
+        };
+        let actor = self
+            .actor_ref()
+            .hold()
+            .expect("TCP session must be live while fulfilling the open result");
+        let opened = OpenedTcpSession {
+            session: TcpSessionRef::new(actor),
+            peer_addr,
+        };
+        if promise.fulfil(Ok(opened)).is_err() {
+            debug!(self.log(), "dropping TCP session open reply");
+        }
+    }
+
+    fn fulfil_open_failure(&mut self, reason: OpenFailureReason) {
+        let Some(promise) = self.open_promise.take() else {
+            return;
+        };
+        if promise.fulfil(Err(reason)).is_err() {
+            debug!(self.log(), "dropping TCP session open reply");
+        }
     }
 }
 
@@ -139,10 +280,6 @@ impl Actor for TcpSession {
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             TcpSessionMessage::Request(request) => self.handle_request(request),
-            TcpSessionMessage::Attach(connection_id) => {
-                self.connection_id = Some(connection_id);
-                Handled::Ok
-            }
             TcpSessionMessage::DriverEvent(event) => self.handle_driver_event(event),
         }
     }

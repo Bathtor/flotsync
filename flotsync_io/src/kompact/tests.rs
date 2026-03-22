@@ -8,6 +8,7 @@ use super::{
     TcpSessionEvent,
     TcpSessionRequest,
     UdpIndication,
+    UdpOpenRequestId,
     UdpPort,
     UdpRequest,
     UdpSendResult,
@@ -71,38 +72,32 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     start_component(&system, &reply2);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let receiver_id = bridge_handle
-        .reserve_udp_socket()
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("receiver reservation future")
-        .expect("receiver reservation");
-    let sender_id = bridge_handle
-        .reserve_udp_socket()
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("sender reservation future")
-        .expect("sender reservation");
+    let receiver_request_id = UdpOpenRequestId::new();
+    let sender_request_id = UdpOpenRequestId::new();
 
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id: receiver_id,
+            request_id: receiver_request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
-    let receiver_addr = match recv_until(&observer1_rx, |event| {
+    let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
+                request_id,
                 socket_id,
                 ..
-            } if *socket_id == receiver_id
+            } if *request_id == receiver_request_id
         )
     }) {
         UdpIndication::Bound {
+            request_id,
             socket_id,
             local_addr,
         } => {
-            assert_eq!(socket_id, receiver_id);
-            local_addr
+            assert_eq!(request_id, receiver_request_id);
+            (socket_id, local_addr)
         }
         other => unreachable!("filtered to Bound for receiver socket, got {other:?}"),
     };
@@ -110,15 +105,17 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == receiver_id
+            } if *request_id == receiver_request_id
         )
     }) {
         UdpIndication::Bound {
+            request_id,
             socket_id,
             local_addr,
         } => {
+            assert_eq!(request_id, receiver_request_id);
             assert_eq!(socket_id, receiver_id);
             assert_eq!(local_addr, receiver_addr);
         }
@@ -127,26 +124,36 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
 
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id: sender_id,
+            request_id: sender_request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
-    recv_until(&observer1_rx, |event| {
+    let sender_id = match recv_until(&observer1_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == sender_id
+            } if *request_id == sender_request_id
         )
-    });
+    }) {
+        UdpIndication::Bound {
+            request_id,
+            socket_id,
+            ..
+        } => {
+            assert_eq!(request_id, sender_request_id);
+            socket_id
+        }
+        other => unreachable!("filtered to Bound for sender socket, got {other:?}"),
+    };
     recv_until(&observer2_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == sender_id
+            } if *request_id == sender_request_id
         )
     });
 
@@ -256,34 +263,40 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
     start_component(&system, &observer2);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let socket_id = bridge_handle
-        .reserve_udp_socket()
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("socket reservation future")
-        .expect("socket reservation");
+    let request_id = UdpOpenRequestId::new();
 
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id,
+            request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
-    recv_until(&observer1_rx, |event| {
+    let socket_id = match recv_until(&observer1_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id: observed_socket_id,
+                request_id: observed_request_id,
                 ..
-            } if *observed_socket_id == socket_id
+            } if *observed_request_id == request_id
         )
-    });
+    }) {
+        UdpIndication::Bound {
+            request_id: observed_request_id,
+            socket_id,
+            ..
+        } => {
+            assert_eq!(observed_request_id, request_id);
+            socket_id
+        }
+        other => unreachable!("filtered to UDP Bound, got {other:?}"),
+    };
     recv_until(&observer2_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id: observed_socket_id,
+                request_id: observed_request_id,
                 ..
-            } if *observed_socket_id == socket_id
+            } if *observed_request_id == request_id
         )
     });
 
@@ -369,7 +382,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     start_component(&system, &event_probe);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let session_ref = bridge_handle
+    let opened_session = bridge_handle
         .open_tcp_session(OpenTcpSession {
             remote_addr,
             local_addr: None,
@@ -378,17 +391,9 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
         .wait_timeout(WAIT_TIMEOUT)
         .expect("TCP open future")
         .expect("TCP session open");
+    assert_eq!(opened_session.peer_addr, remote_addr);
 
-    match recv_until(&events_rx, |event| {
-        matches!(event, TcpSessionEvent::Connected { .. })
-    }) {
-        TcpSessionEvent::Connected { peer_addr } => {
-            assert_eq!(peer_addr, remote_addr);
-        }
-        other => unreachable!("filtered to TCP Connected, got {other:?}"),
-    }
-
-    session_ref.tell(TcpSessionRequest::Send {
+    opened_session.session.tell(TcpSessionRequest::Send {
         transmission_id: TransmissionId(7),
         payload: IoPayload::Bytes(Bytes::from_static(b"hello")),
     });
@@ -417,7 +422,9 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
         }
     }
 
-    session_ref.tell(TcpSessionRequest::Close { abort: false });
+    opened_session
+        .session
+        .tell(TcpSessionRequest::Close { abort: false });
     match recv_until(&events_rx, |event| {
         matches!(event, TcpSessionEvent::Closed { .. })
     }) {
@@ -438,7 +445,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     );
 
     server.join().expect("join TCP server thread");
-    drop(session_ref);
+    drop(opened_session);
     drop(bridge_handle);
     kill_component(&system, event_probe);
     kill_component(&system, bridge);
@@ -465,7 +472,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     start_component(&system, &session_probe);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let listener_ref = bridge_handle
+    let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
             local_addr: localhost(0),
             incoming_to: listener_probe.actor_ref().recipient(),
@@ -473,13 +480,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
         .wait_timeout(WAIT_TIMEOUT)
         .expect("TCP listener open future")
         .expect("TCP listener open");
-
-    let listener_addr = match recv_until(&listener_events_rx, |event| {
-        matches!(event, TcpListenerEvent::Listening { .. })
-    }) {
-        TcpListenerEvent::Listening { local_addr } => local_addr,
-        other => unreachable!("filtered to TCP listener Listening, got {other:?}"),
-    };
+    let listener_addr = opened_listener.local_addr;
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
     let pending = match recv_until(&listener_events_rx, |event| {
@@ -526,7 +527,9 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
         other => unreachable!("filtered to TCP session Closed, got {other:?}"),
     }
 
-    listener_ref.tell(super::TcpListenerRequest::Close);
+    opened_listener
+        .listener
+        .tell(super::TcpListenerRequest::Close);
     match recv_until(&listener_events_rx, |event| {
         matches!(event, TcpListenerEvent::Closed)
     }) {
@@ -536,7 +539,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 
     drop(client);
     drop(session_ref);
-    drop(listener_ref);
+    drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, session_probe);
     kill_component(&system, listener_probe);
@@ -561,7 +564,7 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
     start_component(&system, &listener_probe);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let listener_ref = bridge_handle
+    let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
             local_addr: localhost(0),
             incoming_to: listener_probe.actor_ref().recipient(),
@@ -569,13 +572,7 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
         .wait_timeout(WAIT_TIMEOUT)
         .expect("TCP listener open future")
         .expect("TCP listener open");
-
-    let listener_addr = match recv_until(&listener_events_rx, |event| {
-        matches!(event, TcpListenerEvent::Listening { .. })
-    }) {
-        TcpListenerEvent::Listening { local_addr } => local_addr,
-        other => unreachable!("filtered to TCP listener Listening, got {other:?}"),
-    };
+    let listener_addr = opened_listener.local_addr;
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
     client
@@ -604,7 +601,9 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
         other => panic!("unexpected client read result after dropping pending session: {other:?}"),
     }
 
-    listener_ref.tell(super::TcpListenerRequest::Close);
+    opened_listener
+        .listener
+        .tell(super::TcpListenerRequest::Close);
     match recv_until(&listener_events_rx, |event| {
         matches!(event, TcpListenerEvent::Closed)
     }) {
@@ -613,7 +612,7 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
     }
 
     drop(client);
-    drop(listener_ref);
+    drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);

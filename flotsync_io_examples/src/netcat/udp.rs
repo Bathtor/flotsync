@@ -28,7 +28,10 @@ pub(super) fn run_udp(
     mode: UdpMode,
 ) -> Result<()> {
     let mode = match mode {
-        UdpMode::Connect { remote, bind } => UdpNetcatMode::Connected { remote, bind },
+        UdpMode::Connect { remote, bind } => UdpNetcatMode::Connected {
+            remote,
+            bind: bind.map_or(UdpLocalBind::ForPeer(remote), UdpLocalBind::Exact),
+        },
         UdpMode::Bind { bind, target } => UdpNetcatMode::Unconnected {
             bind: UdpLocalBind::Exact(bind),
             default_target: target,
@@ -64,7 +67,7 @@ pub(super) fn run_udp(
 enum UdpNetcatMode {
     Connected {
         remote: SocketAddr,
-        bind: Option<SocketAddr>,
+        bind: UdpLocalBind,
     },
     Unconnected {
         bind: UdpLocalBind,
@@ -75,8 +78,7 @@ enum UdpNetcatMode {
 /// Lifecycle of the shared UDP socket used by the example component.
 #[derive(Clone, Copy, Debug)]
 enum UdpSocketState {
-    Reserving,
-    Opening(SocketId),
+    Opening(UdpOpenRequestId),
     Ready(SocketId),
     Closing(SocketId),
     Closed,
@@ -85,10 +87,8 @@ enum UdpSocketState {
 impl UdpSocketState {
     fn socket_id(self) -> Option<SocketId> {
         match self {
-            Self::Opening(socket_id) | Self::Ready(socket_id) | Self::Closing(socket_id) => {
-                Some(socket_id)
-            }
-            Self::Reserving | Self::Closed => None,
+            Self::Ready(socket_id) | Self::Closing(socket_id) => Some(socket_id),
+            Self::Opening(_) | Self::Closed => None,
         }
     }
 }
@@ -146,7 +146,7 @@ impl UdpNetcat {
             udp: RequiredPort::uninitialised(),
             bridge_handle,
             mode,
-            socket_state: UdpSocketState::Reserving,
+            socket_state: UdpSocketState::Closed,
             last_received_source: None,
             queued_lines: VecDeque::new(),
             input_closed: false,
@@ -175,88 +175,89 @@ impl UdpNetcat {
     }
 
     fn handle_indication(&mut self, indication: UdpIndication) -> Handled {
-        let Some(socket_id) = self.socket_state.socket_id() else {
-            return Handled::Ok;
-        };
-
         match indication {
             UdpIndication::Bound {
+                request_id,
                 socket_id: event_socket_id,
                 local_addr,
-            } if event_socket_id == socket_id => {
-                self.socket_state = UdpSocketState::Ready(socket_id);
+            } if matches!(self.socket_state, UdpSocketState::Opening(current_request_id) if current_request_id == request_id) =>
+            {
+                self.socket_state = UdpSocketState::Ready(event_socket_id);
                 log::info!("UDP bound {local_addr}");
                 self.start_next_send();
             }
             UdpIndication::BindFailed {
-                socket_id: event_socket_id,
+                request_id,
                 local_addr,
                 reason,
-            } if event_socket_id == socket_id => {
+            } if matches!(self.socket_state, UdpSocketState::Opening(current_request_id) if current_request_id == request_id) =>
+            {
                 return self.fail_and_die(format!("udp bind to {local_addr} failed: {reason:?}"));
             }
             UdpIndication::Connected {
+                request_id,
                 socket_id: event_socket_id,
                 local_addr,
                 remote_addr,
-            } if event_socket_id == socket_id => {
-                self.socket_state = UdpSocketState::Ready(socket_id);
+            } if matches!(self.socket_state, UdpSocketState::Opening(current_request_id) if current_request_id == request_id) =>
+            {
+                self.socket_state = UdpSocketState::Ready(event_socket_id);
                 log::info!("UDP connected {local_addr} -> {remote_addr}");
                 self.start_next_send();
             }
             UdpIndication::ConnectFailed {
-                socket_id: event_socket_id,
+                request_id,
                 local_addr,
                 remote_addr,
                 reason,
-            } if event_socket_id == socket_id => {
+            } if matches!(self.socket_state, UdpSocketState::Opening(current_request_id) if current_request_id == request_id) =>
+            {
                 return self.fail_and_die(format!(
-                    "UDP connect {:?} -> {remote_addr} failed: {reason:?}",
-                    local_addr
+                    "UDP connect {local_addr} -> {remote_addr} failed: {reason:?}"
                 ));
             }
             UdpIndication::Received {
                 socket_id: event_socket_id,
                 source,
                 payload,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 self.last_received_source = Some(source);
                 log::debug!("UDP recv from {source}");
                 print_payload(payload);
             }
             UdpIndication::ReadSuspended {
                 socket_id: event_socket_id,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 log::debug!("UDP read suspended");
             }
             UdpIndication::ReadResumed {
                 socket_id: event_socket_id,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 log::debug!("UDP read resumed");
             }
             UdpIndication::WriteSuspended {
                 socket_id: event_socket_id,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 log::debug!("UDP write suspended");
             }
             UdpIndication::WriteResumed {
                 socket_id: event_socket_id,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 log::debug!("UDP write resumed");
             }
             UdpIndication::Configured {
                 socket_id: event_socket_id,
                 ..
-            } if event_socket_id == socket_id => {}
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {}
             UdpIndication::ConfigureFailed {
                 socket_id: event_socket_id,
                 ..
-            } if event_socket_id == socket_id => {}
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {}
             UdpIndication::Closed {
                 socket_id: event_socket_id,
                 remote_addr,
                 reason,
-            } if event_socket_id == socket_id => {
+            } if self.socket_state.socket_id() == Some(event_socket_id) => {
                 self.socket_state = UdpSocketState::Closed;
                 self.send_pending = false;
                 match remote_addr {
@@ -305,17 +306,17 @@ impl UdpNetcat {
         Handled::Ok
     }
 
-    fn trigger_open_request(&mut self, socket_id: SocketId) {
+    fn trigger_open_request(&mut self, request_id: UdpOpenRequestId) {
         match self.mode {
             UdpNetcatMode::Connected { remote, bind } => {
                 self.udp.trigger(UdpRequest::Connect {
-                    socket_id,
+                    request_id,
                     remote_addr: remote,
-                    local_addr: bind,
+                    bind,
                 });
             }
             UdpNetcatMode::Unconnected { bind, .. } => {
-                self.udp.trigger(UdpRequest::Bind { socket_id, bind });
+                self.udp.trigger(UdpRequest::Bind { request_id, bind });
             }
         }
     }
@@ -450,27 +451,10 @@ impl UdpNetcat {
 
 impl ComponentLifecycle for UdpNetcat {
     fn on_start(&mut self) -> Handled {
-        let reserve = self.bridge_handle.reserve_udp_socket();
-        Handled::block_on(self, move |mut async_self| async move {
-            let socket_reply = match reserve.await {
-                Ok(reply) => reply,
-                Err(error) => {
-                    return async_self.fail_and_die(format!(
-                        "UDP socket reservation dropped before completion: {error}"
-                    ));
-                }
-            };
-            let socket_id = match socket_reply {
-                Ok(socket_id) => socket_id,
-                Err(error) => {
-                    return async_self
-                        .fail_and_die(format!("failed to reserve UDP socket: {error}"));
-                }
-            };
-            async_self.socket_state = UdpSocketState::Opening(socket_id);
-            async_self.trigger_open_request(socket_id);
-            Handled::Ok
-        })
+        let request_id = UdpOpenRequestId::new();
+        self.socket_state = UdpSocketState::Opening(request_id);
+        self.trigger_open_request(request_id);
+        Handled::Ok
     }
 
     fn on_stop(&mut self) -> Handled {

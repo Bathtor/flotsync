@@ -1,14 +1,8 @@
 use super::{
-    bridge::IoBridgeMessage,
+    bridge::{IoBridgeMessage, UdpBridgeEvent},
     listener::{TcpListenerDriverEvent, TcpListenerMessage},
-    session::TcpSessionMessage,
-    types::{
-        ConfigureFailureReason,
-        OpenFailureReason,
-        TcpSessionEvent,
-        UdpIndication,
-        UdpSendResult,
-    },
+    session::{TcpSessionDriverEvent, TcpSessionMessage},
+    types::OpenFailureReason,
 };
 use crate::{
     api::{
@@ -19,7 +13,6 @@ use crate::{
         SocketId,
         TcpCommand,
         TcpEvent,
-        UdpCloseReason,
         UdpCommand,
         UdpEvent,
     },
@@ -297,6 +290,33 @@ impl IoDriverComponent {
         request.await
     }
 
+    fn release_udp_socket_after_open_failure(&mut self, socket_id: SocketId) {
+        let release = match self
+            .driver_ref()
+            .and_then(|driver| driver.release_socket(socket_id))
+        {
+            Ok(release) => release,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "failed to release UDP socket {} after open failure: {}", socket_id, error
+                );
+                return;
+            }
+        };
+        let log = self.log().clone();
+        let _ = self.spawn_off(async move {
+            if let Err(error) = release.await {
+                warn!(
+                    log,
+                    "failed to complete UDP socket {} release after open failure: {}",
+                    socket_id,
+                    error
+                );
+            }
+        });
+    }
+
     async fn open_tcp_listener_inner(
         &mut self,
         listener: ActorRefStrong<TcpListenerMessage>,
@@ -420,55 +440,27 @@ impl IoDriverComponent {
     }
 
     fn handle_udp_driver_event(&mut self, event: UdpEvent) {
+        let socket_id = udp_event_socket_id(&event);
+        let Some(route) = self.udp_routes.get(&socket_id).cloned() else {
+            warn!(
+                self.log(),
+                "dropping UDP event for unknown bridge-owned socket {}", socket_id
+            );
+            return;
+        };
+        route.tell(IoBridgeMessage::UdpEvent(udp_bridge_event_from_raw(
+            event.clone(),
+        )));
+
         match event {
-            UdpEvent::SendAck {
-                socket_id,
-                transmission_id,
-            } => {
-                if let Some(route) = self.udp_routes.get(&socket_id) {
-                    route.tell(IoBridgeMessage::UdpSendResult(UdpSendResult::Ack {
-                        socket_id,
-                        transmission_id,
-                    }));
-                } else {
-                    warn!(
-                        self.log(),
-                        "dropping UDP send ack for unknown bridge-owned socket {}", socket_id
-                    );
-                }
+            UdpEvent::BindFailed { .. } | UdpEvent::ConnectFailed { .. } => {
+                self.udp_routes.remove(&socket_id);
+                self.release_udp_socket_after_open_failure(socket_id);
             }
-            UdpEvent::SendNack {
-                socket_id,
-                transmission_id,
-                reason,
-            } => {
-                if let Some(route) = self.udp_routes.get(&socket_id) {
-                    route.tell(IoBridgeMessage::UdpSendResult(UdpSendResult::Nack {
-                        socket_id,
-                        transmission_id,
-                        reason,
-                    }));
-                } else {
-                    warn!(
-                        self.log(),
-                        "dropping UDP send nack for unknown bridge-owned socket {}", socket_id
-                    );
-                }
+            UdpEvent::Closed { .. } => {
+                self.udp_routes.remove(&socket_id);
             }
-            other => {
-                let (socket_id, indication) = udp_indication_from_raw(other);
-                if let Some(route) = self.udp_routes.get(&socket_id) {
-                    route.tell(IoBridgeMessage::UdpIndication(indication.clone()));
-                } else {
-                    warn!(
-                        self.log(),
-                        "dropping UDP indication for unknown bridge-owned socket {}", socket_id
-                    );
-                }
-                if matches!(indication, UdpIndication::Closed { .. }) {
-                    self.udp_routes.remove(&socket_id);
-                }
-            }
+            _ => {}
         }
     }
 
@@ -480,18 +472,20 @@ impl IoDriverComponent {
             } => {
                 self.route_tcp_listener_event(
                     listener_id,
-                    TcpListenerDriverEvent::Listening { local_addr },
+                    TcpListenerDriverEvent::Listening {
+                        listener_id,
+                        local_addr,
+                    },
                 );
             }
             TcpEvent::ListenFailed {
                 listener_id,
-                local_addr,
+                local_addr: _,
                 error_kind,
             } => {
                 self.route_tcp_listener_event(
                     listener_id,
                     TcpListenerDriverEvent::ListenFailed {
-                        local_addr,
                         reason: OpenFailureReason::Io(error_kind),
                     },
                 );
@@ -537,54 +531,62 @@ impl IoDriverComponent {
         }
 
         match command {
-            UdpCommand::Bind { socket_id, bind } => self.route_udp_indication(
-                socket_id,
-                UdpIndication::BindFailed {
+            UdpCommand::Bind { socket_id, bind } => {
+                self.route_udp_event(
                     socket_id,
-                    local_addr: bind.resolve_local_addr(),
-                    reason: OpenFailureReason::DriverUnavailable,
-                },
-            ),
+                    UdpBridgeEvent::BindFailed {
+                        socket_id,
+                        local_addr: bind.resolve_local_addr(),
+                        reason: OpenFailureReason::DriverUnavailable,
+                    },
+                );
+                self.udp_routes.remove(&socket_id);
+                self.release_udp_socket_after_open_failure(socket_id);
+            }
             UdpCommand::Connect {
                 socket_id,
                 remote_addr,
-                local_addr,
-            } => self.route_udp_indication(
-                socket_id,
-                UdpIndication::ConnectFailed {
+                bind,
+            } => {
+                self.route_udp_event(
                     socket_id,
-                    local_addr,
-                    remote_addr,
-                    reason: OpenFailureReason::DriverUnavailable,
-                },
-            ),
+                    UdpBridgeEvent::ConnectFailed {
+                        socket_id,
+                        local_addr: bind.resolve_local_addr(),
+                        remote_addr,
+                        reason: OpenFailureReason::DriverUnavailable,
+                    },
+                );
+                self.udp_routes.remove(&socket_id);
+                self.release_udp_socket_after_open_failure(socket_id);
+            }
             UdpCommand::Send {
                 socket_id,
                 transmission_id,
                 ..
-            } => self.route_udp_send_result(
+            } => self.route_udp_event(
                 socket_id,
-                UdpSendResult::Nack {
+                UdpBridgeEvent::SendNack {
                     socket_id,
                     transmission_id,
                     reason: SendFailureReason::DriverUnavailable,
                 },
             ),
-            UdpCommand::Configure { socket_id, option } => self.route_udp_indication(
+            UdpCommand::Configure { socket_id, option } => self.route_udp_event(
                 socket_id,
-                UdpIndication::ConfigureFailed {
+                UdpBridgeEvent::ConfigureFailed {
                     socket_id,
                     option,
-                    reason: ConfigureFailureReason::DriverUnavailable,
+                    reason: super::types::ConfigureFailureReason::DriverUnavailable,
                 },
             ),
             UdpCommand::Close { socket_id } => {
-                self.route_udp_indication(
+                self.route_udp_event(
                     socket_id,
-                    UdpIndication::Closed {
+                    UdpBridgeEvent::Closed {
                         socket_id,
                         remote_addr: None,
-                        reason: UdpCloseReason::Requested,
+                        reason: crate::api::UdpCloseReason::Requested,
                     },
                 );
                 self.udp_routes.remove(&socket_id);
@@ -606,12 +608,11 @@ impl IoDriverComponent {
             TcpCommand::Connect {
                 connection_id,
                 local_addr: _,
-                remote_addr,
+                remote_addr: _,
             } => {
                 self.route_tcp_session_event(
                     connection_id,
-                    TcpSessionEvent::ConnectFailed {
-                        remote_addr,
+                    TcpSessionDriverEvent::OpenFailed {
                         reason: OpenFailureReason::DriverUnavailable,
                     },
                 );
@@ -619,12 +620,11 @@ impl IoDriverComponent {
             }
             TcpCommand::Listen {
                 listener_id,
-                local_addr,
+                local_addr: _,
             } => {
                 self.route_tcp_listener_event(
                     listener_id,
                     TcpListenerDriverEvent::ListenFailed {
-                        local_addr,
                         reason: OpenFailureReason::DriverUnavailable,
                     },
                 );
@@ -633,7 +633,7 @@ impl IoDriverComponent {
             TcpCommand::AdoptAccepted { connection_id } => {
                 self.route_tcp_session_event(
                     connection_id,
-                    TcpSessionEvent::Closed {
+                    TcpSessionDriverEvent::Closed {
                         reason: CloseReason::DriverShutdown,
                     },
                 );
@@ -646,7 +646,7 @@ impl IoDriverComponent {
                 ..
             } => self.route_tcp_session_event(
                 connection_id,
-                TcpSessionEvent::SendNack {
+                TcpSessionDriverEvent::SendNack {
                     transmission_id,
                     reason: SendFailureReason::DriverUnavailable,
                 },
@@ -654,7 +654,7 @@ impl IoDriverComponent {
             TcpCommand::Close { connection_id, .. } => {
                 self.route_tcp_session_event(
                     connection_id,
-                    TcpSessionEvent::Closed {
+                    TcpSessionDriverEvent::Closed {
                         reason: CloseReason::DriverShutdown,
                     },
                 );
@@ -667,29 +667,18 @@ impl IoDriverComponent {
         }
     }
 
-    fn route_udp_indication(&self, socket_id: SocketId, indication: UdpIndication) {
+    fn route_udp_event(&self, socket_id: SocketId, event: UdpBridgeEvent) {
         if let Some(route) = self.udp_routes.get(&socket_id) {
-            route.tell(IoBridgeMessage::UdpIndication(indication));
+            route.tell(IoBridgeMessage::UdpEvent(event));
         } else {
             warn!(
                 self.log(),
-                "dropping UDP indication for unknown bridge-owned socket {}", socket_id
+                "dropping UDP event for unknown bridge-owned socket {}", socket_id
             );
         }
     }
 
-    fn route_udp_send_result(&self, socket_id: SocketId, result: UdpSendResult) {
-        if let Some(route) = self.udp_routes.get(&socket_id) {
-            route.tell(IoBridgeMessage::UdpSendResult(result));
-        } else {
-            warn!(
-                self.log(),
-                "dropping UDP send result for unknown bridge-owned socket {}", socket_id
-            );
-        }
-    }
-
-    fn route_tcp_session_event(&self, connection_id: ConnectionId, event: TcpSessionEvent) {
+    fn route_tcp_session_event(&self, connection_id: ConnectionId, event: TcpSessionDriverEvent) {
         if let Some(route) = self.tcp_routes.get(&connection_id) {
             route.tell(TcpSessionMessage::DriverEvent(event));
         } else {
@@ -944,131 +933,136 @@ fn shutdown_driver_component(component: &mut IoDriverComponent) -> Handled {
     })
 }
 
-fn udp_indication_from_raw(event: UdpEvent) -> (SocketId, UdpIndication) {
+fn udp_event_socket_id(event: &UdpEvent) -> SocketId {
+    match event {
+        UdpEvent::Bound { socket_id, .. }
+        | UdpEvent::BindFailed { socket_id, .. }
+        | UdpEvent::Connected { socket_id, .. }
+        | UdpEvent::ConnectFailed { socket_id, .. }
+        | UdpEvent::Received { socket_id, .. }
+        | UdpEvent::SendAck { socket_id, .. }
+        | UdpEvent::SendNack { socket_id, .. }
+        | UdpEvent::Configured { socket_id, .. }
+        | UdpEvent::ConfigureFailed { socket_id, .. }
+        | UdpEvent::ReadSuspended { socket_id }
+        | UdpEvent::ReadResumed { socket_id }
+        | UdpEvent::WriteSuspended { socket_id }
+        | UdpEvent::WriteResumed { socket_id }
+        | UdpEvent::Closed { socket_id, .. } => *socket_id,
+    }
+}
+
+fn udp_bridge_event_from_raw(event: UdpEvent) -> UdpBridgeEvent {
     match event {
         UdpEvent::Bound {
             socket_id,
             local_addr,
-        } => (
+        } => UdpBridgeEvent::Bound {
             socket_id,
-            UdpIndication::Bound {
-                socket_id,
-                local_addr,
-            },
-        ),
+            local_addr,
+        },
         UdpEvent::BindFailed {
             socket_id,
             local_addr,
             error_kind,
-        } => (
+        } => UdpBridgeEvent::BindFailed {
             socket_id,
-            UdpIndication::BindFailed {
-                socket_id,
-                local_addr,
-                reason: OpenFailureReason::Io(error_kind),
-            },
-        ),
+            local_addr,
+            reason: OpenFailureReason::Io(error_kind),
+        },
         UdpEvent::Connected {
             socket_id,
             local_addr,
             remote_addr,
-        } => (
+        } => UdpBridgeEvent::Connected {
             socket_id,
-            UdpIndication::Connected {
-                socket_id,
-                local_addr,
-                remote_addr,
-            },
-        ),
+            local_addr,
+            remote_addr,
+        },
         UdpEvent::ConnectFailed {
             socket_id,
             local_addr,
             remote_addr,
             error_kind,
-        } => (
+        } => UdpBridgeEvent::ConnectFailed {
             socket_id,
-            UdpIndication::ConnectFailed {
-                socket_id,
-                local_addr,
-                remote_addr,
-                reason: OpenFailureReason::Io(error_kind),
-            },
-        ),
+            local_addr,
+            remote_addr,
+            reason: OpenFailureReason::Io(error_kind),
+        },
         UdpEvent::Received {
             socket_id,
             source,
             payload,
-        } => (
+        } => UdpBridgeEvent::Received {
             socket_id,
-            UdpIndication::Received {
-                socket_id,
-                source,
-                payload,
-            },
-        ),
+            source,
+            payload,
+        },
+        UdpEvent::SendAck {
+            socket_id,
+            transmission_id,
+        } => UdpBridgeEvent::SendAck {
+            socket_id,
+            transmission_id,
+        },
+        UdpEvent::SendNack {
+            socket_id,
+            transmission_id,
+            reason,
+        } => UdpBridgeEvent::SendNack {
+            socket_id,
+            transmission_id,
+            reason,
+        },
         UdpEvent::Configured { socket_id, option } => {
-            (socket_id, UdpIndication::Configured { socket_id, option })
+            UdpBridgeEvent::Configured { socket_id, option }
         }
         UdpEvent::ConfigureFailed {
             socket_id,
             option,
             error_kind,
-        } => (
+        } => UdpBridgeEvent::ConfigureFailed {
             socket_id,
-            UdpIndication::ConfigureFailed {
-                socket_id,
-                option,
-                reason: ConfigureFailureReason::Io(error_kind),
-            },
-        ),
-        UdpEvent::ReadSuspended { socket_id } => {
-            (socket_id, UdpIndication::ReadSuspended { socket_id })
-        }
-        UdpEvent::ReadResumed { socket_id } => {
-            (socket_id, UdpIndication::ReadResumed { socket_id })
-        }
-        UdpEvent::WriteSuspended { socket_id } => {
-            (socket_id, UdpIndication::WriteSuspended { socket_id })
-        }
-        UdpEvent::WriteResumed { socket_id } => {
-            (socket_id, UdpIndication::WriteResumed { socket_id })
-        }
+            option,
+            reason: super::types::ConfigureFailureReason::Io(error_kind),
+        },
+        UdpEvent::ReadSuspended { socket_id } => UdpBridgeEvent::ReadSuspended { socket_id },
+        UdpEvent::ReadResumed { socket_id } => UdpBridgeEvent::ReadResumed { socket_id },
+        UdpEvent::WriteSuspended { socket_id } => UdpBridgeEvent::WriteSuspended { socket_id },
+        UdpEvent::WriteResumed { socket_id } => UdpBridgeEvent::WriteResumed { socket_id },
         UdpEvent::Closed {
             socket_id,
             remote_addr,
             reason,
-        } => (
+        } => UdpBridgeEvent::Closed {
             socket_id,
-            UdpIndication::Closed {
-                socket_id,
-                remote_addr,
-                reason,
-            },
-        ),
-        UdpEvent::SendAck { .. } | UdpEvent::SendNack { .. } => {
-            unreachable!("send outcomes are handled separately")
-        }
+            remote_addr,
+            reason,
+        },
     }
 }
 
-fn tcp_session_event_from_raw(event: TcpEvent) -> (ConnectionId, TcpSessionEvent, bool) {
+fn tcp_session_event_from_raw(event: TcpEvent) -> (ConnectionId, TcpSessionDriverEvent, bool) {
     match event {
         TcpEvent::Connected {
             connection_id,
             peer_addr,
         } => (
             connection_id,
-            TcpSessionEvent::Connected { peer_addr },
+            TcpSessionDriverEvent::Opened {
+                connection_id,
+                peer_addr,
+            },
             false,
         ),
         TcpEvent::ConnectFailed {
             connection_id,
-            remote_addr,
+            remote_addr: _,
             error_kind,
         } => (
             connection_id,
-            TcpSessionEvent::ConnectFailed {
-                remote_addr,
+            TcpSessionDriverEvent::OpenFailed {
                 reason: OpenFailureReason::Io(error_kind),
             },
             true,
@@ -1076,13 +1070,17 @@ fn tcp_session_event_from_raw(event: TcpEvent) -> (ConnectionId, TcpSessionEvent
         TcpEvent::Received {
             connection_id,
             payload,
-        } => (connection_id, TcpSessionEvent::Received { payload }, false),
+        } => (
+            connection_id,
+            TcpSessionDriverEvent::Received { payload },
+            false,
+        ),
         TcpEvent::SendAck {
             connection_id,
             transmission_id,
         } => (
             connection_id,
-            TcpSessionEvent::SendAck { transmission_id },
+            TcpSessionDriverEvent::SendAck { transmission_id },
             false,
         ),
         TcpEvent::SendNack {
@@ -1091,28 +1089,32 @@ fn tcp_session_event_from_raw(event: TcpEvent) -> (ConnectionId, TcpSessionEvent
             reason,
         } => (
             connection_id,
-            TcpSessionEvent::SendNack {
+            TcpSessionDriverEvent::SendNack {
                 transmission_id,
                 reason,
             },
             false,
         ),
         TcpEvent::ReadSuspended { connection_id } => {
-            (connection_id, TcpSessionEvent::ReadSuspended, false)
+            (connection_id, TcpSessionDriverEvent::ReadSuspended, false)
         }
         TcpEvent::ReadResumed { connection_id } => {
-            (connection_id, TcpSessionEvent::ReadResumed, false)
+            (connection_id, TcpSessionDriverEvent::ReadResumed, false)
         }
         TcpEvent::WriteSuspended { connection_id } => {
-            (connection_id, TcpSessionEvent::WriteSuspended, false)
+            (connection_id, TcpSessionDriverEvent::WriteSuspended, false)
         }
         TcpEvent::WriteResumed { connection_id } => {
-            (connection_id, TcpSessionEvent::WriteResumed, false)
+            (connection_id, TcpSessionDriverEvent::WriteResumed, false)
         }
         TcpEvent::Closed {
             connection_id,
             reason,
-        } => (connection_id, TcpSessionEvent::Closed { reason }, true),
+        } => (
+            connection_id,
+            TcpSessionDriverEvent::Closed { reason },
+            true,
+        ),
         TcpEvent::ListenFailed { listener_id, .. }
         | TcpEvent::Listening { listener_id, .. }
         | TcpEvent::Accepted { listener_id, .. }

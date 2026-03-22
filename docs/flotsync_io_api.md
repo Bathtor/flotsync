@@ -122,10 +122,14 @@ The Kompact bridge keeps transport control and payload allocation on one narrow 
 
 ```rust
 impl IoBridgeHandle {
-    pub fn reserve_udp_socket(&self) -> KFuture<Result<SocketId>>;
-    pub fn release_udp_socket(&self, socket_id: SocketId) -> KFuture<Result<()>>;
-    pub fn open_tcp_session(&self, request: OpenTcpSession) -> KFuture<Result<TcpSessionRef>>;
-    pub fn open_tcp_listener(&self, request: OpenTcpListener) -> KFuture<Result<TcpListenerRef>>;
+    pub fn open_tcp_session(
+        &self,
+        request: OpenTcpSession,
+    ) -> KFuture<Result<OpenedTcpSession, OpenFailureReason>>;
+    pub fn open_tcp_listener(
+        &self,
+        request: OpenTcpListener,
+    ) -> KFuture<Result<OpenedTcpListener, OpenFailureReason>>;
     pub fn egress_pool(&self) -> &EgressPool;
 }
 ```
@@ -133,6 +137,14 @@ impl IoBridgeHandle {
 `egress_pool()` is the transport-agnostic payload-allocation hook. Any component that can send
 payloads can clone the shared egress pool through the same bridge handle and serialise into
 lease-backed `IoPayload::Lease` values instead of allocating ad hoc `Bytes` payloads.
+
+The TCP open-style futures now resolve only once the returned handle is actually usable:
+
+- `open_tcp_session(...)` resolves once the session is connected or has failed
+- `open_tcp_listener(...)` resolves once the listener is listening or has failed
+
+Callers therefore do not need a separate `Opening(...)` state just to wait for a later public
+`Connected` / `Listening` event.
 
 ## Kompact UDP API
 
@@ -158,13 +170,13 @@ pub enum UdpLocalBind {
 ```rust
 pub enum UdpRequest {
     Bind {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         bind: UdpLocalBind,
     },
     Connect {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
-        local_addr: Option<SocketAddr>,
+        bind: UdpLocalBind,
     },
     Send {
         socket_id: SocketId,
@@ -181,6 +193,10 @@ pub enum UdpRequest {
         socket_id: SocketId,
     },
 }
+```
+
+```rust
+pub struct UdpOpenRequestId(pub Uuid);
 ```
 
 ```rust
@@ -225,22 +241,24 @@ pub enum UdpCloseReason {
 ```rust
 pub enum UdpIndication {
     Bound {
+        request_id: UdpOpenRequestId,
         socket_id: SocketId,
         local_addr: SocketAddr,
     },
     BindFailed {
-        socket_id: SocketId,
+        request_id: UdpOpenRequestId,
         local_addr: SocketAddr,
         reason: OpenFailureReason,
     },
     Connected {
+        request_id: UdpOpenRequestId,
         socket_id: SocketId,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     },
     ConnectFailed {
-        socket_id: SocketId,
-        local_addr: Option<SocketAddr>,
+        request_id: UdpOpenRequestId,
+        local_addr: SocketAddr,
         remote_addr: SocketAddr,
         reason: OpenFailureReason,
     },
@@ -296,6 +314,10 @@ pub enum UdpSendResult {
 
 - A single `IoBridge` provides one shared UDP capability to its connected components.
 - Multiple local components may observe the same socket's `Received` and lifecycle indications.
+- UDP bind/connect no longer require a separate reservation step. The bridge allocates the
+  `SocketId` internally once the request runs.
+- `UdpOpenRequestId` exists only to correlate one bind/connect request with the later shared
+  success or failure indication that reports its outcome.
 - `UdpLocalBind::ForPeer(peer)` lets the driver own the default local-bind policy for unconnected
   UDP sockets. The concrete local address is still reported by `Bound` / `BindFailed`.
 - `UdpLocalBind::resolve_local_addr()` exposes that policy explicitly for callers that need to
@@ -342,7 +364,14 @@ Opening a listener is an actor request/response operation:
 bridge_ref.ask(OpenTcpListener {
     local_addr,
     incoming_to,
-}) -> Result<TcpListenerRef>
+}) -> Result<OpenedTcpListener>
+```
+
+```rust
+pub struct OpenedTcpListener {
+    pub listener: TcpListenerRef,
+    pub local_addr: SocketAddr,
+}
 ```
 
 `TcpListenerRef` is then used for listener-local control:
@@ -358,13 +387,6 @@ pub enum TcpListenerRequest {
 }
 
 pub enum TcpListenerEvent {
-    Listening {
-        local_addr: SocketAddr,
-    },
-    ListenFailed {
-        local_addr: SocketAddr,
-        reason: OpenFailureReason,
-    },
     Incoming {
         peer_addr: SocketAddr,
         pending: PendingTcpSession,
@@ -412,7 +434,14 @@ Opening a session is an actor request/response operation:
 bridge_ref.ask(OpenTcpSession {
     remote_addr,
     local_addr,
-}) -> Result<TcpSessionRef>
+}) -> Result<OpenedTcpSession>
+```
+
+```rust
+pub struct OpenedTcpSession {
+    pub session: TcpSessionRef,
+    pub peer_addr: SocketAddr,
+}
 ```
 
 `TcpSessionRef` is then used for all traffic on that session:
@@ -435,13 +464,6 @@ pub enum TcpSessionRequest {
 }
 
 pub enum TcpSessionEvent {
-    Connected {
-        peer_addr: SocketAddr,
-    },
-    ConnectFailed {
-        remote_addr: SocketAddr,
-        reason: OpenFailureReason,
-    },
     Received {
         payload: IoPayload,
     },
@@ -466,6 +488,8 @@ pub enum TcpSessionEvent {
 
 - Session identity is represented by the Kompact session endpoint, not by repeatedly exposing
   `ConnectionId` to the client.
+- Outbound TCP open/listen futures resolve only once the resource is usable, so normal callers do
+  not need separate bridge-local `Opening(...)` states.
 - `TransmissionId` only needs to be meaningful within one session.
 - Inbound listeners expose pending decisions first; they do not auto-spawn session owners.
 - Connected UDP may close with `UdpCloseReason::Disconnected` when the platform surfaces a remote

@@ -26,6 +26,7 @@ slog-scope = { version = "4", optional = true }
 slog-stdlog = { version = "4", optional = true }
 slog-term = "2"
 snafu = { workspace = true }
+uuid = { workspace = true }
 
 [[test]]
 name = "kompact_tcp"

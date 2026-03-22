@@ -1,10 +1,13 @@
 use super::{
     driver_component::DriverComponentRef,
     resolve_kfuture,
-    session::{TcpSession, TcpSessionMessage},
+    session::TcpSession,
     types::{
+        OpenFailureReason,
+        OpenedTcpListener,
         PendingTcpSession,
         TcpListenerEvent,
+        TcpListenerRef,
         TcpListenerRequest,
         TcpSessionEvent,
         TcpSessionRef,
@@ -32,10 +35,10 @@ pub(crate) struct AcceptPendingTcpSession {
 #[derive(Debug)]
 pub(crate) enum TcpListenerDriverEvent {
     Listening {
+        listener_id: ListenerId,
         local_addr: std::net::SocketAddr,
     },
     ListenFailed {
-        local_addr: std::net::SocketAddr,
         reason: super::types::OpenFailureReason,
     },
     Incoming {
@@ -49,7 +52,6 @@ pub(crate) enum TcpListenerDriverEvent {
 #[derive(Debug)]
 pub(crate) enum TcpListenerMessage {
     Request(TcpListenerRequest),
-    Attach(ListenerId),
     DriverEvent(TcpListenerDriverEvent),
     AcceptPending(Ask<AcceptPendingTcpSession, Result<TcpSessionRef>>),
     RejectPending(Ask<ConnectionId, Result<()>>),
@@ -73,17 +75,25 @@ pub(crate) struct TcpListener {
     driver: DriverComponentRef,
     events_to: Recipient<TcpListenerEvent>,
     listener_id: Option<ListenerId>,
+    open_promise: Option<KPromise<std::result::Result<OpenedTcpListener, OpenFailureReason>>>,
+    opened: bool,
     pending_connections: HashSet<ConnectionId>,
     terminal: bool,
 }
 
 impl TcpListener {
-    pub(crate) fn new(driver: DriverComponentRef, events_to: Recipient<TcpListenerEvent>) -> Self {
+    pub(crate) fn new(
+        driver: DriverComponentRef,
+        events_to: Recipient<TcpListenerEvent>,
+        open_promise: Option<KPromise<std::result::Result<OpenedTcpListener, OpenFailureReason>>>,
+    ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             driver,
             events_to,
             listener_id: None,
+            open_promise,
+            opened: false,
             pending_connections: HashSet::new(),
             terminal: false,
         }
@@ -98,7 +108,10 @@ impl TcpListener {
     fn handle_close_request(&mut self) -> Handled {
         let Some(listener_id) = self.listener_id else {
             if !self.terminal {
-                self.events_to.tell(TcpListenerEvent::Closed);
+                self.fulfil_open_failure(OpenFailureReason::DriverUnavailable);
+                if self.opened {
+                    self.events_to.tell(TcpListenerEvent::Closed);
+                }
                 self.terminal = true;
             }
             self.ctx.suicide();
@@ -115,14 +128,17 @@ impl TcpListener {
 
     fn handle_driver_event(&mut self, event: TcpListenerDriverEvent) -> Handled {
         match event {
-            TcpListenerDriverEvent::Listening { local_addr } => {
-                self.events_to
-                    .tell(TcpListenerEvent::Listening { local_addr });
+            TcpListenerDriverEvent::Listening {
+                listener_id,
+                local_addr,
+            } => {
+                self.listener_id = Some(listener_id);
+                self.opened = true;
+                self.fulfil_open_success(local_addr);
             }
-            TcpListenerDriverEvent::ListenFailed { local_addr, reason } => {
+            TcpListenerDriverEvent::ListenFailed { reason } => {
                 self.pending_connections.clear();
-                self.events_to
-                    .tell(TcpListenerEvent::ListenFailed { local_addr, reason });
+                self.fulfil_open_failure(reason);
                 self.terminal = true;
                 self.ctx.suicide();
             }
@@ -142,7 +158,9 @@ impl TcpListener {
             }
             TcpListenerDriverEvent::Closed => {
                 self.pending_connections.clear();
-                self.events_to.tell(TcpListenerEvent::Closed);
+                if self.opened {
+                    self.events_to.tell(TcpListenerEvent::Closed);
+                }
                 self.terminal = true;
                 self.ctx.suicide();
             }
@@ -167,10 +185,13 @@ impl TcpListener {
 
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
-            let session_component = async_self
-                .ctx
-                .system()
-                .create(|| TcpSession::new(driver.clone(), request.events_to.clone()));
+            let session_component = async_self.ctx.system().create(|| {
+                TcpSession::attached(
+                    driver.clone(),
+                    request.events_to.clone(),
+                    request.connection_id,
+                )
+            });
             let session_strong = session_component
                 .actor_ref()
                 .hold()
@@ -184,7 +205,6 @@ impl TcpListener {
             let reply = resolve_kfuture(adopt).await;
             match reply {
                 Ok(()) => {
-                    session_strong.tell(TcpSessionMessage::Attach(request.connection_id));
                     if promise.fulfil(Ok(session_ref)).is_err() {
                         debug!(
                             async_self.log(),
@@ -246,6 +266,32 @@ impl TcpListener {
             }
         })
     }
+
+    fn fulfil_open_success(&mut self, local_addr: std::net::SocketAddr) {
+        let Some(promise) = self.open_promise.take() else {
+            return;
+        };
+        let actor = self
+            .actor_ref()
+            .hold()
+            .expect("TCP listener must be live while fulfilling the open result");
+        let opened = OpenedTcpListener {
+            listener: TcpListenerRef::new(actor),
+            local_addr,
+        };
+        if promise.fulfil(Ok(opened)).is_err() {
+            debug!(self.log(), "dropping TCP listener open reply");
+        }
+    }
+
+    fn fulfil_open_failure(&mut self, reason: OpenFailureReason) {
+        let Some(promise) = self.open_promise.take() else {
+            return;
+        };
+        if promise.fulfil(Err(reason)).is_err() {
+            debug!(self.log(), "dropping TCP listener open reply");
+        }
+    }
 }
 
 impl ComponentLifecycle for TcpListener {
@@ -264,10 +310,6 @@ impl Actor for TcpListener {
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             TcpListenerMessage::Request(request) => self.handle_request(request),
-            TcpListenerMessage::Attach(listener_id) => {
-                self.listener_id = Some(listener_id);
-                Handled::Ok
-            }
             TcpListenerMessage::DriverEvent(event) => self.handle_driver_event(event),
             TcpListenerMessage::AcceptPending(ask) => self.handle_accept_pending(ask),
             TcpListenerMessage::RejectPending(ask) => self.handle_reject_pending(ask),

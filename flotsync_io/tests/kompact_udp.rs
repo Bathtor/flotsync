@@ -47,38 +47,32 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     start_component(&system, &reply2);
 
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let receiver_id = bridge_handle
-        .reserve_udp_socket()
-        .wait_timeout(Duration::from_secs(2))
-        .expect("receiver reservation future")
-        .expect("receiver reservation");
-    let sender_id = bridge_handle
-        .reserve_udp_socket()
-        .wait_timeout(Duration::from_secs(2))
-        .expect("sender reservation future")
-        .expect("sender reservation");
+    let receiver_request_id = UdpOpenRequestId::new();
+    let sender_request_id = UdpOpenRequestId::new();
 
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id: receiver_id,
+            request_id: receiver_request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
-    let receiver_addr = match recv_until(&observer1_rx, |event| {
+    let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
+                request_id,
                 socket_id,
                 ..
-            } if *socket_id == receiver_id
+            } if *request_id == receiver_request_id
         )
     }) {
         UdpIndication::Bound {
+            request_id,
             socket_id,
             local_addr,
         } => {
-            assert_eq!(socket_id, receiver_id);
-            local_addr
+            assert_eq!(request_id, receiver_request_id);
+            (socket_id, local_addr)
         }
         other => unreachable!("filtered to receiver Bound indication, got {other:?}"),
     };
@@ -86,15 +80,17 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == receiver_id
+            } if *request_id == receiver_request_id
         )
     }) {
         UdpIndication::Bound {
+            request_id,
             socket_id,
             local_addr,
         } => {
+            assert_eq!(request_id, receiver_request_id);
             assert_eq!(socket_id, receiver_id);
             assert_eq!(local_addr, receiver_addr);
         }
@@ -103,26 +99,36 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
 
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id: sender_id,
+            request_id: sender_request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
-    let _ = recv_until(&observer1_rx, |event| {
+    let sender_id = match recv_until(&observer1_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == sender_id
+            } if *request_id == sender_request_id
         )
-    });
+    }) {
+        UdpIndication::Bound {
+            request_id,
+            socket_id,
+            ..
+        } => {
+            assert_eq!(request_id, sender_request_id);
+            socket_id
+        }
+        other => unreachable!("filtered to sender Bound indication, got {other:?}"),
+    };
     let _ = recv_until(&observer2_rx, |event| {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id,
+                request_id,
                 ..
-            } if *socket_id == sender_id
+            } if *request_id == sender_request_id
         )
     });
 
@@ -250,15 +256,11 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     start_component(&system, &observer1);
 
     let bridge1_handle = IoBridgeHandle::from_component(&bridge1);
-    let socket_id = bridge1_handle
-        .reserve_udp_socket()
-        .wait_timeout(Duration::from_secs(2))
-        .expect("first socket reservation future")
-        .expect("first socket reservation");
+    let request_id = UdpOpenRequestId::new();
 
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id,
+            request_id,
             bind: UdpLocalBind::Exact(localhost(0)),
         });
     });
@@ -266,9 +268,9 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id: observed_socket_id,
+                request_id: observed_request_id,
                 ..
-            } if *observed_socket_id == socket_id
+            } if *observed_request_id == request_id
         )
     }) {
         UdpIndication::Bound { local_addr, .. } => local_addr,
@@ -290,15 +292,11 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     start_component(&system, &observer2);
 
     let bridge2_handle = IoBridgeHandle::from_component(&bridge2);
-    let rebound_socket_id = bridge2_handle
-        .reserve_udp_socket()
-        .wait_timeout(Duration::from_secs(2))
-        .expect("second socket reservation future")
-        .expect("second socket reservation");
+    let rebound_request_id = UdpOpenRequestId::new();
 
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
-            socket_id: rebound_socket_id,
+            request_id: rebound_request_id,
             bind: UdpLocalBind::Exact(bound_addr),
         });
     });
@@ -306,16 +304,17 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
         matches!(
             event,
             UdpIndication::Bound {
-                socket_id: observed_socket_id,
+                request_id: observed_request_id,
                 ..
-            } if *observed_socket_id == rebound_socket_id
+            } if *observed_request_id == rebound_request_id
         )
     }) {
         UdpIndication::Bound {
-            socket_id: observed_socket_id,
+            request_id: observed_request_id,
+            socket_id: _observed_socket_id,
             local_addr,
         } => {
-            assert_eq!(observed_socket_id, rebound_socket_id);
+            assert_eq!(observed_request_id, rebound_request_id);
             assert_eq!(local_addr, bound_addr);
         }
         other => unreachable!("filtered to rebound UDP Bound indication, got {other:?}"),

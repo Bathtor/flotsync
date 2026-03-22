@@ -368,7 +368,7 @@ pub enum UdpCommand {
     Connect {
         socket_id: SocketId,
         remote_addr: SocketAddr,
-        local_addr: Option<SocketAddr>,
+        bind: UdpLocalBind,
     },
     /// Requests transmission of a UDP datagram, optionally to an explicit target for unconnected sockets.
     Send {
@@ -414,7 +414,7 @@ pub enum UdpEvent {
     /// Reports that a requested UDP socket connect failed before the socket became usable.
     ConnectFailed {
         socket_id: SocketId,
-        local_addr: Option<SocketAddr>,
+        local_addr: SocketAddr,
         remote_addr: SocketAddr,
         error_kind: io::ErrorKind,
     },

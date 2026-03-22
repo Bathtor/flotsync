@@ -13,7 +13,7 @@ use crate::{
     logging::RuntimeLogger,
 };
 use mio::Registry;
-use slog::{error, info, warn};
+use slog::{debug, error, info, warn};
 
 /// Commands passed across the control plane into the dedicated driver thread.
 #[derive(Debug)]
@@ -157,7 +157,9 @@ impl DriverRuntimeState {
 
     pub(super) fn record_ready_hit(&mut self, token: DriverToken) {
         let Some(key) = self.readiness_key(token) else {
-            warn!(
+            // Deregistered sockets can still leave one stale readiness notification queued in the
+            // poller. That is observable but benign, so keep it at debug level.
+            debug!(
                 self.logger,
                 "received readiness for unknown flotsync_io token {}", token.0
             );
@@ -389,12 +391,12 @@ impl DriverRuntimeState {
                             UdpCommand::Connect {
                                 socket_id,
                                 remote_addr,
-                                local_addr,
+                                bind,
                             } => {
                                 self.udp.handle_connect(
                                     socket_id,
                                     remote_addr,
-                                    local_addr,
+                                    bind,
                                     registry,
                                     event_sink,
                                 )?;
