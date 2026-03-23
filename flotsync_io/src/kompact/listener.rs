@@ -9,13 +9,14 @@ use super::{
         TcpListenerEvent,
         TcpListenerRef,
         TcpListenerRequest,
-        TcpSessionEvent,
+        TcpSessionEventTarget,
         TcpSessionRef,
     },
 };
 use crate::{
     api::{ConnectionId, ListenerId, TcpCommand},
     errors::{Error, Result},
+    pool::EgressPool,
 };
 use ::kompact::prelude::*;
 use std::collections::HashSet;
@@ -24,7 +25,7 @@ use std::collections::HashSet;
 #[derive(Debug)]
 pub(crate) struct AcceptPendingTcpSession {
     pub(crate) connection_id: ConnectionId,
-    pub(crate) events_to: Recipient<TcpSessionEvent>,
+    pub(crate) events_to: TcpSessionEventTarget,
 }
 
 /// Internal listener-directed event routed from the shared driver component.
@@ -73,6 +74,7 @@ impl From<TcpListenerRequest> for TcpListenerMessage {
 pub(crate) struct TcpListener {
     ctx: ComponentContext<Self>,
     driver: DriverComponentRef,
+    egress_pool: EgressPool,
     events_to: Recipient<TcpListenerEvent>,
     listener_id: Option<ListenerId>,
     open_promise: Option<KPromise<std::result::Result<OpenedTcpListener, OpenFailureReason>>>,
@@ -85,11 +87,13 @@ impl TcpListener {
     pub(crate) fn new(
         driver: DriverComponentRef,
         events_to: Recipient<TcpListenerEvent>,
+        egress_pool: EgressPool,
         open_promise: Option<KPromise<std::result::Result<OpenedTcpListener, OpenFailureReason>>>,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             driver,
+            egress_pool,
             events_to,
             listener_id: None,
             open_promise,
@@ -157,6 +161,7 @@ impl TcpListener {
                 });
             }
             TcpListenerDriverEvent::Closed => {
+                self.listener_id = None;
                 self.pending_connections.clear();
                 if self.opened {
                     self.events_to.tell(TcpListenerEvent::Closed);
@@ -190,13 +195,15 @@ impl TcpListener {
                     driver.clone(),
                     request.events_to.clone(),
                     request.connection_id,
+                    async_self.egress_pool.clone(),
                 )
             });
             let session_strong = session_component
                 .actor_ref()
                 .hold()
                 .expect("newly created TCP session must be live");
-            let session_ref = TcpSessionRef::new(session_strong.clone());
+            let session_ref =
+                TcpSessionRef::new(session_strong.clone(), async_self.egress_pool.clone());
             async_self.ctx.system().start(&session_component);
 
             let adopt = async_self
@@ -325,6 +332,12 @@ impl Actor for TcpListener {
 }
 
 fn shutdown_listener(listener: &mut TcpListener) -> Handled {
+    if listener.terminal {
+        listener.listener_id = None;
+        listener.pending_connections.clear();
+        return Handled::Ok;
+    }
+
     let Some(listener_id) = listener.listener_id.take() else {
         listener.pending_connections.clear();
         return Handled::Ok;

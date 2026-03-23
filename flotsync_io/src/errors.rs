@@ -79,6 +79,19 @@ pub enum Error {
     #[snafu(display("cannot create an empty lease-backed payload"))]
     EmptyIoLease,
 
+    #[snafu(display(
+        "cannot transfer pooled payload ownership because the payload is still shared"
+    ))]
+    SharedIoPayloadOwnership,
+
+    #[snafu(display(
+        "cannot adopt {chunk_count} live chunks into the egress pool because that would exceed the configured max chunk count {max_chunk_count}"
+    ))]
+    EgressLiveChunkAdoptionExhausted {
+        chunk_count: usize,
+        max_chunk_count: usize,
+    },
+
     #[snafu(display("unknown TCP listener id {listener_id}"))]
     UnknownListener { listener_id: ListenerId },
 

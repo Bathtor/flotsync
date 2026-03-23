@@ -10,6 +10,7 @@ use super::{
         OpenTcpSession,
         OpenedTcpListener,
         OpenedTcpSession,
+        TcpSessionEventTarget,
         UdpIndication,
         UdpOpenRequestId,
         UdpPort,
@@ -615,7 +616,8 @@ impl IoBridge {
             let session_component = async_self.ctx.system().create(|| {
                 TcpSession::with_open_promise(
                     driver.clone(),
-                    request.events_to.clone(),
+                    TcpSessionEventTarget::from_recipient(request.events_to.clone()),
+                    async_self.egress_pool.clone(),
                     Some(promise),
                 )
             });
@@ -650,7 +652,12 @@ impl IoBridge {
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
             let listener_component = async_self.ctx.system().create(|| {
-                TcpListener::new(driver.clone(), request.incoming_to.clone(), Some(promise))
+                TcpListener::new(
+                    driver.clone(),
+                    request.incoming_to.clone(),
+                    async_self.egress_pool.clone(),
+                    Some(promise),
+                )
             });
             let listener_strong = listener_component
                 .actor_ref()

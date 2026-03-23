@@ -232,6 +232,21 @@ fn http_10_returns_version_not_supported() {
     let _output = server.kill_and_collect();
 }
 
+#[test]
+fn stdin_eof_shuts_the_server_down() {
+    let _guard = smoke_test_guard();
+    let server = spawn_http_server();
+    let _addr = server.wait_for_socket_addr("HTTP listening on ");
+
+    let output = server.close_stdin_and_wait();
+    assert!(
+        output.status.success(),
+        "http_server did not exit cleanly after stdin EOF\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 struct ParsedResponse {
     status_line: String,
     headers: HashMap<String, String>,
@@ -314,6 +329,35 @@ impl SpawnedHttpServer {
         let mut output = child
             .wait_with_output()
             .expect("collect killed child output");
+        output.stdout = self.join_stdout();
+        output.stderr = self.join_stderr();
+        output
+    }
+
+    fn close_stdin_and_wait(mut self) -> Output {
+        self.stdin.take();
+        let mut child = self.child.take().expect("live child process");
+        let deadline = Instant::now() + WAIT_TIMEOUT;
+        loop {
+            match child.try_wait().expect("poll child exit after stdin EOF") {
+                Some(_status) => break,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                None => {
+                    let _ = child.kill();
+                    let mut output = child
+                        .wait_with_output()
+                        .expect("collect killed child output after stdin EOF timeout");
+                    output.stdout = self.join_stdout();
+                    output.stderr = self.join_stderr();
+                    panic!(
+                        "timed out waiting for http_server to exit after stdin EOF\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        let mut output = child.wait_with_output().expect("collect child output");
         output.stdout = self.join_stdout();
         output.stderr = self.join_stderr();
         output

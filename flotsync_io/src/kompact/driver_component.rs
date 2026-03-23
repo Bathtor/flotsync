@@ -651,6 +651,26 @@ impl IoDriverComponent {
                     reason: SendFailureReason::DriverUnavailable,
                 },
             ),
+            TcpCommand::SendAndClose {
+                connection_id,
+                transmission_id,
+                ..
+            } => {
+                self.route_tcp_session_event(
+                    connection_id,
+                    TcpSessionDriverEvent::SendNack {
+                        transmission_id,
+                        reason: SendFailureReason::DriverUnavailable,
+                    },
+                );
+                self.route_tcp_session_event(
+                    connection_id,
+                    TcpSessionDriverEvent::Closed {
+                        reason: CloseReason::DriverShutdown,
+                    },
+                );
+                self.tcp_routes.remove(&connection_id);
+            }
             TcpCommand::Close { connection_id, .. } => {
                 self.route_tcp_session_event(
                     connection_id,

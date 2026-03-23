@@ -361,6 +361,22 @@ impl DriverRuntimeState {
                                     self.release_readiness(record.token);
                                 }
                             }
+                            TcpCommand::SendAndClose {
+                                connection_id,
+                                transmission_id,
+                                payload,
+                            } => {
+                                let closed_record = self.tcp.handle_send_and_close(
+                                    connection_id,
+                                    transmission_id,
+                                    payload,
+                                    registry,
+                                    event_sink,
+                                )?;
+                                if let Some(record) = closed_record {
+                                    self.release_readiness(record.token);
+                                }
+                            }
                             TcpCommand::Close {
                                 connection_id,
                                 abort,
@@ -597,6 +613,9 @@ impl From<&DriverCommand> for CommandTrace {
                 Self::TcpReject(*connection_id)
             }
             DriverCommand::Tcp(TcpCommand::Send { connection_id, .. }) => {
+                Self::TcpSend(*connection_id)
+            }
+            DriverCommand::Tcp(TcpCommand::SendAndClose { connection_id, .. }) => {
                 Self::TcpSend(*connection_id)
             }
             DriverCommand::Tcp(TcpCommand::CloseListener { listener_id }) => {

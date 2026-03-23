@@ -1,11 +1,12 @@
 //! Raw transport command and event surfaces shared by the driver core and adapter layers.
 
-use crate::pool::IoLease;
-use bytes::Bytes;
+use crate::pool::{IoCursor, IoLease};
+use bytes::{Buf, Bytes};
 use std::{
     fmt,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
 };
 
 /// Driver-local handle for a listening TCP socket.
@@ -81,6 +82,8 @@ pub enum IoPayload {
     Lease(IoLease),
     /// Uses owned byte storage for compatibility with callers outside the pool-based path.
     Bytes(Bytes),
+    /// Chains multiple payload fragments into one logical transmission.
+    Chain(Arc<[IoPayload]>),
 }
 
 impl IoPayload {
@@ -89,6 +92,7 @@ impl IoPayload {
         match self {
             Self::Lease(lease) => lease.len(),
             Self::Bytes(bytes) => bytes.len(),
+            Self::Chain(parts) => parts.iter().map(Self::len).sum(),
         }
     }
 
@@ -96,6 +100,247 @@ impl IoPayload {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Creates a payload from a static byte slice.
+    pub fn from_static(bytes: &'static [u8]) -> Self {
+        Self::Bytes(Bytes::from_static(bytes))
+    }
+
+    /// Chains multiple payload fragments into one logical payload.
+    pub fn chain(parts: impl IntoIterator<Item = IoPayload>) -> Self {
+        let mut normalized_parts = Vec::new();
+        for part in parts {
+            if part.is_empty() {
+                continue;
+            }
+            normalized_parts.push(part);
+        }
+        match normalized_parts.len() {
+            0 => Self::Bytes(Bytes::new()),
+            1 => normalized_parts
+                .pop()
+                .expect("single payload chain lost its only part"),
+            _ => Self::Chain(Arc::from(normalized_parts)),
+        }
+    }
+
+    /// Returns a sliced view over the readable payload bytes.
+    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
+        let payload_len = self.len();
+        if offset > payload_len || len > payload_len.saturating_sub(offset) {
+            return None;
+        }
+        if len == 0 {
+            return Some(Self::Bytes(Bytes::new()));
+        }
+        if offset == 0 && len == payload_len {
+            return Some(self);
+        }
+        match self {
+            Self::Lease(lease) => Some(Self::Lease(lease.try_slice(offset, len)?)),
+            Self::Bytes(bytes) => Some(Self::Bytes(bytes.slice(offset..offset + len))),
+            Self::Chain(parts) => {
+                let mut skipped = 0;
+                let mut remaining_len = len;
+                let mut sliced_parts = Vec::new();
+                for part in parts.iter() {
+                    if remaining_len == 0 {
+                        break;
+                    }
+
+                    let part_len = part.len();
+                    if skipped + part_len <= offset {
+                        skipped += part_len;
+                        continue;
+                    }
+
+                    let part_offset = offset.saturating_sub(skipped);
+                    let visible_len = remaining_len.min(part_len.saturating_sub(part_offset));
+                    sliced_parts.push(part.clone().try_slice(part_offset, visible_len)?);
+                    remaining_len -= visible_len;
+                    skipped += part_len;
+                }
+                if remaining_len != 0 {
+                    return None;
+                }
+                Some(Self::chain(sliced_parts))
+            }
+        }
+    }
+
+    /// Creates a fresh cursor over the full readable payload.
+    pub fn cursor(&self) -> IoPayloadCursor {
+        IoPayloadCursor::new(self)
+    }
+
+    /// Creates a byte clone of the full readable payload contents.
+    pub fn create_byte_clone(&self) -> Bytes {
+        if self.is_empty() {
+            return Bytes::new();
+        }
+
+        let mut bytes = Vec::with_capacity(self.len());
+        let mut cursor = self.cursor();
+        while cursor.has_remaining() {
+            let chunk = cursor.chunk();
+            let chunk_len = chunk.len();
+            debug_assert!(
+                chunk_len > 0,
+                "IoPayload cursor produced an empty chunk while bytes remained"
+            );
+            bytes.extend_from_slice(chunk);
+            cursor.advance(chunk_len);
+        }
+        Bytes::from(bytes)
+    }
+}
+
+impl From<IoLease> for IoPayload {
+    fn from(lease: IoLease) -> Self {
+        Self::Lease(lease)
+    }
+}
+
+impl From<Bytes> for IoPayload {
+    fn from(bytes: Bytes) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum IoPayloadCursorPart {
+    Lease(IoCursor),
+    Bytes(Bytes),
+}
+
+impl IoPayloadCursorPart {
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Lease(cursor) => cursor.remaining(),
+            Self::Bytes(bytes) => bytes.remaining(),
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        match self {
+            Self::Lease(cursor) => cursor.chunk(),
+            Self::Bytes(bytes) => bytes.chunk(),
+        }
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        match self {
+            Self::Lease(cursor) => cursor.advance(cnt),
+            Self::Bytes(bytes) => bytes.advance(cnt),
+        }
+    }
+}
+
+/// Cursor over one [`IoPayload`] that hides the underlying payload representation.
+#[derive(Clone, Debug)]
+pub struct IoPayloadCursor {
+    parts: Vec<IoPayloadCursorPart>,
+    part_index: usize,
+    remaining: usize,
+}
+
+impl IoPayloadCursor {
+    fn new(payload: &IoPayload) -> Self {
+        let mut parts = Vec::new();
+        collect_cursor_parts(payload, 0, payload.len(), &mut parts)
+            .expect("full payload range must always be valid");
+        Self {
+            remaining: parts.iter().map(IoPayloadCursorPart::remaining).sum(),
+            parts,
+            part_index: 0,
+        }
+    }
+}
+
+impl Buf for IoPayloadCursor {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        if self.remaining == 0 {
+            return &[];
+        }
+        self.parts[self.part_index].chunk()
+    }
+
+    fn advance(&mut self, mut cnt: usize) {
+        assert!(
+            cnt <= self.remaining,
+            "advanced past end of IoPayloadCursor"
+        );
+
+        while cnt > 0 {
+            let part_remaining = self.parts[self.part_index].remaining();
+            if cnt < part_remaining {
+                self.parts[self.part_index].advance(cnt);
+                self.remaining -= cnt;
+                return;
+            }
+
+            self.parts[self.part_index].advance(part_remaining);
+            self.remaining -= part_remaining;
+            cnt -= part_remaining;
+            self.part_index += 1;
+        }
+    }
+}
+
+fn collect_cursor_parts(
+    payload: &IoPayload,
+    offset: usize,
+    len: usize,
+    out: &mut Vec<IoPayloadCursorPart>,
+) -> Option<()> {
+    let payload_len = payload.len();
+    if offset > payload_len || len > payload_len.saturating_sub(offset) {
+        return None;
+    }
+    if len == 0 {
+        return Some(());
+    }
+
+    match payload {
+        IoPayload::Lease(lease) => {
+            let lease = lease.clone().try_slice(offset, len)?;
+            out.push(IoPayloadCursorPart::Lease(lease.cursor()));
+        }
+        IoPayload::Bytes(bytes) => {
+            out.push(IoPayloadCursorPart::Bytes(
+                bytes.slice(offset..offset + len),
+            ));
+        }
+        IoPayload::Chain(parts) => {
+            let mut skipped = 0;
+            let mut remaining_len = len;
+            for part in parts.iter() {
+                if remaining_len == 0 {
+                    break;
+                }
+
+                let part_len = part.len();
+                if skipped + part_len <= offset {
+                    skipped += part_len;
+                    continue;
+                }
+
+                let part_offset = offset.saturating_sub(skipped);
+                let visible_len = remaining_len.min(part_len.saturating_sub(part_offset));
+                collect_cursor_parts(part, part_offset, visible_len, out)?;
+                remaining_len -= visible_len;
+                skipped += part_len;
+            }
+            if remaining_len != 0 {
+                return None;
+            }
+        }
+    }
+    Some(())
 }
 
 /// Explains why a requested send could not be accepted or completed.
@@ -227,6 +472,12 @@ pub enum TcpCommand {
     RejectAccepted { connection_id: ConnectionId },
     /// Requests transmission of raw payload bytes on an established TCP connection.
     Send {
+        connection_id: ConnectionId,
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+    },
+    /// Requests transmission of raw payload bytes and then a graceful close once the send drains.
+    SendAndClose {
         connection_id: ConnectionId,
         transmission_id: TransmissionId,
         payload: IoPayload,

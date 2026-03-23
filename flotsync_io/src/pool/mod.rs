@@ -279,12 +279,18 @@ impl fmt::Debug for PoolAvailabilityNotifier {
 pub struct IoLease {
     /* `IoLease` deliberately hides whether the payload comes from a `flotsync_io` pool or from an externally produced Kompact buffer. */
     inner: IoLeaseInner,
+    offset: usize,
+    len: usize,
 }
 
 impl IoLease {
     fn from_pooled(segments: Vec<LeaseSegment>, recycler: LeaseRecycler) -> Self {
+        let payload = Arc::new(PooledPayload::new(segments, recycler));
+        let len = payload.len();
         Self {
-            inner: IoLeaseInner::Pooled(Arc::new(PooledPayload::new(segments, recycler))),
+            inner: IoLeaseInner::Pooled(payload),
+            offset: 0,
+            len,
         }
     }
 
@@ -293,8 +299,12 @@ impl IoLease {
     /// The mutable `ChunkLease` is converted into an immutable [`ChunkRef`] immediately so the
     /// shared payload can be cloned cheaply and each consumer can create an independent cursor.
     pub fn from_chunk_lease(lease: ChunkLease) -> Self {
+        let chunk_ref = lease.into_chunk_ref();
+        let len = chunk_ref.remaining();
         Self {
-            inner: IoLeaseInner::External(lease.into_chunk_ref()),
+            inner: IoLeaseInner::External(chunk_ref),
+            offset: 0,
+            len,
         }
     }
 
@@ -303,17 +313,17 @@ impl IoLease {
     /// The wrapped payload starts at the `ChunkRef`'s current readable position and future cursors
     /// will all see that same readable region.
     pub fn from_chunk_ref(chunk_ref: ChunkRef) -> Self {
+        let len = chunk_ref.remaining();
         Self {
             inner: IoLeaseInner::External(chunk_ref),
+            offset: 0,
+            len,
         }
     }
 
     /// Returns the total readable payload length in bytes.
     pub fn len(&self) -> usize {
-        match &self.inner {
-            IoLeaseInner::External(chunk_ref) => chunk_ref.remaining(),
-            IoLeaseInner::Pooled(payload) => payload.len(),
-        }
+        self.len
     }
 
     /// Returns whether the payload is empty.
@@ -326,25 +336,52 @@ impl IoLease {
     /// Each cursor advances independently, so the same payload can be read many times before the
     /// shared memory is finally released.
     pub fn cursor(&self) -> IoCursor {
-        match &self.inner {
-            IoLeaseInner::External(chunk_ref) => IoCursor {
-                inner: IoCursorInner::External(chunk_ref.clone()),
-            },
-            IoLeaseInner::Pooled(payload) => IoCursor {
-                inner: IoCursorInner::Pooled(PooledCursor::new(Arc::clone(payload))),
-            },
+        let mut inner = match &self.inner {
+            IoLeaseInner::External(chunk_ref) => IoCursorInner::External(chunk_ref.clone()),
+            IoLeaseInner::Pooled(payload) => {
+                IoCursorInner::Pooled(PooledCursor::new(Arc::clone(payload)))
+            }
+        };
+        if self.offset > 0 {
+            inner.advance(self.offset);
         }
+        IoCursor {
+            inner,
+            remaining: self.len,
+        }
+    }
+
+    /// Returns one sliced view over the readable payload bytes.
+    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
+        if offset > self.len || len > self.len.saturating_sub(offset) {
+            return None;
+        }
+        Some(Self {
+            inner: self.inner,
+            offset: self.offset + offset,
+            len,
+        })
     }
 
     /// Creates a byte-clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
-        match &self.inner {
-            IoLeaseInner::External(chunk_ref) => {
-                let mut cursor = chunk_ref.clone();
-                cursor.copy_to_bytes(cursor.remaining())
-            }
-            IoLeaseInner::Pooled(payload) => payload.create_byte_clone(),
+        if self.is_empty() {
+            return Bytes::new();
         }
+
+        let mut bytes = Vec::with_capacity(self.len());
+        let mut cursor = self.cursor();
+        while cursor.has_remaining() {
+            let chunk = cursor.chunk();
+            let chunk_len = chunk.len();
+            debug_assert!(
+                chunk_len > 0,
+                "IoLease cursor produced an empty chunk while bytes remained"
+            );
+            bytes.extend_from_slice(chunk);
+            cursor.advance(chunk_len);
+        }
+        Bytes::from(bytes)
     }
 }
 
@@ -373,6 +410,7 @@ impl fmt::Debug for IoLease {
 #[derive(Clone)]
 pub struct IoCursor {
     inner: IoCursorInner,
+    remaining: usize,
 }
 
 impl fmt::Debug for IoCursor {
@@ -385,24 +423,27 @@ impl fmt::Debug for IoCursor {
 
 impl Buf for IoCursor {
     fn remaining(&self) -> usize {
-        match &self.inner {
-            IoCursorInner::External(chunk_ref) => chunk_ref.remaining(),
-            IoCursorInner::Pooled(cursor) => cursor.remaining(),
-        }
+        self.remaining
     }
 
     fn chunk(&self) -> &[u8] {
-        match &self.inner {
+        if self.remaining == 0 {
+            return &[];
+        }
+        let chunk = match &self.inner {
             IoCursorInner::External(chunk_ref) => chunk_ref.chunk(),
             IoCursorInner::Pooled(cursor) => cursor.chunk(),
-        }
+        };
+        &chunk[..self.remaining.min(chunk.len())]
     }
 
     fn advance(&mut self, cnt: usize) {
+        assert!(cnt <= self.remaining, "advanced past end of IoCursor");
         match &mut self.inner {
             IoCursorInner::External(chunk_ref) => chunk_ref.advance(cnt),
             IoCursorInner::Pooled(cursor) => cursor.advance(cnt),
         }
+        self.remaining -= cnt;
     }
 }
 
@@ -416,6 +457,15 @@ enum IoLeaseInner {
 enum IoCursorInner {
     External(ChunkRef),
     Pooled(PooledCursor),
+}
+
+impl IoCursorInner {
+    fn advance(&mut self, cnt: usize) {
+        match self {
+            Self::External(chunk_ref) => chunk_ref.advance(cnt),
+            Self::Pooled(cursor) => cursor.advance(cnt),
+        }
+    }
 }
 
 /// Shared immutable pooled payload representation.
@@ -442,12 +492,8 @@ impl PooledPayload {
         self.len
     }
 
-    fn create_byte_clone(&self) -> Bytes {
-        let mut bytes = Vec::with_capacity(self.len);
-        for segment in &self.segments {
-            bytes.extend_from_slice(&segment.chunk[..segment.written_len]);
-        }
-        Bytes::from(bytes)
+    fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 }
 
@@ -483,10 +529,6 @@ impl PooledCursor {
             segment_offset: 0,
             remaining,
         }
-    }
-
-    fn remaining(&self) -> usize {
-        self.remaining
     }
 
     fn chunk(&self) -> &[u8] {
@@ -536,6 +578,24 @@ impl LeaseRecycler {
         match self {
             Self::Ingress(inner) => IngressPoolState::return_chunks_from_weak(inner, chunks),
             Self::Egress(inner) => EgressPoolState::return_chunks_from_weak(inner, chunks),
+        }
+    }
+
+    fn release_live_chunks(&self, chunk_count: usize) -> Result<()> {
+        match self {
+            Self::Ingress(inner) => {
+                IngressPoolState::release_live_chunks_from_weak(inner, chunk_count)
+            }
+            Self::Egress(inner) => {
+                EgressPoolState::release_live_chunks_from_weak(inner, chunk_count)
+            }
+        }
+    }
+
+    fn is_owned_by_egress(&self, inner: &Arc<Mutex<EgressPoolState>>) -> bool {
+        match self {
+            Self::Ingress(_) => false,
+            Self::Egress(current) => current.ptr_eq(&Arc::downgrade(inner)),
         }
     }
 }
@@ -602,6 +662,27 @@ impl ChunkPoolState {
 
     fn return_chunks(&mut self, chunks: impl IntoIterator<Item = PooledChunk>) {
         self.available.extend(chunks);
+    }
+
+    fn can_import_live_chunks(&self, chunk_count: usize) -> bool {
+        self.allocated + chunk_count <= self.config.max_chunk_count
+    }
+
+    fn import_live_chunks(&mut self, chunk_count: usize) -> bool {
+        if !self.can_import_live_chunks(chunk_count) {
+            return false;
+        }
+        self.allocated += chunk_count;
+        true
+    }
+
+    fn release_live_chunks(&mut self, chunk_count: usize) {
+        let live_chunks = self.allocated.saturating_sub(self.available.len());
+        assert!(
+            chunk_count <= live_chunks,
+            "released more live chunks than the pool currently owns"
+        );
+        self.allocated -= chunk_count;
     }
 }
 
@@ -790,6 +871,98 @@ mod tests {
             second_lease.create_byte_clone(),
             Bytes::from_static(b"next")
         );
+    }
+
+    #[test]
+    fn zero_byte_egress_write_returns_chunks_without_leaking_capacity() {
+        init_test_logger();
+
+        let config = IoPoolConfig {
+            max_chunk_count: 1,
+            ..tiny_config()
+        };
+        let pool = EgressPool::new(config, default_runtime_logger());
+
+        let first =
+            wait_for_request(pool.reserve(64).expect("reserve first")).expect("first ready");
+        let ((), lease) = first
+            .write_with_optional(|_writer| Ok(()))
+            .expect("zero-byte write succeeds");
+        assert!(lease.is_none());
+
+        let second =
+            wait_for_request(pool.reserve(64).expect("reserve second")).expect("second ready");
+        drop(second);
+    }
+
+    #[test]
+    fn adopted_ingress_lease_releases_ingress_capacity_and_consumes_egress_capacity() {
+        init_test_logger();
+
+        let config = IoBufferConfig {
+            ingress: IoPoolConfig {
+                chunk_size: 128,
+                initial_chunk_count: 2,
+                max_chunk_count: 2,
+                encode_buf_min_free_space: 8,
+            },
+            egress: IoPoolConfig {
+                chunk_size: 128,
+                initial_chunk_count: 0,
+                max_chunk_count: 2,
+                encode_buf_min_free_space: 8,
+            },
+        };
+        let pools = IoBufferPools::new(config).expect("create shared pools");
+
+        let held_ingress = pools
+            .ingress()
+            .try_acquire()
+            .expect("lock ingress")
+            .expect("acquire held ingress chunk");
+        let mut ingress = pools
+            .ingress()
+            .try_acquire()
+            .expect("lock ingress")
+            .expect("acquire ingress chunk");
+        ingress.writable()[..4].copy_from_slice(b"echo");
+        let lease = ingress.commit(4).expect("commit ingress lease");
+
+        assert!(
+            pools
+                .ingress()
+                .try_acquire()
+                .expect("lock ingress")
+                .is_none()
+        );
+
+        let adopted = pools
+            .egress()
+            .adopt_lease(lease)
+            .expect("adopt ingress lease");
+
+        assert!(
+            pools
+                .ingress()
+                .try_acquire()
+                .expect("lock ingress")
+                .is_some()
+        );
+
+        let mut pending = pools
+            .egress()
+            .reserve(256)
+            .expect("reserve queued egress waiter");
+        assert!(pending.try_receive().expect("poll queued waiter").is_none());
+
+        drop(adopted);
+        drop(held_ingress);
+
+        let reservation = wait_for_request(pending).expect("ready after adopted lease drop");
+        let leased = reservation
+            .copy_bytes(b"next")
+            .expect("write next egress payload");
+        assert_eq!(leased.create_byte_clone(), Bytes::from_static(b"next"));
     }
 
     #[test]

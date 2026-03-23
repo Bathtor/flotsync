@@ -836,29 +836,24 @@ fn send_udp_payload(
     target: UdpSendTarget,
     udp_send_scratch: &mut [u8],
 ) -> io::Result<usize> {
-    match payload {
-        IoPayload::Bytes(bytes) => send_udp_slice(socket, bytes.as_ref(), target),
-        IoPayload::Lease(lease) => {
-            let mut cursor = lease.cursor();
-            if cursor.chunk().len() == cursor.remaining() {
-                return send_udp_slice(socket, cursor.chunk(), target);
-            }
-
-            // mio UDP sends only accept a single contiguous slice, so multi-segment payloads are
-            // linearised into a fixed driver-owned scratch buffer before the syscall.
-            let mut written = 0;
-            while cursor.remaining() > 0 {
-                let chunk = cursor.chunk();
-                let chunk_len = chunk.len();
-                let next_written = written + chunk_len;
-                debug_assert!(next_written <= udp_send_scratch.len());
-                udp_send_scratch[written..next_written].copy_from_slice(chunk);
-                cursor.advance(chunk_len);
-                written = next_written;
-            }
-            send_udp_slice(socket, &udp_send_scratch[..written], target)
-        }
+    let mut cursor = payload.cursor();
+    if cursor.chunk().len() == cursor.remaining() {
+        return send_udp_slice(socket, cursor.chunk(), target);
     }
+
+    // mio UDP sends only accept a single contiguous slice, so multi-segment payloads are
+    // linearised into a fixed driver-owned scratch buffer before the syscall.
+    let mut written = 0;
+    while cursor.has_remaining() {
+        let chunk = cursor.chunk();
+        let chunk_len = chunk.len();
+        let next_written = written + chunk_len;
+        debug_assert!(next_written <= udp_send_scratch.len());
+        udp_send_scratch[written..next_written].copy_from_slice(chunk);
+        cursor.advance(chunk_len);
+        written = next_written;
+    }
+    send_udp_slice(socket, &udp_send_scratch[..written], target)
 }
 
 fn send_udp_slice(
@@ -943,10 +938,7 @@ mod tests {
     }
 
     fn payload_bytes(payload: IoPayload) -> Bytes {
-        match payload {
-            IoPayload::Lease(lease) => lease.create_byte_clone(),
-            IoPayload::Bytes(bytes) => bytes,
-        }
+        payload.create_byte_clone()
     }
 
     fn bind_udp_socket_at(

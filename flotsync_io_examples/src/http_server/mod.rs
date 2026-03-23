@@ -5,6 +5,9 @@ use crate::{
 use bytes::{Buf, BufMut};
 use clap::Parser;
 use flotsync_io::prelude::{
+    BoundedCollector,
+    CloseReason,
+    CollectUntil,
     EgressPool,
     IoBridgeHandle,
     IoBufWriter,
@@ -16,7 +19,6 @@ use flotsync_io::prelude::{
     TcpListenerRequest,
     TcpSessionEvent,
     TcpSessionRef,
-    TcpSessionRequest,
     TransmissionId,
 };
 use http::{Method, StatusCode};
@@ -216,11 +218,10 @@ impl HttpListenerComponent {
     }
 
     fn spawn_connection(&mut self, peer_addr: SocketAddr, pending: PendingTcpSession) {
-        let egress_pool = self.bridge_handle.egress_pool().clone();
         let connection_component = self
             .ctx
             .system()
-            .create(|| HttpConnectionComponent::new(peer_addr, pending, egress_pool));
+            .create(|| HttpConnectionComponent::new(peer_addr, pending));
         self.ctx.system().start(&connection_component);
     }
 
@@ -307,7 +308,7 @@ impl HttpSessionState {
     fn request_close(&mut self, abort: bool) -> bool {
         match std::mem::replace(self, Self::Closed) {
             Self::Ready(session) => {
-                session.tell(TcpSessionRequest::Close { abort });
+                session.close(abort);
                 *self = Self::Closing(session);
                 true
             }
@@ -373,7 +374,6 @@ struct PayloadSlice {
 enum PayloadConsumeOutcome {
     NeedMore,
     Respond(HttpResponseSpec),
-    Fatal(String),
 }
 
 /// Walks one payload cursor until the HTTP parser either needs more bytes, chooses a response, or
@@ -400,7 +400,7 @@ where
         payload_offset += chunk_len;
         match &outcome {
             PayloadConsumeOutcome::NeedMore => {}
-            PayloadConsumeOutcome::Respond(_) | PayloadConsumeOutcome::Fatal(_) => {
+            PayloadConsumeOutcome::Respond(_) => {
                 return outcome;
             }
         }
@@ -419,35 +419,29 @@ struct HttpConnectionComponent {
     ctx: ComponentContext<Self>,
     peer_addr: SocketAddr,
     pending: Option<PendingTcpSession>,
-    egress_pool: EgressPool,
     session_state: HttpSessionState,
     retained_input: Vec<IoPayload>,
-    header_buffer: Vec<u8>,
+    header_collector: BoundedCollector,
     request: Option<ParsedRequest>,
     body_slices: Vec<PayloadSlice>,
     received_body_len: usize,
     response_started: bool,
-    response_sent: bool,
-    response_in_flight: Option<TransmissionId>,
     next_transmission_id: TransmissionId,
 }
 
 impl HttpConnectionComponent {
-    fn new(peer_addr: SocketAddr, pending: PendingTcpSession, egress_pool: EgressPool) -> Self {
+    fn new(peer_addr: SocketAddr, pending: PendingTcpSession) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             peer_addr,
             pending: Some(pending),
-            egress_pool,
             session_state: HttpSessionState::Accepting,
             retained_input: Vec::new(),
-            header_buffer: Vec::new(),
+            header_collector: BoundedCollector::new(MAX_HEADER_BYTES),
             request: None,
             body_slices: Vec::new(),
             received_body_len: 0,
             response_started: false,
-            response_sent: false,
-            response_in_flight: None,
             next_transmission_id: TransmissionId::ONE,
         }
     }
@@ -456,11 +450,11 @@ impl HttpConnectionComponent {
         match event {
             TcpSessionEvent::Received { payload } => self.handle_received_payload(payload),
             TcpSessionEvent::SendAck { transmission_id } => {
-                if self.response_in_flight == Some(transmission_id) {
-                    self.response_in_flight = None;
-                    self.response_sent = true;
-                    self.session_state.request_close(false);
-                }
+                log::debug!(
+                    "HTTP response send {} drained for {}",
+                    transmission_id,
+                    self.peer_addr
+                );
                 Handled::Ok
             }
             TcpSessionEvent::SendNack {
@@ -488,7 +482,7 @@ impl HttpConnectionComponent {
             }
             TcpSessionEvent::Closed { reason } => {
                 self.session_state.mark_closed();
-                if self.response_sent {
+                if self.response_started && reason == CloseReason::Graceful {
                     return Handled::DieNow;
                 }
                 self.fail_and_die(format!(
@@ -501,11 +495,10 @@ impl HttpConnectionComponent {
 
     fn handle_received_payload(&mut self, payload: IoPayload) -> Handled {
         if self.response_started {
-            log::debug!(
-                "HTTP session for {} ignored extra bytes after committing the response",
+            return self.fail_and_die(format!(
+                "HTTP session for {} received bytes after committing the single supported response",
                 self.peer_addr
-            );
-            return Handled::Ok;
+            ));
         }
 
         let payload_index = self.retained_input.len();
@@ -517,7 +510,6 @@ impl HttpConnectionComponent {
                 self.retained_input.push(payload);
                 self.start_response(response);
             }
-            PayloadConsumeOutcome::Fatal(message) => return self.fail_and_die(message),
         }
         Handled::Ok
     }
@@ -527,18 +519,9 @@ impl HttpConnectionComponent {
         payload_index: usize,
         payload: &IoPayload,
     ) -> PayloadConsumeOutcome {
-        match payload {
-            IoPayload::Bytes(bytes) => self.consume_payload_chunk(payload_index, 0, bytes.as_ref()),
-            IoPayload::Lease(lease) => {
-                consume_payload_cursor(lease.cursor(), |payload_offset, chunk| {
-                    self.consume_payload_chunk(payload_index, payload_offset, chunk)
-                })
-            }
-            _ => PayloadConsumeOutcome::Fatal(format!(
-                "HTTP session for {} received an unsupported IoPayload variant",
-                self.peer_addr
-            )),
-        }
+        consume_payload_cursor(payload.cursor(), |payload_offset, chunk| {
+            self.consume_payload_chunk(payload_index, payload_offset, chunk)
+        })
     }
 
     fn consume_payload_chunk(
@@ -551,49 +534,28 @@ impl HttpConnectionComponent {
         let mut body_bytes = bytes;
 
         if self.request.is_none() {
-            match find_header_end(bytes, &self.header_buffer) {
-                Some(0) => {
-                    return PayloadConsumeOutcome::Fatal(format!(
-                        "HTTP session for {} reached an impossible header-parse state",
-                        self.peer_addr
+            match self.header_collector.push_until(bytes, b"\r\n\r\n") {
+                CollectUntil::NeedMore => return PayloadConsumeOutcome::NeedMore,
+                CollectUntil::LimitExceeded => {
+                    return PayloadConsumeOutcome::Respond(bad_request_response(
+                        "request headers too large\n",
                     ));
                 }
-                Some(header_bytes_in_chunk) => {
-                    let total_header_bytes = self.header_buffer.len() + header_bytes_in_chunk;
-                    if total_header_bytes > MAX_HEADER_BYTES {
-                        return PayloadConsumeOutcome::Respond(bad_request_response(
-                            "request headers too large\n",
-                        ));
-                    }
-                    self.header_buffer
-                        .extend_from_slice(&bytes[..header_bytes_in_chunk]);
-                    let request = match parse_complete_request_head(&self.header_buffer) {
+                CollectUntil::Complete {
+                    frame,
+                    trailing_offset,
+                } => {
+                    let request = match parse_complete_request_head(frame) {
                         Ok(request) => request,
                         Err(response) => {
-                            self.header_buffer.clear();
+                            self.header_collector.clear();
                             return PayloadConsumeOutcome::Respond(response);
                         }
                     };
-                    self.header_buffer.clear();
+                    self.header_collector.clear();
                     self.request = Some(request);
-                    body_offset += header_bytes_in_chunk;
-                    body_bytes = &bytes[header_bytes_in_chunk..];
-                }
-                None => {
-                    let remaining_header_budget =
-                        MAX_HEADER_BYTES.saturating_sub(self.header_buffer.len());
-                    if bytes.len() > remaining_header_budget {
-                        return PayloadConsumeOutcome::Respond(bad_request_response(
-                            "request headers too large\n",
-                        ));
-                    }
-                    self.header_buffer.extend_from_slice(bytes);
-                    if self.header_buffer.len() == MAX_HEADER_BYTES {
-                        return PayloadConsumeOutcome::Respond(bad_request_response(
-                            "request headers too large\n",
-                        ));
-                    }
-                    return PayloadConsumeOutcome::NeedMore;
+                    body_offset += trailing_offset;
+                    body_bytes = &bytes[trailing_offset..];
                 }
             }
         }
@@ -616,7 +578,7 @@ impl HttpConnectionComponent {
             .saturating_sub(self.received_body_len);
         let to_take = remaining_body_bytes.min(bytes.len());
         if to_take > 0 {
-            self.body_slices.push(PayloadSlice {
+            self.append_body_slice(PayloadSlice {
                 payload_index,
                 offset: payload_offset,
                 len: to_take,
@@ -630,6 +592,17 @@ impl HttpConnectionComponent {
         PayloadConsumeOutcome::Respond(build_response(request))
     }
 
+    fn append_body_slice(&mut self, next: PayloadSlice) {
+        if let Some(previous) = self.body_slices.last_mut() {
+            let previous_end = previous.offset + previous.len;
+            if previous.payload_index == next.payload_index && previous_end == next.offset {
+                previous.len += next.len;
+                return;
+            }
+        }
+        self.body_slices.push(next);
+    }
+
     fn start_response(&mut self, response: HttpResponseSpec) {
         let Some(session) = self.session_state.session().cloned() else {
             let _ = self.fail_and_die(format!(
@@ -640,27 +613,26 @@ impl HttpConnectionComponent {
         };
         let encode_plan = ResponseEncodePlan {
             response,
-            retained_input: self.retained_input.clone(),
-            body_slices: self.body_slices.clone(),
+            retained_input: std::mem::take(&mut self.retained_input)
+                .into_iter()
+                .map(Some)
+                .collect(),
+            body_slices: std::mem::take(&mut self.body_slices),
         };
-        let egress_pool = self.egress_pool.clone();
         let transmission_id = self.next_transmission_id.take_next();
         let peer_addr = self.peer_addr;
         self.response_started = true;
         self.spawn_local(move |mut async_self| async move {
-            let payload = match encode_response_payload(egress_pool, encode_plan).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return async_self.fail_and_die(format!(
-                        "failed to encode HTTP response for {peer_addr}: {error}",
-                    ));
-                }
-            };
-            session.tell(TcpSessionRequest::Send {
-                transmission_id,
-                payload,
-            });
-            async_self.response_in_flight = Some(transmission_id);
+            let payload =
+                match encode_response_payload(session.egress_pool().clone(), encode_plan).await {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return async_self.fail_and_die(format!(
+                            "failed to encode HTTP response for {peer_addr}: {error}",
+                        ));
+                    }
+                };
+            session.send_and_close(transmission_id, payload);
             Handled::Ok
         });
     }
@@ -679,7 +651,7 @@ impl ComponentLifecycle for HttpConnectionComponent {
             .take()
             .expect("HTTP connection component must start with a pending session");
         Handled::block_on(self, move |mut async_self| async move {
-            let accept_reply = match pending.accept(async_self.actor_ref().recipient()).await {
+            let accept_reply = match pending.accept(async_self.actor_ref()).await {
                 Ok(reply) => reply,
                 Err(error) => {
                     return async_self.fail_and_die(format!(
@@ -721,7 +693,7 @@ type HttpParseResult<T> = std::result::Result<T, HttpResponseSpec>;
 #[derive(Clone, Debug)]
 struct ResponseEncodePlan {
     response: HttpResponseSpec,
-    retained_input: Vec<IoPayload>,
+    retained_input: Vec<Option<IoPayload>>,
     body_slices: Vec<PayloadSlice>,
 }
 
@@ -909,46 +881,31 @@ fn simple_text_response(
     }
 }
 
-fn find_header_end(chunk: &[u8], buffered_header: &[u8]) -> Option<usize> {
-    let prefix = &buffered_header[buffered_header.len().saturating_sub(3)..];
-    let combined_len = prefix.len() + chunk.len();
-    if combined_len < 4 {
-        return None;
-    }
-
-    for start in 0..=(combined_len - 4) {
-        if combined_byte(prefix, chunk, start) == b'\r'
-            && combined_byte(prefix, chunk, start + 1) == b'\n'
-            && combined_byte(prefix, chunk, start + 2) == b'\r'
-            && combined_byte(prefix, chunk, start + 3) == b'\n'
-        {
-            let end = start + 4;
-            return Some(end.saturating_sub(prefix.len()));
-        }
-    }
-    None
-}
-
-fn combined_byte(prefix: &[u8], chunk: &[u8], index: usize) -> u8 {
-    if index < prefix.len() {
-        prefix[index]
-    } else {
-        chunk[index - prefix.len()]
-    }
-}
-
 async fn encode_response_payload(
     egress_pool: EgressPool,
-    plan: ResponseEncodePlan,
+    mut plan: ResponseEncodePlan,
 ) -> flotsync_io::errors::Result<IoPayload> {
-    let reserved_capacity = reserved_response_capacity(&plan.response);
+    let reserved_capacity = reserved_response_header_capacity(&plan.response);
     let reservation_request = egress_pool.reserve(reserved_capacity)?;
     let reservation = reservation_request.await?;
     let (_, lease) = reservation.write_with(|writer| {
-        write_response(writer, &plan);
+        write_response_head(writer, &plan.response);
         Ok(())
     })?;
-    Ok(IoPayload::Lease(lease))
+    let header = IoPayload::Lease(lease);
+    let body = match plan.response.body {
+        HttpResponseBody::Static(body) if plan.response.include_body => {
+            Some(IoPayload::from_static(body))
+        }
+        HttpResponseBody::EchoedRequestBody if plan.response.include_body => {
+            Some(build_echo_body_payload(&egress_pool, &mut plan)?)
+        }
+        HttpResponseBody::Static(_) | HttpResponseBody::EchoedRequestBody => None,
+    };
+    Ok(match body {
+        Some(body) => IoPayload::chain([header, body]),
+        None => header,
+    })
 }
 
 const BASE_RESPONSE_HEADER_RESERVATION: usize =
@@ -962,21 +919,16 @@ const ALLOW_HEADER_RESERVATION: usize = b"Allow: \r\n".len();
 /// Proposal A responses are tiny, so readability is more important here than exact byte math.
 /// `write_with` only publishes the written prefix and returns unused chunks to the pool, so a
 /// small over-reservation is acceptable.
-fn reserved_response_capacity(response: &HttpResponseSpec) -> usize {
-    let mut reserved = BASE_RESPONSE_HEADER_RESERVATION
-        + MAX_CONTENT_LENGTH_DIGITS
-        + response.content_type.len();
+fn reserved_response_header_capacity(response: &HttpResponseSpec) -> usize {
+    let mut reserved =
+        BASE_RESPONSE_HEADER_RESERVATION + MAX_CONTENT_LENGTH_DIGITS + response.content_type.len();
     if let Some(allow) = response.allow {
         reserved += ALLOW_HEADER_RESERVATION + allow.len();
-    }
-    if response.include_body {
-        reserved += response.content_length;
     }
     reserved
 }
 
-fn write_response(writer: &mut IoBufWriter, plan: &ResponseEncodePlan) {
-    let response = &plan.response;
+fn write_response_head(writer: &mut IoBufWriter, response: &HttpResponseSpec) {
     let mut content_length_buffer = ItoaBuffer::new();
     let content_length_text = content_length_buffer.format(response.content_length);
     let reason = response.status.canonical_reason().unwrap_or("Unknown");
@@ -996,39 +948,35 @@ fn write_response(writer: &mut IoBufWriter, plan: &ResponseEncodePlan) {
         writer.put_slice(b"\r\n");
     }
     writer.put_slice(b"\r\n");
-
-    if !response.include_body {
-        return;
-    }
-
-    match response.body {
-        HttpResponseBody::Static(body) => writer.put_slice(body),
-        HttpResponseBody::EchoedRequestBody => {
-            for slice in &plan.body_slices {
-                let payload = &plan.retained_input[slice.payload_index];
-                write_payload_slice(writer, payload, slice.offset, slice.len);
-            }
-        }
-    }
 }
 
-fn write_payload_slice(writer: &mut IoBufWriter, payload: &IoPayload, offset: usize, len: usize) {
-    match payload {
-        IoPayload::Bytes(bytes) => writer.put_slice(&bytes[offset..offset + len]),
-        IoPayload::Lease(lease) => {
-            let mut cursor = lease.cursor();
-            cursor.advance(offset);
-            let mut remaining = len;
-            while remaining > 0 {
-                let chunk = cursor.chunk();
-                let to_copy = remaining.min(chunk.len());
-                writer.put_slice(&chunk[..to_copy]);
-                cursor.advance(to_copy);
-                remaining -= to_copy;
-            }
-        }
-        _ => unreachable!("unsupported IoPayload variant"),
+fn build_echo_body_payload(
+    egress_pool: &EgressPool,
+    plan: &mut ResponseEncodePlan,
+) -> flotsync_io::errors::Result<IoPayload> {
+    let mut parts = Vec::with_capacity(plan.body_slices.len());
+    for slice in &plan.body_slices {
+        let payload = plan.retained_input[slice.payload_index]
+            .take()
+            .unwrap_or_else(|| {
+                panic!(
+                    "echo response reused retained payload {} unexpectedly",
+                    slice.payload_index
+                )
+            });
+        let payload = payload
+            .try_slice(slice.offset, slice.len)
+            .unwrap_or_else(|| {
+                panic!(
+                    "echo response slice {}..{} fell outside retained payload {}",
+                    slice.offset,
+                    slice.offset + slice.len,
+                    slice.payload_index
+                )
+            });
+        parts.push(egress_pool.adopt_payload(payload)?);
     }
+    Ok(IoPayload::chain(parts))
 }
 
 #[cfg(test)]

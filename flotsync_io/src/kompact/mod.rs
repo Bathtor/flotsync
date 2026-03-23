@@ -27,6 +27,7 @@ pub use types::{
     TcpListenerRef,
     TcpListenerRequest,
     TcpSessionEvent,
+    TcpSessionEventTarget,
     TcpSessionRef,
     TcpSessionRequest,
     UdpIndication,
@@ -34,6 +35,7 @@ pub use types::{
     UdpPort,
     UdpRequest,
     UdpSendResult,
+    tagged_tcp_session_event_target,
 };
 
 #[cfg(test)]

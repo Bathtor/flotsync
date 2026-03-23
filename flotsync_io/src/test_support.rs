@@ -74,10 +74,7 @@ pub fn localhost(port: u16) -> SocketAddr {
 
 /// Extracts payload bytes from the variants used by the tests.
 pub fn payload_bytes(payload: IoPayload) -> Bytes {
-    match payload {
-        IoPayload::Lease(lease) => lease.create_byte_clone(),
-        IoPayload::Bytes(bytes) => bytes,
-    }
+    payload.create_byte_clone()
 }
 
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].

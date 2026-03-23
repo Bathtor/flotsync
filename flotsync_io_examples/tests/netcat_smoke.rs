@@ -203,6 +203,78 @@ fn tcp_listener_and_client_exchange_one_scripted_line() {
 }
 
 #[test]
+fn tcp_connect_empty_scripted_line_exits_cleanly() {
+    let _guard = smoke_test_guard();
+    let listener = spawn_netcat(&["tcp", "listen", "--bind", "127.0.0.1:0"]);
+    let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
+
+    let client = spawn_netcat(&[
+        "--send",
+        "",
+        "--exit-after-send",
+        "tcp",
+        "connect",
+        "--remote",
+        &listener_addr.to_string(),
+    ]);
+
+    let client_output = client.wait_for_output();
+    let listener_output = listener.kill_and_collect();
+
+    assert!(
+        client_output.status.success(),
+        "client failed on empty scripted send\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&client_output.stdout),
+        String::from_utf8_lossy(&client_output.stderr)
+    );
+
+    assert!(
+        listener_output.status.success() || listener_output.status.code().is_none(),
+        "listener teardown failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
+}
+
+#[test]
+fn tcp_listener_empty_scripted_line_closes_cleanly() {
+    let _guard = smoke_test_guard();
+    let listener = spawn_netcat(&[
+        "--send",
+        "",
+        "--exit-after-send",
+        "tcp",
+        "listen",
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
+
+    let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
+    client
+        .set_read_timeout(Some(WAIT_TIMEOUT))
+        .expect("set client read timeout");
+    let mut received = Vec::new();
+    client
+        .read_to_end(&mut received)
+        .expect("read empty scripted response to end");
+
+    let listener_output = listener.wait_for_output();
+
+    assert!(
+        listener_output.status.success(),
+        "listener failed on empty scripted send\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&listener_output.stdout),
+        String::from_utf8_lossy(&listener_output.stderr)
+    );
+    assert!(
+        received.is_empty(),
+        "expected no bytes from empty scripted TCP send, got {:?}",
+        received
+    );
+}
+
+#[test]
 fn udp_bind_replies_to_the_last_sender_without_explicit_target() {
     let _guard = smoke_test_guard();
     let mut listener = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);

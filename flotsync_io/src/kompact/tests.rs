@@ -41,6 +41,48 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone, Debug)]
+struct TaggedSessionEvent {
+    tag: usize,
+    event: TcpSessionEvent,
+}
+
+fn wrap_tagged_session_event(tag: usize, event: TcpSessionEvent) -> TaggedSessionEvent {
+    TaggedSessionEvent { tag, event }
+}
+
+#[derive(ComponentDefinition)]
+struct TaggedSessionEventProbe {
+    ctx: ComponentContext<Self>,
+    events: mpsc::Sender<TaggedSessionEvent>,
+}
+
+impl TaggedSessionEventProbe {
+    fn new(events: mpsc::Sender<TaggedSessionEvent>) -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            events,
+        }
+    }
+}
+
+ignore_lifecycle!(TaggedSessionEventProbe);
+
+impl Actor for TaggedSessionEventProbe {
+    type Message = TaggedSessionEvent;
+
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        self.events
+            .send(msg)
+            .expect("tagged TCP session event receiver must stay live during integration tests");
+        Handled::Ok
+    }
+
+    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
+        unimplemented!("tagged TCP session probe does not use network actor messages")
+    }
+}
+
 #[test]
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     init_test_logger();
@@ -542,6 +584,106 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, session_probe);
+    kill_component(&system, listener_probe);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
+fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
+    init_test_logger();
+
+    let system = build_test_kompact_system();
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (listener_events_tx, listener_events_rx) = mpsc::channel();
+    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_events_tx));
+    let (tagged_events_tx, tagged_events_rx) = mpsc::channel();
+    let tagged_probe = system.create(move || TaggedSessionEventProbe::new(tagged_events_tx));
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &listener_probe);
+    start_component(&system, &tagged_probe);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let opened_listener = bridge_handle
+        .open_tcp_listener(OpenTcpListener {
+            local_addr: localhost(0),
+            incoming_to: listener_probe.actor_ref().recipient(),
+        })
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("TCP listener open future")
+        .expect("TCP listener open");
+    let listener_addr = opened_listener.local_addr;
+
+    let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
+    let pending = match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Incoming { .. })
+    }) {
+        TcpListenerEvent::Incoming { pending, .. } => pending,
+        other => unreachable!("filtered to TCP listener Incoming, got {other:?}"),
+    };
+
+    let session_ref = pending
+        .accept_tagged(tagged_probe.actor_ref(), 7, wrap_tagged_session_event)
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("pending tagged TCP session accept future")
+        .expect("pending tagged TCP session accept");
+
+    client
+        .write_all(b"hello")
+        .expect("write tagged TCP session payload");
+
+    match recv_until(&tagged_events_rx, |event| {
+        matches!(event.event, TcpSessionEvent::Received { .. })
+    }) {
+        TaggedSessionEvent { tag, event } => {
+            assert_eq!(tag, 7);
+            match event {
+                TcpSessionEvent::Received { payload } => {
+                    assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+                }
+                other => unreachable!("filtered to tagged TCP session Received, got {other:?}"),
+            }
+        }
+    }
+
+    session_ref.close(false);
+    match recv_until(&tagged_events_rx, |event| {
+        matches!(event.event, TcpSessionEvent::Closed { .. })
+    }) {
+        TaggedSessionEvent { tag, event } => {
+            assert_eq!(tag, 7);
+            match event {
+                TcpSessionEvent::Closed { reason } => {
+                    assert!(matches!(
+                        reason,
+                        CloseReason::Graceful | CloseReason::Aborted
+                    ));
+                }
+                other => unreachable!("filtered to tagged TCP session Closed, got {other:?}"),
+            }
+        }
+    }
+
+    opened_listener
+        .listener
+        .tell(super::TcpListenerRequest::Close);
+    match recv_until(&listener_events_rx, |event| {
+        matches!(event, TcpListenerEvent::Closed)
+    }) {
+        TcpListenerEvent::Closed => {}
+        other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
+    }
+
+    drop(client);
+    drop(session_ref);
+    drop(opened_listener);
+    drop(bridge_handle);
+    kill_component(&system, tagged_probe);
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);

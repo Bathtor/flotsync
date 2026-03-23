@@ -6,6 +6,7 @@ use crate::{
         CloseReason,
         ConnectionId,
         IoPayload,
+        IoPayloadCursor,
         ListenerId,
         SendFailureReason,
         TcpEvent,
@@ -15,7 +16,9 @@ use crate::{
     logging::RuntimeLogger,
     pool::IngressPool,
 };
-use bytes::{Buf, Bytes};
+use bytes::Buf;
+#[cfg(test)]
+use bytes::Bytes;
 use flotsync_utils::option_when;
 use mio::{
     Interest,
@@ -201,18 +204,14 @@ pub(super) struct ReleasedTcpListener {
 #[derive(Debug)]
 struct PendingTcpSend {
     transmission_id: TransmissionId,
-    buffer: PendingSendBuffer,
+    buffer: IoPayloadCursor,
 }
 
 impl PendingTcpSend {
     fn new(transmission_id: TransmissionId, payload: IoPayload) -> Self {
-        let buffer = match payload {
-            IoPayload::Lease(lease) => PendingSendBuffer::Lease(lease.cursor()),
-            IoPayload::Bytes(bytes) => PendingSendBuffer::Bytes(bytes),
-        };
         Self {
             transmission_id,
-            buffer,
+            buffer: payload.cursor(),
         }
     }
 
@@ -226,35 +225,6 @@ impl PendingTcpSend {
 
     fn advance(&mut self, cnt: usize) {
         self.buffer.advance(cnt);
-    }
-}
-
-#[derive(Debug)]
-enum PendingSendBuffer {
-    Lease(crate::pool::IoCursor),
-    Bytes(Bytes),
-}
-
-impl PendingSendBuffer {
-    fn remaining(&self) -> usize {
-        match self {
-            Self::Lease(cursor) => cursor.remaining(),
-            Self::Bytes(bytes) => bytes.remaining(),
-        }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        match self {
-            Self::Lease(cursor) => cursor.chunk(),
-            Self::Bytes(bytes) => bytes.chunk(),
-        }
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        match self {
-            Self::Lease(cursor) => cursor.advance(cnt),
-            Self::Bytes(bytes) => bytes.advance(cnt),
-        }
     }
 }
 
@@ -643,6 +613,43 @@ impl TcpRuntimeState {
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
+        self.handle_send_inner(
+            connection_id,
+            transmission_id,
+            payload,
+            false,
+            registry,
+            event_sink,
+        )
+    }
+
+    pub(super) fn handle_send_and_close(
+        &mut self,
+        connection_id: ConnectionId,
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<Option<ResourceRecord>> {
+        self.handle_send_inner(
+            connection_id,
+            transmission_id,
+            payload,
+            true,
+            registry,
+            event_sink,
+        )
+    }
+
+    fn handle_send_inner(
+        &mut self,
+        connection_id: ConnectionId,
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+        close_after_send: bool,
+        registry: &Registry,
+        event_sink: &dyn DriverEventSink,
+    ) -> Result<Option<ResourceRecord>> {
         let Some(entry) = self.connections.get_mut(connection_id.0) else {
             event_sink.publish(super::DriverEvent::Tcp(TcpEvent::SendNack {
                 connection_id,
@@ -685,10 +692,20 @@ impl TcpRuntimeState {
                 connection_id,
                 transmission_id,
             }))?;
+            if close_after_send {
+                let record = self.close_connection(
+                    connection_id,
+                    registry,
+                    CloseReason::Graceful,
+                    event_sink,
+                )?;
+                return Ok(Some(record));
+            }
             return Ok(None);
         }
 
         entry.pending_send = Some(PendingTcpSend::new(transmission_id, payload));
+        entry.close_after_flush = close_after_send;
         self.flush_pending_send(connection_id, registry, event_sink)
     }
 
@@ -1334,10 +1351,7 @@ mod tests {
     }
 
     fn payload_bytes(payload: IoPayload) -> Bytes {
-        match payload {
-            IoPayload::Lease(lease) => lease.create_byte_clone(),
-            IoPayload::Bytes(bytes) => bytes,
-        }
+        payload.create_byte_clone()
     }
 
     #[test]
@@ -1905,6 +1919,84 @@ mod tests {
         assert_eq!(server_rx.recv().expect("server payload"), *b"hello");
 
         server.join().expect("join server thread");
+        driver.shutdown().expect("driver shuts down");
+    }
+
+    #[test]
+    fn tcp_send_and_close_supports_chained_payloads() {
+        init_test_logger();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let remote_addr = listener.local_addr().expect("listener addr");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept TCP stream");
+            let mut received = Vec::new();
+            stream
+                .read_to_end(&mut received)
+                .expect("server read to end");
+            received
+        });
+
+        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let connection_id = resolve_request(driver.reserve_connection());
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
+                connection_id,
+                local_addr: None,
+                remote_addr,
+            }))
+            .expect("dispatch TCP connect");
+
+        loop {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::Connected {
+                    connection_id: connected_id,
+                    ..
+                }) if connected_id == connection_id => break,
+                _ => {}
+            }
+        }
+
+        let transmission_id = TransmissionId(21);
+        driver
+            .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::SendAndClose {
+                connection_id,
+                transmission_id,
+                payload: IoPayload::chain([
+                    IoPayload::from_static(b"he"),
+                    IoPayload::from_static(b"llo"),
+                ]),
+            }))
+            .expect("dispatch chained send-and-close");
+
+        let mut saw_ack = false;
+        let mut saw_closed = false;
+        while !saw_ack || !saw_closed {
+            match wait_for_event(&driver) {
+                DriverEvent::Tcp(TcpEvent::SendAck {
+                    connection_id: ack_connection_id,
+                    transmission_id: ack_id,
+                }) if ack_connection_id == connection_id && ack_id == transmission_id => {
+                    saw_ack = true;
+                }
+                DriverEvent::Tcp(TcpEvent::Closed {
+                    connection_id: closed_id,
+                    reason,
+                }) if closed_id == connection_id => {
+                    assert_eq!(reason, CloseReason::Graceful);
+                    saw_closed = true;
+                }
+                other => {
+                    log::debug!(
+                        "ignoring unrelated event while waiting for TCP send-and-close: {:?}",
+                        other
+                    );
+                }
+            }
+        }
+
+        let received = server.join().expect("join server thread");
+        assert_eq!(received, b"hello");
         driver.shutdown().expect("driver shuts down");
     }
 

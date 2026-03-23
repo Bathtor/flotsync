@@ -1,6 +1,7 @@
 use super::{
     ChunkPoolState,
     IoLease,
+    IoLeaseInner,
     IoPoolConfig,
     LeaseRecycler,
     LeaseSegment,
@@ -9,10 +10,11 @@ use super::{
     chunks_for_bytes,
 };
 use crate::{
+    api::IoPayload,
     errors::{Error, Result},
     logging::RuntimeLogger,
 };
-use bytes::{BufMut, buf::UninitSlice};
+use bytes::{Buf, BufMut, buf::UninitSlice};
 use slog::{error, warn};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -79,10 +81,80 @@ impl EgressPool {
         Ok(())
     }
 
+    /// Retargets a uniquely owned pooled lease to this egress pool without copying bytes.
+    ///
+    /// Non-pooled leases are returned unchanged. Pooled leases must be uniquely owned so the
+    /// recycler can be retargeted without affecting other shared readers.
+    pub fn adopt_lease(&self, mut lease: IoLease) -> Result<IoLease> {
+        self.adopt_lease_in_place(&mut lease)?;
+        Ok(lease)
+    }
+
+    /// Retargets every uniquely owned pooled fragment inside one payload to this egress pool.
+    ///
+    /// This works recursively for chained payloads and for lease-backed fragments produced through
+    /// payload slicing as long as each pooled fragment is uniquely owned. Shared pooled fragments
+    /// fail with [`Error::SharedIoPayloadOwnership`].
+    pub fn adopt_payload(&self, mut payload: IoPayload) -> Result<IoPayload> {
+        self.adopt_payload_in_place(&mut payload)?;
+        Ok(payload)
+    }
+
     fn lock_state(&self) -> Result<MutexGuard<'_, EgressPoolState>> {
         self.inner.lock().map_err(|_| Error::IoBufferStatePoisoned {
             pool_kind: "egress",
         })
+    }
+
+    fn import_live_chunks(&self, chunk_count: usize) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if state.chunks.import_live_chunks(chunk_count) {
+            return Ok(());
+        }
+        Err(Error::EgressLiveChunkAdoptionExhausted {
+            chunk_count,
+            max_chunk_count: state.chunks.config.max_chunk_count,
+        })
+    }
+
+    fn adopt_lease_in_place(&self, lease: &mut IoLease) -> Result<()> {
+        let IoLeaseInner::Pooled(payload) = &mut lease.inner else {
+            return Ok(());
+        };
+        let Some(payload) = Arc::get_mut(payload) else {
+            return Err(Error::SharedIoPayloadOwnership);
+        };
+        if payload.recycler.is_owned_by_egress(&self.inner) {
+            return Ok(());
+        }
+
+        let chunk_count = payload.segment_count();
+        self.import_live_chunks(chunk_count)?;
+        if let Err(error) = payload.recycler.release_live_chunks(chunk_count) {
+            EgressPoolState::release_live_chunks_from_weak(
+                &Arc::downgrade(&self.inner),
+                chunk_count,
+            )?;
+            return Err(error);
+        }
+        payload.recycler = LeaseRecycler::Egress(Arc::downgrade(&self.inner));
+        Ok(())
+    }
+
+    fn adopt_payload_in_place(&self, payload: &mut IoPayload) -> Result<()> {
+        match payload {
+            IoPayload::Lease(lease) => self.adopt_lease_in_place(lease),
+            IoPayload::Bytes(_) => Ok(()),
+            IoPayload::Chain(parts) => {
+                let Some(parts) = Arc::get_mut(parts) else {
+                    return Err(Error::SharedIoPayloadOwnership);
+                };
+                for part in parts.iter_mut() {
+                    self.adopt_payload_in_place(part)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -132,6 +204,18 @@ impl EgressPoolState {
         self.chunks.return_chunks(chunks);
     }
 
+    fn release_live_chunks(
+        &mut self,
+        chunk_count: usize,
+        pool: &Arc<Mutex<Self>>,
+    ) -> Vec<(
+        futures_channel::oneshot::Sender<Result<EgressReservation>>,
+        EgressReservation,
+    )> {
+        self.chunks.release_live_chunks(chunk_count);
+        self.dispatch_waiters(pool)
+    }
+
     fn deliver_ready(
         logger: &RuntimeLogger,
         ready: Vec<(
@@ -173,6 +257,31 @@ impl EgressPoolState {
 
         Self::deliver_ready(&logger, ready);
     }
+
+    pub(super) fn release_live_chunks_from_weak(
+        inner: &Weak<Mutex<Self>>,
+        chunk_count: usize,
+    ) -> Result<()> {
+        let Some(inner) = inner.upgrade() else {
+            return Ok(());
+        };
+
+        let (ready, logger) = match inner.lock() {
+            Ok(mut state) => {
+                let ready = state.release_live_chunks(chunk_count, &inner);
+                let logger = state.logger.clone();
+                (ready, logger)
+            }
+            Err(_) => {
+                return Err(Error::IoBufferStatePoisoned {
+                    pool_kind: "egress",
+                });
+            }
+        };
+
+        Self::deliver_ready(&logger, ready);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -206,11 +315,14 @@ impl EgressReservation {
         self.requested_bytes
     }
 
-    /// Serialises into the reserved pooled memory and returns the resulting lease.
-    pub fn write_with<T>(
+    /// Serialises into the reserved pooled memory and optionally returns the resulting lease.
+    ///
+    /// A closure that writes zero bytes succeeds with `None` and returns the entire reservation to
+    /// the pool immediately.
+    pub(crate) fn write_with_optional<T>(
         mut self,
         write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
-    ) -> Result<(T, IoLease)> {
+    ) -> Result<(T, Option<IoLease>)> {
         let chunks = self
             .chunks
             .take()
@@ -220,16 +332,30 @@ impl EgressReservation {
         let write_result = write(&mut writer);
         match write_result {
             Ok(value) => {
+                if writer.written_bytes() == 0 {
+                    EgressPoolState::return_chunks_from_weak(&self.pool, writer.into_chunks());
+                    return Ok((value, None));
+                }
                 let (lease, unused_chunks) =
                     writer.finish(LeaseRecycler::Egress(self.pool.clone()))?;
                 EgressPoolState::return_chunks_from_weak(&self.pool, unused_chunks);
-                Ok((value, lease))
+                Ok((value, Some(lease)))
             }
             Err(error) => {
                 EgressPoolState::return_chunks_from_weak(&self.pool, writer.into_chunks());
                 Err(error)
             }
         }
+    }
+
+    /// Serialises into the reserved pooled memory and returns the resulting lease.
+    pub fn write_with<T>(
+        self,
+        write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
+    ) -> Result<(T, IoLease)> {
+        let (value, lease) = self.write_with_optional(write)?;
+        let lease = lease.ok_or(Error::EmptyIoLease)?;
+        Ok((value, lease))
     }
 
     /// Convenience helper for copying a byte slice into the reserved pooled memory.
@@ -307,6 +433,33 @@ impl IoBufWriter {
 
     fn into_chunks(self) -> Vec<PooledChunk> {
         self.chunks
+    }
+
+    /// Copies one payload into the reserved pooled memory.
+    ///
+    /// This writes the payload's currently readable bytes in order, independent of whether the
+    /// source is lease-backed, byte-backed, or chained.
+    pub fn put_payload(&mut self, payload: &IoPayload) {
+        let mut cursor = payload.cursor();
+        while cursor.has_remaining() {
+            let chunk = cursor.chunk();
+            let chunk_len = chunk.len();
+            self.put_slice(chunk);
+            cursor.advance(chunk_len);
+        }
+    }
+
+    /// Copies one readable payload sub-range into the reserved pooled memory.
+    ///
+    /// The caller must supply a valid readable range for `payload`. This panics if the range is
+    /// invalid because all current use-sites derive the range from previously validated parser
+    /// state.
+    pub fn put_payload_slice(&mut self, payload: &IoPayload, offset: usize, len: usize) {
+        let slice = payload
+            .clone()
+            .try_slice(offset, len)
+            .unwrap_or_else(|| panic!("invalid IoPayload slice range {offset}..{}", offset + len));
+        self.put_payload(&slice);
     }
 }
 

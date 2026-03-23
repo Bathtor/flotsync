@@ -5,6 +5,7 @@ use super::{
         OpenFailureReason,
         OpenedTcpSession,
         TcpSessionEvent,
+        TcpSessionEventTarget,
         TcpSessionRef,
         TcpSessionRequest,
     },
@@ -12,6 +13,7 @@ use super::{
 use crate::{
     api::{CloseReason, ConnectionId, SendFailureReason, TcpCommand},
     errors::Error,
+    pool::EgressPool,
 };
 use ::kompact::prelude::*;
 use std::net::SocketAddr;
@@ -74,7 +76,8 @@ impl From<TcpSessionRequest> for TcpSessionMessage {
 pub(crate) struct TcpSession {
     ctx: ComponentContext<Self>,
     driver: DriverComponentRef,
-    events_to: Recipient<TcpSessionEvent>,
+    egress_pool: EgressPool,
+    events_to: TcpSessionEventTarget,
     connection_id: Option<ConnectionId>,
     open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
     opened: bool,
@@ -84,29 +87,39 @@ pub(crate) struct TcpSession {
 impl TcpSession {
     pub(crate) fn attached(
         driver: DriverComponentRef,
-        events_to: Recipient<TcpSessionEvent>,
+        events_to: TcpSessionEventTarget,
         connection_id: ConnectionId,
+        egress_pool: EgressPool,
     ) -> Self {
-        Self::with_connection_and_open_promise(driver, events_to, Some(connection_id), None)
+        Self::with_connection_and_open_promise(
+            driver,
+            events_to,
+            Some(connection_id),
+            egress_pool,
+            None,
+        )
     }
 
     pub(crate) fn with_open_promise(
         driver: DriverComponentRef,
-        events_to: Recipient<TcpSessionEvent>,
+        events_to: TcpSessionEventTarget,
+        egress_pool: EgressPool,
         open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
     ) -> Self {
-        Self::with_connection_and_open_promise(driver, events_to, None, open_promise)
+        Self::with_connection_and_open_promise(driver, events_to, None, egress_pool, open_promise)
     }
 
     fn with_connection_and_open_promise(
         driver: DriverComponentRef,
-        events_to: Recipient<TcpSessionEvent>,
+        events_to: TcpSessionEventTarget,
         connection_id: Option<ConnectionId>,
+        egress_pool: EgressPool,
         open_promise: Option<KPromise<std::result::Result<OpenedTcpSession, OpenFailureReason>>>,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             driver,
+            egress_pool,
             events_to,
             connection_id,
             open_promise,
@@ -121,6 +134,10 @@ impl TcpSession {
                 transmission_id,
                 payload,
             } => self.handle_send_request(transmission_id, payload),
+            TcpSessionRequest::SendAndClose {
+                transmission_id,
+                payload,
+            } => self.handle_send_and_close_request(transmission_id, payload),
             TcpSessionRequest::Close { abort } => self.handle_close_request(abort),
         }
     }
@@ -146,6 +163,34 @@ impl TcpSession {
         }
 
         self.driver.dispatch_tcp(TcpCommand::Send {
+            connection_id,
+            transmission_id,
+            payload,
+        });
+        Handled::Ok
+    }
+
+    fn handle_send_and_close_request(
+        &mut self,
+        transmission_id: crate::api::TransmissionId,
+        payload: crate::api::IoPayload,
+    ) -> Handled {
+        let Some(connection_id) = self.connection_id else {
+            self.events_to.tell(TcpSessionEvent::SendNack {
+                transmission_id,
+                reason: SendFailureReason::InvalidState,
+            });
+            return Handled::Ok;
+        };
+        if self.terminal {
+            self.events_to.tell(TcpSessionEvent::SendNack {
+                transmission_id,
+                reason: SendFailureReason::Closed,
+            });
+            return Handled::Ok;
+        }
+
+        self.driver.dispatch_tcp(TcpCommand::SendAndClose {
             connection_id,
             transmission_id,
             payload,
@@ -246,7 +291,7 @@ impl TcpSession {
             .hold()
             .expect("TCP session must be live while fulfilling the open result");
         let opened = OpenedTcpSession {
-            session: TcpSessionRef::new(actor),
+            session: TcpSessionRef::new(actor, self.egress_pool.clone()),
             peer_addr,
         };
         if promise.fulfil(Ok(opened)).is_err() {

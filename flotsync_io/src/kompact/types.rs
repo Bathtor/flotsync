@@ -15,9 +15,21 @@ use crate::{
         UdpSocketOption,
     },
     errors::Result,
+    pool::{EgressPool, IoBufWriter},
 };
-use ::kompact::prelude::{ActorRefStrong, KFuture, Port, Receiver, Recipient, promise};
-use std::{io, net::SocketAddr};
+use ::kompact::prelude::{
+    ActorRef,
+    ActorRefFactory,
+    ActorRefStrong,
+    KFuture,
+    MessageBounds,
+    Port,
+    Receiver,
+    Recipient,
+    promise,
+};
+use bytes::Bytes;
+use std::{io, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
 /// Describes why an open-style operation could not make the requested socket or session usable.
@@ -311,10 +323,14 @@ impl PendingTcpSession {
     /// `events_to` receives all future lifecycle and I/O events for the accepted session. The
     /// returned future resolves once the session actor exists, owns the accepted connection, and
     /// the raw driver has enabled normal session readiness.
-    pub fn accept(
-        mut self,
-        events_to: Recipient<TcpSessionEvent>,
-    ) -> KFuture<Result<TcpSessionRef>> {
+    pub fn accept<R>(self, events_to: R) -> KFuture<Result<TcpSessionRef>>
+    where
+        R: Receiver<TcpSessionEvent>,
+    {
+        self.accept_target(TcpSessionEventTarget::from_receiver(events_to))
+    }
+
+    fn accept_target(mut self, events_to: TcpSessionEventTarget) -> KFuture<Result<TcpSessionRef>> {
         let inner = self.take_inner();
         let request = AcceptPendingTcpSession {
             connection_id: inner.connection_id,
@@ -337,6 +353,21 @@ impl PendingTcpSession {
         future
     }
 
+    /// Accepts the inbound connection and forwards future session events through a runtime tag.
+    pub fn accept_tagged<R, M, Tag>(
+        self,
+        target: R,
+        tag: Tag,
+        wrap: fn(Tag, TcpSessionEvent) -> M,
+    ) -> KFuture<Result<TcpSessionRef>>
+    where
+        R: ActorRefFactory<Message = M>,
+        M: MessageBounds,
+        Tag: Copy + Send + Sync + 'static,
+    {
+        self.accept_target(tagged_tcp_session_event_target(target, tag, wrap))
+    }
+
     fn take_inner(&mut self) -> PendingTcpSessionInner {
         self.inner.take().unwrap_or_else(|| {
             panic!("pending TCP session decision handle may only be consumed once")
@@ -353,6 +384,100 @@ impl Drop for PendingTcpSession {
             .listener
             .tell(TcpListenerMessage::DropPending(inner.connection_id));
     }
+}
+
+/// Type-erased session-event delivery target used by the Kompact TCP adapter.
+#[derive(Clone)]
+pub struct TcpSessionEventTarget {
+    inner: Arc<dyn DynTcpSessionEventTarget>,
+}
+
+impl std::fmt::Debug for TcpSessionEventTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TcpSessionEventTarget(..)")
+    }
+}
+
+impl TcpSessionEventTarget {
+    fn new(inner: impl DynTcpSessionEventTarget + 'static) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Builds one event target from a plain Kompact recipient.
+    pub fn from_recipient(recipient: Recipient<TcpSessionEvent>) -> Self {
+        Self::new(RecipientTcpSessionEventTarget { recipient })
+    }
+
+    /// Builds one event target from any local receiver of `TcpSessionEvent`.
+    pub fn from_receiver<R>(receiver: R) -> Self
+    where
+        R: Receiver<TcpSessionEvent>,
+    {
+        Self::from_recipient(receiver.recipient())
+    }
+
+    pub(crate) fn tell(&self, event: TcpSessionEvent) {
+        self.inner.tell(event);
+    }
+}
+
+trait DynTcpSessionEventTarget: Send + Sync {
+    fn tell(&self, event: TcpSessionEvent);
+}
+
+#[derive(Clone)]
+struct RecipientTcpSessionEventTarget {
+    recipient: Recipient<TcpSessionEvent>,
+}
+
+impl DynTcpSessionEventTarget for RecipientTcpSessionEventTarget {
+    fn tell(&self, event: TcpSessionEvent) {
+        self.recipient.tell(event);
+    }
+}
+
+#[derive(Clone)]
+struct TaggedActorRefTcpSessionEventTarget<M, Tag>
+where
+    M: MessageBounds,
+    Tag: Copy + Send + Sync + 'static,
+{
+    actor: ActorRef<M>,
+    tag: Tag,
+    wrap: fn(Tag, TcpSessionEvent) -> M,
+}
+
+impl<M, Tag> DynTcpSessionEventTarget for TaggedActorRefTcpSessionEventTarget<M, Tag>
+where
+    M: MessageBounds,
+    Tag: Copy + Send + Sync + 'static,
+{
+    fn tell(&self, event: TcpSessionEvent) {
+        self.actor.tell((self.wrap)(self.tag, event));
+    }
+}
+
+/// Builds one tagged TCP session-event target that wraps an actor ref directly.
+///
+/// Unlike Kompact's `Recipient`, this helper can carry one small `Copy` tag and combine it with
+/// each forwarded `TcpSessionEvent` using the supplied `wrap` function before telling the actor.
+pub fn tagged_tcp_session_event_target<A, M, Tag>(
+    target: A,
+    tag: Tag,
+    wrap: fn(Tag, TcpSessionEvent) -> M,
+) -> TcpSessionEventTarget
+where
+    A: ActorRefFactory<Message = M>,
+    M: MessageBounds,
+    Tag: Copy + Send + Sync + 'static,
+{
+    TcpSessionEventTarget::new(TaggedActorRefTcpSessionEventTarget {
+        actor: target.actor_ref(),
+        tag,
+        wrap,
+    })
 }
 
 /// Request used with the TCP manager side of an [`IoBridge`](super::IoBridge).
@@ -383,6 +508,11 @@ pub struct OpenedTcpSession {
 pub enum TcpSessionRequest {
     /// Sends raw payload bytes on this session.
     Send {
+        transmission_id: TransmissionId,
+        payload: IoPayload,
+    },
+    /// Sends raw payload bytes and then closes the session gracefully after the send drains.
+    SendAndClose {
         transmission_id: TransmissionId,
         payload: IoPayload,
     },
@@ -426,16 +556,76 @@ pub enum TcpSessionEvent {
 #[derive(Clone, Debug)]
 pub struct TcpSessionRef {
     actor: ActorRefStrong<TcpSessionMessage>,
+    egress_pool: EgressPool,
 }
 
 impl TcpSessionRef {
-    pub(crate) fn new(actor: ActorRefStrong<TcpSessionMessage>) -> Self {
-        Self { actor }
+    pub(crate) fn new(actor: ActorRefStrong<TcpSessionMessage>, egress_pool: EgressPool) -> Self {
+        Self { actor, egress_pool }
     }
 
     /// Sends one request to the underlying TCP session endpoint.
     pub fn tell(&self, request: TcpSessionRequest) {
         self.actor.tell(TcpSessionMessage::Request(request));
+    }
+
+    /// Returns the shared egress pool owned by the underlying raw driver instance.
+    pub fn egress_pool(&self) -> &EgressPool {
+        &self.egress_pool
+    }
+
+    /// Sends one payload on this session.
+    pub fn send(&self, transmission_id: TransmissionId, payload: IoPayload) {
+        self.tell(TcpSessionRequest::Send {
+            transmission_id,
+            payload,
+        });
+    }
+
+    /// Sends one byte-backed payload on this session.
+    pub fn send_bytes(&self, transmission_id: TransmissionId, bytes: Bytes) {
+        self.send(transmission_id, IoPayload::Bytes(bytes));
+    }
+
+    /// Sends one static byte slice on this session.
+    pub fn send_static(&self, transmission_id: TransmissionId, bytes: &'static [u8]) {
+        self.send(transmission_id, IoPayload::from_static(bytes));
+    }
+
+    /// Serialises one payload into the shared egress pool and sends it once ready.
+    ///
+    /// `estimated_bytes` must be an upper bound for the bytes the closure will write. The current
+    /// reservation API does not grow dynamically once granted, so underestimation can cause the
+    /// writer to panic when it advances past the reserved budget. If the closure writes zero
+    /// bytes, this sends one empty payload instead of failing.
+    pub async fn send_with<T>(
+        &self,
+        transmission_id: TransmissionId,
+        estimated_bytes: usize,
+        write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
+    ) -> Result<T> {
+        let reservation = self.egress_pool.reserve(estimated_bytes.max(1))?;
+        let reservation = reservation.await?;
+        let (value, lease) = reservation.write_with_optional(write)?;
+        let payload = match lease {
+            Some(lease) => IoPayload::Lease(lease),
+            None => IoPayload::Bytes(Bytes::new()),
+        };
+        self.send(transmission_id, payload);
+        Ok(value)
+    }
+
+    /// Sends one payload and requests a graceful close once the send drains.
+    pub fn send_and_close(&self, transmission_id: TransmissionId, payload: IoPayload) {
+        self.tell(TcpSessionRequest::SendAndClose {
+            transmission_id,
+            payload,
+        });
+    }
+
+    /// Closes the session; `abort = true` requests an abortive close.
+    pub fn close(&self, abort: bool) {
+        self.tell(TcpSessionRequest::Close { abort });
     }
 
     /// Returns a narrowed recipient for this session.

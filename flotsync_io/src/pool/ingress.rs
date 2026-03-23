@@ -103,6 +103,12 @@ impl IngressPoolState {
         !had_available_capacity && self.has_available_chunk()
     }
 
+    fn release_live_chunks(&mut self, chunk_count: usize) -> bool {
+        let had_available_capacity = self.has_available_chunk();
+        self.chunks.release_live_chunks(chunk_count);
+        !had_available_capacity && self.has_available_chunk()
+    }
+
     pub(super) fn return_chunks_from_weak(inner: &Weak<Mutex<Self>>, chunks: Vec<PooledChunk>) {
         let Some(inner) = inner.upgrade() else {
             return;
@@ -126,6 +132,30 @@ impl IngressPoolState {
                 );
             }
         };
+    }
+
+    pub(super) fn release_live_chunks_from_weak(
+        inner: &Weak<Mutex<Self>>,
+        chunk_count: usize,
+    ) -> Result<()> {
+        let Some(inner) = inner.upgrade() else {
+            return Ok(());
+        };
+
+        match inner.lock() {
+            Ok(mut state) => {
+                let should_notify = state.release_live_chunks(chunk_count);
+                if should_notify {
+                    let notifier = state.availability_notifier.clone();
+                    drop(state);
+                    notifier.notify();
+                }
+                Ok(())
+            }
+            Err(_) => Err(Error::IoBufferStatePoisoned {
+                pool_kind: "ingress",
+            }),
+        }
     }
 }
 

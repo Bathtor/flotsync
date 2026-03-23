@@ -3,6 +3,7 @@
 pub mod api;
 pub mod driver;
 pub mod errors;
+pub mod framing;
 pub mod kompact;
 mod logging;
 pub mod pool;
@@ -39,6 +40,7 @@ pub mod prelude {
             IoDriver,
         },
         errors::{Error, Result},
+        framing::{BoundedCollector, CollectUntil},
         kompact::{
             ConfigureFailureReason,
             IoBridge,
@@ -54,6 +56,7 @@ pub mod prelude {
             TcpListenerRef,
             TcpListenerRequest,
             TcpSessionEvent,
+            TcpSessionEventTarget,
             TcpSessionRef,
             TcpSessionRequest,
             UdpIndication,
@@ -61,6 +64,7 @@ pub mod prelude {
             UdpPort,
             UdpRequest,
             UdpSendResult,
+            tagged_tcp_session_event_target,
         },
         pool::{
             EgressPool,

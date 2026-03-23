@@ -6,7 +6,6 @@ use super::{
     ShutdownTimerState,
     TcpMode,
     complete_outcome,
-    encode_line_payload,
     install_input_source,
     new_outcome_promise,
     print_payload,
@@ -290,7 +289,6 @@ impl TcpConnectNetcat {
         if self.pending_send {
             return;
         }
-        let egress_pool = self.bridge_handle.egress_pool().clone();
         let Some(line) = self.queued_lines.pop_front() else {
             return;
         };
@@ -300,19 +298,18 @@ impl TcpConnectNetcat {
         let transmission_id = self.next_transmission_id.take_next();
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
-            let payload = match encode_line_payload(egress_pool, line).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return async_self.fail_and_die(format!(
-                        "failed to encode TCP payload from stdin/script input: {error}"
-                    ));
-                }
-            };
-            session.tell(TcpSessionRequest::Send {
-                transmission_id,
-                payload,
-            });
-            Handled::Ok
+            let send_result = session
+                .send_with(transmission_id, line.len(), |writer| {
+                    writer.put_slice(line.as_bytes());
+                    Ok(())
+                })
+                .await;
+            match send_result {
+                Ok(()) => Handled::Ok,
+                Err(error) => async_self.fail_and_die(format!(
+                    "failed to encode TCP payload from stdin/script input: {error}"
+                )),
+            }
         });
     }
 
@@ -360,7 +357,7 @@ impl TcpConnectNetcat {
         let Some(session) = self.state.session().cloned() else {
             return Handled::Ok;
         };
-        session.tell(TcpSessionRequest::Close { abort: false });
+        session.close(false);
         self.state = TcpConnectState::Closing(session);
         Handled::Ok
     }
@@ -592,14 +589,7 @@ impl TcpListenNetcat {
         self.session_state = TcpAcceptedSessionState::Accepting;
         log::info!("accepting inbound TCP session from {peer_addr}");
         Handled::block_on(self, move |mut async_self| async move {
-            let accept_reply = match pending
-                .accept(
-                    async_self
-                        .actor_ref()
-                        .recipient_with(TcpListenMessage::SessionEvent),
-                )
-                .await
-            {
+            let accept_reply = match pending.accept(async_self.actor_ref()).await {
                 Ok(reply) => reply,
                 Err(error) => {
                     return async_self.fail_and_die(format!(
@@ -627,7 +617,6 @@ impl TcpListenNetcat {
         if self.pending_send {
             return;
         }
-        let egress_pool = self.bridge_handle.egress_pool().clone();
         let Some(line) = self.queued_lines.pop_front() else {
             return;
         };
@@ -636,19 +625,18 @@ impl TcpListenNetcat {
         let transmission_id = self.next_transmission_id.take_next();
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
-            let payload = match encode_line_payload(egress_pool, line).await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    return async_self.fail_and_die(format!(
-                        "failed to encode TCP payload from stdin/script input: {error}"
-                    ));
-                }
-            };
-            session.tell(TcpSessionRequest::Send {
-                transmission_id,
-                payload,
-            });
-            Handled::Ok
+            let send_result = session
+                .send_with(transmission_id, line.len(), |writer| {
+                    writer.put_slice(line.as_bytes());
+                    Ok(())
+                })
+                .await;
+            match send_result {
+                Ok(()) => Handled::Ok,
+                Err(error) => async_self.fail_and_die(format!(
+                    "failed to encode TCP payload from stdin/script input: {error}"
+                )),
+            }
         });
     }
 
@@ -695,7 +683,7 @@ impl TcpListenNetcat {
         }
 
         if let Some(session) = self.session_state.session().cloned() {
-            session.tell(TcpSessionRequest::Close { abort: false });
+            session.close(false);
             self.session_state = TcpAcceptedSessionState::Closing(session);
             return Handled::Ok;
         }
