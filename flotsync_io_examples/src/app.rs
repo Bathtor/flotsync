@@ -1,7 +1,7 @@
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
 use kompact::prelude::{Component, KompactConfig, KompactSystem};
 use slog::{Drain, Level, Logger, o};
-use snafu::{Whatever, prelude::*};
+use snafu::{FromString, Whatever, prelude::*};
 use std::sync::{Arc, OnceLock};
 
 /// Result type used by the example binaries.
@@ -28,9 +28,9 @@ impl ExampleRuntime {
     pub fn setup() -> Result<Self> {
         init_logging();
 
-        let system = KompactConfig::default()
-            .build()
-            .with_whatever_context(|_| "failed to build Kompact system".to_string())?;
+        let system = KompactConfig::default().build().map_err(|error| {
+            Whatever::without_source(format!("failed to build Kompact system: {error}"))
+        })?;
 
         let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver_component.clone();

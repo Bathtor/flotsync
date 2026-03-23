@@ -1841,10 +1841,10 @@ where
                 value: $decode($operation.value).map_err(operation_invalid_value)?,
             };
             $current.apply_operation(operation).map_err(|_| {
-                crate::OperationError::InternalOperation {
+                crate::InternalOperationSnafu {
                     context: "Applying a generated LatestValueWins operation failed.".to_owned(),
-                    location: snafu::Location::default(),
                 }
+                .build()
             })
         }};
     }

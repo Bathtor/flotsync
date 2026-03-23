@@ -1,4 +1,10 @@
 use crate::app::ExampleRuntime;
+pub(crate) use crate::support::{
+    OutcomePromise,
+    complete_outcome,
+    new_outcome_promise,
+    wait_for_component_outcome,
+};
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
 use flotsync_io::prelude::{EgressPool, IoPayload};
@@ -7,7 +13,7 @@ use snafu::{Whatever, prelude::*};
 use std::{
     io::{self, BufRead, BufReader, Write},
     net::SocketAddr,
-    sync::{Arc, Condvar, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -107,20 +113,6 @@ enum NetcatInput {
     Closed,
 }
 
-/// Shared terminal outcome signal written by the example component before it shuts down.
-///
-/// The outer process only needs to know whether the component finished cleanly or with a terminal
-/// error. We wait for that signal directly instead of using `Component::wait_ended()`, because
-/// Kompact only reports a component as "ended" once it is fully destroyed, and that can lag behind
-/// a clean `DieNow` if other references are still alive briefly.
-type OutcomeSlot = Arc<OutcomeSignal>;
-
-/// One tiny synchronisation cell for terminal component outcomes.
-struct OutcomeSignal {
-    state: Mutex<Option<std::result::Result<(), String>>>,
-    ready: Condvar,
-}
-
 /// One scheduled scripted-shutdown timer together with the generation that armed it.
 ///
 /// The generation lets components ignore stale timeout callbacks that were already queued when the
@@ -141,29 +133,6 @@ pub fn run(args: NetcatArgs) -> Result<()> {
     run_result?;
     shutdown_result?;
     Ok(())
-}
-
-fn new_outcome_slot() -> OutcomeSlot {
-    Arc::new(OutcomeSignal {
-        state: Mutex::new(None),
-        ready: Condvar::new(),
-    })
-}
-
-fn record_success(slot: &OutcomeSlot) {
-    let mut guard = slot.state.lock().expect("netcat outcome lock");
-    if guard.is_none() {
-        *guard = Some(Ok(()));
-        slot.ready.notify_all();
-    }
-}
-
-fn record_failure(slot: &OutcomeSlot, message: impl Into<String>) {
-    let mut guard = slot.state.lock().expect("netcat outcome lock");
-    if guard.is_none() {
-        *guard = Some(Err(message.into()));
-        slot.ready.notify_all();
-    }
 }
 
 fn start_component<C>(runtime: &ExampleRuntime, component: &Arc<Component<C>>) -> Result<()>
@@ -189,32 +158,6 @@ where
     );
 
     Ok(())
-}
-
-fn wait_for_component_outcome<C>(component: &Arc<Component<C>>, outcome: &OutcomeSlot) -> Result<()>
-where
-    C: ComponentDefinition + Sized + 'static,
-{
-    let mut guard = outcome.state.lock().expect("netcat outcome lock");
-    loop {
-        if let Some(result) = guard.take() {
-            return match result {
-                Ok(()) => Ok(()),
-                Err(message) => whatever!("{message}"),
-            };
-        }
-        if component.is_faulty() {
-            whatever!("netcat component faulted");
-        }
-        if component.is_destroyed() {
-            whatever!("netcat component exited without recording an outcome");
-        }
-        let (next_guard, _) = outcome
-            .ready
-            .wait_timeout(guard, Duration::from_millis(100))
-            .expect("netcat outcome wait");
-        guard = next_guard;
-    }
 }
 
 async fn encode_line_payload(

@@ -1,22 +1,22 @@
 use super::{
     NetcatInput,
-    OutcomeSlot,
+    OutcomePromise,
     Result,
     SCRIPTED_EXIT_GRACE,
     ShutdownTimerState,
     TcpMode,
+    complete_outcome,
     encode_line_payload,
     install_input_source,
-    new_outcome_slot,
+    new_outcome_promise,
     print_payload,
-    record_failure,
-    record_success,
     start_component,
     wait_for_component_outcome,
 };
 use crate::app::ExampleRuntime;
 use flotsync_io::prelude::*;
 use kompact::prelude::*;
+use snafu::{FromString, Whatever};
 use std::{collections::VecDeque, net::SocketAddr};
 
 /// Runs the TCP flavour of the netcat example.
@@ -49,18 +49,14 @@ fn run_tcp_connect(
     shutdown_after_input: bool,
     config: TcpConnectConfig,
 ) -> Result<()> {
-    let outcome = new_outcome_slot();
-    let component = runtime.system().create(|| {
-        TcpConnectNetcat::new(
-            runtime.bridge_handle().clone(),
-            config,
-            shutdown_after_input,
-            outcome.clone(),
-        )
+    let (outcome_promise, outcome_future) = new_outcome_promise();
+    let bridge_handle = runtime.bridge_handle().clone();
+    let component = runtime.system().create(move || {
+        TcpConnectNetcat::new(bridge_handle, config, shutdown_after_input, outcome_promise)
     });
     start_component(runtime, &component)?;
     install_input_source(component.actor_ref(), scripted_lines);
-    wait_for_component_outcome(&component, &outcome)
+    wait_for_component_outcome(&component, outcome_future, "netcat")
 }
 
 fn run_tcp_listen(
@@ -69,18 +65,14 @@ fn run_tcp_listen(
     shutdown_after_input: bool,
     config: TcpListenConfig,
 ) -> Result<()> {
-    let outcome = new_outcome_slot();
-    let component = runtime.system().create(|| {
-        TcpListenNetcat::new(
-            runtime.bridge_handle().clone(),
-            config,
-            shutdown_after_input,
-            outcome.clone(),
-        )
+    let (outcome_promise, outcome_future) = new_outcome_promise();
+    let bridge_handle = runtime.bridge_handle().clone();
+    let component = runtime.system().create(move || {
+        TcpListenNetcat::new(bridge_handle, config, shutdown_after_input, outcome_promise)
     });
     start_component(runtime, &component)?;
     install_input_source(component.actor_ref(), scripted_lines);
-    wait_for_component_outcome(&component, &outcome)
+    wait_for_component_outcome(&component, outcome_future, "netcat")
 }
 
 /// Static configuration for one outbound TCP session example.
@@ -204,10 +196,10 @@ struct TcpConnectNetcat {
     input_closed: bool,
     shutdown_after_input: bool,
     pending_send: bool,
-    next_transmission_id: usize,
+    next_transmission_id: TransmissionId,
     shutdown_timer: Option<ShutdownTimerState>,
     next_shutdown_timer_generation: usize,
-    outcome: OutcomeSlot,
+    outcome: Option<OutcomePromise>,
 }
 
 impl TcpConnectNetcat {
@@ -215,7 +207,7 @@ impl TcpConnectNetcat {
         bridge_handle: IoBridgeHandle,
         config: TcpConnectConfig,
         shutdown_after_input: bool,
-        outcome: OutcomeSlot,
+        outcome: OutcomePromise,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -226,10 +218,10 @@ impl TcpConnectNetcat {
             input_closed: false,
             shutdown_after_input,
             pending_send: false,
-            next_transmission_id: 1,
+            next_transmission_id: TransmissionId::ONE,
             shutdown_timer: None,
             next_shutdown_timer_generation: 1,
-            outcome,
+            outcome: Some(outcome),
         }
     }
 
@@ -305,7 +297,7 @@ impl TcpConnectNetcat {
 
         // Need to mutate through `self`, so need to get rid of the ref.
         let session = session.clone();
-        let transmission_id = self.next_transmission_id();
+        let transmission_id = self.next_transmission_id.take_next();
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
             let payload = match encode_line_payload(egress_pool, line).await {
@@ -385,18 +377,12 @@ impl TcpConnectNetcat {
 
     fn terminate_success(&mut self) {
         self.clear_shutdown_timer();
-        record_success(&self.outcome);
+        complete_outcome(&mut self.outcome, Ok(()));
     }
 
     fn terminate_failure(&mut self, message: String) {
         self.clear_shutdown_timer();
-        record_failure(&self.outcome, message);
-    }
-
-    fn next_transmission_id(&mut self) -> TransmissionId {
-        let id = self.next_transmission_id;
-        self.next_transmission_id = self.next_transmission_id.wrapping_add(1);
-        TransmissionId(id)
+        complete_outcome(&mut self.outcome, Err(Whatever::without_source(message)));
     }
 }
 
@@ -471,10 +457,10 @@ struct TcpListenNetcat {
     input_closed: bool,
     shutdown_after_input: bool,
     pending_send: bool,
-    next_transmission_id: usize,
+    next_transmission_id: TransmissionId,
     shutdown_timer: Option<ShutdownTimerState>,
     next_shutdown_timer_generation: usize,
-    outcome: OutcomeSlot,
+    outcome: Option<OutcomePromise>,
 }
 
 impl TcpListenNetcat {
@@ -482,7 +468,7 @@ impl TcpListenNetcat {
         bridge_handle: IoBridgeHandle,
         config: TcpListenConfig,
         shutdown_after_input: bool,
-        outcome: OutcomeSlot,
+        outcome: OutcomePromise,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -494,10 +480,10 @@ impl TcpListenNetcat {
             input_closed: false,
             shutdown_after_input,
             pending_send: false,
-            next_transmission_id: 1,
+            next_transmission_id: TransmissionId::ONE,
             shutdown_timer: None,
             next_shutdown_timer_generation: 1,
-            outcome,
+            outcome: Some(outcome),
         }
     }
 
@@ -647,7 +633,7 @@ impl TcpListenNetcat {
         };
 
         let session = session.clone();
-        let transmission_id = self.next_transmission_id();
+        let transmission_id = self.next_transmission_id.take_next();
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
             let payload = match encode_line_payload(egress_pool, line).await {
@@ -745,18 +731,12 @@ impl TcpListenNetcat {
 
     fn terminate_success(&mut self) {
         self.clear_shutdown_timer();
-        record_success(&self.outcome);
+        complete_outcome(&mut self.outcome, Ok(()));
     }
 
     fn terminate_failure(&mut self, message: String) {
         self.clear_shutdown_timer();
-        record_failure(&self.outcome, message);
-    }
-
-    fn next_transmission_id(&mut self) -> TransmissionId {
-        let id = self.next_transmission_id;
-        self.next_transmission_id = self.next_transmission_id.wrapping_add(1);
-        TransmissionId(id)
+        complete_outcome(&mut self.outcome, Err(Whatever::without_source(message)));
     }
 }
 

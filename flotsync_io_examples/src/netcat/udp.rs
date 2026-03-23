@@ -1,23 +1,22 @@
 use super::{
     NetcatInput,
-    OutcomeSlot,
+    OutcomePromise,
     Result,
     SCRIPTED_EXIT_GRACE,
     ShutdownTimerState,
     UdpMode,
+    complete_outcome,
     encode_line_payload,
     install_input_source,
-    new_outcome_slot,
+    new_outcome_promise,
     print_payload,
-    record_failure,
-    record_success,
     start_component,
     wait_for_component_outcome,
 };
 use crate::app::ExampleRuntime;
 use flotsync_io::prelude::*;
 use kompact::prelude::*;
-use snafu::prelude::*;
+use snafu::{FromString, Whatever, prelude::*};
 use std::{collections::VecDeque, net::SocketAddr};
 
 /// Runs the UDP flavour of the netcat example.
@@ -42,15 +41,11 @@ pub(super) fn run_udp(
         },
     };
     let shutdown_after_input = exit_after_send;
-    let outcome = new_outcome_slot();
-    let component = runtime.system().create(|| {
-        UdpNetcat::new(
-            runtime.bridge_handle().clone(),
-            mode,
-            shutdown_after_input,
-            outcome.clone(),
-        )
-    });
+    let (outcome_promise, outcome_future) = new_outcome_promise();
+    let bridge_handle = runtime.bridge_handle().clone();
+    let component = runtime
+        .system()
+        .create(move || UdpNetcat::new(bridge_handle, mode, shutdown_after_input, outcome_promise));
     match biconnect_components::<UdpPort, _, _>(runtime.bridge_component(), &component) {
         Ok(_) => {}
         Err(error) => {
@@ -59,7 +54,7 @@ pub(super) fn run_udp(
     }
     start_component(runtime, &component)?;
     install_input_source(component.actor_ref(), scripted_lines);
-    wait_for_component_outcome(&component, &outcome)
+    wait_for_component_outcome(&component, outcome_future, "netcat")
 }
 
 /// Static UDP configuration chosen from the CLI.
@@ -127,11 +122,11 @@ struct UdpNetcat {
     queued_lines: VecDeque<String>,
     input_closed: bool,
     shutdown_after_input: bool,
-    next_transmission_id: usize,
+    next_transmission_id: TransmissionId,
     send_pending: bool,
     shutdown_timer: Option<ShutdownTimerState>,
     next_shutdown_timer_generation: usize,
-    outcome: OutcomeSlot,
+    outcome: Option<OutcomePromise>,
 }
 
 impl UdpNetcat {
@@ -139,7 +134,7 @@ impl UdpNetcat {
         bridge_handle: IoBridgeHandle,
         mode: UdpNetcatMode,
         shutdown_after_input: bool,
-        outcome: OutcomeSlot,
+        outcome: OutcomePromise,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -151,11 +146,11 @@ impl UdpNetcat {
             queued_lines: VecDeque::new(),
             input_closed: false,
             shutdown_after_input,
-            next_transmission_id: 1,
+            next_transmission_id: TransmissionId::ONE,
             send_pending: false,
             shutdown_timer: None,
             next_shutdown_timer_generation: 1,
-            outcome,
+            outcome: Some(outcome),
         }
     }
 
@@ -344,7 +339,7 @@ impl UdpNetcat {
                 }
             };
 
-            let transmission_id = self.next_transmission_id();
+            let transmission_id = self.next_transmission_id.take_next();
             let reply_to = self
                 .actor_ref()
                 .recipient_with(UdpNetcatMessage::SendResult);
@@ -433,19 +428,13 @@ impl UdpNetcat {
 
     fn terminate_success(&mut self) {
         self.clear_shutdown_timer();
-        record_success(&self.outcome);
+        complete_outcome(&mut self.outcome, Ok(()));
     }
 
     fn terminate_failure(&mut self, message: String) {
         self.clear_shutdown_timer();
         log::error!("UDP component terminal failure: {message}");
-        record_failure(&self.outcome, message);
-    }
-
-    fn next_transmission_id(&mut self) -> TransmissionId {
-        let id = self.next_transmission_id;
-        self.next_transmission_id = self.next_transmission_id.wrapping_add(1);
-        TransmissionId(id)
+        complete_outcome(&mut self.outcome, Err(Whatever::without_source(message)));
     }
 }
 

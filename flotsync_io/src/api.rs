@@ -36,6 +36,18 @@ pub struct SocketId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TransmissionId(pub usize);
 
+impl TransmissionId {
+    /// First transmission id.
+    pub const ONE: Self = Self(1);
+
+    /// Returns the current identifier and advances the sequence with wrapping arithmetic.
+    pub fn take_next(&mut self) -> Self {
+        let current = *self;
+        self.0 = self.0.wrapping_add(1);
+        current
+    }
+}
+
 macro_rules! impl_local_id_display {
     ($id_type:ident, $label:literal) => {
         impl fmt::Display for $id_type {
