@@ -25,7 +25,8 @@ The default Rust integration suite does not try to validate:
 - fault-injection scenarios such as delay, reordering, corruption, or packet loss
 - broad external conformance suites or packet-level tooling
 
-Those areas are either environment-sensitive or better handled in later soak/fault-injection work.
+Those areas are either environment-sensitive or better handled in separate fault-injection or
+long-running soak work.
 
 ## Why Broadcast/Multicast Traffic Is Excluded
 
@@ -42,7 +43,7 @@ For `flotsync-0w3`, broadcast and multicast are therefore covered only through:
 
 ## Running
 
-The expected validation path for this task is:
+The expected baseline validation path is:
 
 ```bash
 cargo test -p flotsync_io

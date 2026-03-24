@@ -38,7 +38,7 @@ Tokio or a higher-level server framework that would hide the `flotsync_io` trans
 - automatic retries for UDP or TCP backpressure nacks
 - live broadcast or multicast traffic workflows
 
-For `http_server`, Proposal A intentionally does not cover:
+For `http_server`, the current example intentionally does not cover:
 
 - keep-alive or request pipelining
 - chunked request bodies
@@ -46,7 +46,7 @@ For `http_server`, Proposal A intentionally does not cover:
 - HTTP versions other than `HTTP/1.1`
 - routing beyond `GET /`, `HEAD /`, and `POST /echo`
 
-That broader HTTP behavior is tracked separately in `flotsync-8j6`.
+That broader HTTP behavior is outside the scope of this example.
 
 ## Examples
 
@@ -126,6 +126,6 @@ python3 flotsync_io_examples/scripts/http_h11_smoke.py --port PORT
 ```
 
 By default the helper runs a small suite covering `GET /`, `HEAD /`, `POST /echo`, and one
-negative `404` case. Use `--case post_echo` to run one case only. The current Proposal A server
+negative `404` case. Use `--case post_echo` to run one case only. The current example server
 always responds with `Connection: close`, so the harness should expect EOF after each response.
 Add `--verbose` if you want the raw `h11` event dump after each case summary.

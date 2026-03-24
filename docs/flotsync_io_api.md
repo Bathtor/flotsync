@@ -1,8 +1,8 @@
-# FlotSync Freeform I/O API (v1 Draft)
+# FlotSync Freeform I/O API
 
 ## Scope
 
-v1 adds Kompact-native freeform network I/O for raw bytes over UDP and TCP.
+`flotsync_io` provides Kompact-native freeform network I/O for raw bytes over UDP and TCP.
 
 ## Constraints
 
