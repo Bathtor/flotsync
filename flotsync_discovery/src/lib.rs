@@ -1,18 +1,16 @@
 use derive_more::{Deref, Display, From};
 
-#[cfg(feature = "kompact")]
+#[cfg(feature = "kompact-runtime")]
 pub use kompact;
 pub use uuid;
 pub mod errors;
-#[cfg(feature = "kompact")]
+#[cfg(feature = "kompact-runtime")]
 pub mod kompact_fsm;
 pub mod services;
 pub mod utils;
 
-#[cfg(all(feature = "zeroconf", not(feature = "zeroconf-tokio")))]
+#[cfg(feature = "zeroconf-support")]
 pub use zeroconf;
-#[cfg(feature = "zeroconf-tokio")]
-pub use zeroconf_tokio as zeroconf;
 
 /// A new-type wrapper for socket ports.
 #[derive(Clone, Copy, Debug, Deref, Display, PartialEq, Eq, Hash, From, PartialOrd, Ord)]

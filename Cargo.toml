@@ -1,9 +1,20 @@
 [workspace]
-members = ["flotsync_core", "flotsync_messages", "flotsync_discovery", "flotsync_discovery_cli", "flotsync_data_types", "flotsync_utils", "flotsync_replication"]
+members = [
+    "flotsync_core",
+    "flotsync_messages",
+    "flotsync_discovery",
+    "flotsync_discovery_cli",
+    "flotsync_data_types",
+    "flotsync_utils",
+    "flotsync_replication",
+    "flotsync_io",
+    "flotsync_io_examples",
+]
 resolver = "3"
 
 [workspace.dependencies]
-snafu = "0.8"
+snafu = "0.9"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
 uuid = "1"
+kompact = "0.11"

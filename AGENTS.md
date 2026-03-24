@@ -8,6 +8,7 @@
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
+- Add developer-facing docs or comments to non-public Rust types, fields, and helper functions when their role, invariants, or lifecycle are not obvious from local context.
 
 <!-- BEGIN BEADS INTEGRATION -->
 
@@ -49,6 +50,8 @@ bd update bd-42 --priority 1 --json
 ```bash
 bd close bd-42 --reason "Completed" --json
 ```
+
+_Note:_ Do _not_ close issues until I have reviewed the changes made and agreed that the issue is indeed completed. Ask if uncertain.
 
 ### Issue Types
 

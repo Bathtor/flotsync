@@ -1,19 +1,21 @@
 #[allow(unused)]
 use crate::errors::*;
-#[cfg(feature = "full-tokio")]
-use async_trait::async_trait;
 #[allow(unused)]
 use snafu::prelude::*;
 
-#[cfg(feature = "full-tokio")]
+#[cfg(feature = "peer-announcement-via-kompact")]
 mod peer_announcement;
-#[cfg(feature = "full-tokio")]
-pub use peer_announcement::PeerAnnouncementService;
+#[cfg(feature = "peer-announcement-via-kompact")]
+pub use peer_announcement::{
+    PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
+    PeerAnnouncementComponent,
+    PeerAnnouncementStartupError,
+    PeerAnnouncementStartupResult,
+    peer_announcement_startup_signal,
+};
 
-#[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
+#[cfg(feature = "zeroconf-support")]
 mod mdns_announcement;
-#[cfg(feature = "zeroconf-via-tokio")]
-pub use mdns_announcement::MdnsAnnouncementService;
 #[cfg(feature = "zeroconf-via-kompact")]
 pub use mdns_announcement::{
     MDNS_ANNOUNCEMENT_SERVICE_DEFAULT_OPTIONS,
@@ -22,142 +24,5 @@ pub use mdns_announcement::{
     MdnsAnnouncementMessages,
 };
 
-#[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
+#[cfg(feature = "zeroconf-support")]
 mod mdns_browser;
-
-#[cfg(feature = "full-tokio")]
-mod tokio_services {
-    use super::*;
-    use crate::utils::shutdown::{self, ShutdownHandle};
-    use std::time::Duration;
-
-    #[derive(Debug)]
-    pub struct ServiceHandle {
-        /// Identifies the service that this handle belongs to.
-        pub label: &'static str,
-        shutdown: ShutdownHandle,
-        join: tokio::task::JoinHandle<Result<()>>,
-    }
-    impl ServiceHandle {
-        pub async fn shutdown(self) -> Result<()> {
-            if self.shutdown.shutdown().is_err() {
-                log::warn!(
-                    "The {} service referenced by this service handle was already dropped.",
-                    self.label
-                );
-                Ok(())
-            } else {
-                self.join.await.context(JoinSnafu)?
-            }
-        }
-    }
-
-    // struct ShutdownChannel {
-    //     channel: oneshot::Receiver<oneshot::Sender<Result<()>>>,
-    // }
-    // impl ShutdownChannel {
-    //     // async fn execute_shutdown<F>(self, thunk: F)
-    //     // where
-    //     //     F: FnOnce() -> Result<()>,
-    //     // {
-    //     //     let result = thunk();
-    //     //     if self.channel.send(result).is_err() {
-    //     //         log::warn!(
-    //     //             "Could not send shutdown result, because the service handle was already dropped."
-    //     //         );
-    //     //     }
-    //     // }
-    // }
-
-    // fn create_handle(label: &'static str) -> (ServiceHandle, ShutdownChannel) {
-    //      let (tx, rx) = watch::channel(false);
-    //     let handle = ServiceHandle {
-    //         label,
-    //         shutdown: tx,
-    //     };
-    //     let channel = ShutdownChannel { channel: rx };
-    //     (handle, channel)
-    // }
-
-    pub async fn start_service<Fut, F, S>(
-        constructor: F,
-        options: S::Options,
-    ) -> Result<ServiceHandle>
-    where
-        Fut: Future<Output = Result<S>> + Send,
-        F: FnOnce(S::Options) -> Fut,
-        S: Service + Send + 'static,
-    {
-        let service_name = std::any::type_name::<S>();
-        let mut service = constructor(options).await?;
-        let (handle, mut watcher) = shutdown::watcher();
-        let join = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = watcher.wait() => {
-                        if let Err(e) = service.shutdown().await {
-                            log::error!("Error during service '{service_name}' shutdown: {e}");
-                        }
-                        break;
-                    }
-                    res = service.run() => {
-                        if let Err(e) = res {
-                            log::error!("Error during service '{service_name}' execution: {e}");
-                        }
-                        // continue
-                    }
-                }
-            }
-            Ok(())
-        });
-        Ok(ServiceHandle {
-            label: service_name,
-            shutdown: handle,
-            join,
-        })
-    }
-
-    /// A generic interface for a background kind of service.
-    #[async_trait]
-    pub trait Service {
-        type Options;
-
-        async fn run(&mut self) -> Result<()>;
-
-        async fn shutdown(self) -> Result<()>;
-    }
-
-    /// A way to hold on to some arbitrary value until the service handles decides to shutdown.
-    pub struct ServiceWrapper<T> {
-        inner: T,
-    }
-
-    impl<T> ServiceWrapper<T>
-    where
-        T: Send + 'static,
-    {
-        pub async fn setup(service: T) -> Result<Self> {
-            Ok(Self { inner: service })
-        }
-    }
-
-    #[async_trait]
-    impl<T> Service for ServiceWrapper<T>
-    where
-        T: Send + 'static,
-    {
-        type Options = T;
-
-        async fn run(&mut self) -> Result<()> {
-            tokio::time::interval(Duration::from_secs(60)).tick().await;
-            Ok(())
-        }
-
-        async fn shutdown(self) -> Result<()> {
-            drop(self.inner);
-            Ok(())
-        }
-    }
-}
-#[cfg(feature = "full-tokio")]
-pub use tokio_services::*;

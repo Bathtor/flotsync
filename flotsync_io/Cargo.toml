@@ -1,0 +1,49 @@
+[package]
+name = "flotsync_io"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["test-support"]
+test-support = [
+    "dep:slog-async",
+    "dep:slog-scope",
+    "dep:slog-stdlog",
+]
+
+[dependencies]
+flotsync_utils = { path = "../flotsync_utils" }
+bytes = "1"
+crossbeam-channel = "0.5"
+futures-channel = "0.3"
+kompact = { workspace = true }
+log = "0.4"
+mio = { version = "1", features = ["net", "os-poll"] }
+socket2 = "0.5"
+slog = "2"
+slog-async = { version = "2", optional = true }
+slog-scope = { version = "4", optional = true }
+slog-stdlog = { version = "4", optional = true }
+slog-term = "2"
+snafu = { workspace = true }
+uuid = { workspace = true }
+
+[[test]]
+name = "kompact_tcp"
+path = "tests/kompact_tcp.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "kompact_udp"
+path = "tests/kompact_udp.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "raw_tcp"
+path = "tests/raw_tcp.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "raw_udp"
+path = "tests/raw_udp.rs"
+required-features = ["test-support"]

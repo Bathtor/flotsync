@@ -7,7 +7,7 @@ edition = "2024"
 flotsync_utils = { path = "../flotsync_utils" }
 itertools = "0.14"
 regex = "1"
-snafu = "0.8"
+snafu = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 ahash = "0.8"
 base64 = "0.22"
