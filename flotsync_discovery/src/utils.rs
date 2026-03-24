@@ -19,33 +19,34 @@ impl fmt::Display for Base64Display<'_> {
 }
 
 /// A simple wrapper for handling async shutdowns.
-#[cfg(any(feature = "full-tokio", feature = "tokio-sync-only"))]
+#[cfg(feature = "zeroconf-via-kompact")]
 pub mod shutdown {
     use snafu::prelude::*;
-    use tokio::sync::watch;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub(crate)))]
     pub enum ShutdownError {
-        #[snafu(display("The shutdown handle was already dropped."))]
-        HandleDropped,
-        #[snafu(display("The shutdown watcher was already dropped."))]
-        WatcherDropped,
         #[snafu(display("The target of the shutdown panicked"))]
         Panic,
     }
 
     pub fn watcher() -> (ShutdownHandle, ShutdownWatch) {
-        let (tx, rx) = watch::channel(false);
+        let flag = Arc::new(AtomicBool::new(false));
         (
-            ShutdownHandle { sender: tx },
-            ShutdownWatch { receiver: rx },
+            ShutdownHandle {
+                flag: Arc::clone(&flag),
+            },
+            ShutdownWatch { flag },
         )
     }
 
     #[derive(Debug)]
     pub struct ShutdownHandle {
-        sender: watch::Sender<bool>,
+        flag: Arc<AtomicBool>,
     }
 
     impl ShutdownHandle {
@@ -59,33 +60,19 @@ pub mod shutdown {
             }
         }
 
-        pub fn shutdown(self) -> Result<(), ShutdownError> {
-            self.sender.send(true).map_err(|e| {
-                log::debug!("Error during shutdown send: {e}");
-                WatcherDroppedSnafu.build()
-            })
+        pub fn shutdown(self) {
+            self.flag.store(true, Ordering::Release);
         }
     }
 
     #[derive(Debug)]
     pub struct ShutdownWatch {
-        receiver: watch::Receiver<bool>,
+        flag: Arc<AtomicBool>,
     }
 
     impl ShutdownWatch {
         pub fn should_shutdown(&self) -> bool {
-            *self.receiver.borrow()
-        }
-
-        pub async fn wait(&mut self) -> Result<(), ShutdownError> {
-            self.receiver
-                .wait_for(|b| *b)
-                .await
-                .map(|_| ())
-                .map_err(|e| {
-                    log::debug!("Error during shutdown wait: {e}");
-                    HandleDroppedSnafu.build()
-                })
+            self.flag.load(Ordering::Acquire)
         }
     }
 
@@ -103,13 +90,12 @@ pub mod shutdown {
         ///
         /// Useful when the target is likely errored out already and we are mostly making sure that the memory gets cleaned up.
         pub fn shutdown_and_forget(self) {
-            // Ignore the result.
-            let _ = self.shutdown_handle.shutdown();
+            self.shutdown_handle.shutdown();
         }
 
         /// Shutdown and wait for the thread to complete.
         pub async fn shutdown(self) -> Result<T, ShutdownError> {
-            self.shutdown_handle.shutdown()?;
+            self.shutdown_handle.shutdown();
             blocking::unblock(|| self.join_handle.join().map_err(|_| PanicSnafu.build())).await
         }
     }

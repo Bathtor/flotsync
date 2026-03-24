@@ -5,13 +5,17 @@ edition = "2024"
 
 [features]
 default = ["zeroconf-via-kompact"]
-# These two are mutually exclusive.
-zeroconf-via-tokio = ["full-tokio", "zeroconf-tokio"]
-zeroconf-via-kompact = ["kompact", "zeroconf", "tokio-sync-only"]
-full-tokio = ["tokio/full", "async-trait"]
-tokio-sync-only = ["tokio/sync"]
+kompact-runtime = ["dep:kompact"]
+peer-announcement-via-kompact = ["kompact-runtime", "dep:flotsync_io"]
+zeroconf-support = ["dep:zeroconf"]
+zeroconf-via-kompact = [
+    "kompact-runtime",
+    "peer-announcement-via-kompact",
+    "zeroconf-support",
+]
 
 [dependencies]
+flotsync_io = { path = "../flotsync_io", default-features = false, optional = true }
 flotsync_messages = { path = "../flotsync_messages" }
 # socket2 = "0.5"
 derive_more = { version = "2", features = ["deref", "display", "from"] }
@@ -24,8 +28,8 @@ base64 = "0.22"
 blocking = "1"
 uuid = { version = "1", features = ["v4"] }
 
-tokio = { version = "1", default-features = false }
 zeroconf = { version = "0.15", optional = true }
-zeroconf-tokio = { version = "0.2", optional = true }
 kompact = { workspace = true, optional = true }
-async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+flotsync_io = { path = "../flotsync_io", features = ["test-support"] }

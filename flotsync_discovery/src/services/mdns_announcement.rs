@@ -19,6 +19,12 @@ impl Options {
         service_provider_name: Cow::Borrowed("flotsync_discovery"),
     };
 
+    /// Replaces the current instance id with `instance_id`.
+    pub fn with_instance_id(mut self, instance_id: Uuid) -> Self {
+        self.instance_id = instance_id;
+        self
+    }
+
     /// Replace the current instance id with a new random (V4) id.
     pub fn with_new_instance_id(&mut self) {
         self.instance_id = Uuid::new_v4();
@@ -319,154 +325,9 @@ pub use kompact_implementation::{
     MdnsAnnouncementMessages,
 };
 
-#[cfg(feature = "zeroconf-via-tokio")]
-mod tokio_implementation {
-    use super::*;
-    use crate::{
-        utils::shutdown::{self, ShutdownHandle, ShutdownWatch},
-        zeroconf::service::MdnsServiceAsync,
-    };
-    use tokio::{runtime::Builder, task::LocalSet};
-
-    pub struct MdnsAnnouncementService {
-        config: ServiceConfig,
-        state: ServiceState,
-    }
-    enum ServiceState {
-        Setup,
-        Running {
-            // This is almost the same as the ServiceHandle again,
-            // but MdnsServiceAsync doesn't let me move it between threads,
-            // so I cannot hold it's state directly here -.-
-            shutdown_handle: ShutdownHandle,
-            join: std::thread::JoinHandle<Result<()>>,
-        },
-        Stopped,
-    }
-
-    impl MdnsAnnouncementService {
-        /// The default options for this service:
-        ///
-        /// - port: 52156,
-        /// - instance_id: Uuid::nil(),
-        /// - service_provider_name: "flotsync_discovery",
-        pub const DEFAULT_OPTIONS: Options = Options::DEFAULT;
-
-        pub async fn setup(options: Options) -> Result<Self> {
-            let config = ServiceConfig::try_from_options(options)?;
-
-            Ok(Self {
-                config,
-                state: ServiceState::Setup,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl Service for MdnsAnnouncementService {
-        type Options = Options;
-
-        async fn run(&mut self) -> Result<()> {
-            match self.state {
-                ServiceState::Setup => {
-                    let service_type = self.config.service_type.clone();
-                    let port = *self.config.options.port;
-                    let service_provider_name = self.config.options.service_provider_name.clone();
-                    let txt_record = self.config.txt_record.clone();
-
-                    let (handle, watch) = shutdown::watcher();
-                    let rt = Builder::new_current_thread().enable_all().build().unwrap();
-                    let join = std::thread::spawn(move || {
-                        let local = LocalSet::new();
-
-                        let join = local.spawn_local(async move {
-                            run_mdns_service(
-                                service_type,
-                                port,
-                                service_provider_name.as_ref(),
-                                txt_record,
-                                watch,
-                            )
-                            .await
-                        });
-
-                        rt.block_on(
-                            local.run_until(async move { join.await.context(JoinSnafu).flatten() }),
-                        )
-                    });
-                    self.state = ServiceState::Running {
-                        shutdown_handle: handle,
-                        join,
-                    };
-                    Ok(())
-                }
-                ServiceState::Running { .. } => std::future::pending().await,
-                ServiceState::Stopped => {
-                    unreachable!("Should not invoke run anymore after stopping.")
-                }
-            }
-        }
-
-        async fn shutdown(mut self) -> Result<()> {
-            match self.state {
-                ServiceState::Setup => {
-                    log::debug!("Shutting down service before starting.");
-                    self.state = ServiceState::Stopped;
-                    Ok(())
-                }
-                ServiceState::Running {
-                    shutdown_handle,
-                    join,
-                } => {
-                    if let Err(e) = shutdown_handle.shutdown() {
-                        log::warn!("Error sending mDNS service shutdown instruction: {e}");
-                    }
-                    tokio::task::spawn_blocking(|| {
-                        join.join().map_err(|_| ThreadJoinSnafu.build()).flatten()
-                    })
-                    .await
-                    .context(JoinSnafu)
-                    .flatten()?;
-                    self.state = ServiceState::Stopped;
-                    Ok(())
-                }
-                ServiceState::Stopped => {
-                    log::warn!("Executed shutdown twice.");
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    async fn run_mdns_service(
-        service_type: ServiceType,
-        port: u16,
-        service_provider_name: &str,
-        txt_record: TxtRecord,
-        mut shutdown: ShutdownWatch,
-    ) -> Result<()> {
-        let service = build_mdns_service(service_type, port, service_provider_name, txt_record);
-        let mut service = MdnsServiceAsync::new(service).context(ZeroconfSnafu)?;
-
-        let registration = service.start().await.context(ZeroconfSnafu)?;
-        log::info!("Registered mDNS service: {registration:?}");
-        drop(registration);
-
-        if let Err(e) = shutdown.wait().await {
-            log::warn!("Error waiting for mDNS service shutdown instruction: {e}");
-        }
-
-        log::debug!("Shutting down mDNS service...");
-        service.shutdown().await.context(ZeroconfSnafu)?;
-        Ok(())
-    }
-}
-#[cfg(feature = "zeroconf-via-tokio")]
-pub use tokio_implementation::MdnsAnnouncementService;
-
 const FALLBACK_HOST_NAME: &str = "unknown";
 
-#[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
+#[cfg(feature = "zeroconf-support")]
 fn build_mdns_service(
     service_type: ServiceType,
     port: u16,

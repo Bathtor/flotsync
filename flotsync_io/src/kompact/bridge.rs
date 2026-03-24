@@ -174,6 +174,30 @@ impl UdpSendReplyTable {
     }
 }
 
+/// Tracks UDP open requests until the first bound/connect outcome is delivered locally.
+#[derive(Debug, Default)]
+struct UdpOpenRequestTable {
+    by_socket: HashMap<SocketId, UdpOpenRequestId>,
+}
+
+impl UdpOpenRequestTable {
+    fn insert(&mut self, socket_id: SocketId, request_id: UdpOpenRequestId) {
+        self.by_socket.insert(socket_id, request_id);
+    }
+
+    fn forget_socket(&mut self, socket_id: SocketId) {
+        let _ = self.by_socket.remove(&socket_id);
+    }
+
+    fn take(&mut self, socket_id: SocketId) -> Option<UdpOpenRequestId> {
+        self.by_socket.remove(&socket_id)
+    }
+
+    fn clear(&mut self) {
+        self.by_socket.clear();
+    }
+}
+
 /// Helper handle for the bridge's actor-style control surface.
 ///
 /// Use this handle for local resource-management operations such as opening TCP sessions and
@@ -234,7 +258,7 @@ pub struct IoBridge {
     driver: DriverComponentRef,
     egress_pool: EgressPool,
     owned_sockets: HashSet<SocketId>,
-    pending_udp_opens: HashMap<SocketId, UdpOpenRequestId>,
+    udp_open_requests: UdpOpenRequestTable,
     udp_send_replies: UdpSendReplyTable,
 }
 
@@ -257,7 +281,7 @@ impl IoBridge {
             driver,
             egress_pool,
             owned_sockets: HashSet::new(),
-            pending_udp_opens: HashMap::new(),
+            udp_open_requests: UdpOpenRequestTable::default(),
             udp_send_replies: UdpSendReplyTable::default(),
         }
     }
@@ -319,7 +343,7 @@ impl IoBridge {
                 }
             };
             async_self.owned_sockets.insert(socket_id);
-            async_self.pending_udp_opens.insert(socket_id, request_id);
+            async_self.udp_open_requests.insert(socket_id, request_id);
             async_self
                 .driver
                 .dispatch_udp(UdpCommand::Bind { socket_id, bind });
@@ -353,7 +377,7 @@ impl IoBridge {
                 }
             };
             async_self.owned_sockets.insert(socket_id);
-            async_self.pending_udp_opens.insert(socket_id, request_id);
+            async_self.udp_open_requests.insert(socket_id, request_id);
             async_self.driver.dispatch_udp(UdpCommand::Connect {
                 socket_id,
                 remote_addr,
@@ -379,6 +403,7 @@ impl IoBridge {
             });
             return;
         }
+        self.udp_open_requests.forget_socket(socket_id);
         let insert_result = self
             .udp_send_replies
             .insert(socket_id, transmission_id, reply_to);
@@ -407,6 +432,7 @@ impl IoBridge {
             });
             return;
         }
+        self.udp_open_requests.forget_socket(socket_id);
         self.driver
             .dispatch_udp(UdpCommand::Configure { socket_id, option });
     }
@@ -415,6 +441,7 @@ impl IoBridge {
         if !self.owns_socket(socket_id) {
             return;
         }
+        self.udp_open_requests.forget_socket(socket_id);
         self.driver.dispatch_udp(UdpCommand::Close { socket_id });
     }
 
@@ -424,7 +451,7 @@ impl IoBridge {
                 socket_id,
                 local_addr,
             } => {
-                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                let Some(request_id) = self.udp_open_requests.take(socket_id) else {
                     warn!(
                         self.log(),
                         "dropping UDP bound indication for socket {} without a pending open request",
@@ -444,7 +471,7 @@ impl IoBridge {
                 reason,
             } => {
                 self.owned_sockets.remove(&socket_id);
-                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                let Some(request_id) = self.udp_open_requests.take(socket_id) else {
                     warn!(
                         self.log(),
                         "dropping UDP bind failure for socket {} without a pending open request",
@@ -463,7 +490,7 @@ impl IoBridge {
                 local_addr,
                 remote_addr,
             } => {
-                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                let Some(request_id) = self.udp_open_requests.take(socket_id) else {
                     warn!(
                         self.log(),
                         "dropping UDP connected indication for socket {} without a pending open request",
@@ -485,7 +512,7 @@ impl IoBridge {
                 reason,
             } => {
                 self.owned_sockets.remove(&socket_id);
-                let Some(request_id) = self.pending_udp_opens.remove(&socket_id) else {
+                let Some(request_id) = self.udp_open_requests.take(socket_id) else {
                     warn!(
                         self.log(),
                         "dropping UDP connect failure for socket {} without a pending open request",
@@ -583,7 +610,7 @@ impl IoBridge {
                 reason,
             } => {
                 self.owned_sockets.remove(&socket_id);
-                self.pending_udp_opens.remove(&socket_id);
+                self.udp_open_requests.forget_socket(socket_id);
                 self.udp_send_replies
                     .fail_socket(socket_id, SendFailureReason::Closed);
                 self.udp.trigger(UdpIndication::Closed {
@@ -711,13 +738,13 @@ impl Actor for IoBridge {
 
 fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
     if bridge.owned_sockets.is_empty() {
-        bridge.pending_udp_opens.clear();
+        bridge.udp_open_requests.clear();
         bridge.udp_send_replies.clear();
         return Handled::Ok;
     }
 
     let sockets: Vec<SocketId> = bridge.owned_sockets.drain().collect();
-    bridge.pending_udp_opens.clear();
+    bridge.udp_open_requests.clear();
     for socket_id in &sockets {
         bridge
             .udp_send_replies

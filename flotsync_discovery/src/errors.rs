@@ -15,12 +15,9 @@ pub enum ServiceError {
     Io { source: std::io::Error },
     #[snafu(display("A thread panicked"))]
     ThreadJoin,
-    #[cfg(feature = "full-tokio")]
-    #[snafu(display("A task failed to shutdown properly: {source}"))]
-    Join { source: tokio::task::JoinError },
     #[snafu(display("Error during protobuf operations: {source}"))]
     Proto { source: protobuf::Error },
-    #[cfg(any(feature = "zeroconf", feature = "zeroconf-tokio"))]
+    #[cfg(feature = "zeroconf-support")]
     #[snafu(display("Error with a zeroconf service operation: {source}"))]
     Zeroconf {
         source: crate::zeroconf::error::Error,
