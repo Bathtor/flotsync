@@ -570,7 +570,11 @@ impl Actor for PeerAnnouncementComponent {
     }
 
     fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("Peer announcement component does not use network actor messages");
+        // Safe assumption for this component: peer announcements only use local actor messages and
+        // the local UDP port bridge. Without a network dispatcher in the system, no remote actor
+        // message can reach this handler. If that system invariant is broken, we prefer to crash
+        // loudly instead of pretending the component supports network traffic.
+        unreachable!("PeerAnnouncementComponent does not use Kompact network actor messages");
     }
 }
 
@@ -625,7 +629,9 @@ mod tests {
         }
 
         fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unimplemented!("UDP request probe does not use network actor messages");
+            // Test probe helper: this component only participates in local test wiring and never
+            // in Kompact network dispatch.
+            unreachable!("UdpRequestProbe does not use Kompact network actor messages");
         }
     }
 

@@ -285,7 +285,11 @@ mod kompact_implementation {
         }
 
         fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unimplemented!("Not using networking.");
+            // Safe assumption for this component: discovery announcements only use local actor
+            // messages and local Kompact ports. Without a network dispatcher in the system, no
+            // remote actor message can reach this handler. If that system invariant is broken, we
+            // prefer to crash loudly instead of pretending the component supports network traffic.
+            unreachable!("MdnsAnnouncementComponent does not use Kompact network actor messages");
         }
     }
     #[derive(Debug)]
