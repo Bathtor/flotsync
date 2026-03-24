@@ -14,9 +14,29 @@ use crate::{
     errors::{Error, Result},
     logging::RuntimeLogger,
 };
-use bytes::{Buf, BufMut, buf::UninitSlice};
+use bytes::{Buf, Bytes};
 use slog::{error, warn};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex, MutexGuard, Weak},
+    task::{Context, Poll},
+};
+
+macro_rules! payload_writer_fixed_width_methods {
+    ($(($be_name:ident, $le_name:ident, $ty:ty)),* $(,)?) => {
+        $(
+            async fn $be_name(&mut self, value: $ty) -> Result<()> {
+                let bytes = value.to_be_bytes();
+                self.write_slice(&bytes).await
+            }
+
+            async fn $le_name(&mut self, value: $ty) -> Result<()> {
+                let bytes = value.to_le_bytes();
+                self.write_slice(&bytes).await
+            }
+        )*
+    };
+}
 
 /// Shared egress pool used for outbound serialisation.
 #[derive(Clone, Debug)]
@@ -57,10 +77,9 @@ impl EgressPool {
         let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
         let (ready, logger) = {
             let mut state = self.lock_state()?;
-            state.waiters.push_back(EgressWaiter {
-                requested_bytes,
-                reply_tx,
-            });
+            state
+                .waiters
+                .push_back(EgressWaiter::exact_with_reply(requested_bytes, reply_tx));
             let ready = state.dispatch_waiters(&self.inner);
             let logger = state.logger.clone();
             (ready, logger)
@@ -75,10 +94,41 @@ impl EgressPool {
         self.config.clone()
     }
 
+    /// Creates one growable async writer over this pool.
+    pub fn writer(&self, hint_bytes: Option<usize>) -> EgressAsyncWriter {
+        let chunk_size = self.config.chunk_size;
+        let total_capacity = self.config.total_capacity_bytes();
+        let preferred_bytes = hint_bytes
+            .unwrap_or(chunk_size)
+            .max(chunk_size)
+            .min(total_capacity);
+        EgressAsyncWriter::new(self.clone(), preferred_bytes)
+    }
+
     pub(crate) fn replace_logger(&self, logger: RuntimeLogger) -> Result<()> {
         let mut state = self.lock_state()?;
         state.logger = logger;
         Ok(())
+    }
+
+    fn reserve_up_to(&self, preferred_bytes: usize) -> Result<PoolRequest<EgressReservation>> {
+        let max_bytes = self.config.total_capacity_bytes();
+        let chunk_size = self.config.chunk_size;
+        let preferred_bytes = preferred_bytes.max(chunk_size).min(max_bytes);
+
+        let (reply_tx, reply_rx) = futures_channel::oneshot::channel();
+        let (ready, logger) = {
+            let mut state = self.lock_state()?;
+            state
+                .waiters
+                .push_back(EgressWaiter::up_to_with_reply(preferred_bytes, reply_tx));
+            let ready = state.dispatch_waiters(&self.inner);
+            let logger = state.logger.clone();
+            (ready, logger)
+        };
+        EgressPoolState::deliver_ready(&logger, ready);
+
+        Ok(PoolRequest::new(reply_rx))
     }
 
     /// Retargets a uniquely owned pooled lease to this egress pool without copying bytes.
@@ -158,6 +208,110 @@ impl EgressPool {
     }
 }
 
+/// Async payload-serialization surface for pool-backed egress writers.
+///
+/// This deliberately models "build one payload and seal it later", not a byte-stream sink. The
+/// enclosing API decides when the finished payload is sent, so this trait does not expose
+/// `flush`/`close`-style sink semantics. Implementations may either copy readable bytes into pooled
+/// storage or adopt owned payload fragments zero-copy when `adopt_payload` is used.
+#[allow(async_fn_in_trait)]
+pub trait PayloadWriter {
+    /// Writes the full byte slice into the pending payload.
+    async fn write_slice(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// Writes the readable bytes from one payload by copying them into this writer.
+    async fn copy_payload(&mut self, payload: &IoPayload) -> Result<()> {
+        let mut cursor = payload.cursor();
+        while cursor.has_remaining() {
+            let chunk = cursor.chunk();
+            let chunk_len = chunk.len();
+            self.write_slice(chunk).await?;
+            cursor.advance(chunk_len);
+        }
+        Ok(())
+    }
+
+    /// Writes one readable sub-range from an existing payload by copying it into this writer.
+    async fn copy_payload_slice(
+        &mut self,
+        payload: &IoPayload,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let payload_len = payload.len();
+        let Some(slice) = payload.clone().try_slice(offset, len) else {
+            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        };
+        self.copy_payload(&slice).await
+    }
+
+    /// Adopts one owned payload fragment into the pending payload.
+    ///
+    /// This must preserve the fragment as an owned payload part rather than copying its readable
+    /// bytes back through pooled storage.
+    async fn adopt_payload(&mut self, payload: IoPayload) -> Result<()>;
+
+    /// Splices one static byte slice into the pending payload without copying it.
+    ///
+    /// This seals any currently open pooled fragment and appends `bytes` as a separate payload
+    /// fragment. It is a good fit for occasional prebuilt/static fragments and a poor fit for many
+    /// tiny pieces in a loop, where [`PayloadWriter::write_slice`] keeps the payload more compact.
+    async fn splice_static(&mut self, bytes: &'static [u8]) -> Result<()> {
+        self.splice_bytes(Bytes::from_static(bytes)).await
+    }
+
+    /// Splices one owned byte buffer into the pending payload without copying it.
+    ///
+    /// This seals any currently open pooled fragment and appends `bytes` as a separate payload
+    /// fragment. It is a good fit for occasional prebuilt fragments and a poor fit for many tiny
+    /// pieces in a loop, where [`PayloadWriter::write_slice`] keeps the payload more compact.
+    async fn splice_bytes(&mut self, bytes: Bytes) -> Result<()> {
+        self.adopt_payload(IoPayload::Bytes(bytes)).await
+    }
+
+    /// Adopts one readable sub-range from an owned payload fragment.
+    async fn adopt_payload_slice(
+        &mut self,
+        payload: IoPayload,
+        offset: usize,
+        len: usize,
+    ) -> Result<()>;
+
+    /// Writes a boolean as `0` or `1`.
+    async fn write_bool(&mut self, value: bool) -> Result<()> {
+        self.write_u8(u8::from(value)).await
+    }
+
+    /// Writes one unsigned byte.
+    async fn write_u8(&mut self, value: u8) -> Result<()> {
+        self.write_slice(&[value]).await
+    }
+
+    /// Writes one signed byte.
+    async fn write_i8(&mut self, value: i8) -> Result<()> {
+        let bytes = value.to_be_bytes();
+        self.write_slice(&bytes).await
+    }
+
+    payload_writer_fixed_width_methods!(
+        (write_u16_be, write_u16_le, u16),
+        (write_u32_be, write_u32_le, u32),
+        (write_u64_be, write_u64_le, u64),
+        (write_u128_be, write_u128_le, u128),
+        (write_i16_be, write_i16_le, i16),
+        (write_i32_be, write_i32_le, i32),
+        (write_i64_be, write_i64_le, i64),
+        (write_i128_be, write_i128_le, i128),
+        (write_f32_be, write_f32_le, f32),
+        (write_f64_be, write_f64_le, f64),
+    );
+
+    /// Writes a string's UTF-8 bytes verbatim.
+    async fn write_str(&mut self, value: &str) -> Result<()> {
+        self.write_slice(value.as_bytes()).await
+    }
+}
+
 /// Internal egress-side state guarded by [`EgressPool::inner`].
 ///
 /// `waiters` is a FIFO queue. The dispatcher always examines the front request first and stops as
@@ -180,20 +334,41 @@ impl EgressPoolState {
         let mut ready = Vec::new();
 
         'waiters: while let Some(waiter) = self.waiters.front() {
-            let chunk_count =
-                chunks_for_bytes(waiter.requested_bytes, self.chunks.config.chunk_size);
-            if !self.chunks.can_reserve_chunks(chunk_count) {
-                break 'waiters;
-            }
+            let chunk_count = match waiter.kind {
+                EgressWaiterKind::Exact { requested_bytes } => {
+                    let chunk_count =
+                        chunks_for_bytes(requested_bytes, self.chunks.config.chunk_size);
+                    if !self.chunks.can_reserve_chunks(chunk_count) {
+                        break 'waiters;
+                    }
+                    chunk_count
+                }
+                EgressWaiterKind::UpTo { preferred_bytes } => {
+                    let preferred_chunk_count =
+                        chunks_for_bytes(preferred_bytes, self.chunks.config.chunk_size);
+                    let chunk_count = self
+                        .chunks
+                        .reservable_chunk_count()
+                        .min(preferred_chunk_count);
+                    if chunk_count == 0 {
+                        break 'waiters;
+                    }
+                    chunk_count
+                }
+            };
 
             let waiter = self.waiters.pop_front().expect("front waiter vanished");
             let chunks = self
                 .chunks
                 .reserve_chunks(chunk_count)
                 .expect("chunk availability changed while dispatching waiters");
+            let reserved_bytes = match waiter.kind {
+                EgressWaiterKind::Exact { requested_bytes } => requested_bytes,
+                EgressWaiterKind::UpTo { .. } => chunk_count * self.chunks.config.chunk_size,
+            };
             ready.push((
                 waiter.reply_tx,
-                EgressReservation::new(waiter.requested_bytes, chunks, Arc::downgrade(pool)),
+                EgressReservation::new(reserved_bytes, chunks, Arc::downgrade(pool)),
             ));
         }
 
@@ -286,84 +461,83 @@ impl EgressPoolState {
 
 #[derive(Debug)]
 struct EgressWaiter {
-    requested_bytes: usize,
+    kind: EgressWaiterKind,
     reply_tx: futures_channel::oneshot::Sender<Result<EgressReservation>>,
+}
+
+impl EgressWaiter {
+    fn exact_with_reply(
+        requested_bytes: usize,
+        reply_tx: futures_channel::oneshot::Sender<Result<EgressReservation>>,
+    ) -> Self {
+        Self {
+            kind: EgressWaiterKind::Exact { requested_bytes },
+            reply_tx,
+        }
+    }
+
+    fn up_to_with_reply(
+        preferred_bytes: usize,
+        reply_tx: futures_channel::oneshot::Sender<Result<EgressReservation>>,
+    ) -> Self {
+        Self {
+            kind: EgressWaiterKind::UpTo { preferred_bytes },
+            reply_tx,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EgressWaiterKind {
+    Exact { requested_bytes: usize },
+    UpTo { preferred_bytes: usize },
 }
 
 /// Exclusive reservation of pooled egress capacity.
 pub struct EgressReservation {
-    requested_bytes: usize,
+    reserved_bytes: usize,
     chunks: Option<Vec<PooledChunk>>,
     pool: Weak<Mutex<EgressPoolState>>,
 }
 
 impl EgressReservation {
     fn new(
-        requested_bytes: usize,
+        reserved_bytes: usize,
         chunks: Vec<PooledChunk>,
         pool: Weak<Mutex<EgressPoolState>>,
     ) -> Self {
         Self {
-            requested_bytes,
+            reserved_bytes,
             chunks: Some(chunks),
             pool,
         }
     }
 
     /// Returns the reserved payload budget in bytes.
-    pub fn requested_bytes(&self) -> usize {
-        self.requested_bytes
-    }
-
-    /// Serialises into the reserved pooled memory and optionally returns the resulting lease.
-    ///
-    /// A closure that writes zero bytes succeeds with `None` and returns the entire reservation to
-    /// the pool immediately.
-    pub(crate) fn write_with_optional<T>(
-        mut self,
-        write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
-    ) -> Result<(T, Option<IoLease>)> {
-        let chunks = self
-            .chunks
-            .take()
-            .expect("egress reservation consumed twice");
-        let mut writer = IoBufWriter::new(chunks, self.requested_bytes);
-
-        let write_result = write(&mut writer);
-        match write_result {
-            Ok(value) => {
-                if writer.written_bytes() == 0 {
-                    EgressPoolState::return_chunks_from_weak(&self.pool, writer.into_chunks());
-                    return Ok((value, None));
-                }
-                let (lease, unused_chunks) =
-                    writer.finish(LeaseRecycler::Egress(self.pool.clone()))?;
-                EgressPoolState::return_chunks_from_weak(&self.pool, unused_chunks);
-                Ok((value, Some(lease)))
-            }
-            Err(error) => {
-                EgressPoolState::return_chunks_from_weak(&self.pool, writer.into_chunks());
-                Err(error)
-            }
-        }
-    }
-
-    /// Serialises into the reserved pooled memory and returns the resulting lease.
-    pub fn write_with<T>(
-        self,
-        write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
-    ) -> Result<(T, IoLease)> {
-        let (value, lease) = self.write_with_optional(write)?;
-        let lease = lease.ok_or(Error::EmptyIoLease)?;
-        Ok((value, lease))
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
     }
 
     /// Convenience helper for copying a byte slice into the reserved pooled memory.
-    pub fn copy_bytes(self, bytes: &[u8]) -> Result<IoLease> {
-        let ((), lease) = self.write_with(|writer| {
-            writer.put_slice(bytes);
-            Ok(())
-        })?;
+    pub fn copy_bytes(mut self, bytes: &[u8]) -> Result<IoLease> {
+        if bytes.is_empty() {
+            return Err(Error::EmptyIoLease);
+        }
+        if bytes.len() > self.reserved_bytes {
+            return Err(Error::EgressReservationOverflow {
+                reserved_bytes: self.reserved_bytes,
+                attempted_bytes: bytes.len(),
+            });
+        }
+
+        let mut chunks = self
+            .chunks
+            .take()
+            .expect("egress reservation consumed twice");
+        copy_bytes_into_chunks(&mut chunks, bytes);
+        let (used_segments, unused_chunks) = split_chunks_by_written_prefix(chunks, bytes.len());
+        let lease = IoLease::from_pooled(used_segments, LeaseRecycler::Egress(self.pool.clone()));
+        EgressPoolState::return_chunks_from_weak(&self.pool, unused_chunks);
         Ok(lease)
     }
 }
@@ -376,136 +550,253 @@ impl Drop for EgressReservation {
     }
 }
 
-/// Writer over an egress reservation's pooled memory.
+/// Growable async writer over pooled egress memory and appended payload fragments.
 ///
-/// The writer owns all reserved chunks exclusively until it is finished or dropped. `chunk_index`
-/// and `chunk_offset` always point at the next writable byte, while `written_bytes` tracks the
-/// total payload prefix that will become visible in the resulting [`IoLease`].
-pub struct IoBufWriter {
+/// This is the default high-level serialization path. It can grow incrementally by requesting
+/// more pooled capacity from the egress pool and can also append pre-existing payload fragments
+/// without copying them back into pooled byte storage.
+///
+/// Staged bytes are only sealed into a finished payload when [`EgressAsyncWriter::finish`] is
+/// called. Dropping the writer discards any staged payload and returns pooled capacity to the
+/// egress pool.
+pub struct EgressAsyncWriter {
+    pool: EgressPool,
+    parts: Vec<IoPayload>,
     chunks: Vec<PooledChunk>,
-    requested_bytes: usize,
     written_bytes: usize,
     chunk_index: usize,
     chunk_offset: usize,
+    next_preferred_bytes: usize,
+    pending_request: Option<PoolRequest<EgressReservation>>,
 }
 
-impl IoBufWriter {
-    fn new(chunks: Vec<PooledChunk>, requested_bytes: usize) -> Self {
+impl EgressAsyncWriter {
+    fn new(pool: EgressPool, preferred_bytes: usize) -> Self {
         Self {
-            chunks,
-            requested_bytes,
+            pool,
+            parts: Vec::new(),
+            chunks: Vec::new(),
             written_bytes: 0,
             chunk_index: 0,
             chunk_offset: 0,
+            next_preferred_bytes: preferred_bytes,
+            pending_request: None,
         }
     }
 
-    /// Returns the number of bytes written so far.
-    pub fn written_bytes(&self) -> usize {
-        self.written_bytes
+    async fn write_all_bytes(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let written = std::future::poll_fn(|cx| self.poll_write_result(cx, bytes)).await?;
+            bytes = &bytes[written..];
+        }
+        Ok(())
     }
 
-    fn finish(self, recycler: LeaseRecycler) -> Result<(IoLease, Vec<PooledChunk>)> {
-        if self.written_bytes == 0 {
-            return Err(Error::EmptyIoLease);
+    fn adopt_payload_part(&mut self, payload: IoPayload) -> Result<()> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+        let payload = self.pool.adopt_payload(payload)?;
+        self.flush_current_part()?;
+        if !payload.is_empty() {
+            self.parts.push(payload);
+        }
+        Ok(())
+    }
+
+    /// Seals the staged bytes into one payload and returns it.
+    ///
+    /// This is the only commit point for bytes staged through the writer. Dropping the writer
+    /// without calling `finish` discards any unsent staged payload and returns pooled capacity.
+    pub fn finish(mut self) -> Result<Option<IoPayload>> {
+        self.flush_current_part()?;
+        Ok(match self.parts.len() {
+            0 => None,
+            1 => Some(self.parts.pop().expect("single finished part vanished")),
+            _ => Some(IoPayload::chain(std::mem::take(&mut self.parts))),
+        })
+    }
+
+    fn poll_write_result(&mut self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<Result<usize>> {
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
         }
 
-        let mut remaining = self.written_bytes;
-        let mut used_segments = Vec::new();
-        let mut unused_chunks = Vec::new();
-        for chunk in self.chunks {
-            if remaining == 0 {
-                unused_chunks.push(chunk);
+        let mut written = 0;
+        loop {
+            let available = self.current_chunk_remaining();
+            if available > 0 {
+                let to_copy = available.min(bytes.len() - written);
+                let chunk = &mut self.chunks[self.chunk_index];
+                chunk[self.chunk_offset..self.chunk_offset + to_copy]
+                    .copy_from_slice(&bytes[written..written + to_copy]);
+                self.written_bytes += to_copy;
+                self.chunk_offset += to_copy;
+                written += to_copy;
+                if self.chunk_offset == chunk.len() {
+                    self.chunk_index += 1;
+                    self.chunk_offset = 0;
+                }
+                if written == bytes.len() {
+                    return Poll::Ready(Ok(written));
+                }
                 continue;
             }
 
-            let written_in_chunk = remaining.min(chunk.len());
-            remaining -= written_in_chunk;
-            used_segments.push(LeaseSegment {
-                chunk,
-                written_len: written_in_chunk,
-            });
+            match self.poll_acquire_more(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending if written > 0 => return Poll::Ready(Ok(written)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
+    }
+
+    fn poll_acquire_more(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.pending_request.is_none() {
+            let request = self.pool.reserve_up_to(self.next_preferred_bytes)?;
+            self.pending_request = Some(request);
+            self.next_preferred_bytes = self.grow_preferred_bytes();
+        }
+
+        let request = self
+            .pending_request
+            .as_mut()
+            .expect("pending request must exist after starting one");
+        match Pin::new(request).poll(cx) {
+            Poll::Ready(Ok(mut reservation)) => {
+                let chunks = reservation
+                    .chunks
+                    .take()
+                    .expect("ready async reservation lost its chunks");
+                self.chunks.extend(chunks);
+                self.pending_request = None;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => {
+                self.pending_request = None;
+                Poll::Ready(Err(error))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn current_chunk_remaining(&self) -> usize {
+        if self.chunk_index >= self.chunks.len() {
+            return 0;
+        }
+        self.chunks[self.chunk_index].len() - self.chunk_offset
+    }
+
+    fn flush_current_part(&mut self) -> Result<()> {
+        let recycler = LeaseRecycler::Egress(Arc::downgrade(&self.pool.inner));
+        if self.written_bytes == 0 {
+            if !self.chunks.is_empty() {
+                let chunks = std::mem::take(&mut self.chunks);
+                EgressPoolState::return_chunks_from_weak(&Arc::downgrade(&self.pool.inner), chunks);
+            }
+            self.chunk_index = 0;
+            self.chunk_offset = 0;
+            return Ok(());
+        }
+
+        let (used_segments, unused_chunks) =
+            split_chunks_by_written_prefix(std::mem::take(&mut self.chunks), self.written_bytes);
+        EgressPoolState::return_chunks_from_weak(&Arc::downgrade(&self.pool.inner), unused_chunks);
 
         let lease = IoLease::from_pooled(used_segments, recycler);
-        Ok((lease, unused_chunks))
+        self.parts.push(IoPayload::Lease(lease));
+        self.written_bytes = 0;
+        self.chunk_index = 0;
+        self.chunk_offset = 0;
+        Ok(())
     }
 
-    fn into_chunks(self) -> Vec<PooledChunk> {
-        self.chunks
-    }
-
-    /// Copies one payload into the reserved pooled memory.
-    ///
-    /// This writes the payload's currently readable bytes in order, independent of whether the
-    /// source is lease-backed, byte-backed, or chained.
-    pub fn put_payload(&mut self, payload: &IoPayload) {
-        let mut cursor = payload.cursor();
-        while cursor.has_remaining() {
-            let chunk = cursor.chunk();
-            let chunk_len = chunk.len();
-            self.put_slice(chunk);
-            cursor.advance(chunk_len);
-        }
-    }
-
-    /// Copies one readable payload sub-range into the reserved pooled memory.
-    ///
-    /// The caller must supply a valid readable range for `payload`. This panics if the range is
-    /// invalid because all current use-sites derive the range from previously validated parser
-    /// state.
-    pub fn put_payload_slice(&mut self, payload: &IoPayload, offset: usize, len: usize) {
-        let slice = payload
-            .clone()
-            .try_slice(offset, len)
-            .unwrap_or_else(|| panic!("invalid IoPayload slice range {offset}..{}", offset + len));
-        self.put_payload(&slice);
+    fn grow_preferred_bytes(&self) -> usize {
+        self.next_preferred_bytes
+            .saturating_mul(2)
+            .max(self.pool.config.chunk_size)
+            .min(self.pool.config.total_capacity_bytes())
     }
 }
 
-// SAFETY:
-// - `IoBufWriter` owns all reserved chunks exclusively while the writer exists.
-// - `chunk_mut` exposes only the unwritten tail of the current chunk, clamped to the reservation
-//   budget reported by `remaining_mut`.
-// - `advance_mut` maintains `chunk_index` and `chunk_offset` within chunk boundaries and never lets
-//   the visible writable region extend past the reserved payload budget.
-unsafe impl BufMut for IoBufWriter {
-    fn remaining_mut(&self) -> usize {
-        self.requested_bytes - self.written_bytes
-    }
-
-    unsafe fn advance_mut(&mut self, cnt: usize) {
-        assert!(
-            cnt <= self.remaining_mut(),
-            "advanced past reserved writer budget"
-        );
-
-        let current_chunk = &self.chunks[self.chunk_index];
-        let current_remaining = current_chunk.len() - self.chunk_offset;
-        assert!(
-            cnt <= current_remaining,
-            "advanced past current chunk boundary"
-        );
-
-        self.written_bytes += cnt;
-        self.chunk_offset += cnt;
-        if self.chunk_offset == current_chunk.len() && self.written_bytes < self.requested_bytes {
-            self.chunk_index += 1;
-            self.chunk_offset = 0;
+impl Drop for EgressAsyncWriter {
+    fn drop(&mut self) {
+        if !self.chunks.is_empty() {
+            let chunks = std::mem::take(&mut self.chunks);
+            EgressPoolState::return_chunks_from_weak(&Arc::downgrade(&self.pool.inner), chunks);
         }
     }
+}
 
-    fn chunk_mut(&mut self) -> &mut UninitSlice {
-        let budget = self.remaining_mut();
-        let chunk = &mut self.chunks[self.chunk_index];
-        let available_in_chunk = chunk.len() - self.chunk_offset;
-        let length = available_in_chunk.min(budget);
-        unsafe {
-            // SAFETY: `chunk` is owned exclusively by this writer, `chunk_offset..chunk_offset +
-            // length` stays within the current chunk, and `length` is additionally clamped by the
-            // remaining reservation budget reported via `remaining_mut`.
-            let ptr = chunk.as_mut_ptr().add(self.chunk_offset);
-            UninitSlice::from_raw_parts_mut(ptr, length)
-        }
+impl PayloadWriter for EgressAsyncWriter {
+    async fn write_slice(&mut self, bytes: &[u8]) -> Result<()> {
+        self.write_all_bytes(bytes).await
     }
+
+    async fn adopt_payload(&mut self, payload: IoPayload) -> Result<()> {
+        self.adopt_payload_part(payload)
+    }
+
+    async fn adopt_payload_slice(
+        &mut self,
+        payload: IoPayload,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let payload_len = payload.len();
+        let Some(slice) = payload.try_slice(offset, len) else {
+            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        };
+        self.adopt_payload_part(slice)
+    }
+}
+
+fn invalid_payload_slice_range(payload_len: usize, offset: usize, len: usize) -> Error {
+    Error::InvalidIoPayloadSliceRange {
+        offset,
+        len,
+        payload_len,
+    }
+}
+
+fn copy_bytes_into_chunks(chunks: &mut [PooledChunk], mut bytes: &[u8]) {
+    for chunk in chunks.iter_mut() {
+        if bytes.is_empty() {
+            break;
+        }
+
+        let to_copy = bytes.len().min(chunk.len());
+        chunk[..to_copy].copy_from_slice(&bytes[..to_copy]);
+        bytes = &bytes[to_copy..];
+    }
+
+    debug_assert!(
+        bytes.is_empty(),
+        "copy_bytes_into_chunks was asked to copy more bytes than the provided chunks can hold"
+    );
+}
+
+fn split_chunks_by_written_prefix(
+    chunks: Vec<PooledChunk>,
+    written_bytes: usize,
+) -> (Vec<LeaseSegment>, Vec<PooledChunk>) {
+    let mut remaining = written_bytes;
+    let mut used_segments = Vec::new();
+    let mut unused_chunks = Vec::new();
+    for chunk in chunks {
+        if remaining == 0 {
+            unused_chunks.push(chunk);
+            continue;
+        }
+
+        let written_in_chunk = remaining.min(chunk.len());
+        remaining -= written_in_chunk;
+        used_segments.push(LeaseSegment {
+            chunk,
+            written_len: written_in_chunk,
+        });
+    }
+
+    (used_segments, unused_chunks)
 }

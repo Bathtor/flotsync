@@ -80,6 +80,23 @@ pub enum Error {
     EmptyIoLease,
 
     #[snafu(display(
+        "invalid IoPayload slice range offset {offset} len {len} for payload length {payload_len}"
+    ))]
+    InvalidIoPayloadSliceRange {
+        offset: usize,
+        len: usize,
+        payload_len: usize,
+    },
+
+    #[snafu(display(
+        "egress serialization exceeded the reserved budget: attempted {attempted_bytes} bytes with only {reserved_bytes} bytes reserved"
+    ))]
+    EgressReservationOverflow {
+        reserved_bytes: usize,
+        attempted_bytes: usize,
+    },
+
+    #[snafu(display(
         "cannot transfer pooled payload ownership because the payload is still shared"
     ))]
     SharedIoPayloadOwnership,

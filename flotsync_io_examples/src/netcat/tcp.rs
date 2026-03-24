@@ -299,8 +299,8 @@ impl TcpConnectNetcat {
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
             let send_result = session
-                .send_with(transmission_id, line.len(), |writer| {
-                    writer.put_slice(line.as_bytes());
+                .send_with(transmission_id, Some(line.len()), async |writer| {
+                    writer.write_slice(line.as_bytes()).await?;
                     Ok(())
                 })
                 .await;
@@ -626,8 +626,8 @@ impl TcpListenNetcat {
         self.pending_send = true;
         self.spawn_local(move |mut async_self| async move {
             let send_result = session
-                .send_with(transmission_id, line.len(), |writer| {
-                    writer.put_slice(line.as_bytes());
+                .send_with(transmission_id, Some(line.len()), async |writer| {
+                    writer.write_slice(line.as_bytes()).await?;
                     Ok(())
                 })
                 .await;

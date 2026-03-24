@@ -7,7 +7,7 @@ pub(crate) use crate::support::{
 };
 use bytes::Bytes;
 use clap::{Args, Parser, Subcommand};
-use flotsync_io::prelude::{EgressPool, IoPayload};
+use flotsync_io::prelude::{EgressPool, IoPayload, PayloadWriter};
 use kompact::prelude::*;
 use snafu::{Whatever, prelude::*};
 use std::{
@@ -164,17 +164,12 @@ async fn encode_line_payload(
     egress_pool: EgressPool,
     line: String,
 ) -> flotsync_io::errors::Result<IoPayload> {
-    if line.is_empty() {
-        return Ok(IoPayload::Bytes(Bytes::new()));
-    }
-
-    let reservation_request = egress_pool.reserve(line.len())?;
-    let reservation = reservation_request.await?;
-    let (_, lease) = reservation.write_with(|writer| {
-        writer.put_slice(line.as_bytes());
-        Ok(())
-    })?;
-    Ok(IoPayload::Lease(lease))
+    let mut writer = egress_pool.writer(Some(line.len()));
+    writer.write_slice(line.as_bytes()).await?;
+    Ok(match writer.finish()? {
+        Some(payload) => payload,
+        None => IoPayload::Bytes(Bytes::new()),
+    })
 }
 
 fn install_input_source<M>(actor_ref: ActorRef<M>, scripted_lines: Vec<String>)

@@ -2,17 +2,16 @@ use crate::{
     app::ExampleRuntime,
     support::{OutcomePromise, complete_outcome, new_outcome_promise, wait_for_component_outcome},
 };
-use bytes::{Buf, BufMut};
+use bytes::Buf;
 use clap::Parser;
 use flotsync_io::prelude::{
     BoundedCollector,
     CloseReason,
     CollectUntil,
-    EgressPool,
     IoBridgeHandle,
-    IoBufWriter,
     IoPayload,
     OpenTcpListener,
+    PayloadWriter,
     PendingTcpSession,
     TcpListenerEvent,
     TcpListenerRef,
@@ -611,7 +610,7 @@ impl HttpConnectionComponent {
             ));
             return;
         };
-        let encode_plan = ResponseEncodePlan {
+        let mut encode_plan = ResponseEncodePlan {
             response,
             retained_input: std::mem::take(&mut self.retained_input)
                 .into_iter()
@@ -621,18 +620,33 @@ impl HttpConnectionComponent {
         };
         let transmission_id = self.next_transmission_id.take_next();
         let peer_addr = self.peer_addr;
+        let hint_bytes = Some(reserved_response_header_capacity(&encode_plan.response));
         self.response_started = true;
         self.spawn_local(move |mut async_self| async move {
-            let payload =
-                match encode_response_payload(session.egress_pool().clone(), encode_plan).await {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return async_self.fail_and_die(format!(
-                            "failed to encode HTTP response for {peer_addr}: {error}",
-                        ));
+            let send_result = session
+                .send_and_close_with(transmission_id, hint_bytes, async |writer| {
+                    write_response_head(writer, &encode_plan.response).await?;
+                    match encode_plan.response.body {
+                        HttpResponseBody::Static(body) if encode_plan.response.include_body => {
+                            writer.splice_static(body).await?;
+                        }
+                        HttpResponseBody::EchoedRequestBody
+                            if encode_plan.response.include_body =>
+                        {
+                            writer
+                                .adopt_payload(build_echo_body_payload(&mut encode_plan)?)
+                                .await?;
+                        }
+                        HttpResponseBody::Static(_) | HttpResponseBody::EchoedRequestBody => {}
                     }
-                };
-            session.send_and_close(transmission_id, payload);
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = send_result {
+                return async_self.fail_and_die(format!(
+                    "failed to encode HTTP response for {peer_addr}: {error}",
+                ));
+            }
             Handled::Ok
         });
     }
@@ -881,33 +895,6 @@ fn simple_text_response(
     }
 }
 
-async fn encode_response_payload(
-    egress_pool: EgressPool,
-    mut plan: ResponseEncodePlan,
-) -> flotsync_io::errors::Result<IoPayload> {
-    let reserved_capacity = reserved_response_header_capacity(&plan.response);
-    let reservation_request = egress_pool.reserve(reserved_capacity)?;
-    let reservation = reservation_request.await?;
-    let (_, lease) = reservation.write_with(|writer| {
-        write_response_head(writer, &plan.response);
-        Ok(())
-    })?;
-    let header = IoPayload::Lease(lease);
-    let body = match plan.response.body {
-        HttpResponseBody::Static(body) if plan.response.include_body => {
-            Some(IoPayload::from_static(body))
-        }
-        HttpResponseBody::EchoedRequestBody if plan.response.include_body => {
-            Some(build_echo_body_payload(&egress_pool, &mut plan)?)
-        }
-        HttpResponseBody::Static(_) | HttpResponseBody::EchoedRequestBody => None,
-    };
-    Ok(match body {
-        Some(body) => IoPayload::chain([header, body]),
-        None => header,
-    })
-}
-
 const BASE_RESPONSE_HEADER_RESERVATION: usize =
     b"HTTP/1.1 999 HTTP Version Not Supported\r\nConnection: close\r\nContent-Length: \r\nContent-Type: \r\n\r\n"
         .len();
@@ -916,9 +903,8 @@ const ALLOW_HEADER_RESERVATION: usize = b"Allow: \r\n".len();
 
 /// Returns a conservative pooled-capacity reservation for one encoded HTTP response.
 ///
-/// Proposal A responses are tiny, so readability is more important here than exact byte math.
-/// `write_with` only publishes the written prefix and returns unused chunks to the pool, so a
-/// small over-reservation is acceptable.
+/// Proposal A responses are tiny, so readability is more important here than exact byte math. This
+/// is only a hint for the async writer's initial reservation, so a small over-estimate is fine.
 fn reserved_response_header_capacity(response: &HttpResponseSpec) -> usize {
     let mut reserved =
         BASE_RESPONSE_HEADER_RESERVATION + MAX_CONTENT_LENGTH_DIGITS + response.content_type.len();
@@ -928,30 +914,37 @@ fn reserved_response_header_capacity(response: &HttpResponseSpec) -> usize {
     reserved
 }
 
-fn write_response_head(writer: &mut IoBufWriter, response: &HttpResponseSpec) {
+async fn write_response_head(
+    writer: &mut impl PayloadWriter,
+    response: &HttpResponseSpec,
+) -> flotsync_io::errors::Result<()> {
     let mut content_length_buffer = ItoaBuffer::new();
     let content_length_text = content_length_buffer.format(response.content_length);
     let reason = response.status.canonical_reason().unwrap_or("Unknown");
 
-    writer.put_slice(b"HTTP/1.1 ");
-    writer.put_slice(response.status.as_str().as_bytes());
-    writer.put_slice(b" ");
-    writer.put_slice(reason.as_bytes());
-    writer.put_slice(b"\r\nConnection: close\r\nContent-Length: ");
-    writer.put_slice(content_length_text.as_bytes());
-    writer.put_slice(b"\r\nContent-Type: ");
-    writer.put_slice(response.content_type.as_bytes());
-    writer.put_slice(b"\r\n");
+    writer.write_slice(b"HTTP/1.1 ").await?;
+    writer
+        .write_slice(response.status.as_str().as_bytes())
+        .await?;
+    writer.write_slice(b" ").await?;
+    writer.write_slice(reason.as_bytes()).await?;
+    writer
+        .write_slice(b"\r\nConnection: close\r\nContent-Length: ")
+        .await?;
+    writer.write_slice(content_length_text.as_bytes()).await?;
+    writer.write_slice(b"\r\nContent-Type: ").await?;
+    writer.write_slice(response.content_type.as_bytes()).await?;
+    writer.write_slice(b"\r\n").await?;
     if let Some(allow) = response.allow {
-        writer.put_slice(b"Allow: ");
-        writer.put_slice(allow.as_bytes());
-        writer.put_slice(b"\r\n");
+        writer.write_slice(b"Allow: ").await?;
+        writer.write_slice(allow.as_bytes()).await?;
+        writer.write_slice(b"\r\n").await?;
     }
-    writer.put_slice(b"\r\n");
+    writer.write_slice(b"\r\n").await?;
+    Ok(())
 }
 
 fn build_echo_body_payload(
-    egress_pool: &EgressPool,
     plan: &mut ResponseEncodePlan,
 ) -> flotsync_io::errors::Result<IoPayload> {
     let mut parts = Vec::with_capacity(plan.body_slices.len());
@@ -974,7 +967,7 @@ fn build_echo_body_payload(
                     slice.payload_index
                 )
             });
-        parts.push(egress_pool.adopt_payload(payload)?);
+        parts.push(payload);
     }
     Ok(IoPayload::chain(parts))
 }

@@ -15,7 +15,7 @@ use crate::{
         UdpSocketOption,
     },
     errors::Result,
-    pool::{EgressPool, IoBufWriter},
+    pool::{EgressAsyncWriter, EgressPool},
 };
 use ::kompact::prelude::{
     ActorRef,
@@ -29,7 +29,7 @@ use ::kompact::prelude::{
     promise,
 };
 use bytes::Bytes;
-use std::{io, net::SocketAddr, sync::Arc};
+use std::{io, net::SocketAddr, ops::AsyncFnOnce, sync::Arc};
 use uuid::Uuid;
 
 /// Describes why an open-style operation could not make the requested socket or session usable.
@@ -592,26 +592,45 @@ impl TcpSessionRef {
         self.send(transmission_id, IoPayload::from_static(bytes));
     }
 
-    /// Serialises one payload into the shared egress pool and sends it once ready.
-    ///
-    /// `estimated_bytes` must be an upper bound for the bytes the closure will write. The current
-    /// reservation API does not grow dynamically once granted, so underestimation can cause the
-    /// writer to panic when it advances past the reserved budget. If the closure writes zero
-    /// bytes, this sends one empty payload instead of failing.
-    pub async fn send_with<T>(
+    /// Serialises one payload through a growable async writer and sends it once the closure
+    /// completes successfully.
+    pub async fn send_with<T, F>(
         &self,
         transmission_id: TransmissionId,
-        estimated_bytes: usize,
-        write: impl FnOnce(&mut IoBufWriter) -> Result<T>,
-    ) -> Result<T> {
-        let reservation = self.egress_pool.reserve(estimated_bytes.max(1))?;
-        let reservation = reservation.await?;
-        let (value, lease) = reservation.write_with_optional(write)?;
-        let payload = match lease {
-            Some(lease) => IoPayload::Lease(lease),
+        hint_bytes: Option<usize>,
+        write: F,
+    ) -> Result<T>
+    where
+        F: for<'a> AsyncFnOnce(&'a mut EgressAsyncWriter) -> Result<T>,
+    {
+        let mut writer = self.egress_pool.writer(hint_bytes);
+        let value = write(&mut writer).await?;
+        let payload = match writer.finish()? {
+            Some(payload) => payload,
             None => IoPayload::Bytes(Bytes::new()),
         };
         self.send(transmission_id, payload);
+        Ok(value)
+    }
+
+    /// Serialises one payload through a growable async writer, sends it, and then requests a
+    /// graceful close once the send drains.
+    pub async fn send_and_close_with<T, F>(
+        &self,
+        transmission_id: TransmissionId,
+        hint_bytes: Option<usize>,
+        write: F,
+    ) -> Result<T>
+    where
+        F: for<'a> AsyncFnOnce(&'a mut EgressAsyncWriter) -> Result<T>,
+    {
+        let mut writer = self.egress_pool.writer(hint_bytes);
+        let value = write(&mut writer).await?;
+        let payload = match writer.finish()? {
+            Some(payload) => payload,
+            None => IoPayload::Bytes(Bytes::new()),
+        };
+        self.send_and_close(transmission_id, payload);
         Ok(value)
     }
 

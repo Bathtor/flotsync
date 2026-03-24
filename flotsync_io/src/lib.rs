@@ -67,16 +67,17 @@ pub mod prelude {
             tagged_tcp_session_event_target,
         },
         pool::{
+            EgressAsyncWriter,
             EgressPool,
             EgressReservation,
             IngressBuffer,
             IngressPool,
-            IoBufWriter,
             IoBufferConfig,
             IoBufferPools,
             IoCursor,
             IoLease,
             IoPoolConfig,
+            PayloadWriter,
             PoolRequest,
         },
     };
