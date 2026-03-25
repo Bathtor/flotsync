@@ -462,11 +462,13 @@ mod tests {
             linear: LinearString<u32>,
             ops: Vec<LinearStringDiff<u32>>,
         }
-        let mut writers = Vec::from_fn(3, |id| Writer {
-            id,
-            linear: shared_base.clone(),
-            ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
-        });
+        let mut writers: Vec<_> = (0..3)
+            .map(|id| Writer {
+                id,
+                linear: shared_base.clone(),
+                ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
+            })
+            .collect();
         for group in SMALL_CHANGE_TEST_GROUPS.iter() {
             for (writer_index, writer) in writers.iter_mut().enumerate() {
                 let op =

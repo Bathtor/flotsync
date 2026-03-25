@@ -339,6 +339,7 @@ impl SpawnedNetcat {
         }
     }
 
+    #[allow(dead_code)] // for later
     fn wait_for_stderr(&self, pattern: &str) {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
