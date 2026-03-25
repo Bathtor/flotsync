@@ -217,6 +217,12 @@ impl UdpOpenRequestId {
     }
 }
 
+impl Default for UdpOpenRequestId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Request used with the TCP listener manager side of an [`IoBridge`](super::IoBridge).
 ///
 /// Sending this request asks the bridge to allocate one inbound TCP listener endpoint, start an

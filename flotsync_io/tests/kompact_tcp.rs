@@ -93,9 +93,9 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
                 saw_write_suspended = true;
             }
             TcpSessionEvent::SendNack {
-                transmission_id,
+                transmission_id: TransmissionId(11),
                 reason,
-            } if transmission_id == TransmissionId(11) => {
+            } => {
                 assert_eq!(reason, SendFailureReason::Backpressure);
                 saw_backpressure_nack = true;
             }
@@ -112,9 +112,9 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
     let mut saw_received = false;
     while !saw_send_ack || !saw_write_resumed || !saw_received {
         match recv_until(&session1_rx, |_| true) {
-            TcpSessionEvent::SendAck { transmission_id }
-                if transmission_id == TransmissionId(10) =>
-            {
+            TcpSessionEvent::SendAck {
+                transmission_id: TransmissionId(10),
+            } => {
                 saw_send_ack = true;
             }
             TcpSessionEvent::WriteResumed => {

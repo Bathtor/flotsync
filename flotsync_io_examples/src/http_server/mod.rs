@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn consume_payload_cursor_preserves_response_from_first_segment() {
-        let lease = multi_segment_lease(&vec![b'x'; 160]);
+        let lease = multi_segment_lease(&[b'x'; 160]);
         let mut seen_offsets = Vec::new();
 
         let outcome = consume_payload_cursor(lease.cursor(), |payload_offset, _chunk| {

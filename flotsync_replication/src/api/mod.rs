@@ -208,17 +208,9 @@ impl Default for GroupMigrationPolicy {
 }
 
 /// Runtime configuration passed during `load`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplicationConfig {
     pub group_migration_policy: GroupMigrationPolicy,
-}
-
-impl Default for ReplicationConfig {
-    fn default() -> Self {
-        Self {
-            group_migration_policy: Default::default(),
-        }
-    }
 }
 
 /// Request to create a new replication group.

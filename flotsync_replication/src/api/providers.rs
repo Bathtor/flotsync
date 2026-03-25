@@ -18,7 +18,7 @@ pub struct VecRowProvider {
 
 impl VecRowProvider {
     pub fn new(rows: Vec<RowChange>) -> Self {
-        Self { rows: rows.into() }
+        Self { rows }
     }
 }
 

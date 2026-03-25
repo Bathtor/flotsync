@@ -637,36 +637,30 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
         .write_all(b"hello")
         .expect("write tagged TCP session payload");
 
-    match recv_until(&tagged_events_rx, |event| {
+    let TaggedSessionEvent { tag, event } = recv_until(&tagged_events_rx, |event| {
         matches!(event.event, TcpSessionEvent::Received { .. })
-    }) {
-        TaggedSessionEvent { tag, event } => {
-            assert_eq!(tag, 7);
-            match event {
-                TcpSessionEvent::Received { payload } => {
-                    assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
-                }
-                other => unreachable!("filtered to tagged TCP session Received, got {other:?}"),
-            }
+    });
+    assert_eq!(tag, 7);
+    match event {
+        TcpSessionEvent::Received { payload } => {
+            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
         }
+        other => unreachable!("filtered to tagged TCP session Received, got {other:?}"),
     }
 
     session_ref.close(false);
-    match recv_until(&tagged_events_rx, |event| {
+    let TaggedSessionEvent { tag, event } = recv_until(&tagged_events_rx, |event| {
         matches!(event.event, TcpSessionEvent::Closed { .. })
-    }) {
-        TaggedSessionEvent { tag, event } => {
-            assert_eq!(tag, 7);
-            match event {
-                TcpSessionEvent::Closed { reason } => {
-                    assert!(matches!(
-                        reason,
-                        CloseReason::Graceful | CloseReason::Aborted
-                    ));
-                }
-                other => unreachable!("filtered to tagged TCP session Closed, got {other:?}"),
-            }
+    });
+    assert_eq!(tag, 7);
+    match event {
+        TcpSessionEvent::Closed { reason } => {
+            assert!(matches!(
+                reason,
+                CloseReason::Graceful | CloseReason::Aborted
+            ));
         }
+        other => unreachable!("filtered to tagged TCP session Closed, got {other:?}"),
     }
 
     opened_listener

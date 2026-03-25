@@ -842,7 +842,9 @@ mod tests {
         );
 
         assert!(
-            requests_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            requests_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
             "stopping during Opening should not emit extra UDP requests"
         );
 

@@ -53,6 +53,7 @@ impl<V> TrieMap<V> {
         node.value.as_ref()
     }
 
+    #[allow(dead_code)] // for later
     pub fn get_mut(&mut self, key: &Identifier) -> Option<&mut V> {
         let mut node = &mut self.root;
         for segment in key.segments_iter() {

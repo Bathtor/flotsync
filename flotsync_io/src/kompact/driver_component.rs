@@ -305,7 +305,7 @@ impl IoDriverComponent {
             }
         };
         let log = self.log().clone();
-        let _ = self.spawn_off(async move {
+        let release_task = self.spawn_off(async move {
             if let Err(error) = release.await {
                 warn!(
                     log,
@@ -315,6 +315,7 @@ impl IoDriverComponent {
                 );
             }
         });
+        std::mem::drop(release_task);
     }
 
     async fn open_tcp_listener_inner(

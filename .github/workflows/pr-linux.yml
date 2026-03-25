@@ -1,0 +1,51 @@
+name: pr-linux
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pr-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-ci:
+    name: linux-ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install discovery dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libavahi-compat-libdnssd-dev
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Run discovery feature matrix
+        working-directory: flotsync_discovery
+        run: ./test_features.sh

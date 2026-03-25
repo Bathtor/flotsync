@@ -1753,11 +1753,14 @@ fn build_counter_operation(
     }
 }
 
+type LinearListOperations<OperationId> =
+    Vec<DataOperation<IdWithIndex<OperationId>, PrimitiveValueArray>>;
+
 fn build_linear_list_operation<OperationId>(
     current: &LinearListValue<OperationId>,
     target: PrimitiveValueArray,
     operation_id: OperationId,
-) -> crate::OperationResult<Option<Vec<DataOperation<IdWithIndex<OperationId>, PrimitiveValueArray>>>>
+) -> crate::OperationResult<Option<LinearListOperations<OperationId>>>
 where
     OperationId:
         Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,

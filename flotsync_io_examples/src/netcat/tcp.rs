@@ -409,8 +409,7 @@ impl ComponentLifecycle for TcpConnectNetcat {
                     Handled::Ok
                 }
                 Err(error) => {
-                    return async_self
-                        .fail_and_die(format!("failed to open TCP session: {error:?}"));
+                    async_self.fail_and_die(format!("failed to open TCP session: {error:?}"))
                 }
             }
         })

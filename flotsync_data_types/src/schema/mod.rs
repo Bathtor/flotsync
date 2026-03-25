@@ -25,10 +25,10 @@ impl Schema {
     pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
         let mut columns = HashMap::with_capacity(N);
         for field in fields {
-            if let Some(default_value) = field.default_value.clone() {
-                if let Err(source) = field.initial(default_value) {
-                    panic!("Invalid default value for field '{}': {source}", field.name);
-                }
+            if let Some(default_value) = field.default_value.clone()
+                && let Err(source) = field.initial(default_value)
+            {
+                panic!("Invalid default value for field '{}': {source}", field.name);
             }
             if let Some(existing_field) = columns.insert(field.name.to_string(), field) {
                 panic!("Duplicate field name: {}", existing_field.name);

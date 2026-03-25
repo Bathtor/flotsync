@@ -160,12 +160,12 @@ fn finite_state_contains(
 ) -> bool {
     match (states, value) {
         (NullablePrimitiveValueArray::NonNull(states), NullablePrimitiveValueRef::Value(value)) => {
-            finite_state_contains_non_null(states, &value)
+            finite_state_contains_non_null(states, value)
         }
         (
             NullablePrimitiveValueArray::Nullable { values, .. },
             NullablePrimitiveValueRef::Value(value),
-        ) => finite_state_contains_non_null(values, &value),
+        ) => finite_state_contains_non_null(values, value),
         (NullablePrimitiveValueArray::Nullable { .. }, NullablePrimitiveValueRef::Null) => true,
         (NullablePrimitiveValueArray::NonNull(_), NullablePrimitiveValueRef::Null) => false,
     }

@@ -68,9 +68,7 @@ impl UdpSocketEntry {
 
     /// Returns the readiness interests required for the socket's current suspension state.
     fn desired_interest(&self) -> Option<Interest> {
-        if self.socket.is_none() {
-            return None;
-        }
+        self.socket.as_ref()?;
 
         match (self.read_suspended, self.write_suspended) {
             (false, false) => Some(Interest::READABLE),
@@ -134,15 +132,15 @@ impl UdpRuntimeState {
             .remove(socket_id.0)
             .ok_or(Error::UnknownSocket { socket_id })?;
         let remote_addr = entry.remote_addr;
-        if let Some(mut socket) = entry.socket {
-            if entry.registered {
-                let deregister_result = registry.deregister(&mut socket);
-                if let Err(error) = deregister_result {
-                    warn!(
-                        self.logger,
-                        "failed to deregister UDP socket {} during release: {}", socket_id, error
-                    );
-                }
+        if let Some(mut socket) = entry.socket
+            && entry.registered
+        {
+            let deregister_result = registry.deregister(&mut socket);
+            if let Err(error) = deregister_result {
+                warn!(
+                    self.logger,
+                    "failed to deregister UDP socket {} during release: {}", socket_id, error
+                );
             }
         }
         Ok(ReleasedUdpSocket {
@@ -324,6 +322,10 @@ impl UdpRuntimeState {
         }))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "driver send handlers take runtime resources explicitly to stay testable"
+    )]
     pub(super) fn handle_send(
         &mut self,
         socket_id: SocketId,
@@ -727,17 +729,17 @@ fn reset_socket_after_failure(
     entry: &mut UdpSocketEntry,
     registry: &Registry,
 ) {
-    if let Some(socket) = entry.socket.as_mut() {
-        if entry.registered {
-            let deregister_result = registry.deregister(socket);
-            if let Err(error) = deregister_result {
-                warn!(
-                    logger,
-                    "failed to deregister UDP socket {} while resetting failed bind/connect state: {}",
-                    entry.record.token.0,
-                    error
-                );
-            }
+    if let Some(socket) = entry.socket.as_mut()
+        && entry.registered
+    {
+        let deregister_result = registry.deregister(socket);
+        if let Err(error) = deregister_result {
+            warn!(
+                logger,
+                "failed to deregister UDP socket {} while resetting failed bind/connect state: {}",
+                entry.record.token.0,
+                error
+            );
         }
     }
     entry.socket = None;

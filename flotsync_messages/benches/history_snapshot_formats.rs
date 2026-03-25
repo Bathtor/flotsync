@@ -88,7 +88,7 @@ where
 struct LvwFixture {
     name: &'static str,
     value_type: NullableBasicDataType,
-    nodes: Vec<SnapshotNode<UpdateId, ModelNullableBasicValue>>,
+    nodes: Vec<SnapshotNode<IdWithIndex<UpdateId>, ModelNullableBasicValue>>,
 }
 
 struct LinearStringFixture {
@@ -121,7 +121,11 @@ fn build_lvw_array_fixture(name: &'static str, updates: usize) -> LvwFixture {
         ModelNullableBasicValue::Value(ModelBasicValue::Array(ModelPrimitiveValueArray::Int(
             vec![1, 2, 3],
         ))),
-        [update_id(1), update_id(2), update_id(3)],
+        [
+            indexed_update_id(1),
+            indexed_update_id(2),
+            indexed_update_id(3),
+        ],
     );
 
     for step in 0..updates {
@@ -135,7 +139,7 @@ fn build_lvw_array_fixture(name: &'static str, updates: usize) -> LvwFixture {
                 ModelPrimitiveValueArray::Int(vec![step as i64, step as i64 + 1, step as i64 + 2]),
             )),
         };
-        value.update(update_id(version), value_update);
+        value.update(indexed_update_id(version), value_update);
     }
 
     let mut sink = CollectSink::new(Clone::clone);
@@ -247,7 +251,7 @@ fn list_bytes(fixture: &LinearListFixture) -> Vec<u8> {
 fn decode_lvw(
     bytes: &[u8],
     fixture: &LvwFixture,
-) -> Vec<SnapshotNode<UpdateId, ModelNullableBasicValue>> {
+) -> Vec<SnapshotNode<IdWithIndex<UpdateId>, ModelNullableBasicValue>> {
     let history = proto::HistorySnapshot::parse_from_bytes(bytes).unwrap();
     decode_columnar_latest_value_wins_history_snapshot(history, fixture.value_type.clone()).unwrap()
 }
@@ -265,7 +269,7 @@ fn decode_list(
     decode_columnar_linear_list_history_snapshot(history, fixture.value_type).unwrap()
 }
 
-fn reconstruct_lvw(nodes: Vec<SnapshotNode<UpdateId, ModelNullableBasicValue>>) {
+fn reconstruct_lvw(nodes: Vec<SnapshotNode<IdWithIndex<UpdateId>, ModelNullableBasicValue>>) {
     let value = LinearLatestValueWins::from_snapshot_nodes(
         nodes.into_iter().map(Ok::<_, ColumnarHistoryCodecError>),
     )

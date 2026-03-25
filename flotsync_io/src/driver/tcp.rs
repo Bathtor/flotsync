@@ -129,9 +129,7 @@ impl TcpConnectionEntry {
     }
 
     fn desired_interest(&self) -> Option<Interest> {
-        if self.stream.is_none() {
-            return None;
-        }
+        self.stream.as_ref()?;
         if self.connect_pending {
             return Some(Interest::WRITABLE);
         }
@@ -269,17 +267,15 @@ impl TcpRuntimeState {
             .remove(listener_id.0)
             .ok_or(Error::UnknownListener { listener_id })?;
         let mut listener = entry.listener;
-        if let Some(listener) = listener.as_mut() {
-            if entry.registered {
-                let deregister_result = registry.deregister(listener);
-                if let Err(error) = deregister_result {
-                    warn!(
-                        self.logger,
-                        "failed to deregister TCP listener {} during release: {}",
-                        listener_id,
-                        error
-                    );
-                }
+        if let Some(listener) = listener.as_mut()
+            && entry.registered
+        {
+            let deregister_result = registry.deregister(listener);
+            if let Err(error) = deregister_result {
+                warn!(
+                    self.logger,
+                    "failed to deregister TCP listener {} during release: {}", listener_id, error
+                );
             }
         }
 
@@ -306,17 +302,17 @@ impl TcpRuntimeState {
             .remove(connection_id.0)
             .ok_or(Error::UnknownConnection { connection_id })?;
         let mut stream = entry.stream;
-        if let Some(stream) = stream.as_mut() {
-            if entry.registered {
-                let deregister_result = registry.deregister(stream);
-                if let Err(error) = deregister_result {
-                    warn!(
-                        self.logger,
-                        "failed to deregister TCP connection {} during release: {}",
-                        connection_id,
-                        error
-                    );
-                }
+        if let Some(stream) = stream.as_mut()
+            && entry.registered
+        {
+            let deregister_result = registry.deregister(stream);
+            if let Err(error) = deregister_result {
+                warn!(
+                    self.logger,
+                    "failed to deregister TCP connection {} during release: {}",
+                    connection_id,
+                    error
+                );
             }
         }
         Ok(entry.record)
@@ -1164,17 +1160,17 @@ impl TcpRuntimeState {
             .remove(connection_id.0)
             .ok_or(Error::UnknownConnection { connection_id })?;
         let mut stream = entry.stream;
-        if let Some(stream) = stream.as_mut() {
-            if entry.registered {
-                let deregister_result = registry.deregister(stream);
-                if let Err(error) = deregister_result {
-                    warn!(
-                        self.logger,
-                        "failed to deregister pending TCP connection {} during release: {}",
-                        connection_id,
-                        error
-                    );
-                }
+        if let Some(stream) = stream.as_mut()
+            && entry.registered
+        {
+            let deregister_result = registry.deregister(stream);
+            if let Err(error) = deregister_result {
+                warn!(
+                    self.logger,
+                    "failed to deregister pending TCP connection {} during release: {}",
+                    connection_id,
+                    error
+                );
             }
         }
         Ok(entry.record)
@@ -1215,10 +1211,10 @@ fn reset_connection_after_failure(
     entry: &mut TcpConnectionEntry,
     registry: &Registry,
 ) -> io::Result<()> {
-    if let Some(stream) = entry.stream.as_mut() {
-        if entry.registered {
-            registry.deregister(stream)?;
-        }
+    if let Some(stream) = entry.stream.as_mut()
+        && entry.registered
+    {
+        registry.deregister(stream)?;
     }
     entry.reset_to_reserved();
     Ok(())
@@ -1723,9 +1719,9 @@ mod tests {
                 }
                 DriverEvent::Tcp(TcpEvent::SendNack {
                     connection_id: _,
-                    transmission_id,
+                    transmission_id: TransmissionId(11),
                     reason,
-                }) if transmission_id == TransmissionId(11) => {
+                }) => {
                     assert_eq!(reason, SendFailureReason::Backpressure);
                     saw_backpressure_nack = true;
                 }
