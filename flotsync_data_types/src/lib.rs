@@ -1,4 +1,3 @@
-#![feature(vec_from_fn)]
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
