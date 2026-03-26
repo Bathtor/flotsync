@@ -106,6 +106,10 @@ Must convey:
 
 ## 6. Sub-Protocol B: GroupBroadcast
 
+Implementation detail:
+See [`group_broadcast_queue_model.md`](./group_broadcast_queue_model.md) for the
+concrete queue/state-machine and ownership model that refines this section.
+
 ### 6.1 Purpose and Ownership
 
 This sub-protocol fans messages to:
@@ -113,18 +117,21 @@ This sub-protocol fans messages to:
 - all currently reachable group members
 - configured relays
 
-It also keeps pending delivery work for currently unreachable members.
+For delivery classes that allow retry, it also keeps pending delivery work for
+currently unreachable routes.
 
 It does not interpret replication payload semantics.
 It does enforce delivery-class behavior (`Durable` vs `BestEffort`).
 
-### 6.2 State Model (per group message, per target)
+### 6.2 State Model (per group message, per route)
 
 - `Queued`: accepted for fan-out.
 - `AttemptingDirect`: direct delivery in progress.
 - `AwaitingRelayStore`: durable message still needs relay persistence confirmation.
-- `PendingTarget`: target currently unreachable; retry pending.
-- `StoredAtRelay`, `Delivered`, and `Expired` are terminal bookkeeping outcomes, not explicit active states.
+- `PendingRoute`: route currently unavailable; retry pending.
+- `StoredAtRelay`, `Delivered`, and `Expired` are terminal bookkeeping outcomes,
+  not explicit active states; reaching one cleans up the active local route
+  state.
 
 ### 6.3 Message Classes
 
@@ -154,12 +161,12 @@ Notes:
 #### `DeliveryReceipt` (optional)
 
 Purpose:
-Signal successful target delivery for queue compaction.
+Signal successful route delivery for queue compaction.
 
 Must convey:
 
 - message id
-- target identity
+- route identity
 
 ### 6.4 Delivery Class Semantics
 
@@ -167,9 +174,11 @@ Must convey:
     - for messages that carry important group state and should remain retrievable
     - broadcaster should attempt direct delivery and relay persistence before giving up
     - relay stores/indexes by cleartext header fields including `message_ref`
+    - unreachable routes may remain pending for later retry
 - `BestEffort`:
     - for transient request-like messages (for example `NeedRange`)
     - broadcast once, no persistence guarantee required
+    - unreachable or failed routes expire instead of remaining pending
 
 ## 7. Sub-Protocol C: Replication
 
