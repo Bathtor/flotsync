@@ -199,16 +199,18 @@ It is a protobuf convention rather than a standalone RFC.
 
 This should be preferred over inventing a custom stream framing.
 
-### 3.8 Datagram Multipart Remains Deferred
+### 3.8 Datagram Multipart Is Defined Separately
 
-Handling logical payloads that do not fit into a single datagram is deferred.
+Handling logical payloads that do not fit into a single datagram is defined in a
+separate design note:
 
-That work is tracked in:
+- [Datagram Multipart Transfer](./datagram_multipart_transfer.md)
+
+That work remains tracked in:
 
 - `flotsync-p9u` `Design logical-payload transfer over datagram routes`
 
-That task must survey existing relevant protocols and framing schemes before
-proposing a custom multipart design.
+The multipart design remains iterative, but it is no longer wholly deferred.
 
 ### 3.9 Route Transport Surfaces Only `Sent`
 
