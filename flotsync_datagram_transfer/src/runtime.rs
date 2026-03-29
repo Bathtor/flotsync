@@ -633,19 +633,17 @@ impl Require<UdpPort> for DatagramTransferComponent {
     }
 }
 
-impl Actor for DatagramTransferComponent {
+impl LocalActor for DatagramTransferComponent {
     type Message = DatagramTransferComponentMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive(&mut self, msg: Self::Message) -> Handled {
         match msg {
             DatagramTransferComponentMessage::SendResult(result) => self.handle_send_result(result),
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("DatagramTransferComponent does not use network actor messages")
-    }
 }
+
+impl_local_actor!(DatagramTransferComponent);
 
 #[doc(hidden)]
 #[derive(Clone, Debug)]
