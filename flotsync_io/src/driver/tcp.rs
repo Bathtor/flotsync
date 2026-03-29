@@ -1346,10 +1346,6 @@ mod tests {
         }
     }
 
-    fn payload_bytes(payload: IoPayload) -> Bytes {
-        payload.create_byte_clone()
-    }
-
     #[test]
     fn tcp_listen_failure_is_reported() {
         init_test_logger();
@@ -1454,7 +1450,7 @@ mod tests {
                     connection_id,
                     payload,
                 }) if connection_id == accepted_connection_id => {
-                    assert_eq!(payload_bytes(payload), b"pending"[..]);
+                    assert_eq!(payload.to_vec().as_slice(), b"pending");
                     break;
                 }
                 other => {
@@ -1601,7 +1597,7 @@ mod tests {
                     connection_id: received_id,
                     payload,
                 }) if received_id == connection_id => {
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated TCP event: {:?}", other);
@@ -2105,7 +2101,7 @@ mod tests {
                     connection_id: received_id,
                     payload,
                 }) if received_id == connection_id => {
-                    third_payload = Some(payload_bytes(payload));
+                    third_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!(

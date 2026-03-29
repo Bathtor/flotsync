@@ -3,13 +3,7 @@
 use super::{
     group_broadcast::{GroupBroadcastDeliver, GroupBroadcastSubmit},
     reliable_delivery::{ReliableDeliveryDeliver, ReliableDeliverySubmit},
-    shared::{
-        MessageId,
-        ReachabilityClass,
-        RelayIdentity,
-        RouteSendId,
-        SendRouteId,
-    },
+    shared::{MessageId, ReachabilityClass, RelayIdentity, RouteSendId, SendRouteId},
 };
 use crate::api::MemberIdentity;
 use flotsync_utils::BoxFuture;
@@ -211,4 +205,3 @@ pub trait DeliveryWorkStore: Send + Sync {
         message_id: MessageId,
     ) -> BoxFuture<'_, Result<(), DeliveryWorkStoreError>>;
 }
-

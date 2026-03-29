@@ -175,8 +175,13 @@ impl IoPayload {
 
     /// Creates a byte clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
+        Bytes::from(self.to_vec())
+    }
+
+    /// Copies the full readable payload contents into one owned `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
         if self.is_empty() {
-            return Bytes::new();
+            return Vec::new();
         }
 
         let mut bytes = Vec::with_capacity(self.len());
@@ -191,7 +196,7 @@ impl IoPayload {
             bytes.extend_from_slice(chunk);
             cursor.advance(chunk_len);
         }
-        Bytes::from(bytes)
+        bytes
     }
 }
 

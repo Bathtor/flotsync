@@ -199,4 +199,3 @@ pub struct RelayStoreConfirmation {
     pub route_id: LogicalRouteId,
     pub receipt_id: RelayStoreReceiptId,
 }
-

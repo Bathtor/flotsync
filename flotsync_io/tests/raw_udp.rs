@@ -6,7 +6,6 @@ use flotsync_io::{
         assert_no_driver_event,
         init_test_logger,
         localhost,
-        payload_bytes,
         wait_for_driver_event,
         wait_for_driver_request,
     },
@@ -86,7 +85,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 payload,
             }) if socket_id == receiver_id => {
                 assert_eq!(source, sender_addr);
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+                assert_eq!(payload.to_vec().as_slice(), b"hello");
                 saw_unconnected_receive = true;
             }
             other => {
@@ -149,7 +148,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 payload,
             }) if socket_id == receiver_id => {
                 assert_eq!(source, connected_sender_addr);
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_connected_receive = true;
             }
             other => {
@@ -405,7 +404,7 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
             DriverEvent::Udp(UdpEvent::Received {
                 socket_id, payload, ..
             }) if socket_id == receiver_id => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"third"));
+                assert_eq!(payload.to_vec().as_slice(), b"third");
                 saw_third_payload = true;
             }
             other => {

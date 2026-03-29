@@ -581,6 +581,7 @@ impl Actor for PeerAnnouncementComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
     use flotsync_io::test_support::{
         build_test_kompact_system,
         init_test_logger,
@@ -746,7 +747,7 @@ mod tests {
                     )))
                 );
 
-                let message = Peer::parse_from_bytes(&payload.create_byte_clone())
+                let message = Peer::parse_from_reader(&mut payload.cursor().reader())
                     .expect("decode peer announcement");
                 assert_eq!(message.instance_uuid, expected_instance_id.as_bytes());
             }

@@ -70,6 +70,7 @@ pub mod prelude {
             EgressAsyncWriter,
             EgressPool,
             EgressReservation,
+            EgressReservedWriter,
             IngressBuffer,
             IngressPool,
             IoBufferConfig,

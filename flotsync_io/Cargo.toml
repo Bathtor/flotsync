@@ -13,7 +13,7 @@ test-support = [
 
 [dependencies]
 flotsync_utils = { path = "../flotsync_utils" }
-bytes = "1"
+bytes = { workspace = true }
 crossbeam-channel = "0.5"
 futures-channel = "0.3"
 kompact = { workspace = true }

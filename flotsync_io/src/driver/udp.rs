@@ -939,10 +939,6 @@ mod tests {
         }
     }
 
-    fn payload_bytes(payload: IoPayload) -> Bytes {
-        payload.create_byte_clone()
-    }
-
     fn bind_udp_socket_at(
         driver: &IoDriver,
         socket_id: SocketId,
@@ -1013,7 +1009,7 @@ mod tests {
                     payload,
                 }) if socket_id == receiver_id => {
                     assert_eq!(source, sender_addr);
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated UDP event: {:?}", other);
@@ -1089,7 +1085,7 @@ mod tests {
                     payload,
                 }) if socket_id == receiver_id => {
                     assert_eq!(source, sender_addr);
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated UDP event: {:?}", other);
@@ -1436,7 +1432,7 @@ mod tests {
                 DriverEvent::Udp(UdpEvent::Received {
                     socket_id, payload, ..
                 }) if socket_id == receiver_id => {
-                    third_payload = Some(payload_bytes(payload));
+                    third_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!(

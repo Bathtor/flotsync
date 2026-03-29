@@ -66,4 +66,3 @@ pub struct DeliveryReceipt {
     pub route_id: LogicalRouteId,
     pub recipient: MemberIdentity,
 }
-

@@ -8,7 +8,6 @@ use flotsync_io::{
         init_test_logger,
         kill_component,
         localhost,
-        payload_bytes,
         recv_until,
         start_component,
     },
@@ -121,7 +120,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
                 saw_write_resumed = true;
             }
             TcpSessionEvent::Received { payload } => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_received = true;
             }
             other => {
@@ -203,7 +202,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         matches!(event, TcpSessionEvent::Received { .. })
     }) {
         TcpSessionEvent::Received { payload } => {
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to first accepted TCP session receive, got {other:?}"),
     }
@@ -255,7 +254,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         matches!(event, TcpSessionEvent::Received { .. })
     }) {
         TcpSessionEvent::Received { payload } => {
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"again"));
+            assert_eq!(payload.to_vec().as_slice(), b"again");
         }
         other => unreachable!("filtered to post-close accepted TCP session receive, got {other:?}"),
     }

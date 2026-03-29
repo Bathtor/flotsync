@@ -32,4 +32,5 @@ zeroconf = { version = "0.15", optional = true }
 kompact = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 flotsync_io = { path = "../flotsync_io", features = ["test-support"] }

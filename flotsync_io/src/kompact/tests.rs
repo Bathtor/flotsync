@@ -26,7 +26,6 @@ use crate::{
         init_test_logger,
         kill_component,
         localhost,
-        payload_bytes,
         recv_until,
         start_component,
     },
@@ -245,7 +244,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
             socket_id, payload, ..
         } => {
             assert_eq!(socket_id, receiver_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to UDP receive, got {other:?}"),
     }
@@ -262,7 +261,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
             socket_id, payload, ..
         } => {
             assert_eq!(socket_id, receiver_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to UDP receive, got {other:?}"),
     }
@@ -449,7 +448,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
                 saw_ack = true;
             }
             TcpSessionEvent::Received { payload } => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_received = true;
             }
             TcpSessionEvent::Closed { reason } => {
@@ -549,7 +548,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 
     match recv_until(&session_events_rx, |_| true) {
         TcpSessionEvent::Received { payload } => {
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => {
             panic!("expected accepted TCP session to start with Received, got {other:?}");
@@ -643,7 +642,7 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     assert_eq!(tag, 7);
     match event {
         TcpSessionEvent::Received { payload } => {
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to tagged TCP session Received, got {other:?}"),
     }

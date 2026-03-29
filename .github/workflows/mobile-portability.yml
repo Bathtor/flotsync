@@ -26,6 +26,7 @@ jobs:
           - aarch64-apple-ios
           - aarch64-apple-ios-sim
           - aarch64-linux-android
+          - i686-unknown-linux-gnu
 
     steps:
       - name: Check out repository
@@ -40,10 +41,11 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Check mobile-target libraries
+      - name: Check portability-target libraries
         run: >
           cargo check --locked --lib --target ${{ matrix.target }}
           -p flotsync_core
+          -p flotsync_datagram_transfer
           -p flotsync_data_types
           -p flotsync_messages
           -p flotsync_replication

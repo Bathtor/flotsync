@@ -4,7 +4,6 @@
 //! probes, wait helpers, and captured logging setup that the crate's own tests use.
 
 use crate::prelude::*;
-use bytes::Bytes;
 use kompact::{KompactLogger, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
 use std::{
@@ -70,11 +69,6 @@ fn captured_kompact_logger() -> KompactLogger {
 /// Returns the loopback address for the supplied port.
 pub fn localhost(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
-}
-
-/// Extracts payload bytes from the variants used by the tests.
-pub fn payload_bytes(payload: IoPayload) -> Bytes {
-    payload.create_byte_clone()
 }
 
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].

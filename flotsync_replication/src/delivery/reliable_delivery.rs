@@ -131,4 +131,3 @@ pub struct MailboxAck {
     pub recipient: MemberIdentity,
     pub acknowledgements: Vec<MailboxAckHandle>,
 }
-

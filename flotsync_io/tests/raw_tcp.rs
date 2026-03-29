@@ -5,7 +5,6 @@ use flotsync_io::{
         assert_no_driver_event,
         init_test_logger,
         localhost,
-        payload_bytes,
         wait_for_driver_event,
         wait_for_driver_request,
     },
@@ -172,7 +171,7 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
                 connection_id: observed_connection_id,
                 payload,
             }) if observed_connection_id == connection_id => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_receive = true;
             }
             DriverEvent::Tcp(TcpEvent::Closed {
@@ -303,7 +302,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
             payload,
         }) => {
             assert_eq!(observed_connection_id, accepted_connection_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"pending"));
+            assert_eq!(payload.to_vec().as_slice(), b"pending");
         }
         other => unreachable!("filtered to adopted TCP receive event, got {other:?}"),
     }
@@ -387,7 +386,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
             payload,
         }) => {
             assert_eq!(observed_connection_id, accepted_connection_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"again"));
+            assert_eq!(payload.to_vec().as_slice(), b"again");
         }
         other => unreachable!("filtered to post-listener-close TCP receive, got {other:?}"),
     }
@@ -592,7 +591,7 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
                 connection_id: observed_connection_id,
                 payload,
             }) if observed_connection_id == connection_id => {
-                assert_eq!(payload_bytes(payload).len(), 44);
+                assert_eq!(payload.to_vec().len(), 44);
                 saw_third_payload = true;
             }
             other => {

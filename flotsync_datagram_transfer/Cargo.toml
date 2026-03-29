@@ -1,0 +1,12 @@
+[package]
+name = "flotsync_datagram_transfer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+crc32c = "0.6"
+flotsync_io = { path = "../flotsync_io" }
+kompact = { workspace = true }
+roaring = "0.10"
+snafu = { workspace = true }

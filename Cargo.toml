@@ -5,6 +5,7 @@ members = [
     "flotsync_discovery",
     "flotsync_discovery_cli",
     "flotsync_data_types",
+    "flotsync_datagram_transfer",
     "flotsync_utils",
     "flotsync_replication",
     "flotsync_io",
@@ -13,6 +14,7 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
+bytes = "1"
 snafu = "0.9"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
