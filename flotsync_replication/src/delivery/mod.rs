@@ -12,4 +12,5 @@
 pub mod contracts;
 pub mod group_broadcast;
 pub mod reliable_delivery;
+pub mod route_transport;
 pub mod shared;

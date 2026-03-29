@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, pin::Pin};
+use std::{fmt, future::Future, marker::PhantomData, pin::Pin};
 
 pub mod debugging;
 pub mod err;
@@ -6,6 +6,14 @@ pub mod testing;
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Non-owning phantom marker for generic parameters that affect a type's API
+/// surface but are neither stored nor dropped by that type.
+///
+/// This is equivalent to `PhantomData<fn() -> T>`, which keeps the generic
+/// parameter visible to the type system without modeling the enclosing type as
+/// logically owning a `T`.
+pub type NonOwningPhantomData<T> = PhantomData<fn() -> T>;
 
 pub trait OptionExt<T> {
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;

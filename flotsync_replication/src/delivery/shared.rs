@@ -20,14 +20,6 @@ pub type RelayIdentity = MemberIdentity;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub Uuid);
 
-/// Opaque discovery-published route identity.
-///
-/// Equality on concrete route handles should reduce to this id so the delivery
-/// scheduler can build coverage classes without knowing anything about the
-/// underlying transport.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SendRouteId(pub Uuid);
-
 /// Stable identifier for one concrete send operation issued against an opaque
 /// discovery-provided route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

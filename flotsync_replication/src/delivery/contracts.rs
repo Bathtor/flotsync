@@ -3,25 +3,14 @@
 use super::{
     group_broadcast::{GroupBroadcastDeliver, GroupBroadcastSubmit},
     reliable_delivery::{ReliableDeliveryDeliver, ReliableDeliverySubmit},
-    shared::{MessageId, ReachabilityClass, RelayIdentity, RouteSendId, SendRouteId},
+    shared::MessageId,
 };
-use crate::api::MemberIdentity;
 use flotsync_utils::BoxFuture;
-use kompact::prelude::{Port, Recipient};
+use kompact::prelude::Port;
 use snafu::prelude::*;
-use std::{
-    fmt,
-    hash::{Hash, Hasher},
-    sync::Arc,
-    time::SystemTime,
-};
+use std::time::SystemTime;
 
-/// Marker trait for protobuf-backed network messages.
-///
-/// The concrete serialization method does not belong in this task. The only
-/// thing the delivery domain needs here is a shared dyn-safe payload type that
-/// discovery-published send routes can accept.
-pub trait ProtobufSerializable: Send + Sync + 'static {}
+pub use super::route_transport::DiscoveryRouteUpdate;
 
 /// Group-broadcast Kompact port.
 #[derive(Clone, Copy, Debug)]
@@ -63,91 +52,6 @@ pub enum ReliableDeliveryPortRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReliableDeliveryPortIndication {
     Deliver(ReliableDeliveryDeliver),
-}
-
-/// Discovery-published opaque send route.
-///
-/// Equality and hashing intentionally ignore the underlying recipient and use
-/// only `route_id`. That gives the scheduler exactly the information it needs
-/// for route-coverage grouping and nothing more.
-#[derive(Clone)]
-pub struct ResolvedSendRoute {
-    pub route_id: SendRouteId,
-    pub send_to: Recipient<RouteSend>,
-}
-
-impl fmt::Debug for ResolvedSendRoute {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ResolvedSendRoute")
-            .field("route_id", &self.route_id)
-            .finish()
-    }
-}
-
-impl PartialEq for ResolvedSendRoute {
-    fn eq(&self, other: &Self) -> bool {
-        self.route_id == other.route_id
-    }
-}
-
-impl Eq for ResolvedSendRoute {}
-
-impl Hash for ResolvedSendRoute {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.route_id.hash(state);
-    }
-}
-
-/// Generic send request issued against one discovery-provided route.
-#[derive(Clone)]
-pub struct RouteSend {
-    pub send_id: RouteSendId,
-    pub payload: Arc<dyn ProtobufSerializable>,
-    pub reply_to: Recipient<RouteSendResult>,
-}
-
-impl fmt::Debug for RouteSend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RouteSend")
-            .field("send_id", &self.send_id)
-            .finish()
-    }
-}
-
-/// Generic transport-facing response to one `RouteSend`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteSendResult {
-    Ack {
-        send_id: RouteSendId,
-    },
-    Nack {
-        send_id: RouteSendId,
-        reason: RouteSendNackReason,
-    },
-}
-
-/// Abstract reasons why a discovery-provided route could not accept a send.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RouteSendNackReason {
-    RouteUnavailable,
-    Backpressure,
-    InvalidPayload,
-    Other(String),
-}
-
-/// Published discovery update for one peer or relay.
-#[derive(Clone, Debug)]
-pub enum DiscoveryRouteUpdate {
-    PeerRoutes {
-        peer: MemberIdentity,
-        classification: ReachabilityClass,
-        routes: Vec<ResolvedSendRoute>,
-    },
-    RelayRoutes {
-        relay: RelayIdentity,
-        classification: ReachabilityClass,
-        routes: Vec<ResolvedSendRoute>,
-    },
 }
 
 /// Durable store record for one accepted group-broadcast request.

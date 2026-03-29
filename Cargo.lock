@@ -1054,6 +1054,7 @@ dependencies = [
  "bytes",
  "flotsync_core",
  "flotsync_data_types",
+ "flotsync_io",
  "flotsync_utils",
  "kompact",
  "smallvec",

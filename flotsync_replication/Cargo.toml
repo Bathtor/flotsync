@@ -7,6 +7,7 @@ edition = "2024"
 bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
+flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 kompact = { workspace = true }
 smallvec = "1"
