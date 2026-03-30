@@ -1,5 +1,5 @@
 [package]
-name = "flotsync_datagram_transfer"
+name = "flotsync_udpour"
 version = "0.1.0"
 edition = "2024"
 

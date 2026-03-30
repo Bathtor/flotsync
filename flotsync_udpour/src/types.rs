@@ -4,7 +4,7 @@ use roaring::RoaringBitmap;
 use snafu::prelude::*;
 use std::num::NonZeroU32;
 
-/// Current datagram multipart protocol version.
+/// Current UDPour protocol version.
 pub(crate) const PROTOCOL_VERSION: u8 = 1;
 
 /// Whole-message CRC32C checksum.
@@ -25,7 +25,7 @@ pub struct PartCount(NonZeroU32);
 
 impl PartCount {
     /// Wraps one raw part count while enforcing the protocol's non-zero rule.
-    pub(crate) fn new(value: u32) -> Result<Self, DatagramTypeError> {
+    pub(crate) fn new(value: u32) -> Result<Self, UDPourTypeError> {
         let value = NonZeroU32::new(value).context(ZeroPartCountSnafu)?;
         Ok(Self(value))
     }
@@ -71,7 +71,7 @@ pub(crate) enum FrameType {
 }
 
 impl TryFrom<u8> for FrameType {
-    type Error = DatagramTypeError;
+    type Error = UDPourTypeError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
@@ -112,7 +112,7 @@ impl From<FrameType> for u8 {
 /// Control frames do not refer to one concrete slice and therefore always carry
 /// `part_number = 0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct DatagramHeader {
+pub(crate) struct UDPourHeader {
     /// Fixed frame kind discriminator.
     pub frame_type: FrameType,
     /// Protocol version for this frame format.
@@ -134,7 +134,7 @@ pub(crate) struct DatagramHeader {
     pub checksum: Checksum,
 }
 
-impl DatagramHeader {
+impl UDPourHeader {
     /// Builds one payload header.
     pub fn payload(
         message_id: MessageId,
@@ -163,7 +163,7 @@ impl DatagramHeader {
         message_id: MessageId,
         part_count: PartCount,
         checksum: Checksum,
-    ) -> Result<Self, DatagramTypeError> {
+    ) -> Result<Self, UDPourTypeError> {
         ensure!(frame_type != FrameType::Payload, PayloadControlHeaderSnafu);
         Ok(Self {
             frame_type,
@@ -178,7 +178,7 @@ impl DatagramHeader {
     }
 
     /// Validates one header against protocol invariants.
-    pub fn validate(self) -> Result<Self, DatagramTypeError> {
+    pub fn validate(self) -> Result<Self, UDPourTypeError> {
         ensure!(
             self.version == PROTOCOL_VERSION,
             UnsupportedVersionSnafu {
@@ -211,7 +211,7 @@ impl DatagramHeader {
 /// One payload-carrying datagram.
 #[derive(Clone, Debug)]
 pub(crate) struct PayloadFrame {
-    pub header: DatagramHeader,
+    pub header: UDPourHeader,
     pub payload: IoPayload,
 }
 
@@ -224,13 +224,13 @@ impl PartialEq for PayloadFrame {
 /// One receiver acknowledgment datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AckFrame {
-    pub header: DatagramHeader,
+    pub header: UDPourHeader,
 }
 
 /// One receiver repair request datagram.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct NeedPartsFrame {
-    pub header: DatagramHeader,
+    pub header: UDPourHeader,
     pub missing_parts: RoaringBitmap,
 }
 
@@ -239,21 +239,21 @@ impl Eq for NeedPartsFrame {}
 /// One sender-side late-repair rejection datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NoLongerAvailableFrame {
-    pub header: DatagramHeader,
+    pub header: UDPourHeader,
 }
 
 /// Any datagram frame.
 #[derive(Clone, Debug)]
-pub(crate) enum DatagramFrame {
+pub(crate) enum UDPourFrame {
     Payload(PayloadFrame),
     Ack(AckFrame),
     NeedParts(NeedPartsFrame),
     NoLongerAvailable(NoLongerAvailableFrame),
 }
 
-impl DatagramFrame {
+impl UDPourFrame {
     /// Returns the shared fixed header.
-    pub fn header(&self) -> DatagramHeader {
+    pub fn header(&self) -> UDPourHeader {
         match self {
             Self::Payload(frame) => frame.header,
             Self::Ack(frame) => frame.header,
@@ -263,7 +263,7 @@ impl DatagramFrame {
     }
 }
 
-impl PartialEq for DatagramFrame {
+impl PartialEq for UDPourFrame {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Payload(left), Self::Payload(right)) => left == right,
@@ -302,7 +302,7 @@ pub(crate) fn io_payload_eq(left: &IoPayload, right: &IoPayload) -> bool {
 
 /// Local type validation and parse errors.
 #[derive(Debug, Snafu)]
-pub(crate) enum DatagramTypeError {
+pub(crate) enum UDPourTypeError {
     #[snafu(display("Unsupported protocol version {version}"))]
     UnsupportedVersion { version: u8 },
     #[snafu(display("Frame type 0x{value:02X} is not assigned"))]

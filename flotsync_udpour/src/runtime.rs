@@ -1,4 +1,4 @@
-//! Kompact runtime adapter for the datagram multipart protocol.
+//! Kompact runtime adapter for the UDPour protocol.
 //!
 //! This module binds the pure sender/receiver state machines to one shared UDP
 //! socket from `flotsync_io`, owns the mapping from logical multipart messages
@@ -19,16 +19,17 @@ use crate::{
     types::{
         AckFrame,
         Checksum,
-        DatagramFrame,
         MessageId,
         NeedPartsFrame,
         NoLongerAvailableFrame,
         PartCount,
         PayloadFrame,
+        UDPourFrame,
     },
 };
 use flotsync_io::prelude::{
     EgressPool,
+    Error as IoError,
     IoPayload,
     PayloadWriter,
     SendFailureReason,
@@ -47,24 +48,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One logical outbound transfer request for the UDP multipart runtime.
+/// One logical outbound transfer request for the UDPour runtime.
 #[derive(Clone, Debug)]
-pub struct DatagramTransferSend {
-    /// Caller-owned correlation id for this logical send.
-    pub send_ref: DatagramTransferSendRef,
+pub struct UDPourSend {
     /// Route-level UDP target that should receive every `Payload` retransmission.
     pub target: SocketAddr,
     /// Full logical payload to split into multipart `Payload` frames.
     pub payload: IoPayload,
 }
 
-/// Caller-owned correlation id for one logical send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DatagramTransferSendRef(pub u64);
-
 /// One fully reassembled inbound logical message.
 #[derive(Clone, Debug)]
-pub struct DatagramTransferDeliver {
+pub struct UDPourDeliver {
     /// Forwarded UDP source address that identified the sender at this route.
     pub source: SocketAddr,
     /// Sender-local logical message id recovered from the multipart header.
@@ -77,26 +72,13 @@ pub struct DatagramTransferDeliver {
     pub checksum: Checksum,
 }
 
-/// One logical outbound send failure surfaced back to the runtime user.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DatagramTransferSendFailed {
-    /// Caller-owned correlation id from the original [`DatagramTransferSend`].
-    pub send_ref: DatagramTransferSendRef,
-    /// Multipart `message_id` once the sender state machine had allocated one.
-    ///
-    /// State-machine failures raised before allocation leave this as `None`.
-    pub message_id: Option<MessageId>,
-    /// Route-transport failure classification for this logical send.
-    pub reason: DatagramTransferSendFailureReason,
-}
-
 /// Why a logical outbound send could not make progress through the runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DatagramTransferSendFailureReason {
+pub enum UDPourSendFailureReason {
     /// The pure sender state machine rejected the request locally.
-    State(DatagramTransferStateFailure),
+    State(UDPourStateFailure),
     /// The runtime could not serialize one frame into egress-managed memory.
-    Encode(DatagramTransferEncodeFailure),
+    Encode(UDPourEncodeFailure),
     /// `flotsync_io` rejected one UDP datagram belonging to this logical send.
     ///
     /// This runtime intentionally treats the first transport `Nack` as a terminal logical-send
@@ -105,9 +87,21 @@ pub enum DatagramTransferSendFailureReason {
     Transport(SendFailureReason),
 }
 
+/// Directed outcome of one outbound UDPour submission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UDPourSubmitResult {
+    /// All initial `Payload` datagrams were accepted by the UDP transport.
+    Sent { message_id: MessageId },
+    /// The logical send failed before or during its initial UDP handoff.
+    SendFailed {
+        message_id: Option<MessageId>,
+        reason: UDPourSendFailureReason,
+    },
+}
+
 /// Cloneable summary of sender-state-machine failures at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DatagramTransferStateFailure {
+pub enum UDPourStateFailure {
     ZeroMaxPartPayloadLen,
     TooManyParts {
         payload_len: usize,
@@ -119,37 +113,34 @@ pub enum DatagramTransferStateFailure {
 
 /// Cloneable summary of runtime frame-encoding failures at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DatagramTransferEncodeFailure {
+pub enum UDPourEncodeFailure {
     Io,
     Bitmap,
     EmptyEncodedFrame,
 }
 
-/// Kompact port exported by the UDP multipart runtime component.
+/// Kompact port exported by the UDPour runtime component.
+///
+/// This port is indication-only: the runtime triggers fully reassembled
+/// deliveries upward here, while directed outbound submission uses actor ask on
+/// [`UDPourComponentMessage::Submit`].
 #[derive(Clone, Copy, Debug)]
-pub struct DatagramTransferPort;
+pub struct UDPourPort;
 
-impl Port for DatagramTransferPort {
-    type Request = DatagramTransferPortRequest;
-    type Indication = DatagramTransferPortIndication;
+impl Port for UDPourPort {
+    type Request = Never;
+    type Indication = UDPourPortIndication;
 }
 
-/// Requests accepted by the UDP multipart runtime component.
+/// Indications emitted by the UDPour runtime component.
 #[derive(Clone, Debug)]
-pub enum DatagramTransferPortRequest {
-    Send(DatagramTransferSend),
+pub enum UDPourPortIndication {
+    Deliver(UDPourDeliver),
 }
 
-/// Indications emitted by the UDP multipart runtime component.
+/// Runtime configuration for the UDPour component.
 #[derive(Clone, Debug)]
-pub enum DatagramTransferPortIndication {
-    Deliver(DatagramTransferDeliver),
-    SendFailed(DatagramTransferSendFailed),
-}
-
-/// Runtime configuration for the UDP multipart component.
-#[derive(Clone, Debug)]
-pub struct DatagramTransferConfig {
+pub struct UDPourConfig {
     /// Sender-side multipart retention and message-id reuse policy.
     pub sender: SenderConfig,
     /// Receiver-side repair and give-up policy.
@@ -158,12 +149,9 @@ pub struct DatagramTransferConfig {
     pub poll_interval: Duration,
 }
 
-impl DatagramTransferConfig {
+impl UDPourConfig {
     /// Builds runtime configuration from the sender/receiver state-machine configs.
-    pub fn new(
-        sender: SenderConfig,
-        receiver: ReceiverConfig,
-    ) -> Result<Self, DatagramTransferConfigError> {
+    pub fn new(sender: SenderConfig, receiver: ReceiverConfig) -> Result<Self, UDPourConfigError> {
         ensure!(
             sender.max_part_payload_len > 0,
             ZeroMaxPartPayloadLenConfigSnafu
@@ -187,9 +175,9 @@ impl DatagramTransferConfig {
     }
 }
 
-/// Configuration errors for the UDP multipart runtime.
+/// Configuration errors for the UDPour runtime.
 #[derive(Debug, Snafu)]
-pub enum DatagramTransferConfigError {
+pub enum UDPourConfigError {
     #[snafu(display("sender max_part_payload_len must be greater than zero"))]
     ZeroMaxPartPayloadLenConfig,
     #[snafu(display("runtime poll interval must be greater than zero"))]
@@ -209,29 +197,25 @@ pub enum DatagramTransferConfigError {
 /// TODO(flotsync-nzz): Integrate this one-socket runtime boundary with discovery-published route
 /// candidates and broader route-handle ownership.
 #[derive(ComponentDefinition)]
-pub struct DatagramTransferComponent {
+pub struct UDPourComponent {
     ctx: ComponentContext<Self>,
     udp: RequiredPort<UdpPort>,
-    transfer: ProvidedPort<DatagramTransferPort>,
+    transfer: ProvidedPort<UDPourPort>,
     socket_id: SocketId,
     egress_pool: EgressPool,
-    config: DatagramTransferConfig,
+    config: UDPourConfig,
     sender: SenderMachine,
     receiver: ReceiverMachine,
     next_transmission_id: TransmissionId,
     outbound: HashMap<MessageId, OutboundTransfer>,
-    pending_transmissions: HashMap<TransmissionId, MessageId>,
+    pending_transmissions: HashMap<TransmissionId, PendingTransmission>,
     poll_timer: Option<PollTimerState>,
     next_poll_generation: usize,
 }
 
-impl DatagramTransferComponent {
+impl UDPourComponent {
     /// Creates one runtime component bound to one already-open UDP socket.
-    pub fn new(
-        socket_id: SocketId,
-        egress_pool: EgressPool,
-        config: DatagramTransferConfig,
-    ) -> Self {
+    pub fn new(socket_id: SocketId, egress_pool: EgressPool, config: UDPourConfig) -> Self {
         let sender = SenderMachine::new(config.sender.clone());
         let receiver = ReceiverMachine::new(config.receiver.clone());
         Self {
@@ -251,44 +235,37 @@ impl DatagramTransferComponent {
         }
     }
 
-    fn handle_request(&mut self, request: DatagramTransferPortRequest) -> Handled {
-        match request {
-            DatagramTransferPortRequest::Send(send) => {
-                let now = Instant::now();
-                match self.sender.start_transfer(send.payload, now) {
-                    Ok(SenderAction::SendPayloads { message_id, frames }) => {
-                        self.outbound.insert(
-                            message_id,
-                            OutboundTransfer {
-                                send_ref: send.send_ref,
-                                target: send.target,
-                                failure_reported: false,
-                            },
-                        );
-                        self.dispatch_payload_frames(message_id, frames);
-                    }
-                    Ok(other) => {
-                        debug_assert!(
-                            false,
-                            "start_transfer returned unexpected action: {other:?}"
-                        );
-                    }
-                    Err(error) => {
-                        self.transfer
-                            .trigger(DatagramTransferPortIndication::SendFailed(
-                                DatagramTransferSendFailed {
-                                    send_ref: send.send_ref,
-                                    message_id: None,
-                                    reason: DatagramTransferSendFailureReason::State(
-                                        classify_sender_error(&error),
-                                    ),
-                                },
-                            ));
-                    }
-                }
-                Handled::Ok
+    fn handle_submit(&mut self, ask: Ask<UDPourSend, UDPourSubmitResult>) -> Handled {
+        let (promise, send) = ask.take();
+        let now = Instant::now();
+        match self.sender.start_transfer(send.payload, now) {
+            Ok(SenderAction::SendPayloads { message_id, frames }) => {
+                self.outbound.insert(
+                    message_id,
+                    OutboundTransfer {
+                        target: send.target,
+                        submit_promise: Some(promise),
+                        failure_reported: false,
+                        sent_reported: false,
+                        pending_initial_transmissions: frames.len(),
+                    },
+                );
+                self.dispatch_payload_frames(message_id, frames, true);
+            }
+            Ok(other) => {
+                debug_assert!(
+                    false,
+                    "start_transfer returned unexpected action: {other:?}"
+                );
+            }
+            Err(error) => {
+                let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
+                    message_id: None,
+                    reason: UDPourSendFailureReason::State(classify_sender_error(&error)),
+                });
             }
         }
+        Handled::Ok
     }
 
     fn handle_udp_indication(&mut self, indication: UdpIndication) -> Handled {
@@ -312,7 +289,7 @@ impl DatagramTransferComponent {
             Err(error) => {
                 error!(
                     self.log(),
-                    "Dropping invalid datagram-transfer frame from {source}: {error}"
+                    "Dropping invalid UDPour frame from {source}: {error}"
                 );
                 return Handled::Ok;
             }
@@ -320,8 +297,7 @@ impl DatagramTransferComponent {
         let now = Instant::now();
 
         match frame {
-            DatagramFrame::Payload(frame) => match self.receiver.accept_payload(source, frame, now)
-            {
+            UDPourFrame::Payload(frame) => match self.receiver.accept_payload(source, frame, now) {
                 Ok(actions) => {
                     for action in actions {
                         self.handle_receiver_action(action);
@@ -334,17 +310,17 @@ impl DatagramTransferComponent {
                     );
                 }
             },
-            DatagramFrame::Ack(frame) => {
+            UDPourFrame::Ack(frame) => {
                 if let Some(action) = self.sender.handle_ack(&frame, now) {
                     self.handle_sender_action(action, Some(source));
                 }
             }
-            DatagramFrame::NeedParts(frame) => {
+            UDPourFrame::NeedParts(frame) => {
                 if let Some(action) = self.sender.handle_need_parts(&frame, now) {
                     self.handle_sender_action(action, Some(source));
                 }
             }
-            DatagramFrame::NoLongerAvailable(frame) => {
+            UDPourFrame::NoLongerAvailable(frame) => {
                 if let Some(action) = self.receiver.accept_no_longer_available(source, frame) {
                     self.handle_receiver_action(action);
                 }
@@ -360,16 +336,38 @@ impl DatagramTransferComponent {
                 socket_id,
                 transmission_id,
             } if socket_id == self.socket_id => {
-                self.pending_transmissions.remove(&transmission_id);
+                let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
+                    return Handled::Ok;
+                };
+                let Some(outbound) = self.outbound.get_mut(&pending.message_id) else {
+                    return Handled::Ok;
+                };
+                if !pending.counts_towards_sent
+                    || outbound.failure_reported
+                    || outbound.sent_reported
+                {
+                    return Handled::Ok;
+                }
+                outbound.pending_initial_transmissions =
+                    outbound.pending_initial_transmissions.saturating_sub(1);
+                if outbound.pending_initial_transmissions == 0 {
+                    outbound.sent_reported = true;
+                    if let Some(promise) = outbound.submit_promise.take() {
+                        let _ = promise.fulfil(UDPourSubmitResult::Sent {
+                            message_id: pending.message_id,
+                        });
+                    }
+                }
             }
             UdpSendResult::Nack {
                 socket_id,
                 transmission_id,
                 reason,
             } if socket_id == self.socket_id => {
-                let Some(message_id) = self.pending_transmissions.remove(&transmission_id) else {
+                let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
                     return Handled::Ok;
                 };
+                let message_id = pending.message_id;
                 let Some(outbound) = self.outbound.get_mut(&message_id) else {
                     return Handled::Ok;
                 };
@@ -384,14 +382,12 @@ impl DatagramTransferComponent {
                     // rather than surfacing as an immediate logical-send failure.
                 }
                 outbound.failure_reported = true;
-                self.transfer
-                    .trigger(DatagramTransferPortIndication::SendFailed(
-                        DatagramTransferSendFailed {
-                            send_ref: outbound.send_ref,
-                            message_id: Some(message_id),
-                            reason: DatagramTransferSendFailureReason::Transport(reason),
-                        },
-                    ));
+                if let Some(promise) = outbound.submit_promise.take() {
+                    let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
+                        message_id: Some(message_id),
+                        reason: UDPourSendFailureReason::Transport(reason),
+                    });
+                }
             }
             _ => {}
         }
@@ -401,17 +397,17 @@ impl DatagramTransferComponent {
     fn handle_sender_action(&mut self, action: SenderAction, source: Option<SocketAddr>) {
         match action {
             SenderAction::SendPayloads { message_id, frames } => {
-                self.dispatch_payload_frames(message_id, frames);
+                self.dispatch_payload_frames(message_id, frames, false);
             }
             SenderAction::SendNoLongerAvailable { frame } => {
                 if let Some(target) = source {
-                    self.dispatch_control_frame(target, DatagramFrame::NoLongerAvailable(frame));
+                    self.dispatch_control_frame(target, UDPourFrame::NoLongerAvailable(frame));
                 }
             }
             SenderAction::ObservedAck { .. } => {}
             SenderAction::Purged { message_id, .. } => {
                 self.pending_transmissions
-                    .retain(|_, pending_message_id| *pending_message_id != message_id);
+                    .retain(|_, pending| pending.message_id != message_id);
                 self.outbound.remove(&message_id);
             }
         }
@@ -427,28 +423,26 @@ impl DatagramTransferComponent {
                 checksum,
             } => {
                 self.transfer
-                    .trigger(DatagramTransferPortIndication::Deliver(
-                        DatagramTransferDeliver {
-                            source,
-                            message_id,
-                            payload,
-                            part_count,
-                            checksum,
-                        },
-                    ));
+                    .trigger(UDPourPortIndication::Deliver(UDPourDeliver {
+                        source,
+                        message_id,
+                        payload,
+                        part_count,
+                        checksum,
+                    }));
             }
             ReceiverAction::SendAck { source, frame } => {
-                self.dispatch_control_frame(source, DatagramFrame::Ack(frame));
+                self.dispatch_control_frame(source, UDPourFrame::Ack(frame));
             }
             ReceiverAction::SendNeedParts { source, frames } => {
                 for frame in frames {
-                    self.dispatch_control_frame(source, DatagramFrame::NeedParts(frame));
+                    self.dispatch_control_frame(source, UDPourFrame::NeedParts(frame));
                 }
             }
             ReceiverAction::Purged { key, reason } => {
                 debug!(
                     self.log(),
-                    "Purged inbound datagram-transfer state for source={} message_id={:?}: {:?}",
+                    "Purged inbound UDPour state for source={} message_id={:?}: {:?}",
                     key.source,
                     key.message_id,
                     reason
@@ -457,17 +451,27 @@ impl DatagramTransferComponent {
         }
     }
 
-    fn dispatch_payload_frames(&mut self, message_id: MessageId, frames: Vec<PayloadFrame>) {
+    fn dispatch_payload_frames(
+        &mut self,
+        message_id: MessageId,
+        frames: Vec<PayloadFrame>,
+        counts_towards_sent: bool,
+    ) {
         let Some(outbound) = self.outbound.get(&message_id) else {
             return;
         };
         let target = outbound.target;
         for frame in frames {
-            self.dispatch_outbound_frame(message_id, target, DatagramFrame::Payload(frame));
+            self.dispatch_outbound_frame(
+                message_id,
+                target,
+                UDPourFrame::Payload(frame),
+                counts_towards_sent,
+            );
         }
     }
 
-    fn dispatch_control_frame(&mut self, target: SocketAddr, frame: DatagramFrame) {
+    fn dispatch_control_frame(&mut self, target: SocketAddr, frame: UDPourFrame) {
         self.spawn_encoded_send(target, frame, None);
     }
 
@@ -475,16 +479,17 @@ impl DatagramTransferComponent {
         &mut self,
         message_id: MessageId,
         target: SocketAddr,
-        frame: DatagramFrame,
+        frame: UDPourFrame,
+        counts_towards_sent: bool,
     ) {
-        self.spawn_encoded_send(target, frame, Some(message_id));
+        self.spawn_encoded_send(target, frame, Some((message_id, counts_towards_sent)));
     }
 
     fn spawn_encoded_send(
         &mut self,
         target: SocketAddr,
-        frame: DatagramFrame,
-        message_id: Option<MessageId>,
+        frame: UDPourFrame,
+        message_id: Option<(MessageId, bool)>,
     ) {
         // TODO(flotsync-szl): Replace the spawn_local-per-frame send path with one owned
         // outbound queue/dispatcher so large multipart sends do not translate into one task per
@@ -494,32 +499,36 @@ impl DatagramTransferComponent {
         let egress_pool = self.egress_pool.clone();
         let reply_to = self
             .actor_ref()
-            .recipient_with(DatagramTransferComponentMessage::SendResult);
+            .recipient_with(UDPourComponentMessage::SendResult);
         self.spawn_local(move |mut async_self| async move {
             let frame_type = frame.header().frame_type;
             let encoded = match encode_frame_with_pool(&egress_pool, &frame).await {
                 Ok(encoded) => encoded,
                 Err(error) => {
-                    if let Some(message_id) = message_id {
+                    if let Some((message_id, _)) = message_id {
                         async_self.report_send_failure(
                             message_id,
-                            DatagramTransferSendFailureReason::Encode(classify_encode_error(
+                            UDPourSendFailureReason::Encode(classify_encode_error(
                                 &error,
                             )),
                         );
                     } else {
                         error!(
                             async_self.log(),
-                            "Failed to encode {frame_type:?} control frame for datagram-transfer send to {target}: {error}"
+                            "Failed to encode {frame_type:?} control frame for UDPour send to {target}: {error}"
                         );
                     }
                     return Handled::Ok;
                 }
             };
-            if let Some(message_id) = message_id {
-                async_self
-                    .pending_transmissions
-                    .insert(transmission_id, message_id);
+            if let Some((message_id, counts_towards_sent)) = message_id {
+                async_self.pending_transmissions.insert(
+                    transmission_id,
+                    PendingTransmission {
+                        message_id,
+                        counts_towards_sent,
+                    },
+                );
             }
             async_self.udp.trigger(UdpRequest::Send {
                 socket_id,
@@ -532,11 +541,7 @@ impl DatagramTransferComponent {
         });
     }
 
-    fn report_send_failure(
-        &mut self,
-        message_id: MessageId,
-        reason: DatagramTransferSendFailureReason,
-    ) {
+    fn report_send_failure(&mut self, message_id: MessageId, reason: UDPourSendFailureReason) {
         let Some(outbound) = self.outbound.get_mut(&message_id) else {
             return;
         };
@@ -544,14 +549,12 @@ impl DatagramTransferComponent {
             return;
         }
         outbound.failure_reported = true;
-        self.transfer
-            .trigger(DatagramTransferPortIndication::SendFailed(
-                DatagramTransferSendFailed {
-                    send_ref: outbound.send_ref,
-                    message_id: Some(message_id),
-                    reason,
-                },
-            ));
+        if let Some(promise) = outbound.submit_promise.take() {
+            let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
+                message_id: Some(message_id),
+                reason,
+            });
+        }
     }
 
     fn poll_runtime(&mut self) {
@@ -568,7 +571,7 @@ impl DatagramTransferComponent {
             Err(error) => {
                 error!(
                     self.log(),
-                    "Receiver timeout processing failed in datagram-transfer runtime: {error}"
+                    "Receiver timeout processing failed in UDPour runtime: {error}"
                 );
             }
         }
@@ -604,7 +607,7 @@ impl DatagramTransferComponent {
     }
 }
 
-impl ComponentLifecycle for DatagramTransferComponent {
+impl ComponentLifecycle for UDPourComponent {
     fn on_start(&mut self) -> Handled {
         self.arm_poll_timer();
         Handled::Ok
@@ -621,33 +624,38 @@ impl ComponentLifecycle for DatagramTransferComponent {
     }
 }
 
-impl Provide<DatagramTransferPort> for DatagramTransferComponent {
-    fn handle(&mut self, request: DatagramTransferPortRequest) -> Handled {
-        self.handle_request(request)
+impl Provide<UDPourPort> for UDPourComponent {
+    fn handle(&mut self, request: Never) -> Handled {
+        match request {}
     }
 }
 
-impl Require<UdpPort> for DatagramTransferComponent {
+impl Require<UdpPort> for UDPourComponent {
     fn handle(&mut self, indication: UdpIndication) -> Handled {
         self.handle_udp_indication(indication)
     }
 }
 
-impl LocalActor for DatagramTransferComponent {
-    type Message = DatagramTransferComponentMessage;
+impl LocalActor for UDPourComponent {
+    type Message = UDPourComponentMessage;
 
     fn receive(&mut self, msg: Self::Message) -> Handled {
         match msg {
-            DatagramTransferComponentMessage::SendResult(result) => self.handle_send_result(result),
+            UDPourComponentMessage::Submit(ask) => self.handle_submit(ask),
+            UDPourComponentMessage::SendResult(result) => self.handle_send_result(result),
         }
     }
 }
 
-impl_local_actor!(DatagramTransferComponent);
+impl_local_actor!(UDPourComponent);
 
 #[doc(hidden)]
-#[derive(Clone, Debug)]
-pub enum DatagramTransferComponentMessage {
+#[derive(Debug)]
+pub enum UDPourComponentMessage {
+    /// Directed outbound submission resolved once the initial multipart payload
+    /// handoff either succeeded or failed.
+    Submit(Ask<UDPourSend, UDPourSubmitResult>),
+    /// Internal feedback from `flotsync_io` about one physical UDP send.
     SendResult(UdpSendResult),
 }
 
@@ -657,11 +665,19 @@ struct PollTimerState {
     timer: ScheduledTimer,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct OutboundTransfer {
-    send_ref: DatagramTransferSendRef,
     target: SocketAddr,
+    submit_promise: Option<KPromise<UDPourSubmitResult>>,
     failure_reported: bool,
+    sent_reported: bool,
+    pending_initial_transmissions: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingTransmission {
+    message_id: MessageId,
+    counts_towards_sent: bool,
 }
 
 /// Pool-backed frame-encoding errors for the UDP runtime.
@@ -677,12 +693,12 @@ pub(crate) enum RuntimeEncodeError {
 
 async fn encode_frame_with_pool(
     egress_pool: &EgressPool,
-    frame: &DatagramFrame,
+    frame: &UDPourFrame,
 ) -> Result<IoPayload, RuntimeEncodeError> {
     let hint = encoded_frame_len(frame);
     let mut writer = egress_pool.writer(Some(hint));
     match frame {
-        DatagramFrame::Payload(PayloadFrame { payload, .. }) => {
+        UDPourFrame::Payload(PayloadFrame { payload, .. }) => {
             {
                 let mut reserved = writer
                     .write_with_reserved(FRAME_HEADER_LEN)
@@ -690,20 +706,24 @@ async fn encode_frame_with_pool(
                     .context(IoSnafu)?;
                 encode_header_into(frame.header(), &mut reserved);
             }
-            writer
-                .adopt_payload(payload.clone())
-                .await
-                .context(IoSnafu)?;
+            let adopt_result = writer.adopt_payload(payload.clone()).await;
+            match adopt_result {
+                Ok(()) => {}
+                Err(IoError::SharedIoPayloadOwnership) => {
+                    writer.copy_payload(payload).await.context(IoSnafu)?;
+                }
+                Err(source) => return Err(RuntimeEncodeError::Io { source }),
+            }
         }
-        DatagramFrame::Ack(AckFrame { .. })
-        | DatagramFrame::NoLongerAvailable(NoLongerAvailableFrame { .. }) => {
+        UDPourFrame::Ack(AckFrame { .. })
+        | UDPourFrame::NoLongerAvailable(NoLongerAvailableFrame { .. }) => {
             let mut reserved = writer
                 .write_with_reserved(FRAME_HEADER_LEN)
                 .await
                 .context(IoSnafu)?;
             encode_header_into(frame.header(), &mut reserved);
         }
-        DatagramFrame::NeedParts(NeedPartsFrame { missing_parts, .. }) => {
+        UDPourFrame::NeedParts(NeedPartsFrame { missing_parts, .. }) => {
             let mut reserved = writer.write_with_reserved(hint).await.context(IoSnafu)?;
             encode_header_into(frame.header(), &mut reserved);
             encode_need_parts_body_into(missing_parts, &mut reserved).context(BitmapSnafu)?;
@@ -713,27 +733,27 @@ async fn encode_frame_with_pool(
     payload.context(EmptyEncodedFrameSnafu)
 }
 
-fn classify_sender_error(error: &SenderError) -> DatagramTransferStateFailure {
+fn classify_sender_error(error: &SenderError) -> UDPourStateFailure {
     match error {
-        SenderError::ZeroMaxPartPayloadLen => DatagramTransferStateFailure::ZeroMaxPartPayloadLen,
+        SenderError::ZeroMaxPartPayloadLen => UDPourStateFailure::ZeroMaxPartPayloadLen,
         SenderError::TooManyParts {
             payload_len,
             max_part_payload_len,
             ..
-        } => DatagramTransferStateFailure::TooManyParts {
+        } => UDPourStateFailure::TooManyParts {
             payload_len: *payload_len,
             max_part_payload_len: *max_part_payload_len,
         },
-        SenderError::InvalidPartCount { .. } => DatagramTransferStateFailure::InvalidPartCount,
-        SenderError::MessageIdExhausted => DatagramTransferStateFailure::MessageIdExhausted,
+        SenderError::InvalidPartCount { .. } => UDPourStateFailure::InvalidPartCount,
+        SenderError::MessageIdExhausted => UDPourStateFailure::MessageIdExhausted,
     }
 }
 
-fn classify_encode_error(error: &RuntimeEncodeError) -> DatagramTransferEncodeFailure {
+fn classify_encode_error(error: &RuntimeEncodeError) -> UDPourEncodeFailure {
     match error {
-        RuntimeEncodeError::Io { .. } => DatagramTransferEncodeFailure::Io,
-        RuntimeEncodeError::Bitmap { .. } => DatagramTransferEncodeFailure::Bitmap,
-        RuntimeEncodeError::EmptyEncodedFrame => DatagramTransferEncodeFailure::EmptyEncodedFrame,
+        RuntimeEncodeError::Io { .. } => UDPourEncodeFailure::Io,
+        RuntimeEncodeError::Bitmap { .. } => UDPourEncodeFailure::Bitmap,
+        RuntimeEncodeError::EmptyEncodedFrame => UDPourEncodeFailure::EmptyEncodedFrame,
     }
 }
 
@@ -751,10 +771,10 @@ mod tests {
             max_need_parts_frame_len: FRAME_HEADER_LEN,
         };
 
-        let error = DatagramTransferConfig::new(sender, receiver).unwrap_err();
+        let error = UDPourConfig::new(sender, receiver).unwrap_err();
         assert!(matches!(
             error,
-            DatagramTransferConfigError::NeedPartsFrameLenTooSmall {
+            UDPourConfigError::NeedPartsFrameLenTooSmall {
                 max_need_parts_frame_len: FRAME_HEADER_LEN
             }
         ));
@@ -774,10 +794,10 @@ mod tests {
             max_need_parts_frame_len: FRAME_HEADER_LEN + 1,
         };
 
-        let error = DatagramTransferConfig::new(sender, receiver).unwrap_err();
+        let error = UDPourConfig::new(sender, receiver).unwrap_err();
         assert!(matches!(
             error,
-            DatagramTransferConfigError::ZeroMaxPartPayloadLenConfig
+            UDPourConfigError::ZeroMaxPartPayloadLenConfig
         ));
     }
 }

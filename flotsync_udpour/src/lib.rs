@@ -1,4 +1,4 @@
-//! Datagram multipart transfer protocol and state machines.
+//! UDPour protocol and state machines.
 //!
 //! This crate implements one small multipart protocol for carrying one logical
 //! payload over one UDP route when that payload does not fit into a single
@@ -148,7 +148,7 @@
 //! The Kompact runtime in this crate is intentionally narrow:
 //!
 //! - it runs over one already-open `flotsync_io` UDP socket
-//! - it accepts logical outbound sends
+//! - it accepts logical outbound sends via actor ask
 //! - it emits fully reassembled inbound deliveries
 //! - it surfaces route-transport send failures separately from higher-level
 //!   semantic-delivery acknowledgments
@@ -165,19 +165,18 @@ mod types;
 pub use crate::{
     receiver::ReceiverConfig,
     runtime::{
-        DatagramTransferComponent,
-        DatagramTransferConfig,
-        DatagramTransferConfigError,
-        DatagramTransferDeliver,
-        DatagramTransferEncodeFailure,
-        DatagramTransferPort,
-        DatagramTransferPortIndication,
-        DatagramTransferPortRequest,
-        DatagramTransferSend,
-        DatagramTransferSendFailed,
-        DatagramTransferSendFailureReason,
-        DatagramTransferSendRef,
-        DatagramTransferStateFailure,
+        UDPourComponent,
+        UDPourComponentMessage,
+        UDPourConfig,
+        UDPourConfigError,
+        UDPourDeliver,
+        UDPourEncodeFailure,
+        UDPourPort,
+        UDPourPortIndication,
+        UDPourSend,
+        UDPourSendFailureReason,
+        UDPourStateFailure,
+        UDPourSubmitResult,
     },
     sender::SenderConfig,
     types::{Checksum, MessageId, PartCount},

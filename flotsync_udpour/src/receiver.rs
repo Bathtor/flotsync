@@ -8,13 +8,13 @@ use crate::{
     types::{
         AckFrame,
         Checksum,
-        DatagramHeader,
         FrameType,
         MessageId,
         NeedPartsFrame,
         NoLongerAvailableFrame,
         PartCount,
         PayloadFrame,
+        UDPourHeader,
         io_payload_eq,
     },
 };
@@ -104,7 +104,7 @@ impl ReceiverMachine {
                     checksum,
                 });
                 let header =
-                    DatagramHeader::control(FrameType::Ack, message_id, part_count, checksum)
+                    UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
                         .expect("Ack metadata gathered from a valid transfer must stay valid");
                 actions.push(ReceiverAction::SendAck {
                     source,
@@ -390,7 +390,7 @@ mod tests {
                 .accept_payload(
                     source(),
                     PayloadFrame {
-                        header: DatagramHeader::payload(
+                        header: UDPourHeader::payload(
                             message_id,
                             PartNumber(0),
                             part_count,
@@ -407,7 +407,7 @@ mod tests {
                 .accept_payload(
                     source(),
                     PayloadFrame {
-                        header: DatagramHeader::payload(
+                        header: UDPourHeader::payload(
                             message_id,
                             PartNumber(1),
                             part_count,
@@ -424,7 +424,7 @@ mod tests {
                 .accept_payload(
                     source(),
                     PayloadFrame {
-                        header: DatagramHeader::payload(
+                        header: UDPourHeader::payload(
                             message_id,
                             PartNumber(2),
                             part_count,
@@ -461,12 +461,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b"abcd"),
                 },
                 now,
@@ -486,12 +481,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(2),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(2), part_count, checksum),
                     payload: IoPayload::from_static(b"ijkl"),
                 },
                 now + Duration::from_millis(12),
@@ -520,12 +510,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b"abcd"),
                 },
                 now,
@@ -536,7 +521,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
+                    header: UDPourHeader::payload(
                         message_id,
                         PartNumber(1),
                         PartCount::new(3).unwrap(),
@@ -567,12 +552,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b"abcd"),
                 },
                 now,
@@ -583,12 +563,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(1),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(1), part_count, checksum),
                     payload: IoPayload::from_static(b"efgh"),
                 },
                 now + Duration::from_millis(1),
@@ -614,12 +589,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b"abcd"),
                 },
                 now,
@@ -629,7 +599,7 @@ mod tests {
         let action = receiver.accept_no_longer_available(
             source(),
             NoLongerAvailableFrame {
-                header: DatagramHeader::control(
+                header: UDPourHeader::control(
                     FrameType::NoLongerAvailable,
                     message_id,
                     part_count,
@@ -662,12 +632,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b"abcd"),
                 },
                 now,
@@ -680,7 +645,7 @@ mod tests {
                 .accept_no_longer_available(
                     wrong_source,
                     NoLongerAvailableFrame {
-                        header: DatagramHeader::control(
+                        header: UDPourHeader::control(
                             FrameType::NoLongerAvailable,
                             message_id,
                             part_count,
@@ -696,7 +661,7 @@ mod tests {
                 .accept_no_longer_available(
                     source(),
                     NoLongerAvailableFrame {
-                        header: DatagramHeader::control(
+                        header: UDPourHeader::control(
                             FrameType::NoLongerAvailable,
                             message_id,
                             part_count,
@@ -712,7 +677,7 @@ mod tests {
                 .accept_no_longer_available(
                     source(),
                     NoLongerAvailableFrame {
-                        header: DatagramHeader::control(
+                        header: UDPourHeader::control(
                             FrameType::NoLongerAvailable,
                             message_id,
                             PartCount::new(3).unwrap(),
@@ -737,12 +702,7 @@ mod tests {
             .accept_payload(
                 source(),
                 PayloadFrame {
-                    header: DatagramHeader::payload(
-                        message_id,
-                        PartNumber(0),
-                        part_count,
-                        checksum,
-                    ),
+                    header: UDPourHeader::payload(message_id, PartNumber(0), part_count, checksum),
                     payload: IoPayload::from_static(b""),
                 },
                 now,

@@ -1,5 +1,7 @@
 # Agent Instructions
 
+- Always assume I made manual changes since the last time you ran. Be careful not to accidentally overwrite those changes by regenerating from outdated state.
+
 ## Rust Rules
 
 - Format Rust code according to `rustfmt.toml`.

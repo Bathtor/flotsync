@@ -5,7 +5,7 @@ members = [
     "flotsync_discovery",
     "flotsync_discovery_cli",
     "flotsync_data_types",
-    "flotsync_datagram_transfer",
+    "flotsync_udpour",
     "flotsync_utils",
     "flotsync_replication",
     "flotsync_io",

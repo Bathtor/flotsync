@@ -6,7 +6,6 @@
 use crate::types::{
     AckFrame,
     Checksum,
-    DatagramHeader,
     FrameType,
     MessageId,
     NeedPartsFrame,
@@ -14,6 +13,7 @@ use crate::types::{
     PartCount,
     PartNumber,
     PayloadFrame,
+    UDPourHeader,
 };
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
@@ -280,12 +280,7 @@ impl LiveMessage {
             self.part_count,
         );
         PayloadFrame {
-            header: DatagramHeader::payload(
-                message_id,
-                part_number,
-                self.part_count,
-                self.checksum,
-            ),
+            header: UDPourHeader::payload(message_id, part_number, self.part_count, self.checksum),
             payload,
         }
     }
@@ -320,8 +315,8 @@ fn slice_part(
         .expect("payload part range must stay inside the retained payload")
 }
 
-fn no_longer_available_frame(header: DatagramHeader) -> NoLongerAvailableFrame {
-    let header = DatagramHeader::control(
+fn no_longer_available_frame(header: UDPourHeader) -> NoLongerAvailableFrame {
+    let header = UDPourHeader::control(
         FrameType::NoLongerAvailable,
         header.message_id,
         header.part_count,
@@ -358,7 +353,7 @@ pub(crate) enum SenderError {
     },
     #[snafu(display("Generated an invalid part count"))]
     InvalidPartCount {
-        source: crate::types::DatagramTypeError,
+        source: crate::types::UDPourTypeError,
     },
     #[snafu(display("All message ids are currently live or cooling down"))]
     MessageIdExhausted,
@@ -390,7 +385,7 @@ mod tests {
         let mut missing_parts = RoaringBitmap::new();
         missing_parts.insert(1);
         let need_parts = NeedPartsFrame {
-            header: DatagramHeader::control(
+            header: UDPourHeader::control(
                 FrameType::NeedParts,
                 message_id,
                 PartCount::new(3).unwrap(),
@@ -417,7 +412,7 @@ mod tests {
         let mut missing_parts = RoaringBitmap::new();
         missing_parts.insert(0);
         let need_parts = NeedPartsFrame {
-            header: DatagramHeader::control(
+            header: UDPourHeader::control(
                 FrameType::NeedParts,
                 MessageId(22),
                 PartCount::new(1).unwrap(),
@@ -487,7 +482,7 @@ mod tests {
         };
 
         let ack = AckFrame {
-            header: DatagramHeader::control(
+            header: UDPourHeader::control(
                 FrameType::Ack,
                 message_id,
                 PartCount::new(1).unwrap(),
@@ -518,7 +513,7 @@ mod tests {
         };
 
         let ack = AckFrame {
-            header: DatagramHeader::control(
+            header: UDPourHeader::control(
                 FrameType::Ack,
                 message_id,
                 PartCount::new(1).unwrap(),
@@ -556,7 +551,7 @@ mod tests {
         };
 
         let stale_ack = AckFrame {
-            header: DatagramHeader::control(
+            header: UDPourHeader::control(
                 FrameType::Ack,
                 message_id,
                 PartCount::new(1).unwrap(),

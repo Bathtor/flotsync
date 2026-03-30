@@ -3,28 +3,27 @@ use crate::{
     SenderConfig,
     codec::{decode_frame, encode_frame},
     runtime::{
-        DatagramTransferComponent,
-        DatagramTransferConfig,
-        DatagramTransferDeliver,
-        DatagramTransferPort,
-        DatagramTransferPortIndication,
-        DatagramTransferPortRequest,
-        DatagramTransferSend,
-        DatagramTransferSendFailed,
-        DatagramTransferSendFailureReason,
-        DatagramTransferSendRef,
+        UDPourComponent,
+        UDPourComponentMessage,
+        UDPourConfig,
+        UDPourDeliver,
+        UDPourPort,
+        UDPourPortIndication,
+        UDPourSend,
+        UDPourSendFailureReason,
+        UDPourSubmitResult,
     },
     types::{
         AckFrame,
         Checksum,
-        DatagramFrame,
-        DatagramHeader,
         FrameType,
         MessageId,
         PROTOCOL_VERSION,
         PartCount,
         PartNumber,
         PayloadFrame,
+        UDPourFrame,
+        UDPourHeader,
     },
 };
 use bytes::Bytes;
@@ -67,12 +66,12 @@ use std::{
 #[derive(ComponentDefinition)]
 struct TransferProbe {
     ctx: ComponentContext<Self>,
-    transfer: RequiredPort<DatagramTransferPort>,
-    indications: mpsc::Sender<DatagramTransferPortIndication>,
+    transfer: RequiredPort<UDPourPort>,
+    indications: mpsc::Sender<UDPourPortIndication>,
 }
 
 impl TransferProbe {
-    fn new(indications: mpsc::Sender<DatagramTransferPortIndication>) -> Self {
+    fn new(indications: mpsc::Sender<UDPourPortIndication>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             transfer: RequiredPort::uninitialised(),
@@ -83,8 +82,8 @@ impl TransferProbe {
 
 ignore_lifecycle!(TransferProbe);
 
-impl Require<DatagramTransferPort> for TransferProbe {
-    fn handle(&mut self, indication: DatagramTransferPortIndication) -> Handled {
+impl Require<UDPourPort> for TransferProbe {
+    fn handle(&mut self, indication: UDPourPortIndication) -> Handled {
         self.indications
             .send(indication)
             .expect("transfer indication receiver must stay live during tests");
@@ -401,22 +400,20 @@ struct RuntimeHarness {
     observer: Arc<Component<UdpObserver>>,
     sender_proxy: Arc<Component<ScriptedUdpProxy>>,
     receiver_proxy: Arc<Component<ScriptedUdpProxy>>,
-    sender_runtime: Arc<Component<DatagramTransferComponent>>,
-    receiver_runtime: Arc<Component<DatagramTransferComponent>>,
+    sender_runtime: Arc<Component<UDPourComponent>>,
+    receiver_runtime: Arc<Component<UDPourComponent>>,
+    sender_runtime_ref: ActorRefStrong<UDPourComponentMessage>,
     sender_probe: Arc<Component<TransferProbe>>,
     receiver_probe: Arc<Component<TransferProbe>>,
     _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
     _bridge_to_sender_proxy: TwoWayChannel<UdpPort, IoBridge, ScriptedUdpProxy>,
     _bridge_to_receiver_proxy: TwoWayChannel<UdpPort, IoBridge, ScriptedUdpProxy>,
-    _sender_proxy_to_runtime: TwoWayChannel<UdpPort, ScriptedUdpProxy, DatagramTransferComponent>,
-    _receiver_proxy_to_runtime: TwoWayChannel<UdpPort, ScriptedUdpProxy, DatagramTransferComponent>,
-    _sender_runtime_to_probe:
-        TwoWayChannel<DatagramTransferPort, DatagramTransferComponent, TransferProbe>,
-    _receiver_runtime_to_probe:
-        TwoWayChannel<DatagramTransferPort, DatagramTransferComponent, TransferProbe>,
+    _sender_proxy_to_runtime: TwoWayChannel<UdpPort, ScriptedUdpProxy, UDPourComponent>,
+    _receiver_proxy_to_runtime: TwoWayChannel<UdpPort, ScriptedUdpProxy, UDPourComponent>,
+    _sender_runtime_to_probe: TwoWayChannel<UDPourPort, UDPourComponent, TransferProbe>,
+    _receiver_runtime_to_probe: TwoWayChannel<UDPourPort, UDPourComponent, TransferProbe>,
     observer_rx: BufferedReceiver<UdpIndication>,
-    sender_rx: BufferedReceiver<DatagramTransferPortIndication>,
-    receiver_rx: BufferedReceiver<DatagramTransferPortIndication>,
+    receiver_rx: BufferedReceiver<UDPourPortIndication>,
     sender_socket_id: SocketId,
     receiver_socket_id: SocketId,
     receiver_addr: SocketAddr,
@@ -453,7 +450,7 @@ impl RuntimeHarness {
         let (sender_socket_id, _) = bind_socket(&observer, &observer_rx);
         let (receiver_socket_id, receiver_addr) = bind_socket(&observer, &observer_rx);
 
-        let config = DatagramTransferConfig::new(sender_config, receiver_config).unwrap();
+        let config = UDPourConfig::new(sender_config, receiver_config).unwrap();
         let sender_proxy = system.create(move || {
             ScriptedUdpProxy::new(
                 sender_socket_id,
@@ -471,14 +468,18 @@ impl RuntimeHarness {
         let sender_runtime = system.create({
             let config = config.clone();
             let egress_pool = egress_pool.clone();
-            move || DatagramTransferComponent::new(sender_socket_id, egress_pool, config)
+            move || UDPourComponent::new(sender_socket_id, egress_pool, config)
         });
+        let sender_runtime_ref = sender_runtime
+            .actor_ref()
+            .hold()
+            .expect("sender runtime must still be live after creation");
         let receiver_runtime = system.create({
             let config = config.clone();
             let egress_pool = egress_pool.clone();
-            move || DatagramTransferComponent::new(receiver_socket_id, egress_pool, config)
+            move || UDPourComponent::new(receiver_socket_id, egress_pool, config)
         });
-        let (sender_tx, sender_rx) = mpsc::channel();
+        let (sender_tx, _sender_rx) = mpsc::channel();
         let sender_probe = system.create(move || TransferProbe::new(sender_tx));
         let (receiver_tx, receiver_rx) = mpsc::channel();
         let receiver_probe = system.create(move || TransferProbe::new(receiver_tx));
@@ -495,10 +496,10 @@ impl RuntimeHarness {
             biconnect_components::<UdpPort, _, _>(&receiver_proxy, &receiver_runtime)
                 .expect("receiver_proxy/runtime connection");
         let sender_runtime_to_probe =
-            biconnect_components::<DatagramTransferPort, _, _>(&sender_runtime, &sender_probe)
+            biconnect_components::<UDPourPort, _, _>(&sender_runtime, &sender_probe)
                 .expect("sender_runtime/probe connection");
         let receiver_runtime_to_probe =
-            biconnect_components::<DatagramTransferPort, _, _>(&receiver_runtime, &receiver_probe)
+            biconnect_components::<UDPourPort, _, _>(&receiver_runtime, &receiver_probe)
                 .expect("receiver_runtime/probe connection");
 
         start_component(&system, &sender_proxy);
@@ -517,6 +518,7 @@ impl RuntimeHarness {
             receiver_proxy,
             sender_runtime,
             receiver_runtime,
+            sender_runtime_ref,
             sender_probe,
             receiver_probe,
             _bridge_to_observer: bridge_to_observer,
@@ -527,7 +529,6 @@ impl RuntimeHarness {
             _sender_runtime_to_probe: sender_runtime_to_probe,
             _receiver_runtime_to_probe: receiver_runtime_to_probe,
             observer_rx,
-            sender_rx: BufferedReceiver::new(sender_rx),
             receiver_rx: BufferedReceiver::new(receiver_rx),
             sender_socket_id,
             receiver_socket_id,
@@ -535,24 +536,21 @@ impl RuntimeHarness {
         }
     }
 
-    fn send(&self, send_ref: DatagramTransferSendRef, payload: IoPayload) {
+    fn send(&self, payload: IoPayload) -> UDPourSubmitResult {
         let target = self.receiver_addr;
-        self.sender_probe.on_definition(|component| {
-            component
-                .transfer
-                .trigger(DatagramTransferPortRequest::Send(DatagramTransferSend {
-                    send_ref,
-                    target,
-                    payload,
-                }));
+        let future = self.sender_runtime_ref.ask_with(|promise| {
+            UDPourComponentMessage::Submit(Ask::new(promise, UDPourSend { target, payload }))
         });
+        future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for sender submit result")
     }
 
     fn wait_for_bridge_frame(
         &self,
         socket_id: SocketId,
-        mut predicate: impl FnMut(&DatagramFrame) -> bool,
-    ) -> DatagramFrame {
+        mut predicate: impl FnMut(&UDPourFrame) -> bool,
+    ) -> UDPourFrame {
         let indication = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
             let UdpIndication::Received {
                 socket_id: indicated_socket_id,
@@ -580,7 +578,7 @@ impl RuntimeHarness {
         &self,
         socket_id: SocketId,
         duration: Duration,
-        mut predicate: impl FnMut(&DatagramFrame) -> bool,
+        mut predicate: impl FnMut(&UDPourFrame) -> bool,
     ) {
         self.observer_rx.assert_no_match(duration, |indication| {
             let UdpIndication::Received {
@@ -601,35 +599,16 @@ impl RuntimeHarness {
         });
     }
 
-    fn wait_for_receiver_deliver(&self) -> DatagramTransferDeliver {
+    fn wait_for_receiver_deliver(&self) -> UDPourDeliver {
         let indication = self.receiver_rx.recv_matching(WAIT_TIMEOUT, |_| true);
         match indication {
-            DatagramTransferPortIndication::Deliver(deliver) => deliver,
-            DatagramTransferPortIndication::SendFailed(failed) => {
-                panic!("unexpected receiver send failure: {failed:?}")
-            }
+            UDPourPortIndication::Deliver(deliver) => deliver,
         }
-    }
-
-    fn wait_for_sender_send_failed(&self) -> DatagramTransferSendFailed {
-        let indication = self.sender_rx.recv_matching(WAIT_TIMEOUT, |_| true);
-        match indication {
-            DatagramTransferPortIndication::SendFailed(failed) => failed,
-            DatagramTransferPortIndication::Deliver(deliver) => {
-                panic!("unexpected sender deliver indication: {deliver:?}")
-            }
-        }
-    }
-
-    fn assert_no_sender_send_failed(&self, duration: Duration) {
-        self.sender_rx.assert_no_match(duration, |indication| {
-            matches!(indication, DatagramTransferPortIndication::SendFailed(_))
-        });
     }
 
     fn assert_no_receiver_deliver(&self, duration: Duration) {
         self.receiver_rx.assert_no_match(duration, |indication| {
-            matches!(indication, DatagramTransferPortIndication::Deliver(_))
+            matches!(indication, UDPourPortIndication::Deliver(_))
         });
     }
 
@@ -707,7 +686,7 @@ fn payload_frame_for_socket(
         return None;
     }
     match decode_frame(payload.clone()).ok()? {
-        DatagramFrame::Payload(frame) => Some(frame),
+        UDPourFrame::Payload(frame) => Some(frame),
         _ => None,
     }
 }
@@ -728,7 +707,7 @@ fn conflicting_duplicate_indication(
     } else {
         bytes[0] ^= 0xFF;
     }
-    let duplicate = DatagramFrame::Payload(PayloadFrame {
+    let duplicate = UDPourFrame::Payload(PayloadFrame {
         header: frame.header,
         payload: IoPayload::from(Bytes::from(bytes)),
     });
@@ -740,8 +719,8 @@ fn conflicting_duplicate_indication(
 }
 
 fn malformed_payload_indication(socket_id: SocketId, source: SocketAddr) -> UdpIndication {
-    let valid = DatagramFrame::Payload(PayloadFrame {
-        header: DatagramHeader::payload(
+    let valid = UDPourFrame::Payload(PayloadFrame {
+        header: UDPourHeader::payload(
             MessageId(901),
             PartNumber(0),
             PartCount::new(1).unwrap(),
@@ -761,8 +740,8 @@ fn malformed_payload_indication(socket_id: SocketId, source: SocketAddr) -> UdpI
 }
 
 fn malformed_control_indication(socket_id: SocketId, source: SocketAddr) -> UdpIndication {
-    let valid = DatagramFrame::Ack(AckFrame {
-        header: DatagramHeader::control(
+    let valid = UDPourFrame::Ack(AckFrame {
+        header: UDPourHeader::control(
             FrameType::Ack,
             MessageId(902),
             PartCount::new(1).unwrap(),
@@ -792,24 +771,23 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(1),
-        IoPayload::from_static(b"hello world"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"hello world")),
+        UDPourSubmitResult::Sent { .. }
+    ));
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"hello world");
 
     let ack = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
-        matches!(frame, DatagramFrame::Ack(_))
+        matches!(frame, UDPourFrame::Ack(_))
     });
-    assert!(matches!(ack, DatagramFrame::Ack(_)));
+    assert!(matches!(ack, UDPourFrame::Ack(_)));
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
         Duration::from_millis(100),
-        |frame| matches!(frame, DatagramFrame::NeedParts(_)),
+        |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
-    harness.assert_no_sender_send_failed(Duration::from_millis(100));
     harness.shutdown();
 }
 
@@ -827,27 +805,27 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         default_receiver_config(Duration::from_millis(20)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(2),
-        IoPayload::from_static(b"abcdefghijkl"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     for _ in 0..3 {
         harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
-            matches!(frame, DatagramFrame::Payload(_))
+            matches!(frame, UDPourFrame::Payload(_))
         });
     }
 
     let need_parts = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
-        matches!(frame, DatagramFrame::NeedParts(_))
+        matches!(frame, UDPourFrame::NeedParts(_))
     });
-    let DatagramFrame::NeedParts(need_parts) = need_parts else {
+    let UDPourFrame::NeedParts(need_parts) = need_parts else {
         unreachable!("filtered to NeedParts");
     };
     let missing: Vec<_> = need_parts.missing_parts.iter().collect();
     assert_eq!(missing, vec![1]);
 
     let retransmit = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
-        let DatagramFrame::Payload(frame) = frame else {
+        let UDPourFrame::Payload(frame) = frame else {
             return false;
         };
         if frame.header.part_number != PartNumber(1) {
@@ -855,11 +833,11 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         }
         frame.payload.to_vec().as_slice() == b"efgh"
     });
-    assert!(matches!(retransmit, DatagramFrame::Payload(_)));
+    assert!(matches!(retransmit, UDPourFrame::Payload(_)));
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
         Duration::from_millis(100),
-        |frame| matches!(frame, DatagramFrame::Payload(_)),
+        |frame| matches!(frame, UDPourFrame::Payload(_)),
     );
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -881,22 +859,22 @@ fn no_longer_available_after_sender_retention_expiry() {
         default_receiver_config(Duration::from_millis(50)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(3),
-        IoPayload::from_static(b"abcdefghijkl"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     for _ in 0..3 {
         harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
-            matches!(frame, DatagramFrame::Payload(_))
+            matches!(frame, UDPourFrame::Payload(_))
         });
     }
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
-        matches!(frame, DatagramFrame::NeedParts(_))
+        matches!(frame, UDPourFrame::NeedParts(_))
     });
     let nla = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
-        matches!(frame, DatagramFrame::NoLongerAvailable(_))
+        matches!(frame, UDPourFrame::NoLongerAvailable(_))
     });
-    assert!(matches!(nla, DatagramFrame::NoLongerAvailable(_)));
+    assert!(matches!(nla, UDPourFrame::NoLongerAvailable(_)));
     harness.assert_no_receiver_deliver(Duration::from_millis(150));
     harness.shutdown();
 }
@@ -915,16 +893,14 @@ fn runtime_nack_reports_one_send_failed_with_correct_identity() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(DatagramTransferSendRef(44), IoPayload::from_static(b"x"));
-
-    let failed = harness.wait_for_sender_send_failed();
-    assert_eq!(failed.send_ref, DatagramTransferSendRef(44));
-    assert_eq!(failed.message_id, Some(MessageId(0)));
+    let failed = harness.send(IoPayload::from_static(b"x"));
     assert_eq!(
-        failed.reason,
-        DatagramTransferSendFailureReason::Transport(SendFailureReason::Closed)
+        failed,
+        UDPourSubmitResult::SendFailed {
+            message_id: Some(MessageId(0)),
+            reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
+        }
     );
-    harness.assert_no_sender_send_failed(Duration::from_millis(100));
     harness.shutdown();
 }
 
@@ -943,15 +919,15 @@ fn runtime_out_of_order_payloads_still_reassemble_and_ack() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(5),
-        IoPayload::from_static(b"abcdefghijkl"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent { .. }
+    ));
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
-        matches!(frame, DatagramFrame::Ack(_))
+        matches!(frame, UDPourFrame::Ack(_))
     });
     harness.shutdown();
 }
@@ -973,17 +949,17 @@ fn runtime_duplicate_payload_datagrams_do_not_break_delivery() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(6),
-        IoPayload::from_static(b"abcdefghijkl"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent { .. }
+    ));
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
         Duration::from_millis(100),
-        |frame| matches!(frame, DatagramFrame::NeedParts(_)),
+        |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
     harness.shutdown();
 }
@@ -1005,18 +981,21 @@ fn runtime_conflicting_duplicates_purge_without_requesting_repair() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(7),
-        IoPayload::from_static(b"abcdefgh"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefgh")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     harness.assert_no_receiver_deliver(Duration::from_millis(150));
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
         Duration::from_millis(150),
-        |frame| matches!(frame, DatagramFrame::NeedParts(_)),
+        |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
 
-    harness.send(DatagramTransferSendRef(8), IoPayload::from_static(b"qrst"));
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"qrst")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"qrst");
     harness.shutdown();
@@ -1033,14 +1012,17 @@ fn malformed_frames_are_dropped_without_poisoning_valid_traffic() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(
-        DatagramTransferSendRef(9),
-        IoPayload::from_static(b"abcdefghijkl"),
-    );
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     let first = harness.wait_for_receiver_deliver();
     assert_eq!(first.payload.to_vec().as_slice(), b"abcdefghijkl");
 
-    harness.send(DatagramTransferSendRef(10), IoPayload::from_static(b"mnop"));
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"mnop")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     let second = harness.wait_for_receiver_deliver();
     assert_eq!(second.payload.to_vec().as_slice(), b"mnop");
     harness.shutdown();
@@ -1057,12 +1039,15 @@ fn zero_length_payload_round_trips_through_runtime() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
-    harness.send(DatagramTransferSendRef(11), IoPayload::from_static(b""));
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"")),
+        UDPourSubmitResult::Sent { .. }
+    ));
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.part_count, PartCount::new(1).unwrap());
     assert_eq!(deliver.payload.len(), 0);
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
-        matches!(frame, DatagramFrame::Ack(_))
+        matches!(frame, UDPourFrame::Ack(_))
     });
     harness.shutdown();
 }

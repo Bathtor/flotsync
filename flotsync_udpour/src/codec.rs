@@ -23,7 +23,7 @@ pub const FRAME_HEADER_LEN: usize = 20;
 ///
 /// The header is copied into a small local buffer for parsing. The payload body
 /// of a `Payload` frame stays in `IoPayload` form.
-pub(crate) fn decode_frame(payload: IoPayload) -> Result<DatagramFrame, CodecError> {
+pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError> {
     ensure!(
         payload.len() >= FRAME_HEADER_LEN,
         FrameTooShortSnafu { len: payload.len() }
@@ -42,7 +42,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<DatagramFrame, CodecErr
                     offset: FRAME_HEADER_LEN,
                     len: body_len,
                 })?;
-            Ok(DatagramFrame::Payload(PayloadFrame {
+            Ok(UDPourFrame::Payload(PayloadFrame {
                 header,
                 payload: body,
             }))
@@ -54,7 +54,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<DatagramFrame, CodecErr
                     frame_type: header.frame_type
                 }
             );
-            Ok(DatagramFrame::Ack(AckFrame { header }))
+            Ok(UDPourFrame::Ack(AckFrame { header }))
         }
         FrameType::NoLongerAvailable => {
             ensure!(
@@ -63,7 +63,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<DatagramFrame, CodecErr
                     frame_type: header.frame_type
                 }
             );
-            Ok(DatagramFrame::NoLongerAvailable(NoLongerAvailableFrame {
+            Ok(UDPourFrame::NoLongerAvailable(NoLongerAvailableFrame {
                 header,
             }))
         }
@@ -80,7 +80,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<DatagramFrame, CodecErr
             let missing_parts =
                 deserialize_bitmap_from(body.cursor().reader()).context(BitmapSnafu)?;
             ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
-            Ok(DatagramFrame::NeedParts(NeedPartsFrame {
+            Ok(UDPourFrame::NeedParts(NeedPartsFrame {
                 header,
                 missing_parts,
             }))
@@ -104,7 +104,7 @@ pub(crate) fn split_need_parts_frames(
     ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
 
     let max_body_len = max_frame_len - FRAME_HEADER_LEN;
-    let header = DatagramHeader::control(FrameType::NeedParts, message_id, part_count, checksum)
+    let header = UDPourHeader::control(FrameType::NeedParts, message_id, part_count, checksum)
         .context(TypeSnafu)?;
     let mut remaining = Some(missing_parts.clone());
     let mut frames = Vec::new();
@@ -120,16 +120,16 @@ pub(crate) fn split_need_parts_frames(
 }
 
 /// Returns the exact encoded frame length in bytes.
-pub(crate) fn encoded_frame_len(frame: &DatagramFrame) -> usize {
+pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
     match frame {
-        DatagramFrame::Payload(frame) => FRAME_HEADER_LEN + frame.payload.len(),
-        DatagramFrame::Ack(_) | DatagramFrame::NoLongerAvailable(_) => FRAME_HEADER_LEN,
-        DatagramFrame::NeedParts(frame) => FRAME_HEADER_LEN + frame.missing_parts.serialized_size(),
+        UDPourFrame::Payload(frame) => FRAME_HEADER_LEN + frame.payload.len(),
+        UDPourFrame::Ack(_) | UDPourFrame::NoLongerAvailable(_) => FRAME_HEADER_LEN,
+        UDPourFrame::NeedParts(frame) => FRAME_HEADER_LEN + frame.missing_parts.serialized_size(),
     }
 }
 
 /// Encodes one validated fixed header into any synchronous `BufMut`.
-pub(crate) fn encode_header_into<B>(header: DatagramHeader, out: &mut B)
+pub(crate) fn encode_header_into<B>(header: UDPourHeader, out: &mut B)
 where
     B: BufMut,
 {
@@ -164,17 +164,17 @@ where
 /// Payload frames preserve their payload storage as-is and prepend only the
 /// fixed 20-byte header. Control frames emit only owned header/body bytes.
 #[cfg(test)]
-pub(crate) fn encode_frame(frame: &DatagramFrame) -> Result<IoPayload, CodecError> {
+pub(crate) fn encode_frame(frame: &UDPourFrame) -> Result<IoPayload, CodecError> {
     let header = frame.header();
     header.validate().context(TypeSnafu)?;
     let header_bytes = encode_header(header).freeze();
     let header_payload = IoPayload::from(header_bytes);
     match frame {
-        DatagramFrame::Payload(frame) => {
+        UDPourFrame::Payload(frame) => {
             Ok(IoPayload::chain([header_payload, frame.payload.clone()]))
         }
-        DatagramFrame::Ack(_) | DatagramFrame::NoLongerAvailable(_) => Ok(header_payload),
-        DatagramFrame::NeedParts(frame) => {
+        UDPourFrame::Ack(_) | UDPourFrame::NoLongerAvailable(_) => Ok(header_payload),
+        UDPourFrame::NeedParts(frame) => {
             let body = serialize_bitmap(&frame.missing_parts).context(BitmapSnafu)?;
             Ok(IoPayload::chain([
                 header_payload,
@@ -185,26 +185,26 @@ pub(crate) fn encode_frame(frame: &DatagramFrame) -> Result<IoPayload, CodecErro
 }
 
 #[cfg(test)]
-fn encode_header(header: DatagramHeader) -> BytesMut {
+fn encode_header(header: UDPourHeader) -> BytesMut {
     let mut bytes = BytesMut::with_capacity(FRAME_HEADER_LEN);
     encode_header_into(header, &mut bytes);
     bytes
 }
 
-fn decode_header_payload(payload: &IoPayload) -> Result<DatagramHeader, CodecError> {
+fn decode_header_payload(payload: &IoPayload) -> Result<UDPourHeader, CodecError> {
     let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
     let mut cursor = payload.cursor();
     cursor.copy_to_slice(&mut header_bytes);
     decode_header(&header_bytes)
 }
 
-fn decode_header(bytes: &[u8]) -> Result<DatagramHeader, CodecError> {
+fn decode_header(bytes: &[u8]) -> Result<UDPourHeader, CodecError> {
     let frame_type = FrameType::try_from(bytes[0]).context(TypeSnafu)?;
     let part_count = PartCount::new(u32::from_be_bytes(
         bytes[12..16].try_into().expect("part_count slice"),
     ))
     .context(TypeSnafu)?;
-    Ok(DatagramHeader {
+    Ok(UDPourHeader {
         frame_type,
         version: bytes[1],
         flags: bytes[2],
@@ -236,7 +236,7 @@ pub(crate) enum CodecError {
     #[snafu(display("Invalid roaring bitmap payload"))]
     Bitmap { source: RoaringBitmapError },
     #[snafu(display("Invalid datagram frame"))]
-    Type { source: DatagramTypeError },
+    Type { source: UDPourTypeError },
     #[snafu(display(
         "Invalid IoPayload slice range offset={offset}, len={len}, payload_len={payload_len}"
     ))]
@@ -258,7 +258,7 @@ mod tests {
 
     fn encode_control_header(frame_type: FrameType) -> Vec<u8> {
         encode_header(
-            DatagramHeader::control(
+            UDPourHeader::control(
                 frame_type,
                 MessageId(99),
                 PartCount::new(4).unwrap(),
@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn payload_round_trip() {
-        let frame = DatagramFrame::Payload(PayloadFrame {
-            header: DatagramHeader::payload(
+        let frame = UDPourFrame::Payload(PayloadFrame {
+            header: UDPourHeader::payload(
                 MessageId(7),
                 PartNumber(2),
                 PartCount::new(4).unwrap(),
@@ -290,8 +290,8 @@ mod tests {
         let mut missing_parts = RoaringBitmap::new();
         missing_parts.insert(1);
         missing_parts.insert(3);
-        let frame = DatagramFrame::NeedParts(NeedPartsFrame {
-            header: DatagramHeader::control(
+        let frame = UDPourFrame::NeedParts(NeedPartsFrame {
+            header: UDPourHeader::control(
                 FrameType::NeedParts,
                 MessageId(8),
                 PartCount::new(10).unwrap(),
@@ -323,7 +323,7 @@ mod tests {
 
         assert!(frames.len() > 1);
         for frame in frames {
-            let encoded = encode_frame(&DatagramFrame::NeedParts(frame)).unwrap();
+            let encoded = encode_frame(&UDPourFrame::NeedParts(frame)).unwrap();
             assert!(encoded.len() <= 96);
         }
     }
@@ -379,7 +379,7 @@ mod tests {
         assert!(matches!(
             error,
             CodecError::Type {
-                source: DatagramTypeError::UnsupportedVersion { .. },
+                source: UDPourTypeError::UnsupportedVersion { .. },
             }
         ));
     }
@@ -393,7 +393,7 @@ mod tests {
         assert!(matches!(
             error,
             CodecError::Type {
-                source: DatagramTypeError::ControlPartNumberMustBeZero { part_number: 1 },
+                source: UDPourTypeError::ControlPartNumberMustBeZero { part_number: 1 },
             }
         ));
     }

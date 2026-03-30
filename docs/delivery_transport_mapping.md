@@ -22,7 +22,7 @@ This note defines:
 
 This note does not define:
 
-- the datagram multipart protocol for oversized logical payloads
+- the UDPour protocol for oversized logical payloads
 - inbound decode and demux ownership
 - the exact code shape for route-candidate descriptors
 
@@ -199,12 +199,12 @@ It is a protobuf convention rather than a standalone RFC.
 
 This should be preferred over inventing a custom stream framing.
 
-### 3.8 Datagram Multipart Is Defined Separately
+### 3.8 UDPour Is Defined Separately
 
 Handling logical payloads that do not fit into a single datagram is defined in a
 separate design note:
 
-- [Datagram Multipart Transfer](./datagram_multipart_transfer.md)
+- [UDPour](./datagram_multipart_transfer.md)
 
 That work remains tracked in:
 
@@ -288,5 +288,5 @@ candidate currently maps to.
 
 The main deferred items are:
 
-- `flotsync-p9u` for datagram multipart transfer design and protocol survey
+- `flotsync-p9u` for UDPour design and protocol survey
 - `flotsync-zup` for inbound transport decode and demux ownership

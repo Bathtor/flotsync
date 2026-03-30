@@ -26,22 +26,45 @@ use crate::{
 use ::kompact::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     net::SocketAddr,
     sync::Arc,
 };
+
+/// Bridge-local request to register one child required UDP port on the bridge's
+/// shared provided UDP port.
+///
+/// `RequiredRef<UdpPort>` does not implement `Debug`, but Kompact actor
+/// messages do. This wrapper therefore provides a manual `Debug`
+/// implementation that documents the operation without trying to print the
+/// opaque port reference itself.
+#[doc(hidden)]
+pub struct ConnectUdpPortRequest {
+    promise: KPromise<crate::errors::Result<()>>,
+    required: RequiredRef<UdpPort>,
+}
+
+impl fmt::Debug for ConnectUdpPortRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConnectUdpPortRequest")
+            .field("required", &"<RequiredRef<UdpPort>>")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Internal actor mailbox for one bridge component.
 ///
 /// The bridge receives both control-plane `ask` traffic and routed driver events on this mailbox.
 /// Keeping them in one local message enum avoids exposing bridge-internal routing details on the
 /// public UDP port surface.
-#[doc(hidden)]
 #[derive(Debug)]
+#[doc(hidden)]
 pub enum IoBridgeMessage {
     OpenTcpListener(
         Ask<OpenTcpListener, std::result::Result<OpenedTcpListener, OpenFailureReason>>,
     ),
     OpenTcpSession(Ask<OpenTcpSession, std::result::Result<OpenedTcpSession, OpenFailureReason>>),
+    ConnectUdpPort(ConnectUdpPortRequest),
     UdpEvent(UdpBridgeEvent),
 }
 
@@ -203,10 +226,11 @@ impl UdpOpenRequestTable {
 /// Use this handle for local resource-management operations such as opening TCP sessions and
 /// listeners. The actual UDP traffic surface remains a typed Kompact port on the component
 /// itself.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IoBridgeHandle {
     actor: ActorRefStrong<IoBridgeMessage>,
     egress_pool: EgressPool,
+    udp: ProvidedRef<UdpPort>,
 }
 
 impl IoBridgeHandle {
@@ -216,13 +240,46 @@ impl IoBridgeHandle {
             .actor_ref()
             .hold()
             .expect("IoBridge must still be live when creating a control handle");
-        let egress_pool = component.on_definition(|bridge| bridge.egress_pool.clone());
-        Self { actor, egress_pool }
+        let (egress_pool, udp) =
+            component.on_definition(|bridge| (bridge.egress_pool.clone(), bridge.provided_ref()));
+        Self {
+            actor,
+            egress_pool,
+            udp,
+        }
     }
 
     /// Returns the shared egress pool used by the underlying raw driver instance.
     pub fn egress_pool(&self) -> &EgressPool {
         &self.egress_pool
+    }
+
+    /// Returns a clone of the bridge's shared UDP provided-port reference.
+    pub fn udp_port_ref(&self) -> ProvidedRef<UdpPort> {
+        self.udp.clone()
+    }
+
+    /// Connects one component's required UDP port to this bridge.
+    ///
+    /// The component-side connection is installed immediately on the (expected to be)
+    /// not-yet-running component definition. The bridge-side connection is installed by the
+    /// bridge actor itself so callers do not need direct mutable access to the
+    /// bridge component.
+    ///
+    /// ## Warning
+    /// If `component` is already running when this is called, this function might block.
+    pub async fn connect_udp<C>(&self, component: &Arc<Component<C>>) -> crate::errors::Result<()>
+    where
+        C: ComponentDefinition + ComponentLifecycle + Require<UdpPort> + RequireRef<UdpPort>,
+    {
+        let required = component.on_definition(|definition| {
+            definition.connect_to_provided(self.udp_port_ref());
+            definition.required_ref()
+        });
+        let future = self.actor.ask_with(|promise| {
+            IoBridgeMessage::ConnectUdpPort(ConnectUdpPortRequest { promise, required })
+        });
+        resolve_kfuture(future).await
     }
 
     /// Opens one outbound TCP session managed by this bridge.
@@ -626,11 +683,23 @@ impl IoBridge {
         match msg {
             IoBridgeMessage::OpenTcpListener(ask) => self.handle_open_tcp_listener(ask),
             IoBridgeMessage::OpenTcpSession(ask) => self.handle_open_tcp_session(ask),
+            IoBridgeMessage::ConnectUdpPort(ask) => self.handle_connect_udp_port(ask),
             IoBridgeMessage::UdpEvent(event) => {
                 self.handle_udp_event(event);
                 Handled::Ok
             }
         }
+    }
+
+    fn handle_connect_udp_port(&mut self, request: ConnectUdpPortRequest) -> Handled {
+        self.udp.connect(request.required);
+        if request.promise.fulfil(Ok(())).is_err() {
+            warn!(
+                self.log(),
+                "dropping UDP port-connect completion because requester disappeared"
+            );
+        }
+        Handled::Ok
     }
 
     fn handle_open_tcp_session(

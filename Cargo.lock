@@ -952,18 +952,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "flotsync_datagram_transfer"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32c",
- "flotsync_io",
- "kompact",
- "roaring",
- "snafu",
-]
-
-[[package]]
 name = "flotsync_discovery"
 version = "0.1.0"
 dependencies = [
@@ -1055,11 +1043,24 @@ dependencies = [
  "flotsync_core",
  "flotsync_data_types",
  "flotsync_io",
+ "flotsync_udpour",
  "flotsync_utils",
  "kompact",
  "smallvec",
  "snafu",
  "uuid",
+]
+
+[[package]]
+name = "flotsync_udpour"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "flotsync_io",
+ "kompact",
+ "roaring",
+ "snafu",
 ]
 
 [[package]]
@@ -1493,8 +1494,6 @@ dependencies = [
 [[package]]
 name = "kompact"
 version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72e53f2031095827a482438424a663c8ffb4fddce8b2cbe0eb1f7d19d8a95d72"
 dependencies = [
  "arc-swap",
  "as_num",

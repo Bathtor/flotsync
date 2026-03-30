@@ -1,4 +1,4 @@
-# Datagram Multipart Transfer
+# UDPour
 
 This note captures the current protocol draft for `flotsync-p9u`.
 
@@ -112,7 +112,7 @@ and is therefore known once all parts have been received.
 
 ### 4.1 Fixed Base Header
 
-All datagram multipart frames share the same fixed 20-byte base header:
+All UDPour frames share the same fixed 20-byte base header:
 
 ```text
 +--------+---------+-------+----------+
