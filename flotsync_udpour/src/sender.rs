@@ -93,13 +93,21 @@ impl SenderMachine {
             payload,
             checksum,
             part_count,
-            expires_at: now + self.config.retention_timeout,
+            expires_at: None,
         };
         // TODO(flotsync-2hd): Stream payload frames directly into the runtime send path instead
         // of materializing one Vec<PayloadFrame> per logical send.
         let frames = live_message.all_payload_frames(message_id, self.config.max_part_payload_len);
         self.live.insert(message_id, live_message);
         Ok(SenderAction::SendPayloads { message_id, frames })
+    }
+
+    /// Starts the retained-state timeout once the initial multipart send has fully completed.
+    pub fn mark_initial_send_complete(&mut self, message_id: MessageId, now: Instant) {
+        let Some(live) = self.live.get_mut(&message_id) else {
+            return;
+        };
+        live.expires_at = Some(now + self.config.retention_timeout);
     }
 
     /// Handles one receiver acknowledgment.
@@ -152,7 +160,11 @@ impl SenderMachine {
         let expired_ids: Vec<_> = self
             .live
             .iter()
-            .filter_map(|(message_id, live)| (live.expires_at <= now).then_some(*message_id))
+            .filter_map(|(message_id, live)| {
+                live.expires_at
+                    .filter(|expires_at| *expires_at <= now)
+                    .map(|_| *message_id)
+            })
             .collect();
         let mut actions = Vec::with_capacity(expired_ids.len());
         for message_id in expired_ids {
@@ -163,6 +175,12 @@ impl SenderMachine {
             }
         }
         actions
+    }
+
+    /// Aborts one live logical message and moves its `message_id` into cooldown immediately.
+    pub fn abort_transfer(&mut self, message_id: MessageId, now: Instant) -> Option<SenderAction> {
+        self.collect_expired_cooldown(now);
+        self.purge_message(message_id, now, SenderPurgeReason::Aborted)
     }
 
     fn allocate_message_id(&mut self, now: Instant) -> Result<MessageId, SenderError> {
@@ -223,6 +241,7 @@ pub(crate) enum SenderAction {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SenderPurgeReason {
     Acked,
+    Aborted,
     RetentionExpired,
 }
 
@@ -232,7 +251,8 @@ struct LiveMessage {
     payload: IoPayload,
     checksum: Checksum,
     part_count: PartCount,
-    expires_at: Instant,
+    /// `None` until the initial multipart send has fully completed.
+    expires_at: Option<Instant>,
 }
 
 impl LiveMessage {
@@ -444,6 +464,7 @@ mod tests {
             panic!("expected payload send");
         };
         assert_eq!(message_id, MessageId(0));
+        sender.mark_initial_send_complete(message_id, now);
 
         let purges = sender.poll_timeouts(now + Duration::from_millis(6));
         assert!(purges.iter().any(|action| matches!(

@@ -177,6 +177,7 @@ pub use crate::{
         UDPourSendFailureReason,
         UDPourStateFailure,
         UDPourSubmitResult,
+        config_keys,
     },
     sender::SenderConfig,
     types::{Checksum, MessageId, PartCount},

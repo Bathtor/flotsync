@@ -2,6 +2,7 @@ use crate::{
     ReceiverConfig,
     SenderConfig,
     codec::{decode_frame, encode_frame},
+    config_keys,
     runtime::{
         UDPourComponent,
         UDPourComponentMessage,
@@ -46,7 +47,6 @@ use flotsync_io::{
     test_support::{
         UdpObserver,
         WAIT_TIMEOUT,
-        build_test_kompact_system,
         init_test_logger,
         kill_component,
         localhost,
@@ -62,6 +62,29 @@ use std::{
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Copy, Debug)]
+struct TestSendRateControl {
+    send_delay: Duration,
+    backpressure_retry_delay: Duration,
+    max_in_flight_datagrams: usize,
+}
+
+impl Default for TestSendRateControl {
+    fn default() -> Self {
+        Self {
+            send_delay: config_keys::SEND_DELAY
+                .default()
+                .expect("UDPour send-delay default must exist"),
+            backpressure_retry_delay: config_keys::BACKPRESSURE_RETRY_DELAY
+                .default()
+                .expect("UDPour backpressure-retry-delay default must exist"),
+            max_in_flight_datagrams: config_keys::MAX_IN_FLIGHT_DATAGRAMS
+                .default()
+                .expect("UDPour max-in-flight-datagrams default must exist"),
+        }
+    }
+}
 
 #[derive(ComponentDefinition)]
 struct TransferProbe {
@@ -428,9 +451,29 @@ impl RuntimeHarness {
         sender_config: SenderConfig,
         receiver_config: ReceiverConfig,
     ) -> Self {
+        Self::with_send_rate_control(
+            sender_request_behavior,
+            sender_indication_behavior,
+            receiver_request_behavior,
+            receiver_indication_behavior,
+            sender_config,
+            receiver_config,
+            TestSendRateControl::default(),
+        )
+    }
+
+    fn with_send_rate_control(
+        sender_request_behavior: ProxyRequestBehavior,
+        sender_indication_behavior: ProxyIndicationBehavior,
+        receiver_request_behavior: ProxyRequestBehavior,
+        receiver_indication_behavior: ProxyIndicationBehavior,
+        sender_config: SenderConfig,
+        receiver_config: ReceiverConfig,
+        send_rate_control: TestSendRateControl,
+    ) -> Self {
         init_test_logger();
 
-        let system = build_test_kompact_system();
+        let system = build_runtime_test_kompact_system(send_rate_control);
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
         let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -537,13 +580,23 @@ impl RuntimeHarness {
     }
 
     fn send(&self, payload: IoPayload) -> UDPourSubmitResult {
-        let target = self.receiver_addr;
-        let future = self.sender_runtime_ref.ask_with(|promise| {
-            UDPourComponentMessage::Submit(Ask::new(promise, UDPourSend { target, payload }))
-        });
-        future
+        self.submit_async(payload)
             .wait_timeout(WAIT_TIMEOUT)
             .expect("timed out waiting for sender submit result")
+    }
+
+    fn submit_async(&self, payload: IoPayload) -> KFuture<UDPourSubmitResult> {
+        let target = self.receiver_addr;
+        self.sender_runtime_ref.ask_with(|promise| {
+            UDPourComponentMessage::Submit(Ask::new(promise, UDPourSend { target, payload }))
+        })
+    }
+
+    fn close_sender_socket(&self) {
+        let socket_id = self.sender_socket_id;
+        self.observer.on_definition(|component| {
+            component.udp.trigger(UdpRequest::Close { socket_id });
+        });
     }
 
     fn wait_for_bridge_frame(
@@ -624,6 +677,20 @@ impl RuntimeHarness {
         kill_component(&self.system, self.driver);
         self.system.shutdown().expect("Kompact shutdown");
     }
+}
+
+fn build_runtime_test_kompact_system(send_rate_control: TestSendRateControl) -> KompactSystem {
+    let mut config = KompactConfig::default();
+    config.set_config_value(&config_keys::SEND_DELAY, send_rate_control.send_delay);
+    config.set_config_value(
+        &config_keys::BACKPRESSURE_RETRY_DELAY,
+        send_rate_control.backpressure_retry_delay,
+    );
+    config.set_config_value(
+        &config_keys::MAX_IN_FLIGHT_DATAGRAMS,
+        send_rate_control.max_in_flight_datagrams,
+    );
+    config.build().expect("build KompactSystem")
 }
 
 fn bind_socket(
@@ -792,6 +859,33 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
 }
 
 #[test]
+fn backpressure_is_retried_without_failing_logical_send() {
+    let harness = RuntimeHarness::new(
+        ProxyRequestBehavior::NackFirstSend {
+            reason: SendFailureReason::Backpressure,
+            fired: false,
+        },
+        ProxyIndicationBehavior::Pass,
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        default_sender_config(Duration::from_millis(200)),
+        default_receiver_config(Duration::from_millis(40)),
+    );
+
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"hello world")),
+        UDPourSubmitResult::Sent { .. }
+    ));
+
+    let deliver = harness.wait_for_receiver_deliver();
+    assert_eq!(deliver.payload.to_vec().as_slice(), b"hello world");
+    harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
+        matches!(frame, UDPourFrame::Ack(_))
+    });
+    harness.shutdown();
+}
+
+#[test]
 fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
     let harness = RuntimeHarness::new(
         ProxyRequestBehavior::Pass,
@@ -839,6 +933,70 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         Duration::from_millis(100),
         |frame| matches!(frame, UDPourFrame::Payload(_)),
     );
+
+    let deliver = harness.wait_for_receiver_deliver();
+    assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
+    harness.shutdown();
+}
+
+#[test]
+fn send_delay_and_window_pace_multipart_transmission() {
+    let harness = RuntimeHarness::with_send_rate_control(
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        default_sender_config(Duration::from_millis(200)),
+        default_receiver_config(Duration::from_millis(40)),
+        TestSendRateControl {
+            send_delay: Duration::from_millis(40),
+            backpressure_retry_delay: Duration::from_millis(10),
+            max_in_flight_datagrams: 1,
+        },
+    );
+
+    let submit = harness.submit_async(IoPayload::from_static(b"abcdefghijkl"));
+
+    let first = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        matches!(
+            frame,
+            UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(0)
+        )
+    });
+    assert!(matches!(first, UDPourFrame::Payload(_)));
+    harness.assert_no_bridge_frame(
+        harness.receiver_socket_id,
+        Duration::from_millis(15),
+        |frame| matches!(frame, UDPourFrame::Payload(_)),
+    );
+
+    let second = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        matches!(
+            frame,
+            UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(1)
+        )
+    });
+    assert!(matches!(second, UDPourFrame::Payload(_)));
+    harness.assert_no_bridge_frame(
+        harness.receiver_socket_id,
+        Duration::from_millis(15),
+        |frame| matches!(frame, UDPourFrame::Payload(_)),
+    );
+
+    let third = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        matches!(
+            frame,
+            UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(2)
+        )
+    });
+    assert!(matches!(third, UDPourFrame::Payload(_)));
+
+    assert!(matches!(
+        submit
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for paced sender submit result"),
+        UDPourSubmitResult::Sent { .. }
+    ));
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
@@ -896,6 +1054,45 @@ fn runtime_nack_reports_one_send_failed_with_correct_identity() {
     let failed = harness.send(IoPayload::from_static(b"x"));
     assert_eq!(
         failed,
+        UDPourSubmitResult::SendFailed {
+            message_id: Some(MessageId(0)),
+            reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
+        }
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn socket_close_fails_submit_while_datagrams_are_still_queued() {
+    let harness = RuntimeHarness::with_send_rate_control(
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        default_sender_config(Duration::from_millis(200)),
+        default_receiver_config(Duration::from_millis(40)),
+        TestSendRateControl {
+            send_delay: Duration::from_millis(50),
+            backpressure_retry_delay: Duration::from_millis(10),
+            max_in_flight_datagrams: 1,
+        },
+    );
+
+    let submit = harness.submit_async(IoPayload::from_static(
+        b"abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    ));
+    harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        matches!(
+            frame,
+            UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(0)
+        )
+    });
+    harness.close_sender_socket();
+
+    assert_eq!(
+        submit
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for closed-socket submit result"),
         UDPourSubmitResult::SendFailed {
             message_id: Some(MessageId(0)),
             reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),

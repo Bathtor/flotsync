@@ -40,10 +40,14 @@ use flotsync_io::prelude::{
     UdpRequest,
     UdpSendResult,
 };
-use kompact::prelude::*;
+use kompact::{
+    config::{DurationValue, HoconExt, UsizeValue},
+    kompact_config,
+    prelude::*,
+};
 use snafu::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -138,6 +142,39 @@ pub enum UDPourPortIndication {
     Deliver(UDPourDeliver),
 }
 
+/// Kompact configuration keys that control UDPour runtime pacing.
+pub mod config_keys {
+    use super::*;
+
+    kompact_config! {
+        SEND_DELAY,
+        key = "flotsync.udpour.send-delay",
+        type = DurationValue,
+        default = Duration::ZERO,
+        doc = "Minimum spacing between all outbound UDPour datagram attempts.",
+        version = "0.1.0"
+    }
+
+    kompact_config! {
+        BACKPRESSURE_RETRY_DELAY,
+        key = "flotsync.udpour.backpressure-retry-delay",
+        type = DurationValue,
+        default = Duration::from_millis(10),
+        doc = "Extra cooldown applied after a UDPour datagram send attempt is Nacked with Backpressure.",
+        version = "0.1.0"
+    }
+
+    kompact_config! {
+        MAX_IN_FLIGHT_DATAGRAMS,
+        key = "flotsync.udpour.max-in-flight-datagrams",
+        type = UsizeValue,
+        default = 1024,
+        validate = |value| *value > 0,
+        doc = "Maximum number of UDPour datagrams that may be in flight on one socket at once.",
+        version = "0.1.0"
+    }
+}
+
 /// Runtime configuration for the UDPour component.
 #[derive(Clone, Debug)]
 pub struct UDPourConfig {
@@ -188,6 +225,62 @@ pub enum UDPourConfigError {
     NeedPartsFrameLenTooSmall { max_need_parts_frame_len: usize },
 }
 
+/// Runtime pacing policy for outbound UDPour datagrams.
+#[derive(Clone, Debug)]
+struct UDPourSendRateControl {
+    send_delay: Duration,
+    backpressure_retry_delay: Duration,
+    max_in_flight_datagrams: usize,
+}
+
+impl Default for UDPourSendRateControl {
+    fn default() -> Self {
+        Self {
+            send_delay: config_keys::SEND_DELAY
+                .default()
+                .expect("UDPour send-delay key must define a default"),
+            backpressure_retry_delay: config_keys::BACKPRESSURE_RETRY_DELAY
+                .default()
+                .expect("UDPour backpressure-retry-delay key must define a default"),
+            max_in_flight_datagrams: config_keys::MAX_IN_FLIGHT_DATAGRAMS
+                .default()
+                .expect("UDPour max-in-flight-datagrams key must define a default"),
+        }
+    }
+}
+
+/// Owned outbound scheduling state for one UDPour socket runtime.
+#[derive(Debug)]
+struct OutboundDispatcherState {
+    send_rate: UDPourSendRateControl,
+    /// Datagrams still waiting for one physical UDP send attempt.
+    queue: VecDeque<QueuedDatagram>,
+    /// Datagrams already handed to `flotsync_io` and still awaiting `Ack`/`Nack`.
+    in_flight_datagrams: usize,
+    /// True while one spawned async task is encoding and dispatching the next queue head.
+    dispatch_in_progress: bool,
+    /// Earliest time at which the next UDP send attempt may start.
+    next_send_allowed_at: Instant,
+    /// Timer used to resume dispatch once `next_send_allowed_at` is reached.
+    dispatch_timer: Option<DispatchTimerState>,
+    /// Monotonic generation used to ignore stale dispatch timer firings.
+    next_dispatch_generation: usize,
+}
+
+impl OutboundDispatcherState {
+    fn new() -> Self {
+        Self {
+            send_rate: UDPourSendRateControl::default(),
+            queue: VecDeque::new(),
+            in_flight_datagrams: 0,
+            dispatch_in_progress: false,
+            next_send_allowed_at: Instant::now(),
+            dispatch_timer: None,
+            next_dispatch_generation: 1,
+        }
+    }
+}
+
 /// Kompact component that runs the multipart UDP protocol over one shared UDP socket.
 ///
 /// The socket must already exist in `flotsync_io`. This component does not own UDP bind/connect
@@ -209,6 +302,13 @@ pub struct UDPourComponent {
     next_transmission_id: TransmissionId,
     outbound: HashMap<MessageId, OutboundTransfer>,
     pending_transmissions: HashMap<TransmissionId, PendingTransmission>,
+    dispatcher: OutboundDispatcherState,
+    /// Once the underlying UDP socket closes, this runtime never dispatches another datagram.
+    ///
+    /// A close can race with the async frame-encoding task that was already spawned for the next
+    /// queue head. This flag makes that task drop its work instead of reintroducing pending sends
+    /// after the runtime has already failed every outstanding submit.
+    socket_closed: bool,
     poll_timer: Option<PollTimerState>,
     next_poll_generation: usize,
 }
@@ -230,13 +330,226 @@ impl UDPourComponent {
             next_transmission_id: TransmissionId::ONE,
             outbound: HashMap::new(),
             pending_transmissions: HashMap::new(),
+            dispatcher: OutboundDispatcherState::new(),
+            socket_closed: false,
             poll_timer: None,
             next_poll_generation: 1,
         }
     }
 
+    fn load_send_rate_control(&self) -> UDPourSendRateControl {
+        let defaults = UDPourSendRateControl::default();
+        let send_delay = match self.ctx.config().get_or_default(&config_keys::SEND_DELAY) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Failed to load UDPour send-delay config from {}: {}. Falling back to {:?}",
+                    config_keys::SEND_DELAY.key,
+                    error,
+                    defaults.send_delay
+                );
+                defaults.send_delay
+            }
+        };
+        let backpressure_retry_delay = match self
+            .ctx
+            .config()
+            .get_or_default(&config_keys::BACKPRESSURE_RETRY_DELAY)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Failed to load UDPour backpressure-retry-delay config from {}: {}. Falling back to {:?}",
+                    config_keys::BACKPRESSURE_RETRY_DELAY.key,
+                    error,
+                    defaults.backpressure_retry_delay
+                );
+                defaults.backpressure_retry_delay
+            }
+        };
+        let max_in_flight_datagrams = match self
+            .ctx
+            .config()
+            .get_or_default(&config_keys::MAX_IN_FLIGHT_DATAGRAMS)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Failed to load UDPour max-in-flight-datagrams config from {}: {}. Falling back to {}",
+                    config_keys::MAX_IN_FLIGHT_DATAGRAMS.key,
+                    error,
+                    defaults.max_in_flight_datagrams
+                );
+                defaults.max_in_flight_datagrams
+            }
+        };
+        UDPourSendRateControl {
+            send_delay,
+            backpressure_retry_delay,
+            max_in_flight_datagrams,
+        }
+    }
+
+    fn enqueue_back_all<I>(&mut self, datagrams: I)
+    where
+        I: IntoIterator<Item = QueuedDatagram>,
+    {
+        self.dispatcher.queue.extend(datagrams);
+        self.try_dispatch_outbound();
+    }
+
+    fn enqueue_front(&mut self, datagram: QueuedDatagram) {
+        self.dispatcher.queue.push_front(datagram);
+        self.try_dispatch_outbound();
+    }
+
+    fn enqueue_front_all<I>(&mut self, datagrams: I)
+    where
+        I: IntoIterator<Item = QueuedDatagram>,
+    {
+        let datagrams: Vec<_> = datagrams.into_iter().collect();
+        for datagram in datagrams.into_iter().rev() {
+            self.dispatcher.queue.push_front(datagram);
+        }
+        self.try_dispatch_outbound();
+    }
+
+    fn try_dispatch_outbound(&mut self) {
+        if self.socket_closed {
+            return;
+        }
+        if self.dispatcher.dispatch_in_progress {
+            // One spawned encode/send task is already working on the next queue head, so there is
+            // nothing for this caller to do until that task finishes and re-enters dispatch.
+            return;
+        }
+        if self.dispatcher.in_flight_datagrams >= self.dispatcher.send_rate.max_in_flight_datagrams
+        {
+            return;
+        }
+        if self.dispatcher.queue.is_empty() {
+            self.clear_dispatch_timer();
+            return;
+        }
+        let now = Instant::now();
+        if now < self.dispatcher.next_send_allowed_at {
+            self.set_dispatch_timer(self.dispatcher.next_send_allowed_at - now);
+            return;
+        }
+
+        self.clear_dispatch_timer();
+        let datagram = self
+            .dispatcher
+            .queue
+            .pop_front()
+            .expect("queue emptiness was checked before dispatch");
+        self.dispatcher.dispatch_in_progress = true;
+        let socket_id = self.socket_id;
+        let transmission_id = self.next_transmission_id.take_next();
+        let egress_pool = self.egress_pool.clone();
+        let reply_to = self
+            .actor_ref()
+            .recipient_with(UDPourComponentMessage::SendResult);
+        self.spawn_local(move |mut async_self| async move {
+            let frame_type = datagram.frame_type();
+            let target = datagram.target;
+            let encoded = match encode_frame_with_pool(&egress_pool, &datagram.frame).await {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    async_self.dispatcher.dispatch_in_progress = false;
+                    if let Some(message_id) = datagram.message_id() {
+                        async_self.report_send_failure(
+                            message_id,
+                            UDPourSendFailureReason::Encode(classify_encode_error(&error)),
+                        );
+                    } else {
+                        error!(
+                            async_self.log(),
+                            "Failed to encode {frame_type:?} control frame for UDPour send to {}: {}",
+                            datagram.target,
+                            error
+                        );
+                    }
+                    async_self.try_dispatch_outbound();
+                    return Handled::Ok;
+                }
+            };
+
+            if async_self.socket_closed {
+                async_self.dispatcher.dispatch_in_progress = false;
+                if let Some(message_id) = datagram.message_id() {
+                    async_self.abort_outbound_transfer(
+                        message_id,
+                        Some(UDPourSendFailureReason::Transport(
+                            SendFailureReason::Closed,
+                        )),
+                    );
+                }
+                async_self.try_dispatch_outbound();
+                return Handled::Ok;
+            }
+
+            async_self.pending_transmissions.insert(
+                transmission_id,
+                PendingTransmission { datagram },
+            );
+            async_self.dispatcher.in_flight_datagrams += 1;
+            async_self.dispatcher.dispatch_in_progress = false;
+            async_self.dispatcher.next_send_allowed_at =
+                Instant::now() + async_self.dispatcher.send_rate.send_delay;
+            async_self.udp.trigger(UdpRequest::Send {
+                socket_id,
+                transmission_id,
+                payload: encoded,
+                target: Some(target),
+                reply_to,
+            });
+            async_self.try_dispatch_outbound();
+            Handled::Ok
+        });
+    }
+
+    fn set_dispatch_timer(&mut self, delay: Duration) {
+        self.clear_dispatch_timer();
+        let generation = self.dispatcher.next_dispatch_generation;
+        self.dispatcher.next_dispatch_generation =
+            self.dispatcher.next_dispatch_generation.wrapping_add(1);
+        let timer = self.schedule_once(delay, move |component, _| {
+            component.handle_dispatch_timeout(generation)
+        });
+        self.dispatcher.dispatch_timer = Some(DispatchTimerState { generation, timer });
+    }
+
+    fn clear_dispatch_timer(&mut self) {
+        if let Some(timer) = self.dispatcher.dispatch_timer.take() {
+            self.cancel_timer(timer.timer);
+        }
+    }
+
+    fn handle_dispatch_timeout(&mut self, generation: usize) -> Handled {
+        let Some(timer) = self.dispatcher.dispatch_timer.take() else {
+            return Handled::Ok;
+        };
+        if timer.generation != generation {
+            self.dispatcher.dispatch_timer = Some(timer);
+            return Handled::Ok;
+        }
+        self.try_dispatch_outbound();
+        Handled::Ok
+    }
+
     fn handle_submit(&mut self, ask: Ask<UDPourSend, UDPourSubmitResult>) -> Handled {
         let (promise, send) = ask.take();
+        if self.socket_closed {
+            let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
+                message_id: None,
+                reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
+            });
+            return Handled::Ok;
+        }
         let now = Instant::now();
         match self.sender.start_transfer(send.payload, now) {
             Ok(SenderAction::SendPayloads { message_id, frames }) => {
@@ -276,7 +589,7 @@ impl UDPourComponent {
                 payload,
             } if socket_id == self.socket_id => self.handle_received(source, payload),
             UdpIndication::Closed { socket_id, .. } if socket_id == self.socket_id => {
-                self.clear_poll_timer();
+                self.handle_socket_closed();
                 Handled::Ok
             }
             _ => Handled::Ok,
@@ -339,25 +652,34 @@ impl UDPourComponent {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
                     return Handled::Ok;
                 };
-                let Some(outbound) = self.outbound.get_mut(&pending.message_id) else {
-                    return Handled::Ok;
-                };
-                if !pending.counts_towards_sent
-                    || outbound.failure_reported
-                    || outbound.sent_reported
-                {
-                    return Handled::Ok;
-                }
-                outbound.pending_initial_transmissions =
-                    outbound.pending_initial_transmissions.saturating_sub(1);
-                if outbound.pending_initial_transmissions == 0 {
-                    outbound.sent_reported = true;
-                    if let Some(promise) = outbound.submit_promise.take() {
-                        let _ = promise.fulfil(UDPourSubmitResult::Sent {
-                            message_id: pending.message_id,
-                        });
+                self.dispatcher.in_flight_datagrams =
+                    self.dispatcher.in_flight_datagrams.saturating_sub(1);
+
+                if let Some(message_id) = pending.datagram.message_id() {
+                    let mut promise = None;
+                    let mut report_sent = false;
+                    if let Some(outbound) = self.outbound.get_mut(&message_id)
+                        && pending.datagram.counts_towards_sent()
+                        && !outbound.failure_reported
+                        && !outbound.sent_reported
+                    {
+                        outbound.pending_initial_transmissions =
+                            outbound.pending_initial_transmissions.saturating_sub(1);
+                        if outbound.pending_initial_transmissions == 0 {
+                            outbound.sent_reported = true;
+                            promise = outbound.submit_promise.take();
+                            report_sent = true;
+                        }
+                    }
+                    if report_sent {
+                        self.sender
+                            .mark_initial_send_complete(message_id, Instant::now());
+                    }
+                    if let Some(promise) = promise {
+                        let _ = promise.fulfil(UDPourSubmitResult::Sent { message_id });
                     }
                 }
+                self.try_dispatch_outbound();
             }
             UdpSendResult::Nack {
                 socket_id,
@@ -367,27 +689,30 @@ impl UDPourComponent {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
                     return Handled::Ok;
                 };
-                let message_id = pending.message_id;
-                let Some(outbound) = self.outbound.get_mut(&message_id) else {
-                    return Handled::Ok;
-                };
-                if outbound.failure_reported {
-                    return Handled::Ok;
-                }
-                // Transport failure is terminal at the route-transport layer. Higher-level
-                // semantic delivery is responsible for deciding whether later multipart acks or
-                // retries change the overall message outcome.
+                self.dispatcher.in_flight_datagrams =
+                    self.dispatcher.in_flight_datagrams.saturating_sub(1);
                 if reason == SendFailureReason::Backpressure {
-                    // TODO(flotsync-ml0): Backpressure should feed a bounded send-rate controller
-                    // rather than surfacing as an immediate logical-send failure.
+                    self.dispatcher.next_send_allowed_at = self
+                        .dispatcher
+                        .next_send_allowed_at
+                        .max(Instant::now() + self.dispatcher.send_rate.backpressure_retry_delay);
+                    self.enqueue_front(pending.datagram);
+                    return Handled::Ok;
                 }
-                outbound.failure_reported = true;
-                if let Some(promise) = outbound.submit_promise.take() {
-                    let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
-                        message_id: Some(message_id),
-                        reason: UDPourSendFailureReason::Transport(reason),
-                    });
+                if let Some(message_id) = pending.datagram.message_id() {
+                    self.report_send_failure(
+                        message_id,
+                        UDPourSendFailureReason::Transport(reason),
+                    );
+                } else {
+                    error!(
+                        self.log(),
+                        "Dropping UDPour control frame to {} after terminal transport failure: {:?}",
+                        pending.datagram.target,
+                        reason
+                    );
                 }
+                self.try_dispatch_outbound();
             }
             _ => {}
         }
@@ -406,9 +731,23 @@ impl UDPourComponent {
             }
             SenderAction::ObservedAck { .. } => {}
             SenderAction::Purged { message_id, .. } => {
-                self.pending_transmissions
-                    .retain(|_, pending| pending.message_id != message_id);
+                let mut removed_in_flight = 0usize;
+                self.pending_transmissions.retain(|_, pending| {
+                    let keep = pending.datagram.message_id() != Some(message_id);
+                    if !keep {
+                        removed_in_flight += 1;
+                    }
+                    keep
+                });
+                self.dispatcher.in_flight_datagrams = self
+                    .dispatcher
+                    .in_flight_datagrams
+                    .saturating_sub(removed_in_flight);
+                self.dispatcher
+                    .queue
+                    .retain(|datagram| datagram.message_id() != Some(message_id));
                 self.outbound.remove(&message_id);
+                self.try_dispatch_outbound();
             }
         }
     }
@@ -461,99 +800,72 @@ impl UDPourComponent {
             return;
         };
         let target = outbound.target;
-        for frame in frames {
-            self.dispatch_outbound_frame(
-                message_id,
-                target,
-                UDPourFrame::Payload(frame),
-                counts_towards_sent,
-            );
+        let datagrams = frames
+            .into_iter()
+            .map(|frame| QueuedDatagram::payload(message_id, target, frame, counts_towards_sent));
+        if counts_towards_sent {
+            self.enqueue_back_all(datagrams);
+        } else {
+            self.enqueue_front_all(datagrams);
         }
     }
 
     fn dispatch_control_frame(&mut self, target: SocketAddr, frame: UDPourFrame) {
-        self.spawn_encoded_send(target, frame, None);
-    }
-
-    fn dispatch_outbound_frame(
-        &mut self,
-        message_id: MessageId,
-        target: SocketAddr,
-        frame: UDPourFrame,
-        counts_towards_sent: bool,
-    ) {
-        self.spawn_encoded_send(target, frame, Some((message_id, counts_towards_sent)));
-    }
-
-    fn spawn_encoded_send(
-        &mut self,
-        target: SocketAddr,
-        frame: UDPourFrame,
-        message_id: Option<(MessageId, bool)>,
-    ) {
-        // TODO(flotsync-szl): Replace the spawn_local-per-frame send path with one owned
-        // outbound queue/dispatcher so large multipart sends do not translate into one task per
-        // datagram.
-        let socket_id = self.socket_id;
-        let transmission_id = self.next_transmission_id.take_next();
-        let egress_pool = self.egress_pool.clone();
-        let reply_to = self
-            .actor_ref()
-            .recipient_with(UDPourComponentMessage::SendResult);
-        self.spawn_local(move |mut async_self| async move {
-            let frame_type = frame.header().frame_type;
-            let encoded = match encode_frame_with_pool(&egress_pool, &frame).await {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    if let Some((message_id, _)) = message_id {
-                        async_self.report_send_failure(
-                            message_id,
-                            UDPourSendFailureReason::Encode(classify_encode_error(
-                                &error,
-                            )),
-                        );
-                    } else {
-                        error!(
-                            async_self.log(),
-                            "Failed to encode {frame_type:?} control frame for UDPour send to {target}: {error}"
-                        );
-                    }
-                    return Handled::Ok;
-                }
-            };
-            if let Some((message_id, counts_towards_sent)) = message_id {
-                async_self.pending_transmissions.insert(
-                    transmission_id,
-                    PendingTransmission {
-                        message_id,
-                        counts_towards_sent,
-                    },
-                );
-            }
-            async_self.udp.trigger(UdpRequest::Send {
-                socket_id,
-                transmission_id,
-                payload: encoded,
-                target: Some(target),
-                reply_to,
-            });
-            Handled::Ok
-        });
+        self.enqueue_front(QueuedDatagram::control(target, frame));
     }
 
     fn report_send_failure(&mut self, message_id: MessageId, reason: UDPourSendFailureReason) {
-        let Some(outbound) = self.outbound.get_mut(&message_id) else {
-            return;
+        self.abort_outbound_transfer(message_id, Some(reason));
+    }
+
+    fn abort_outbound_transfer(
+        &mut self,
+        message_id: MessageId,
+        reason: Option<UDPourSendFailureReason>,
+    ) {
+        let promise = {
+            let Some(outbound) = self.outbound.get_mut(&message_id) else {
+                return;
+            };
+            if reason.is_some() {
+                outbound.failure_reported = true;
+                outbound.submit_promise.take()
+            } else {
+                None
+            }
         };
-        if outbound.failure_reported {
-            return;
-        }
-        outbound.failure_reported = true;
-        if let Some(promise) = outbound.submit_promise.take() {
+        if let Some(promise) = promise {
             let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
                 message_id: Some(message_id),
-                reason,
+                reason: reason.expect("submit promise can only be present when reporting failure"),
             });
+        }
+        let Some(action) = self.sender.abort_transfer(message_id, Instant::now()) else {
+            return;
+        };
+        self.handle_sender_action(action, None);
+    }
+
+    fn handle_socket_closed(&mut self) {
+        if self.socket_closed {
+            return;
+        }
+        self.socket_closed = true;
+        self.clear_poll_timer();
+        self.clear_dispatch_timer();
+        self.dispatcher.dispatch_in_progress = false;
+        self.dispatcher.queue.clear();
+        self.dispatcher.in_flight_datagrams = 0;
+        self.pending_transmissions.clear();
+
+        let outstanding_message_ids: Vec<_> = self.outbound.keys().copied().collect();
+        for message_id in outstanding_message_ids {
+            self.abort_outbound_transfer(
+                message_id,
+                Some(UDPourSendFailureReason::Transport(
+                    SendFailureReason::Closed,
+                )),
+            );
         }
     }
 
@@ -577,7 +889,7 @@ impl UDPourComponent {
         }
     }
 
-    fn arm_poll_timer(&mut self) {
+    fn set_poll_timer(&mut self) {
         self.clear_poll_timer();
         let generation = self.next_poll_generation;
         self.next_poll_generation = self.next_poll_generation.wrapping_add(1);
@@ -602,24 +914,28 @@ impl UDPourComponent {
             return Handled::Ok;
         }
         self.poll_runtime();
-        self.arm_poll_timer();
+        self.set_poll_timer();
         Handled::Ok
     }
 }
 
 impl ComponentLifecycle for UDPourComponent {
     fn on_start(&mut self) -> Handled {
-        self.arm_poll_timer();
+        self.dispatcher.send_rate = self.load_send_rate_control();
+        self.dispatcher.next_send_allowed_at = Instant::now();
+        self.set_poll_timer();
         Handled::Ok
     }
 
     fn on_stop(&mut self) -> Handled {
         self.clear_poll_timer();
+        self.clear_dispatch_timer();
         Handled::Ok
     }
 
     fn on_kill(&mut self) -> Handled {
         self.clear_poll_timer();
+        self.clear_dispatch_timer();
         Handled::Ok
     }
 }
@@ -665,6 +981,12 @@ struct PollTimerState {
     timer: ScheduledTimer,
 }
 
+#[derive(Clone, Debug)]
+struct DispatchTimerState {
+    generation: usize,
+    timer: ScheduledTimer,
+}
+
 #[derive(Debug)]
 struct OutboundTransfer {
     target: SocketAddr,
@@ -674,10 +996,54 @@ struct OutboundTransfer {
     pending_initial_transmissions: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PendingTransmission {
-    message_id: MessageId,
+#[derive(Clone, Debug)]
+struct QueuedDatagram {
+    target: SocketAddr,
+    frame: UDPourFrame,
+    message_id: Option<MessageId>,
     counts_towards_sent: bool,
+}
+
+impl QueuedDatagram {
+    fn payload(
+        message_id: MessageId,
+        target: SocketAddr,
+        frame: PayloadFrame,
+        counts_towards_sent: bool,
+    ) -> Self {
+        Self {
+            target,
+            frame: UDPourFrame::Payload(frame),
+            message_id: Some(message_id),
+            counts_towards_sent,
+        }
+    }
+
+    fn control(target: SocketAddr, frame: UDPourFrame) -> Self {
+        Self {
+            target,
+            frame,
+            message_id: None,
+            counts_towards_sent: false,
+        }
+    }
+
+    fn frame_type(&self) -> crate::types::FrameType {
+        self.frame.header().frame_type
+    }
+
+    fn message_id(&self) -> Option<MessageId> {
+        self.message_id
+    }
+
+    fn counts_towards_sent(&self) -> bool {
+        self.counts_towards_sent
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingTransmission {
+    datagram: QueuedDatagram,
 }
 
 /// Pool-backed frame-encoding errors for the UDP runtime.

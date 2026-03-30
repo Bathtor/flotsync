@@ -36,7 +36,12 @@ use flotsync_udpour::{
     UDPourSendFailureReason,
     UDPourSubmitResult,
 };
-use kompact::{Never, prelude::*};
+use kompact::{
+    Never,
+    config::{HoconExt, UsizeValue},
+    kompact_config,
+    prelude::*,
+};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -47,6 +52,21 @@ type TransportConnectionInfoPort = ConnectionInfoPort<TransportRouteKey>;
 type TransportRouteTransportSend = RouteTransportSend<TransportRouteKey>;
 type TransportRouteTransportPort = RouteTransportPort<TransportRouteKey>;
 
+/// Kompact configuration keys that control when the manager creates per-socket
+/// UDPour children.
+mod config_keys {
+    use super::*;
+
+    kompact_config! {
+        UDP_ACTIVATION_POLICY,
+        key = "flotsync.route-transport.udp-activation-policy",
+        type = UsizeValue,
+        default = 0,
+        doc = "When to create one UDPour child for a bound UDP socket: 0 = OnBind, 1 = OnFirstUse.",
+        version = "0.1.0"
+    }
+}
+
 /// Upper bound on inbound UDP datagrams forwarded into one per-socket UDPour child while it is
 /// still starting.
 ///
@@ -54,6 +74,21 @@ type TransportRouteTransportPort = RouteTransportPort<TransportRouteKey>;
 /// Instead it enqueues exact `UdpIndication::Received` events onto the starting child's required
 /// `UdpPort` via `KompactSystem::trigger_i`. This counter only exists to bound that queueing.
 const MAX_BUFFERED_STARTUP_DATAGRAMS: usize = 64;
+
+/// When one bound UDP socket should gain its per-socket UDPour child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdpActivationPolicy {
+    /// Create and connect the child immediately once the socket bind completes.
+    OnBind,
+    /// Keep the socket dormant until the first inbound or outbound message actually needs it.
+    OnFirstUse,
+}
+
+impl Default for UdpActivationPolicy {
+    fn default() -> Self {
+        Self::OnBind
+    }
+}
 
 /// Concrete route-transport manager for the current UDP/TCP key type.
 ///
@@ -73,6 +108,8 @@ pub struct RouteTransportManager {
     bridge: IoBridgeHandle,
     /// Runtime configuration shared by every live UDP UDPour child.
     udpour_config: UDPourConfig,
+    /// Policy that decides when a bound UDP socket gains its UDPour child.
+    udp_activation_policy: UdpActivationPolicy,
     /// UDP local sockets currently waiting for a bind result.
     ///
     /// This is keyed by the reusable local-socket shape rather than the full
@@ -82,6 +119,8 @@ pub struct RouteTransportManager {
     udp_open_requests: HashMap<UdpOpenRequestId, UdpSocketKey>,
     /// Sockets that are already bound but whose UDPour child is still starting.
     udp_starting_sockets: HashMap<UdpSocketKey, StartingUdpSocketHandle>,
+    /// Bound UDP sockets that exist on the bridge but do not yet have a UDPour child.
+    udp_dormant_sockets: HashMap<UdpSocketKey, DormantUdpSocketHandle>,
     /// Live sockets currently waiting for `Broadcast(true)` to apply.
     udp_broadcast_configurations: HashMap<SocketId, UdpSocketKey>,
     /// Reverse lookup from driver socket id back to the live local-socket key.
@@ -109,14 +148,48 @@ impl RouteTransportManager {
             system,
             bridge,
             udpour_config,
+            udp_activation_policy: UdpActivationPolicy::default(),
             udp_open_sockets: HashMap::new(),
             udp_open_requests: HashMap::new(),
             udp_starting_sockets: HashMap::new(),
+            udp_dormant_sockets: HashMap::new(),
             udp_broadcast_configurations: HashMap::new(),
             udp_socket_ids: HashMap::new(),
             udp_sockets: HashMap::new(),
             tcp_routes: HashMap::new(),
             pending_sends: HashMap::new(),
+        }
+    }
+
+    fn load_udp_activation_policy(&self) -> UdpActivationPolicy {
+        let raw = match self
+            .ctx
+            .config()
+            .get_or_default(&config_keys::UDP_ACTIVATION_POLICY)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Failed to load route-transport UDP activation policy from {}: {}. Falling back to OnBind",
+                    config_keys::UDP_ACTIVATION_POLICY.key,
+                    error
+                );
+                return UdpActivationPolicy::OnBind;
+            }
+        };
+        match raw {
+            0 => UdpActivationPolicy::OnBind,
+            1 => UdpActivationPolicy::OnFirstUse,
+            other => {
+                warn!(
+                    self.log(),
+                    "Unknown route-transport UDP activation policy value {} in {}. Falling back to OnBind",
+                    other,
+                    config_keys::UDP_ACTIVATION_POLICY.key
+                );
+                UdpActivationPolicy::OnBind
+            }
         }
     }
 
@@ -141,6 +214,16 @@ impl RouteTransportManager {
             return;
         }
 
+        if let Some(dormant) = self.udp_dormant_sockets.remove(&socket_key) {
+            self.begin_starting_udp_socket(
+                socket_key,
+                dormant.socket_id,
+                UdpSocketStartOrigin::ExternalDormant,
+                vec![QueuedUdpSend { send_id, route }],
+            );
+            return;
+        }
+
         let request_id = UdpOpenRequestId::default();
         let bind = socket_key.bind_policy();
         self.udp_open_sockets.insert(
@@ -154,13 +237,52 @@ impl RouteTransportManager {
             .trigger(UdpRequest::Bind { request_id, bind });
     }
 
-    fn handle_udp_bound(&mut self, request_id: UdpOpenRequestId, socket_id: SocketId) {
+    fn handle_udp_bound(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) {
         let Some(socket_key) = self.udp_open_requests.remove(&request_id) else {
+            self.handle_external_udp_bound(socket_id, local_addr);
             return;
         };
         let Some(open) = self.udp_open_sockets.remove(&socket_key) else {
             return;
         };
+        self.begin_starting_udp_socket(
+            socket_key,
+            socket_id,
+            UdpSocketStartOrigin::ManagerOwned,
+            open.queued_sends,
+        );
+    }
+
+    fn handle_external_udp_bound(&mut self, socket_id: SocketId, local_addr: SocketAddr) {
+        if self.udp_activation_policy != UdpActivationPolicy::OnFirstUse {
+            return;
+        }
+        let socket_key = UdpSocketKey { local_addr };
+        if self.udp_socket_ids.contains_key(&socket_id)
+            || self.udp_sockets.contains_key(&socket_key)
+            || self.udp_starting_sockets.contains_key(&socket_key)
+            || self.udp_open_sockets.contains_key(&socket_key)
+            || self.udp_dormant_sockets.contains_key(&socket_key)
+        {
+            return;
+        }
+        self.udp_socket_ids.insert(socket_id, socket_key);
+        self.udp_dormant_sockets
+            .insert(socket_key, DormantUdpSocketHandle { socket_id });
+    }
+
+    fn begin_starting_udp_socket(
+        &mut self,
+        socket_key: UdpSocketKey,
+        socket_id: SocketId,
+        origin: UdpSocketStartOrigin,
+        queued_sends: Vec<QueuedUdpSend>,
+    ) {
         let udpour_config = self.udpour_config.clone();
         let egress_pool = self.bridge.egress_pool().clone();
         let runtime = self
@@ -182,7 +304,8 @@ impl RouteTransportManager {
                 runtime_ref,
                 udp_port,
                 transfer_channel,
-                queued_sends: open.queued_sends,
+                origin,
+                queued_sends,
                 buffered_datagram_count: 0,
             },
         );
@@ -288,22 +411,13 @@ impl RouteTransportManager {
             let Some(starting) = self.udp_starting_sockets.remove(&socket_key) else {
                 return;
             };
-            self.udp_socket_ids.remove(&starting.socket_id);
-            let mut failed_routes = HashSet::new();
-            for queued in &starting.queued_sends {
-                failed_routes.insert(queued.route);
-            }
-            let discovery_reason = classify_udp_connect_failure_for_discovery(&error);
-            for route in failed_routes {
-                self.report_route_failed(TransportRouteKey::Udp(route), discovery_reason.clone());
-            }
-            for queued in starting.queued_sends {
-                self.fail_pending_send(
-                    queued.send_id,
-                    TransportRouteKey::Udp(queued.route),
-                    RouteTransportNackReason::RouteUnavailable,
-                );
-            }
+            self.handle_udp_socket_activation_failed(
+                socket_key,
+                starting.socket_id,
+                starting.origin,
+                starting.queued_sends,
+                classify_udp_connect_failure_for_discovery(&error),
+            );
             self.ctx.system().kill(starting.runtime);
             return;
         }
@@ -320,6 +434,7 @@ impl RouteTransportManager {
                 runtime: starting.runtime,
                 runtime_ref: starting.runtime_ref,
                 _transfer_channel: starting.transfer_channel,
+                startup_buffered_datagram_count: starting.buffered_datagram_count,
                 known_routes: HashSet::new(),
                 broadcast_state: UdpBroadcastState::Disabled,
             },
@@ -513,6 +628,14 @@ impl RouteTransportManager {
         if self.udp_sockets.contains_key(&socket_key) {
             return;
         }
+        if let Some(dormant) = self.udp_dormant_sockets.remove(&socket_key) {
+            self.begin_starting_udp_socket(
+                socket_key,
+                dormant.socket_id,
+                UdpSocketStartOrigin::ExternalDormant,
+                Vec::new(),
+            );
+        }
         let Some(starting) = self.udp_starting_sockets.get_mut(&socket_key) else {
             return;
         };
@@ -539,6 +662,9 @@ impl RouteTransportManager {
         let Some(socket_key) = self.udp_socket_ids.remove(&socket_id) else {
             return;
         };
+        if self.udp_dormant_sockets.remove(&socket_key).is_some() {
+            return;
+        }
         if let Some(starting) = self.udp_starting_sockets.remove(&socket_key) {
             let discovery_reason = classify_udp_close_for_discovery(reason);
             for queued in starting.queued_sends {
@@ -584,14 +710,56 @@ impl RouteTransportManager {
         for (_, handle) in self.udp_starting_sockets.drain() {
             self.ctx.system().kill(handle.runtime);
         }
+        self.udp_dormant_sockets.clear();
         self.udp_broadcast_configurations.clear();
         self.udp_socket_ids.clear();
         self.pending_sends.clear();
+    }
+
+    /// Restores or forgets one starting UDP socket after its child could not be connected.
+    ///
+    /// Manager-owned sockets are removed completely because the manager itself requested the bind
+    /// and cannot recover without re-opening a fresh socket. Externally bound dormant sockets stay
+    /// around so a later inbound datagram can retry child activation.
+    fn handle_udp_socket_activation_failed(
+        &mut self,
+        socket_key: UdpSocketKey,
+        socket_id: SocketId,
+        origin: UdpSocketStartOrigin,
+        queued_sends: Vec<QueuedUdpSend>,
+        discovery_reason: ConnectionFailureReason,
+    ) {
+        match origin {
+            UdpSocketStartOrigin::ManagerOwned => {
+                self.udp_socket_ids.remove(&socket_id);
+            }
+            UdpSocketStartOrigin::ExternalDormant => {
+                self.udp_socket_ids.insert(socket_id, socket_key);
+                self.udp_dormant_sockets
+                    .insert(socket_key, DormantUdpSocketHandle { socket_id });
+            }
+        }
+
+        let mut failed_routes = HashSet::new();
+        for queued in &queued_sends {
+            failed_routes.insert(queued.route);
+        }
+        for route in failed_routes {
+            self.report_route_failed(TransportRouteKey::Udp(route), discovery_reason.clone());
+        }
+        for queued in queued_sends {
+            self.fail_pending_send(
+                queued.send_id,
+                TransportRouteKey::Udp(queued.route),
+                RouteTransportNackReason::RouteUnavailable,
+            );
+        }
     }
 }
 
 impl ComponentLifecycle for RouteTransportManager {
     fn on_start(&mut self) -> Handled {
+        self.udp_activation_policy = self.load_udp_activation_policy();
         Handled::Ok
     }
 
@@ -638,8 +806,8 @@ impl Require<UdpPort> for RouteTransportManager {
             UdpIndication::Bound {
                 request_id,
                 socket_id,
-                ..
-            } => self.handle_udp_bound(request_id, socket_id),
+                local_addr,
+            } => self.handle_udp_bound(request_id, socket_id, local_addr),
             UdpIndication::BindFailed {
                 request_id, reason, ..
             } => self.handle_udp_bind_failed(request_id, reason),
@@ -682,6 +850,13 @@ struct LiveUdpSocketHandle {
     runtime: Arc<Component<UDPourComponent>>,
     runtime_ref: ActorRefStrong<UDPourComponentMessage>,
     _transfer_channel: ProviderChannel<UDPourPort, UDPourComponent>,
+    /// Number of raw UDP datagrams that were queued onto this child's required
+    /// `UdpPort` before the child was started.
+    ///
+    /// This survives the `Starting -> Live` transition so tests and diagnostics
+    /// can still tell whether the lazy startup path buffered anything.
+    #[cfg_attr(not(test), allow(dead_code))]
+    startup_buffered_datagram_count: usize,
     /// Every concrete UDP route that currently relies on this socket.
     known_routes: HashSet<UdpRouteKey>,
     /// Broadcast enablement state for this shared socket.
@@ -708,6 +883,12 @@ struct PendingUdpSocketOpen {
     queued_sends: Vec<QueuedUdpSend>,
 }
 
+/// One bound UDP socket that exists on the shared bridge but has not yet
+/// needed a UDPour child.
+struct DormantUdpSocketHandle {
+    socket_id: SocketId,
+}
+
 /// One bound UDP socket whose child runtime is still being connected and started.
 struct StartingUdpSocketHandle {
     socket_id: SocketId,
@@ -715,10 +896,22 @@ struct StartingUdpSocketHandle {
     runtime_ref: ActorRefStrong<UDPourComponentMessage>,
     udp_port: RequiredRef<UdpPort>,
     transfer_channel: ProviderChannel<UDPourPort, UDPourComponent>,
+    /// Whether this starting socket came from a manager-owned bind or from an externally bound
+    /// dormant socket that may need to be restored on activation failure.
+    origin: UdpSocketStartOrigin,
     /// Logical sends queued while the child runtime is not yet ready.
     queued_sends: Vec<QueuedUdpSend>,
     /// Number of raw UDP datagrams queued onto the child before it was started.
     buffered_datagram_count: usize,
+}
+
+/// Provenance of one per-socket UDPour child while it is still starting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdpSocketStartOrigin {
+    /// The manager opened this socket itself and owns the whole resource lifecycle.
+    ManagerOwned,
+    /// The bridge reported an external bind and the manager is only attaching a child on demand.
+    ExternalDormant,
 }
 
 /// One logical UDP send queued while the shared local socket is not fully ready.
@@ -867,16 +1060,95 @@ mod tests {
     use flotsync_io::{
         pool::PayloadWriter,
         prelude::{DriverConfig, IoBridge, IoDriverComponent},
-        test_support::{WAIT_TIMEOUT, build_test_kompact_system, start_component},
+        test_support::{UdpObserver, WAIT_TIMEOUT, init_test_logger, localhost, start_component},
     };
-    use flotsync_udpour::{MessageId, ReceiverConfig, SenderConfig};
+    use flotsync_udpour::{
+        MessageId,
+        ReceiverConfig,
+        SenderConfig,
+        config_keys as udpour_config_keys,
+    };
     use flotsync_utils::BoxFuture;
     use std::{
+        cell::RefCell,
+        collections::VecDeque,
         net::{SocketAddr, UdpSocket},
         sync::mpsc,
-        time::Duration,
+        thread,
+        time::{Duration, Instant},
     };
     use uuid::Uuid;
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestSendRateControl {
+        send_delay: Duration,
+        backpressure_retry_delay: Duration,
+        max_in_flight_datagrams: usize,
+    }
+
+    impl Default for TestSendRateControl {
+        fn default() -> Self {
+            Self {
+                send_delay: udpour_config_keys::SEND_DELAY
+                    .default()
+                    .expect("UDPour send-delay default must exist"),
+                backpressure_retry_delay: udpour_config_keys::BACKPRESSURE_RETRY_DELAY
+                    .default()
+                    .expect("UDPour backpressure-retry-delay default must exist"),
+                max_in_flight_datagrams: udpour_config_keys::MAX_IN_FLIGHT_DATAGRAMS
+                    .default()
+                    .expect("UDPour max-in-flight-datagrams default must exist"),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct BufferedReceiver<T> {
+        receiver: mpsc::Receiver<T>,
+        deferred: RefCell<VecDeque<T>>,
+    }
+
+    impl<T> BufferedReceiver<T> {
+        fn new(receiver: mpsc::Receiver<T>) -> Self {
+            Self {
+                receiver,
+                deferred: RefCell::new(VecDeque::new()),
+            }
+        }
+
+        fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
+            let mut deferred = self.deferred.borrow_mut();
+            let deferred_len = deferred.len();
+            for _ in 0..deferred_len {
+                let event = deferred
+                    .pop_front()
+                    .expect("deferred length was just measured");
+                if predicate(&event) {
+                    return Some(event);
+                }
+                deferred.push_back(event);
+            }
+            None
+        }
+
+        fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(event) = self.take_deferred_match(&mut predicate) {
+                    return event;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let event = self
+                    .receiver
+                    .recv_timeout(remaining)
+                    .expect("timed out waiting for buffered test event");
+                if predicate(&event) {
+                    return event;
+                }
+                self.deferred.borrow_mut().push_back(event);
+            }
+        }
+    }
 
     #[derive(ComponentDefinition)]
     struct RouteTransportProbe {
@@ -948,28 +1220,47 @@ mod tests {
         bridge: Arc<Component<IoBridge>>,
         manager: Arc<Component<RouteTransportManager>>,
         probe: Arc<Component<RouteTransportProbe>>,
+        observer: Arc<Component<UdpObserver>>,
         _bridge_to_manager: TwoWayChannel<UdpPort, IoBridge, RouteTransportManager>,
+        _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
         _manager_to_probe:
             TwoWayChannel<TransportRouteTransportPort, RouteTransportManager, RouteTransportProbe>,
-        indications: mpsc::Receiver<RouteTransportPortIndication<TransportRouteKey>>,
+        indications: BufferedReceiver<RouteTransportPortIndication<TransportRouteKey>>,
+        observer_rx: BufferedReceiver<UdpIndication>,
     }
 
     impl UdpManagerHarness {
         fn new() -> Self {
-            let system = build_test_kompact_system();
+            Self::with_config(
+                UdpActivationPolicy::OnBind,
+                TestSendRateControl::default(),
+                udpour_config(),
+            )
+        }
+
+        fn with_config(
+            activation_policy: UdpActivationPolicy,
+            send_rate_control: TestSendRateControl,
+            udpour_config: UDPourConfig,
+        ) -> Self {
+            let system = build_manager_test_kompact_system(activation_policy, send_rate_control);
             let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
             let driver_for_bridge = driver.clone();
             let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
             let bridge_handle = IoBridgeHandle::from_component(&bridge);
-            let config = udpour_config();
             let manager_system = system.clone();
-            let manager = system
-                .create(move || RouteTransportManager::new(manager_system, bridge_handle, config));
+            let manager = system.create(move || {
+                RouteTransportManager::new(manager_system, bridge_handle, udpour_config)
+            });
+            let (observer_tx, observer_rx) = mpsc::channel();
+            let observer = system.create(move || UdpObserver::new(observer_tx));
             let (indications_tx, indications_rx) = mpsc::channel();
             let probe = system.create(move || RouteTransportProbe::new(indications_tx));
 
             let bridge_to_manager = biconnect_components::<UdpPort, _, _>(&bridge, &manager)
                 .expect("bridge must connect to route transport manager");
+            let bridge_to_observer = biconnect_components::<UdpPort, _, _>(&bridge, &observer)
+                .expect("bridge must connect to UDP observer");
             let manager_to_probe =
                 biconnect_components::<TransportRouteTransportPort, _, _>(&manager, &probe)
                     .expect("manager must connect to transport probe");
@@ -978,6 +1269,7 @@ mod tests {
             start_component(&system, &bridge);
             start_component(&system, &manager);
             start_component(&system, &probe);
+            start_component(&system, &observer);
 
             Self {
                 system,
@@ -985,9 +1277,12 @@ mod tests {
                 bridge,
                 manager,
                 probe,
+                observer,
                 _bridge_to_manager: bridge_to_manager,
+                _bridge_to_observer: bridge_to_observer,
                 _manager_to_probe: manager_to_probe,
-                indications: indications_rx,
+                indications: BufferedReceiver::new(indications_rx),
+                observer_rx: BufferedReceiver::new(observer_rx),
             }
         }
 
@@ -999,10 +1294,7 @@ mod tests {
 
         fn wait_for_send_ack(&self, send_id: RouteSendId) -> TransportRouteKey {
             loop {
-                let indication = self
-                    .indications
-                    .recv_timeout(WAIT_TIMEOUT)
-                    .expect("timed out waiting for route transport indication");
+                let indication = self.indications.recv_matching(WAIT_TIMEOUT, |_| true);
                 match indication {
                     RouteTransportPortIndication::SendAck {
                         send_id: observed_send_id,
@@ -1020,14 +1312,191 @@ mod tests {
             }
         }
 
+        fn wait_for_send_nack(
+            &self,
+            send_id: RouteSendId,
+        ) -> (TransportRouteKey, RouteTransportNackReason) {
+            loop {
+                let indication = self.indications.recv_matching(WAIT_TIMEOUT, |_| true);
+                match indication {
+                    RouteTransportPortIndication::SendNack {
+                        send_id: observed_send_id,
+                        coverage_key,
+                        reason,
+                    } if observed_send_id == send_id => return (coverage_key, reason),
+                    RouteTransportPortIndication::SendAck {
+                        send_id: observed_send_id,
+                        ..
+                    } if observed_send_id == send_id => {
+                        panic!("unexpected SendAck for {send_id:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         fn live_udp_socket_count(&self) -> usize {
             self.manager
                 .on_definition(|component| component.udp_sockets.len())
+        }
+
+        fn dormant_udp_socket_count(&self) -> usize {
+            self.manager
+                .on_definition(|component| component.udp_dormant_sockets.len())
+        }
+
+        fn wait_for_dormant_socket(&self, socket_key: UdpSocketKey) {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
+            loop {
+                if self.manager.on_definition(|component| {
+                    component.udp_dormant_sockets.contains_key(&socket_key)
+                }) {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for dormant UDP socket {socket_key:?}");
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn wait_for_startup_buffered_datagrams(
+            &self,
+            socket_key: UdpSocketKey,
+            min_count: usize,
+        ) -> usize {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
+            let mut max_observed = 0usize;
+            loop {
+                let (buffered_count, live) = self.manager.on_definition(|component| {
+                    (
+                        component
+                            .udp_starting_sockets
+                            .get(&socket_key)
+                            .map(|handle| handle.buffered_datagram_count)
+                            .or_else(|| {
+                                component
+                                    .udp_sockets
+                                    .get(&socket_key)
+                                    .map(|handle| handle.startup_buffered_datagram_count)
+                            }),
+                        component.udp_sockets.contains_key(&socket_key),
+                    )
+                });
+                if let Some(buffered_count) = buffered_count {
+                    max_observed = max_observed.max(buffered_count);
+                    if buffered_count >= min_count {
+                        return buffered_count;
+                    }
+                }
+                if live && max_observed == 0 {
+                    panic!(
+                        "UDPour child became live before any startup datagram was buffered for {socket_key:?}"
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "timed out waiting for the manager to buffer {min_count} startup datagrams; max observed was {max_observed}"
+                    );
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn wait_for_live_udp_socket(&self, socket_key: UdpSocketKey) {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
+            loop {
+                if self
+                    .manager
+                    .on_definition(|component| component.udp_sockets.contains_key(&socket_key))
+                {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    panic!("timed out waiting for live UDP socket {socket_key:?}");
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn bind_external_socket(&self, bind: UdpLocalBind) -> (SocketId, SocketAddr) {
+            let request_id = UdpOpenRequestId::new();
+            self.observer.on_definition(|component| {
+                component.udp.trigger(UdpRequest::Bind { request_id, bind });
+            });
+            match self.observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
+                matches!(
+                    event,
+                    UdpIndication::Bound {
+                        request_id: indicated_request_id,
+                        ..
+                    } if *indicated_request_id == request_id
+                )
+            }) {
+                UdpIndication::Bound {
+                    request_id: indicated_request_id,
+                    socket_id,
+                    local_addr,
+                } => {
+                    assert_eq!(indicated_request_id, request_id);
+                    (socket_id, local_addr)
+                }
+                other => unreachable!("filtered to Bound, got {other:?}"),
+            }
+        }
+
+        fn wait_for_new_bound_socket(&self) -> (SocketId, SocketAddr) {
+            match self.observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
+                matches!(event, UdpIndication::Bound { .. })
+            }) {
+                UdpIndication::Bound {
+                    socket_id,
+                    local_addr,
+                    ..
+                } => (socket_id, local_addr),
+                other => unreachable!("filtered to Bound, got {other:?}"),
+            }
+        }
+
+        fn wait_for_bridge_frame_type(&self, socket_id: SocketId, frame_type: u8) {
+            let _ = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
+                let UdpIndication::Received {
+                    socket_id: indicated_socket_id,
+                    payload,
+                    ..
+                } = indication
+                else {
+                    return false;
+                };
+                *indicated_socket_id == socket_id
+                    && payload.to_vec().first().copied() == Some(frame_type)
+            });
+        }
+
+        fn wait_for_bridge_payload_frames(&self, socket_id: SocketId, min_count: usize) {
+            for _ in 0..min_count {
+                let _ = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
+                    let UdpIndication::Received {
+                        socket_id: indicated_socket_id,
+                        payload,
+                        ..
+                    } = indication
+                    else {
+                        return false;
+                    };
+                    *indicated_socket_id == socket_id
+                        && payload.to_vec().first().copied() == Some(0x01)
+                });
+            }
         }
     }
 
     impl Drop for UdpManagerHarness {
         fn drop(&mut self) {
+            let _ = self
+                .system
+                .kill_notify(self.observer.clone())
+                .wait_timeout(WAIT_TIMEOUT);
             let _ = self
                 .system
                 .kill_notify(self.probe.clone())
@@ -1161,6 +1630,7 @@ mod tests {
                     runtime_ref,
                     udp_port,
                     transfer_channel,
+                    origin: UdpSocketStartOrigin::ManagerOwned,
                     queued_sends: Vec::new(),
                     buffered_datagram_count: 0,
                 },
@@ -1180,10 +1650,94 @@ mod tests {
         });
     }
 
-    // TODO(flotsync-ml0): Add a real end-to-end startup-buffering smoke test here once UDPour
-    // send-rate control exists. That should pace a multi-part sender slowly enough that several
-    // parts are queued through the manager before the per-socket child starts and several more
-    // arrive afterward on the normal live path.
+    #[test]
+    fn udp_manager_starts_dormant_socket_on_first_inbound_udpour_message() {
+        let receiver_harness = UdpManagerHarness::with_config(
+            UdpActivationPolicy::OnFirstUse,
+            TestSendRateControl::default(),
+            udpour_config_with_part_size(64),
+        );
+        let (receiver_socket_id, receiver_addr) =
+            receiver_harness.bind_external_socket(UdpLocalBind::Exact(localhost(0)));
+        let receiver_socket_key = UdpSocketKey {
+            local_addr: receiver_addr,
+        };
+        receiver_harness.wait_for_dormant_socket(receiver_socket_key);
+        assert_eq!(receiver_harness.dormant_udp_socket_count(), 1);
+        assert_eq!(receiver_harness.live_udp_socket_count(), 0);
+
+        let sender_harness = UdpManagerHarness::with_config(
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl {
+                send_delay: Duration::from_millis(10),
+                backpressure_retry_delay: Duration::from_millis(10),
+                max_in_flight_datagrams: 1,
+            },
+            udpour_config_with_part_size(64),
+        );
+        let route = UdpRouteKey {
+            remote_addr: receiver_addr,
+            scope: DatagramRouteScope::Unicast,
+            local_bind: None,
+        };
+        let send_id = RouteSendId(Uuid::new_v4());
+        let multipart_payload = vec![0x5a; 64 * 16];
+
+        sender_harness.send(route_send(send_id, route, multipart_payload));
+
+        let (sender_socket_id, _sender_addr) = sender_harness.wait_for_new_bound_socket();
+        let buffered_count =
+            receiver_harness.wait_for_startup_buffered_datagrams(receiver_socket_key, 1);
+        receiver_harness.wait_for_live_udp_socket(receiver_socket_key);
+        receiver_harness.wait_for_bridge_payload_frames(receiver_socket_id, buffered_count + 3);
+
+        assert_eq!(
+            sender_harness.wait_for_send_ack(send_id),
+            TransportRouteKey::Udp(route)
+        );
+        sender_harness.wait_for_bridge_frame_type(sender_socket_id, 0x81);
+    }
+
+    #[test]
+    fn udp_manager_restores_dormant_external_socket_after_activation_failure() {
+        let harness = UdpManagerHarness::with_config(
+            UdpActivationPolicy::OnFirstUse,
+            TestSendRateControl::default(),
+            udpour_config(),
+        );
+        let local_addr = localhost(34567);
+        let socket_key = UdpSocketKey { local_addr };
+        let socket_id = SocketId(77);
+        let route = UdpRouteKey {
+            remote_addr: localhost(45678),
+            scope: DatagramRouteScope::Unicast,
+            local_bind: Some(local_addr),
+        };
+        let send_id = RouteSendId(Uuid::new_v4());
+
+        harness.manager.on_definition(|component| {
+            component.pending_sends.insert(
+                send_id,
+                PendingRouteSend {
+                    send: route_send(send_id, route, b"retry me".to_vec()),
+                },
+            );
+            component.udp_socket_ids.insert(socket_id, socket_key);
+            component.handle_udp_socket_activation_failed(
+                socket_key,
+                socket_id,
+                UdpSocketStartOrigin::ExternalDormant,
+                vec![QueuedUdpSend { send_id, route }],
+                ConnectionFailureReason::TimedOut,
+            );
+        });
+
+        harness.wait_for_dormant_socket(socket_key);
+        assert_eq!(harness.dormant_udp_socket_count(), 1);
+        let (coverage_key, reason) = harness.wait_for_send_nack(send_id);
+        assert_eq!(coverage_key, TransportRouteKey::Udp(route));
+        assert_eq!(reason, RouteTransportNackReason::RouteUnavailable);
+    }
 
     fn route_send(
         send_id: RouteSendId,
@@ -1202,8 +1756,12 @@ mod tests {
     }
 
     fn udpour_config() -> UDPourConfig {
+        udpour_config_with_part_size(1024)
+    }
+
+    fn udpour_config_with_part_size(max_part_payload_len: usize) -> UDPourConfig {
         let sender = SenderConfig {
-            max_part_payload_len: 1024,
+            max_part_payload_len,
             retention_timeout: Duration::from_secs(1),
             reuse_cooldown: Duration::from_millis(100),
             eager_ack_cleanup: false,
@@ -1214,6 +1772,33 @@ mod tests {
             give_up_timeout: Duration::from_secs(1),
         };
         UDPourConfig::new(sender, receiver).expect("valid datagram config")
+    }
+
+    fn build_manager_test_kompact_system(
+        activation_policy: UdpActivationPolicy,
+        send_rate_control: TestSendRateControl,
+    ) -> KompactSystem {
+        init_test_logger();
+
+        let mut config = KompactConfig::default();
+        let activation_policy_value = match activation_policy {
+            UdpActivationPolicy::OnBind => 0usize,
+            UdpActivationPolicy::OnFirstUse => 1usize,
+        };
+        config.set_config_value(&config_keys::UDP_ACTIVATION_POLICY, activation_policy_value);
+        config.set_config_value(
+            &udpour_config_keys::SEND_DELAY,
+            send_rate_control.send_delay,
+        );
+        config.set_config_value(
+            &udpour_config_keys::BACKPRESSURE_RETRY_DELAY,
+            send_rate_control.backpressure_retry_delay,
+        );
+        config.set_config_value(
+            &udpour_config_keys::MAX_IN_FLIGHT_DATAGRAMS,
+            send_rate_control.max_in_flight_datagrams,
+        );
+        config.build().expect("build KompactSystem")
     }
 
     fn zero_length_udpour_payload(message_id: MessageId) -> IoPayload {
