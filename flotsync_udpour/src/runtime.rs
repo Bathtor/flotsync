@@ -40,6 +40,7 @@ use flotsync_io::prelude::{
     UdpRequest,
     UdpSendResult,
 };
+use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::{
     config::{DurationValue, HoconExt, UsizeValue},
     kompact_config,

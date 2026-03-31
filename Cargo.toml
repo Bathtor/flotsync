@@ -20,6 +20,3 @@ itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
 uuid = "1"
 kompact = "0.11"
-
-[patch.crates-io]
-kompact = { path = "patches/kompact" }

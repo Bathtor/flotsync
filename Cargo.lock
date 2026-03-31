@@ -1058,6 +1058,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "flotsync_io",
+ "flotsync_utils",
  "kompact",
  "roaring",
  "snafu",
@@ -1067,6 +1068,7 @@ dependencies = [
 name = "flotsync_utils"
 version = "0.1.0"
 dependencies = [
+ "kompact",
  "proptest",
 ]
 
@@ -1494,6 +1496,8 @@ dependencies = [
 [[package]]
 name = "kompact"
 version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72e53f2031095827a482438424a663c8ffb4fddce8b2cbe0eb1f7d19d8a95d72"
 dependencies = [
  "arc-swap",
  "as_num",
