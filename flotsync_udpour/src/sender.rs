@@ -6,6 +6,7 @@
 use crate::types::{
     AckFrame,
     Checksum,
+    FrameFlags,
     FrameType,
     MessageId,
     NeedPartsFrame,
@@ -267,7 +268,12 @@ impl LiveMessage {
     ) -> Vec<PayloadFrame> {
         (0..self.part_count.get())
             .map(|part_number| {
-                self.payload_frame(message_id, max_part_payload_len, PartNumber(part_number))
+                self.payload_frame(
+                    message_id,
+                    max_part_payload_len,
+                    PartNumber(part_number),
+                    FrameFlags::DEFAULT,
+                )
             })
             .collect()
     }
@@ -282,7 +288,12 @@ impl LiveMessage {
             .iter()
             .filter(|part_number| *part_number < self.part_count.get())
             .map(|part_number| {
-                self.payload_frame(message_id, max_part_payload_len, PartNumber(part_number))
+                self.payload_frame(
+                    message_id,
+                    max_part_payload_len,
+                    PartNumber(part_number),
+                    FrameFlags::DEFAULT.with_retransmit(),
+                )
             })
             .collect()
     }
@@ -292,6 +303,7 @@ impl LiveMessage {
         message_id: MessageId,
         max_part_payload_len: usize,
         part_number: PartNumber,
+        flags: FrameFlags,
     ) -> PayloadFrame {
         let payload = slice_part(
             self.payload.clone(),
@@ -299,10 +311,14 @@ impl LiveMessage {
             part_number,
             self.part_count,
         );
-        PayloadFrame {
-            header: UDPourHeader::payload(message_id, part_number, self.part_count, self.checksum),
-            payload,
-        }
+        let header = UDPourHeader::payload_with_flags(
+            message_id,
+            part_number,
+            self.part_count,
+            self.checksum,
+            flags,
+        );
+        PayloadFrame { header, payload }
     }
 }
 
@@ -402,8 +418,7 @@ mod tests {
         assert_eq!(frames[0].payload.to_vec().as_slice(), b"abcd");
         assert_eq!(frames[2].payload.to_vec().as_slice(), b"ijkl");
 
-        let mut missing_parts = RoaringBitmap::new();
-        missing_parts.insert(1);
+        let missing_parts = RoaringBitmap::from([1]);
         let need_parts = NeedPartsFrame {
             header: UDPourHeader::control(
                 FrameType::NeedParts,
@@ -420,6 +435,7 @@ mod tests {
             panic!("expected resend");
         };
         assert_eq!(frames.len(), 1);
+        assert!(frames[0].header.is_retransmit());
         assert_eq!(frames[0].payload.to_vec().as_slice(), b"efgh");
     }
 
@@ -429,8 +445,7 @@ mod tests {
             SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
-        let mut missing_parts = RoaringBitmap::new();
-        missing_parts.insert(0);
+        let missing_parts = RoaringBitmap::from([0]);
         let need_parts = NeedPartsFrame {
             header: UDPourHeader::control(
                 FrameType::NeedParts,

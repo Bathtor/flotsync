@@ -139,7 +139,7 @@ where
     );
     out.put_u8(u8::from(header.frame_type));
     out.put_u8(header.version);
-    out.put_u8(header.flags);
+    out.put_u8(header.flags.bits());
     out.put_u8(header.reserved);
     out.put_u32(header.message_id.0);
     out.put_u32(header.part_number.0);
@@ -207,7 +207,7 @@ fn decode_header(bytes: &[u8]) -> Result<UDPourHeader, CodecError> {
     Ok(UDPourHeader {
         frame_type,
         version: bytes[1],
-        flags: bytes[2],
+        flags: FrameFlags::from_bits(bytes[2]),
         reserved: bytes[3],
         message_id: MessageId(u32::from_be_bytes(
             bytes[4..8].try_into().expect("message_id slice"),

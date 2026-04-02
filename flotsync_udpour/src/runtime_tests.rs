@@ -19,6 +19,7 @@ use crate::{
         Checksum,
         FrameType,
         MessageId,
+        NeedPartsFrame,
         PROTOCOL_VERSION,
         PartCount,
         PartNumber,
@@ -54,6 +55,7 @@ use flotsync_io::{
     },
 };
 use kompact::prelude::*;
+use roaring::RoaringBitmap;
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -438,6 +440,7 @@ struct RuntimeHarness {
     observer_rx: BufferedReceiver<UdpIndication>,
     receiver_rx: BufferedReceiver<UDPourPortIndication>,
     sender_socket_id: SocketId,
+    sender_addr: SocketAddr,
     receiver_socket_id: SocketId,
     receiver_addr: SocketAddr,
 }
@@ -490,7 +493,7 @@ impl RuntimeHarness {
         start_component(&system, &observer);
 
         let observer_rx = BufferedReceiver::new(observer_rx);
-        let (sender_socket_id, _) = bind_socket(&observer, &observer_rx);
+        let (sender_socket_id, sender_addr) = bind_socket(&observer, &observer_rx);
         let (receiver_socket_id, receiver_addr) = bind_socket(&observer, &observer_rx);
 
         let config = UDPourConfig::new(sender_config, receiver_config).unwrap();
@@ -574,6 +577,7 @@ impl RuntimeHarness {
             observer_rx,
             receiver_rx: BufferedReceiver::new(receiver_rx),
             sender_socket_id,
+            sender_addr,
             receiver_socket_id,
             receiver_addr,
         }
@@ -597,6 +601,28 @@ impl RuntimeHarness {
         self.observer.on_definition(|component| {
             component.udp.trigger(UdpRequest::Close { socket_id });
         });
+    }
+
+    fn inject_sender_indication(&self, source: SocketAddr, frame: UDPourFrame) {
+        self.system.trigger_i(
+            UdpIndication::Received {
+                socket_id: self.sender_socket_id,
+                source,
+                payload: encode_frame(&frame).expect("injected sender frame must encode"),
+            },
+            &self.sender_runtime.required_ref(),
+        );
+    }
+
+    fn inject_receiver_indication(&self, source: SocketAddr, frame: UDPourFrame) {
+        self.system.trigger_i(
+            UdpIndication::Received {
+                socket_id: self.receiver_socket_id,
+                source,
+                payload: encode_frame(&frame).expect("injected receiver frame must encode"),
+            },
+            &self.receiver_runtime.required_ref(),
+        );
     }
 
     fn wait_for_bridge_frame(
@@ -734,7 +760,31 @@ fn default_receiver_config(repair_interval: Duration) -> ReceiverConfig {
         repair_interval,
         give_up_timeout: Duration::from_millis(200),
         max_need_parts_frame_len: 256,
+        delivered_tombstone_timeout: Duration::from_millis(300),
     }
+}
+
+fn wait_for_retransmitted_parts(
+    harness: &RuntimeHarness,
+    message_id: MessageId,
+    expected_part_count: PartCount,
+) -> Vec<u32> {
+    let mut part_numbers = Vec::new();
+    for _ in 0..expected_part_count.get() {
+        let frame = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+            matches!(
+                frame,
+                UDPourFrame::Payload(frame)
+                    if frame.header.message_id == message_id && frame.header.is_retransmit()
+            )
+        });
+        let UDPourFrame::Payload(frame) = frame else {
+            unreachable!("filtered to retransmitted payload");
+        };
+        part_numbers.push(frame.header.part_number.0);
+    }
+    part_numbers.sort_unstable();
+    part_numbers
 }
 
 fn payload_frame_for_socket(
@@ -936,6 +986,80 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
+    harness.shutdown();
+}
+
+#[test]
+fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
+    let sender_config =
+        SenderConfig::new(4, Duration::from_millis(80), Duration::from_millis(40)).unwrap();
+    let harness = RuntimeHarness::new(
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        ProxyRequestBehavior::Pass,
+        ProxyIndicationBehavior::Pass,
+        sender_config,
+        default_receiver_config(Duration::from_millis(20)),
+    );
+
+    let UDPourSubmitResult::Sent { message_id } =
+        harness.send(IoPayload::from_static(b"abcdefghijkl"))
+    else {
+        panic!("expected initial send to succeed");
+    };
+    let first_deliver = harness.wait_for_receiver_deliver();
+    assert_eq!(first_deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
+    harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
+        matches!(frame, UDPourFrame::Ack(_))
+    });
+
+    let missing_parts = RoaringBitmap::from([0, 1, 2]);
+    harness.inject_sender_indication(
+        localhost(9001),
+        UDPourFrame::NeedParts(NeedPartsFrame {
+            header: UDPourHeader::control(
+                FrameType::NeedParts,
+                message_id,
+                first_deliver.part_count,
+                first_deliver.checksum,
+            )
+            .unwrap(),
+            missing_parts,
+        }),
+    );
+
+    let retransmitted_parts =
+        wait_for_retransmitted_parts(&harness, message_id, first_deliver.part_count);
+    assert_eq!(retransmitted_parts, vec![0, 1, 2]);
+
+    harness.assert_no_receiver_deliver(Duration::from_millis(60));
+    harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
+        matches!(frame, UDPourFrame::Ack(_))
+    });
+
+    std::thread::sleep(Duration::from_millis(140));
+
+    for (part_number, payload) in [
+        (PartNumber(0), IoPayload::from_static(b"abcd")),
+        (PartNumber(1), IoPayload::from_static(b"efgh")),
+        (PartNumber(2), IoPayload::from_static(b"ijkl")),
+    ] {
+        harness.inject_receiver_indication(
+            harness.sender_addr,
+            UDPourFrame::Payload(PayloadFrame {
+                header: UDPourHeader::payload(
+                    message_id,
+                    part_number,
+                    first_deliver.part_count,
+                    first_deliver.checksum,
+                ),
+                payload,
+            }),
+        );
+    }
+
+    let second_deliver = harness.wait_for_receiver_deliver();
+    assert_eq!(second_deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
     harness.shutdown();
 }
 

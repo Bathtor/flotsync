@@ -55,6 +55,8 @@
 //!
 //! `Payload` frames use zero-based `part_number`. Control frames do not refer
 //! to a concrete payload slice and therefore always carry `part_number = 0`.
+//! The low bit in `flags` marks a sender-side payload retransmission that was
+//! emitted in response to `NeedParts`.
 //!
 //! The current frame family is:
 //!
@@ -118,7 +120,7 @@
 //! request, and retransmitted parts may be received redundantly by other
 //! listeners on the same route.
 //!
-//! # Receiver Behavior
+//! # Receiver Behaviour
 //!
 //! The receiver creates reassembly state when it first observes a `Payload`
 //! frame for one `(source, message_id)` pair. That state records:
@@ -135,13 +137,16 @@
 //! Once all parts are present, the receiver reassembles the payload and checks
 //! the whole-message checksum:
 //!
-//! - on success, it delivers the payload upward, emits `Ack`, and purges local
-//!   state immediately
+//! - on success, it delivers the payload upward, emits `Ack`, and keeps a short
+//!   delivered tombstone so late shared-route repair traffic does not trigger a
+//!   second delivery
 //! - on checksum mismatch, it purges local state immediately without delivery
 //!
 //! Incomplete reassembly state is retained only until the receiver give-up
 //! timeout expires. That timeout resets whenever a fresh `Payload` part is
 //! accepted. Until then the receiver may emit one or more `NeedParts` frames.
+//! Delivered tombstones are retained only for a bounded timeout derived from
+//! sender retention and `message_id` reuse cooldown.
 //!
 //! # Runtime Boundary
 //!

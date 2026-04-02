@@ -1771,6 +1771,7 @@ mod tests {
             max_need_parts_frame_len: 1024,
             repair_interval: Duration::from_millis(100),
             give_up_timeout: Duration::from_secs(1),
+            delivered_tombstone_timeout: Duration::ZERO,
         };
         UDPourConfig::new(sender, receiver).expect("valid datagram config")
     }

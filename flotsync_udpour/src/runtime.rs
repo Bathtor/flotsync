@@ -181,7 +181,11 @@ pub mod config_keys {
 pub struct UDPourConfig {
     /// Sender-side multipart retention and message-id reuse policy.
     pub sender: SenderConfig,
-    /// Receiver-side repair and give-up policy.
+    /// Receiver-side repair, give-up, and duplicate-suppression policy.
+    ///
+    /// `delivered_tombstone_timeout` is derived in [`UDPourConfig::new`] from sender retention
+    /// and message-id reuse cooldown because the receiver must remember successful deliveries long
+    /// enough to suppress late shared-route repairs for the old logical message.
     pub receiver: ReceiverConfig,
     /// Timer cadence used to drive sender retention expiry and receiver repair.
     pub poll_interval: Duration,
@@ -189,7 +193,10 @@ pub struct UDPourConfig {
 
 impl UDPourConfig {
     /// Builds runtime configuration from the sender/receiver state-machine configs.
-    pub fn new(sender: SenderConfig, receiver: ReceiverConfig) -> Result<Self, UDPourConfigError> {
+    pub fn new(
+        sender: SenderConfig,
+        mut receiver: ReceiverConfig,
+    ) -> Result<Self, UDPourConfigError> {
         ensure!(
             sender.max_part_payload_len > 0,
             ZeroMaxPartPayloadLenConfigSnafu
@@ -200,10 +207,14 @@ impl UDPourConfig {
                 max_need_parts_frame_len: receiver.max_need_parts_frame_len,
             }
         );
+        receiver.delivered_tombstone_timeout = sender
+            .retention_timeout
+            .saturating_add(sender.reuse_cooldown);
         let poll_interval = sender
             .retention_timeout
             .min(receiver.repair_interval)
-            .min(receiver.give_up_timeout);
+            .min(receiver.give_up_timeout)
+            .min(receiver.delivered_tombstone_timeout);
         ensure!(poll_interval > Duration::ZERO, ZeroPollIntervalSnafu);
         Ok(Self {
             sender,
@@ -1136,6 +1147,7 @@ mod tests {
             repair_interval: Duration::from_millis(10),
             give_up_timeout: Duration::from_secs(1),
             max_need_parts_frame_len: FRAME_HEADER_LEN,
+            delivered_tombstone_timeout: Duration::ZERO,
         };
 
         let error = UDPourConfig::new(sender, receiver).unwrap_err();
@@ -1159,6 +1171,7 @@ mod tests {
             repair_interval: Duration::from_millis(10),
             give_up_timeout: Duration::from_secs(1),
             max_need_parts_frame_len: FRAME_HEADER_LEN + 1,
+            delivered_tombstone_timeout: Duration::ZERO,
         };
 
         let error = UDPourConfig::new(sender, receiver).unwrap_err();

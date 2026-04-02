@@ -39,6 +39,12 @@ pub struct ReceiverConfig {
     pub give_up_timeout: Duration,
     /// Maximum encoded wire size for one `NeedParts` frame.
     pub max_need_parts_frame_len: usize,
+    /// How long one successful delivery stays around as a duplicate-suppression tombstone.
+    ///
+    /// `UDPourConfig::new` derives this from sender retention and message-id reuse cooldown so
+    /// late shared-route repair traffic is still recognized as belonging to the old logical
+    /// message. Callers that construct `ReceiverConfig` directly in tests must set it explicitly.
+    pub delivered_tombstone_timeout: Duration,
 }
 
 /// Sender identity plus logical message id.
@@ -52,7 +58,7 @@ pub(crate) struct ReceiverTransferKey {
 #[derive(Debug)]
 pub(crate) struct ReceiverMachine {
     config: ReceiverConfig,
-    transfers: HashMap<ReceiverTransferKey, InboundTransfer>,
+    transfers: HashMap<ReceiverTransferKey, InboundState>,
 }
 
 impl ReceiverMachine {
@@ -75,12 +81,16 @@ impl ReceiverMachine {
             source,
             message_id: frame.header.message_id,
         };
+        let frame_header = frame.header;
         let mut actions = Vec::new();
         let transfer = match self.transfers.remove(&key) {
-            Some(transfer) => transfer,
+            Some(InboundState::Delivered(tombstone)) => {
+                return Ok(self.accept_delivered_payload(key, tombstone, frame, now));
+            }
+            Some(InboundState::Pending(transfer)) => transfer,
             None => InboundTransfer::new(
-                frame.header.part_count,
-                frame.header.checksum,
+                frame_header.part_count,
+                frame_header.checksum,
                 now,
                 &self.config,
             ),
@@ -88,7 +98,7 @@ impl ReceiverMachine {
 
         match transfer.accept_payload(frame, now, &self.config) {
             InboundUpdate::Pending(next) => {
-                self.transfers.insert(key, next);
+                self.transfers.insert(key, InboundState::Pending(next));
             }
             InboundUpdate::Deliver {
                 payload,
@@ -96,6 +106,14 @@ impl ReceiverMachine {
                 part_count,
                 checksum,
             } => {
+                self.transfers.insert(
+                    key,
+                    InboundState::Delivered(DeliveredTombstone::new(
+                        part_count,
+                        checksum,
+                        now + self.config.delivered_tombstone_timeout,
+                    )),
+                );
                 actions.push(ReceiverAction::Deliver {
                     source,
                     message_id,
@@ -110,16 +128,89 @@ impl ReceiverMachine {
                     source,
                     frame: AckFrame { header },
                 });
-                actions.push(ReceiverAction::Purged {
-                    key,
-                    reason: ReceiverPurgeReason::Delivered,
-                });
             }
             InboundUpdate::Purged(reason) => {
                 actions.push(ReceiverAction::Purged { key, reason });
             }
         }
         Ok(actions)
+    }
+
+    fn accept_delivered_payload(
+        &mut self,
+        key: ReceiverTransferKey,
+        tombstone: DeliveredTombstone,
+        frame: PayloadFrame,
+        now: Instant,
+    ) -> Vec<ReceiverAction> {
+        if tombstone.matches(frame.header.part_count, frame.header.checksum) {
+            self.transfers
+                .insert(key, InboundState::Delivered(tombstone));
+            let header = UDPourHeader::control(
+                FrameType::Ack,
+                key.message_id,
+                frame.header.part_count,
+                frame.header.checksum,
+            )
+            .expect("delivered tombstone metadata must always produce a valid Ack header");
+            return vec![ReceiverAction::SendAck {
+                source: key.source,
+                frame: AckFrame { header },
+            }];
+        }
+        if frame.header.is_retransmit() {
+            // A retransmitted part that disagrees with the delivered tombstone belongs to some
+            // earlier repair attempt and must not resurrect inbound state after successful
+            // delivery.
+            self.transfers
+                .insert(key, InboundState::Delivered(tombstone));
+            return Vec::new();
+        }
+
+        let transfer = InboundTransfer::new(
+            frame.header.part_count,
+            frame.header.checksum,
+            now,
+            &self.config,
+        );
+        match transfer.accept_payload(frame, now, &self.config) {
+            InboundUpdate::Pending(next) => {
+                self.transfers.insert(key, InboundState::Pending(next));
+                Vec::new()
+            }
+            InboundUpdate::Deliver {
+                payload,
+                message_id,
+                part_count,
+                checksum,
+            } => {
+                self.transfers.insert(
+                    key,
+                    InboundState::Delivered(DeliveredTombstone::new(
+                        part_count,
+                        checksum,
+                        now + self.config.delivered_tombstone_timeout,
+                    )),
+                );
+                let header =
+                    UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
+                        .expect("Ack metadata gathered from a valid transfer must stay valid");
+                vec![
+                    ReceiverAction::Deliver {
+                        source: key.source,
+                        message_id,
+                        payload,
+                        part_count,
+                        checksum,
+                    },
+                    ReceiverAction::SendAck {
+                        source: key.source,
+                        frame: AckFrame { header },
+                    },
+                ]
+            }
+            InboundUpdate::Purged(reason) => vec![ReceiverAction::Purged { key, reason }],
+        }
     }
 
     /// Accepts one sender `NoLongerAvailable` control frame.
@@ -132,7 +223,9 @@ impl ReceiverMachine {
             source,
             message_id: frame.header.message_id,
         };
-        let transfer = self.transfers.get(&key)?;
+        let InboundState::Pending(transfer) = self.transfers.get(&key)? else {
+            return None;
+        };
         if transfer.part_count != frame.header.part_count
             || transfer.checksum != frame.header.checksum
         {
@@ -150,37 +243,52 @@ impl ReceiverMachine {
         let keys: Vec<_> = self.transfers.keys().copied().collect();
         let mut actions = Vec::new();
         for key in keys {
-            let Some(mut transfer) = self.transfers.remove(&key) else {
+            let Some(state) = self.transfers.remove(&key) else {
                 continue;
             };
-            if transfer.give_up_deadline <= now {
-                actions.push(ReceiverAction::Purged {
-                    key,
-                    reason: ReceiverPurgeReason::TimedOut,
-                });
-                continue;
-            }
-            if transfer.repair_deadline <= now {
-                // TODO(flotsync-1n9): Keep repair state incremental so we do not rebuild the full
-                // missing-part set and re-split roaring bitmaps from scratch on every poll.
-                let missing_parts = transfer.missing_parts();
-                let frames = split_need_parts_frames(
-                    key.message_id,
-                    transfer.part_count,
-                    transfer.checksum,
-                    &missing_parts,
-                    self.config.max_need_parts_frame_len,
-                )
-                .context(SplitNeedPartsSnafu)?;
-                if !frames.is_empty() {
-                    actions.push(ReceiverAction::SendNeedParts {
-                        source: key.source,
-                        frames,
-                    });
-                    transfer.repair_deadline = now + self.config.repair_interval;
+            match state {
+                InboundState::Pending(mut transfer) => {
+                    if transfer.give_up_deadline <= now {
+                        actions.push(ReceiverAction::Purged {
+                            key,
+                            reason: ReceiverPurgeReason::TimedOut,
+                        });
+                        continue;
+                    }
+                    if transfer.repair_deadline <= now {
+                        // TODO(flotsync-1n9): Keep repair state incremental so we do not rebuild the full
+                        // missing-part set and re-split roaring bitmaps from scratch on every poll.
+                        let missing_parts = transfer.missing_parts();
+                        let frames = split_need_parts_frames(
+                            key.message_id,
+                            transfer.part_count,
+                            transfer.checksum,
+                            &missing_parts,
+                            self.config.max_need_parts_frame_len,
+                        )
+                        .context(SplitNeedPartsSnafu)?;
+                        if !frames.is_empty() {
+                            actions.push(ReceiverAction::SendNeedParts {
+                                source: key.source,
+                                frames,
+                            });
+                            transfer.repair_deadline = now + self.config.repair_interval;
+                        }
+                    }
+                    self.transfers.insert(key, InboundState::Pending(transfer));
+                }
+                InboundState::Delivered(tombstone) => {
+                    if tombstone.expires_at <= now {
+                        actions.push(ReceiverAction::Purged {
+                            key,
+                            reason: ReceiverPurgeReason::DeliveredTombstoneExpired,
+                        });
+                    } else {
+                        self.transfers
+                            .insert(key, InboundState::Delivered(tombstone));
+                    }
                 }
             }
-            self.transfers.insert(key, transfer);
         }
         Ok(actions)
     }
@@ -216,9 +324,16 @@ pub(crate) enum ReceiverAction {
 pub(crate) enum ReceiverPurgeReason {
     Confused,
     ChecksumMismatch,
-    Delivered,
+    DeliveredTombstoneExpired,
     NoLongerAvailable,
     TimedOut,
+}
+
+/// One active receiver-side entry for one `(source, message_id)` pair.
+#[derive(Debug)]
+enum InboundState {
+    Pending(InboundTransfer),
+    Delivered(DeliveredTombstone),
 }
 
 /// One receiver-owned in-progress transfer keyed by `(source, message_id)`.
@@ -230,6 +345,29 @@ struct InboundTransfer {
     regular_part_size: Option<usize>,
     give_up_deadline: Instant,
     repair_deadline: Instant,
+}
+
+/// One successfully delivered transfer remembered just long enough to suppress late repair
+/// traffic from shared routes.
+#[derive(Clone, Copy, Debug)]
+struct DeliveredTombstone {
+    part_count: PartCount,
+    checksum: Checksum,
+    expires_at: Instant,
+}
+
+impl DeliveredTombstone {
+    fn new(part_count: PartCount, checksum: Checksum, expires_at: Instant) -> Self {
+        Self {
+            part_count,
+            checksum,
+            expires_at,
+        }
+    }
+
+    fn matches(self, part_count: PartCount, checksum: Checksum) -> bool {
+        self.part_count == part_count && self.checksum == checksum
+    }
 }
 
 impl InboundTransfer {
@@ -369,6 +507,7 @@ mod tests {
             repair_interval: Duration::from_millis(10),
             give_up_timeout: Duration::from_millis(50),
             max_need_parts_frame_len: 256,
+            delivered_tombstone_timeout: Duration::from_millis(100),
         }
     }
 
@@ -715,6 +854,80 @@ mod tests {
         )));
         assert!(
             actions
+                .iter()
+                .any(|action| matches!(action, ReceiverAction::SendAck { .. }))
+        );
+    }
+
+    #[test]
+    fn delivered_tombstone_suppresses_duplicate_delivery_and_reacks() {
+        let mut receiver = ReceiverMachine::new(receiver_config());
+        let now = Instant::now();
+        let message_id = MessageId(14);
+        let checksum = Checksum(crc32c::crc32c(b"abcdefghijkl"));
+        let part_count = PartCount::new(3).unwrap();
+
+        for (offset, part_number, payload) in [
+            (0u64, PartNumber(0), IoPayload::from_static(b"abcd")),
+            (1u64, PartNumber(1), IoPayload::from_static(b"efgh")),
+            (2u64, PartNumber(2), IoPayload::from_static(b"ijkl")),
+        ] {
+            let actions = receiver
+                .accept_payload(
+                    source(),
+                    PayloadFrame {
+                        header: UDPourHeader::payload(
+                            message_id,
+                            part_number,
+                            part_count,
+                            checksum,
+                        ),
+                        payload,
+                    },
+                    now + Duration::from_millis(offset),
+                )
+                .unwrap();
+            if part_number == PartNumber(2) {
+                assert!(actions.iter().any(|action| matches!(
+                    action,
+                    ReceiverAction::Deliver { payload, .. }
+                        if payload.to_vec().as_slice() == b"abcdefghijkl"
+                )));
+            }
+        }
+
+        let mut duplicate_actions = Vec::new();
+        for (offset, part_number, payload) in [
+            (10u64, PartNumber(0), IoPayload::from_static(b"abcd")),
+            (11u64, PartNumber(1), IoPayload::from_static(b"efgh")),
+            (12u64, PartNumber(2), IoPayload::from_static(b"ijkl")),
+        ] {
+            duplicate_actions.extend(
+                receiver
+                    .accept_payload(
+                        source(),
+                        PayloadFrame {
+                            header: UDPourHeader::payload(
+                                message_id,
+                                part_number,
+                                part_count,
+                                checksum,
+                            ),
+                            payload,
+                        },
+                        now + Duration::from_millis(offset),
+                    )
+                    .unwrap(),
+            );
+        }
+
+        assert!(
+            !duplicate_actions
+                .iter()
+                .any(|action| matches!(action, ReceiverAction::Deliver { .. }))
+        );
+        assert!(
+            duplicate_actions
                 .iter()
                 .any(|action| matches!(action, ReceiverAction::SendAck { .. }))
         );

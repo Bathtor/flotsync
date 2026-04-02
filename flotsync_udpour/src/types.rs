@@ -7,6 +7,40 @@ use std::num::NonZeroU32;
 /// Current UDPour protocol version.
 pub(crate) const PROTOCOL_VERSION: u8 = 1;
 
+/// Bitflags carried in the shared UDPour header.
+///
+/// This is a small wrapper rather than a raw `u8` so call sites can describe
+/// intent directly and we have one place to grow future payload/control flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(crate) struct FrameFlags(u8);
+
+impl FrameFlags {
+    /// Default header flags for frames without any optional signalling bits.
+    pub const DEFAULT: Self = Self(0);
+    const RETRANSMIT_MASK: u8 = 0x01;
+
+    /// Wraps raw on-the-wire bits.
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    /// Returns these flags with the retransmit bit enabled.
+    pub fn with_retransmit(mut self) -> Self {
+        self.0 |= Self::RETRANSMIT_MASK;
+        self
+    }
+
+    /// Returns the raw on-the-wire bits.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Returns whether this frame is marked as a sender-side payload retransmission.
+    pub const fn is_retransmit(self) -> bool {
+        (self.0 & Self::RETRANSMIT_MASK) != 0
+    }
+}
+
 /// Whole-message CRC32C checksum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Checksum(pub u32);
@@ -117,8 +151,11 @@ pub(crate) struct UDPourHeader {
     pub frame_type: FrameType,
     /// Protocol version for this frame format.
     pub version: u8,
-    /// Reserved for future per-frame feature bits.
-    pub flags: u8,
+    /// Per-frame feature bits.
+    ///
+    /// The low bit currently marks a sender-side payload retransmission that
+    /// was emitted in response to `NeedParts`.
+    pub flags: FrameFlags,
     /// Reserved for future header extensions.
     pub reserved: u8,
     /// Sender-local logical message identifier.
@@ -135,17 +172,34 @@ pub(crate) struct UDPourHeader {
 }
 
 impl UDPourHeader {
-    /// Builds one payload header.
+    /// Builds one payload header for tests and local fixtures.
+    #[cfg(test)]
     pub fn payload(
         message_id: MessageId,
         part_number: PartNumber,
         part_count: PartCount,
         checksum: Checksum,
     ) -> Self {
+        Self::payload_with_flags(
+            message_id,
+            part_number,
+            part_count,
+            checksum,
+            FrameFlags::DEFAULT,
+        )
+    }
+
+    pub(crate) fn payload_with_flags(
+        message_id: MessageId,
+        part_number: PartNumber,
+        part_count: PartCount,
+        checksum: Checksum,
+        flags: FrameFlags,
+    ) -> Self {
         Self {
             frame_type: FrameType::Payload,
             version: PROTOCOL_VERSION,
-            flags: 0,
+            flags,
             reserved: 0,
             message_id,
             part_number,
@@ -168,7 +222,7 @@ impl UDPourHeader {
         Ok(Self {
             frame_type,
             version: PROTOCOL_VERSION,
-            flags: 0,
+            flags: FrameFlags::DEFAULT,
             reserved: 0,
             message_id,
             part_number: PartNumber(0),
@@ -205,6 +259,11 @@ impl UDPourHeader {
             }
         }
         Ok(self)
+    }
+
+    /// Returns whether this header marks a sender-side payload retransmission.
+    pub fn is_retransmit(self) -> bool {
+        self.frame_type == FrameType::Payload && self.flags.is_retransmit()
     }
 }
 
