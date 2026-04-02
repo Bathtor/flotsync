@@ -32,9 +32,15 @@ pub fn init_test_logger() {
 
 /// Builds a Kompact system whose logs follow libtest output capture.
 pub fn build_test_kompact_system() -> KompactSystem {
+    build_test_kompact_system_with(|_| {})
+}
+
+/// Builds a Kompact system whose logs follow libtest output capture after applying extra config.
+pub fn build_test_kompact_system_with(configure: impl FnOnce(&mut KompactConfig)) -> KompactSystem {
     init_test_logger();
 
     let mut config = KompactConfig::default();
+    configure(&mut config);
     config.logger(captured_kompact_logger());
     config.build().expect("build KompactSystem")
 }

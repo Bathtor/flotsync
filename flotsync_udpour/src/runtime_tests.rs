@@ -48,7 +48,7 @@ use flotsync_io::{
     test_support::{
         UdpObserver,
         WAIT_TIMEOUT,
-        init_test_logger,
+        build_test_kompact_system_with,
         kill_component,
         localhost,
         start_component,
@@ -474,8 +474,6 @@ impl RuntimeHarness {
         receiver_config: ReceiverConfig,
         send_rate_control: TestSendRateControl,
     ) -> Self {
-        init_test_logger();
-
         let system = build_runtime_test_kompact_system(send_rate_control);
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
@@ -706,17 +704,17 @@ impl RuntimeHarness {
 }
 
 fn build_runtime_test_kompact_system(send_rate_control: TestSendRateControl) -> KompactSystem {
-    let mut config = KompactConfig::default();
-    config.set_config_value(&config_keys::SEND_DELAY, send_rate_control.send_delay);
-    config.set_config_value(
-        &config_keys::BACKPRESSURE_RETRY_DELAY,
-        send_rate_control.backpressure_retry_delay,
-    );
-    config.set_config_value(
-        &config_keys::MAX_IN_FLIGHT_DATAGRAMS,
-        send_rate_control.max_in_flight_datagrams,
-    );
-    config.build().expect("build KompactSystem")
+    build_test_kompact_system_with(|config| {
+        config.set_config_value(&config_keys::SEND_DELAY, send_rate_control.send_delay);
+        config.set_config_value(
+            &config_keys::BACKPRESSURE_RETRY_DELAY,
+            send_rate_control.backpressure_retry_delay,
+        );
+        config.set_config_value(
+            &config_keys::MAX_IN_FLIGHT_DATAGRAMS,
+            send_rate_control.max_in_flight_datagrams,
+        );
+    })
 }
 
 fn bind_socket(

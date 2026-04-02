@@ -1061,7 +1061,13 @@ mod tests {
     use flotsync_io::{
         pool::PayloadWriter,
         prelude::{DriverConfig, IoBridge, IoDriverComponent},
-        test_support::{UdpObserver, WAIT_TIMEOUT, init_test_logger, localhost, start_component},
+        test_support::{
+            UdpObserver,
+            WAIT_TIMEOUT,
+            build_test_kompact_system_with,
+            localhost,
+            start_component,
+        },
     };
     use flotsync_udpour::{
         MessageId,
@@ -1780,27 +1786,25 @@ mod tests {
         activation_policy: UdpActivationPolicy,
         send_rate_control: TestSendRateControl,
     ) -> KompactSystem {
-        init_test_logger();
-
-        let mut config = KompactConfig::default();
-        let activation_policy_value = match activation_policy {
-            UdpActivationPolicy::OnBind => 0usize,
-            UdpActivationPolicy::OnFirstUse => 1usize,
-        };
-        config.set_config_value(&config_keys::UDP_ACTIVATION_POLICY, activation_policy_value);
-        config.set_config_value(
-            &udpour_config_keys::SEND_DELAY,
-            send_rate_control.send_delay,
-        );
-        config.set_config_value(
-            &udpour_config_keys::BACKPRESSURE_RETRY_DELAY,
-            send_rate_control.backpressure_retry_delay,
-        );
-        config.set_config_value(
-            &udpour_config_keys::MAX_IN_FLIGHT_DATAGRAMS,
-            send_rate_control.max_in_flight_datagrams,
-        );
-        config.build().expect("build KompactSystem")
+        build_test_kompact_system_with(|config| {
+            let activation_policy_value = match activation_policy {
+                UdpActivationPolicy::OnBind => 0usize,
+                UdpActivationPolicy::OnFirstUse => 1usize,
+            };
+            config.set_config_value(&config_keys::UDP_ACTIVATION_POLICY, activation_policy_value);
+            config.set_config_value(
+                &udpour_config_keys::SEND_DELAY,
+                send_rate_control.send_delay,
+            );
+            config.set_config_value(
+                &udpour_config_keys::BACKPRESSURE_RETRY_DELAY,
+                send_rate_control.backpressure_retry_delay,
+            );
+            config.set_config_value(
+                &udpour_config_keys::MAX_IN_FLIGHT_DATAGRAMS,
+                send_rate_control.max_in_flight_datagrams,
+            );
+        })
     }
 
     fn zero_length_udpour_payload(message_id: MessageId) -> IoPayload {
