@@ -741,7 +741,17 @@ impl UDPourComponent {
                     self.dispatch_control_frame(target, UDPourFrame::NoLongerAvailable(frame));
                 }
             }
-            SenderAction::ObservedAck { .. } => {}
+            SenderAction::ObservedAck { message_id } => {
+                // Logical send completion is reported when all initial datagrams were transport
+                // acknowledged. A later receiver `Ack` only informs sender-side retention state,
+                // so the runtime has no additional control-plane work to perform here.
+                debug!(
+                    self.log(),
+                    "Observed receiver Ack for UDPour message_id={:?}; eager_ack_cleanup={} so runtime submit state stays unchanged",
+                    message_id,
+                    self.config.sender.eager_ack_cleanup
+                );
+            }
             SenderAction::Purged { message_id, .. } => {
                 let mut removed_in_flight = 0usize;
                 self.pending_transmissions.retain(|_, pending| {

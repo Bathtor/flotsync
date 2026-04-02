@@ -18,6 +18,7 @@ use crate::types::{
 };
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
+use smallvec::SmallVec;
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
@@ -63,6 +64,12 @@ pub(crate) struct SenderMachine {
     live: HashMap<MessageId, LiveMessage>,
     cooldown: HashMap<MessageId, Instant>,
 }
+
+/// Sender timeout polling only emits purge actions for expired retained messages.
+///
+/// The per-tick action list is therefore usually tiny even though the individual
+/// `SendPayloads` action can still carry a large payload-frame `Vec`.
+type SenderActions = SmallVec<[SenderAction; 2]>;
 
 impl SenderMachine {
     /// Creates one new sender state machine.
@@ -156,7 +163,7 @@ impl SenderMachine {
     }
 
     /// Purges expired retained messages and moves their ids into cooldown.
-    pub fn poll_timeouts(&mut self, now: Instant) -> Vec<SenderAction> {
+    pub fn poll_timeouts(&mut self, now: Instant) -> SenderActions {
         self.collect_expired_cooldown(now);
         let expired_ids: Vec<_> = self
             .live
@@ -167,7 +174,7 @@ impl SenderMachine {
                     .map(|_| *message_id)
             })
             .collect();
-        let mut actions = Vec::with_capacity(expired_ids.len());
+        let mut actions = SenderActions::new();
         for message_id in expired_ids {
             if let Some(action) =
                 self.purge_message(message_id, now, SenderPurgeReason::RetentionExpired)

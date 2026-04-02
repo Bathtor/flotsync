@@ -21,9 +21,10 @@ use crate::{
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
+use smallvec::{SmallVec, smallvec};
 use snafu::prelude::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -61,6 +62,10 @@ pub(crate) struct ReceiverMachine {
     transfers: HashMap<ReceiverTransferKey, InboundState>,
 }
 
+/// Most receiver interactions produce zero, one, or two actions:
+/// one optional `Deliver`, one optional immediate follow-up control frame.
+type ReceiverActions = SmallVec<[ReceiverAction; 2]>;
+
 impl ReceiverMachine {
     /// Creates one new receiver state machine.
     pub fn new(config: ReceiverConfig) -> Self {
@@ -76,76 +81,74 @@ impl ReceiverMachine {
         source: SocketAddr,
         frame: PayloadFrame,
         now: Instant,
-    ) -> Result<Vec<ReceiverAction>, ReceiverError> {
+    ) -> Result<ReceiverActions, ReceiverError> {
         let key = ReceiverTransferKey {
             source,
             message_id: frame.header.message_id,
         };
-        let frame_header = frame.header;
-        let mut actions = Vec::new();
-        let transfer = match self.transfers.remove(&key) {
-            Some(InboundState::Delivered(tombstone)) => {
-                return Ok(self.accept_delivered_payload(key, tombstone, frame, now));
+        match self.transfers.entry(key) {
+            Entry::Occupied(mut entry) => {
+                // Copy the delivered tombstone out before moving the occupied entry into the
+                // helper. Otherwise the temporary borrow from `entry.get()` overlaps with moving
+                // the entry itself, and Rust is right to reject that.
+                let delivered_tombstone = match entry.get() {
+                    InboundState::Delivered(tombstone) => Some(*tombstone),
+                    InboundState::Pending(_) => None,
+                };
+                if let Some(tombstone) = delivered_tombstone {
+                    return Ok(Self::apply_delivered_tombstone_update(
+                        &self.config,
+                        key,
+                        entry,
+                        tombstone,
+                        frame,
+                        now,
+                    ));
+                }
+                match entry.get_mut() {
+                    InboundState::Delivered(_) => unreachable!("handled above"),
+                    InboundState::Pending(transfer) => {
+                        let update = transfer.accept_payload(frame, now, &self.config);
+                        Ok(Self::apply_pending_update(
+                            &self.config,
+                            source,
+                            key,
+                            entry,
+                            update,
+                            now,
+                        ))
+                    }
+                }
             }
-            Some(InboundState::Pending(transfer)) => transfer,
-            None => InboundTransfer::new(
-                frame_header.part_count,
-                frame_header.checksum,
-                now,
-                &self.config,
-            ),
-        };
-
-        match transfer.accept_payload(frame, now, &self.config) {
-            InboundUpdate::Pending(next) => {
-                self.transfers.insert(key, InboundState::Pending(next));
-            }
-            InboundUpdate::Deliver {
-                payload,
-                message_id,
-                part_count,
-                checksum,
-            } => {
-                self.transfers.insert(
-                    key,
-                    InboundState::Delivered(DeliveredTombstone::new(
-                        part_count,
-                        checksum,
-                        now + self.config.delivered_tombstone_timeout,
-                    )),
+            Entry::Vacant(entry) => {
+                let mut transfer = InboundTransfer::new(
+                    frame.header.part_count,
+                    frame.header.checksum,
+                    now,
+                    &self.config,
                 );
-                actions.push(ReceiverAction::Deliver {
+                let update = transfer.accept_payload(frame, now, &self.config);
+                Ok(Self::apply_new_transfer_update(
+                    &self.config,
                     source,
-                    message_id,
-                    payload,
-                    part_count,
-                    checksum,
-                });
-                let header =
-                    UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
-                        .expect("Ack metadata gathered from a valid transfer must stay valid");
-                actions.push(ReceiverAction::SendAck {
-                    source,
-                    frame: AckFrame { header },
-                });
-            }
-            InboundUpdate::Purged(reason) => {
-                actions.push(ReceiverAction::Purged { key, reason });
+                    key,
+                    entry,
+                    transfer,
+                    update,
+                    now,
+                ))
             }
         }
-        Ok(actions)
     }
 
     fn accept_delivered_payload(
-        &mut self,
+        config: &ReceiverConfig,
         key: ReceiverTransferKey,
         tombstone: DeliveredTombstone,
         frame: PayloadFrame,
         now: Instant,
-    ) -> Vec<ReceiverAction> {
+    ) -> (Option<InboundState>, ReceiverActions) {
         if tombstone.matches(frame.header.part_count, frame.header.checksum) {
-            self.transfers
-                .insert(key, InboundState::Delivered(tombstone));
             let header = UDPourHeader::control(
                 FrameType::Ack,
                 key.message_id,
@@ -153,49 +156,46 @@ impl ReceiverMachine {
                 frame.header.checksum,
             )
             .expect("delivered tombstone metadata must always produce a valid Ack header");
-            return vec![ReceiverAction::SendAck {
-                source: key.source,
-                frame: AckFrame { header },
-            }];
+            return (
+                Some(InboundState::Delivered(tombstone)),
+                smallvec![ReceiverAction::SendAck {
+                    source: key.source,
+                    frame: AckFrame { header },
+                }],
+            );
         }
         if frame.header.is_retransmit() {
             // A retransmitted part that disagrees with the delivered tombstone belongs to some
             // earlier repair attempt and must not resurrect inbound state after successful
             // delivery.
-            self.transfers
-                .insert(key, InboundState::Delivered(tombstone));
-            return Vec::new();
+            return (Some(InboundState::Delivered(tombstone)), SmallVec::new());
         }
 
-        let transfer = InboundTransfer::new(
+        let mut transfer = InboundTransfer::new(
             frame.header.part_count,
             frame.header.checksum,
             now,
-            &self.config,
+            config,
         );
-        match transfer.accept_payload(frame, now, &self.config) {
-            InboundUpdate::Pending(next) => {
-                self.transfers.insert(key, InboundState::Pending(next));
-                Vec::new()
-            }
+        match transfer.accept_payload(frame, now, config) {
+            InboundUpdate::Pending => (Some(InboundState::Pending(transfer)), SmallVec::new()),
             InboundUpdate::Deliver {
                 payload,
                 message_id,
                 part_count,
                 checksum,
             } => {
-                self.transfers.insert(
-                    key,
-                    InboundState::Delivered(DeliveredTombstone::new(
-                        part_count,
-                        checksum,
-                        now + self.config.delivered_tombstone_timeout,
-                    )),
-                );
+                let next_state = InboundState::Delivered(DeliveredTombstone::new(
+                    part_count,
+                    checksum,
+                    now + config.delivered_tombstone_timeout,
+                ));
                 let header =
                     UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
                         .expect("Ack metadata gathered from a valid transfer must stay valid");
-                vec![
+                (
+                    Some(next_state),
+                    smallvec![
                     ReceiverAction::Deliver {
                         source: key.source,
                         message_id,
@@ -207,9 +207,13 @@ impl ReceiverMachine {
                         source: key.source,
                         frame: AckFrame { header },
                     },
-                ]
+                ],
+                )
             }
-            InboundUpdate::Purged(reason) => vec![ReceiverAction::Purged { key, reason }],
+            InboundUpdate::Purged(reason) => (
+                None,
+                smallvec![ReceiverAction::Purged { key, reason }],
+            ),
         }
     }
 
@@ -243,12 +247,13 @@ impl ReceiverMachine {
         let keys: Vec<_> = self.transfers.keys().copied().collect();
         let mut actions = Vec::new();
         for key in keys {
-            let Some(state) = self.transfers.remove(&key) else {
+            let Entry::Occupied(mut entry) = self.transfers.entry(key) else {
                 continue;
             };
-            match state {
-                InboundState::Pending(mut transfer) => {
+            match entry.get_mut() {
+                InboundState::Pending(transfer) => {
                     if transfer.give_up_deadline <= now {
+                        entry.remove();
                         actions.push(ReceiverAction::Purged {
                             key,
                             reason: ReceiverPurgeReason::TimedOut,
@@ -275,17 +280,14 @@ impl ReceiverMachine {
                             transfer.repair_deadline = now + self.config.repair_interval;
                         }
                     }
-                    self.transfers.insert(key, InboundState::Pending(transfer));
                 }
                 InboundState::Delivered(tombstone) => {
                     if tombstone.expires_at <= now {
+                        entry.remove();
                         actions.push(ReceiverAction::Purged {
                             key,
                             reason: ReceiverPurgeReason::DeliveredTombstoneExpired,
                         });
-                    } else {
-                        self.transfers
-                            .insert(key, InboundState::Delivered(tombstone));
                     }
                 }
             }
@@ -388,7 +390,7 @@ impl InboundTransfer {
     }
 
     fn accept_payload(
-        mut self,
+        &mut self,
         frame: PayloadFrame,
         now: Instant,
         config: &ReceiverConfig,
@@ -425,7 +427,7 @@ impl InboundTransfer {
         self.repair_deadline = now + config.repair_interval;
 
         if self.parts.len() as u32 != self.part_count.get() {
-            return InboundUpdate::Pending(self);
+            return InboundUpdate::Pending;
         }
 
         let payload = self.assemble_payload();
@@ -467,7 +469,7 @@ impl InboundTransfer {
 
 #[derive(Debug)]
 enum InboundUpdate {
-    Pending(InboundTransfer),
+    Pending,
     Deliver {
         payload: IoPayload,
         message_id: MessageId,
@@ -475,6 +477,122 @@ enum InboundUpdate {
         checksum: Checksum,
     },
     Purged(ReceiverPurgeReason),
+}
+
+impl ReceiverMachine {
+    fn apply_pending_update(
+        config: &ReceiverConfig,
+        source: SocketAddr,
+        key: ReceiverTransferKey,
+        mut entry: std::collections::hash_map::OccupiedEntry<'_, ReceiverTransferKey, InboundState>,
+        update: InboundUpdate,
+        now: Instant,
+    ) -> ReceiverActions {
+        match update {
+            InboundUpdate::Pending => SmallVec::new(),
+            InboundUpdate::Deliver {
+                payload,
+                message_id,
+                part_count,
+                checksum,
+            } => {
+                entry.insert(InboundState::Delivered(DeliveredTombstone::new(
+                    part_count,
+                    checksum,
+                    now + config.delivered_tombstone_timeout,
+                )));
+                let header =
+                    UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
+                        .expect("Ack metadata gathered from a valid transfer must stay valid");
+                smallvec![
+                    ReceiverAction::Deliver {
+                        source,
+                        message_id,
+                        payload,
+                        part_count,
+                        checksum,
+                    },
+                    ReceiverAction::SendAck {
+                        source,
+                        frame: AckFrame { header },
+                    },
+                ]
+            }
+            InboundUpdate::Purged(reason) => {
+                entry.remove();
+                smallvec![ReceiverAction::Purged { key, reason }]
+            }
+        }
+    }
+
+    fn apply_new_transfer_update(
+        config: &ReceiverConfig,
+        source: SocketAddr,
+        key: ReceiverTransferKey,
+        entry: std::collections::hash_map::VacantEntry<'_, ReceiverTransferKey, InboundState>,
+        transfer: InboundTransfer,
+        update: InboundUpdate,
+        now: Instant,
+    ) -> ReceiverActions {
+        match update {
+            InboundUpdate::Pending => {
+                entry.insert(InboundState::Pending(transfer));
+                SmallVec::new()
+            }
+            InboundUpdate::Deliver {
+                payload,
+                message_id,
+                part_count,
+                checksum,
+            } => {
+                entry.insert(InboundState::Delivered(DeliveredTombstone::new(
+                    part_count,
+                    checksum,
+                    now + config.delivered_tombstone_timeout,
+                )));
+                let header =
+                    UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
+                        .expect("Ack metadata gathered from a valid transfer must stay valid");
+                smallvec![
+                    ReceiverAction::Deliver {
+                        source,
+                        message_id,
+                        payload,
+                        part_count,
+                        checksum,
+                    },
+                    ReceiverAction::SendAck {
+                        source,
+                        frame: AckFrame { header },
+                    },
+                ]
+            }
+            InboundUpdate::Purged(reason) => smallvec![ReceiverAction::Purged {
+                key,
+                reason,
+            }],
+        }
+    }
+
+    fn apply_delivered_tombstone_update(
+        config: &ReceiverConfig,
+        key: ReceiverTransferKey,
+        mut entry: std::collections::hash_map::OccupiedEntry<'_, ReceiverTransferKey, InboundState>,
+        tombstone: DeliveredTombstone,
+        frame: PayloadFrame,
+        now: Instant,
+    ) -> ReceiverActions {
+        let (next_state, actions) = Self::accept_delivered_payload(config, key, tombstone, frame, now);
+        match next_state {
+            Some(state) => {
+                entry.insert(state);
+            }
+            None => {
+                entry.remove();
+            }
+        }
+        actions
+    }
 }
 
 fn checksum_payload(payload: &IoPayload) -> Checksum {

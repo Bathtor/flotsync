@@ -1061,6 +1061,7 @@ dependencies = [
  "flotsync_utils",
  "kompact",
  "roaring",
+ "smallvec",
  "snafu",
 ]
 
