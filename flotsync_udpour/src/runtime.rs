@@ -1087,8 +1087,8 @@ async fn encode_frame_with_pool(
                     .context(IoSnafu)?;
                 frame
                     .header()
-                    .encode_into(&mut reserved)
-                    .expect("UDPourHeader::encode_into is infallible");
+                    .encode_into_buf(&mut reserved)
+                    .expect("UDPourHeader::encode_into_buf is infallible");
             }
             let adopt_result = writer.adopt_payload(payload.clone()).await;
             match adopt_result {
@@ -1107,16 +1107,18 @@ async fn encode_frame_with_pool(
                 .context(IoSnafu)?;
             frame
                 .header()
-                .encode_into(&mut reserved)
-                .expect("UDPourHeader::encode_into is infallible");
+                .encode_into_buf(&mut reserved)
+                .expect("UDPourHeader::encode_into_buf is infallible");
         }
         UDPourFrame::NeedParts(NeedPartsFrame { missing_parts, .. }) => {
             let mut reserved = writer.write_with_reserved(hint).await.context(IoSnafu)?;
             frame
                 .header()
-                .encode_into(&mut reserved)
-                .expect("UDPourHeader::encode_into is infallible");
-            missing_parts.encode_into(&mut reserved).context(BitmapSnafu)?;
+                .encode_into_buf(&mut reserved)
+                .expect("UDPourHeader::encode_into_buf is infallible");
+            missing_parts
+                .encode_into_buf(&mut reserved)
+                .context(BitmapSnafu)?;
         }
     }
     let payload = writer.finish().context(IoSnafu)?;

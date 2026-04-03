@@ -2,28 +2,22 @@ use crate::wire::{DecodeFromBuf, EncodeToBufMut};
 use bytes::{Buf, BufMut};
 use roaring::RoaringBitmap;
 use snafu::prelude::*;
-#[cfg(test)]
-use std::io::Cursor;
 
-/// Serializes one roaring bitmap into its compact on-the-wire byte form.
-#[cfg(test)]
-pub(crate) fn serialize_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>, RoaringBitmapError> {
-    let mut buffer = Vec::with_capacity(bitmap.serialized_size());
-    bitmap.encode_into(&mut buffer)?;
-    Ok(buffer)
-}
-
-/// Deserializes one roaring bitmap from its compact on-the-wire byte form.
-#[cfg(test)]
-pub(crate) fn deserialize_bitmap(bytes: &[u8]) -> Result<RoaringBitmap, RoaringBitmapError> {
-    let mut cursor = Cursor::new(bytes);
-    RoaringBitmap::deserialize_from(&mut cursor).context(DeserializeSnafu)
-}
+/// Smallest known encoded size of one non-empty roaring bitmap body.
+///
+/// `NeedParts` must always carry at least one missing-part number, so callers that
+/// want to fit one serialized bitmap into a frame budget need at least this many
+/// bytes available for the bitmap body itself.
+pub(crate) const MIN_ENCODED_NON_EMPTY_BITMAP_LEN: usize = 16;
 
 impl EncodeToBufMut for RoaringBitmap {
     type Error = RoaringBitmapError;
 
-    fn encode_into<B>(&self, out: &mut B) -> Result<(), Self::Error>
+    fn encoded_len(&self) -> usize {
+        self.serialized_size()
+    }
+
+    fn encode_into_buf<B>(&self, out: &mut B) -> Result<(), Self::Error>
     where
         B: BufMut,
     {
@@ -36,13 +30,51 @@ impl EncodeToBufMut for RoaringBitmap {
 impl DecodeFromBuf for RoaringBitmap {
     type Error = RoaringBitmapError;
 
-    fn decode_from<B>(buf: &mut B) -> Result<Self, Self::Error>
+    fn decode_from_buf<B>(buf: &mut B) -> Result<Self, Self::Error>
     where
         B: Buf,
     {
         let mut reader = buf.reader();
         RoaringBitmap::deserialize_from(&mut reader).context(DeserializeSnafu)
     }
+}
+
+/// Selects one largest-fitting chunk from `bitmap`, optionally restricted to values strictly
+/// greater than `after_exclusive`.
+///
+/// This helper performs one chunk selection only. Callers that want to iterate over the whole set
+/// should update their own cursor or watermark between calls.
+///
+/// Returns `Ok(None)` only when `bitmap` still has values overall but none remain strictly after
+/// `after_exclusive`. It does not mean that a chunk failed to fit within the serialized budget.
+pub(crate) fn select_bitmap_chunk(
+    bitmap: &RoaringBitmap,
+    after_exclusive: Option<u32>,
+    max_serialized_size: usize,
+) -> Result<Option<RoaringBitmap>, RoaringBitmapError> {
+    ensure!(
+        max_serialized_size >= MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
+        MaxSerializedSizeTooSmallSnafu {
+            max_serialized_size,
+            min_serialized_size: MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
+        }
+    );
+    if bitmap.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(suffix) = suffix_after(bitmap, after_exclusive) else {
+        return Ok(None);
+    };
+    let step = split_bitmap_to_serialized_bounds(suffix, max_serialized_size)?;
+    Ok(Some(step.chunk))
+}
+
+/// One incremental split result for a roaring bitmap.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SplittingResult {
+    pub(crate) chunk: RoaringBitmap,
+    pub(crate) rest: Option<RoaringBitmap>,
 }
 
 /// Splits one bitmap into one chunk that fits within `max_serialized_size` and the remaining tail.
@@ -73,7 +105,13 @@ pub(crate) fn split_bitmap_to_serialized_bounds(
     max_serialized_size: usize,
 ) -> Result<SplittingResult, RoaringBitmapError> {
     ensure!(!bitmap.is_empty(), EmptyBitmapSnafu);
-    ensure!(max_serialized_size > 0, ZeroMaxSerializedSizeSnafu);
+    ensure!(
+        max_serialized_size >= MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
+        MaxSerializedSizeTooSmallSnafu {
+            max_serialized_size,
+            min_serialized_size: MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
+        }
+    );
 
     if bitmap.serialized_size() <= max_serialized_size {
         return Ok(SplittingResult {
@@ -84,69 +122,40 @@ pub(crate) fn split_bitmap_to_serialized_bounds(
 
     let total_cardinality = bitmap.len();
     let total_serialized_size = bitmap.serialized_size() as u64;
-    let estimated = ((total_cardinality * max_serialized_size as u64) / total_serialized_size)
-        .max(1)
-        .min(total_cardinality);
-    let fit =
-        best_prefix_chunk_cardinality(&bitmap, total_cardinality, estimated, max_serialized_size)?;
+    // This is unlikely to overflow in u64 math. RoaringBitmaps cannot be that large.
+    let estimated_cutoff_in_rank_space =
+        (total_cardinality * max_serialized_size as u64) / total_serialized_size;
+    let fit = best_prefix_chunk_cardinality(
+        &bitmap,
+        total_cardinality,
+        estimated_cutoff_in_rank_space,
+        max_serialized_size,
+    )?;
     let chunk = prefix_chunk(&bitmap, fit)?;
-    let rest = if fit == total_cardinality {
-        None
-    } else {
-        Some(remove_prefix(bitmap, fit)?)
-    };
+    // This should never trigger, because we already checked above that we don't fully fit.
+    debug_assert!(fit < total_cardinality);
+    let rest = Some(remove_prefix(bitmap, fit)?);
 
     Ok(SplittingResult { chunk, rest })
 }
 
-/// Selects one largest-fitting chunk from `bitmap`, optionally restricted to values strictly
-/// greater than `after_exclusive`.
+/// Returns the largest prefix cardinality whose serialized bitmap still fits within
+/// `max_serialized_size`.
 ///
-/// This helper performs one chunk selection only. Callers that want to iterate over the whole set
-/// should update their own cursor or watermark between calls.
-///
-/// Returns `Ok(None)` only when `bitmap` still has values overall but none remain strictly after
-/// `after_exclusive`. It does not mean that a chunk failed to fit within the serialized budget.
-pub(crate) fn select_bitmap_chunk(
-    bitmap: &RoaringBitmap,
-    after_exclusive: Option<u32>,
-    max_serialized_size: usize,
-) -> Result<Option<RoaringBitmap>, RoaringBitmapError> {
-    ensure!(max_serialized_size > 0, ZeroMaxSerializedSizeSnafu);
-    if bitmap.is_empty() {
-        return Ok(None);
-    }
-
-    let Some(candidate) = suffix_after(bitmap, after_exclusive) else {
-        return Ok(None);
-    };
-    let step = split_bitmap_to_serialized_bounds(candidate, max_serialized_size)?;
-    Ok(Some(step.chunk))
-}
-
-/// One incremental split result for a roaring bitmap.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SplittingResult {
-    pub(crate) chunk: RoaringBitmap,
-    pub(crate) rest: Option<RoaringBitmap>,
-}
-
-/// Finds one large prefix chunk that still fits into `max_serialized_size`.
-///
-/// This uses the caller's rough estimate first, then shrinks and binary-searches from there.
+/// The search starts from the caller's rough estimate, shrinks until that prefix fits,
+/// and then binary-searches upward to recover the largest fitting prefix length.
 fn best_prefix_chunk_cardinality(
     bitmap: &RoaringBitmap,
     total_cardinality: u64,
-    estimated: u64,
+    initial_candidate: u64,
     max_serialized_size: usize,
 ) -> Result<u64, RoaringBitmapError> {
     let mut low_fit;
     let mut high_fit = total_cardinality;
-    let mut candidate = estimated.clamp(1, total_cardinality);
+    let mut candidate = initial_candidate.clamp(1, total_cardinality);
     let mut candidate_bitmap = prefix_chunk(bitmap, candidate)?;
-    let mut candidate_size = candidate_bitmap.serialized_size();
 
-    while candidate_size > max_serialized_size {
+    while candidate_bitmap.serialized_size() > max_serialized_size {
         high_fit = candidate.saturating_sub(1);
         ensure!(
             high_fit > 0,
@@ -156,7 +165,6 @@ fn best_prefix_chunk_cardinality(
         );
         candidate = (candidate / 2).max(1);
         candidate_bitmap = prefix_chunk(bitmap, candidate)?;
-        candidate_size = candidate_bitmap.serialized_size();
     }
     low_fit = candidate;
 
@@ -246,7 +254,11 @@ fn suffix_after(bitmap: &RoaringBitmap, after_exclusive: Option<u32>) -> Option<
             let upper_bound = value.checked_add(1)?;
             let mut suffix = bitmap.clone();
             suffix.remove_range(0..upper_bound);
-            if suffix.is_empty() { None } else { Some(suffix) }
+            if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix)
+            }
         }
     }
 }
@@ -264,8 +276,13 @@ fn select_rank(bitmap: &RoaringBitmap, rank: u64) -> Result<u32, RoaringBitmapEr
 pub enum RoaringBitmapError {
     #[snafu(display("roaring bitmap body must not be empty"))]
     EmptyBitmap,
-    #[snafu(display("max serialized size must be greater than zero"))]
-    ZeroMaxSerializedSize,
+    #[snafu(display(
+        "max serialized size {max_serialized_size} is too small; need at least {min_serialized_size} bytes for one non-empty roaring bitmap"
+    ))]
+    MaxSerializedSizeTooSmall {
+        max_serialized_size: usize,
+        min_serialized_size: usize,
+    },
     #[snafu(display("chunk count must be greater than zero"))]
     ZeroChunkCount,
     #[snafu(display(
@@ -322,8 +339,8 @@ mod tests {
         bitmap.insert(33);
         bitmap.insert(4096);
 
-        let encoded = serialize_bitmap(&bitmap).unwrap();
-        let decoded = deserialize_bitmap(&encoded).unwrap();
+        let encoded = bitmap.encode_to_bytes().unwrap();
+        let decoded = RoaringBitmap::decode_from_slice(encoded.as_ref()).unwrap();
         assert_eq!(decoded, bitmap);
     }
 }

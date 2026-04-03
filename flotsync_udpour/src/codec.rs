@@ -1,20 +1,30 @@
-#[cfg(test)]
-use crate::roaring_helpers::serialize_bitmap;
 use crate::{
-    roaring_helpers::{RoaringBitmapError, select_bitmap_chunk},
+    roaring_helpers::{
+        MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError, select_bitmap_chunk,
+    },
     types::*,
-    wire::DecodeFromBuf,
+    wire::{DecodeFromBuf, EncodeToBufMut},
 };
 #[cfg(test)]
-use bytes::{Bytes, BytesMut};
-#[cfg(test)]
-use crate::wire::EncodeToBufMut;
+use bytes::BytesMut;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
 use snafu::prelude::*;
 
 /// Fixed protocol header size in bytes.
 pub const FRAME_HEADER_LEN: usize = 20;
+
+/// Returns the exact encoded frame length in bytes.
+pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
+    match frame {
+        UDPourFrame::Payload(frame) => frame.header.encoded_len() + frame.payload.len(),
+        UDPourFrame::Ack(frame) => frame.header.encoded_len(),
+        UDPourFrame::NoLongerAvailable(frame) => frame.header.encoded_len(),
+        UDPourFrame::NeedParts(frame) => {
+            frame.header.encoded_len() + frame.missing_parts.encoded_len()
+        }
+    }
+}
 
 /// Decodes one frame from an `IoPayload`.
 pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError> {
@@ -23,7 +33,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
         FrameTooShortSnafu { len: payload.len() }
     );
     let mut cursor = payload.cursor();
-    let header = UDPourHeader::decode_from(&mut cursor).context(TypeSnafu)?;
+    let header = UDPourHeader::decode_from_buf(&mut cursor).context(TypeSnafu)?;
     let body_len = payload.len() - FRAME_HEADER_LEN;
     match header.frame_type {
         FrameType::Payload => {
@@ -71,7 +81,8 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
                     len: body_len,
                 })?;
             let mut body_cursor = body.cursor();
-            let missing_parts = RoaringBitmap::decode_from(&mut body_cursor).context(BitmapSnafu)?;
+            let missing_parts =
+                RoaringBitmap::decode_from_buf(&mut body_cursor).context(BitmapSnafu)?;
             ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
             Ok(UDPourFrame::NeedParts(NeedPartsFrame {
                 header,
@@ -95,7 +106,7 @@ pub(crate) fn fit_one_need_parts_frame(
     max_frame_len: usize,
 ) -> Result<Option<NeedPartsFrame>, CodecError> {
     ensure!(
-        max_frame_len > FRAME_HEADER_LEN + 16, // This happens to be the minimal size of a serialized roaring bitmap, last I checked.
+        max_frame_len >= FRAME_HEADER_LEN + MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
         MaxFrameLenTooSmallSnafu { max_frame_len }
     );
     ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
@@ -114,14 +125,37 @@ pub(crate) fn fit_one_need_parts_frame(
     }))
 }
 
-/// Returns the exact encoded frame length in bytes.
-pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
-    match frame {
-        UDPourFrame::Payload(frame) => FRAME_HEADER_LEN + frame.payload.len(),
-        UDPourFrame::Ack(_) | UDPourFrame::NoLongerAvailable(_) => FRAME_HEADER_LEN,
-        UDPourFrame::NeedParts(frame) => FRAME_HEADER_LEN + frame.missing_parts.serialized_size(),
-    }
+/// Codec-level errors.
+#[derive(Debug, Snafu)]
+pub(crate) enum CodecError {
+    #[snafu(display("Frame length {len} is shorter than the {FRAME_HEADER_LEN}-byte header"))]
+    FrameTooShort { len: usize },
+    #[snafu(display("Frame {:?} must not carry a body", frame_type))]
+    UnexpectedBody { frame_type: FrameType },
+    #[snafu(display("NeedParts must encode at least one missing part"))]
+    EmptyNeedParts,
+    #[snafu(display(
+        "max frame length {max_frame_len} is too small; need at least {} bytes for the fixed header plus one non-empty roaring bitmap body",
+        FRAME_HEADER_LEN + MIN_ENCODED_NON_EMPTY_BITMAP_LEN
+    ))]
+    MaxFrameLenTooSmall { max_frame_len: usize },
+    #[snafu(display("Invalid roaring bitmap payload"))]
+    Bitmap { source: RoaringBitmapError },
+    #[snafu(display("Invalid datagram frame"))]
+    Type { source: UDPourTypeError },
+    #[snafu(display(
+        "Invalid IoPayload slice range offset={offset}, len={len}, payload_len={payload_len}"
+    ))]
+    InvalidPayloadSlice {
+        payload_len: usize,
+        offset: usize,
+        len: usize,
+    },
 }
+
+/*
+ * Test Helpers
+ */
 
 /// Encodes one frame into an `IoPayload` for tests.
 ///
@@ -139,10 +173,10 @@ pub(crate) fn encode_frame(frame: &UDPourFrame) -> Result<IoPayload, CodecError>
         }
         UDPourFrame::Ack(_) | UDPourFrame::NoLongerAvailable(_) => Ok(header_payload),
         UDPourFrame::NeedParts(frame) => {
-            let body = serialize_bitmap(&frame.missing_parts).context(BitmapSnafu)?;
+            let body = frame.missing_parts.encode_to_bytes().context(BitmapSnafu)?;
             Ok(IoPayload::chain([
                 header_payload,
-                IoPayload::from(Bytes::from(body)),
+                IoPayload::from(body.freeze()),
             ]))
         }
     }
@@ -150,36 +184,9 @@ pub(crate) fn encode_frame(frame: &UDPourFrame) -> Result<IoPayload, CodecError>
 
 #[cfg(test)]
 fn encode_header(header: UDPourHeader) -> BytesMut {
-    let mut bytes = BytesMut::with_capacity(FRAME_HEADER_LEN);
     header
-        .encode_into(&mut bytes)
-        .expect("UDPourHeader::encode_into is infallible");
-    bytes
-}
-
-/// Codec-level errors.
-#[derive(Debug, Snafu)]
-pub(crate) enum CodecError {
-    #[snafu(display("Frame length {len} is shorter than the {FRAME_HEADER_LEN}-byte header"))]
-    FrameTooShort { len: usize },
-    #[snafu(display("Frame {:?} must not carry a body", frame_type))]
-    UnexpectedBody { frame_type: FrameType },
-    #[snafu(display("NeedParts must encode at least one missing part"))]
-    EmptyNeedParts,
-    #[snafu(display("max frame length {max_frame_len} must be larger than the fixed header"))]
-    MaxFrameLenTooSmall { max_frame_len: usize },
-    #[snafu(display("Invalid roaring bitmap payload"))]
-    Bitmap { source: RoaringBitmapError },
-    #[snafu(display("Invalid datagram frame"))]
-    Type { source: UDPourTypeError },
-    #[snafu(display(
-        "Invalid IoPayload slice range offset={offset}, len={len}, payload_len={payload_len}"
-    ))]
-    InvalidPayloadSlice {
-        payload_len: usize,
-        offset: usize,
-        len: usize,
-    },
+        .encode_to_bytes()
+        .expect("UDPourHeader::encode_into_buf is infallible")
 }
 
 #[cfg(test)]

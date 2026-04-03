@@ -271,7 +271,11 @@ impl UDPourHeader {
 impl EncodeToBufMut for UDPourHeader {
     type Error = std::convert::Infallible;
 
-    fn encode_into<B>(&self, out: &mut B) -> Result<(), Self::Error>
+    fn encoded_len(&self) -> usize {
+        20
+    }
+
+    fn encode_into_buf<B>(&self, out: &mut B) -> Result<(), Self::Error>
     where
         B: BufMut,
     {
@@ -294,7 +298,7 @@ impl EncodeToBufMut for UDPourHeader {
 impl DecodeFromBuf for UDPourHeader {
     type Error = UDPourTypeError;
 
-    fn decode_from<B>(buf: &mut B) -> Result<Self, Self::Error>
+    fn decode_from_buf<B>(buf: &mut B) -> Result<Self, Self::Error>
     where
         B: Buf,
     {
