@@ -125,16 +125,25 @@ pub(crate) fn split_bitmap_to_serialized_bounds(
     // This is unlikely to overflow in u64 math. RoaringBitmaps cannot be that large.
     let estimated_cutoff_in_rank_space =
         (total_cardinality * max_serialized_size as u64) / total_serialized_size;
-    let fit = best_prefix_chunk_cardinality(
+    let fitting_prefix_len = best_prefix_chunk_cardinality(
         &bitmap,
         total_cardinality,
         estimated_cutoff_in_rank_space,
         max_serialized_size,
     )?;
-    let chunk = prefix_chunk(&bitmap, fit)?;
     // This should never trigger, because we already checked above that we don't fully fit.
-    debug_assert!(fit < total_cardinality);
-    let rest = Some(remove_prefix(bitmap, fit)?);
+    debug_assert!(fitting_prefix_len < total_cardinality);
+    let chunk = prefix_chunk(&bitmap, fitting_prefix_len)?;
+    let rest = {
+        let mut rest = bitmap;
+        rest.remove_smallest(fitting_prefix_len);
+        debug_assert_eq!(
+            rest.len(),
+            total_cardinality - fitting_prefix_len,
+            "rest bitmap should keep exactly the suffix cardinality"
+        );
+        Some(rest)
+    };
 
     Ok(SplittingResult { chunk, rest })
 }
@@ -200,50 +209,10 @@ fn prefix_chunk(
         return Ok(bitmap.clone());
     }
 
-    let end_value = select_rank(bitmap, prefix_len - 1)?;
-    let upper_bound = end_value
-        .checked_add(1)
-        .context(PrefixUpperBoundOverflowSnafu)?;
+    let suffix_len = total_cardinality - prefix_len;
     let mut chunk = bitmap.clone();
-    let removed = chunk.remove_range(upper_bound..);
-    debug_assert_eq!(
-        removed,
-        total_cardinality - prefix_len,
-        "prefix chunk should remove exactly the suffix cardinality"
-    );
+    chunk.remove_biggest(suffix_len);
     Ok(chunk)
-}
-
-/// Removes the first `prefix_len` values from `bitmap` and returns the remainder.
-fn remove_prefix(
-    mut bitmap: RoaringBitmap,
-    prefix_len: u64,
-) -> Result<RoaringBitmap, RoaringBitmapError> {
-    ensure!(prefix_len > 0, ZeroChunkCountSnafu);
-    let total_cardinality = bitmap.len();
-    ensure!(
-        prefix_len <= total_cardinality,
-        PrefixLongerThanBitmapSnafu {
-            prefix_len,
-            cardinality: total_cardinality,
-        }
-    );
-
-    if prefix_len == total_cardinality {
-        return Ok(RoaringBitmap::new());
-    }
-
-    let first_value = bitmap.min().context(EmptyBitmapSnafu)?;
-    let end_value = select_rank(&bitmap, prefix_len - 1)?;
-    let upper_bound = end_value
-        .checked_add(1)
-        .context(PrefixUpperBoundOverflowSnafu)?;
-    let removed = bitmap.remove_range(first_value..upper_bound);
-    debug_assert_eq!(
-        removed, prefix_len,
-        "rest bitmap should remove exactly the selected prefix cardinality"
-    );
-    Ok(bitmap)
 }
 
 /// Returns all bitmap values strictly greater than `after_exclusive`.
@@ -251,9 +220,8 @@ fn suffix_after(bitmap: &RoaringBitmap, after_exclusive: Option<u32>) -> Option<
     match after_exclusive {
         None => Some(bitmap.clone()),
         Some(value) => {
-            let upper_bound = value.checked_add(1)?;
             let mut suffix = bitmap.clone();
-            suffix.remove_range(0..upper_bound);
+            suffix.remove_range(..=value);
             if suffix.is_empty() {
                 None
             } else {
@@ -261,14 +229,6 @@ fn suffix_after(bitmap: &RoaringBitmap, after_exclusive: Option<u32>) -> Option<
             }
         }
     }
-}
-
-/// Converts one logical rank into the `u32` API used by `roaring::select`.
-fn select_rank(bitmap: &RoaringBitmap, rank: u64) -> Result<u32, RoaringBitmapError> {
-    let rank = u32::try_from(rank).context(RankTooLargeSnafu { rank })?;
-    bitmap
-        .select(rank)
-        .context(SelectOutOfRangeSnafu { rank: rank as u64 })
 }
 
 /// Roaring-bitmap helper errors.
@@ -289,17 +249,8 @@ pub enum RoaringBitmapError {
         "requested prefix length {prefix_len} exceeds bitmap cardinality {cardinality}"
     ))]
     PrefixLongerThanBitmap { prefix_len: u64, cardinality: u64 },
-    #[snafu(display("rank {rank} does not fit into the u32 API used by roaring::select"))]
-    RankTooLarge {
-        rank: u64,
-        source: std::num::TryFromIntError,
-    },
-    #[snafu(display("rank {rank} is outside the bitmap cardinality"))]
-    SelectOutOfRange { rank: u64 },
     #[snafu(display("bitmap chunk cannot fit into max serialized size {max_serialized_size}"))]
     ChunkTooSmall { max_serialized_size: usize },
-    #[snafu(display("cannot split a prefix that ends at u32::MAX but is not the whole bitmap"))]
-    PrefixUpperBoundOverflow,
     #[snafu(display("failed to serialize roaring bitmap"))]
     Serialize { source: std::io::Error },
     #[snafu(display("failed to deserialize roaring bitmap"))]

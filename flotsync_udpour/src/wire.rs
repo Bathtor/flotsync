@@ -1,6 +1,6 @@
-use bytes::{Buf, BufMut};
 #[cfg(test)]
 use bytes::BytesMut;
+use bytes::{Buf, BufMut};
 
 /// Encodes one wire-level value directly into any synchronous `BufMut`.
 ///

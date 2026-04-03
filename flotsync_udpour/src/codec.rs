@@ -1,7 +1,5 @@
 use crate::{
-    roaring_helpers::{
-        MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError, select_bitmap_chunk,
-    },
+    roaring_helpers::{MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError, select_bitmap_chunk},
     types::*,
     wire::{DecodeFromBuf, EncodeToBufMut},
 };

@@ -171,12 +171,8 @@ impl ReceiverMachine {
             return (Some(InboundState::Delivered(tombstone)), SmallVec::new());
         }
 
-        let mut transfer = InboundTransfer::new(
-            frame.header.part_count,
-            frame.header.checksum,
-            now,
-            config,
-        );
+        let mut transfer =
+            InboundTransfer::new(frame.header.part_count, frame.header.checksum, now, config);
         match transfer.accept_payload(frame, now, config) {
             InboundUpdate::Pending => (Some(InboundState::Pending(transfer)), SmallVec::new()),
             InboundUpdate::Deliver {
@@ -196,24 +192,23 @@ impl ReceiverMachine {
                 (
                     Some(next_state),
                     smallvec![
-                    ReceiverAction::Deliver {
-                        source: key.source,
-                        message_id,
-                        payload,
-                        part_count,
-                        checksum,
-                    },
-                    ReceiverAction::SendAck {
-                        source: key.source,
-                        frame: AckFrame { header },
-                    },
-                ],
+                        ReceiverAction::Deliver {
+                            source: key.source,
+                            message_id,
+                            payload,
+                            part_count,
+                            checksum,
+                        },
+                        ReceiverAction::SendAck {
+                            source: key.source,
+                            frame: AckFrame { header },
+                        },
+                    ],
                 )
             }
-            InboundUpdate::Purged(reason) => (
-                None,
-                smallvec![ReceiverAction::Purged { key, reason }],
-            ),
+            InboundUpdate::Purged(reason) => {
+                (None, smallvec![ReceiverAction::Purged { key, reason }])
+            }
         }
     }
 
@@ -264,8 +259,7 @@ impl ReceiverMachine {
                         let frame = transfer.next_need_parts_frame(
                             key.message_id,
                             self.config.max_need_parts_frame_len,
-                        )
-                        ?;
+                        )?;
                         if let Some(frame) = frame {
                             actions.push(ReceiverAction::SendNeedParts {
                                 source: key.source,
@@ -597,10 +591,7 @@ impl ReceiverMachine {
                     },
                 ]
             }
-            InboundUpdate::Purged(reason) => smallvec![ReceiverAction::Purged {
-                key,
-                reason,
-            }],
+            InboundUpdate::Purged(reason) => smallvec![ReceiverAction::Purged { key, reason }],
         }
     }
 
@@ -612,7 +603,8 @@ impl ReceiverMachine {
         frame: PayloadFrame,
         now: Instant,
     ) -> ReceiverActions {
-        let (next_state, actions) = Self::accept_delivered_payload(config, key, tombstone, frame, now);
+        let (next_state, actions) =
+            Self::accept_delivered_payload(config, key, tombstone, frame, now);
         match next_state {
             Some(state) => {
                 entry.insert(state);
@@ -831,7 +823,9 @@ mod tests {
             let requested = actions
                 .iter()
                 .find_map(|action| match action {
-                    ReceiverAction::SendNeedParts { frame, .. } => Some(frame.missing_parts.clone()),
+                    ReceiverAction::SendNeedParts { frame, .. } => {
+                        Some(frame.missing_parts.clone())
+                    }
                     _ => None,
                 })
                 .expect("repair poll should emit one NeedParts frame");
@@ -847,7 +841,10 @@ mod tests {
             seen_chunks.push(requested);
         }
 
-        assert!(saw_wrap, "repair polling should eventually wrap back to the first chunk");
+        assert!(
+            saw_wrap,
+            "repair polling should eventually wrap back to the first chunk"
+        );
     }
 
     fn pending_transfer_with_missing_parts(
