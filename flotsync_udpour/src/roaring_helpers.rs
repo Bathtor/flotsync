@@ -88,6 +88,31 @@ pub(crate) fn split_bitmap_to_serialized_bounds(
     Ok(SplittingResult { chunk, rest })
 }
 
+/// Selects one largest-fitting chunk from `bitmap`, optionally restricted to values strictly
+/// greater than `after_exclusive`.
+///
+/// This helper performs one chunk selection only. Callers that want to iterate over the whole set
+/// should update their own cursor or watermark between calls.
+///
+/// Returns `Ok(None)` only when `bitmap` still has values overall but none remain strictly after
+/// `after_exclusive`. It does not mean that a chunk failed to fit within the serialized budget.
+pub(crate) fn select_bitmap_chunk(
+    bitmap: &RoaringBitmap,
+    after_exclusive: Option<u32>,
+    max_serialized_size: usize,
+) -> Result<Option<RoaringBitmap>, RoaringBitmapError> {
+    ensure!(max_serialized_size > 0, ZeroMaxSerializedSizeSnafu);
+    if bitmap.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(candidate) = suffix_after(bitmap, after_exclusive) else {
+        return Ok(None);
+    };
+    let step = split_bitmap_to_serialized_bounds(candidate, max_serialized_size)?;
+    Ok(Some(step.chunk))
+}
+
 /// One incremental split result for a roaring bitmap.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SplittingResult {
@@ -200,6 +225,19 @@ fn remove_prefix(
         "rest bitmap should remove exactly the selected prefix cardinality"
     );
     Ok(bitmap)
+}
+
+/// Returns all bitmap values strictly greater than `after_exclusive`.
+fn suffix_after(bitmap: &RoaringBitmap, after_exclusive: Option<u32>) -> Option<RoaringBitmap> {
+    match after_exclusive {
+        None => Some(bitmap.clone()),
+        Some(value) => {
+            let upper_bound = value.checked_add(1)?;
+            let mut suffix = bitmap.clone();
+            suffix.remove_range(0..upper_bound);
+            if suffix.is_empty() { None } else { Some(suffix) }
+        }
+    }
 }
 
 /// Converts one logical rank into the `u32` API used by `roaring::select`.

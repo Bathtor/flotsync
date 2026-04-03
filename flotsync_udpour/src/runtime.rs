@@ -795,10 +795,8 @@ impl UDPourComponent {
             ReceiverAction::SendAck { source, frame } => {
                 self.dispatch_control_frame(source, UDPourFrame::Ack(frame));
             }
-            ReceiverAction::SendNeedParts { source, frames } => {
-                for frame in frames {
-                    self.dispatch_control_frame(source, UDPourFrame::NeedParts(frame));
-                }
+            ReceiverAction::SendNeedParts { source, frame } => {
+                self.dispatch_control_frame(source, UDPourFrame::NeedParts(frame));
             }
             ReceiverAction::Purged { key, reason } => {
                 debug!(

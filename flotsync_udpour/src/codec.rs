@@ -4,8 +4,8 @@ use crate::{
     roaring_helpers::{
         RoaringBitmapError,
         deserialize_bitmap_from,
+        select_bitmap_chunk,
         serialize_bitmap_into,
-        split_bitmap_to_serialized_bounds,
     },
     types::*,
 };
@@ -88,15 +88,15 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
     }
 }
 
-/// Splits one missing-part set into as many `NeedParts` frames as needed to fit
-/// within `max_frame_len`.
-pub(crate) fn split_need_parts_frames(
+/// Fits one missing-part chunk into one `NeedParts` frame within `max_frame_len`.
+pub(crate) fn fit_one_need_parts_frame(
     message_id: MessageId,
     part_count: PartCount,
     checksum: Checksum,
     missing_parts: &RoaringBitmap,
+    after_exclusive: Option<u32>,
     max_frame_len: usize,
-) -> Result<Vec<NeedPartsFrame>, CodecError> {
+) -> Result<Option<NeedPartsFrame>, CodecError> {
     ensure!(
         max_frame_len > FRAME_HEADER_LEN,
         MaxFrameLenTooSmallSnafu { max_frame_len }
@@ -106,17 +106,15 @@ pub(crate) fn split_need_parts_frames(
     let max_body_len = max_frame_len - FRAME_HEADER_LEN;
     let header = UDPourHeader::control(FrameType::NeedParts, message_id, part_count, checksum)
         .context(TypeSnafu)?;
-    let mut remaining = Some(missing_parts.clone());
-    let mut frames = Vec::new();
-    while let Some(bitmap) = remaining.take() {
-        let step = split_bitmap_to_serialized_bounds(bitmap, max_body_len).context(BitmapSnafu)?;
-        frames.push(NeedPartsFrame {
-            header,
-            missing_parts: step.chunk,
-        });
-        remaining = step.rest;
-    }
-    Ok(frames)
+    let Some(chunk) =
+        select_bitmap_chunk(missing_parts, after_exclusive, max_body_len).context(BitmapSnafu)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(NeedPartsFrame {
+        header,
+        missing_parts: chunk,
+    }))
 }
 
 /// Returns the exact encoded frame length in bytes.
@@ -306,26 +304,25 @@ mod tests {
     }
 
     #[test]
-    fn need_parts_fragmentation_respects_frame_budget() {
+    fn need_parts_chunk_respects_frame_budget() {
         let mut missing_parts = RoaringBitmap::new();
         for part_number in 0..4096u32 {
             missing_parts.insert(part_number * 3);
         }
 
-        let frames = split_need_parts_frames(
+        let frame = fit_one_need_parts_frame(
             MessageId(42),
             PartCount::new(u32::MAX).unwrap(),
             Checksum(101),
             &missing_parts,
+            None,
             96,
         )
+        .unwrap()
         .unwrap();
 
-        assert!(frames.len() > 1);
-        for frame in frames {
-            let encoded = encode_frame(&UDPourFrame::NeedParts(frame)).unwrap();
-            assert!(encoded.len() <= 96);
-        }
+        let encoded = encode_frame(&UDPourFrame::NeedParts(frame)).unwrap();
+        assert!(encoded.len() <= 96);
     }
 
     #[test]

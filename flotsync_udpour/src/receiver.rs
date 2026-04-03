@@ -4,7 +4,7 @@
 //! whole-message checksum validation, and purge behavior.
 
 use crate::{
-    codec::split_need_parts_frames,
+    codec::fit_one_need_parts_frame,
     types::{
         AckFrame,
         Checksum,
@@ -261,21 +261,15 @@ impl ReceiverMachine {
                         continue;
                     }
                     if transfer.repair_deadline <= now {
-                        // TODO(flotsync-1n9): Keep repair state incremental so we do not rebuild the full
-                        // missing-part set and re-split roaring bitmaps from scratch on every poll.
-                        let missing_parts = transfer.missing_parts();
-                        let frames = split_need_parts_frames(
+                        let frame = transfer.next_need_parts_frame(
                             key.message_id,
-                            transfer.part_count,
-                            transfer.checksum,
-                            &missing_parts,
                             self.config.max_need_parts_frame_len,
                         )
-                        .context(SplitNeedPartsSnafu)?;
-                        if !frames.is_empty() {
+                        ?;
+                        if let Some(frame) = frame {
                             actions.push(ReceiverAction::SendNeedParts {
                                 source: key.source,
-                                frames,
+                                frame,
                             });
                             transfer.repair_deadline = now + self.config.repair_interval;
                         }
@@ -312,7 +306,7 @@ pub(crate) enum ReceiverAction {
     /// Ask the sender to repeat one or more missing parts.
     SendNeedParts {
         source: SocketAddr,
-        frames: Vec<NeedPartsFrame>,
+        frame: NeedPartsFrame,
     },
     /// Report that the receiver-side state for one inbound transfer was purged.
     Purged {
@@ -344,6 +338,12 @@ struct InboundTransfer {
     part_count: PartCount,
     checksum: Checksum,
     parts: BTreeMap<u32, IoPayload>,
+    missing_parts: RoaringBitmap,
+    /// Largest missing part number included in the last emitted repair request.
+    ///
+    /// The next repair poll first prefers missing parts strictly greater than this watermark and
+    /// only wraps back to the beginning once every later missing part has been requested once.
+    repair_watermark: Option<u32>,
     regular_part_size: Option<usize>,
     give_up_deadline: Instant,
     repair_deadline: Instant,
@@ -383,6 +383,8 @@ impl InboundTransfer {
             part_count,
             checksum,
             parts: BTreeMap::new(),
+            missing_parts: RoaringBitmap::from_iter(0..part_count.get()),
+            repair_watermark: None,
             regular_part_size: None,
             give_up_deadline: now + config.give_up_timeout,
             repair_deadline: now + config.repair_interval,
@@ -420,13 +422,14 @@ impl InboundTransfer {
                 return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
             }
         } else {
+            self.missing_parts.remove(frame.header.part_number.0);
             self.parts.insert(frame.header.part_number.0, frame.payload);
         }
 
         self.give_up_deadline = now + config.give_up_timeout;
         self.repair_deadline = now + config.repair_interval;
 
-        if self.parts.len() as u32 != self.part_count.get() {
+        if !self.missing_parts.is_empty() {
             return InboundUpdate::Pending;
         }
 
@@ -444,14 +447,41 @@ impl InboundTransfer {
         }
     }
 
-    fn missing_parts(&self) -> RoaringBitmap {
-        let mut missing = RoaringBitmap::new();
-        for part_number in 0..self.part_count.get() {
-            if !self.parts.contains_key(&part_number) {
-                missing.insert(part_number);
-            }
+    fn next_need_parts_frame(
+        &mut self,
+        message_id: MessageId,
+        max_need_parts_frame_len: usize,
+    ) -> Result<Option<NeedPartsFrame>, ReceiverError> {
+        if self.missing_parts.is_empty() {
+            return Ok(None);
         }
-        missing
+
+        // Repair polling walks forward through the missing-part space. We only wrap back to
+        // earlier missing parts once every later missing part has been requested at least once.
+        let frame = fit_one_need_parts_frame(
+            message_id,
+            self.part_count,
+            self.checksum,
+            &self.missing_parts,
+            self.repair_watermark,
+            max_need_parts_frame_len,
+        )
+        .context(SplitNeedPartsSnafu)?;
+        let frame = match frame {
+            Some(frame) => frame,
+            None => fit_one_need_parts_frame(
+                message_id,
+                self.part_count,
+                self.checksum,
+                &self.missing_parts,
+                None,
+                max_need_parts_frame_len,
+            )
+            .context(SplitNeedPartsSnafu)?
+            .expect("non-empty missing_parts must yield one fitted frame after wrap"),
+        };
+        self.repair_watermark = frame.missing_parts.max();
+        Ok(Some(frame))
     }
 
     fn assemble_payload(&self) -> IoPayload {
@@ -754,6 +784,88 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn need_parts_repairs_progress_across_missing_parts_before_wrapping() {
+        let mut receiver = ReceiverMachine::new(ReceiverConfig {
+            repair_interval: Duration::from_millis(10),
+            give_up_timeout: Duration::from_millis(100),
+            max_need_parts_frame_len: 40,
+            delivered_tombstone_timeout: Duration::from_millis(100),
+        });
+        let now = Instant::now();
+        let message_id = MessageId(44);
+        let checksum = Checksum(1234);
+        let part_count = PartCount::new(1003).unwrap();
+        let key = ReceiverTransferKey {
+            source: source(),
+            message_id,
+        };
+        receiver.transfers.insert(
+            key,
+            InboundState::Pending(pending_transfer_with_missing_parts(
+                part_count,
+                checksum,
+                RoaringBitmap::from([1, 2, 3, 1000, 1001, 1002]),
+                now,
+            )),
+        );
+
+        let first_actions = receiver
+            .poll_timeouts(now + Duration::from_millis(11))
+            .unwrap();
+        let first_requested = first_actions
+            .iter()
+            .find_map(|action| match action {
+                ReceiverAction::SendNeedParts { frame, .. } => Some(frame.missing_parts.clone()),
+                _ => None,
+            })
+            .expect("first repair poll should emit one NeedParts frame");
+        let mut saw_wrap = false;
+        let mut seen_chunks = vec![first_requested.clone()];
+        for step in 0..4u64 {
+            let actions = receiver
+                .poll_timeouts(now + Duration::from_millis(22 + (step * 11)))
+                .unwrap();
+            let requested = actions
+                .iter()
+                .find_map(|action| match action {
+                    ReceiverAction::SendNeedParts { frame, .. } => Some(frame.missing_parts.clone()),
+                    _ => None,
+                })
+                .expect("repair poll should emit one NeedParts frame");
+
+            if requested == first_requested {
+                saw_wrap = true;
+                break;
+            }
+            assert!(
+                seen_chunks.iter().all(|prior| prior != &requested),
+                "repair chunks should not repeat before the watermark wraps"
+            );
+            seen_chunks.push(requested);
+        }
+
+        assert!(saw_wrap, "repair polling should eventually wrap back to the first chunk");
+    }
+
+    fn pending_transfer_with_missing_parts(
+        part_count: PartCount,
+        checksum: Checksum,
+        missing_parts: RoaringBitmap,
+        now: Instant,
+    ) -> InboundTransfer {
+        InboundTransfer {
+            part_count,
+            checksum,
+            parts: BTreeMap::new(),
+            missing_parts,
+            repair_watermark: None,
+            regular_part_size: None,
+            give_up_deadline: now + Duration::from_millis(100),
+            repair_deadline: now + Duration::from_millis(10),
+        }
     }
 
     #[test]
