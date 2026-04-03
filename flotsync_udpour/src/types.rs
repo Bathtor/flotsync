@@ -1,4 +1,5 @@
-use bytes::Buf;
+use crate::wire::{DecodeFromBuf, EncodeToBufMut};
+use bytes::{Buf, BufMut};
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
 use snafu::prelude::*;
@@ -264,6 +265,50 @@ impl UDPourHeader {
     /// Returns whether this header marks a sender-side payload retransmission.
     pub fn is_retransmit(self) -> bool {
         self.frame_type == FrameType::Payload && self.flags.is_retransmit()
+    }
+}
+
+impl EncodeToBufMut for UDPourHeader {
+    type Error = std::convert::Infallible;
+
+    fn encode_into<B>(&self, out: &mut B) -> Result<(), Self::Error>
+    where
+        B: BufMut,
+    {
+        debug_assert!(
+            self.validate().is_ok(),
+            "UDPourHeader::encode_into expects a validated header"
+        );
+        out.put_u8(self.frame_type.into());
+        out.put_u8(self.version);
+        out.put_u8(self.flags.bits());
+        out.put_u8(self.reserved);
+        out.put_u32(self.message_id.0);
+        out.put_u32(self.part_number.0);
+        out.put_u32(self.part_count.into());
+        out.put_u32(self.checksum.0);
+        Ok(())
+    }
+}
+
+impl DecodeFromBuf for UDPourHeader {
+    type Error = UDPourTypeError;
+
+    fn decode_from<B>(buf: &mut B) -> Result<Self, Self::Error>
+    where
+        B: Buf,
+    {
+        Self {
+            frame_type: FrameType::try_from(buf.get_u8())?,
+            version: buf.get_u8(),
+            flags: FrameFlags::from_bits(buf.get_u8()),
+            reserved: buf.get_u8(),
+            message_id: MessageId(buf.get_u32()),
+            part_number: PartNumber(buf.get_u32()),
+            part_count: PartCount::new(buf.get_u32())?,
+            checksum: Checksum(buf.get_u32()),
+        }
+        .validate()
     }
 }
 

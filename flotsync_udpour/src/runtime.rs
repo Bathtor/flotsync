@@ -6,13 +6,7 @@
 //! component boundary.
 
 use crate::{
-    codec::{
-        FRAME_HEADER_LEN,
-        decode_frame,
-        encode_header_into,
-        encode_need_parts_body_into,
-        encoded_frame_len,
-    },
+    codec::{FRAME_HEADER_LEN, decode_frame, encoded_frame_len},
     receiver::{ReceiverAction, ReceiverConfig, ReceiverMachine},
     roaring_helpers::RoaringBitmapError,
     sender::{SenderAction, SenderConfig, SenderError, SenderMachine},
@@ -26,6 +20,7 @@ use crate::{
         PayloadFrame,
         UDPourFrame,
     },
+    wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::{
     EgressPool,
@@ -1090,7 +1085,10 @@ async fn encode_frame_with_pool(
                     .write_with_reserved(FRAME_HEADER_LEN)
                     .await
                     .context(IoSnafu)?;
-                encode_header_into(frame.header(), &mut reserved);
+                frame
+                    .header()
+                    .encode_into(&mut reserved)
+                    .expect("UDPourHeader::encode_into is infallible");
             }
             let adopt_result = writer.adopt_payload(payload.clone()).await;
             match adopt_result {
@@ -1107,12 +1105,18 @@ async fn encode_frame_with_pool(
                 .write_with_reserved(FRAME_HEADER_LEN)
                 .await
                 .context(IoSnafu)?;
-            encode_header_into(frame.header(), &mut reserved);
+            frame
+                .header()
+                .encode_into(&mut reserved)
+                .expect("UDPourHeader::encode_into is infallible");
         }
         UDPourFrame::NeedParts(NeedPartsFrame { missing_parts, .. }) => {
             let mut reserved = writer.write_with_reserved(hint).await.context(IoSnafu)?;
-            encode_header_into(frame.header(), &mut reserved);
-            encode_need_parts_body_into(missing_parts, &mut reserved).context(BitmapSnafu)?;
+            frame
+                .header()
+                .encode_into(&mut reserved)
+                .expect("UDPourHeader::encode_into is infallible");
+            missing_parts.encode_into(&mut reserved).context(BitmapSnafu)?;
         }
     }
     let payload = writer.finish().context(IoSnafu)?;

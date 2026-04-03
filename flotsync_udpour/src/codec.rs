@@ -1,17 +1,14 @@
 #[cfg(test)]
 use crate::roaring_helpers::serialize_bitmap;
 use crate::{
-    roaring_helpers::{
-        RoaringBitmapError,
-        deserialize_bitmap_from,
-        select_bitmap_chunk,
-        serialize_bitmap_into,
-    },
+    roaring_helpers::{RoaringBitmapError, select_bitmap_chunk},
     types::*,
+    wire::DecodeFromBuf,
 };
-use bytes::{Buf, BufMut};
 #[cfg(test)]
 use bytes::{Bytes, BytesMut};
+#[cfg(test)]
+use crate::wire::EncodeToBufMut;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
 use snafu::prelude::*;
@@ -20,17 +17,13 @@ use snafu::prelude::*;
 pub const FRAME_HEADER_LEN: usize = 20;
 
 /// Decodes one frame from an `IoPayload`.
-///
-/// The header is copied into a small local buffer for parsing. The payload body
-/// of a `Payload` frame stays in `IoPayload` form.
 pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError> {
     ensure!(
         payload.len() >= FRAME_HEADER_LEN,
         FrameTooShortSnafu { len: payload.len() }
     );
-    let header = decode_header_payload(&payload)?
-        .validate()
-        .context(TypeSnafu)?;
+    let mut cursor = payload.cursor();
+    let header = UDPourHeader::decode_from(&mut cursor).context(TypeSnafu)?;
     let body_len = payload.len() - FRAME_HEADER_LEN;
     match header.frame_type {
         FrameType::Payload => {
@@ -77,8 +70,8 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
                     offset: FRAME_HEADER_LEN,
                     len: body_len,
                 })?;
-            let missing_parts =
-                deserialize_bitmap_from(body.cursor().reader()).context(BitmapSnafu)?;
+            let mut body_cursor = body.cursor();
+            let missing_parts = RoaringBitmap::decode_from(&mut body_cursor).context(BitmapSnafu)?;
             ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
             Ok(UDPourFrame::NeedParts(NeedPartsFrame {
                 header,
@@ -89,6 +82,10 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
 }
 
 /// Fits one missing-part chunk into one `NeedParts` frame within `max_frame_len`.
+///
+/// Returns `Ok(None)` only when `missing_parts` still contains values overall but none remain
+/// strictly after `after_exclusive`. Callers should then decide whether to wrap their repair
+/// cursor back to the beginning of the missing-part set.
 pub(crate) fn fit_one_need_parts_frame(
     message_id: MessageId,
     part_count: PartCount,
@@ -98,7 +95,7 @@ pub(crate) fn fit_one_need_parts_frame(
     max_frame_len: usize,
 ) -> Result<Option<NeedPartsFrame>, CodecError> {
     ensure!(
-        max_frame_len > FRAME_HEADER_LEN,
+        max_frame_len > FRAME_HEADER_LEN + 16, // This happens to be the minimal size of a serialized roaring bitmap, last I checked.
         MaxFrameLenTooSmallSnafu { max_frame_len }
     );
     ensure!(!missing_parts.is_empty(), EmptyNeedPartsSnafu);
@@ -124,37 +121,6 @@ pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
         UDPourFrame::Ack(_) | UDPourFrame::NoLongerAvailable(_) => FRAME_HEADER_LEN,
         UDPourFrame::NeedParts(frame) => FRAME_HEADER_LEN + frame.missing_parts.serialized_size(),
     }
-}
-
-/// Encodes one validated fixed header into any synchronous `BufMut`.
-pub(crate) fn encode_header_into<B>(header: UDPourHeader, out: &mut B)
-where
-    B: BufMut,
-{
-    debug_assert!(
-        header.validate().is_ok(),
-        "encode_header_into expects a validated header"
-    );
-    out.put_u8(u8::from(header.frame_type));
-    out.put_u8(header.version);
-    out.put_u8(header.flags.bits());
-    out.put_u8(header.reserved);
-    out.put_u32(header.message_id.0);
-    out.put_u32(header.part_number.0);
-    out.put_u32(u32::from(header.part_count));
-    out.put_u32(header.checksum.0);
-}
-
-/// Encodes one `NeedParts` body into an existing synchronous writer.
-pub(crate) fn encode_need_parts_body_into<W>(
-    missing_parts: &RoaringBitmap,
-    writer: &mut W,
-) -> Result<(), RoaringBitmapError>
-where
-    W: std::io::Write,
-{
-    serialize_bitmap_into(missing_parts, writer)?;
-    Ok(())
 }
 
 /// Encodes one frame into an `IoPayload` for tests.
@@ -185,39 +151,10 @@ pub(crate) fn encode_frame(frame: &UDPourFrame) -> Result<IoPayload, CodecError>
 #[cfg(test)]
 fn encode_header(header: UDPourHeader) -> BytesMut {
     let mut bytes = BytesMut::with_capacity(FRAME_HEADER_LEN);
-    encode_header_into(header, &mut bytes);
+    header
+        .encode_into(&mut bytes)
+        .expect("UDPourHeader::encode_into is infallible");
     bytes
-}
-
-fn decode_header_payload(payload: &IoPayload) -> Result<UDPourHeader, CodecError> {
-    let mut header_bytes = [0_u8; FRAME_HEADER_LEN];
-    let mut cursor = payload.cursor();
-    cursor.copy_to_slice(&mut header_bytes);
-    decode_header(&header_bytes)
-}
-
-fn decode_header(bytes: &[u8]) -> Result<UDPourHeader, CodecError> {
-    let frame_type = FrameType::try_from(bytes[0]).context(TypeSnafu)?;
-    let part_count = PartCount::new(u32::from_be_bytes(
-        bytes[12..16].try_into().expect("part_count slice"),
-    ))
-    .context(TypeSnafu)?;
-    Ok(UDPourHeader {
-        frame_type,
-        version: bytes[1],
-        flags: FrameFlags::from_bits(bytes[2]),
-        reserved: bytes[3],
-        message_id: MessageId(u32::from_be_bytes(
-            bytes[4..8].try_into().expect("message_id slice"),
-        )),
-        part_number: PartNumber(u32::from_be_bytes(
-            bytes[8..12].try_into().expect("part_number slice"),
-        )),
-        part_count,
-        checksum: Checksum(u32::from_be_bytes(
-            bytes[16..20].try_into().expect("checksum slice"),
-        )),
-    })
 }
 
 /// Codec-level errors.

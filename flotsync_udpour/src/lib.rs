@@ -166,6 +166,7 @@ mod runtime;
 mod runtime_tests;
 mod sender;
 mod types;
+mod wire;
 
 pub use crate::{
     receiver::ReceiverConfig,

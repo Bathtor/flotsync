@@ -1,37 +1,48 @@
+use crate::wire::{DecodeFromBuf, EncodeToBufMut};
+use bytes::{Buf, BufMut};
 use roaring::RoaringBitmap;
 use snafu::prelude::*;
 #[cfg(test)]
 use std::io::Cursor;
-use std::io::{Read, Write};
 
 /// Serializes one roaring bitmap into its compact on-the-wire byte form.
 #[cfg(test)]
 pub(crate) fn serialize_bitmap(bitmap: &RoaringBitmap) -> Result<Vec<u8>, RoaringBitmapError> {
     let mut buffer = Vec::with_capacity(bitmap.serialized_size());
-    serialize_bitmap_into(bitmap, &mut buffer)?;
+    bitmap.encode_into(&mut buffer)?;
     Ok(buffer)
-}
-
-/// Serializes one roaring bitmap directly into an existing writer.
-pub(crate) fn serialize_bitmap_into<W: Write>(
-    bitmap: &RoaringBitmap,
-    writer: &mut W,
-) -> Result<(), RoaringBitmapError> {
-    bitmap.serialize_into(writer).context(SerializeSnafu)?;
-    Ok(())
 }
 
 /// Deserializes one roaring bitmap from its compact on-the-wire byte form.
 #[cfg(test)]
 pub(crate) fn deserialize_bitmap(bytes: &[u8]) -> Result<RoaringBitmap, RoaringBitmapError> {
-    deserialize_bitmap_from(Cursor::new(bytes))
+    let mut cursor = Cursor::new(bytes);
+    RoaringBitmap::deserialize_from(&mut cursor).context(DeserializeSnafu)
 }
 
-/// Deserializes one roaring bitmap from any synchronous reader.
-pub(crate) fn deserialize_bitmap_from<R: Read>(
-    mut reader: R,
-) -> Result<RoaringBitmap, RoaringBitmapError> {
-    RoaringBitmap::deserialize_from(&mut reader).context(DeserializeSnafu)
+impl EncodeToBufMut for RoaringBitmap {
+    type Error = RoaringBitmapError;
+
+    fn encode_into<B>(&self, out: &mut B) -> Result<(), Self::Error>
+    where
+        B: BufMut,
+    {
+        let mut writer = out.writer();
+        self.serialize_into(&mut writer).context(SerializeSnafu)?;
+        Ok(())
+    }
+}
+
+impl DecodeFromBuf for RoaringBitmap {
+    type Error = RoaringBitmapError;
+
+    fn decode_from<B>(buf: &mut B) -> Result<Self, Self::Error>
+    where
+        B: Buf,
+    {
+        let mut reader = buf.reader();
+        RoaringBitmap::deserialize_from(&mut reader).context(DeserializeSnafu)
+    }
 }
 
 /// Splits one bitmap into one chunk that fits within `max_serialized_size` and the remaining tail.
