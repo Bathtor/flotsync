@@ -112,6 +112,26 @@ pub(crate) enum ReceiverPurgeReason {
     TimedOut,
 }
 
+/// Receiver-side errors.
+#[derive(Debug, Snafu)]
+pub(crate) enum ReceiverError {
+    /// One `NeedParts` frame could not be fitted into the configured frame budget.
+    #[snafu(display("Failed to split NeedParts frames"))]
+    SplitNeedParts { source: crate::codec::CodecError },
+}
+
+fn checksum_payload(payload: &IoPayload) -> Checksum {
+    let mut cursor = payload.cursor();
+    let mut checksum = 0u32;
+    while cursor.has_remaining() {
+        let chunk = cursor.chunk();
+        let chunk_len = chunk.len();
+        checksum = crc32c::crc32c_append(checksum, chunk);
+        cursor.advance(chunk_len);
+    }
+    Checksum(checksum)
+}
+
 /// One active receiver-side entry for one `(source, message_id)` pair.
 #[derive(Debug)]
 enum InboundState {
@@ -640,26 +660,6 @@ impl ReceiverMachine {
         }
         actions
     }
-}
-
-fn checksum_payload(payload: &IoPayload) -> Checksum {
-    let mut cursor = payload.cursor();
-    let mut checksum = 0u32;
-    while cursor.has_remaining() {
-        let chunk = cursor.chunk();
-        let chunk_len = chunk.len();
-        checksum = crc32c::crc32c_append(checksum, chunk);
-        cursor.advance(chunk_len);
-    }
-    Checksum(checksum)
-}
-
-/// Receiver-side errors.
-#[derive(Debug, Snafu)]
-pub(crate) enum ReceiverError {
-    /// One `NeedParts` frame could not be fitted into the configured frame budget.
-    #[snafu(display("Failed to split NeedParts frames"))]
-    SplitNeedParts { source: crate::codec::CodecError },
 }
 
 #[cfg(test)]

@@ -12,16 +12,18 @@
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Add developer-facing docs or comments to non-public Rust types, fields, variants, and helper functions when their role, invariants, or lifecycle are not totally obvious from local context.
 - Prefer this item order within Rust files unless there is a strong local reason not to:
-  1. imports
-  2. public traits
-  3. public functions
-  4. public structs/enums followed immediately by all their impls
-  5. macros
-  6. private traits
-  7. private functions
-  8. private structs/enums followed immediately by all their impls
-  9. exposed test helpers
-  10. tests
+    1. imports
+    2. public constants
+    3. public traits
+    4. public functions
+    5. public structs/enums followed immediately by all their impls
+    6. macros
+    7. private constants (if they cannot be in a narrower scope)
+    8. private traits
+    9. private functions
+    10. private structs/enums followed immediately by all their impls
+    11. exposed test helpers
+    12. tests
 
 <!-- BEGIN BEADS INTEGRATION -->
 

@@ -232,6 +232,17 @@ pub enum UDPourConfigError {
     NeedPartsFrameLenTooSmall { max_need_parts_frame_len: usize },
 }
 
+/// Pool-backed frame-encoding errors for the UDP runtime.
+#[derive(Debug, Snafu)]
+pub(crate) enum RuntimeEncodeError {
+    #[snafu(display("pool-backed frame encoding failed"))]
+    Io { source: flotsync_io::prelude::Error },
+    #[snafu(display("failed to encode NeedParts bitmap"))]
+    Bitmap { source: RoaringBitmapError },
+    #[snafu(display("frame encoding produced no payload"))]
+    EmptyEncodedFrame,
+}
+
 /// Runtime pacing policy for outbound UDPour datagrams.
 #[derive(Clone, Debug)]
 struct UDPourSendRateControl {
@@ -318,6 +329,16 @@ pub struct UDPourComponent {
     socket_closed: bool,
     poll_timer: Option<PollTimerState>,
     next_poll_generation: usize,
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum UDPourComponentMessage {
+    /// Directed outbound submission resolved once the initial multipart payload
+    /// handoff either succeeded or failed.
+    Submit(Ask<UDPourSend, UDPourSubmitResult>),
+    /// Internal feedback from `flotsync_io` about one physical UDP send.
+    SendResult(UdpSendResult),
 }
 
 impl UDPourComponent {
@@ -980,16 +1001,6 @@ impl LocalActor for UDPourComponent {
 
 impl_local_actor!(UDPourComponent);
 
-#[doc(hidden)]
-#[derive(Debug)]
-pub enum UDPourComponentMessage {
-    /// Directed outbound submission resolved once the initial multipart payload
-    /// handoff either succeeded or failed.
-    Submit(Ask<UDPourSend, UDPourSubmitResult>),
-    /// Internal feedback from `flotsync_io` about one physical UDP send.
-    SendResult(UdpSendResult),
-}
-
 #[derive(Clone, Debug)]
 struct PollTimerState {
     generation: usize,
@@ -1059,17 +1070,6 @@ impl QueuedDatagram {
 #[derive(Clone, Debug)]
 struct PendingTransmission {
     datagram: QueuedDatagram,
-}
-
-/// Pool-backed frame-encoding errors for the UDP runtime.
-#[derive(Debug, Snafu)]
-pub(crate) enum RuntimeEncodeError {
-    #[snafu(display("pool-backed frame encoding failed"))]
-    Io { source: flotsync_io::prelude::Error },
-    #[snafu(display("failed to encode NeedParts bitmap"))]
-    Bitmap { source: RoaringBitmapError },
-    #[snafu(display("frame encoding produced no payload"))]
-    EmptyEncodedFrame,
 }
 
 async fn encode_frame_with_pool(

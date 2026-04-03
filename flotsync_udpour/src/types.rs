@@ -13,7 +13,7 @@ pub(crate) const PROTOCOL_VERSION: u8 = 1;
 /// This is a small wrapper rather than a raw `u8` so call sites can describe
 /// intent directly and we have one place to grow future payload/control flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub(crate) struct FrameFlags(u8);
+pub struct FrameFlags(u8);
 
 impl FrameFlags {
     /// Default header flags for frames without any optional signalling bits.
@@ -52,7 +52,7 @@ pub struct MessageId(pub u32);
 
 /// Zero-based part number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct PartNumber(pub(crate) u32);
+pub struct PartNumber(pub u32);
 
 /// Total number of parts in one logical message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -60,7 +60,7 @@ pub struct PartCount(NonZeroU32);
 
 impl PartCount {
     /// Wraps one raw part count while enforcing the protocol's non-zero rule.
-    pub(crate) fn new(value: u32) -> Result<Self, UDPourTypeError> {
+    pub fn new(value: u32) -> Result<Self, UDPourTypeError> {
         let value = NonZeroU32::new(value).context(ZeroPartCountSnafu)?;
         Ok(Self(value))
     }
@@ -80,6 +80,23 @@ impl From<PartCount> for u32 {
     fn from(value: PartCount) -> Self {
         value.get()
     }
+}
+
+/// Local type validation and parse errors.
+#[derive(Debug, Snafu)]
+pub enum UDPourTypeError {
+    #[snafu(display("Unsupported protocol version {version}"))]
+    UnsupportedVersion { version: u8 },
+    #[snafu(display("Frame type 0x{value:02X} is not assigned"))]
+    UnknownFrameType { value: u8 },
+    #[snafu(display("part_count must be greater than zero"))]
+    ZeroPartCount,
+    #[snafu(display("Payload part_number {part_number} is outside part_count {part_count}"))]
+    PartNumberOutOfRange { part_number: u32, part_count: u32 },
+    #[snafu(display("Control frame part_number must be zero, got {part_number}"))]
+    ControlPartNumberMustBeZero { part_number: u32 },
+    #[snafu(display("control() must not be used for payload frames"))]
+    PayloadControlHeader,
 }
 
 /// Fixed-header frame kind.
@@ -406,21 +423,4 @@ pub(crate) fn io_payload_eq(left: &IoPayload, right: &IoPayload) -> bool {
     }
 
     true
-}
-
-/// Local type validation and parse errors.
-#[derive(Debug, Snafu)]
-pub(crate) enum UDPourTypeError {
-    #[snafu(display("Unsupported protocol version {version}"))]
-    UnsupportedVersion { version: u8 },
-    #[snafu(display("Frame type 0x{value:02X} is not assigned"))]
-    UnknownFrameType { value: u8 },
-    #[snafu(display("part_count must be greater than zero"))]
-    ZeroPartCount,
-    #[snafu(display("Payload part_number {part_number} is outside part_count {part_count}"))]
-    PartNumberOutOfRange { part_number: u32, part_count: u32 },
-    #[snafu(display("Control frame part_number must be zero, got {part_number}"))]
-    ControlPartNumberMustBeZero { part_number: u32 },
-    #[snafu(display("control() must not be used for payload frames"))]
-    PayloadControlHeader,
 }

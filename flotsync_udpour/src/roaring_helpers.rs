@@ -10,6 +10,32 @@ use snafu::prelude::*;
 /// bytes available for the bitmap body itself.
 pub(crate) const MIN_ENCODED_NON_EMPTY_BITMAP_LEN: usize = 16;
 
+/// Roaring-bitmap helper errors.
+#[derive(Debug, Snafu)]
+pub enum RoaringBitmapError {
+    #[snafu(display("roaring bitmap body must not be empty"))]
+    EmptyBitmap,
+    #[snafu(display(
+        "max serialized size {max_serialized_size} is too small; need at least {min_serialized_size} bytes for one non-empty roaring bitmap"
+    ))]
+    MaxSerializedSizeTooSmall {
+        max_serialized_size: usize,
+        min_serialized_size: usize,
+    },
+    #[snafu(display("chunk count must be greater than zero"))]
+    ZeroChunkCount,
+    #[snafu(display(
+        "requested prefix length {prefix_len} exceeds bitmap cardinality {cardinality}"
+    ))]
+    PrefixLongerThanBitmap { prefix_len: u64, cardinality: u64 },
+    #[snafu(display("bitmap chunk cannot fit into max serialized size {max_serialized_size}"))]
+    ChunkTooSmall { max_serialized_size: usize },
+    #[snafu(display("failed to serialize roaring bitmap"))]
+    Serialize { source: std::io::Error },
+    #[snafu(display("failed to deserialize roaring bitmap"))]
+    Deserialize { source: std::io::Error },
+}
+
 impl EncodeToBufMut for RoaringBitmap {
     type Error = RoaringBitmapError;
 
@@ -68,13 +94,6 @@ pub(crate) fn select_bitmap_chunk(
     };
     let step = split_bitmap_to_serialized_bounds(suffix, max_serialized_size)?;
     Ok(Some(step.chunk))
-}
-
-/// One incremental split result for a roaring bitmap.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct SplittingResult {
-    pub(crate) chunk: RoaringBitmap,
-    pub(crate) rest: Option<RoaringBitmap>,
 }
 
 /// Splits one bitmap into one chunk that fits within `max_serialized_size` and the remaining tail.
@@ -146,6 +165,13 @@ pub(crate) fn split_bitmap_to_serialized_bounds(
     };
 
     Ok(SplittingResult { chunk, rest })
+}
+
+/// One incremental split result for a roaring bitmap.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SplittingResult {
+    pub(crate) chunk: RoaringBitmap,
+    pub(crate) rest: Option<RoaringBitmap>,
 }
 
 /// Returns the largest prefix cardinality whose serialized bitmap still fits within
@@ -229,32 +255,6 @@ fn suffix_after(bitmap: &RoaringBitmap, after_exclusive: Option<u32>) -> Option<
             }
         }
     }
-}
-
-/// Roaring-bitmap helper errors.
-#[derive(Debug, Snafu)]
-pub enum RoaringBitmapError {
-    #[snafu(display("roaring bitmap body must not be empty"))]
-    EmptyBitmap,
-    #[snafu(display(
-        "max serialized size {max_serialized_size} is too small; need at least {min_serialized_size} bytes for one non-empty roaring bitmap"
-    ))]
-    MaxSerializedSizeTooSmall {
-        max_serialized_size: usize,
-        min_serialized_size: usize,
-    },
-    #[snafu(display("chunk count must be greater than zero"))]
-    ZeroChunkCount,
-    #[snafu(display(
-        "requested prefix length {prefix_len} exceeds bitmap cardinality {cardinality}"
-    ))]
-    PrefixLongerThanBitmap { prefix_len: u64, cardinality: u64 },
-    #[snafu(display("bitmap chunk cannot fit into max serialized size {max_serialized_size}"))]
-    ChunkTooSmall { max_serialized_size: usize },
-    #[snafu(display("failed to serialize roaring bitmap"))]
-    Serialize { source: std::io::Error },
-    #[snafu(display("failed to deserialize roaring bitmap"))]
-    Deserialize { source: std::io::Error },
 }
 
 #[cfg(test)]

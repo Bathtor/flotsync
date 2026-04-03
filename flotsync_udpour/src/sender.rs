@@ -253,6 +253,79 @@ pub(crate) enum SenderPurgeReason {
     RetentionExpired,
 }
 
+/// Sender-side errors.
+#[derive(Debug, Snafu)]
+pub(crate) enum SenderError {
+    #[snafu(display("max_part_payload_len must be greater than zero"))]
+    ZeroMaxPartPayloadLen,
+    #[snafu(display(
+        "Payload of {payload_len} bytes would exceed the supported part count for max_part_payload_len={max_part_payload_len}"
+    ))]
+    TooManyParts {
+        payload_len: usize,
+        max_part_payload_len: usize,
+        source: std::num::TryFromIntError,
+    },
+    #[snafu(display("Generated an invalid part count"))]
+    InvalidPartCount {
+        source: crate::types::UDPourTypeError,
+    },
+    #[snafu(display("All message ids are currently live or cooling down"))]
+    MessageIdExhausted,
+}
+
+fn part_count_for_payload(
+    payload_len: usize,
+    max_part_payload_len: usize,
+) -> Result<PartCount, SenderError> {
+    let part_count = payload_len.max(1).div_ceil(max_part_payload_len);
+    let part_count = u32::try_from(part_count).context(TooManyPartsSnafu {
+        payload_len,
+        max_part_payload_len,
+    })?;
+    PartCount::new(part_count).context(InvalidPartCountSnafu)
+}
+
+fn slice_part(
+    payload: IoPayload,
+    max_part_payload_len: usize,
+    part_number: PartNumber,
+    part_count: PartCount,
+) -> IoPayload {
+    let start = part_number.0 as usize * max_part_payload_len;
+    let end = if part_number == part_count.last_part_number() {
+        payload.len()
+    } else {
+        (start + max_part_payload_len).min(payload.len())
+    };
+    payload
+        .try_slice(start, end - start)
+        .expect("payload part range must stay inside the retained payload")
+}
+
+fn no_longer_available_frame(header: UDPourHeader) -> NoLongerAvailableFrame {
+    let header = UDPourHeader::control(
+        FrameType::NoLongerAvailable,
+        header.message_id,
+        header.part_count,
+        header.checksum,
+    )
+    .expect("NeedParts metadata must always produce a valid NoLongerAvailable header");
+    NoLongerAvailableFrame { header }
+}
+
+fn checksum_payload(payload: &IoPayload) -> Checksum {
+    let mut cursor = payload.cursor();
+    let mut checksum = 0u32;
+    while cursor.has_remaining() {
+        let chunk = cursor.chunk();
+        let chunk_len = chunk.len();
+        checksum = crc32c::crc32c_append(checksum, chunk);
+        cursor.advance(chunk_len);
+    }
+    Checksum(checksum)
+}
+
 /// One retained logical message together with the metadata needed for repair.
 #[derive(Debug)]
 struct LiveMessage {
@@ -327,79 +400,6 @@ impl LiveMessage {
         );
         PayloadFrame { header, payload }
     }
-}
-
-fn part_count_for_payload(
-    payload_len: usize,
-    max_part_payload_len: usize,
-) -> Result<PartCount, SenderError> {
-    let part_count = payload_len.max(1).div_ceil(max_part_payload_len);
-    let part_count = u32::try_from(part_count).context(TooManyPartsSnafu {
-        payload_len,
-        max_part_payload_len,
-    })?;
-    PartCount::new(part_count).context(InvalidPartCountSnafu)
-}
-
-fn slice_part(
-    payload: IoPayload,
-    max_part_payload_len: usize,
-    part_number: PartNumber,
-    part_count: PartCount,
-) -> IoPayload {
-    let start = part_number.0 as usize * max_part_payload_len;
-    let end = if part_number == part_count.last_part_number() {
-        payload.len()
-    } else {
-        (start + max_part_payload_len).min(payload.len())
-    };
-    payload
-        .try_slice(start, end - start)
-        .expect("payload part range must stay inside the retained payload")
-}
-
-fn no_longer_available_frame(header: UDPourHeader) -> NoLongerAvailableFrame {
-    let header = UDPourHeader::control(
-        FrameType::NoLongerAvailable,
-        header.message_id,
-        header.part_count,
-        header.checksum,
-    )
-    .expect("NeedParts metadata must always produce a valid NoLongerAvailable header");
-    NoLongerAvailableFrame { header }
-}
-
-fn checksum_payload(payload: &IoPayload) -> Checksum {
-    let mut cursor = payload.cursor();
-    let mut checksum = 0u32;
-    while cursor.has_remaining() {
-        let chunk = cursor.chunk();
-        let chunk_len = chunk.len();
-        checksum = crc32c::crc32c_append(checksum, chunk);
-        cursor.advance(chunk_len);
-    }
-    Checksum(checksum)
-}
-
-/// Sender-side errors.
-#[derive(Debug, Snafu)]
-pub(crate) enum SenderError {
-    #[snafu(display("max_part_payload_len must be greater than zero"))]
-    ZeroMaxPartPayloadLen,
-    #[snafu(display(
-        "Payload of {payload_len} bytes would exceed the supported part count for max_part_payload_len={max_part_payload_len}"
-    ))]
-    TooManyParts {
-        payload_len: usize,
-        max_part_payload_len: usize,
-        source: std::num::TryFromIntError,
-    },
-    #[snafu(display("Generated an invalid part count"))]
-    InvalidPartCount {
-        source: crate::types::UDPourTypeError,
-    },
-    #[snafu(display("All message ids are currently live or cooling down"))]
-    MessageIdExhausted,
 }
 
 #[cfg(test)]
