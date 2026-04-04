@@ -1074,6 +1074,9 @@ async fn encode_frame_with_pool(
                     .encode_into_buf(&mut reserved)
                     .expect("UDPourHeader::encode_into_buf is infallible");
             }
+            // The queued payload is usually already owned by this same egress pool, so adoption
+            // still succeeds here despite the clone. When that is not true, the writer cannot take
+            // ownership of the shared payload and we must copy the readable bytes instead.
             let adopt_result = writer.adopt_payload(payload.clone()).await;
             match adopt_result {
                 Ok(()) => {}

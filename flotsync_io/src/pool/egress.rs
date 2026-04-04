@@ -146,7 +146,8 @@ impl EgressPool {
     ///
     /// This works recursively for chained payloads and for lease-backed fragments produced through
     /// payload slicing as long as each pooled fragment is uniquely owned. Shared pooled fragments
-    /// fail with [`Error::SharedIoPayloadOwnership`].
+    /// fail with [`Error::SharedIoPayloadOwnership`] unless the payload is already fully owned by
+    /// this egress pool, in which case adoption is a no-op.
     pub fn adopt_payload(&self, mut payload: IoPayload) -> Result<IoPayload> {
         self.adopt_payload_in_place(&mut payload)?;
         Ok(payload)
@@ -173,12 +174,12 @@ impl EgressPool {
         let IoLeaseInner::Pooled(payload) = &mut lease.inner else {
             return Ok(());
         };
-        let Some(payload) = Arc::get_mut(payload) else {
-            return Err(Error::SharedIoPayloadOwnership);
-        };
         if payload.recycler.is_owned_by_egress(&self.inner) {
             return Ok(());
         }
+        let Some(payload) = Arc::get_mut(payload) else {
+            return Err(Error::SharedIoPayloadOwnership);
+        };
 
         let chunk_count = payload.segment_count();
         self.import_live_chunks(chunk_count)?;
@@ -194,6 +195,9 @@ impl EgressPool {
     }
 
     fn adopt_payload_in_place(&self, payload: &mut IoPayload) -> Result<()> {
+        if self.payload_is_already_owned(payload) {
+            return Ok(());
+        }
         match payload {
             IoPayload::Lease(lease) => self.adopt_lease_in_place(lease),
             IoPayload::Bytes(_) => Ok(()),
@@ -206,6 +210,21 @@ impl EgressPool {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Returns whether `payload` already needs no retargeting or copying for this egress pool.
+    ///
+    /// This covers plain byte payloads, external leases, and pooled fragments already owned by the
+    /// same egress pool even when they are shared behind `Arc`.
+    fn payload_is_already_owned(&self, payload: &IoPayload) -> bool {
+        match payload {
+            IoPayload::Bytes(_) => true,
+            IoPayload::Lease(lease) => match &lease.inner {
+                IoLeaseInner::External(_) => true,
+                IoLeaseInner::Pooled(payload) => payload.recycler.is_owned_by_egress(&self.inner),
+            },
+            IoPayload::Chain(parts) => parts.iter().all(|part| self.payload_is_already_owned(part)),
         }
     }
 }

@@ -776,6 +776,22 @@ mod tests {
         }
     }
 
+    fn assert_exactly_one_chunk_of_quota_remains(pool: &EgressPool) {
+        let chunk_size = pool.config().chunk_size;
+        let second = wait_for_request(pool.reserve(chunk_size).expect("reserve remaining chunk"))
+            .expect("exactly one chunk of quota should remain");
+        let mut blocked = pool
+            .reserve(chunk_size)
+            .expect("request over the remaining quota should enqueue");
+        assert!(
+            blocked
+                .try_receive()
+                .expect("queued request channel must stay live")
+                .is_none()
+        );
+        drop(second);
+    }
+
     #[test]
     fn ingress_notifier_fires_after_last_shared_lease_drop() {
         init_test_logger();
@@ -1126,8 +1142,10 @@ mod tests {
         init_test_logger();
 
         let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let foreign_pool = EgressPool::new(tiny_config(), default_runtime_logger());
         let reservation =
-            wait_for_request(pool.reserve(8).expect("reserve shared payload")).expect("ready");
+            wait_for_request(foreign_pool.reserve(8).expect("reserve shared payload"))
+                .expect("ready");
         let shared_lease = reservation
             .copy_bytes(b"-tail")
             .expect("write shared payload");
@@ -1154,6 +1172,102 @@ mod tests {
             matches!(payload, IoPayload::Lease(_)),
             "failed adopt should not have sealed a separate payload part"
         );
+    }
+
+    #[test]
+    fn shared_payload_already_owned_by_same_egress_pool_is_adopted() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve shared payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let shared_payload = IoPayload::Lease(owned_lease.clone());
+
+        let adopted = pool
+            .adopt_payload(shared_payload.clone())
+            .expect("same-pool shared payload should adopt without copying");
+
+        assert_eq!(adopted.to_vec().as_slice(), b"tail");
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn shared_chain_already_owned_by_same_egress_pool_is_adopted() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve pooled payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let owned_payload = IoPayload::Lease(owned_lease.clone());
+        let shared_chain = IoPayload::chain([
+            IoPayload::from_static(b"head"),
+            owned_payload.clone(),
+            IoPayload::from_static(b"!"),
+        ]);
+
+        let adopted = pool
+            .adopt_payload(shared_chain.clone())
+            .expect("same-pool shared chain should adopt without copying");
+
+        assert_eq!(adopted.to_vec().as_slice(), b"headtail!");
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn writer_adopts_shared_payload_already_owned_by_same_egress_pool_zero_copy() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve pooled payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let shared_payload = IoPayload::Lease(owned_lease.clone());
+
+        let mut writer = pool.writer(Some(16));
+        wait_for_future(async { writer.adopt_payload(shared_payload.clone()).await })
+            .expect("same-pool shared payload adopt should succeed");
+
+        let payload = writer
+            .finish()
+            .expect("finish adopted payload")
+            .expect("adopted payload is non-empty");
+        assert_eq!(payload.to_vec().as_slice(), b"tail");
+        assert!(
+            matches!(payload, IoPayload::Lease(_)),
+            "same-pool adopt should preserve the pooled lease without copying"
+        );
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn shared_chain_with_foreign_pooled_fragment_still_fails_adopt() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let foreign_pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(foreign_pool.reserve(8).expect("reserve foreign payload"))
+                .expect("ready");
+        let foreign_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write foreign payload");
+        let shared_chain = IoPayload::chain([
+            IoPayload::from_static(b"head"),
+            IoPayload::Lease(foreign_lease.clone()),
+        ]);
+
+        let error = pool
+            .adopt_payload(shared_chain.clone())
+            .expect_err("shared foreign pooled fragment must still fail adoption");
+        assert!(matches!(error, Error::SharedIoPayloadOwnership));
     }
 
     #[test]
