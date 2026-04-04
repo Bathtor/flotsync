@@ -9,7 +9,6 @@ use crate::{
         UDPourConfig,
         UDPourDeliver,
         UDPourPort,
-        UDPourPortIndication,
         UDPourSend,
         UDPourSendFailureReason,
         UDPourSubmitResult,
@@ -93,11 +92,11 @@ impl Default for TestSendRateControl {
 struct TransferProbe {
     ctx: ComponentContext<Self>,
     transfer: RequiredPort<UDPourPort>,
-    indications: mpsc::Sender<UDPourPortIndication>,
+    indications: mpsc::Sender<UDPourDeliver>,
 }
 
 impl TransferProbe {
-    fn new(indications: mpsc::Sender<UDPourPortIndication>) -> Self {
+    fn new(indications: mpsc::Sender<UDPourDeliver>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             transfer: RequiredPort::uninitialised(),
@@ -109,7 +108,7 @@ impl TransferProbe {
 ignore_lifecycle!(TransferProbe);
 
 impl Require<UDPourPort> for TransferProbe {
-    fn handle(&mut self, indication: UDPourPortIndication) -> Handled {
+    fn handle(&mut self, indication: UDPourDeliver) -> Handled {
         self.indications
             .send(indication)
             .expect("transfer indication receiver must stay live during tests");
@@ -439,7 +438,7 @@ struct RuntimeHarness {
     _sender_runtime_to_probe: TwoWayChannel<UDPourPort, UDPourComponent, TransferProbe>,
     _receiver_runtime_to_probe: TwoWayChannel<UDPourPort, UDPourComponent, TransferProbe>,
     observer_rx: BufferedReceiver<UdpIndication>,
-    receiver_rx: BufferedReceiver<UDPourPortIndication>,
+    receiver_rx: BufferedReceiver<UDPourDeliver>,
     sender_socket_id: SocketId,
     sender_addr: SocketAddr,
     receiver_socket_id: SocketId,
@@ -678,16 +677,11 @@ impl RuntimeHarness {
     }
 
     fn wait_for_receiver_deliver(&self) -> UDPourDeliver {
-        let indication = self.receiver_rx.recv_matching(WAIT_TIMEOUT, |_| true);
-        match indication {
-            UDPourPortIndication::Deliver(deliver) => deliver,
-        }
+        self.receiver_rx.recv_matching(WAIT_TIMEOUT, |_| true)
     }
 
     fn assert_no_receiver_deliver(&self, duration: Duration) {
-        self.receiver_rx.assert_no_match(duration, |indication| {
-            matches!(indication, UDPourPortIndication::Deliver(_))
-        });
+        self.receiver_rx.assert_no_match(duration, |_| true);
     }
 
     fn shutdown(self) {
@@ -893,7 +887,7 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"hello world")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -927,7 +921,7 @@ fn backpressure_is_retried_without_failing_logical_send() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"hello world")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -954,7 +948,7 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefghijkl")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
         harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
@@ -1008,11 +1002,20 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
         default_receiver_config(Duration::from_millis(20)),
     );
 
-    let UDPourSubmitResult::Sent { message_id } =
-        harness.send(IoPayload::from_static(b"abcdefghijkl"))
+    assert!(matches!(
+        harness.send(IoPayload::from_static(b"abcdefghijkl")),
+        UDPourSubmitResult::Sent
+    ));
+    let UDPourFrame::Payload(first_payload) = harness
+        .wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+            matches!(frame, UDPourFrame::Payload(_))
+        })
     else {
-        panic!("expected initial send to succeed");
+        unreachable!("filtered to Payload");
     };
+    let message_id = first_payload.header.message_id;
+    let part_count = first_payload.header.part_count;
+    let checksum = first_payload.header.checksum;
     let first_deliver = harness.wait_for_receiver_deliver();
     assert_eq!(first_deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
@@ -1023,19 +1026,13 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     harness.inject_sender_indication(
         localhost(9001),
         UDPourFrame::NeedParts(NeedPartsFrame {
-            header: UDPourHeader::control(
-                FrameType::NeedParts,
-                message_id,
-                first_deliver.part_count,
-                first_deliver.checksum,
-            )
-            .unwrap(),
+            header: UDPourHeader::control(FrameType::NeedParts, message_id, part_count, checksum)
+                .unwrap(),
             missing_parts,
         }),
     );
 
-    let retransmitted_parts =
-        wait_for_retransmitted_parts(&harness, message_id, first_deliver.part_count);
+    let retransmitted_parts = wait_for_retransmitted_parts(&harness, message_id, part_count);
     assert_eq!(retransmitted_parts, vec![0, 1, 2]);
 
     harness.assert_no_receiver_deliver(Duration::from_millis(60));
@@ -1053,12 +1050,7 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
         harness.inject_receiver_indication(
             harness.sender_addr,
             UDPourFrame::Payload(PayloadFrame {
-                header: UDPourHeader::payload(
-                    message_id,
-                    part_number,
-                    first_deliver.part_count,
-                    first_deliver.checksum,
-                ),
+                header: UDPourHeader::payload(message_id, part_number, part_count, checksum),
                 payload,
             }),
         );
@@ -1125,7 +1117,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
         submit
             .wait_timeout(WAIT_TIMEOUT)
             .expect("timed out waiting for paced sender submit result"),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -1143,13 +1135,13 @@ fn no_longer_available_after_sender_retention_expiry() {
             part_number: PartNumber(1),
             dropped: false,
         },
-        default_sender_config(Duration::from_millis(20)),
-        default_receiver_config(Duration::from_millis(50)),
+        default_sender_config(Duration::from_millis(10)),
+        default_receiver_config(Duration::from_millis(20)),
     );
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefghijkl")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
         harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
@@ -1163,7 +1155,7 @@ fn no_longer_available_after_sender_retention_expiry() {
         matches!(frame, UDPourFrame::NoLongerAvailable(_))
     });
     assert!(matches!(nla, UDPourFrame::NoLongerAvailable(_)));
-    harness.assert_no_receiver_deliver(Duration::from_millis(150));
+    harness.assert_no_receiver_deliver(Duration::from_millis(100));
     harness.shutdown();
 }
 
@@ -1185,7 +1177,6 @@ fn runtime_nack_reports_one_send_failed_with_correct_identity() {
     assert_eq!(
         failed,
         UDPourSubmitResult::SendFailed {
-            message_id: Some(MessageId(0)),
             reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
         }
     );
@@ -1224,7 +1215,6 @@ fn socket_close_fails_submit_while_datagrams_are_still_queued() {
             .wait_timeout(WAIT_TIMEOUT)
             .expect("timed out waiting for closed-socket submit result"),
         UDPourSubmitResult::SendFailed {
-            message_id: Some(MessageId(0)),
             reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
         }
     );
@@ -1248,7 +1238,7 @@ fn runtime_out_of_order_payloads_still_reassemble_and_ack() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefghijkl")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -1278,7 +1268,7 @@ fn runtime_duplicate_payload_datagrams_do_not_break_delivery() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefghijkl")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
 
     let deliver = harness.wait_for_receiver_deliver();
@@ -1310,7 +1300,7 @@ fn runtime_conflicting_duplicates_purge_without_requesting_repair() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefgh")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     harness.assert_no_receiver_deliver(Duration::from_millis(150));
     harness.assert_no_bridge_frame(
@@ -1321,7 +1311,7 @@ fn runtime_conflicting_duplicates_purge_without_requesting_repair() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"qrst")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"qrst");
@@ -1341,14 +1331,14 @@ fn malformed_frames_are_dropped_without_poisoning_valid_traffic() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"abcdefghijkl")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     let first = harness.wait_for_receiver_deliver();
     assert_eq!(first.payload.to_vec().as_slice(), b"abcdefghijkl");
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"mnop")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     let second = harness.wait_for_receiver_deliver();
     assert_eq!(second.payload.to_vec().as_slice(), b"mnop");
@@ -1368,10 +1358,10 @@ fn zero_length_payload_round_trips_through_runtime() {
 
     assert!(matches!(
         harness.send(IoPayload::from_static(b"")),
-        UDPourSubmitResult::Sent { .. }
+        UDPourSubmitResult::Sent
     ));
     let deliver = harness.wait_for_receiver_deliver();
-    assert_eq!(deliver.part_count, PartCount::new(1).unwrap());
+    assert_eq!(deliver.source, harness.sender_addr);
     assert_eq!(deliver.payload.len(), 0);
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::Ack(_))

@@ -8,33 +8,12 @@
 use crate::{
     codec::{FRAME_HEADER_LEN, decode_frame, encoded_frame_len},
     receiver::{ReceiverAction, ReceiverConfig, ReceiverMachine},
-    roaring_helpers::RoaringBitmapError,
+    roaring_helpers::{MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError},
     sender::{SenderAction, SenderConfig, SenderError, SenderMachine},
-    types::{
-        AckFrame,
-        Checksum,
-        MessageId,
-        NeedPartsFrame,
-        NoLongerAvailableFrame,
-        PartCount,
-        PayloadFrame,
-        UDPourFrame,
-    },
+    types::*,
     wire::EncodeToBufMut,
 };
-use flotsync_io::prelude::{
-    EgressPool,
-    Error as IoError,
-    IoPayload,
-    PayloadWriter,
-    SendFailureReason,
-    SocketId,
-    TransmissionId,
-    UdpIndication,
-    UdpPort,
-    UdpRequest,
-    UdpSendResult,
-};
+use flotsync_io::prelude::*;
 use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::{
     config::{DurationValue, HoconExt, UsizeValue},
@@ -44,6 +23,7 @@ use kompact::{
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -62,14 +42,8 @@ pub struct UDPourSend {
 pub struct UDPourDeliver {
     /// Forwarded UDP source address that identified the sender at this route.
     pub source: SocketAddr,
-    /// Sender-local logical message id recovered from the multipart header.
-    pub message_id: MessageId,
     /// Fully reassembled logical payload.
     pub payload: IoPayload,
-    /// Total number of payload parts that made up this logical message.
-    pub part_count: PartCount,
-    /// Whole-message CRC32C recovered from the multipart header.
-    pub checksum: Checksum,
 }
 
 /// Why a logical outbound send could not make progress through the runtime.
@@ -87,16 +61,32 @@ pub enum UDPourSendFailureReason {
     Transport(SendFailureReason),
 }
 
+impl fmt::Display for UDPourSendFailureReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(reason) => write!(f, "sender state failure: {reason}"),
+            Self::Encode(reason) => write!(f, "frame encoding failure: {reason}"),
+            Self::Transport(reason) => write!(f, "transport failure: {reason:?}"),
+        }
+    }
+}
+
 /// Directed outcome of one outbound UDPour submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UDPourSubmitResult {
     /// All initial `Payload` datagrams were accepted by the UDP transport.
-    Sent { message_id: MessageId },
+    Sent,
     /// The logical send failed before or during its initial UDP handoff.
-    SendFailed {
-        message_id: Option<MessageId>,
-        reason: UDPourSendFailureReason,
-    },
+    SendFailed { reason: UDPourSendFailureReason },
+}
+
+impl fmt::Display for UDPourSubmitResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sent => write!(f, "initial UDPour payload datagrams were accepted"),
+            Self::SendFailed { reason } => write!(f, "UDPour send failed: {reason}"),
+        }
+    }
 }
 
 /// Cloneable summary of sender-state-machine failures at the runtime boundary.
@@ -110,12 +100,40 @@ pub enum UDPourStateFailure {
     MessageIdExhausted,
 }
 
+impl fmt::Display for UDPourStateFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyParts {
+                payload_len,
+                max_part_payload_len,
+            } => write!(
+                f,
+                "payload of {payload_len} bytes exceeds supported multipart split for part size {max_part_payload_len}"
+            ),
+            Self::InvalidPartCount => write!(f, "sender produced an invalid part count"),
+            Self::MessageIdExhausted => {
+                write!(f, "all sender message ids are live or cooling down")
+            }
+        }
+    }
+}
+
 /// Cloneable summary of runtime frame-encoding failures at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UDPourEncodeFailure {
     Io,
     Bitmap,
     EmptyEncodedFrame,
+}
+
+impl fmt::Display for UDPourEncodeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io => write!(f, "egress writer failed while encoding a frame"),
+            Self::Bitmap => write!(f, "NeedParts bitmap encoding failed"),
+            Self::EmptyEncodedFrame => write!(f, "frame encoding produced an empty payload"),
+        }
+    }
 }
 
 /// Kompact port exported by the UDPour runtime component.
@@ -128,13 +146,7 @@ pub struct UDPourPort;
 
 impl Port for UDPourPort {
     type Request = Never;
-    type Indication = UDPourPortIndication;
-}
-
-/// Indications emitted by the UDPour runtime component.
-#[derive(Clone, Debug)]
-pub enum UDPourPortIndication {
-    Deliver(UDPourDeliver),
+    type Indication = UDPourDeliver;
 }
 
 /// Kompact configuration keys that control UDPour runtime pacing.
@@ -192,7 +204,7 @@ impl UDPourConfig {
         mut receiver: ReceiverConfig,
     ) -> Result<Self, UDPourConfigError> {
         ensure!(
-            receiver.max_need_parts_frame_len > FRAME_HEADER_LEN,
+            receiver.max_need_parts_frame_len > FRAME_HEADER_LEN + MIN_ENCODED_NON_EMPTY_BITMAP_LEN,
             NeedPartsFrameLenTooSmallSnafu {
                 max_need_parts_frame_len: receiver.max_need_parts_frame_len,
             }
@@ -266,16 +278,12 @@ struct OutboundDispatcherState {
     send_rate: UDPourSendRateControl,
     /// Datagrams still waiting for one physical UDP send attempt.
     queue: VecDeque<QueuedDatagram>,
-    /// Datagrams already handed to `flotsync_io` and still awaiting `Ack`/`Nack`.
-    in_flight_datagrams: usize,
     /// True while one spawned async task is encoding and dispatching the next queue head.
     dispatch_in_progress: bool,
     /// Earliest time at which the next UDP send attempt may start.
     next_send_allowed_at: Instant,
     /// Timer used to resume dispatch once `next_send_allowed_at` is reached.
-    dispatch_timer: Option<DispatchTimerState>,
-    /// Monotonic generation used to ignore stale dispatch timer firings.
-    next_dispatch_generation: usize,
+    dispatch_timer: Option<ScheduledTimer>,
 }
 
 impl OutboundDispatcherState {
@@ -283,13 +291,21 @@ impl OutboundDispatcherState {
         Self {
             send_rate: UDPourSendRateControl::default(),
             queue: VecDeque::new(),
-            in_flight_datagrams: 0,
             dispatch_in_progress: false,
             next_send_allowed_at: Instant::now(),
             dispatch_timer: None,
-            next_dispatch_generation: 1,
         }
     }
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum UDPourComponentMessage {
+    /// Directed outbound submission resolved once the initial multipart payload
+    /// handoff either succeeded or failed.
+    Submit(Ask<UDPourSend, UDPourSubmitResult>),
+    /// Internal feedback from `flotsync_io` about one physical UDP send.
+    SendResult(UdpSendResult),
 }
 
 /// Kompact component that runs the multipart UDP protocol over one shared UDP socket.
@@ -303,16 +319,27 @@ impl OutboundDispatcherState {
 #[derive(ComponentDefinition)]
 pub struct UDPourComponent {
     ctx: ComponentContext<Self>,
-    udp: RequiredPort<UdpPort>,
-    transfer: ProvidedPort<UDPourPort>,
+    udp_port: RequiredPort<UdpPort>,
+    udpour_port: ProvidedPort<UDPourPort>,
     socket_id: SocketId,
     egress_pool: EgressPool,
     config: UDPourConfig,
     sender: SenderMachine,
     receiver: ReceiverMachine,
     next_transmission_id: TransmissionId,
+    /// Logical outbound submissions keyed by sender `MessageId`.
+    ///
+    /// This is the per-logical-message layer: one entry tracks the target address, submit
+    /// promise, and how many initial payload datagrams must still be transport-acked before the
+    /// caller can see `UDPourSubmitResult::Sent`.
     outbound: HashMap<MessageId, OutboundTransfer>,
-    pending_transmissions: HashMap<TransmissionId, PendingTransmission>,
+    /// Physical UDP datagrams already handed to `flotsync_io` and still awaiting `Ack`/`Nack`.
+    ///
+    /// This is the per-datagram layer: one transmission id maps to exactly one queued datagram
+    /// that is currently in flight on the socket.
+    pending_transmissions: HashMap<TransmissionId, QueuedDatagram>,
+    /// Datagrams not yet handed to `flotsync_io`, plus pacing state for when the next handoff may
+    /// begin.
     dispatcher: OutboundDispatcherState,
     /// Once the underlying UDP socket closes, this runtime never dispatches another datagram.
     ///
@@ -320,18 +347,7 @@ pub struct UDPourComponent {
     /// queue head. This flag makes that task drop its work instead of reintroducing pending sends
     /// after the runtime has already failed every outstanding submit.
     socket_closed: bool,
-    poll_timer: Option<PollTimerState>,
-    next_poll_generation: usize,
-}
-
-#[doc(hidden)]
-#[derive(Debug)]
-pub enum UDPourComponentMessage {
-    /// Directed outbound submission resolved once the initial multipart payload
-    /// handoff either succeeded or failed.
-    Submit(Ask<UDPourSend, UDPourSubmitResult>),
-    /// Internal feedback from `flotsync_io` about one physical UDP send.
-    SendResult(UdpSendResult),
+    poll_timer: Option<ScheduledTimer>,
 }
 
 impl UDPourComponent {
@@ -341,8 +357,8 @@ impl UDPourComponent {
         let receiver = ReceiverMachine::new(config.receiver.clone());
         Self {
             ctx: ComponentContext::uninitialised(),
-            udp: RequiredPort::uninitialised(),
-            transfer: ProvidedPort::uninitialised(),
+            udp_port: RequiredPort::uninitialised(),
+            udpour_port: ProvidedPort::uninitialised(),
             socket_id,
             egress_pool,
             config,
@@ -354,7 +370,6 @@ impl UDPourComponent {
             dispatcher: OutboundDispatcherState::new(),
             socket_closed: false,
             poll_timer: None,
-            next_poll_generation: 1,
         }
     }
 
@@ -429,12 +444,9 @@ impl UDPourComponent {
 
     fn enqueue_front_all<I>(&mut self, datagrams: I)
     where
-        I: IntoIterator<Item = QueuedDatagram>,
+        I: DoubleEndedIterator<Item = QueuedDatagram>,
     {
-        let datagrams: Vec<_> = datagrams.into_iter().collect();
-        for datagram in datagrams.into_iter().rev() {
-            self.dispatcher.queue.push_front(datagram);
-        }
+        self.dispatcher.queue.prepend(datagrams);
         self.try_dispatch_outbound();
     }
 
@@ -447,8 +459,7 @@ impl UDPourComponent {
             // nothing for this caller to do until that task finishes and re-enters dispatch.
             return;
         }
-        if self.dispatcher.in_flight_datagrams >= self.dispatcher.send_rate.max_in_flight_datagrams
-        {
+        if self.pending_transmissions.len() >= self.dispatcher.send_rate.max_in_flight_datagrams {
             return;
         }
         if self.dispatcher.queue.is_empty() {
@@ -481,9 +492,17 @@ impl UDPourComponent {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     async_self.dispatcher.dispatch_in_progress = false;
-                    if let Some(message_id) = datagram.message_id() {
+                    if datagram.is_outbound_payload_datagram() {
+                        error!(
+                            async_self.log(),
+                            "Failed to encode {:?} outbound UDPour payload datagram for message_id={:?} to {}: {}",
+                            frame_type,
+                            datagram.message_id(),
+                            datagram.target,
+                            error
+                        );
                         async_self.report_send_failure(
-                            message_id,
+                            datagram.message_id(),
                             UDPourSendFailureReason::Encode(classify_encode_error(&error)),
                         );
                     } else {
@@ -501,27 +520,22 @@ impl UDPourComponent {
 
             if async_self.socket_closed {
                 async_self.dispatcher.dispatch_in_progress = false;
-                if let Some(message_id) = datagram.message_id() {
+                if datagram.is_outbound_payload_datagram() {
                     async_self.abort_outbound_transfer(
-                        message_id,
+                        datagram.message_id(),
                         Some(UDPourSendFailureReason::Transport(
                             SendFailureReason::Closed,
                         )),
                     );
                 }
-                async_self.try_dispatch_outbound();
                 return Handled::Ok;
             }
 
-            async_self.pending_transmissions.insert(
-                transmission_id,
-                PendingTransmission { datagram },
-            );
-            async_self.dispatcher.in_flight_datagrams += 1;
+            async_self.pending_transmissions.insert(transmission_id, datagram);
             async_self.dispatcher.dispatch_in_progress = false;
             async_self.dispatcher.next_send_allowed_at =
                 Instant::now() + async_self.dispatcher.send_rate.send_delay;
-            async_self.udp.trigger(UdpRequest::Send {
+            async_self.udp_port.trigger(UdpRequest::Send {
                 socket_id,
                 transmission_id,
                 payload: encoded,
@@ -535,27 +549,22 @@ impl UDPourComponent {
 
     fn set_dispatch_timer(&mut self, delay: Duration) {
         self.clear_dispatch_timer();
-        let generation = self.dispatcher.next_dispatch_generation;
-        self.dispatcher.next_dispatch_generation =
-            self.dispatcher.next_dispatch_generation.wrapping_add(1);
-        let timer = self.schedule_once(delay, move |component, _| {
-            component.handle_dispatch_timeout(generation)
-        });
-        self.dispatcher.dispatch_timer = Some(DispatchTimerState { generation, timer });
+        let timer = self.schedule_once(delay, Self::handle_dispatch_timeout);
+        self.dispatcher.dispatch_timer = Some(timer);
     }
 
     fn clear_dispatch_timer(&mut self) {
         if let Some(timer) = self.dispatcher.dispatch_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_dispatch_timeout(&mut self, generation: usize) -> Handled {
-        let Some(timer) = self.dispatcher.dispatch_timer.take() else {
+    fn handle_dispatch_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+        let Some(active_timer) = self.dispatcher.dispatch_timer.take() else {
             return Handled::Ok;
         };
-        if timer.generation != generation {
-            self.dispatcher.dispatch_timer = Some(timer);
+        if active_timer != expected_timer {
+            self.dispatcher.dispatch_timer = Some(active_timer);
             return Handled::Ok;
         }
         self.try_dispatch_outbound();
@@ -566,7 +575,6 @@ impl UDPourComponent {
         let (promise, send) = ask.take();
         if self.socket_closed {
             let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
-                message_id: None,
                 reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
             });
             return Handled::Ok;
@@ -593,8 +601,11 @@ impl UDPourComponent {
                 );
             }
             Err(error) => {
+                error!(
+                    self.log(),
+                    "Sender state machine rejected UDPour submit: {error}"
+                );
                 let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
-                    message_id: None,
                     reason: UDPourSendFailureReason::State(classify_sender_error(&error)),
                 });
             }
@@ -603,13 +614,14 @@ impl UDPourComponent {
     }
 
     fn handle_udp_indication(&mut self, indication: UdpIndication) -> Handled {
+        if indication.socket_id() != Some(self.socket_id) {
+            return Handled::Ok;
+        }
         match indication {
             UdpIndication::Received {
-                socket_id,
-                source,
-                payload,
-            } if socket_id == self.socket_id => self.handle_received(source, payload),
-            UdpIndication::Closed { socket_id, .. } if socket_id == self.socket_id => {
+                source, payload, ..
+            } => self.handle_received(source, payload),
+            UdpIndication::Closed { .. } => {
                 self.handle_socket_closed();
                 Handled::Ok
             }
@@ -650,15 +662,8 @@ impl UDPourComponent {
                 }
             }
             UDPourFrame::NeedParts(frame) => match self.sender.handle_need_parts(&frame) {
-                Ok(Some(action)) => {
+                Ok(action) => {
                     self.handle_sender_action(action, Some(source));
-                }
-                Ok(None) => {
-                    debug!(
-                        self.log(),
-                        "NeedParts from {source} for message_id={} required no sender action",
-                        frame.header.message_id.0
-                    );
                 }
                 Err(error) => {
                     error!(
@@ -686,14 +691,12 @@ impl UDPourComponent {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
                     return Handled::Ok;
                 };
-                self.dispatcher.in_flight_datagrams =
-                    self.dispatcher.in_flight_datagrams.saturating_sub(1);
 
-                if let Some(message_id) = pending.datagram.message_id() {
+                if pending.counts_towards_sent() {
+                    let message_id = pending.message_id();
                     let mut promise = None;
                     let mut report_sent = false;
                     if let Some(outbound) = self.outbound.get_mut(&message_id)
-                        && pending.datagram.counts_towards_sent()
                         && !outbound.failure_reported
                         && !outbound.sent_reported
                     {
@@ -710,7 +713,7 @@ impl UDPourComponent {
                             .mark_initial_send_complete(message_id, Instant::now());
                     }
                     if let Some(promise) = promise {
-                        let _ = promise.fulfil(UDPourSubmitResult::Sent { message_id });
+                        let _ = promise.fulfil(UDPourSubmitResult::Sent);
                     }
                 }
                 self.try_dispatch_outbound();
@@ -723,26 +726,24 @@ impl UDPourComponent {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
                     return Handled::Ok;
                 };
-                self.dispatcher.in_flight_datagrams =
-                    self.dispatcher.in_flight_datagrams.saturating_sub(1);
                 if reason == SendFailureReason::Backpressure {
                     self.dispatcher.next_send_allowed_at = self
                         .dispatcher
                         .next_send_allowed_at
                         .max(Instant::now() + self.dispatcher.send_rate.backpressure_retry_delay);
-                    self.enqueue_front(pending.datagram);
+                    self.enqueue_front(pending);
                     return Handled::Ok;
                 }
-                if let Some(message_id) = pending.datagram.message_id() {
+                if pending.is_outbound_payload_datagram() {
                     self.report_send_failure(
-                        message_id,
+                        pending.message_id(),
                         UDPourSendFailureReason::Transport(reason),
                     );
                 } else {
                     error!(
                         self.log(),
                         "Dropping UDPour control frame to {} after terminal transport failure: {:?}",
-                        pending.datagram.target,
+                        pending.target,
                         reason
                     );
                 }
@@ -775,21 +776,11 @@ impl UDPourComponent {
                 );
             }
             SenderAction::Purged { message_id, .. } => {
-                let mut removed_in_flight = 0usize;
-                self.pending_transmissions.retain(|_, pending| {
-                    let keep = pending.datagram.message_id() != Some(message_id);
-                    if !keep {
-                        removed_in_flight += 1;
-                    }
-                    keep
-                });
-                self.dispatcher.in_flight_datagrams = self
-                    .dispatcher
-                    .in_flight_datagrams
-                    .saturating_sub(removed_in_flight);
+                self.pending_transmissions
+                    .retain(|_, pending| !pending.is_outbound_payload_for(message_id));
                 self.dispatcher
                     .queue
-                    .retain(|datagram| datagram.message_id() != Some(message_id));
+                    .retain(|datagram| !datagram.is_outbound_payload_for(message_id));
                 self.outbound.remove(&message_id);
                 self.try_dispatch_outbound();
             }
@@ -799,20 +790,9 @@ impl UDPourComponent {
     fn handle_receiver_action(&mut self, action: ReceiverAction) {
         match action {
             ReceiverAction::Deliver {
-                source,
-                message_id,
-                payload,
-                part_count,
-                checksum,
+                source, payload, ..
             } => {
-                self.transfer
-                    .trigger(UDPourPortIndication::Deliver(UDPourDeliver {
-                        source,
-                        message_id,
-                        payload,
-                        part_count,
-                        checksum,
-                    }));
+                self.udpour_port.trigger(UDPourDeliver { source, payload });
             }
             ReceiverAction::SendAck { source, frame } => {
                 self.dispatch_control_frame(source, UDPourFrame::Ack(frame));
@@ -844,7 +824,7 @@ impl UDPourComponent {
         let target = outbound.target;
         let datagrams = frames
             .into_iter()
-            .map(|frame| QueuedDatagram::payload(message_id, target, frame, counts_towards_sent));
+            .map(|frame| QueuedDatagram::payload(target, frame, counts_towards_sent));
         if counts_towards_sent {
             self.enqueue_back_all(datagrams);
         } else {
@@ -878,7 +858,6 @@ impl UDPourComponent {
         };
         if let Some(promise) = promise {
             let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
-                message_id: Some(message_id),
                 reason: reason.expect("submit promise can only be present when reporting failure"),
             });
         }
@@ -897,7 +876,6 @@ impl UDPourComponent {
         self.clear_dispatch_timer();
         self.dispatcher.dispatch_in_progress = false;
         self.dispatcher.queue.clear();
-        self.dispatcher.in_flight_datagrams = 0;
         self.pending_transmissions.clear();
 
         let outstanding_message_ids: Vec<_> = self.outbound.keys().copied().collect();
@@ -933,26 +911,22 @@ impl UDPourComponent {
 
     fn set_poll_timer(&mut self) {
         self.clear_poll_timer();
-        let generation = self.next_poll_generation;
-        self.next_poll_generation = self.next_poll_generation.wrapping_add(1);
-        let timer = self.schedule_once(self.config.poll_interval, move |component, _| {
-            component.handle_poll_timeout(generation)
-        });
-        self.poll_timer = Some(PollTimerState { generation, timer });
+        let timer = self.schedule_once(self.config.poll_interval, Self::handle_poll_timeout);
+        self.poll_timer = Some(timer);
     }
 
     fn clear_poll_timer(&mut self) {
         if let Some(timer) = self.poll_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_poll_timeout(&mut self, generation: usize) -> Handled {
-        let Some(timer) = self.poll_timer.take() else {
+    fn handle_poll_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+        let Some(active_timer) = self.poll_timer.take() else {
             return Handled::Ok;
         };
-        if timer.generation != generation {
-            self.poll_timer = Some(timer);
+        if active_timer != expected_timer {
+            self.poll_timer = Some(active_timer);
             return Handled::Ok;
         }
         self.poll_runtime();
@@ -983,8 +957,8 @@ impl ComponentLifecycle for UDPourComponent {
 }
 
 impl Provide<UDPourPort> for UDPourComponent {
-    fn handle(&mut self, request: Never) -> Handled {
-        match request {}
+    fn handle(&mut self, _request: Never) -> Handled {
+        unreachable!("Never cannot be triggered");
     }
 }
 
@@ -1007,18 +981,6 @@ impl LocalActor for UDPourComponent {
 
 impl_local_actor!(UDPourComponent);
 
-#[derive(Clone, Debug)]
-struct PollTimerState {
-    generation: usize,
-    timer: ScheduledTimer,
-}
-
-#[derive(Clone, Debug)]
-struct DispatchTimerState {
-    generation: usize,
-    timer: ScheduledTimer,
-}
-
 #[derive(Debug)]
 struct OutboundTransfer {
     target: SocketAddr,
@@ -1028,26 +990,27 @@ struct OutboundTransfer {
     pending_initial_transmissions: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QueuedDatagramKind {
+    Payload { counts_towards_sent: bool },
+    Control,
+}
+
 #[derive(Clone, Debug)]
 struct QueuedDatagram {
     target: SocketAddr,
     frame: UDPourFrame,
-    message_id: Option<MessageId>,
-    counts_towards_sent: bool,
+    kind: QueuedDatagramKind,
 }
 
 impl QueuedDatagram {
-    fn payload(
-        message_id: MessageId,
-        target: SocketAddr,
-        frame: PayloadFrame,
-        counts_towards_sent: bool,
-    ) -> Self {
+    fn payload(target: SocketAddr, frame: PayloadFrame, counts_towards_sent: bool) -> Self {
         Self {
             target,
             frame: UDPourFrame::Payload(frame),
-            message_id: Some(message_id),
-            counts_towards_sent,
+            kind: QueuedDatagramKind::Payload {
+                counts_towards_sent,
+            },
         }
     }
 
@@ -1055,8 +1018,7 @@ impl QueuedDatagram {
         Self {
             target,
             frame,
-            message_id: None,
-            counts_towards_sent: false,
+            kind: QueuedDatagramKind::Control,
         }
     }
 
@@ -1064,18 +1026,34 @@ impl QueuedDatagram {
         self.frame.header().frame_type
     }
 
-    fn message_id(&self) -> Option<MessageId> {
-        self.message_id
+    fn message_id(&self) -> MessageId {
+        self.frame.header().message_id
     }
 
     fn counts_towards_sent(&self) -> bool {
-        self.counts_towards_sent
+        matches!(
+            self.kind,
+            QueuedDatagramKind::Payload {
+                counts_towards_sent: true
+            }
+        )
     }
-}
 
-#[derive(Clone, Debug)]
-struct PendingTransmission {
-    datagram: QueuedDatagram,
+    /// Returns whether this queued datagram is one sender-originated payload frame that belongs
+    /// to a logical outbound submit tracked in `outbound`.
+    fn is_outbound_payload_datagram(&self) -> bool {
+        matches!(self.kind, QueuedDatagramKind::Payload { .. })
+    }
+
+    /// Returns whether this queued datagram is one outbound payload frame for the given logical
+    /// sender `message_id`.
+    ///
+    /// Control traffic also carries a `message_id`, but that only correlates protocol state. It
+    /// does not mean the control datagram should be purged together with the sender-side lifetime
+    /// of that logical outbound submit.
+    fn is_outbound_payload_for(&self, message_id: MessageId) -> bool {
+        self.is_outbound_payload_datagram() && self.message_id() == message_id
+    }
 }
 
 async fn encode_frame_with_pool(
@@ -1099,7 +1077,7 @@ async fn encode_frame_with_pool(
             let adopt_result = writer.adopt_payload(payload.clone()).await;
             match adopt_result {
                 Ok(()) => {}
-                Err(IoError::SharedIoPayloadOwnership) => {
+                Err(Error::SharedIoPayloadOwnership) => {
                     writer.copy_payload(payload).await.context(IoSnafu)?;
                 }
                 Err(source) => return Err(RuntimeEncodeError::Io { source }),
@@ -1141,9 +1119,10 @@ fn classify_sender_error(error: &SenderError) -> UDPourStateFailure {
             payload_len: *payload_len,
             max_part_payload_len: *max_part_payload_len,
         },
-        SenderError::InvalidPartCount { .. } => UDPourStateFailure::InvalidPartCount,
+        SenderError::InvalidPartCount { .. } | SenderError::RequestedPartOutOfRange { .. } => {
+            UDPourStateFailure::InvalidPartCount
+        }
         SenderError::MessageIdExhausted => UDPourStateFailure::MessageIdExhausted,
-        SenderError::RequestedPartOutOfRange { .. } => UDPourStateFailure::InvalidPartCount,
     }
 }
 

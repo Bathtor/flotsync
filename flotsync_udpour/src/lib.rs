@@ -157,6 +157,7 @@
 //! - it emits fully reassembled inbound deliveries
 //! - it surfaces route-transport send failures separately from higher-level
 //!   semantic-delivery acknowledgments
+#![feature(deque_extend_front)]
 
 mod codec;
 mod receiver;
@@ -178,7 +179,6 @@ pub use crate::{
         UDPourDeliver,
         UDPourEncodeFailure,
         UDPourPort,
-        UDPourPortIndication,
         UDPourSend,
         UDPourSendFailureReason,
         UDPourStateFailure,

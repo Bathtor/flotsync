@@ -30,8 +30,8 @@ use flotsync_udpour::{
     UDPourComponent,
     UDPourComponentMessage,
     UDPourConfig,
+    UDPourDeliver,
     UDPourPort,
-    UDPourPortIndication,
     UDPourSend,
     UDPourSendFailureReason,
     UDPourSubmitResult,
@@ -557,7 +557,7 @@ impl RouteTransportManager {
             ))
         });
         match submit.await {
-            Ok(UDPourSubmitResult::Sent { .. }) => {
+            Ok(UDPourSubmitResult::Sent) => {
                 let Some(_) = self.pending_sends.remove(&send_id) else {
                     return;
                 };
@@ -567,7 +567,7 @@ impl RouteTransportManager {
                         coverage_key,
                     });
             }
-            Ok(UDPourSubmitResult::SendFailed { reason, .. }) => {
+            Ok(UDPourSubmitResult::SendFailed { reason }) => {
                 self.fail_pending_send(
                     send_id,
                     coverage_key,
@@ -606,14 +606,10 @@ impl RouteTransportManager {
             .trigger(ConnectionInfoIndication::ReportRouteFailed { route, reason });
     }
 
-    fn handle_udp_runtime_indication(&mut self, indication: UDPourPortIndication) -> Handled {
-        match indication {
-            UDPourPortIndication::Deliver(deliver) => {
-                let _ = deliver;
-                // TODO(flotsync-zup): Route inbound UDPour deliveries into the
-                // semantic-delivery demux once inbound ownership is specified.
-            }
-        }
+    fn handle_udp_runtime_indication(&mut self, deliver: UDPourDeliver) -> Handled {
+        let _ = deliver;
+        // TODO(flotsync-zup): Route inbound UDPour deliveries into the
+        // semantic-delivery demux once inbound ownership is specified.
         Handled::Ok
     }
 
@@ -791,7 +787,7 @@ impl Provide<TransportConnectionInfoPort> for RouteTransportManager {
 }
 
 impl Require<UDPourPort> for RouteTransportManager {
-    fn handle(&mut self, indication: UDPourPortIndication) -> Handled {
+    fn handle(&mut self, indication: UDPourDeliver) -> Handled {
         self.handle_udp_runtime_indication(indication)
     }
 }

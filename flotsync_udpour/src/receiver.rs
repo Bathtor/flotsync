@@ -177,10 +177,7 @@ impl ReceiverMachine {
                     smallvec![
                         ReceiverAction::Deliver {
                             source: key.source,
-                            message_id,
                             payload,
-                            part_count,
-                            checksum,
                         },
                         ReceiverAction::SendAck {
                             source: key.source,
@@ -295,13 +292,7 @@ impl ReceiverMachine {
                     UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
                         .expect("Ack metadata gathered from a valid transfer must stay valid");
                 smallvec![
-                    ReceiverAction::Deliver {
-                        source,
-                        message_id,
-                        payload,
-                        part_count,
-                        checksum,
-                    },
+                    ReceiverAction::Deliver { source, payload },
                     ReceiverAction::SendAck {
                         source,
                         frame: AckFrame { header },
@@ -344,13 +335,7 @@ impl ReceiverMachine {
                     UDPourHeader::control(FrameType::Ack, message_id, part_count, checksum)
                         .expect("Ack metadata gathered from a valid transfer must stay valid");
                 smallvec![
-                    ReceiverAction::Deliver {
-                        source,
-                        message_id,
-                        payload,
-                        part_count,
-                        checksum,
-                    },
+                    ReceiverAction::Deliver { source, payload },
                     ReceiverAction::SendAck {
                         source,
                         frame: AckFrame { header },
@@ -393,10 +378,7 @@ pub(crate) enum ReceiverAction {
     /// Deliver one fully reassembled logical payload upward.
     Deliver {
         source: SocketAddr,
-        message_id: MessageId,
         payload: IoPayload,
-        part_count: PartCount,
-        checksum: Checksum,
     },
     /// Send one successful receiver acknowledgment back to the sender.
     SendAck { source: SocketAddr, frame: AckFrame },

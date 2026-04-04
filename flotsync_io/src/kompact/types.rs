@@ -183,6 +183,28 @@ pub enum UdpIndication {
     },
 }
 
+impl UdpIndication {
+    /// Returns the concrete socket id for indications that refer to one live shared UDP socket.
+    ///
+    /// Bind/connect failures happen before a socket becomes usable and therefore do not yet have a
+    /// bridge-local [`SocketId`].
+    pub fn socket_id(&self) -> Option<SocketId> {
+        match self {
+            Self::Bound { socket_id, .. }
+            | Self::Connected { socket_id, .. }
+            | Self::Received { socket_id, .. }
+            | Self::Configured { socket_id, .. }
+            | Self::ConfigureFailed { socket_id, .. }
+            | Self::ReadSuspended { socket_id }
+            | Self::ReadResumed { socket_id }
+            | Self::WriteSuspended { socket_id }
+            | Self::WriteResumed { socket_id }
+            | Self::Closed { socket_id, .. } => Some(*socket_id),
+            Self::BindFailed { .. } | Self::ConnectFailed { .. } => None,
+        }
+    }
+}
+
 /// Private reply channel outcome for one UDP send operation.
 #[derive(Clone, Debug)]
 pub enum UdpSendResult {

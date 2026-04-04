@@ -120,16 +120,16 @@ impl SenderMachine {
     pub fn handle_need_parts(
         &mut self,
         need_parts: &NeedPartsFrame,
-    ) -> Result<Option<SenderAction>, SenderError> {
+    ) -> Result<SenderAction, SenderError> {
         let Some(live) = self.live.get(&need_parts.header.message_id) else {
-            return Ok(Some(SenderAction::SendNoLongerAvailable {
+            return Ok(SenderAction::SendNoLongerAvailable {
                 frame: need_parts.no_longer_available_frame(),
-            }));
+            });
         };
         if !live.matches(need_parts.header.part_count, need_parts.header.checksum) {
-            return Ok(Some(SenderAction::SendNoLongerAvailable {
+            return Ok(SenderAction::SendNoLongerAvailable {
                 frame: need_parts.no_longer_available_frame(),
-            }));
+            });
         }
 
         // TODO(flotsync-2hd): Stream NeedParts responses directly into the runtime send path
@@ -139,10 +139,10 @@ impl SenderMachine {
             self.config.max_part_payload_len,
             &need_parts.missing_parts,
         )?;
-        Ok(Some(SenderAction::SendPayloads {
+        Ok(SenderAction::SendPayloads {
             message_id: need_parts.header.message_id,
             frames,
-        }))
+        })
     }
 
     /// Purges expired retained messages and moves their ids into cooldown.
@@ -516,7 +516,7 @@ mod tests {
             .unwrap(),
             missing_parts,
         };
-        let Some(SenderAction::SendPayloads { frames, .. }) =
+        let SenderAction::SendPayloads { frames, .. } =
             sender.handle_need_parts(&need_parts).unwrap()
         else {
             panic!("expected resend");
@@ -546,7 +546,7 @@ mod tests {
             missing_parts,
         };
 
-        let Some(SenderAction::SendNoLongerAvailable { frame }) =
+        let SenderAction::SendNoLongerAvailable { frame } =
             sender.handle_need_parts(&need_parts).unwrap()
         else {
             panic!("expected NoLongerAvailable");
