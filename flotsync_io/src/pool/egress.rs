@@ -18,6 +18,7 @@ use bytes::{Buf, BufMut, Bytes, buf::UninitSlice};
 use slog::{error, warn};
 use std::{
     io,
+    ops::Range,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, Weak},
     task::{Context, Poll},
@@ -233,15 +234,10 @@ pub trait PayloadWriter {
     }
 
     /// Writes one readable sub-range from an existing payload by copying it into this writer.
-    async fn copy_payload_slice(
-        &mut self,
-        payload: &IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()> {
+    async fn copy_payload_slice(&mut self, payload: &IoPayload, range: Range<usize>) -> Result<()> {
         let payload_len = payload.len();
-        let Some(slice) = payload.clone().try_slice(offset, len) else {
-            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        let Some(slice) = payload.clone().try_slice(range.clone()) else {
+            return Err(invalid_payload_slice_range(payload_len, range));
         };
         self.copy_payload(&slice).await
     }
@@ -271,12 +267,7 @@ pub trait PayloadWriter {
     }
 
     /// Adopts one readable sub-range from an owned payload fragment.
-    async fn adopt_payload_slice(
-        &mut self,
-        payload: IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()>;
+    async fn adopt_payload_slice(&mut self, payload: IoPayload, range: Range<usize>) -> Result<()>;
 
     /// Writes a boolean as `0` or `1`.
     async fn write_bool(&mut self, value: bool) -> Result<()> {
@@ -797,15 +788,10 @@ impl PayloadWriter for EgressAsyncWriter {
         self.adopt_payload_part(payload)
     }
 
-    async fn adopt_payload_slice(
-        &mut self,
-        payload: IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()> {
+    async fn adopt_payload_slice(&mut self, payload: IoPayload, range: Range<usize>) -> Result<()> {
         let payload_len = payload.len();
-        let Some(slice) = payload.try_slice(offset, len) else {
-            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        let Some(slice) = payload.try_slice(range.clone()) else {
+            return Err(invalid_payload_slice_range(payload_len, range));
         };
         self.adopt_payload_part(slice)
     }
@@ -955,10 +941,10 @@ impl io::Write for EgressReservedWriter<'_> {
     }
 }
 
-fn invalid_payload_slice_range(payload_len: usize, offset: usize, len: usize) -> Error {
+fn invalid_payload_slice_range(payload_len: usize, range: Range<usize>) -> Error {
     Error::InvalidIoPayloadSliceRange {
-        offset,
-        len,
+        start: range.start,
+        end: range.end,
         payload_len,
     }
 }

@@ -61,6 +61,7 @@ use std::{
     cmp::Reverse,
     collections::VecDeque,
     net::SocketAddr,
+    num::NonZeroUsize,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -750,7 +751,11 @@ fn bind_socket(
 }
 
 fn default_sender_config(retention_timeout: Duration) -> SenderConfig {
-    SenderConfig::new(4, retention_timeout, Duration::from_millis(100)).unwrap()
+    SenderConfig::new(
+        NonZeroUsize::new(4).unwrap(),
+        retention_timeout,
+        Duration::from_millis(100),
+    )
 }
 
 fn default_receiver_config(repair_interval: Duration) -> ReceiverConfig {
@@ -989,8 +994,11 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
 
 #[test]
 fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
-    let sender_config =
-        SenderConfig::new(4, Duration::from_millis(80), Duration::from_millis(40)).unwrap();
+    let sender_config = SenderConfig::new(
+        NonZeroUsize::new(4).unwrap(),
+        Duration::from_millis(80),
+        Duration::from_millis(40),
+    );
     let harness = RuntimeHarness::new(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,

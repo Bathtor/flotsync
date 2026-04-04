@@ -37,7 +37,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
         FrameType::Payload => {
             let body = payload
                 .clone()
-                .try_slice(FRAME_HEADER_LEN, body_len)
+                .try_slice(FRAME_HEADER_LEN..FRAME_HEADER_LEN + body_len)
                 .context(InvalidPayloadSliceSnafu {
                     payload_len: payload.len(),
                     offset: FRAME_HEADER_LEN,
@@ -72,7 +72,7 @@ pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError
             ensure!(body_len > 0, EmptyNeedPartsSnafu);
             let body = payload
                 .clone()
-                .try_slice(FRAME_HEADER_LEN, body_len)
+                .try_slice(FRAME_HEADER_LEN..FRAME_HEADER_LEN + body_len)
                 .context(InvalidPayloadSliceSnafu {
                     payload_len: payload.len(),
                     offset: FRAME_HEADER_LEN,

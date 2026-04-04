@@ -3,25 +3,16 @@
 //! This module owns sender-local `message_id` allocation, bounded retention of
 //! original payload parts, and late repair behavior.
 
-use crate::types::{
-    AckFrame,
-    Checksum,
-    FrameFlags,
-    FrameType,
-    MessageId,
-    NeedPartsFrame,
-    NoLongerAvailableFrame,
-    PartCount,
-    PartNumber,
-    PayloadFrame,
-    UDPourHeader,
-};
+use crate::types::*;
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
+use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 use snafu::prelude::*;
 use std::{
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 
@@ -29,11 +20,11 @@ use std::{
 #[derive(Clone, Debug)]
 pub struct SenderConfig {
     /// Maximum payload bytes carried by one non-final `Payload` frame.
-    pub max_part_payload_len: usize,
+    pub max_part_payload_len: NonZeroUsize,
     /// How long the sender retains parts for repair after the initial send.
     pub retention_timeout: Duration,
     /// How long a purged `message_id` must stay out of circulation before reuse.
-    pub reuse_cooldown: Duration,
+    pub id_reuse_cooldown: Duration,
     /// Whether one observed `Ack` should immediately purge the retained message.
     pub eager_ack_cleanup: bool,
 }
@@ -42,17 +33,16 @@ impl SenderConfig {
     /// Basic sender configuration with shared-route-safe defaults.
     #[cfg(test)]
     pub(crate) fn new(
-        max_part_payload_len: usize,
+        max_part_payload_len: NonZeroUsize,
         retention_timeout: Duration,
-        reuse_cooldown: Duration,
-    ) -> Result<Self, SenderError> {
-        ensure!(max_part_payload_len > 0, ZeroMaxPartPayloadLenSnafu);
-        Ok(Self {
+        id_reuse_cooldown: Duration,
+    ) -> Self {
+        Self {
             max_part_payload_len,
             retention_timeout,
-            reuse_cooldown,
+            id_reuse_cooldown,
             eager_ack_cleanup: false,
-        })
+        }
     }
 }
 
@@ -60,16 +50,10 @@ impl SenderConfig {
 #[derive(Debug)]
 pub(crate) struct SenderMachine {
     config: SenderConfig,
-    next_message_id: u32,
+    next_message_id: MessageId,
     live: HashMap<MessageId, LiveMessage>,
-    cooldown: HashMap<MessageId, Instant>,
+    cooldown: CooldownIds,
 }
-
-/// Sender timeout polling only emits purge actions for expired retained messages.
-///
-/// The per-tick action list is therefore usually tiny even though the individual
-/// `SendPayloads` action can still carry a large payload-frame `Vec`.
-type SenderActions = SmallVec<[SenderAction; 2]>;
 
 impl SenderMachine {
     /// Creates one new sender state machine.
@@ -81,9 +65,9 @@ impl SenderMachine {
     pub fn with_initial_message_id(config: SenderConfig, next_message_id: MessageId) -> Self {
         Self {
             config,
-            next_message_id: next_message_id.0,
+            next_message_id,
             live: HashMap::new(),
-            cooldown: HashMap::new(),
+            cooldown: CooldownIds::new(),
         }
     }
 
@@ -93,9 +77,8 @@ impl SenderMachine {
         payload: IoPayload,
         now: Instant,
     ) -> Result<SenderAction, SenderError> {
-        self.collect_expired_cooldown(now);
         let message_id = self.allocate_message_id(now)?;
-        let checksum = checksum_payload(&payload);
+        let checksum = calculate_payload_checksum(&payload);
         let part_count = part_count_for_payload(payload.len(), self.config.max_part_payload_len)?;
         let live_message = LiveMessage {
             payload,
@@ -103,8 +86,8 @@ impl SenderMachine {
             part_count,
             expires_at: None,
         };
-        // TODO(flotsync-2hd): Stream payload frames directly into the runtime send path instead
-        // of materializing one Vec<PayloadFrame> per logical send.
+        // TODO(flotsync-2hd): Stream initial payload frames directly into the runtime send path
+        // instead of materializing one Vec<PayloadFrame> per logical send.
         let frames = live_message.all_payload_frames(message_id, self.config.max_part_payload_len);
         self.live.insert(message_id, live_message);
         Ok(SenderAction::SendPayloads { message_id, frames })
@@ -120,51 +103,51 @@ impl SenderMachine {
 
     /// Handles one receiver acknowledgment.
     pub fn handle_ack(&mut self, ack: &AckFrame, now: Instant) -> Option<SenderAction> {
-        self.collect_expired_cooldown(now);
         let live = self.live.get(&ack.header.message_id)?;
         if !live.matches(ack.header.part_count, ack.header.checksum) {
             return None;
         }
         if self.config.eager_ack_cleanup {
-            return self.purge_message(ack.header.message_id, now, SenderPurgeReason::Acked);
+            self.purge_message(ack.header.message_id, now, SenderPurgeReason::Acked)
+        } else {
+            Some(SenderAction::ObservedAck {
+                message_id: ack.header.message_id,
+            })
         }
-        Some(SenderAction::ObservedAck {
-            message_id: ack.header.message_id,
-        })
     }
 
     /// Handles one receiver repair request.
     pub fn handle_need_parts(
         &mut self,
         need_parts: &NeedPartsFrame,
-        now: Instant,
-    ) -> Option<SenderAction> {
-        self.collect_expired_cooldown(now);
+    ) -> Result<Option<SenderAction>, SenderError> {
         let Some(live) = self.live.get(&need_parts.header.message_id) else {
-            return Some(SenderAction::SendNoLongerAvailable {
-                frame: no_longer_available_frame(need_parts.header),
-            });
+            return Ok(Some(SenderAction::SendNoLongerAvailable {
+                frame: need_parts.no_longer_available_frame(),
+            }));
         };
         if !live.matches(need_parts.header.part_count, need_parts.header.checksum) {
-            return Some(SenderAction::SendNoLongerAvailable {
-                frame: no_longer_available_frame(need_parts.header),
-            });
+            return Ok(Some(SenderAction::SendNoLongerAvailable {
+                frame: need_parts.no_longer_available_frame(),
+            }));
         }
 
+        // TODO(flotsync-2hd): Stream NeedParts responses directly into the runtime send path
+        // instead of materializing one Vec<PayloadFrame> per repair response.
         let frames = live.payload_frames_for_missing_parts(
             need_parts.header.message_id,
             self.config.max_part_payload_len,
             &need_parts.missing_parts,
-        );
-        Some(SenderAction::SendPayloads {
+        )?;
+        Ok(Some(SenderAction::SendPayloads {
             message_id: need_parts.header.message_id,
             frames,
-        })
+        }))
     }
 
     /// Purges expired retained messages and moves their ids into cooldown.
     pub fn poll_timeouts(&mut self, now: Instant) -> SenderActions {
-        self.collect_expired_cooldown(now);
+        self.cooldown.gc_expired(now);
         let expired_ids: Vec<_> = self
             .live
             .iter()
@@ -187,29 +170,25 @@ impl SenderMachine {
 
     /// Aborts one live logical message and moves its `message_id` into cooldown immediately.
     pub fn abort_transfer(&mut self, message_id: MessageId, now: Instant) -> Option<SenderAction> {
-        self.collect_expired_cooldown(now);
         self.purge_message(message_id, now, SenderPurgeReason::Aborted)
     }
 
     fn allocate_message_id(&mut self, now: Instant) -> Result<MessageId, SenderError> {
-        for _ in 0..=u32::MAX {
-            let candidate = MessageId(self.next_message_id);
-            self.next_message_id = self.next_message_id.wrapping_add(1);
+        self.cooldown.gc_expired(now);
+        'search_loop: for _ in 0..=u32::MAX {
+            let candidate = self.next_message_id;
+            self.next_message_id.wrapping_increment();
             if self.live.contains_key(&candidate) {
-                continue;
+                // Id is still in use.
+                continue 'search_loop;
             }
-            if let Some(cooldown_expires_at) = self.cooldown.get(&candidate)
-                && *cooldown_expires_at > now
-            {
-                continue;
+            if self.cooldown.contains(candidate) {
+                // Id is still in cooldown.
+                continue 'search_loop;
             }
             return Ok(candidate);
         }
         MessageIdExhaustedSnafu.fail()
-    }
-
-    fn collect_expired_cooldown(&mut self, now: Instant) {
-        self.cooldown.retain(|_, expires_at| *expires_at > now);
     }
 
     fn purge_message(
@@ -220,10 +199,14 @@ impl SenderMachine {
     ) -> Option<SenderAction> {
         self.live.remove(&message_id)?;
         self.cooldown
-            .insert(message_id, now + self.config.reuse_cooldown);
+            .insert(message_id, now + self.config.id_reuse_cooldown);
         Some(SenderAction::Purged { message_id, reason })
     }
 }
+
+/// Most sender methods only return < 2 actions even though the individual
+/// `SendPayloads` action can still carry a large payload-frame `Vec`.
+pub(crate) type SenderActions = SmallVec<[SenderAction; 2]>;
 
 /// Sender-facing outcomes from one state-machine interaction.
 #[derive(Clone, Debug, PartialEq)]
@@ -248,16 +231,17 @@ pub(crate) enum SenderAction {
 /// Why one sender-side live transfer was purged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SenderPurgeReason {
+    /// The receiver acknowledged the message and sender policy allowed eager cleanup.
     Acked,
+    /// The runtime aborted the logical send after a terminal lower-layer failure.
     Aborted,
+    /// The sender-side retention window expired naturally.
     RetentionExpired,
 }
 
 /// Sender-side errors.
 #[derive(Debug, Snafu)]
 pub(crate) enum SenderError {
-    #[snafu(display("max_part_payload_len must be greater than zero"))]
-    ZeroMaxPartPayloadLen,
     #[snafu(display(
         "Payload of {payload_len} bytes would exceed the supported part count for max_part_payload_len={max_part_payload_len}"
     ))]
@@ -272,12 +256,21 @@ pub(crate) enum SenderError {
     },
     #[snafu(display("All message ids are currently live or cooling down"))]
     MessageIdExhausted,
+    #[snafu(display(
+        "NeedParts requested part {part_number} but the retained message only has {part_count} parts"
+    ))]
+    RequestedPartOutOfRange { part_number: u32, part_count: u32 },
 }
 
+/// Calculates how many multipart payload frames are needed to carry `payload_len` bytes.
+///
+/// Zero-length logical payloads still occupy one empty payload frame so the receiver can observe
+/// one complete message with checksum and part metadata.
 fn part_count_for_payload(
     payload_len: usize,
-    max_part_payload_len: usize,
+    max_part_payload_len: NonZeroUsize,
 ) -> Result<PartCount, SenderError> {
+    let max_part_payload_len = max_part_payload_len.get();
     let part_count = payload_len.max(1).div_ceil(max_part_payload_len);
     let part_count = u32::try_from(part_count).context(TooManyPartsSnafu {
         payload_len,
@@ -286,35 +279,29 @@ fn part_count_for_payload(
     PartCount::new(part_count).context(InvalidPartCountSnafu)
 }
 
-fn slice_part(
+/// Returns the retained payload slice for one concrete multipart payload part.
+///
+/// All non-final parts have exactly `max_part_payload_len` bytes. The final part may be shorter
+/// so the returned range is trimmed to the logical payload length.
+fn get_slice_for_part(
     payload: IoPayload,
-    max_part_payload_len: usize,
+    max_part_payload_len: NonZeroUsize,
     part_number: PartNumber,
     part_count: PartCount,
 ) -> IoPayload {
+    let max_part_payload_len = max_part_payload_len.get();
     let start = part_number.0 as usize * max_part_payload_len;
-    let end = if part_number == part_count.last_part_number() {
-        payload.len()
+    let len = if part_number == part_count.last_part_number() {
+        payload.len().saturating_sub(start)
     } else {
-        (start + max_part_payload_len).min(payload.len())
+        max_part_payload_len
     };
     payload
-        .try_slice(start, end - start)
+        .try_slice(start..start + len)
         .expect("payload part range must stay inside the retained payload")
 }
 
-fn no_longer_available_frame(header: UDPourHeader) -> NoLongerAvailableFrame {
-    let header = UDPourHeader::control(
-        FrameType::NoLongerAvailable,
-        header.message_id,
-        header.part_count,
-        header.checksum,
-    )
-    .expect("NeedParts metadata must always produce a valid NoLongerAvailable header");
-    NoLongerAvailableFrame { header }
-}
-
-fn checksum_payload(payload: &IoPayload) -> Checksum {
+fn calculate_payload_checksum(payload: &IoPayload) -> Checksum {
     let mut cursor = payload.cursor();
     let mut checksum = 0u32;
     while cursor.has_remaining() {
@@ -336,6 +323,56 @@ struct LiveMessage {
     expires_at: Option<Instant>,
 }
 
+/// Membership plus expiry tracking for sender ids that are temporarily cooling down.
+///
+/// Cooldown ids are garbage-collected lazily right before id allocation and during regular sender
+/// timeout polling. That keeps the hot acknowledgment/repair paths free of unrelated cleanup work.
+///
+/// Each `MessageId` may enter cooldown at most once before expiry. Re-inserting an id that is
+/// still present indicates a sender-state bug, so `insert` asserts that this never happens.
+#[derive(Debug)]
+struct CooldownIds {
+    ids: RoaringBitmap,
+    expirations: BinaryHeap<Reverse<(Instant, MessageId)>>,
+}
+
+impl CooldownIds {
+    fn new() -> Self {
+        Self {
+            ids: RoaringBitmap::new(),
+            expirations: BinaryHeap::new(),
+        }
+    }
+
+    fn contains(&self, message_id: MessageId) -> bool {
+        self.ids.contains(message_id.0)
+    }
+
+    /// Inserts one newly cooled-down id.
+    ///
+    /// This asserts that the id was not already cooling down, because sender logic must not purge
+    /// the same live transfer twice without first waiting for cooldown expiry and reallocation.
+    fn insert(&mut self, message_id: MessageId, expires_at: Instant) {
+        assert!(
+            !self.ids.contains(message_id.0),
+            "message_id {} entered cooldown twice before expiry",
+            message_id.0
+        );
+        self.ids.insert(message_id.0);
+        self.expirations.push(Reverse((expires_at, message_id)));
+    }
+
+    fn gc_expired(&mut self, now: Instant) {
+        while let Some(Reverse((expires_at, message_id))) = self.expirations.peek().copied() {
+            if expires_at > now {
+                break;
+            }
+            self.expirations.pop();
+            self.ids.remove(message_id.0);
+        }
+    }
+}
+
 impl LiveMessage {
     fn matches(&self, part_count: PartCount, checksum: Checksum) -> bool {
         self.part_count == part_count && self.checksum == checksum
@@ -344,7 +381,7 @@ impl LiveMessage {
     fn all_payload_frames(
         &self,
         message_id: MessageId,
-        max_part_payload_len: usize,
+        max_part_payload_len: NonZeroUsize,
     ) -> Vec<PayloadFrame> {
         (0..self.part_count.get())
             .map(|part_number| {
@@ -361,12 +398,21 @@ impl LiveMessage {
     fn payload_frames_for_missing_parts(
         &self,
         message_id: MessageId,
-        max_part_payload_len: usize,
-        missing_parts: &roaring::RoaringBitmap,
-    ) -> Vec<PayloadFrame> {
-        missing_parts
+        max_part_payload_len: NonZeroUsize,
+        missing_parts: &RoaringBitmap,
+    ) -> Result<Vec<PayloadFrame>, SenderError> {
+        if let Some(max_requested_part) = missing_parts.max()
+            && max_requested_part >= self.part_count.get()
+        {
+            return RequestedPartOutOfRangeSnafu {
+                part_number: max_requested_part,
+                part_count: self.part_count.get(),
+            }
+            .fail();
+        }
+
+        let frames = missing_parts
             .iter()
-            .filter(|part_number| *part_number < self.part_count.get())
             .map(|part_number| {
                 self.payload_frame(
                     message_id,
@@ -375,17 +421,18 @@ impl LiveMessage {
                     FrameFlags::DEFAULT.with_retransmit(),
                 )
             })
-            .collect()
+            .collect::<Vec<_>>();
+        Ok(frames)
     }
 
     fn payload_frame(
         &self,
         message_id: MessageId,
-        max_part_payload_len: usize,
+        max_part_payload_len: NonZeroUsize,
         part_number: PartNumber,
         flags: FrameFlags,
     ) -> PayloadFrame {
-        let payload = slice_part(
+        let payload = get_slice_for_part(
             self.payload.clone(),
             max_part_payload_len,
             part_number,
@@ -409,9 +456,42 @@ mod tests {
     use roaring::RoaringBitmap;
 
     #[test]
+    fn cooldown_ids_track_membership_until_gc_runs() {
+        let now = Instant::now();
+        let mut cooldown = CooldownIds::new();
+        let first = MessageId(7);
+        let second = MessageId(9);
+
+        cooldown.insert(first, now + Duration::from_millis(10));
+        cooldown.insert(second, now + Duration::from_millis(20));
+
+        assert!(cooldown.contains(first));
+        assert!(cooldown.contains(second));
+
+        cooldown.gc_expired(now + Duration::from_millis(15));
+
+        assert!(!cooldown.contains(first));
+        assert!(cooldown.contains(second));
+    }
+
+    #[test]
+    #[should_panic(expected = "entered cooldown twice before expiry")]
+    fn cooldown_ids_panics_on_duplicate_insert() {
+        let now = Instant::now();
+        let mut cooldown = CooldownIds::new();
+        let message_id = MessageId(11);
+
+        cooldown.insert(message_id, now + Duration::from_millis(10));
+        cooldown.insert(message_id, now + Duration::from_millis(30));
+    }
+
+    #[test]
     fn splits_payload_and_retransmits_missing_parts() {
-        let config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
 
@@ -437,7 +517,7 @@ mod tests {
             missing_parts,
         };
         let Some(SenderAction::SendPayloads { frames, .. }) =
-            sender.handle_need_parts(&need_parts, now)
+            sender.handle_need_parts(&need_parts).unwrap()
         else {
             panic!("expected resend");
         };
@@ -448,10 +528,12 @@ mod tests {
 
     #[test]
     fn sends_no_longer_available_for_unknown_message() {
-        let config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let mut sender = SenderMachine::new(config);
-        let now = Instant::now();
         let missing_parts = RoaringBitmap::from([0]);
         let need_parts = NeedPartsFrame {
             header: UDPourHeader::control(
@@ -465,7 +547,7 @@ mod tests {
         };
 
         let Some(SenderAction::SendNoLongerAvailable { frame }) =
-            sender.handle_need_parts(&need_parts, now)
+            sender.handle_need_parts(&need_parts).unwrap()
         else {
             panic!("expected NoLongerAvailable");
         };
@@ -474,8 +556,11 @@ mod tests {
 
     #[test]
     fn cooled_down_message_ids_are_skipped_on_wraparound() {
-        let config =
-            SenderConfig::new(4, Duration::from_millis(5), Duration::from_millis(50)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_millis(5),
+            Duration::from_millis(50),
+        );
         let mut sender = SenderMachine::with_initial_message_id(config, MessageId(0));
         let now = Instant::now();
 
@@ -497,7 +582,7 @@ mod tests {
             }
         )));
 
-        sender.next_message_id = 0;
+        sender.next_message_id = MessageId(0);
         let SenderAction::SendPayloads { message_id, .. } = sender
             .start_transfer(
                 IoPayload::from_static(b"wxyz"),
@@ -512,8 +597,11 @@ mod tests {
 
     #[test]
     fn handle_ack_observes_matching_ack() {
-        let config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
 
@@ -542,8 +630,11 @@ mod tests {
 
     #[test]
     fn handle_ack_eager_cleanup_purges_matching_message() {
-        let mut config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let mut config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         config.eager_ack_cleanup = true;
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
@@ -581,8 +672,11 @@ mod tests {
 
     #[test]
     fn handle_ack_ignores_stale_ack() {
-        let config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
 
@@ -612,8 +706,11 @@ mod tests {
 
     #[test]
     fn zero_length_payload_produces_one_empty_part() {
-        let config =
-            SenderConfig::new(4, Duration::from_secs(10), Duration::from_secs(10)).unwrap();
+        let config = SenderConfig::new(
+            NonZeroUsize::new(4).unwrap(),
+            Duration::from_secs(10),
+            Duration::from_secs(10),
+        );
         let mut sender = SenderMachine::new(config);
         let now = Instant::now();
 

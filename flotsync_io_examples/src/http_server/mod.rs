@@ -958,7 +958,7 @@ fn build_echo_body_payload(
                 )
             });
         let payload = payload
-            .try_slice(slice.offset, slice.len)
+            .try_slice(slice.offset..slice.offset + slice.len)
             .unwrap_or_else(|| {
                 panic!(
                     "echo response slice {}..{} fell outside retained payload {}",

@@ -6,6 +6,7 @@ use std::{
     fmt,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Range,
     sync::Arc,
 };
 
@@ -125,26 +126,27 @@ impl IoPayload {
     }
 
     /// Returns a sliced view over the readable payload bytes.
-    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
+    pub fn try_slice(self, range: Range<usize>) -> Option<Self> {
         let payload_len = self.len();
-        if offset > payload_len || len > payload_len.saturating_sub(offset) {
+        if range.start > range.end || range.end > payload_len {
             return None;
         }
-        if len == 0 {
+        if range.is_empty() {
             return Some(Self::Bytes(Bytes::new()));
         }
-        if offset == 0 && len == payload_len {
+        if range.start == 0 && range.end == payload_len {
             return Some(self);
         }
         match self {
-            Self::Lease(lease) => Some(Self::Lease(lease.try_slice(offset, len)?)),
-            Self::Bytes(bytes) => Some(Self::Bytes(bytes.slice(offset..offset + len))),
+            Self::Lease(lease) => Some(Self::Lease(lease.try_slice(range.clone())?)),
+            Self::Bytes(bytes) => Some(Self::Bytes(bytes.slice(range))),
             Self::Chain(parts) => {
+                let offset = range.start;
+                let mut remaining = range.len();
                 let mut skipped = 0;
-                let mut remaining_len = len;
                 let mut sliced_parts = Vec::new();
                 for part in parts.iter() {
-                    if remaining_len == 0 {
+                    if remaining == 0 {
                         break;
                     }
 
@@ -155,12 +157,15 @@ impl IoPayload {
                     }
 
                     let part_offset = offset.saturating_sub(skipped);
-                    let visible_len = remaining_len.min(part_len.saturating_sub(part_offset));
-                    sliced_parts.push(part.clone().try_slice(part_offset, visible_len)?);
-                    remaining_len -= visible_len;
+                    let visible_len = remaining.min(part_len - part_offset);
+                    sliced_parts.push(
+                        part.clone()
+                            .try_slice(part_offset..part_offset + visible_len)?,
+                    );
+                    remaining -= visible_len;
                     skipped += part_len;
                 }
-                if remaining_len != 0 {
+                if remaining != 0 {
                     return None;
                 }
                 Some(Self::chain(sliced_parts))
@@ -312,7 +317,7 @@ fn collect_cursor_parts(
 
     match payload {
         IoPayload::Lease(lease) => {
-            let lease = lease.clone().try_slice(offset, len)?;
+            let lease = lease.clone().try_slice(offset..offset + len)?;
             out.push(IoPayloadCursorPart::Lease(lease.cursor()));
         }
         IoPayload::Bytes(bytes) => {

@@ -102,7 +102,6 @@ pub enum UDPourSubmitResult {
 /// Cloneable summary of sender-state-machine failures at the runtime boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UDPourStateFailure {
-    ZeroMaxPartPayloadLen,
     TooManyParts {
         payload_len: usize,
         max_part_payload_len: usize,
@@ -193,10 +192,6 @@ impl UDPourConfig {
         mut receiver: ReceiverConfig,
     ) -> Result<Self, UDPourConfigError> {
         ensure!(
-            sender.max_part_payload_len > 0,
-            ZeroMaxPartPayloadLenConfigSnafu
-        );
-        ensure!(
             receiver.max_need_parts_frame_len > FRAME_HEADER_LEN,
             NeedPartsFrameLenTooSmallSnafu {
                 max_need_parts_frame_len: receiver.max_need_parts_frame_len,
@@ -204,7 +199,7 @@ impl UDPourConfig {
         );
         receiver.delivered_tombstone_timeout = sender
             .retention_timeout
-            .saturating_add(sender.reuse_cooldown);
+            .saturating_add(sender.id_reuse_cooldown);
         let poll_interval = sender
             .retention_timeout
             .min(receiver.repair_interval)
@@ -222,8 +217,6 @@ impl UDPourConfig {
 /// Configuration errors for the UDPour runtime.
 #[derive(Debug, Snafu)]
 pub enum UDPourConfigError {
-    #[snafu(display("sender max_part_payload_len must be greater than zero"))]
-    ZeroMaxPartPayloadLenConfig,
     #[snafu(display("runtime poll interval must be greater than zero"))]
     ZeroPollInterval,
     #[snafu(display(
@@ -656,11 +649,24 @@ impl UDPourComponent {
                     self.handle_sender_action(action, Some(source));
                 }
             }
-            UDPourFrame::NeedParts(frame) => {
-                if let Some(action) = self.sender.handle_need_parts(&frame, now) {
+            UDPourFrame::NeedParts(frame) => match self.sender.handle_need_parts(&frame) {
+                Ok(Some(action)) => {
                     self.handle_sender_action(action, Some(source));
                 }
-            }
+                Ok(None) => {
+                    debug!(
+                        self.log(),
+                        "NeedParts from {source} for message_id={} required no sender action",
+                        frame.header.message_id.0
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        self.log(),
+                        "Sender state machine failed while handling NeedParts from {source}: {error}"
+                    );
+                }
+            },
             UDPourFrame::NoLongerAvailable(frame) => {
                 if let Some(action) = self.receiver.accept_no_longer_available(source, frame) {
                     self.handle_receiver_action(action);
@@ -1127,7 +1133,6 @@ async fn encode_frame_with_pool(
 
 fn classify_sender_error(error: &SenderError) -> UDPourStateFailure {
     match error {
-        SenderError::ZeroMaxPartPayloadLen => UDPourStateFailure::ZeroMaxPartPayloadLen,
         SenderError::TooManyParts {
             payload_len,
             max_part_payload_len,
@@ -1138,6 +1143,7 @@ fn classify_sender_error(error: &SenderError) -> UDPourStateFailure {
         },
         SenderError::InvalidPartCount { .. } => UDPourStateFailure::InvalidPartCount,
         SenderError::MessageIdExhausted => UDPourStateFailure::MessageIdExhausted,
+        SenderError::RequestedPartOutOfRange { .. } => UDPourStateFailure::InvalidPartCount,
     }
 }
 
@@ -1152,11 +1158,15 @@ fn classify_encode_error(error: &RuntimeEncodeError) -> UDPourEncodeFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
 
     #[test]
     fn rejects_need_parts_frame_budget_that_cannot_fit_a_header() {
-        let sender =
-            SenderConfig::new(256, Duration::from_secs(1), Duration::from_secs(1)).unwrap();
+        let sender = SenderConfig::new(
+            NonZeroUsize::new(256).unwrap(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         let receiver = ReceiverConfig {
             repair_interval: Duration::from_millis(10),
             give_up_timeout: Duration::from_secs(1),
@@ -1170,28 +1180,6 @@ mod tests {
             UDPourConfigError::NeedPartsFrameLenTooSmall {
                 max_need_parts_frame_len: FRAME_HEADER_LEN
             }
-        ));
-    }
-
-    #[test]
-    fn rejects_zero_sender_part_payload_len() {
-        let sender = SenderConfig {
-            max_part_payload_len: 0,
-            retention_timeout: Duration::from_secs(1),
-            reuse_cooldown: Duration::from_secs(1),
-            eager_ack_cleanup: false,
-        };
-        let receiver = ReceiverConfig {
-            repair_interval: Duration::from_millis(10),
-            give_up_timeout: Duration::from_secs(1),
-            max_need_parts_frame_len: FRAME_HEADER_LEN + 1,
-            delivered_tombstone_timeout: Duration::ZERO,
-        };
-
-        let error = UDPourConfig::new(sender, receiver).unwrap_err();
-        assert!(matches!(
-            error,
-            UDPourConfigError::ZeroMaxPartPayloadLenConfig
         ));
     }
 }

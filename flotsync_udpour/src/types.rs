@@ -50,6 +50,13 @@ pub struct Checksum(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub u32);
 
+impl MessageId {
+    /// Advances to the next sender-local id, wrapping across the full `u32` domain.
+    pub(crate) fn wrapping_increment(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+}
+
 /// Zero-based part number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PartNumber(pub u32);
@@ -360,6 +367,20 @@ pub(crate) struct NeedPartsFrame {
 }
 
 impl Eq for NeedPartsFrame {}
+
+impl NeedPartsFrame {
+    /// Builds the sender-side rejection frame used once retained repair state is gone.
+    pub(crate) fn no_longer_available_frame(&self) -> NoLongerAvailableFrame {
+        let header = UDPourHeader::control(
+            FrameType::NoLongerAvailable,
+            self.header.message_id,
+            self.header.part_count,
+            self.header.checksum,
+        )
+        .expect("NeedParts metadata must always produce a valid NoLongerAvailable header");
+        NoLongerAvailableFrame { header }
+    }
+}
 
 /// One sender-side late-repair rejection datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]

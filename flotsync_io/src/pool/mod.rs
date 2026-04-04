@@ -24,6 +24,7 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
+    ops::Range,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll as TaskPoll},
@@ -358,14 +359,14 @@ impl IoLease {
     }
 
     /// Returns one sliced view over the readable payload bytes.
-    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
-        if offset > self.len || len > self.len.saturating_sub(offset) {
+    pub fn try_slice(self, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.len {
             return None;
         }
         Some(Self {
             inner: self.inner,
-            offset: self.offset + offset,
-            len,
+            offset: self.offset + range.start,
+            len: range.len(),
         })
     }
 

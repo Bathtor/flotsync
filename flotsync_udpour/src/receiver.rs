@@ -3,21 +3,7 @@
 //! This module owns `(source, message_id)` reassembly state, repair polling,
 //! whole-message checksum validation, and purge behavior.
 
-use crate::{
-    codec::fit_one_need_parts_frame,
-    types::{
-        AckFrame,
-        Checksum,
-        FrameType,
-        MessageId,
-        NeedPartsFrame,
-        NoLongerAvailableFrame,
-        PartCount,
-        PayloadFrame,
-        UDPourHeader,
-        io_payload_eq,
-    },
-};
+use crate::{codec::fit_one_need_parts_frame, types::*};
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
@@ -60,271 +46,6 @@ pub(crate) struct ReceiverTransferKey {
 pub(crate) struct ReceiverMachine {
     config: ReceiverConfig,
     transfers: HashMap<ReceiverTransferKey, InboundState>,
-}
-
-/// Most receiver interactions produce zero, one, or two actions:
-/// one optional `Deliver`, one optional immediate follow-up control frame.
-type ReceiverActions = SmallVec<[ReceiverAction; 2]>;
-
-/// Receiver-facing outcomes from one state-machine interaction.
-#[derive(Clone, Debug)]
-pub(crate) enum ReceiverAction {
-    /// Deliver one fully reassembled logical payload upward.
-    Deliver {
-        source: SocketAddr,
-        message_id: MessageId,
-        payload: IoPayload,
-        part_count: PartCount,
-        checksum: Checksum,
-    },
-    /// Send one successful receiver acknowledgment back to the sender.
-    SendAck { source: SocketAddr, frame: AckFrame },
-    /// Ask the sender to repeat one fitted chunk of still-missing parts.
-    ///
-    /// The receiver emits at most one such request per repair poll and advances its
-    /// internal repair watermark after doing so.
-    SendNeedParts {
-        source: SocketAddr,
-        frame: NeedPartsFrame,
-    },
-    /// Report that the receiver-side state for one inbound transfer was purged.
-    ///
-    /// The runtime uses this only for local observability and cleanup decisions; it
-    /// does not go on the wire.
-    Purged {
-        key: ReceiverTransferKey,
-        reason: ReceiverPurgeReason,
-    },
-}
-
-/// Why one inbound multipart transfer was purged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReceiverPurgeReason {
-    /// Later packets for the same `(source, message_id)` disagreed on metadata or payload bytes.
-    Confused,
-    /// The reassembled payload bytes did not match the advertised whole-message checksum.
-    ChecksumMismatch,
-    /// The duplicate-suppression tombstone for one successfully delivered transfer expired.
-    DeliveredTombstoneExpired,
-    /// The sender explicitly reported that retained repair state for this message is gone.
-    NoLongerAvailable,
-    /// The receiver gave up waiting for more payload parts.
-    TimedOut,
-}
-
-/// Receiver-side errors.
-#[derive(Debug, Snafu)]
-pub(crate) enum ReceiverError {
-    /// One `NeedParts` frame could not be fitted into the configured frame budget.
-    #[snafu(display("Failed to split NeedParts frames"))]
-    SplitNeedParts { source: crate::codec::CodecError },
-}
-
-fn checksum_payload(payload: &IoPayload) -> Checksum {
-    let mut cursor = payload.cursor();
-    let mut checksum = 0u32;
-    while cursor.has_remaining() {
-        let chunk = cursor.chunk();
-        let chunk_len = chunk.len();
-        checksum = crc32c::crc32c_append(checksum, chunk);
-        cursor.advance(chunk_len);
-    }
-    Checksum(checksum)
-}
-
-/// One active receiver-side entry for one `(source, message_id)` pair.
-#[derive(Debug)]
-enum InboundState {
-    /// One incomplete transfer that is still collecting payload parts or asking for repairs.
-    Pending(InboundTransfer),
-    /// One recently delivered transfer kept only as a duplicate-suppression tombstone.
-    Delivered(DeliveredTombstone),
-}
-
-/// One receiver-owned in-progress transfer keyed by `(source, message_id)`.
-#[derive(Debug)]
-struct InboundTransfer {
-    part_count: PartCount,
-    checksum: Checksum,
-    /// One preallocated slot per expected payload part.
-    ///
-    /// The receiver knows `part_count` from the first accepted frame, so indexed storage is
-    /// simpler than a sparse map and matches the eventual reassembly shape directly.
-    parts: Vec<Option<IoPayload>>,
-    missing_parts: RoaringBitmap,
-    /// Largest missing part number included in the last emitted repair request.
-    ///
-    /// The next repair poll first prefers missing parts strictly greater than this watermark and
-    /// only wraps back to the beginning once every later missing part has been requested once.
-    repair_watermark: Option<u32>,
-    regular_part_size: Option<usize>,
-    give_up_deadline: Instant,
-    repair_deadline: Instant,
-}
-
-impl InboundTransfer {
-    fn new(
-        part_count: PartCount,
-        checksum: Checksum,
-        now: Instant,
-        config: &ReceiverConfig,
-    ) -> Self {
-        Self {
-            part_count,
-            checksum,
-            parts: vec![None; part_count.get() as usize],
-            missing_parts: RoaringBitmap::from_iter(0..part_count.get()),
-            repair_watermark: None,
-            regular_part_size: None,
-            give_up_deadline: now + config.give_up_timeout,
-            repair_deadline: now + config.repair_interval,
-        }
-    }
-
-    fn accept_payload(
-        &mut self,
-        frame: PayloadFrame,
-        now: Instant,
-        config: &ReceiverConfig,
-    ) -> InboundUpdate {
-        if frame.header.part_count != self.part_count || frame.header.checksum != self.checksum {
-            return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
-        }
-        if frame.header.part_number.0 >= self.part_count.get() {
-            return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
-        }
-
-        let is_final_part = frame.header.part_number == self.part_count.last_part_number();
-        if !is_final_part {
-            match self.regular_part_size {
-                Some(existing) if existing != frame.payload.len() => {
-                    return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
-                }
-                None => {
-                    self.regular_part_size = Some(frame.payload.len());
-                }
-                Some(_) => {}
-            }
-        }
-
-        let part_index = frame.header.part_number.0 as usize;
-        if let Some(existing) = self.parts[part_index].as_ref() {
-            if !io_payload_eq(existing, &frame.payload) {
-                return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
-            }
-        } else {
-            self.missing_parts.remove(frame.header.part_number.0);
-            self.parts[part_index] = Some(frame.payload);
-        }
-
-        self.give_up_deadline = now + config.give_up_timeout;
-        self.repair_deadline = now + config.repair_interval;
-
-        if !self.missing_parts.is_empty() {
-            return InboundUpdate::Pending;
-        }
-
-        let payload = self.assemble_payload();
-        let checksum = checksum_payload(&payload);
-        if checksum != self.checksum {
-            return InboundUpdate::Purged(ReceiverPurgeReason::ChecksumMismatch);
-        }
-
-        InboundUpdate::Deliver {
-            payload,
-            message_id: frame.header.message_id,
-            part_count: self.part_count,
-            checksum: self.checksum,
-        }
-    }
-
-    fn next_need_parts_frame(
-        &mut self,
-        message_id: MessageId,
-        max_need_parts_frame_len: usize,
-    ) -> Result<Option<NeedPartsFrame>, ReceiverError> {
-        if self.missing_parts.is_empty() {
-            return Ok(None);
-        }
-
-        // Repair polling walks forward through the missing-part space. We only wrap back to
-        // earlier missing parts once every later missing part has been requested at least once.
-        let frame = fit_one_need_parts_frame(
-            message_id,
-            self.part_count,
-            self.checksum,
-            &self.missing_parts,
-            self.repair_watermark,
-            max_need_parts_frame_len,
-        )
-        .context(SplitNeedPartsSnafu)?;
-        let frame = match frame {
-            Some(frame) => frame,
-            None => fit_one_need_parts_frame(
-                message_id,
-                self.part_count,
-                self.checksum,
-                &self.missing_parts,
-                None,
-                max_need_parts_frame_len,
-            )
-            .context(SplitNeedPartsSnafu)?
-            .expect("non-empty missing_parts must yield one fitted frame after wrap"),
-        };
-        self.repair_watermark = frame.missing_parts.max();
-        Ok(Some(frame))
-    }
-
-    fn assemble_payload(&self) -> IoPayload {
-        let parts = self
-            .parts
-            .iter()
-            .map(|part| {
-                part.as_ref()
-                    .expect("complete transfer has all parts")
-                    .clone()
-            })
-            .collect::<Vec<_>>();
-        IoPayload::chain(parts)
-    }
-}
-
-/// One successfully delivered transfer remembered just long enough to suppress late repair
-/// traffic from shared routes.
-#[derive(Clone, Copy, Debug)]
-struct DeliveredTombstone {
-    part_count: PartCount,
-    checksum: Checksum,
-    expires_at: Instant,
-}
-
-impl DeliveredTombstone {
-    fn new(part_count: PartCount, checksum: Checksum, expires_at: Instant) -> Self {
-        Self {
-            part_count,
-            checksum,
-            expires_at,
-        }
-    }
-
-    fn matches(self, part_count: PartCount, checksum: Checksum) -> bool {
-        self.part_count == part_count && self.checksum == checksum
-    }
-}
-
-#[derive(Debug)]
-enum InboundUpdate {
-    /// The transfer is still incomplete and remains pending.
-    Pending,
-    /// The transfer became complete, passed checksum validation, and can now be delivered.
-    Deliver {
-        payload: IoPayload,
-        message_id: MessageId,
-        part_count: PartCount,
-        checksum: Checksum,
-    },
-    /// The transfer must be dropped immediately for the given purge reason.
-    Purged(ReceiverPurgeReason),
 }
 
 impl ReceiverMachine {
@@ -660,6 +381,269 @@ impl ReceiverMachine {
         }
         actions
     }
+}
+
+/// Most receiver interactions produce zero, one, or two actions:
+/// one optional `Deliver`, one optional immediate follow-up control frame.
+type ReceiverActions = SmallVec<[ReceiverAction; 2]>;
+
+/// Receiver-facing outcomes from one state-machine interaction.
+#[derive(Clone, Debug)]
+pub(crate) enum ReceiverAction {
+    /// Deliver one fully reassembled logical payload upward.
+    Deliver {
+        source: SocketAddr,
+        message_id: MessageId,
+        payload: IoPayload,
+        part_count: PartCount,
+        checksum: Checksum,
+    },
+    /// Send one successful receiver acknowledgment back to the sender.
+    SendAck { source: SocketAddr, frame: AckFrame },
+    /// Ask the sender to repeat one fitted chunk of still-missing parts.
+    ///
+    /// The receiver emits at most one such request per repair poll and advances its
+    /// internal repair watermark after doing so.
+    SendNeedParts {
+        source: SocketAddr,
+        frame: NeedPartsFrame,
+    },
+    /// Report that the receiver-side state for one inbound transfer was purged.
+    ///
+    /// The runtime uses this only for local observability and cleanup decisions; it
+    /// does not go on the wire.
+    Purged {
+        key: ReceiverTransferKey,
+        reason: ReceiverPurgeReason,
+    },
+}
+
+/// Why one inbound multipart transfer was purged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiverPurgeReason {
+    /// Later packets for the same `(source, message_id)` disagreed on metadata or payload bytes.
+    Confused,
+    /// The reassembled payload bytes did not match the advertised whole-message checksum.
+    ChecksumMismatch,
+    /// The duplicate-suppression tombstone for one successfully delivered transfer expired.
+    DeliveredTombstoneExpired,
+    /// The sender explicitly reported that retained repair state for this message is gone.
+    NoLongerAvailable,
+    /// The receiver gave up waiting for more payload parts.
+    TimedOut,
+}
+
+/// Receiver-side errors.
+#[derive(Debug, Snafu)]
+pub(crate) enum ReceiverError {
+    /// One `NeedParts` frame could not be fitted into the configured frame budget.
+    #[snafu(display("Failed to split NeedParts frames"))]
+    SplitNeedParts { source: crate::codec::CodecError },
+}
+
+fn checksum_payload(payload: &IoPayload) -> Checksum {
+    let mut cursor = payload.cursor();
+    let mut checksum = 0u32;
+    while cursor.has_remaining() {
+        let chunk = cursor.chunk();
+        let chunk_len = chunk.len();
+        checksum = crc32c::crc32c_append(checksum, chunk);
+        cursor.advance(chunk_len);
+    }
+    Checksum(checksum)
+}
+
+/// One active receiver-side entry for one `(source, message_id)` pair.
+#[derive(Debug)]
+enum InboundState {
+    /// One incomplete transfer that is still collecting payload parts or asking for repairs.
+    Pending(InboundTransfer),
+    /// One recently delivered transfer kept only as a duplicate-suppression tombstone.
+    Delivered(DeliveredTombstone),
+}
+
+/// One receiver-owned in-progress transfer keyed by `(source, message_id)`.
+#[derive(Debug)]
+struct InboundTransfer {
+    part_count: PartCount,
+    checksum: Checksum,
+    /// One preallocated slot per expected payload part.
+    ///
+    /// The receiver knows `part_count` from the first accepted frame, so indexed storage is
+    /// simpler than a sparse map and matches the eventual reassembly shape directly.
+    parts: Vec<Option<IoPayload>>,
+    missing_parts: RoaringBitmap,
+    /// Largest missing part number included in the last emitted repair request.
+    ///
+    /// The next repair poll first prefers missing parts strictly greater than this watermark and
+    /// only wraps back to the beginning once every later missing part has been requested once.
+    repair_watermark: Option<u32>,
+    regular_part_size: Option<usize>,
+    give_up_deadline: Instant,
+    repair_deadline: Instant,
+}
+
+impl InboundTransfer {
+    fn new(
+        part_count: PartCount,
+        checksum: Checksum,
+        now: Instant,
+        config: &ReceiverConfig,
+    ) -> Self {
+        Self {
+            part_count,
+            checksum,
+            parts: vec![None; part_count.get() as usize],
+            missing_parts: RoaringBitmap::from_iter(0..part_count.get()),
+            repair_watermark: None,
+            regular_part_size: None,
+            give_up_deadline: now + config.give_up_timeout,
+            repair_deadline: now + config.repair_interval,
+        }
+    }
+
+    fn accept_payload(
+        &mut self,
+        frame: PayloadFrame,
+        now: Instant,
+        config: &ReceiverConfig,
+    ) -> InboundUpdate {
+        if frame.header.part_count != self.part_count
+            || frame.header.checksum != self.checksum
+            || frame.header.part_number.0 >= self.part_count.get()
+        {
+            return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
+        }
+
+        let is_final_part = frame.header.part_number == self.part_count.last_part_number();
+        if !is_final_part {
+            match self.regular_part_size {
+                Some(existing) if existing != frame.payload.len() => {
+                    return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
+                }
+                None => {
+                    self.regular_part_size = Some(frame.payload.len());
+                }
+                Some(_) => {
+                    // Do nothing, already matches.
+                }
+            }
+        }
+
+        let part_index = frame.header.part_number.0 as usize;
+        if let Some(existing) = self.parts[part_index].as_ref() {
+            if !io_payload_eq(existing, &frame.payload) {
+                return InboundUpdate::Purged(ReceiverPurgeReason::Confused);
+            }
+        } else {
+            self.parts[part_index] = Some(frame.payload);
+            self.missing_parts.remove(frame.header.part_number.0);
+        }
+
+        self.give_up_deadline = now + config.give_up_timeout;
+        self.repair_deadline = now + config.repair_interval;
+
+        if self.missing_parts.is_empty() {
+            let payload = self.assemble_payload();
+            let checksum = checksum_payload(&payload);
+            if checksum != self.checksum {
+                return InboundUpdate::Purged(ReceiverPurgeReason::ChecksumMismatch);
+            }
+
+            InboundUpdate::Deliver {
+                payload,
+                message_id: frame.header.message_id,
+                part_count: self.part_count,
+                checksum: self.checksum,
+            }
+        } else {
+            InboundUpdate::Pending
+        }
+    }
+
+    fn next_need_parts_frame(
+        &mut self,
+        message_id: MessageId,
+        max_need_parts_frame_len: usize,
+    ) -> Result<Option<NeedPartsFrame>, ReceiverError> {
+        if self.missing_parts.is_empty() {
+            return Ok(None);
+        }
+
+        // Repair polling walks forward through the missing-part space. We only wrap back to
+        // earlier missing parts once every later missing part has been requested at least once.
+        let frame = fit_one_need_parts_frame(
+            message_id,
+            self.part_count,
+            self.checksum,
+            &self.missing_parts,
+            self.repair_watermark,
+            max_need_parts_frame_len,
+        )
+        .context(SplitNeedPartsSnafu)?;
+        let frame = match frame {
+            Some(frame) => frame,
+            None => fit_one_need_parts_frame(
+                message_id,
+                self.part_count,
+                self.checksum,
+                &self.missing_parts,
+                None,
+                max_need_parts_frame_len,
+            )
+            .context(SplitNeedPartsSnafu)?
+            .expect("non-empty missing_parts must yield one fitted frame after wrap"),
+        };
+        self.repair_watermark = frame.missing_parts.max();
+        Ok(Some(frame))
+    }
+
+    fn assemble_payload(&self) -> IoPayload {
+        let parts = self.parts.iter().map(|part| {
+            part.as_ref()
+                .expect("complete transfer has all parts")
+                .clone()
+        });
+        IoPayload::chain(parts)
+    }
+}
+
+/// One successfully delivered transfer remembered just long enough to suppress late repair
+/// traffic from shared routes.
+#[derive(Clone, Copy, Debug)]
+struct DeliveredTombstone {
+    part_count: PartCount,
+    checksum: Checksum,
+    expires_at: Instant,
+}
+
+impl DeliveredTombstone {
+    fn new(part_count: PartCount, checksum: Checksum, expires_at: Instant) -> Self {
+        Self {
+            part_count,
+            checksum,
+            expires_at,
+        }
+    }
+
+    fn matches(self, part_count: PartCount, checksum: Checksum) -> bool {
+        self.part_count == part_count && self.checksum == checksum
+    }
+}
+
+#[derive(Debug)]
+enum InboundUpdate {
+    /// The transfer is still incomplete and remains pending.
+    Pending,
+    /// The transfer became complete, passed checksum validation, and can now be delivered.
+    Deliver {
+        payload: IoPayload,
+        message_id: MessageId,
+        part_count: PartCount,
+        checksum: Checksum,
+    },
+    /// The transfer must be dropped immediately for the given purge reason.
+    Purged(ReceiverPurgeReason),
 }
 
 #[cfg(test)]

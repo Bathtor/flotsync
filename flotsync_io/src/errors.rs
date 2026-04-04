@@ -80,11 +80,11 @@ pub enum Error {
     EmptyIoLease,
 
     #[snafu(display(
-        "invalid IoPayload slice range offset {offset} len {len} for payload length {payload_len}"
+        "invalid IoPayload slice range {start}..{end} for payload length {payload_len}"
     ))]
     InvalidIoPayloadSliceRange {
-        offset: usize,
-        len: usize,
+        start: usize,
+        end: usize,
         payload_len: usize,
     },
 

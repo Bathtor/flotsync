@@ -77,18 +77,13 @@ mod config_keys {
 const MAX_BUFFERED_STARTUP_DATAGRAMS: usize = 64;
 
 /// When one bound UDP socket should gain its per-socket UDPour child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum UdpActivationPolicy {
     /// Create and connect the child immediately once the socket bind completes.
+    #[default]
     OnBind,
     /// Keep the socket dormant until the first inbound or outbound message actually needs it.
     OnFirstUse,
-}
-
-impl Default for UdpActivationPolicy {
-    fn default() -> Self {
-        Self::OnBind
-    }
 }
 
 /// Concrete route-transport manager for the current UDP/TCP key type.
@@ -1080,6 +1075,7 @@ mod tests {
         cell::RefCell,
         collections::VecDeque,
         net::{SocketAddr, UdpSocket},
+        num::NonZeroUsize,
         sync::mpsc,
         thread,
         time::{Duration, Instant},
@@ -1768,9 +1764,10 @@ mod tests {
 
     fn udpour_config_with_part_size(max_part_payload_len: usize) -> UDPourConfig {
         let sender = SenderConfig {
-            max_part_payload_len,
+            max_part_payload_len: NonZeroUsize::new(max_part_payload_len)
+                .expect("test UDPour config must use a non-zero part payload length"),
             retention_timeout: Duration::from_secs(1),
-            reuse_cooldown: Duration::from_millis(100),
+            id_reuse_cooldown: Duration::from_millis(100),
             eager_ack_cleanup: false,
         };
         let receiver = ReceiverConfig {
