@@ -11,19 +11,19 @@
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Add developer-facing docs or comments to non-public Rust types, fields, variants, and helper functions when their role, invariants, or lifecycle are not totally obvious from local context.
-- Prefer this item order within Rust files unless there is a strong local reason not to:
-    1. imports
-    2. public constants
-    3. public traits
-    4. public functions
-    5. public structs/enums followed immediately by all their impls
-    6. macros
-    7. private constants (if they cannot be in a narrower scope)
-    8. private traits
-    9. private functions
-    10. private structs/enums followed immediately by all their impls
-    11. exposed test helpers
-    12. tests
+- Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:
+    1. public items (`pub`)
+    2. restricted-visibility items (`pub(<qualifier>)`)
+    3. macros
+    4. private items
+    5. exposed test helpers
+    6. tests
+- Within each group, use this order:
+    1. constants
+    2. traits
+    3. functions
+    4. structs/enums, each followed immediately by all associated `impl` blocks
+- Imports should remain at the very top of the file.
 
 <!-- BEGIN BEADS INTEGRATION -->
 

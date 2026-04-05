@@ -11,6 +11,8 @@
 
 pub mod contracts;
 pub mod group_broadcast;
+pub mod ingress;
 pub mod reliable_delivery;
 pub mod route_transport;
 pub mod shared;
+pub(crate) mod wire;

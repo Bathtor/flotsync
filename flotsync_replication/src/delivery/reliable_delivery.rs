@@ -1,14 +1,20 @@
 //! Recipient-addressed durable delivery types.
 
-use super::shared::{
-    ActiveRouteRecord,
-    EncryptedPayload,
-    MailboxItemId,
-    MessageId,
-    RelayIdentity,
-    SignedEnvelopeFooter,
+use super::{
+    ingress::InboundDeliveryMeta,
+    shared::{
+        ActiveRouteRecord,
+        EncryptedPayload,
+        MailboxItemId,
+        MessageId,
+        RelayIdentity,
+        SignedEnvelopeFooter,
+    },
 };
 use crate::api::MemberIdentity;
+use flotsync_messages::delivery as delivery_proto;
+use flotsync_utils::NonOwningPhantomData;
+use kompact::{Never, prelude::Port};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -41,6 +47,32 @@ pub struct ReliableDeliveryDeliver {
     pub envelope: ReliableMessageEnvelope,
 }
 
+/// Inbound reliable-delivery payload handed to the semantic owner from
+/// delivery ingress.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReliableDeliveryInboundDeliver<R> {
+    /// Shared ingress metadata derived before the semantic handoff.
+    pub meta: InboundDeliveryMeta<R>,
+    /// Fully decoded reliable-delivery boundary frame owned by the generated
+    /// protobuf types.
+    pub frame: delivery_proto::ReliableDeliveryFrame,
+}
+
+/// Internal ingress port that feeds decoded reliable-delivery boundary frames
+/// into the reliable-delivery service.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReliableDeliveryInboundPort<R>(NonOwningPhantomData<R>);
+
+impl<R> Port for ReliableDeliveryInboundPort<R>
+where
+    R: Clone + std::fmt::Debug + Send + Sync + 'static,
+{
+    /// Delivery ingress is the sole producer for this internal semantic
+    /// stream.
+    type Request = Never;
+    type Indication = ReliableDeliveryInboundDeliver<R>;
+}
+
 /// Queue-owned in-memory state for one accepted reliable-delivery message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReliableDeliveryWorkItem {
@@ -65,6 +97,7 @@ pub enum RecipientAckStatus {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientAckHeader {
     pub message_id: MessageId,
+    pub original_sender: MemberIdentity,
     pub recipient: MemberIdentity,
 }
 
@@ -83,16 +116,10 @@ pub struct IdentityProof {
     pub footer: SignedEnvelopeFooter,
 }
 
-/// Opaque relay cursor for incremental mailbox fetches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct MailboxCursor(pub Uuid);
-
 /// Recipient-driven mailbox retrieval request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailboxFetch {
     pub recipient: MemberIdentity,
-    pub cursor: Option<MailboxCursor>,
-    pub batch_limit: Option<u16>,
     pub freshness_token: Uuid,
     pub proof: IdentityProof,
 }
@@ -104,12 +131,11 @@ pub struct MailboxItem {
     pub envelope: ReliableMessageEnvelope,
 }
 
-/// One fetch response batch from a relay mailbox.
+/// One full fetch response from a relay mailbox.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailboxBatch {
     pub relay: RelayIdentity,
     pub recipient: MemberIdentity,
-    pub next_cursor: Option<MailboxCursor>,
     pub items: Vec<MailboxItem>,
 }
 

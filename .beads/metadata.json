@@ -2,6 +2,7 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
+  "dolt_server_port": 50981,
   "dolt_database": "flotsync_git",
   "project_id": "24d3d981-5c8b-4d20-a293-cd0f1d322121"
 }

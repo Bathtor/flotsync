@@ -40,6 +40,8 @@ pub struct UDPourSend {
 /// One fully reassembled inbound logical message.
 #[derive(Clone, Debug)]
 pub struct UDPourDeliver {
+    /// Local UDP socket that received the final multipart payload part.
+    pub socket_id: SocketId,
     /// Forwarded UDP source address that identified the sender at this route.
     pub source: SocketAddr,
     /// Fully reassembled logical payload.
@@ -792,7 +794,11 @@ impl UDPourComponent {
             ReceiverAction::Deliver {
                 source, payload, ..
             } => {
-                self.udpour_port.trigger(UDPourDeliver { source, payload });
+                self.udpour_port.trigger(UDPourDeliver {
+                    socket_id: self.socket_id,
+                    source,
+                    payload,
+                });
             }
             ReceiverAction::SendAck { source, frame } => {
                 self.dispatch_control_frame(source, UDPourFrame::Ack(frame));

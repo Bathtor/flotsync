@@ -301,6 +301,28 @@ impl Buf for IoPayloadCursor {
     }
 }
 
+impl io::Read for IoPayloadCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        while written < buf.len() && self.has_remaining() {
+            let chunk = self.chunk();
+            let num_bytes_to_copy = chunk.len().min(buf.len() - written);
+            if num_bytes_to_copy == 0 {
+                break;
+            }
+            buf[written..written + num_bytes_to_copy].copy_from_slice(&chunk[..num_bytes_to_copy]);
+            self.advance(num_bytes_to_copy);
+            written += num_bytes_to_copy;
+        }
+
+        Ok(written)
+    }
+}
+
 fn collect_cursor_parts(
     payload: &IoPayload,
     offset: usize,

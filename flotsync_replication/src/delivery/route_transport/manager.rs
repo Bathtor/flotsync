@@ -5,7 +5,7 @@
 //! - opening UDP sockets on demand through the shared bridge port
 //! - creating one child UDPour runtime per live UDP socket
 //! - serializing `FlotsyncSerializable` payloads into pooled `IoPayload`
-//! - mapping directed UDPour submit results onto `RouteTransportPort`
+//! - resolving directed route-transport submits via actor `Ask`
 //!
 //! TCP route handling is intentionally deferred via `TODO(flotsync-638)`.
 
@@ -49,43 +49,6 @@ use std::{
     sync::Arc,
 };
 
-type TransportConnectionInfoPort = ConnectionInfoPort<TransportRouteKey>;
-type TransportRouteTransportSend = RouteTransportSend<TransportRouteKey>;
-type TransportRouteTransportPort = RouteTransportPort<TransportRouteKey>;
-
-/// Kompact configuration keys that control when the manager creates per-socket
-/// UDPour children.
-mod config_keys {
-    use super::*;
-
-    kompact_config! {
-        UDP_ACTIVATION_POLICY,
-        key = "flotsync.route-transport.udp-activation-policy",
-        type = UsizeValue,
-        default = 0,
-        doc = "When to create one UDPour child for a bound UDP socket: 0 = OnBind, 1 = OnFirstUse.",
-        version = "0.1.0"
-    }
-}
-
-/// Upper bound on inbound UDP datagrams forwarded into one per-socket UDPour child while it is
-/// still starting.
-///
-/// During this short bring-up window the manager does not keep its own copy of incoming datagrams.
-/// Instead it enqueues exact `UdpIndication::Received` events onto the starting child's required
-/// `UdpPort` via `KompactSystem::trigger_i`. This counter only exists to bound that queueing.
-const MAX_BUFFERED_STARTUP_DATAGRAMS: usize = 64;
-
-/// When one bound UDP socket should gain its per-socket UDPour child.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum UdpActivationPolicy {
-    /// Create and connect the child immediately once the socket bind completes.
-    #[default]
-    OnBind,
-    /// Keep the socket dormant until the first inbound or outbound message actually needs it.
-    OnFirstUse,
-}
-
 /// Concrete route-transport manager for the current UDP/TCP key type.
 ///
 /// UDP is fully owned here via child `UDPourComponent`s. TCP is left
@@ -93,7 +56,7 @@ enum UdpActivationPolicy {
 #[derive(ComponentDefinition)]
 pub struct RouteTransportManager {
     ctx: ComponentContext<Self>,
-    transport_port: ProvidedPort<TransportRouteTransportPort>,
+    inbound_port: ProvidedPort<TransportRouteTransportPort>,
     connection_info_port: ProvidedPort<TransportConnectionInfoPort>,
     udp_bridge_port: RequiredPort<UdpPort>,
     /// Inbound UDPour deliveries from child runtimes.
@@ -137,7 +100,7 @@ impl RouteTransportManager {
     pub fn new(system: KompactSystem, bridge: IoBridgeHandle, udpour_config: UDPourConfig) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
-            transport_port: ProvidedPort::uninitialised(),
+            inbound_port: ProvidedPort::uninitialised(),
             connection_info_port: ProvidedPort::uninitialised(),
             udp_bridge_port: RequiredPort::uninitialised(),
             udpour_port: RequiredPort::uninitialised(),
@@ -189,11 +152,36 @@ impl RouteTransportManager {
         }
     }
 
-    fn handle_udp_route_send(&mut self, send: TransportRouteTransportSend, route: UdpRouteKey) {
+    fn handle_submit(
+        &mut self,
+        ask: Ask<TransportRouteTransportSend, TransportRouteTransportSubmitResult>,
+    ) -> Handled {
+        let (promise, send) = ask.take();
         let send_id = send.send_id;
+        match send.route.coverage_key {
+            TransportRouteKey::Udp(route) => {
+                let previous = self.pending_sends.insert(
+                    send_id,
+                    PendingRouteSend {
+                        send,
+                        submit_promise: Some(promise),
+                    },
+                );
+                debug_assert!(
+                    previous.is_none(),
+                    "route transport submit replaced pending send_id={send_id:?}"
+                );
+                self.handle_udp_route_send(send_id, route);
+            }
+            TransportRouteKey::Tcp(_) => {
+                todo!("TODO(flotsync-638): implement TCP route transport backend")
+            }
+        }
+        Handled::Ok
+    }
+
+    fn handle_udp_route_send(&mut self, send_id: RouteSendId, route: UdpRouteKey) {
         let socket_key = UdpSocketKey::for_route(route);
-        self.pending_sends
-            .insert(send_id, PendingRouteSend { send });
 
         if self.udp_sockets.contains_key(&socket_key) {
             self.handle_live_udp_send(send_id, route, socket_key);
@@ -522,21 +510,26 @@ impl RouteTransportManager {
         route: UdpRouteKey,
         socket_key: UdpSocketKey,
     ) {
-        let Some(pending) = self.pending_sends.get(&send_id).cloned() else {
+        let Some((payload_source, coverage_key)) =
+            self.pending_sends.get(&send_id).map(|pending| {
+                (
+                    Arc::clone(&pending.send.payload),
+                    pending.send.route.coverage_key,
+                )
+            })
+        else {
             return;
         };
         let Some(handle) = self.udp_sockets.get(&socket_key) else {
             self.fail_pending_send(
                 send_id,
-                pending.send.route.coverage_key,
+                coverage_key,
                 RouteTransportNackReason::RouteUnavailable,
             );
             return;
         };
         let runtime_ref = handle.runtime_ref.clone();
-        let coverage_key = pending.send.route.coverage_key;
-        let payload = match serialize_payload(self.bridge.egress_pool(), pending.send.payload).await
-        {
+        let payload = match serialize_payload(self.bridge.egress_pool(), payload_source).await {
             Ok(payload) => payload,
             Err(error) => {
                 self.fail_pending_send(
@@ -558,14 +551,7 @@ impl RouteTransportManager {
         });
         match submit.await {
             Ok(UDPourSubmitResult::Sent) => {
-                let Some(_) = self.pending_sends.remove(&send_id) else {
-                    return;
-                };
-                self.transport_port
-                    .trigger(RouteTransportPortIndication::SendAck {
-                        send_id,
-                        coverage_key,
-                    });
+                self.complete_pending_send_success(send_id, coverage_key);
             }
             Ok(UDPourSubmitResult::SendFailed { reason }) => {
                 self.fail_pending_send(
@@ -590,15 +576,30 @@ impl RouteTransportManager {
         coverage_key: TransportRouteKey,
         reason: RouteTransportNackReason,
     ) {
-        let Some(_) = self.pending_sends.remove(&send_id) else {
+        let Some(pending) = self.pending_sends.remove(&send_id) else {
             return;
         };
-        self.transport_port
-            .trigger(RouteTransportPortIndication::SendNack {
-                send_id,
-                coverage_key,
-                reason,
-            });
+        let Some(promise) = pending.submit_promise else {
+            return;
+        };
+        let _ = promise.fulfil(RouteTransportSubmitResult::SendFailed {
+            coverage_key,
+            reason,
+        });
+    }
+
+    fn complete_pending_send_success(
+        &mut self,
+        send_id: RouteSendId,
+        coverage_key: TransportRouteKey,
+    ) {
+        let Some(pending) = self.pending_sends.remove(&send_id) else {
+            return;
+        };
+        let Some(promise) = pending.submit_promise else {
+            return;
+        };
+        let _ = promise.fulfil(RouteTransportSubmitResult::Sent { coverage_key });
     }
 
     fn report_route_failed(&mut self, route: TransportRouteKey, reason: ConnectionFailureReason) {
@@ -607,9 +608,27 @@ impl RouteTransportManager {
     }
 
     fn handle_udp_runtime_indication(&mut self, deliver: UDPourDeliver) -> Handled {
-        let _ = deliver;
-        // TODO(flotsync-zup): Route inbound UDPour deliveries into the
-        // semantic-delivery demux once inbound ownership is specified.
+        let Some(socket_key) = self.udp_socket_ids.get(&deliver.socket_id).copied() else {
+            warn!(
+                self.log(),
+                "Dropping UDPour delivery from unknown socket_id={} and source={}",
+                deliver.socket_id,
+                deliver.source
+            );
+            return Handled::Ok;
+        };
+        let route = TransportRouteKey::Udp(UdpRouteKey {
+            remote_addr: deliver.source,
+            scope: DatagramRouteScope::Unicast,
+            local_bind: Some(socket_key.local_addr),
+        });
+        self.inbound_port.trigger(RouteTransportInboundDeliver {
+            payload: deliver.payload,
+            transport: InboundTransportMeta {
+                route,
+                remote_addr: Some(deliver.source),
+            },
+        });
         Handled::Ok
     }
 
@@ -767,16 +786,8 @@ impl ComponentLifecycle for RouteTransportManager {
 }
 
 impl Provide<TransportRouteTransportPort> for RouteTransportManager {
-    fn handle(&mut self, request: TransportRouteTransportSend) -> Handled {
-        match request.route.coverage_key {
-            TransportRouteKey::Udp(route) => {
-                self.handle_udp_route_send(request, route);
-                Handled::Ok
-            }
-            TransportRouteKey::Tcp(_) => {
-                todo!("TODO(flotsync-638): implement TCP route transport backend")
-            }
-        }
+    fn handle(&mut self, request: Never) -> Handled {
+        match request {}
     }
 }
 
@@ -827,14 +838,55 @@ impl Require<UdpPort> for RouteTransportManager {
 }
 
 impl LocalActor for RouteTransportManager {
-    type Message = Never;
+    type Message = TransportRouteTransportMessage;
 
     fn receive(&mut self, msg: Self::Message) -> Handled {
-        match msg {}
+        match msg {
+            RouteTransportActorMessage::Submit(ask) => self.handle_submit(ask),
+        }
     }
 }
 
 impl_local_actor!(RouteTransportManager);
+
+type TransportConnectionInfoPort = ConnectionInfoPort<TransportRouteKey>;
+type TransportRouteTransportMessage = RouteTransportActorMessage<TransportRouteKey>;
+type TransportRouteTransportSend = RouteTransportSend<TransportRouteKey>;
+type TransportRouteTransportPort = RouteTransportPort<TransportRouteKey>;
+type TransportRouteTransportSubmitResult = RouteTransportSubmitResult<TransportRouteKey>;
+
+/// Kompact configuration keys that control when the manager creates per-socket
+/// UDPour children.
+mod config_keys {
+    use super::*;
+
+    kompact_config! {
+        UDP_ACTIVATION_POLICY,
+        key = "flotsync.route-transport.udp-activation-policy",
+        type = UsizeValue,
+        default = 0,
+        doc = "When to create one UDPour child for a bound UDP socket: 0 = OnBind, 1 = OnFirstUse.",
+        version = "0.1.0"
+    }
+}
+
+/// Upper bound on inbound UDP datagrams forwarded into one per-socket UDPour child while it is
+/// still starting.
+///
+/// During this short bring-up window the manager does not keep its own copy of incoming datagrams.
+/// Instead it enqueues exact `UdpIndication::Received` events onto the starting child's required
+/// `UdpPort` via `KompactSystem::trigger_i`. This counter only exists to bound that queueing.
+const MAX_BUFFERED_STARTUP_DATAGRAMS: usize = 64;
+
+/// When one bound UDP socket should gain its per-socket UDPour child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum UdpActivationPolicy {
+    /// Create and connect the child immediately once the socket bind completes.
+    #[default]
+    OnBind,
+    /// Keep the socket dormant until the first inbound or outbound message actually needs it.
+    OnFirstUse,
+}
 
 /// Live UDP route handle owned by the manager.
 struct LiveUdpSocketHandle {
@@ -865,9 +917,9 @@ struct LiveTcpRouteHandle {
 }
 
 /// Logical send remembered while one concrete route attempt is still in flight.
-#[derive(Clone)]
 struct PendingRouteSend {
     send: TransportRouteTransportSend,
+    submit_promise: Option<KPromise<TransportRouteTransportSubmitResult>>,
 }
 
 /// UDP route that has been requested but is not yet ready for sends.
@@ -1149,49 +1201,6 @@ mod tests {
         }
     }
 
-    #[derive(ComponentDefinition)]
-    struct RouteTransportProbe {
-        ctx: ComponentContext<Self>,
-        transport: RequiredPort<TransportRouteTransportPort>,
-        indications: mpsc::Sender<RouteTransportPortIndication<TransportRouteKey>>,
-    }
-
-    impl RouteTransportProbe {
-        fn new(indications: mpsc::Sender<RouteTransportPortIndication<TransportRouteKey>>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                transport: RequiredPort::uninitialised(),
-                indications,
-            }
-        }
-    }
-
-    ignore_lifecycle!(RouteTransportProbe);
-
-    impl Require<TransportRouteTransportPort> for RouteTransportProbe {
-        fn handle(
-            &mut self,
-            indication: RouteTransportPortIndication<TransportRouteKey>,
-        ) -> Handled {
-            self.indications
-                .send(indication)
-                .expect("route transport probe receiver must stay live during tests");
-            Handled::Ok
-        }
-    }
-
-    impl Actor for RouteTransportProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
-            unreachable!("Never type is empty")
-        }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("workspace tests do not use Kompact network actor messages")
-        }
-    }
-
     struct BytesPayload(Vec<u8>);
 
     impl FlotsyncSerializable for BytesPayload {
@@ -1218,13 +1227,10 @@ mod tests {
         driver: Arc<Component<IoDriverComponent>>,
         bridge: Arc<Component<IoBridge>>,
         manager: Arc<Component<RouteTransportManager>>,
-        probe: Arc<Component<RouteTransportProbe>>,
+        manager_ref: ActorRefStrong<TransportRouteTransportMessage>,
         observer: Arc<Component<UdpObserver>>,
         _bridge_to_manager: TwoWayChannel<UdpPort, IoBridge, RouteTransportManager>,
         _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
-        _manager_to_probe:
-            TwoWayChannel<TransportRouteTransportPort, RouteTransportManager, RouteTransportProbe>,
-        indications: BufferedReceiver<RouteTransportPortIndication<TransportRouteKey>>,
         observer_rx: BufferedReceiver<UdpIndication>,
     }
 
@@ -1251,23 +1257,21 @@ mod tests {
             let manager = system.create(move || {
                 RouteTransportManager::new(manager_system, bridge_handle, udpour_config)
             });
+            let manager_ref = manager
+                .actor_ref()
+                .hold()
+                .expect("route transport manager must expose a strong actor ref in tests");
             let (observer_tx, observer_rx) = mpsc::channel();
             let observer = system.create(move || UdpObserver::new(observer_tx));
-            let (indications_tx, indications_rx) = mpsc::channel();
-            let probe = system.create(move || RouteTransportProbe::new(indications_tx));
 
             let bridge_to_manager = biconnect_components::<UdpPort, _, _>(&bridge, &manager)
                 .expect("bridge must connect to route transport manager");
             let bridge_to_observer = biconnect_components::<UdpPort, _, _>(&bridge, &observer)
                 .expect("bridge must connect to UDP observer");
-            let manager_to_probe =
-                biconnect_components::<TransportRouteTransportPort, _, _>(&manager, &probe)
-                    .expect("manager must connect to transport probe");
 
             start_component(&system, &driver);
             start_component(&system, &bridge);
             start_component(&system, &manager);
-            start_component(&system, &probe);
             start_component(&system, &observer);
 
             Self {
@@ -1275,61 +1279,72 @@ mod tests {
                 driver,
                 bridge,
                 manager,
-                probe,
+                manager_ref,
                 observer,
                 _bridge_to_manager: bridge_to_manager,
                 _bridge_to_observer: bridge_to_observer,
-                _manager_to_probe: manager_to_probe,
-                indications: BufferedReceiver::new(indications_rx),
                 observer_rx: BufferedReceiver::new(observer_rx),
             }
         }
 
-        fn send(&self, send: TransportRouteTransportSend) {
-            self.probe.on_definition(|component| {
-                component.transport.trigger(send);
-            });
+        fn send(&self, send: TransportRouteTransportSend) -> TransportRouteTransportSubmitResult {
+            self.send_async(send)
+                .wait_timeout(WAIT_TIMEOUT)
+                .expect("timed out waiting for route transport submit result")
         }
 
-        fn wait_for_send_ack(&self, send_id: RouteSendId) -> TransportRouteKey {
-            loop {
-                let indication = self.indications.recv_matching(WAIT_TIMEOUT, |_| true);
-                match indication {
-                    RouteTransportPortIndication::SendAck {
-                        send_id: observed_send_id,
-                        coverage_key,
-                    } if observed_send_id == send_id => return coverage_key,
-                    RouteTransportPortIndication::SendNack {
-                        send_id: observed_send_id,
-                        reason,
-                        ..
-                    } if observed_send_id == send_id => {
-                        panic!("unexpected SendNack for {send_id:?}: {reason:?}")
-                    }
-                    _ => {}
+        fn send_async(
+            &self,
+            send: TransportRouteTransportSend,
+        ) -> KFuture<TransportRouteTransportSubmitResult> {
+            self.manager_ref
+                .ask_with(|promise| RouteTransportActorMessage::Submit(Ask::new(promise, send)))
+        }
+
+        fn wait_for_send_ack(&self, send: TransportRouteTransportSend) -> TransportRouteKey {
+            match self.send(send) {
+                RouteTransportSubmitResult::Sent { coverage_key } => coverage_key,
+                RouteTransportSubmitResult::SendFailed {
+                    coverage_key,
+                    reason,
+                } => {
+                    panic!("unexpected SendFailed for {coverage_key:?}: {reason:?}")
+                }
+            }
+        }
+
+        fn wait_for_send_ack_future(
+            &self,
+            future: KFuture<TransportRouteTransportSubmitResult>,
+        ) -> TransportRouteKey {
+            match future
+                .wait_timeout(WAIT_TIMEOUT)
+                .expect("timed out waiting for route transport send success")
+            {
+                RouteTransportSubmitResult::Sent { coverage_key } => coverage_key,
+                RouteTransportSubmitResult::SendFailed {
+                    coverage_key,
+                    reason,
+                } => {
+                    panic!("unexpected SendFailed for {coverage_key:?}: {reason:?}")
                 }
             }
         }
 
         fn wait_for_send_nack(
             &self,
-            send_id: RouteSendId,
+            future: KFuture<TransportRouteTransportSubmitResult>,
         ) -> (TransportRouteKey, RouteTransportNackReason) {
-            loop {
-                let indication = self.indications.recv_matching(WAIT_TIMEOUT, |_| true);
-                match indication {
-                    RouteTransportPortIndication::SendNack {
-                        send_id: observed_send_id,
-                        coverage_key,
-                        reason,
-                    } if observed_send_id == send_id => return (coverage_key, reason),
-                    RouteTransportPortIndication::SendAck {
-                        send_id: observed_send_id,
-                        ..
-                    } if observed_send_id == send_id => {
-                        panic!("unexpected SendAck for {send_id:?}")
-                    }
-                    _ => {}
+            match future
+                .wait_timeout(WAIT_TIMEOUT)
+                .expect("timed out waiting for route transport send failure")
+            {
+                RouteTransportSubmitResult::SendFailed {
+                    coverage_key,
+                    reason,
+                } => (coverage_key, reason),
+                RouteTransportSubmitResult::Sent { coverage_key } => {
+                    panic!("unexpected Sent result for {coverage_key:?}")
                 }
             }
         }
@@ -1498,10 +1513,6 @@ mod tests {
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
                 .system
-                .kill_notify(self.probe.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
                 .kill_notify(self.manager.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
@@ -1530,13 +1541,11 @@ mod tests {
             local_bind: None,
         };
         let send_id = RouteSendId(Uuid::new_v4());
-        harness.send(route_send(
+        let coverage_key = harness.wait_for_send_ack(route_send(
             send_id,
             route,
             b"hello route transport".to_vec(),
         ));
-
-        let coverage_key = harness.wait_for_send_ack(send_id);
         assert_eq!(coverage_key, TransportRouteKey::Udp(route));
         assert_eq!(harness.live_udp_socket_count(), 1);
 
@@ -1572,15 +1581,15 @@ mod tests {
         let send_id1 = RouteSendId(Uuid::new_v4());
         let send_id2 = RouteSendId(Uuid::new_v4());
 
-        harness.send(route_send(send_id1, route1, b"first target".to_vec()));
-        harness.send(route_send(send_id2, route2, b"second target".to_vec()));
+        let submit1 = harness.send_async(route_send(send_id1, route1, b"first target".to_vec()));
+        let submit2 = harness.send_async(route_send(send_id2, route2, b"second target".to_vec()));
 
         assert_eq!(
-            harness.wait_for_send_ack(send_id1),
+            harness.wait_for_send_ack_future(submit1),
             TransportRouteKey::Udp(route1)
         );
         assert_eq!(
-            harness.wait_for_send_ack(send_id2),
+            harness.wait_for_send_ack_future(submit2),
             TransportRouteKey::Udp(route2)
         );
         assert_eq!(harness.live_udp_socket_count(), 1);
@@ -1682,7 +1691,7 @@ mod tests {
         let send_id = RouteSendId(Uuid::new_v4());
         let multipart_payload = vec![0x5a; 64 * 16];
 
-        sender_harness.send(route_send(send_id, route, multipart_payload));
+        let submit = sender_harness.send_async(route_send(send_id, route, multipart_payload));
 
         let (sender_socket_id, _sender_addr) = sender_harness.wait_for_new_bound_socket();
         let buffered_count =
@@ -1691,7 +1700,7 @@ mod tests {
         receiver_harness.wait_for_bridge_payload_frames(receiver_socket_id, buffered_count + 3);
 
         assert_eq!(
-            sender_harness.wait_for_send_ack(send_id),
+            sender_harness.wait_for_send_ack_future(submit),
             TransportRouteKey::Udp(route)
         );
         sender_harness.wait_for_bridge_frame_type(sender_socket_id, 0x81);
@@ -1713,12 +1722,14 @@ mod tests {
             local_bind: Some(local_addr),
         };
         let send_id = RouteSendId(Uuid::new_v4());
+        let (promise, submit) = promise::<TransportRouteTransportSubmitResult>();
 
         harness.manager.on_definition(|component| {
             component.pending_sends.insert(
                 send_id,
                 PendingRouteSend {
                     send: route_send(send_id, route, b"retry me".to_vec()),
+                    submit_promise: Some(promise),
                 },
             );
             component.udp_socket_ids.insert(socket_id, socket_key);
@@ -1733,7 +1744,7 @@ mod tests {
 
         harness.wait_for_dormant_socket(socket_key);
         assert_eq!(harness.dormant_udp_socket_count(), 1);
-        let (coverage_key, reason) = harness.wait_for_send_nack(send_id);
+        let (coverage_key, reason) = harness.wait_for_send_nack(submit);
         assert_eq!(coverage_key, TransportRouteKey::Udp(route));
         assert_eq!(reason, RouteTransportNackReason::RouteUnavailable);
     }

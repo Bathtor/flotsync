@@ -1039,10 +1039,12 @@ dependencies = [
 name = "flotsync_replication"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "bytes",
  "flotsync_core",
  "flotsync_data_types",
  "flotsync_io",
+ "flotsync_messages",
  "flotsync_udpour",
  "flotsync_utils",
  "kompact",

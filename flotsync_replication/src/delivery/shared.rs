@@ -5,7 +5,6 @@
 
 use crate::api::{GroupId, MemberIdentity};
 use bytes::Bytes;
-use flotsync_utils::IString;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -44,7 +43,6 @@ pub struct EncryptedPayload {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignatureScheme {
     Ed25519,
-    Custom(IString),
 }
 
 /// Detached signature bytes carried in plaintext footers.
@@ -183,10 +181,23 @@ pub struct ActiveRouteRecord {
     pub state: RouteActiveState,
 }
 
-/// Proof that one relay durably stored one envelope.
+/// Proof that one relay durably stored one group-broadcast envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayStoreConfirmation {
+pub struct GroupRelayStoreConfirmation {
+    pub group_id: GroupId,
     pub message_id: MessageId,
+    pub original_sender: MemberIdentity,
+    pub relay: RelayIdentity,
+    pub route_id: LogicalRouteId,
+    pub receipt_id: RelayStoreReceiptId,
+}
+
+/// Proof that one relay durably stored one reliable-delivery envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReliableRelayStoreConfirmation {
+    pub message_id: MessageId,
+    pub original_sender: MemberIdentity,
+    pub recipient: MemberIdentity,
     pub relay: RelayIdentity,
     pub route_id: LogicalRouteId,
     pub receipt_id: RelayStoreReceiptId,

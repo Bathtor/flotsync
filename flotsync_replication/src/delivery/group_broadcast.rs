@@ -1,14 +1,20 @@
 //! Group-scoped delivery-domain types.
 
-use super::shared::{
-    ActiveRouteRecord,
-    DeliveryClass,
-    EncryptedPayload,
-    LogicalRouteId,
-    MessageId,
-    SignedEnvelopeFooter,
+use super::{
+    ingress::InboundDeliveryMeta,
+    shared::{
+        ActiveRouteRecord,
+        DeliveryClass,
+        EncryptedPayload,
+        LogicalRouteId,
+        MessageId,
+        SignedEnvelopeFooter,
+    },
 };
 use crate::api::{GroupId, MemberIdentity};
+use flotsync_messages::delivery as delivery_proto;
+use flotsync_utils::NonOwningPhantomData;
+use kompact::{Never, prelude::Port};
 use std::time::SystemTime;
 
 /// Plaintext group-scoped envelope header.
@@ -44,6 +50,32 @@ pub struct GroupBroadcastSubmit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupBroadcastDeliver {
     pub envelope: GroupMessageEnvelope,
+}
+
+/// Inbound group-broadcast payload handed to the semantic owner from delivery
+/// ingress.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupBroadcastInboundDeliver<R> {
+    /// Shared ingress metadata derived before the semantic handoff.
+    pub meta: InboundDeliveryMeta<R>,
+    /// Fully decoded group-broadcast boundary frame owned by the generated
+    /// protobuf types.
+    pub frame: delivery_proto::GroupBroadcastFrame,
+}
+
+/// Internal ingress port that feeds decoded group-broadcast boundary frames
+/// into the group-broadcast service.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GroupBroadcastInboundPort<R>(NonOwningPhantomData<R>);
+
+impl<R> Port for GroupBroadcastInboundPort<R>
+where
+    R: Clone + std::fmt::Debug + Send + Sync + 'static,
+{
+    /// Delivery ingress is the sole producer for this internal semantic
+    /// stream.
+    type Request = Never;
+    type Indication = GroupBroadcastInboundDeliver<R>;
 }
 
 /// Queue-owned in-memory state for one accepted group broadcast request.
