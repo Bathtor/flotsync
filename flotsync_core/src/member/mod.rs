@@ -3,6 +3,7 @@ use std::ops::Index;
 mod identifier;
 pub use identifier::*;
 mod identifier_trie;
+pub use identifier_trie::{TrieMap, TrieSet};
 
 /// Some representation of flotsync group's members.
 pub trait GroupMembership:

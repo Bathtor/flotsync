@@ -2,9 +2,12 @@ use std::{fmt, future::Future, marker::PhantomData, pin::Pin};
 
 use kompact::prelude::{Handled, MessageBounds};
 
+pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
 pub mod testing;
+
+pub use claimable_promise::KClaimablePromise;
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

@@ -5,7 +5,7 @@
 
 use crate::api::{GroupId, MemberIdentity};
 use bytes::Bytes;
-use std::time::SystemTime;
+use std::{fmt, time::SystemTime};
 use uuid::Uuid;
 
 /// Temporary relay identity choice.
@@ -18,6 +18,12 @@ pub type RelayIdentity = MemberIdentity;
 /// Stable message identifier reused across retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub Uuid);
+
+impl fmt::Display for MessageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "msg#{}", self.0)
+    }
+}
 
 /// Stable identifier for one concrete send operation issued against an opaque
 /// discovery-provided route.
@@ -127,6 +133,9 @@ pub enum RouteActiveState {
     AttemptingDirect {
         send_id: RouteSendId,
     },
+    /// One direct send was accepted by route transport and reliable delivery is
+    /// now waiting for the semantic recipient ack for the same message id.
+    AwaitingRecipientAck,
     AwaitingRelayStore {
         send_id: RouteSendId,
     },
