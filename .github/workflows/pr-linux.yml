@@ -37,8 +37,19 @@ jobs:
           toolchain: nightly
           components: clippy, rustfmt
 
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.67.0
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Check proto formatting
+        run: buf format --diff --exit-code
+
+      - name: Lint proto schema
+        run: buf lint
 
       - name: Check formatting
         run: cargo fmt --all --check

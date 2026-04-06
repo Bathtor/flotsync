@@ -250,9 +250,9 @@ mod tests {
         test_support::{build_test_kompact_system, kill_component, start_component},
     };
     use flotsync_messages::{
+        buffa::{Message, MessageField},
         delivery as proto,
         discovery as discovery_proto,
-        protobuf::{Message, MessageField},
     };
     use std::{sync::mpsc, time::Duration};
     use uuid::Uuid;
@@ -539,31 +539,40 @@ mod tests {
     }
 
     fn proto_identifier(member: &MemberIdentity) -> discovery_proto::Identifier {
-        let mut identifier = discovery_proto::Identifier::new();
-        identifier.segments = member
+        let segments = member
             .segments_iter()
             .map(|segment| segment.as_ref().to_owned())
             .collect();
-        identifier
+        discovery_proto::Identifier {
+            segments,
+            ..discovery_proto::Identifier::default()
+        }
     }
 
     fn encode_group_boundary_frame(group_id: GroupId, delivery_message_id: MessageId) -> IoPayload {
-        let mut header = proto::GroupEnvelopeHeader::new();
-        header.group_id = group_id.0.as_bytes().to_vec();
-        header.sender = MessageField::some(proto_identifier(&member(&["alice"])));
-        header.message_id = delivery_message_id.0.as_bytes().to_vec();
-
-        let mut envelope = proto::GroupEnvelopeWire::new();
-        envelope.public_header = MessageField::some(header);
-        envelope.encrypted_payload = b"ciphertext".to_vec();
-
-        let mut frame = proto::GroupBroadcastFrame::new();
-        frame.body = Some(proto::group_broadcast_frame::Body::Envelope(envelope));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
-            frame,
-        ));
+        let header = proto::GroupEnvelopeHeader {
+            group_id: group_id.0.as_bytes().to_vec(),
+            sender: MessageField::some(proto_identifier(&member(&["alice"]))),
+            message_id: delivery_message_id.0.as_bytes().to_vec(),
+            ..proto::GroupEnvelopeHeader::default()
+        };
+        let envelope = proto::GroupEnvelopeWire {
+            public_header: MessageField::some(header),
+            encrypted_payload: b"ciphertext".to_vec(),
+            ..proto::GroupEnvelopeWire::default()
+        };
+        let frame = proto::GroupBroadcastFrame {
+            body: Some(proto::group_broadcast_frame::Body::Envelope(Box::new(
+                envelope,
+            ))),
+            ..proto::GroupBroadcastFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+                Box::new(frame),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
         encode_boundary(boundary)
     }
 
@@ -572,28 +581,32 @@ mod tests {
         original_sender: &MemberIdentity,
         recipient: &MemberIdentity,
     ) -> IoPayload {
-        let mut header = proto::RecipientAckHeader::new();
-        header.message_id = delivery_message_id.0.as_bytes().to_vec();
-        header.original_sender = MessageField::some(proto_identifier(original_sender));
-        header.recipient = MessageField::some(proto_identifier(recipient));
-
-        let mut ack = proto::RecipientAckWire::new();
-        ack.public_header = MessageField::some(header);
-
-        let mut frame = proto::ReliableDeliveryFrame::new();
-        frame.body = Some(proto::reliable_delivery_frame::Body::RecipientAck(ack));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
-            frame,
-        ));
+        let header = proto::RecipientAckHeader {
+            message_id: delivery_message_id.0.as_bytes().to_vec(),
+            original_sender: MessageField::some(proto_identifier(original_sender)),
+            recipient: MessageField::some(proto_identifier(recipient)),
+            ..proto::RecipientAckHeader::default()
+        };
+        let ack = proto::RecipientAckWire {
+            public_header: MessageField::some(header),
+            ..proto::RecipientAckWire::default()
+        };
+        let frame = proto::ReliableDeliveryFrame {
+            body: Some(proto::reliable_delivery_frame::Body::RecipientAck(
+                Box::new(ack),
+            )),
+            ..proto::ReliableDeliveryFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+                Box::new(frame),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
         encode_boundary(boundary)
     }
 
     fn encode_boundary(boundary: proto::DeliveryBoundaryFrame) -> IoPayload {
-        let bytes = boundary
-            .write_to_bytes()
-            .expect("test delivery boundary must encode");
-        IoPayload::from(bytes::Bytes::from(bytes))
+        IoPayload::from(boundary.encode_to_bytes())
     }
 }

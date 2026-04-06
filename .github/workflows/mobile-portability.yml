@@ -38,6 +38,11 @@ jobs:
           toolchain: nightly
           targets: ${{ matrix.target }}
 
+      - name: Install Buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          version: 1.67.0
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 

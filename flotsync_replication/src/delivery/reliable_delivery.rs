@@ -14,7 +14,7 @@ use super::{
 };
 use crate::api::MemberIdentity;
 use bytes::Bytes;
-use flotsync_core::member::{IdentifierBuf, TrieMap};
+use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
 use flotsync_utils::{
     BoxFuture,
@@ -322,10 +322,10 @@ impl ReliableDeliveryComponent {
 
         match body {
             delivery_proto::reliable_delivery_frame::Body::Envelope(envelope) => {
-                self.handle_inbound_envelope(envelope)
+                self.handle_inbound_envelope(*envelope)
             }
             delivery_proto::reliable_delivery_frame::Body::RecipientAck(ack) => {
-                self.handle_inbound_recipient_ack(ack)
+                self.handle_inbound_recipient_ack(*ack)
             }
             other => {
                 debug!(
@@ -488,8 +488,7 @@ impl ReliableDeliveryComponent {
                 "Reliable delivery processed message_id={message_id} but has no direct route back to original sender={original_sender} for recipient ack"
             );
             self.schedule_retry(RetryKey::InboundAck(message_id), self.retry_delay);
-            return;
-        };
+        }
     }
 
     async fn dispatch_recipient_ack(
@@ -1019,6 +1018,7 @@ mod tests {
         },
     };
     use arc_swap::ArcSwap;
+    use flotsync_core::member::IdentifierBuf;
     use flotsync_io::{
         prelude::{
             DriverConfig,

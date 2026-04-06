@@ -20,9 +20,9 @@ use crate::api::{GroupId, MemberIdentity};
 use flotsync_core::member::{IdentifierBuf, IdentifierError};
 use flotsync_io::prelude::IoPayload;
 use flotsync_messages::{
+    buffa::{DecodeError, Message, MessageView},
     delivery as proto,
     discovery as discovery_proto,
-    protobuf::{self, CodedInputStream, Message, MessageField, rt::WireType},
 };
 use proto::delivery_boundary_frame::Boundary;
 use snafu::prelude::*;
@@ -44,22 +44,25 @@ pub(crate) fn decode_boundary_frame_if_interested(
     payload: &IoPayload,
     interest: DeliveryInterestView<'_>,
 ) -> Result<Option<DecodedDeliveryFrame>, DeliveryWireError> {
-    let Some(classification) = classify_boundary_frame(payload, interest)? else {
+    let payload_bytes = payload.create_byte_clone();
+    let payload_slice = payload_bytes.as_ref();
+
+    let Some(classification) = classify_boundary_frame(payload_slice, interest)? else {
         return Ok(None);
     };
 
-    let decoded = decode_full_boundary_frame(payload)?;
+    let decoded = decode_full_boundary_frame(payload_slice)?;
     match (classification.owner, decoded) {
         (SemanticOwner::GroupBroadcast, Boundary::GroupBroadcast(frame)) => {
             Ok(Some(DecodedDeliveryFrame::GroupBroadcast {
                 target: classification.target,
-                frame,
+                frame: *frame,
             }))
         }
         (SemanticOwner::ReliableDelivery, Boundary::ReliableDelivery(frame)) => {
             Ok(Some(DecodedDeliveryFrame::ReliableDelivery {
                 target: classification.target,
-                frame,
+                frame: *frame,
             }))
         }
         (SemanticOwner::GroupBroadcast, Boundary::ReliableDelivery(_)) => {
@@ -76,19 +79,6 @@ pub(crate) fn decode_boundary_frame_if_interested(
             }
             .fail()
         }
-        (SemanticOwner::GroupBroadcast, _) => BoundaryOwnerMismatchSnafu {
-            shallow_owner: SemanticOwner::GroupBroadcast,
-            full_owner: SemanticOwner::UnsupportedBoundary,
-        }
-        .fail(),
-        (SemanticOwner::ReliableDelivery, _) => BoundaryOwnerMismatchSnafu {
-            shallow_owner: SemanticOwner::ReliableDelivery,
-            full_owner: SemanticOwner::UnsupportedBoundary,
-        }
-        .fail(),
-        (SemanticOwner::UnsupportedBoundary, _) => unreachable!(
-            "shallow classification never assigns UnsupportedBoundary as the expected owner"
-        ),
     }
 }
 
@@ -147,18 +137,8 @@ impl DeliveryInterestView<'_> {
 /// Failure modes for delivery-wire classification and full decode.
 #[derive(Debug, Snafu)]
 pub(crate) enum DeliveryWireError {
-    #[snafu(display("Failed to parse delivery protobuf payload: {source}"))]
-    Protobuf { source: protobuf::Error },
-
-    #[snafu(display(
-        "Field {field_number} in {context} used wire type {actual:?}, expected {expected:?}."
-    ))]
-    UnexpectedWireType {
-        context: &'static str,
-        field_number: u32,
-        expected: WireType,
-        actual: WireType,
-    },
+    #[snafu(display("Failed to parse delivery wire payload: {source}"))]
+    Decode { source: DecodeError },
 
     #[snafu(display("Protobuf message '{message}' is missing required field '{field}'."))]
     MissingField {
@@ -191,31 +171,6 @@ pub(crate) enum DeliveryWireError {
         shallow_owner: SemanticOwner,
         full_owner: SemanticOwner,
     },
-
-    #[snafu(display(
-        "Encountered invalid protobuf tag value {tag} while classifying a delivery frame."
-    ))]
-    InvalidTag { tag: u32 },
-}
-
-/// Local helper converting generated protobuf option fields into the error
-/// style used by this module.
-trait RequiredMessageFieldExt<T> {
-    fn take_required(
-        &mut self,
-        message: &'static str,
-        field: &'static str,
-    ) -> Result<T, DeliveryWireError>;
-}
-
-impl<T> RequiredMessageFieldExt<T> for MessageField<T> {
-    fn take_required(
-        &mut self,
-        message: &'static str,
-        field: &'static str,
-    ) -> Result<T, DeliveryWireError> {
-        self.take().context(MissingFieldSnafu { message, field })
-    }
 }
 
 /// Perform the shallow classification pass over one boundary frame.
@@ -227,32 +182,24 @@ impl<T> RequiredMessageFieldExt<T> for MessageField<T> {
 /// `Ok(None)` means the payload was classified successfully and deliberately
 /// dropped as irrelevant.
 fn classify_boundary_frame(
-    payload: &IoPayload,
+    payload: &[u8],
     interest: DeliveryInterestView<'_>,
 ) -> Result<Option<RelevantShallowClassification>, DeliveryWireError> {
-    let mut cursor = payload.cursor();
-    let mut input = CodedInputStream::new(&mut cursor);
-    let mut classification = None;
-
-    while !input.eof().context(ProtobufSnafu)? {
-        let (field_number, wire_type) = read_tag(&mut input)?;
-        classification = match field_number {
-            1 => Some(parse_group_broadcast_frame_hint(
-                &mut input, wire_type, interest,
-            )?),
-            2 => Some(parse_reliable_delivery_frame_hint(
-                &mut input, wire_type, interest,
-            )?),
-            _ => {
-                input.skip_field(wire_type).context(ProtobufSnafu)?;
-                classification
-            }
-        };
-    }
-
-    match classification.context(MissingOneofSnafu {
+    let frame = proto::DeliveryBoundaryFrameView::decode_view(payload).context(DecodeSnafu)?;
+    let boundary = frame.boundary.as_ref().context(MissingOneofSnafu {
         name: "DeliveryBoundaryFrame.boundary",
-    })? {
+    })?;
+
+    let classification = match boundary {
+        proto::delivery_boundary_frame::BoundaryView::GroupBroadcast(frame) => {
+            parse_group_broadcast_frame_hint(frame, interest)?
+        }
+        proto::delivery_boundary_frame::BoundaryView::ReliableDelivery(frame) => {
+            parse_reliable_delivery_frame_hint(frame, interest)?
+        }
+    };
+
+    match classification {
         ShallowClassification::Relevant { owner, target } => {
             Ok(Some(RelevantShallowClassification { owner, target }))
         }
@@ -262,62 +209,50 @@ fn classify_boundary_frame(
 
 /// Parse the top-level group-broadcast branch of the delivery boundary.
 fn parse_group_broadcast_frame_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    frame: &proto::GroupBroadcastFrameView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("DeliveryBoundaryFrame", 1, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut selection = None;
-        while !input.eof().context(ProtobufSnafu)? {
-            let (field_number, wire_type) = read_tag(input)?;
-            selection = match field_number {
-                1 => Some(parse_group_envelope_hint(input, wire_type, interest)?),
-                2 => Some(parse_group_relay_store_confirmation_hint(
-                    input, wire_type, interest,
-                )?),
-                _ => {
-                    input.skip_field(wire_type).context(ProtobufSnafu)?;
-                    selection
-                }
-            };
+    let body = frame.body.as_ref().context(MissingOneofSnafu {
+        name: "GroupBroadcastFrame.body",
+    })?;
+    match body {
+        proto::group_broadcast_frame::BodyView::Envelope(envelope) => {
+            parse_group_envelope_hint(envelope, interest)
         }
-        selection.context(MissingOneofSnafu {
-            name: "GroupBroadcastFrame.body",
-        })
-    })
+        proto::group_broadcast_frame::BodyView::RelayStoreConfirmation(confirmation) => {
+            parse_group_relay_store_confirmation_hint(confirmation, interest)
+        }
+    }
 }
 
 /// Parse the top-level reliable-delivery branch of the delivery boundary.
 fn parse_reliable_delivery_frame_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    frame: &proto::ReliableDeliveryFrameView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("DeliveryBoundaryFrame", 2, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut selection = None;
-        while !input.eof().context(ProtobufSnafu)? {
-            let (field_number, wire_type) = read_tag(input)?;
-            selection = match field_number {
-                1 => Some(parse_reliable_envelope_hint(input, wire_type, interest)?),
-                2 => Some(parse_recipient_ack_hint(input, wire_type, interest)?),
-                3 => Some(parse_mailbox_fetch_hint(input, wire_type, interest)?),
-                4 => Some(parse_mailbox_batch_hint(input, wire_type, interest)?),
-                5 => Some(parse_mailbox_ack_hint(input, wire_type, interest)?),
-                6 => Some(parse_reliable_relay_store_confirmation_hint(
-                    input, wire_type, interest,
-                )?),
-                _ => {
-                    input.skip_field(wire_type).context(ProtobufSnafu)?;
-                    selection
-                }
-            };
+    let body = frame.body.as_ref().context(MissingOneofSnafu {
+        name: "ReliableDeliveryFrame.body",
+    })?;
+    match body {
+        proto::reliable_delivery_frame::BodyView::Envelope(envelope) => {
+            parse_reliable_envelope_hint(envelope, interest)
         }
-        selection.context(MissingOneofSnafu {
-            name: "ReliableDeliveryFrame.body",
-        })
-    })
+        proto::reliable_delivery_frame::BodyView::RecipientAck(ack) => {
+            parse_recipient_ack_hint(ack, interest)
+        }
+        proto::reliable_delivery_frame::BodyView::MailboxFetch(fetch) => {
+            parse_mailbox_fetch_hint(fetch, interest)
+        }
+        proto::reliable_delivery_frame::BodyView::MailboxBatch(batch) => {
+            parse_mailbox_batch_hint(batch, interest)
+        }
+        proto::reliable_delivery_frame::BodyView::MailboxAck(ack) => {
+            parse_mailbox_ack_hint(ack, interest)
+        }
+        proto::reliable_delivery_frame::BodyView::RelayStoreConfirmation(confirmation) => {
+            parse_reliable_relay_store_confirmation_hint(confirmation, interest)
+        }
+    }
 }
 
 /// Parse the minimal public header of a group envelope.
@@ -325,26 +260,28 @@ fn parse_reliable_delivery_frame_hint(
 /// A group envelope is relevant only when the addressed group is currently
 /// active locally.
 fn parse_group_envelope_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    envelope: &proto::GroupEnvelopeWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("GroupBroadcastFrame", 1, wire_type)?;
-    read_length_delimited(input, |input| {
-        let header = take_group_header(input, "GroupEnvelopeWire", "public_header")?;
-        let group_id = decode_group_id(header.group_id, "GroupEnvelopeHeader.group_id")?;
-        let delivery_message_id =
-            decode_message_id(header.message_id, "GroupEnvelopeHeader.message_id")?;
-        if let Some(classification) = interest.check_group(&group_id) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::GroupBroadcast,
-            target: DeliveryTargetHint::GroupBroadcast {
-                group_id,
-                delivery_message_id,
-            },
-        })
+    let header = envelope
+        .public_header
+        .as_option()
+        .context(MissingFieldSnafu {
+            message: "GroupEnvelopeWire",
+            field: "public_header",
+        })?;
+    let group_id = decode_group_id(header.group_id, "GroupEnvelopeHeader.group_id")?;
+    let delivery_message_id =
+        decode_message_id(header.message_id, "GroupEnvelopeHeader.message_id")?;
+    if let Some(classification) = interest.check_group(&group_id) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::GroupBroadcast,
+        target: DeliveryTargetHint::GroupBroadcast {
+            group_id,
+            delivery_message_id,
+        },
     })
 }
 
@@ -353,123 +290,131 @@ fn parse_group_envelope_hint(
 /// These confirmations are only relevant to the original sender that may still
 /// be correlating the relay-store result locally.
 fn parse_group_relay_store_confirmation_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    confirmation: &proto::GroupRelayStoreConfirmationWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("GroupBroadcastFrame", 2, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_group_relay_store_confirmation_header(
-            input,
-            "GroupRelayStoreConfirmationWire",
-            "public_header",
-        )?;
-        let original_sender = decode_member_identity(
-            header
-                .original_sender
-                .take_required("GroupRelayStoreConfirmationHeader", "original_sender")?,
-            "GroupRelayStoreConfirmationHeader.original_sender",
-        )?;
-        if let Some(classification) = interest.check_local_member(&original_sender) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::GroupBroadcast,
-            target: DeliveryTargetHint::OriginalSender {
-                original_sender,
-                delivery_message_id: decode_message_id(
-                    header.message_id,
-                    "GroupRelayStoreConfirmationHeader.message_id",
-                )?,
-            },
-        })
+    let header = confirmation
+        .public_header
+        .as_option()
+        .context(MissingFieldSnafu {
+            message: "GroupRelayStoreConfirmationWire",
+            field: "public_header",
+        })?;
+    let original_sender = decode_member_identity(
+        header
+            .original_sender
+            .as_option()
+            .context(MissingFieldSnafu {
+                message: "GroupRelayStoreConfirmationHeader",
+                field: "original_sender",
+            })?,
+        "GroupRelayStoreConfirmationHeader.original_sender",
+    )?;
+    if let Some(classification) = interest.check_local_member(&original_sender) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::GroupBroadcast,
+        target: DeliveryTargetHint::OriginalSender {
+            original_sender,
+            delivery_message_id: decode_message_id(
+                header.message_id,
+                "GroupRelayStoreConfirmationHeader.message_id",
+            )?,
+        },
     })
 }
 
 /// Parse the minimal public header of a reliable envelope.
 fn parse_reliable_envelope_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    envelope: &proto::ReliableEnvelopeWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 1, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_reliable_header(input, "ReliableEnvelopeWire", "public_header")?;
-        let recipient = decode_member_identity(
-            header
-                .recipient
-                .take_required("ReliableEnvelopeHeader", "recipient")?,
-            "ReliableEnvelopeHeader.recipient",
-        )?;
-        if let Some(classification) = interest.check_local_member(&recipient) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::ReliableRecipient {
-                recipient,
-                delivery_message_id: Some(decode_message_id(
-                    header.message_id,
-                    "ReliableEnvelopeHeader.message_id",
-                )?),
-            },
-        })
+    let header = envelope
+        .public_header
+        .as_option()
+        .context(MissingFieldSnafu {
+            message: "ReliableEnvelopeWire",
+            field: "public_header",
+        })?;
+    let recipient = decode_member_identity(
+        header.recipient.as_option().context(MissingFieldSnafu {
+            message: "ReliableEnvelopeHeader",
+            field: "recipient",
+        })?,
+        "ReliableEnvelopeHeader.recipient",
+    )?;
+    if let Some(classification) = interest.check_local_member(&recipient) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::ReliableRecipient {
+            recipient,
+            delivery_message_id: Some(decode_message_id(
+                header.message_id,
+                "ReliableEnvelopeHeader.message_id",
+            )?),
+        },
     })
 }
 
 /// Parse the minimal public header of a recipient acknowledgement.
 fn parse_recipient_ack_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    ack: &proto::RecipientAckWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 2, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_recipient_ack_header(input, "RecipientAckWire", "public_header")?;
-        let original_sender = decode_member_identity(
-            header
-                .original_sender
-                .take_required("RecipientAckHeader", "original_sender")?,
-            "RecipientAckHeader.original_sender",
-        )?;
-        if let Some(classification) = interest.check_local_member(&original_sender) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::OriginalSender {
-                original_sender,
-                delivery_message_id: decode_message_id(
-                    header.message_id,
-                    "RecipientAckHeader.message_id",
-                )?,
-            },
-        })
+    let header = ack.public_header.as_option().context(MissingFieldSnafu {
+        message: "RecipientAckWire",
+        field: "public_header",
+    })?;
+    let original_sender = decode_member_identity(
+        header
+            .original_sender
+            .as_option()
+            .context(MissingFieldSnafu {
+                message: "RecipientAckHeader",
+                field: "original_sender",
+            })?,
+        "RecipientAckHeader.original_sender",
+    )?;
+    if let Some(classification) = interest.check_local_member(&original_sender) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::OriginalSender {
+            original_sender,
+            delivery_message_id: decode_message_id(
+                header.message_id,
+                "RecipientAckHeader.message_id",
+            )?,
+        },
     })
 }
 
 /// Parse the minimal public header of a mailbox fetch request.
 fn parse_mailbox_fetch_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    fetch: &proto::MailboxFetchWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 3, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_mailbox_fetch_header(input, "MailboxFetchWire", "public_header")?;
-        let recipient = decode_member_identity(
-            header
-                .recipient
-                .take_required("MailboxFetchHeader", "recipient")?,
-            "MailboxFetchHeader.recipient",
-        )?;
-        if let Some(classification) = interest.check_hosted_mailbox(&recipient) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::HostedMailbox { recipient },
-        })
+    let header = fetch.public_header.as_option().context(MissingFieldSnafu {
+        message: "MailboxFetchWire",
+        field: "public_header",
+    })?;
+    let recipient = decode_member_identity(
+        header.recipient.as_option().context(MissingFieldSnafu {
+            message: "MailboxFetchHeader",
+            field: "recipient",
+        })?,
+        "MailboxFetchHeader.recipient",
+    )?;
+    if let Some(classification) = interest.check_hosted_mailbox(&recipient) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::HostedMailbox { recipient },
     })
 }
 
@@ -479,267 +424,132 @@ fn parse_mailbox_fetch_hint(
 /// to one delivery-domain message id, so the resulting target hint carries
 /// `delivery_message_id = None`.
 fn parse_mailbox_batch_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    batch: &proto::MailboxBatchWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 4, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_mailbox_batch_header(input, "MailboxBatchWire", "public_header")?;
-        let recipient = decode_member_identity(
-            header
-                .recipient
-                .take_required("MailboxBatchHeader", "recipient")?,
-            "MailboxBatchHeader.recipient",
-        )?;
-        if let Some(classification) = interest.check_local_member(&recipient) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::ReliableRecipient {
-                recipient,
-                delivery_message_id: None,
-            },
-        })
+    let header = batch.public_header.as_option().context(MissingFieldSnafu {
+        message: "MailboxBatchWire",
+        field: "public_header",
+    })?;
+    let recipient = decode_member_identity(
+        header.recipient.as_option().context(MissingFieldSnafu {
+            message: "MailboxBatchHeader",
+            field: "recipient",
+        })?,
+        "MailboxBatchHeader.recipient",
+    )?;
+    if let Some(classification) = interest.check_local_member(&recipient) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::ReliableRecipient {
+            recipient,
+            delivery_message_id: None,
+        },
     })
 }
 
 /// Parse the minimal public header of a mailbox acknowledgement.
 fn parse_mailbox_ack_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    ack: &proto::MailboxAckWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 5, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_mailbox_ack_header(input, "MailboxAckWire", "public_header")?;
-        let recipient = decode_member_identity(
-            header
-                .recipient
-                .take_required("MailboxAckHeader", "recipient")?,
-            "MailboxAckHeader.recipient",
-        )?;
-        if let Some(classification) = interest.check_hosted_mailbox(&recipient) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::HostedMailbox { recipient },
-        })
+    let header = ack.public_header.as_option().context(MissingFieldSnafu {
+        message: "MailboxAckWire",
+        field: "public_header",
+    })?;
+    let recipient = decode_member_identity(
+        header.recipient.as_option().context(MissingFieldSnafu {
+            message: "MailboxAckHeader",
+            field: "recipient",
+        })?,
+        "MailboxAckHeader.recipient",
+    )?;
+    if let Some(classification) = interest.check_hosted_mailbox(&recipient) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::HostedMailbox { recipient },
     })
 }
 
 /// Parse the minimal public header of a reliable relay-store confirmation.
 fn parse_reliable_relay_store_confirmation_hint(
-    input: &mut CodedInputStream<'_>,
-    wire_type: WireType,
+    confirmation: &proto::ReliableRelayStoreConfirmationWireView<'_>,
     interest: DeliveryInterestView<'_>,
 ) -> Result<ShallowClassification, DeliveryWireError> {
-    expect_message_wire_type("ReliableDeliveryFrame", 6, wire_type)?;
-    read_length_delimited(input, |input| {
-        let mut header = take_reliable_relay_store_confirmation_header(
-            input,
-            "ReliableRelayStoreConfirmationWire",
-            "public_header",
-        )?;
-        let original_sender = decode_member_identity(
-            header
-                .original_sender
-                .take_required("ReliableRelayStoreConfirmationHeader", "original_sender")?,
-            "ReliableRelayStoreConfirmationHeader.original_sender",
-        )?;
-        if let Some(classification) = interest.check_local_member(&original_sender) {
-            return Ok(classification);
-        }
-        Ok(ShallowClassification::Relevant {
-            owner: SemanticOwner::ReliableDelivery,
-            target: DeliveryTargetHint::OriginalSender {
-                original_sender,
-                delivery_message_id: decode_message_id(
-                    header.message_id,
-                    "ReliableRelayStoreConfirmationHeader.message_id",
-                )?,
-            },
-        })
+    let header = confirmation
+        .public_header
+        .as_option()
+        .context(MissingFieldSnafu {
+            message: "ReliableRelayStoreConfirmationWire",
+            field: "public_header",
+        })?;
+    let original_sender = decode_member_identity(
+        header
+            .original_sender
+            .as_option()
+            .context(MissingFieldSnafu {
+                message: "ReliableRelayStoreConfirmationHeader",
+                field: "original_sender",
+            })?,
+        "ReliableRelayStoreConfirmationHeader.original_sender",
+    )?;
+    if let Some(classification) = interest.check_local_member(&original_sender) {
+        return Ok(classification);
+    }
+    Ok(ShallowClassification::Relevant {
+        owner: SemanticOwner::ReliableDelivery,
+        target: DeliveryTargetHint::OriginalSender {
+            original_sender,
+            delivery_message_id: decode_message_id(
+                header.message_id,
+                "ReliableRelayStoreConfirmationHeader.message_id",
+            )?,
+        },
     })
-}
-
-fn take_group_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::GroupEnvelopeHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_reliable_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::ReliableEnvelopeHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_recipient_ack_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::RecipientAckHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_mailbox_fetch_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::MailboxFetchHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_mailbox_batch_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::MailboxBatchHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_mailbox_ack_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::MailboxAckHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_group_relay_store_confirmation_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::GroupRelayStoreConfirmationHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-fn take_reliable_relay_store_confirmation_header(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-) -> Result<proto::ReliableRelayStoreConfirmationHeader, DeliveryWireError> {
-    take_public_header(input, message_name, field_name, 1)
-}
-
-/// Read exactly the public header field from one generated delivery-wire
-/// message, skipping any encrypted payload or footer fields.
-///
-/// This is the core of the shallow-classification pass: it lets ingress make a
-/// routing decision without first decoding the entire message.
-fn take_public_header<M>(
-    input: &mut CodedInputStream<'_>,
-    message_name: &'static str,
-    field_name: &'static str,
-    public_header_field_number: u32,
-) -> Result<M, DeliveryWireError>
-where
-    M: Message,
-{
-    let mut header = None;
-    while !input.eof().context(ProtobufSnafu)? {
-        let (field_number, wire_type) = read_tag(input)?;
-        if field_number == public_header_field_number {
-            expect_message_wire_type(message_name, field_number, wire_type)?;
-            header = Some(input.read_message::<M>().context(ProtobufSnafu)?);
-            continue;
-        }
-        input.skip_field(wire_type).context(ProtobufSnafu)?;
-    }
-    header.context(MissingFieldSnafu {
-        message: message_name,
-        field: field_name,
-    })
-}
-
-/// Read one raw protobuf tag and split it into field number and wire type.
-fn read_tag(input: &mut CodedInputStream<'_>) -> Result<(u32, WireType), DeliveryWireError> {
-    let raw_tag = input.read_raw_varint32().context(ProtobufSnafu)?;
-    let wire_type = WireType::new(raw_tag & 0x07).context(InvalidTagSnafu { tag: raw_tag })?;
-    let field_number = raw_tag >> 3;
-    if field_number == 0 {
-        return InvalidTagSnafu { tag: raw_tag }.fail();
-    }
-    Ok((field_number, wire_type))
-}
-
-/// Validate that one protobuf field really is an embedded message.
-fn expect_message_wire_type(
-    context: &'static str,
-    field_number: u32,
-    actual: WireType,
-) -> Result<(), DeliveryWireError> {
-    if actual != WireType::LengthDelimited {
-        return UnexpectedWireTypeSnafu {
-            context,
-            field_number,
-            expected: WireType::LengthDelimited,
-            actual,
-        }
-        .fail();
-    }
-    Ok(())
 }
 
 /// Decode the full boundary frame once shallow classification has already said
 /// the payload is locally relevant.
 fn decode_full_boundary_frame(
-    payload: &IoPayload,
+    payload: &[u8],
 ) -> Result<proto::delivery_boundary_frame::Boundary, DeliveryWireError> {
-    let mut cursor = payload.cursor();
-    let boundary =
-        proto::DeliveryBoundaryFrame::parse_from_reader(&mut cursor).context(ProtobufSnafu)?;
+    let boundary = proto::DeliveryBoundaryFrame::decode_from_slice(payload).context(DecodeSnafu)?;
     boundary.boundary.context(MissingOneofSnafu {
         name: "DeliveryBoundaryFrame.boundary",
     })
 }
 
-/// Run one nested parser inside the length limit of a length-delimited
-/// protobuf message field.
-fn read_length_delimited<T>(
-    input: &mut CodedInputStream<'_>,
-    f: impl FnOnce(&mut CodedInputStream<'_>) -> Result<T, DeliveryWireError>,
-) -> Result<T, DeliveryWireError> {
-    let len = input.read_raw_varint64().context(ProtobufSnafu)?;
-    let old_limit = input.push_limit(len).context(ProtobufSnafu)?;
-    let result = f(input);
-    input.pop_limit(old_limit);
-    result
-}
-
 /// Decode one group id encoded as raw UUID bytes in the wire format.
-fn decode_group_id(raw: Vec<u8>, field: &'static str) -> Result<GroupId, DeliveryWireError> {
+fn decode_group_id(raw: &[u8], field: &'static str) -> Result<GroupId, DeliveryWireError> {
     Ok(GroupId(decode_uuid(raw, field)?))
 }
 
 /// Decode one delivery-domain message id encoded as raw UUID bytes in the wire
 /// format.
-fn decode_message_id(raw: Vec<u8>, field: &'static str) -> Result<MessageId, DeliveryWireError> {
+fn decode_message_id(raw: &[u8], field: &'static str) -> Result<MessageId, DeliveryWireError> {
     Ok(MessageId(decode_uuid(raw, field)?))
 }
 
 /// Decode one UUID from its raw protobuf byte representation.
-fn decode_uuid(raw: Vec<u8>, field: &'static str) -> Result<Uuid, DeliveryWireError> {
-    Uuid::from_slice(&raw).context(InvalidUuidSnafu { field })
+fn decode_uuid(raw: &[u8], field: &'static str) -> Result<Uuid, DeliveryWireError> {
+    Uuid::from_slice(raw).context(InvalidUuidSnafu { field })
 }
 
 /// Decode one member identifier from the generated discovery protobuf shape
 /// into the local identifier type used by the delivery domain.
 fn decode_member_identity(
-    identifier: discovery_proto::Identifier,
+    identifier: &discovery_proto::IdentifierView<'_>,
     field: &'static str,
 ) -> Result<MemberIdentity, DeliveryWireError> {
     let mut buffer = IdentifierBuf::new();
-    for segment in identifier.segments {
+    for segment in identifier.segments.iter() {
+        let segment = segment.to_owned();
         buffer
-            .push_checked(segment.clone())
+            .push_checked(segment.to_owned())
             .context(InvalidIdentifierSegmentSnafu { field, segment })?;
     }
     Ok(buffer.into_identifier())
@@ -750,7 +560,6 @@ fn decode_member_identity(
 pub(crate) enum SemanticOwner {
     GroupBroadcast,
     ReliableDelivery,
-    UnsupportedBoundary,
 }
 
 impl std::fmt::Display for SemanticOwner {
@@ -758,7 +567,6 @@ impl std::fmt::Display for SemanticOwner {
         match self {
             Self::GroupBroadcast => write!(f, "group_broadcast"),
             Self::ReliableDelivery => write!(f, "reliable_delivery"),
-            Self::UnsupportedBoundary => write!(f, "unsupported_delivery_boundary"),
         }
     }
 }
@@ -787,7 +595,7 @@ struct RelevantShallowClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_messages::protobuf::MessageField;
+    use flotsync_messages::buffa::{Message, MessageField};
 
     fn group_id(value: u128) -> GroupId {
         GroupId(Uuid::from_u128(value))
@@ -808,19 +616,18 @@ mod tests {
     }
 
     fn proto_identifier(segments: &[&str]) -> discovery_proto::Identifier {
-        let mut identifier = discovery_proto::Identifier::new();
-        identifier.segments = segments
+        let segments = segments
             .iter()
             .map(|segment| (*segment).to_owned())
             .collect();
-        identifier
+        discovery_proto::Identifier {
+            segments,
+            ..discovery_proto::Identifier::default()
+        }
     }
 
     fn encode_boundary_frame(frame: proto::DeliveryBoundaryFrame) -> IoPayload {
-        let bytes = frame
-            .write_to_bytes()
-            .expect("test delivery boundary frame must encode");
-        IoPayload::from(bytes::Bytes::from(bytes))
+        IoPayload::from(frame.encode_to_bytes())
     }
 
     fn active_groups(groups: impl IntoIterator<Item = GroupId>) -> HashSet<GroupId> {
@@ -835,22 +642,29 @@ mod tests {
     fn irrelevant_group_envelope_is_dropped_before_full_decode() {
         let group_id = group_id(1);
         let delivery_message_id = message_id(2);
-        let mut header = proto::GroupEnvelopeHeader::new();
-        header.group_id = group_id.0.as_bytes().to_vec();
-        header.sender = MessageField::some(proto_identifier(&["alice"]));
-        header.message_id = delivery_message_id.0.as_bytes().to_vec();
-
-        let mut envelope = proto::GroupEnvelopeWire::new();
-        envelope.public_header = MessageField::some(header);
-        envelope.encrypted_payload = vec![0x5a; 32 * 1024];
-
-        let mut frame = proto::GroupBroadcastFrame::new();
-        frame.body = Some(proto::group_broadcast_frame::Body::Envelope(envelope));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
-            frame,
-        ));
+        let header = proto::GroupEnvelopeHeader {
+            group_id: group_id.0.as_bytes().to_vec(),
+            sender: MessageField::some(proto_identifier(&["alice"])),
+            message_id: delivery_message_id.0.as_bytes().to_vec(),
+            ..proto::GroupEnvelopeHeader::default()
+        };
+        let envelope = proto::GroupEnvelopeWire {
+            public_header: MessageField::some(header),
+            encrypted_payload: vec![0x5a; 32 * 1024],
+            ..proto::GroupEnvelopeWire::default()
+        };
+        let frame = proto::GroupBroadcastFrame {
+            body: Some(proto::group_broadcast_frame::Body::Envelope(Box::new(
+                envelope,
+            ))),
+            ..proto::GroupBroadcastFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+                Box::new(frame),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
 
         let active_groups = active_groups([]);
         let local_members = members([]);
@@ -872,24 +686,29 @@ mod tests {
     fn relevant_group_envelope_decodes_full_group_frame() {
         let group_id = group_id(11);
         let delivery_message_id = message_id(12);
-        let mut header = proto::GroupEnvelopeHeader::new();
-        header.group_id = group_id.0.as_bytes().to_vec();
-        header.sender = MessageField::some(proto_identifier(&["alice"]));
-        header.message_id = delivery_message_id.0.as_bytes().to_vec();
-
-        let mut envelope = proto::GroupEnvelopeWire::new();
-        envelope.public_header = MessageField::some(header);
-        envelope.encrypted_payload = b"ciphertext".to_vec();
-
-        let mut frame = proto::GroupBroadcastFrame::new();
-        frame.body = Some(proto::group_broadcast_frame::Body::Envelope(
-            envelope.clone(),
-        ));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
-            frame.clone(),
-        ));
+        let header = proto::GroupEnvelopeHeader {
+            group_id: group_id.0.as_bytes().to_vec(),
+            sender: MessageField::some(proto_identifier(&["alice"])),
+            message_id: delivery_message_id.0.as_bytes().to_vec(),
+            ..proto::GroupEnvelopeHeader::default()
+        };
+        let envelope = proto::GroupEnvelopeWire {
+            public_header: MessageField::some(header),
+            encrypted_payload: b"ciphertext".to_vec(),
+            ..proto::GroupEnvelopeWire::default()
+        };
+        let frame = proto::GroupBroadcastFrame {
+            body: Some(proto::group_broadcast_frame::Body::Envelope(Box::new(
+                envelope.clone(),
+            ))),
+            ..proto::GroupBroadcastFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+                Box::new(frame.clone()),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
 
         let active_groups = active_groups([group_id]);
         let local_members = members([]);
@@ -920,21 +739,28 @@ mod tests {
     #[test]
     fn recipient_ack_for_non_local_sender_is_dropped() {
         let delivery_message_id = message_id(21);
-        let mut header = proto::RecipientAckHeader::new();
-        header.message_id = delivery_message_id.0.as_bytes().to_vec();
-        header.original_sender = MessageField::some(proto_identifier(&["alice"]));
-        header.recipient = MessageField::some(proto_identifier(&["bob"]));
-
-        let mut ack = proto::RecipientAckWire::new();
-        ack.public_header = MessageField::some(header);
-
-        let mut frame = proto::ReliableDeliveryFrame::new();
-        frame.body = Some(proto::reliable_delivery_frame::Body::RecipientAck(ack));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
-            frame,
-        ));
+        let header = proto::RecipientAckHeader {
+            message_id: delivery_message_id.0.as_bytes().to_vec(),
+            original_sender: MessageField::some(proto_identifier(&["alice"])),
+            recipient: MessageField::some(proto_identifier(&["bob"])),
+            ..proto::RecipientAckHeader::default()
+        };
+        let ack = proto::RecipientAckWire {
+            public_header: MessageField::some(header),
+            ..proto::RecipientAckWire::default()
+        };
+        let frame = proto::ReliableDeliveryFrame {
+            body: Some(proto::reliable_delivery_frame::Body::RecipientAck(
+                Box::new(ack),
+            )),
+            ..proto::ReliableDeliveryFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+                Box::new(frame),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
 
         let active_groups = active_groups([]);
         let local_members = members([member(&["charlie"])]);
@@ -955,23 +781,27 @@ mod tests {
     #[test]
     fn mailbox_fetch_for_hosted_mailbox_routes_to_reliable_owner() {
         let recipient = member(&["alice"]);
-
-        let mut header = proto::MailboxFetchHeader::new();
-        header.recipient = MessageField::some(proto_identifier(&["alice"]));
-        header.freshness_token = Uuid::from_u128(31).as_bytes().to_vec();
-
-        let mut fetch = proto::MailboxFetchWire::new();
-        fetch.public_header = MessageField::some(header);
-
-        let mut frame = proto::ReliableDeliveryFrame::new();
-        frame.body = Some(proto::reliable_delivery_frame::Body::MailboxFetch(
-            fetch.clone(),
-        ));
-
-        let mut boundary = proto::DeliveryBoundaryFrame::new();
-        boundary.boundary = Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
-            frame.clone(),
-        ));
+        let header = proto::MailboxFetchHeader {
+            recipient: MessageField::some(proto_identifier(&["alice"])),
+            freshness_token: Uuid::from_u128(31).as_bytes().to_vec(),
+            ..proto::MailboxFetchHeader::default()
+        };
+        let fetch = proto::MailboxFetchWire {
+            public_header: MessageField::some(header),
+            ..proto::MailboxFetchWire::default()
+        };
+        let frame = proto::ReliableDeliveryFrame {
+            body: Some(proto::reliable_delivery_frame::Body::MailboxFetch(
+                Box::new(fetch.clone()),
+            )),
+            ..proto::ReliableDeliveryFrame::default()
+        };
+        let boundary = proto::DeliveryBoundaryFrame {
+            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+                Box::new(frame.clone()),
+            )),
+            ..proto::DeliveryBoundaryFrame::default()
+        };
 
         let active_groups = active_groups([]);
         let local_members = members([]);

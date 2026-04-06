@@ -69,7 +69,7 @@ pub fn encode_update_id(id: UpdateId) -> proto::HistoryId {
         version: id.version,
         node_index: id.node_index,
         chunk_index: 0,
-        ..proto::HistoryId::new()
+        ..proto::HistoryId::default()
     }
 }
 
@@ -85,7 +85,7 @@ pub fn encode_indexed_update_id(id: &UpdateIdWithIndex) -> proto::HistoryId {
         version: id.id.version,
         node_index: id.id.node_index,
         chunk_index: id.index,
-        ..proto::HistoryId::new()
+        ..proto::HistoryId::default()
     }
 }
 
@@ -100,18 +100,27 @@ pub fn decode_indexed_update_id(id: proto::HistoryId) -> Result<UpdateIdWithInde
 }
 
 pub fn encode_primitive_value(value: ModelPrimitiveValueRef<'_>) -> proto::PrimitiveValue {
-    let mut encoded = proto::PrimitiveValue::new();
-    match value {
-        ModelPrimitiveValueRef::String(value) => encoded.set_string(value.to_owned()),
-        ModelPrimitiveValueRef::UInt(value) => encoded.set_uint(value),
-        ModelPrimitiveValueRef::Int(value) => encoded.set_int(value),
-        ModelPrimitiveValueRef::Byte(value) => encoded.set_byte(u32::from(value)),
-        ModelPrimitiveValueRef::Float(value) => encoded.set_float(value.0),
-        ModelPrimitiveValueRef::Boolean(value) => encoded.set_boolean(value),
-        ModelPrimitiveValueRef::Binary(value) => encoded.set_binary(value.to_vec()),
-        ModelPrimitiveValueRef::Date(value) => encoded.set_date(encode_date(value)),
-        ModelPrimitiveValueRef::Timestamp(value) => encoded.set_timestamp(value),
-    }
+    let mut encoded = proto::PrimitiveValue::default();
+    let value_enum = match value {
+        ModelPrimitiveValueRef::String(value) => {
+            proto::primitive_value::Value::String(value.to_owned())
+        }
+        ModelPrimitiveValueRef::UInt(value) => proto::primitive_value::Value::Uint(value),
+        ModelPrimitiveValueRef::Int(value) => proto::primitive_value::Value::Int(value),
+        ModelPrimitiveValueRef::Byte(value) => {
+            proto::primitive_value::Value::Byte(u32::from(value))
+        }
+        ModelPrimitiveValueRef::Float(value) => proto::primitive_value::Value::Float(value.0),
+        ModelPrimitiveValueRef::Boolean(value) => proto::primitive_value::Value::Boolean(value),
+        ModelPrimitiveValueRef::Binary(value) => {
+            proto::primitive_value::Value::Binary(value.to_vec())
+        }
+        ModelPrimitiveValueRef::Date(value) => {
+            proto::primitive_value::Value::Date(Box::new(encode_date(value)))
+        }
+        ModelPrimitiveValueRef::Timestamp(value) => proto::primitive_value::Value::Timestamp(value),
+    };
+    encoded.value = Some(value_enum);
     encoded
 }
 
@@ -135,7 +144,7 @@ pub fn decode_primitive_value(
         proto::primitive_value::Value::Boolean(value) => Ok(ModelPrimitiveValue::Boolean(value)),
         proto::primitive_value::Value::Binary(value) => Ok(ModelPrimitiveValue::Binary(value)),
         proto::primitive_value::Value::Date(value) => {
-            let date = decode_date(value)?;
+            let date = decode_date(*value)?;
             Ok(ModelPrimitiveValue::Date(date))
         }
         proto::primitive_value::Value::Timestamp(value) => {
@@ -147,55 +156,75 @@ pub fn decode_primitive_value(
 pub fn encode_primitive_array(
     value: ModelPrimitiveValueArrayRef<'_>,
 ) -> proto::PrimitiveArrayValue {
-    let mut encoded = proto::PrimitiveArrayValue::new();
-    match value {
+    let value_enum = match value {
         ModelPrimitiveValueArrayRef::String(values) => {
-            let mut message = proto::StringArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_string(message);
+            let message = proto::StringArrayValue {
+                values: values.to_vec(),
+                ..proto::StringArrayValue::default()
+            };
+            proto::primitive_array_value::Value::String(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::UInt(values) => {
-            let mut message = proto::UIntArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_uint(message);
+            let message = proto::UIntArrayValue {
+                values: values.to_vec(),
+                ..proto::UIntArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Uint(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Int(values) => {
-            let mut message = proto::IntArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_int(message);
+            let message = proto::IntArrayValue {
+                values: values.to_vec(),
+                ..proto::IntArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Int(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Byte(values) => {
-            let mut message = proto::ByteArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_byte(message);
+            let message = proto::ByteArrayValue {
+                values: values.to_vec(),
+                ..proto::ByteArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Byte(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Float(values) => {
-            let mut message = proto::FloatArrayValue::new();
-            message.values = values.iter().map(|value| value.0).collect();
-            encoded.set_float(message);
+            let message = proto::FloatArrayValue {
+                values: values.iter().map(|value| value.0).collect(),
+                ..proto::FloatArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Float(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Boolean(values) => {
-            let mut message = proto::BooleanArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_boolean(message);
+            let message = proto::BooleanArrayValue {
+                values: values.to_vec(),
+                ..proto::BooleanArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Boolean(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Binary(values) => {
-            let mut message = proto::BinaryArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_binary(message);
+            let message = proto::BinaryArrayValue {
+                values: values.to_vec(),
+                ..proto::BinaryArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Binary(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Date(values) => {
-            let mut message = proto::DateArrayValue::new();
-            message.values = values.iter().copied().map(encode_date).collect();
-            encoded.set_date(message);
+            let message = proto::DateArrayValue {
+                values: values.iter().copied().map(encode_date).collect(),
+                ..proto::DateArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Date(Box::new(message))
         }
         ModelPrimitiveValueArrayRef::Timestamp(values) => {
-            let mut message = proto::TimestampArrayValue::new();
-            message.values = values.to_vec();
-            encoded.set_timestamp(message);
+            let message = proto::TimestampArrayValue {
+                values: values.to_vec(),
+                ..proto::TimestampArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Timestamp(Box::new(message))
         }
+    };
+    proto::PrimitiveArrayValue {
+        value: Some(value_enum),
+        ..proto::PrimitiveArrayValue::default()
     }
-    encoded
 }
 
 pub fn decode_primitive_array(
@@ -237,12 +266,18 @@ pub fn decode_primitive_array(
 }
 
 pub fn encode_basic_value(value: ModelBasicValueRef<'_>) -> proto::BasicValue {
-    let mut encoded = proto::BasicValue::new();
+    let mut encoded = proto::BasicValue::default();
     match value {
         ModelBasicValueRef::Primitive(value) => {
-            encoded.set_primitive(encode_primitive_value(value))
+            encoded.value = Some(proto::basic_value::Value::Primitive(Box::new(
+                encode_primitive_value(value),
+            )));
         }
-        ModelBasicValueRef::Array(value) => encoded.set_array(encode_primitive_array(value)),
+        ModelBasicValueRef::Array(value) => {
+            encoded.value = Some(proto::basic_value::Value::Array(Box::new(
+                encode_primitive_array(value),
+            )));
+        }
     }
     encoded
 }
@@ -253,10 +288,10 @@ pub fn decode_basic_value(mut value: proto::BasicValue) -> Result<ModelBasicValu
     })?;
     match value {
         proto::basic_value::Value::Primitive(value) => {
-            decode_primitive_value(value).map(ModelBasicValue::Primitive)
+            decode_primitive_value(*value).map(ModelBasicValue::Primitive)
         }
         proto::basic_value::Value::Array(value) => {
-            decode_primitive_array(value).map(ModelBasicValue::Array)
+            decode_primitive_array(*value).map(ModelBasicValue::Array)
         }
     }
 }
@@ -264,16 +299,19 @@ pub fn decode_basic_value(mut value: proto::BasicValue) -> Result<ModelBasicValu
 pub fn encode_nullable_basic_value(
     value: ModelNullableBasicValueRef<'_>,
 ) -> proto::NullableBasicValue {
-    let mut encoded = proto::NullableBasicValue::new();
-    match value {
-        ModelNullableBasicValueRef::Null => encoded.set_null(proto::NullValue::new()),
+    let mut encoded = proto::NullableBasicValue::default();
+    let value_enum = match value {
+        ModelNullableBasicValueRef::Null => {
+            proto::nullable_basic_value::Value::Null(Box::default())
+        }
         ModelNullableBasicValueRef::Value(ModelBasicValueRef::Primitive(value)) => {
-            encoded.set_primitive(encode_primitive_value(value))
+            proto::nullable_basic_value::Value::Primitive(Box::new(encode_primitive_value(value)))
         }
         ModelNullableBasicValueRef::Value(ModelBasicValueRef::Array(value)) => {
-            encoded.set_array(encode_primitive_array(value))
+            proto::nullable_basic_value::Value::Array(Box::new(encode_primitive_array(value)))
         }
-    }
+    };
+    encoded.value = Some(value_enum);
     encoded
 }
 
@@ -285,10 +323,10 @@ pub fn decode_nullable_basic_value(
     })?;
     match value {
         proto::nullable_basic_value::Value::Null(_) => Ok(ModelNullableBasicValue::Null),
-        proto::nullable_basic_value::Value::Primitive(value) => decode_primitive_value(value)
+        proto::nullable_basic_value::Value::Primitive(value) => decode_primitive_value(*value)
             .map(ModelBasicValue::Primitive)
             .map(ModelNullableBasicValue::Value),
-        proto::nullable_basic_value::Value::Array(value) => decode_primitive_array(value)
+        proto::nullable_basic_value::Value::Array(value) => decode_primitive_array(*value)
             .map(ModelBasicValue::Array)
             .map(ModelNullableBasicValue::Value),
     }
@@ -297,13 +335,18 @@ pub fn decode_nullable_basic_value(
 pub fn encode_nullable_primitive_value(
     value: ModelNullablePrimitiveValueRef<'_>,
 ) -> proto::NullablePrimitiveValue {
-    let mut encoded = proto::NullablePrimitiveValue::new();
-    match value {
-        ModelNullablePrimitiveValueRef::Null => encoded.set_null(proto::NullValue::new()),
-        ModelNullablePrimitiveValueRef::Value(value) => {
-            encoded.set_primitive(encode_primitive_value(value))
+    let mut encoded = proto::NullablePrimitiveValue::default();
+    let value_enum = match value {
+        ModelNullablePrimitiveValueRef::Null => {
+            proto::nullable_primitive_value::Value::Null(Box::default())
         }
-    }
+        ModelNullablePrimitiveValueRef::Value(value) => {
+            proto::nullable_primitive_value::Value::Primitive(Box::new(encode_primitive_value(
+                value,
+            )))
+        }
+    };
+    encoded.value = Some(value_enum);
     encoded
 }
 
@@ -316,17 +359,18 @@ pub fn decode_nullable_primitive_value(
     match value {
         proto::nullable_primitive_value::Value::Null(_) => Ok(ModelNullablePrimitiveValue::Null),
         proto::nullable_primitive_value::Value::Primitive(value) => {
-            decode_primitive_value(value).map(ModelNullablePrimitiveValue::Value)
+            decode_primitive_value(*value).map(ModelNullablePrimitiveValue::Value)
         }
     }
 }
 
 pub fn encode_counter_value(value: ModelCounterValueRef) -> proto::CounterValue {
-    let mut encoded = proto::CounterValue::new();
-    match value {
-        ModelCounterValueRef::Byte(value) => encoded.set_byte(value as u32),
-        ModelCounterValueRef::UInt(value) => encoded.set_uint(value),
-    }
+    let mut encoded = proto::CounterValue::default();
+    let value_enum = match value {
+        ModelCounterValueRef::Byte(value) => proto::counter_value::Value::Byte(value as u32),
+        ModelCounterValueRef::UInt(value) => proto::counter_value::Value::Uint(value),
+    };
+    encoded.value = Some(value_enum);
     encoded
 }
 
@@ -404,7 +448,7 @@ fn encode_date(value: NaiveDate) -> proto::Date {
         year: value.year(),
         month: value.month(),
         day: value.day(),
-        ..proto::Date::new()
+        ..proto::Date::default()
     }
 }
 

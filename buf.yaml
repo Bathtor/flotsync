@@ -1,0 +1,12 @@
+version: v2
+
+modules:
+  - path: messages/proto
+
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE

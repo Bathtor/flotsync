@@ -8,7 +8,7 @@ It currently contains reusable crates for version tracking, discovery, wire mess
 | Area | Status | Notes |
 | --- | --- | --- |
 | Core versioning and identifiers | Implemented | `flotsync_core` provides version vectors, group membership identifiers, and ordering logic. |
-| Datamodel wire transport | Implemented (operations/snapshots) | `flotsync_messages` supports protobuf codecs for schema operations and snapshots. |
+| Datamodel wire transport | Implemented (operations/snapshots) | `flotsync_messages` supports proto codecs for schema operations and snapshots via generated `buffa` bindings. |
 | Schema definition transport | Planned | Schema definitions are still agreed out-of-band and need first-class transport support. |
 | In-memory schema datamodel | In progress | Local table operations exist; inbound operation application remains to be added. |
 | Discovery stack | In progress | Core components exist, with remaining open work on browser/public handling and non-mDNS active mode. |
@@ -26,7 +26,7 @@ This repository uses `bd` (beads) as the source of truth for tasks and dependenc
 
 - `flotsync_core/`: Version vectors, group membership identifiers, and happened-before logic.
 - `flotsync_messages/`: Generated protobuf message bindings.
-- `messages/proto/`: Source `.proto` definitions for discovery and versions.
+- `messages/proto/`: Source `.proto` definitions organised by package and version.
 - `flotsync_discovery/`: Discovery services (mDNS and custom UDP announcement building blocks).
 - `flotsync_discovery_cli/`: CLI entrypoint for discovery components.
 - `flotsync_data_types/`: Replicated data structures (text and latest-value-wins register).

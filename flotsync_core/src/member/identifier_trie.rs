@@ -100,6 +100,11 @@ impl<V> TrieMap<V> {
         }
     }
 }
+impl<V> Default for TrieMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<V> TrieNode<V> {
     fn count(&self) -> usize {

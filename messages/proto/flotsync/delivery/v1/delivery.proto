@@ -1,0 +1,187 @@
+syntax = "proto3";
+
+package flotsync.delivery.v1;
+
+import "flotsync/discovery/v1/discovery.proto";
+
+// Top-level delivery wire frame split by semantic owner.
+message DeliveryBoundaryFrame {
+  oneof boundary {
+    GroupBroadcastFrame group_broadcast = 1;
+    ReliableDeliveryFrame reliable_delivery = 2;
+  }
+}
+
+// Group-broadcast-owned inbound boundary frames.
+message GroupBroadcastFrame {
+  oneof body {
+    GroupEnvelopeWire envelope = 1;
+    GroupRelayStoreConfirmationWire relay_store_confirmation = 2;
+  }
+}
+
+// Reliable-delivery-owned inbound boundary frames.
+message ReliableDeliveryFrame {
+  oneof body {
+    ReliableEnvelopeWire envelope = 1;
+    RecipientAckWire recipient_ack = 2;
+    MailboxFetchWire mailbox_fetch = 3;
+    MailboxBatchWire mailbox_batch = 4;
+    MailboxAckWire mailbox_ack = 5;
+    ReliableRelayStoreConfirmationWire relay_store_confirmation = 6;
+  }
+}
+
+// Public group-envelope routing header.
+message GroupEnvelopeHeader {
+  bytes group_id = 1;
+  flotsync.discovery.v1.Identifier sender = 2;
+  bytes message_id = 3;
+}
+
+// Group fan-out envelope with explicit separation between public routing data
+// and encrypted payload bytes.
+message GroupEnvelopeWire {
+  GroupEnvelopeHeader public_header = 1;
+  bytes encrypted_payload = 16;
+  SignatureWire footer = 17;
+}
+
+// Public reliable-envelope routing header.
+message ReliableEnvelopeHeader {
+  flotsync.discovery.v1.Identifier sender = 1;
+  flotsync.discovery.v1.Identifier recipient = 2;
+  bytes message_id = 3;
+}
+
+// Recipient-addressed envelope with explicit separation between public routing
+// data and encrypted payload bytes.
+message ReliableEnvelopeWire {
+  ReliableEnvelopeHeader public_header = 1;
+  bytes encrypted_payload = 16;
+  SignatureWire footer = 17;
+}
+
+// Public recipient-ack routing header.
+message RecipientAckHeader {
+  bytes message_id = 1;
+  flotsync.discovery.v1.Identifier original_sender = 2;
+  flotsync.discovery.v1.Identifier recipient = 3;
+}
+
+// Recipient-owned completion acknowledgement.
+message RecipientAckWire {
+  RecipientAckHeader public_header = 1;
+  SignatureWire footer = 17;
+}
+
+// Public identity-proof header.
+message IdentityProofHeader {
+  flotsync.discovery.v1.Identifier signer = 1;
+  bytes challenge = 2;
+}
+
+// Recipient or relay proof of identity.
+message IdentityProofWire {
+  IdentityProofHeader public_header = 1;
+  SignatureWire footer = 17;
+}
+
+// Public mailbox-fetch routing header.
+message MailboxFetchHeader {
+  flotsync.discovery.v1.Identifier recipient = 1;
+  bytes freshness_token = 2;
+}
+
+// Recipient-initiated relay mailbox fetch request.
+message MailboxFetchWire {
+  MailboxFetchHeader public_header = 1;
+  IdentityProofWire proof = 16;
+}
+
+// Public mailbox-batch routing header.
+message MailboxBatchHeader {
+  flotsync.discovery.v1.Identifier recipient = 1;
+  flotsync.discovery.v1.Identifier relay = 2;
+}
+
+// One mailbox item returned by a relay.
+message MailboxItemWire {
+  bytes item_id = 1;
+  ReliableEnvelopeWire envelope = 2;
+}
+
+// Relay mailbox response batch.
+message MailboxBatchWire {
+  MailboxBatchHeader public_header = 1;
+  repeated MailboxItemWire items = 16;
+}
+
+// Public mailbox-ack routing header.
+message MailboxAckHeader {
+  flotsync.discovery.v1.Identifier relay = 1;
+  flotsync.discovery.v1.Identifier recipient = 2;
+}
+
+// One mailbox-clean-up acknowledgement handle.
+message MailboxAckHandleWire {
+  oneof handle {
+    bytes message_id = 1;
+    bytes item_id = 2;
+  }
+}
+
+// Recipient-issued mailbox clean-up acknowledgement.
+message MailboxAckWire {
+  MailboxAckHeader public_header = 1;
+  repeated MailboxAckHandleWire acknowledgements = 16;
+}
+
+// Public group relay-store-confirmation routing header.
+message GroupRelayStoreConfirmationHeader {
+  bytes group_id = 1;
+  bytes message_id = 2;
+  flotsync.discovery.v1.Identifier original_sender = 3;
+  flotsync.discovery.v1.Identifier relay = 4;
+}
+
+// One logical route endpoint reference.
+message RouteEndpointWire {
+  oneof endpoint {
+    flotsync.discovery.v1.Identifier peer = 1;
+    flotsync.discovery.v1.Identifier relay = 2;
+  }
+}
+
+// Relay-issued durable-store proof for a group-broadcast envelope.
+message GroupRelayStoreConfirmationWire {
+  GroupRelayStoreConfirmationHeader public_header = 1;
+  RouteEndpointWire route_id = 16;
+  bytes receipt_id = 17;
+}
+
+// Public reliable relay-store-confirmation routing header.
+message ReliableRelayStoreConfirmationHeader {
+  bytes message_id = 1;
+  flotsync.discovery.v1.Identifier original_sender = 2;
+  flotsync.discovery.v1.Identifier recipient = 3;
+  flotsync.discovery.v1.Identifier relay = 4;
+}
+
+// Relay-issued durable-store proof for a reliable-delivery envelope.
+message ReliableRelayStoreConfirmationWire {
+  ReliableRelayStoreConfirmationHeader public_header = 1;
+  RouteEndpointWire route_id = 16;
+  bytes receipt_id = 17;
+}
+
+enum KnownSignatureScheme {
+  KNOWN_SIGNATURE_SCHEME_UNSPECIFIED = 0;
+  KNOWN_SIGNATURE_SCHEME_ED25519 = 1;
+}
+
+// Detached signature bytes plus scheme reference.
+message SignatureWire {
+  KnownSignatureScheme scheme = 1;
+  bytes signature_bytes = 2;
+}

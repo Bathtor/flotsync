@@ -2,19 +2,14 @@ use super::*;
 use flotsync_core::member::{IdentifierBuf, IdentifierError};
 use flotsync_io::pool::PayloadWriter;
 use flotsync_messages::{
+    buffa::{EnumValue, Message, MessageField},
     delivery as delivery_proto,
     discovery as discovery_proto,
-    protobuf::{EnumOrUnknown, Message, MessageField},
 };
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub(super) enum ReliableDeliveryWireError {
-    #[snafu(display("failed to encode delivery protobuf payload: {source}"))]
-    Encode {
-        source: flotsync_messages::protobuf::Error,
-    },
-
     #[snafu(display("protobuf message '{message}' is missing required field '{field}'"))]
     MissingField {
         message: &'static str,
@@ -71,50 +66,60 @@ impl FlotsyncSerializable for EncodedDeliveryPayload {
 pub(super) fn encode_reliable_envelope_boundary(
     envelope: &ReliableMessageEnvelope,
 ) -> Result<Bytes, ReliableDeliveryWireError> {
-    let mut header = delivery_proto::ReliableEnvelopeHeader::new();
-    header.sender = MessageField::some(proto_identifier(&envelope.header.sender));
-    header.recipient = MessageField::some(proto_identifier(&envelope.header.recipient));
-    header.message_id = envelope.header.message_id.0.as_bytes().to_vec();
-
-    let mut wire = delivery_proto::ReliableEnvelopeWire::new();
-    wire.public_header = MessageField::some(header);
-    wire.encrypted_payload = envelope.payload.ciphertext.to_vec();
-    wire.footer = MessageField::some(encode_signature_wire(&envelope.footer));
-
-    let mut frame = delivery_proto::ReliableDeliveryFrame::new();
-    frame.body = Some(delivery_proto::reliable_delivery_frame::Body::Envelope(
-        wire,
-    ));
-
-    let mut boundary = delivery_proto::DeliveryBoundaryFrame::new();
-    boundary.boundary =
-        Some(delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(frame));
-    let bytes = boundary.write_to_bytes().context(EncodeSnafu)?;
-    Ok(Bytes::from(bytes))
+    let header = delivery_proto::ReliableEnvelopeHeader {
+        sender: MessageField::some(proto_identifier(&envelope.header.sender)),
+        recipient: MessageField::some(proto_identifier(&envelope.header.recipient)),
+        message_id: envelope.header.message_id.0.as_bytes().to_vec(),
+        ..delivery_proto::ReliableEnvelopeHeader::default()
+    };
+    let wire = delivery_proto::ReliableEnvelopeWire {
+        public_header: MessageField::some(header),
+        encrypted_payload: envelope.payload.ciphertext.to_vec(),
+        footer: MessageField::some(encode_signature_wire(&envelope.footer)),
+        ..delivery_proto::ReliableEnvelopeWire::default()
+    };
+    let frame = delivery_proto::ReliableDeliveryFrame {
+        body: Some(delivery_proto::reliable_delivery_frame::Body::Envelope(
+            Box::new(wire),
+        )),
+        ..delivery_proto::ReliableDeliveryFrame::default()
+    };
+    let boundary = delivery_proto::DeliveryBoundaryFrame {
+        boundary: Some(
+            delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(Box::new(frame)),
+        ),
+        ..delivery_proto::DeliveryBoundaryFrame::default()
+    };
+    Ok(boundary.encode_to_bytes())
 }
 
 pub(super) fn encode_recipient_ack_boundary(
     ack: &RecipientAck,
 ) -> Result<Bytes, ReliableDeliveryWireError> {
-    let mut header = delivery_proto::RecipientAckHeader::new();
-    header.message_id = ack.header.message_id.0.as_bytes().to_vec();
-    header.original_sender = MessageField::some(proto_identifier(&ack.header.original_sender));
-    header.recipient = MessageField::some(proto_identifier(&ack.header.recipient));
-
-    let mut wire = delivery_proto::RecipientAckWire::new();
-    wire.public_header = MessageField::some(header);
-    wire.footer = MessageField::some(encode_signature_wire(&ack.footer));
-
-    let mut frame = delivery_proto::ReliableDeliveryFrame::new();
-    frame.body = Some(delivery_proto::reliable_delivery_frame::Body::RecipientAck(
-        wire,
-    ));
-
-    let mut boundary = delivery_proto::DeliveryBoundaryFrame::new();
-    boundary.boundary =
-        Some(delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(frame));
-    let bytes = boundary.write_to_bytes().context(EncodeSnafu)?;
-    Ok(Bytes::from(bytes))
+    let header = delivery_proto::RecipientAckHeader {
+        message_id: ack.header.message_id.0.as_bytes().to_vec(),
+        original_sender: MessageField::some(proto_identifier(&ack.header.original_sender)),
+        recipient: MessageField::some(proto_identifier(&ack.header.recipient)),
+        ..delivery_proto::RecipientAckHeader::default()
+    };
+    let wire = delivery_proto::RecipientAckWire {
+        public_header: MessageField::some(header),
+        footer: MessageField::some(encode_signature_wire(&ack.footer)),
+        ..delivery_proto::RecipientAckWire::default()
+    };
+    let frame = delivery_proto::ReliableDeliveryFrame {
+        body: Some(delivery_proto::reliable_delivery_frame::Body::RecipientAck(
+            Box::new(wire),
+        )),
+        ..delivery_proto::ReliableDeliveryFrame::default()
+    };
+    let boundary = delivery_proto::DeliveryBoundaryFrame {
+        boundary: Some(
+            delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(Box::new(frame)),
+        ),
+        ..delivery_proto::DeliveryBoundaryFrame::default()
+    };
+    Ok(boundary.encode_to_bytes())
 }
 
 pub(super) fn decode_reliable_envelope(
@@ -197,24 +202,27 @@ pub(super) fn decode_recipient_ack(
 }
 
 fn encode_signature_wire(footer: &SignedEnvelopeFooter) -> delivery_proto::SignatureWire {
-    let mut wire = delivery_proto::SignatureWire::new();
-    wire.scheme = EnumOrUnknown::new(match footer.signature.scheme {
-        SignatureScheme::Ed25519 => {
-            delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519
-        }
-    });
-    wire.signature_bytes = footer.signature.bytes.to_vec();
-    wire
+    delivery_proto::SignatureWire {
+        scheme: EnumValue::from(match footer.signature.scheme {
+            SignatureScheme::Ed25519 => {
+                delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519
+            }
+        }),
+        signature_bytes: footer.signature.bytes.to_vec(),
+        ..delivery_proto::SignatureWire::default()
+    }
 }
 
 fn decode_signature_wire(
     wire: delivery_proto::SignatureWire,
     field: &'static str,
 ) -> Result<SignedEnvelopeFooter, ReliableDeliveryWireError> {
-    let scheme = wire
-        .scheme
-        .enum_value()
-        .map_err(|value| ReliableDeliveryWireError::UnknownSignatureScheme { field, value })?;
+    let scheme = wire.scheme.as_known().ok_or_else(|| {
+        ReliableDeliveryWireError::UnknownSignatureScheme {
+            field,
+            value: wire.scheme.to_i32(),
+        }
+    })?;
     let scheme = match scheme {
         delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519 => {
             SignatureScheme::Ed25519
@@ -253,10 +261,12 @@ fn decode_identifier(
 }
 
 fn proto_identifier(member: &MemberIdentity) -> discovery_proto::Identifier {
-    let mut identifier = discovery_proto::Identifier::new();
-    identifier.segments = member
+    let segments = member
         .segments_iter()
         .map(|segment| segment.as_ref().to_owned())
         .collect();
-    identifier
+    discovery_proto::Identifier {
+        segments,
+        ..discovery_proto::Identifier::default()
+    }
 }
