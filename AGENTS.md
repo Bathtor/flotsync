@@ -4,6 +4,7 @@
 
 ## Rust Rules
 
+- Do not run multiple `cargo` instances in parallel. They anyway lock.
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical.
 - Prefer readable control flow over chained iterator side effects.
