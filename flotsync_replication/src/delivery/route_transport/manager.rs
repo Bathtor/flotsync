@@ -1100,17 +1100,12 @@ fn classify_udp_connect_failure_for_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delivery::test_support::TransportHarnessCore;
     use bytes::Bytes;
     use flotsync_io::{
         pool::PayloadWriter,
-        prelude::{DriverConfig, IoBridge, IoDriverComponent},
-        test_support::{
-            UdpObserver,
-            WAIT_TIMEOUT,
-            build_test_kompact_system_with,
-            localhost,
-            start_component,
-        },
+        prelude::{SocketId, UdpIndication, UdpLocalBind},
+        test_support::{WAIT_TIMEOUT, build_test_kompact_system_with, localhost},
     };
     use flotsync_udpour::{
         MessageId,
@@ -1120,11 +1115,8 @@ mod tests {
     };
     use flotsync_utils::BoxFuture;
     use std::{
-        cell::RefCell,
-        collections::VecDeque,
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
-        sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
@@ -1153,54 +1145,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct BufferedReceiver<T> {
-        receiver: mpsc::Receiver<T>,
-        deferred: RefCell<VecDeque<T>>,
-    }
-
-    impl<T> BufferedReceiver<T> {
-        fn new(receiver: mpsc::Receiver<T>) -> Self {
-            Self {
-                receiver,
-                deferred: RefCell::new(VecDeque::new()),
-            }
-        }
-
-        fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
-            let mut deferred = self.deferred.borrow_mut();
-            let deferred_len = deferred.len();
-            for _ in 0..deferred_len {
-                let event = deferred
-                    .pop_front()
-                    .expect("deferred length was just measured");
-                if predicate(&event) {
-                    return Some(event);
-                }
-                deferred.push_back(event);
-            }
-            None
-        }
-
-        fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Some(event) = self.take_deferred_match(&mut predicate) {
-                    return event;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let event = self
-                    .receiver
-                    .recv_timeout(remaining)
-                    .expect("timed out waiting for buffered test event");
-                if predicate(&event) {
-                    return event;
-                }
-                self.deferred.borrow_mut().push_back(event);
-            }
-        }
-    }
-
     struct BytesPayload(Vec<u8>);
 
     impl FlotsyncSerializable for BytesPayload {
@@ -1223,15 +1167,9 @@ mod tests {
     }
 
     struct UdpManagerHarness {
-        system: KompactSystem,
-        driver: Arc<Component<IoDriverComponent>>,
-        bridge: Arc<Component<IoBridge>>,
+        core: TransportHarnessCore,
         manager: Arc<Component<RouteTransportManager>>,
         manager_ref: ActorRefStrong<TransportRouteTransportMessage>,
-        observer: Arc<Component<UdpObserver>>,
-        _bridge_to_manager: TwoWayChannel<UdpPort, IoBridge, RouteTransportManager>,
-        _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
-        observer_rx: BufferedReceiver<UdpIndication>,
     }
 
     impl UdpManagerHarness {
@@ -1249,41 +1187,15 @@ mod tests {
             udpour_config: UDPourConfig,
         ) -> Self {
             let system = build_manager_test_kompact_system(activation_policy, send_rate_control);
-            let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
-            let driver_for_bridge = driver.clone();
-            let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
-            let bridge_handle = IoBridgeHandle::from_component(&bridge);
-            let manager_system = system.clone();
-            let manager = system.create(move || {
-                RouteTransportManager::new(manager_system, bridge_handle, udpour_config)
-            });
-            let manager_ref = manager
-                .actor_ref()
-                .hold()
-                .expect("route transport manager must expose a strong actor ref in tests");
-            let (observer_tx, observer_rx) = mpsc::channel();
-            let observer = system.create(move || UdpObserver::new(observer_tx));
-
-            let bridge_to_manager = biconnect_components::<UdpPort, _, _>(&bridge, &manager)
-                .expect("bridge must connect to route transport manager");
-            let bridge_to_observer = biconnect_components::<UdpPort, _, _>(&bridge, &observer)
-                .expect("bridge must connect to UDP observer");
-
-            start_component(&system, &driver);
-            start_component(&system, &bridge);
-            start_component(&system, &manager);
-            start_component(&system, &observer);
+            let core = TransportHarnessCore::new(system, udpour_config);
+            let manager = Arc::clone(core.manager());
+            let manager_ref = core.manager_ref();
+            core.start();
 
             Self {
-                system,
-                driver,
-                bridge,
+                core,
                 manager,
                 manager_ref,
-                observer,
-                _bridge_to_manager: bridge_to_manager,
-                _bridge_to_observer: bridge_to_observer,
-                observer_rx: BufferedReceiver::new(observer_rx),
             }
         }
 
@@ -1434,62 +1346,18 @@ mod tests {
         }
 
         fn bind_external_socket(&self, bind: UdpLocalBind) -> (SocketId, SocketAddr) {
-            let request_id = UdpOpenRequestId::new();
-            self.observer.on_definition(|component| {
-                component.udp.trigger(UdpRequest::Bind { request_id, bind });
-            });
-            match self.observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
-                matches!(
-                    event,
-                    UdpIndication::Bound {
-                        request_id: indicated_request_id,
-                        ..
-                    } if *indicated_request_id == request_id
-                )
-            }) {
-                UdpIndication::Bound {
-                    request_id: indicated_request_id,
-                    socket_id,
-                    local_addr,
-                } => {
-                    assert_eq!(indicated_request_id, request_id);
-                    (socket_id, local_addr)
-                }
-                other => unreachable!("filtered to Bound, got {other:?}"),
-            }
+            self.core.bind_external_socket(bind, WAIT_TIMEOUT)
         }
 
         fn wait_for_new_bound_socket(&self) -> (SocketId, SocketAddr) {
-            match self.observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
-                matches!(event, UdpIndication::Bound { .. })
-            }) {
-                UdpIndication::Bound {
-                    socket_id,
-                    local_addr,
-                    ..
-                } => (socket_id, local_addr),
-                other => unreachable!("filtered to Bound, got {other:?}"),
-            }
+            self.core.wait_for_new_bound_socket(WAIT_TIMEOUT)
         }
 
         fn wait_for_bridge_frame_type(&self, socket_id: SocketId, frame_type: u8) {
-            let _ = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
-                let UdpIndication::Received {
-                    socket_id: indicated_socket_id,
-                    payload,
-                    ..
-                } = indication
-                else {
-                    return false;
-                };
-                *indicated_socket_id == socket_id
-                    && payload.to_vec().first().copied() == Some(frame_type)
-            });
-        }
-
-        fn wait_for_bridge_payload_frames(&self, socket_id: SocketId, min_count: usize) {
-            for _ in 0..min_count {
-                let _ = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
+            let _ = self
+                .core
+                .observer_rx()
+                .recv_matching(WAIT_TIMEOUT, |indication| {
                     let UdpIndication::Received {
                         socket_id: indicated_socket_id,
                         payload,
@@ -1499,35 +1367,36 @@ mod tests {
                         return false;
                     };
                     *indicated_socket_id == socket_id
-                        && payload.to_vec().first().copied() == Some(0x01)
+                        && payload.to_vec().first().copied() == Some(frame_type)
                 });
-            }
         }
-    }
 
-    impl Drop for UdpManagerHarness {
-        fn drop(&mut self) {
-            let _ = self
-                .system
-                .kill_notify(self.observer.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.manager.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.bridge.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.driver.clone())
-                .wait_timeout(WAIT_TIMEOUT);
+        fn wait_for_bridge_payload_frames(&self, socket_id: SocketId, min_count: usize) {
+            for _ in 0..min_count {
+                let _ = self
+                    .core
+                    .observer_rx()
+                    .recv_matching(WAIT_TIMEOUT, |indication| {
+                        let UdpIndication::Received {
+                            socket_id: indicated_socket_id,
+                            payload,
+                            ..
+                        } = indication
+                        else {
+                            return false;
+                        };
+                        *indicated_socket_id == socket_id
+                            && payload.to_vec().first().copied() == Some(0x01)
+                    });
+            }
         }
     }
 
     #[test]
     fn udp_manager_sends_payload_over_real_socket() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
         let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind raw UDP receiver");
         receiver
@@ -1558,6 +1427,9 @@ mod tests {
 
     #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
         let receiver1 = UdpSocket::bind("127.0.0.1:0").expect("bind first raw UDP receiver");
         let receiver2 = UdpSocket::bind("127.0.0.1:0").expect("bind second raw UDP receiver");
@@ -1610,6 +1482,9 @@ mod tests {
 
     #[test]
     fn udp_manager_buffers_inbound_datagrams_while_socket_is_starting() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
         let socket_id = SocketId(7);
         let socket_key = UdpSocketKey {
@@ -1660,6 +1535,9 @@ mod tests {
 
     #[test]
     fn udp_manager_starts_dormant_socket_on_first_inbound_udpour_message() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let receiver_harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
@@ -1708,6 +1586,9 @@ mod tests {
 
     #[test]
     fn udp_manager_restores_dormant_external_socket_after_activation_failure() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),

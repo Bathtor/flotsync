@@ -25,6 +25,7 @@ pub mod manager;
 use super::shared::{ReachabilityClass, RelayIdentity, RouteSendId};
 use crate::api::MemberIdentity;
 use flotsync_io::prelude::{EgressAsyncWriter, Error as IoError, IoPayload};
+use flotsync_messages::buffa::Message as BuffaMessage;
 use flotsync_utils::{BoxFuture, IString, NonOwningPhantomData};
 use kompact::{
     Never,
@@ -61,6 +62,30 @@ pub trait FlotsyncSerializable: Send + Sync + 'static {
         &'a self,
         writer: &'a mut EgressAsyncWriter,
     ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>>;
+}
+
+impl<M> FlotsyncSerializable for M
+where
+    M: BuffaMessage + Send + Sync + 'static,
+{
+    fn serialized_size_hint(&self) -> SizeHint {
+        SizeHint::Exact(self.compute_size() as usize)
+    }
+
+    fn serialize_into<'a>(
+        &'a self,
+        writer: &'a mut EgressAsyncWriter,
+    ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
+        Box::pin(async move {
+            let reserved_bytes = self.compute_size() as usize;
+            let mut reserved = writer
+                .write_with_reserved(reserved_bytes)
+                .await
+                .map_err(|source| FlotsyncSerializeError::Io { source })?;
+            self.encode(&mut reserved);
+            Ok(())
+        })
+    }
 }
 
 /// Serialization failure at the route-transport boundary.

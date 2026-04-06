@@ -15,8 +15,14 @@
 //! - `Err(...)`: the payload was malformed, internally inconsistent, or
 //!   otherwise undecodable at the delivery-wire level.
 
-use super::{ingress::DeliveryTargetHint, shared::MessageId};
-use crate::api::{GroupId, MemberIdentity};
+use super::{
+    ingress::DeliveryTargetHint,
+    shared::{DetachedSignature, MessageId, SignatureScheme, SignedEnvelopeFooter},
+};
+use crate::{
+    GroupMemberships,
+    api::{GroupId, MemberIdentity},
+};
 use flotsync_core::member::{IdentifierBuf, IdentifierError};
 use flotsync_io::prelude::IoPayload;
 use flotsync_messages::{
@@ -28,6 +34,81 @@ use proto::delivery_boundary_frame::Boundary;
 use snafu::prelude::*;
 use std::collections::HashSet;
 use uuid::Uuid;
+
+pub(crate) fn member_identity_to_wire_format(
+    member: &MemberIdentity,
+) -> discovery_proto::Identifier {
+    let segments = member
+        .segments_iter()
+        .map(|segment| segment.as_ref().to_owned())
+        .collect();
+    discovery_proto::Identifier {
+        segments,
+        ..discovery_proto::Identifier::default()
+    }
+}
+
+pub(crate) fn member_identity_from_wire(
+    identifier: discovery_proto::Identifier,
+    field: &'static str,
+) -> Result<MemberIdentity, WireValueDecodeError> {
+    let mut buffer = IdentifierBuf::new();
+    for segment in identifier.segments {
+        buffer
+            .push_checked(segment.clone())
+            .context(InvalidIdentifierSegmentSnafu { field, segment })?;
+    }
+    Ok(buffer.into_identifier())
+}
+
+pub(crate) fn group_id_from_wire(
+    raw: &[u8],
+    field: &'static str,
+) -> Result<GroupId, WireValueDecodeError> {
+    Ok(GroupId(uuid_from_wire(raw, field)?))
+}
+
+pub(crate) fn message_id_from_wire(
+    raw: &[u8],
+    field: &'static str,
+) -> Result<MessageId, WireValueDecodeError> {
+    Ok(MessageId(uuid_from_wire(raw, field)?))
+}
+
+pub(crate) fn signature_to_wire_format(footer: &SignedEnvelopeFooter) -> proto::SignatureWire {
+    proto::SignatureWire {
+        scheme: flotsync_messages::buffa::EnumValue::from(match footer.signature.scheme {
+            SignatureScheme::Ed25519 => proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
+        }),
+        signature_bytes: footer.signature.bytes.clone(),
+        ..proto::SignatureWire::default()
+    }
+}
+
+pub(crate) fn signature_from_wire(
+    wire: proto::SignatureWire,
+    field: &'static str,
+) -> Result<SignedEnvelopeFooter, WireValueDecodeError> {
+    let scheme =
+        wire.scheme
+            .as_known()
+            .ok_or_else(|| WireValueDecodeError::UnknownSignatureScheme {
+                field,
+                value: wire.scheme.to_i32(),
+            })?;
+    let scheme = match scheme {
+        proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519 => SignatureScheme::Ed25519,
+        proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_UNSPECIFIED => {
+            return UnspecifiedSignatureSchemeSnafu { field }.fail();
+        }
+    };
+    Ok(SignedEnvelopeFooter {
+        signature: DetachedSignature {
+            scheme,
+            bytes: wire.signature_bytes,
+        },
+    })
+}
 
 /// Parse one delivery boundary frame, dropping it early if the shallow public
 /// header shows that the local node has no interest in it.
@@ -107,16 +188,17 @@ pub(crate) enum DecodedDeliveryFrame {
 /// coherent local-interest view.
 #[derive(Clone, Copy, Debug)]
 pub struct DeliveryInterestView<'a> {
-    pub active_groups: &'a HashSet<GroupId>,
+    pub group_memberships: &'a GroupMemberships,
     pub local_members: &'a HashSet<MemberIdentity>,
     pub hosted_mailboxes: &'a HashSet<MemberIdentity>,
 }
 
 impl DeliveryInterestView<'_> {
-    /// Keep the classification flowing only when the given group is active
-    /// locally.
+    /// Keep the classification flowing only when the given group currently
+    /// exists in the local membership snapshot.
     fn check_group(self, group_id: &GroupId) -> Option<ShallowClassification> {
-        (!self.active_groups.contains(group_id)).then_some(ShallowClassification::Irrelevant)
+        (!self.group_memberships.contains_group(group_id))
+            .then_some(ShallowClassification::Irrelevant)
     }
 
     /// Keep the classification flowing only when the given member identity is
@@ -148,20 +230,8 @@ pub(crate) enum DeliveryWireError {
     #[snafu(display("Protobuf oneof '{name}' has no selected value."))]
     MissingOneof { name: &'static str },
 
-    #[snafu(display("Field '{field}' did not contain a valid UUID: {source}"))]
-    InvalidUuid {
-        field: &'static str,
-        source: uuid::Error,
-    },
-
-    #[snafu(display(
-        "Field '{field}' contains an invalid identifier segment '{segment}': {source}"
-    ))]
-    InvalidIdentifierSegment {
-        field: &'static str,
-        segment: String,
-        source: IdentifierError,
-    },
+    #[snafu(transparent)]
+    WireValueDecode { source: WireValueDecodeError },
 
     #[snafu(display(
         "Shallow delivery classifier selected {shallow_owner}, but full protobuf decode selected {full_owner}."
@@ -269,9 +339,9 @@ fn parse_group_envelope_hint(
             message: "GroupEnvelopeWire",
             field: "public_header",
         })?;
-    let group_id = decode_group_id(header.group_id, "GroupEnvelopeHeader.group_id")?;
+    let group_id = group_id_from_wire(header.group_id, "GroupEnvelopeHeader.group_id")?;
     let delivery_message_id =
-        decode_message_id(header.message_id, "GroupEnvelopeHeader.message_id")?;
+        message_id_from_wire(header.message_id, "GroupEnvelopeHeader.message_id")?;
     if let Some(classification) = interest.check_group(&group_id) {
         return Ok(classification);
     }
@@ -299,7 +369,7 @@ fn parse_group_relay_store_confirmation_hint(
             message: "GroupRelayStoreConfirmationWire",
             field: "public_header",
         })?;
-    let original_sender = decode_member_identity(
+    let original_sender = member_identity_from_wire_view(
         header
             .original_sender
             .as_option()
@@ -316,7 +386,7 @@ fn parse_group_relay_store_confirmation_hint(
         owner: SemanticOwner::GroupBroadcast,
         target: DeliveryTargetHint::OriginalSender {
             original_sender,
-            delivery_message_id: decode_message_id(
+            delivery_message_id: message_id_from_wire(
                 header.message_id,
                 "GroupRelayStoreConfirmationHeader.message_id",
             )?,
@@ -336,7 +406,7 @@ fn parse_reliable_envelope_hint(
             message: "ReliableEnvelopeWire",
             field: "public_header",
         })?;
-    let recipient = decode_member_identity(
+    let recipient = member_identity_from_wire_view(
         header.recipient.as_option().context(MissingFieldSnafu {
             message: "ReliableEnvelopeHeader",
             field: "recipient",
@@ -350,7 +420,7 @@ fn parse_reliable_envelope_hint(
         owner: SemanticOwner::ReliableDelivery,
         target: DeliveryTargetHint::ReliableRecipient {
             recipient,
-            delivery_message_id: Some(decode_message_id(
+            delivery_message_id: Some(message_id_from_wire(
                 header.message_id,
                 "ReliableEnvelopeHeader.message_id",
             )?),
@@ -367,7 +437,7 @@ fn parse_recipient_ack_hint(
         message: "RecipientAckWire",
         field: "public_header",
     })?;
-    let original_sender = decode_member_identity(
+    let original_sender = member_identity_from_wire_view(
         header
             .original_sender
             .as_option()
@@ -384,7 +454,7 @@ fn parse_recipient_ack_hint(
         owner: SemanticOwner::ReliableDelivery,
         target: DeliveryTargetHint::OriginalSender {
             original_sender,
-            delivery_message_id: decode_message_id(
+            delivery_message_id: message_id_from_wire(
                 header.message_id,
                 "RecipientAckHeader.message_id",
             )?,
@@ -401,7 +471,7 @@ fn parse_mailbox_fetch_hint(
         message: "MailboxFetchWire",
         field: "public_header",
     })?;
-    let recipient = decode_member_identity(
+    let recipient = member_identity_from_wire_view(
         header.recipient.as_option().context(MissingFieldSnafu {
             message: "MailboxFetchHeader",
             field: "recipient",
@@ -430,7 +500,7 @@ fn parse_mailbox_batch_hint(
         message: "MailboxBatchWire",
         field: "public_header",
     })?;
-    let recipient = decode_member_identity(
+    let recipient = member_identity_from_wire_view(
         header.recipient.as_option().context(MissingFieldSnafu {
             message: "MailboxBatchHeader",
             field: "recipient",
@@ -458,7 +528,7 @@ fn parse_mailbox_ack_hint(
         message: "MailboxAckWire",
         field: "public_header",
     })?;
-    let recipient = decode_member_identity(
+    let recipient = member_identity_from_wire_view(
         header.recipient.as_option().context(MissingFieldSnafu {
             message: "MailboxAckHeader",
             field: "recipient",
@@ -486,7 +556,7 @@ fn parse_reliable_relay_store_confirmation_hint(
             message: "ReliableRelayStoreConfirmationWire",
             field: "public_header",
         })?;
-    let original_sender = decode_member_identity(
+    let original_sender = member_identity_from_wire_view(
         header
             .original_sender
             .as_option()
@@ -503,7 +573,7 @@ fn parse_reliable_relay_store_confirmation_hint(
         owner: SemanticOwner::ReliableDelivery,
         target: DeliveryTargetHint::OriginalSender {
             original_sender,
-            delivery_message_id: decode_message_id(
+            delivery_message_id: message_id_from_wire(
                 header.message_id,
                 "ReliableRelayStoreConfirmationHeader.message_id",
             )?,
@@ -522,28 +592,12 @@ fn decode_full_boundary_frame(
     })
 }
 
-/// Decode one group id encoded as raw UUID bytes in the wire format.
-fn decode_group_id(raw: &[u8], field: &'static str) -> Result<GroupId, DeliveryWireError> {
-    Ok(GroupId(decode_uuid(raw, field)?))
-}
-
-/// Decode one delivery-domain message id encoded as raw UUID bytes in the wire
-/// format.
-fn decode_message_id(raw: &[u8], field: &'static str) -> Result<MessageId, DeliveryWireError> {
-    Ok(MessageId(decode_uuid(raw, field)?))
-}
-
-/// Decode one UUID from its raw protobuf byte representation.
-fn decode_uuid(raw: &[u8], field: &'static str) -> Result<Uuid, DeliveryWireError> {
-    Uuid::from_slice(raw).context(InvalidUuidSnafu { field })
-}
-
 /// Decode one member identifier from the generated discovery protobuf shape
 /// into the local identifier type used by the delivery domain.
-fn decode_member_identity(
+fn member_identity_from_wire_view(
     identifier: &discovery_proto::IdentifierView<'_>,
     field: &'static str,
-) -> Result<MemberIdentity, DeliveryWireError> {
+) -> Result<MemberIdentity, WireValueDecodeError> {
     let mut buffer = IdentifierBuf::new();
     for segment in identifier.segments.iter() {
         let segment = segment.to_owned();
@@ -552,6 +606,36 @@ fn decode_member_identity(
             .context(InvalidIdentifierSegmentSnafu { field, segment })?;
     }
     Ok(buffer.into_identifier())
+}
+
+/// Shared field-level decode failures reused across semantic delivery wire
+/// adapters and the shallow ingress classifier.
+#[derive(Debug, Snafu)]
+pub(crate) enum WireValueDecodeError {
+    #[snafu(display("Field '{field}' did not contain a valid UUID: {source}"))]
+    InvalidUuid {
+        field: &'static str,
+        source: uuid::Error,
+    },
+
+    #[snafu(display(
+        "Field '{field}' contains an invalid identifier segment '{segment}': {source}"
+    ))]
+    InvalidIdentifierSegment {
+        field: &'static str,
+        segment: String,
+        source: IdentifierError,
+    },
+
+    #[snafu(display("Field '{field}' used an unknown signature scheme value {value}"))]
+    UnknownSignatureScheme { field: &'static str, value: i32 },
+
+    #[snafu(display("Field '{field}' used the unspecified signature scheme"))]
+    UnspecifiedSignatureScheme { field: &'static str },
+}
+
+fn uuid_from_wire(raw: &[u8], field: &'static str) -> Result<Uuid, WireValueDecodeError> {
+    Uuid::from_slice(raw).context(InvalidUuidSnafu { field })
 }
 
 /// Semantic owner for one delivery boundary branch.
@@ -630,8 +714,11 @@ mod tests {
         IoPayload::from(frame.encode_to_bytes())
     }
 
-    fn active_groups(groups: impl IntoIterator<Item = GroupId>) -> HashSet<GroupId> {
-        groups.into_iter().collect()
+    fn group_memberships(groups: impl IntoIterator<Item = GroupId>) -> GroupMemberships {
+        let groups = groups
+            .into_iter()
+            .map(|group_id| (group_id, Default::default()));
+        GroupMemberships::from_groups(groups)
     }
 
     fn members(values: impl IntoIterator<Item = MemberIdentity>) -> HashSet<MemberIdentity> {
@@ -666,14 +753,14 @@ mod tests {
             ..proto::DeliveryBoundaryFrame::default()
         };
 
-        let active_groups = active_groups([]);
+        let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
         let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
-                active_groups: &active_groups,
+                group_memberships: &group_memberships,
                 local_members: &local_members,
                 hosted_mailboxes: &hosted_mailboxes,
             },
@@ -711,14 +798,14 @@ mod tests {
             ..proto::DeliveryBoundaryFrame::default()
         };
 
-        let active_groups = active_groups([group_id]);
+        let group_memberships = group_memberships([group_id]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
         let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
-                active_groups: &active_groups,
+                group_memberships: &group_memberships,
                 local_members: &local_members,
                 hosted_mailboxes: &hosted_mailboxes,
             },
@@ -764,14 +851,14 @@ mod tests {
             ..proto::DeliveryBoundaryFrame::default()
         };
 
-        let active_groups = active_groups([]);
+        let group_memberships = group_memberships([]);
         let local_members = members([member(&["charlie"])]);
         let hosted_mailboxes = members([]);
         let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
-                active_groups: &active_groups,
+                group_memberships: &group_memberships,
                 local_members: &local_members,
                 hosted_mailboxes: &hosted_mailboxes,
             },
@@ -806,14 +893,14 @@ mod tests {
             ..proto::DeliveryBoundaryFrame::default()
         };
 
-        let active_groups = active_groups([]);
+        let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([recipient.clone()]);
         let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
-                active_groups: &active_groups,
+                group_memberships: &group_memberships,
                 local_members: &local_members,
                 hosted_mailboxes: &hosted_mailboxes,
             },

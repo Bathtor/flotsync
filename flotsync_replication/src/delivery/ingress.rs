@@ -24,10 +24,9 @@ use super::{
     wire::{DecodedDeliveryFrame, DeliveryInterestView, decode_boundary_frame_if_interested},
 };
 use crate::{
-    SharedActiveGroups,
+    SharedGroupMemberships,
     api::{GroupId, MemberIdentity},
 };
-use arc_swap::ArcSwap;
 use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::{Never, prelude::*};
 use std::{collections::HashSet, sync::Arc};
@@ -35,8 +34,9 @@ use std::{collections::HashSet, sync::Arc};
 /// Shared local-interest sets consulted before expensive delivery-wire decode.
 #[derive(Clone)]
 pub struct DeliveryInterestConfig {
-    /// Dynamically changing set of groups this node currently participates in.
-    pub active_groups: SharedActiveGroups,
+    /// Dynamically changing group-membership view used for early local
+    /// admission checks and group-broadcast fan-out.
+    pub group_memberships: SharedGroupMemberships,
     /// Member identities hosted locally by this node.
     pub local_members: Arc<HashSet<MemberIdentity>>,
     /// Mailboxes this node is currently willing to serve as a relay.
@@ -46,7 +46,7 @@ pub struct DeliveryInterestConfig {
 impl Default for DeliveryInterestConfig {
     fn default() -> Self {
         Self {
-            active_groups: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            group_memberships: SharedGroupMemberships::default(),
             local_members: Arc::new(HashSet::new()),
             hosted_mailboxes: Arc::new(HashSet::new()),
         }
@@ -156,7 +156,7 @@ impl DeliveryIngressComponent {
         &mut self,
         mut inbound: RouteTransportInboundDeliver<TransportRouteKey>,
     ) -> Handled {
-        let active_groups = self.interest.active_groups.load();
+        let group_memberships = self.interest.group_memberships.snapshot();
         let route = inbound.transport.route;
         // `Ok(None)` means the payload was syntactically valid enough to
         // classify, but the shallow public header showed it is irrelevant to
@@ -164,7 +164,7 @@ impl DeliveryIngressComponent {
         match decode_boundary_frame_if_interested(
             &mut inbound.payload,
             DeliveryInterestView {
-                active_groups: active_groups.as_ref(),
+                group_memberships: group_memberships.as_ref(),
                 local_members: self.interest.local_members.as_ref(),
                 hosted_mailboxes: self.interest.hosted_mailboxes.as_ref(),
             },
@@ -244,6 +244,7 @@ type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<Transpor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::GroupMemberships;
     use bytes::Bytes;
     use flotsync_core::member::IdentifierBuf;
     use flotsync_io::{
@@ -390,9 +391,10 @@ mod tests {
         let transport = system.create(TransportInboundProbe::new);
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
-                active_groups: Arc::new(ArcSwap::from_pointee(
-                    [active_group].into_iter().collect(),
-                )),
+                group_memberships: SharedGroupMemberships::new(GroupMemberships::from_groups([(
+                    active_group,
+                    Default::default(),
+                )])),
                 local_members: Arc::new(HashSet::new()),
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })
@@ -459,7 +461,7 @@ mod tests {
         let transport = system.create(TransportInboundProbe::new);
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
-                active_groups: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                group_memberships: SharedGroupMemberships::default(),
                 local_members: Arc::new([original_sender.clone()].into_iter().collect()),
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })

@@ -16,13 +16,7 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{
-    BoxFuture,
-    KClaimablePromise,
-    LocalActor,
-    NonOwningPhantomData,
-    impl_local_actor,
-};
+use flotsync_utils::{KClaimablePromise, LocalActor, NonOwningPhantomData, impl_local_actor};
 use kompact::{config::HoconExt, kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
@@ -32,11 +26,10 @@ use std::{
 };
 use uuid::Uuid;
 use wire::{
-    EncodedDeliveryPayload,
-    decode_recipient_ack,
-    decode_reliable_envelope,
-    encode_recipient_ack_boundary,
-    encode_reliable_envelope_boundary,
+    recipient_ack_from_wire,
+    recipient_ack_to_wire_format,
+    reliable_envelope_from_wire,
+    reliable_envelope_to_wire_format,
 };
 
 /// Plaintext recipient-addressed envelope header.
@@ -54,6 +47,12 @@ pub struct ReliableMessageEnvelope {
     pub header: ReliableMessageHeader,
     pub payload: EncryptedPayload,
     pub footer: SignedEnvelopeFooter,
+}
+
+impl ReliableMessageEnvelope {
+    fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
+        reliable_envelope_to_wire_format(self)
+    }
 }
 
 /// Replication-to-delivery request for one recipient-addressed message.
@@ -126,6 +125,12 @@ pub struct RecipientAckHeader {
 pub struct RecipientAck {
     pub header: RecipientAckHeader,
     pub footer: SignedEnvelopeFooter,
+}
+
+impl RecipientAck {
+    fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
+        recipient_ack_to_wire_format(self)
+    }
 }
 
 /// Signed proof used by the recipient when checking in with a relay mailbox.
@@ -341,7 +346,7 @@ impl ReliableDeliveryComponent {
         &mut self,
         envelope: delivery_proto::ReliableEnvelopeWire,
     ) -> Handled {
-        let envelope = match decode_reliable_envelope(envelope) {
+        let envelope = match reliable_envelope_from_wire(envelope) {
             Ok(envelope) => envelope,
             Err(error) => {
                 warn!(
@@ -394,7 +399,7 @@ impl ReliableDeliveryComponent {
     }
 
     fn handle_inbound_recipient_ack(&mut self, ack: delivery_proto::RecipientAckWire) -> Handled {
-        let ack = match decode_recipient_ack(ack) {
+        let ack = match recipient_ack_from_wire(ack) {
             Ok(ack) => ack,
             Err(error) => {
                 warn!(
@@ -497,24 +502,14 @@ impl ReliableDeliveryComponent {
         ack: RecipientAck,
         route: SendRouteCandidate<TransportRouteKey>,
     ) {
-        let encoded = match encode_recipient_ack_boundary(&ack) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Reliable delivery failed to encode recipient ack message_id={message_id}: {error}"
-                );
-                self.schedule_retry(RetryKey::InboundAck(message_id), self.retry_delay);
-                return;
-            }
-        };
+        let boundary = ack.to_wire_format();
 
         self.cancel_retry(RetryKey::InboundAck(message_id));
         if let Some(pending) = self.inbound_deliveries.get_mut(&message_id) {
             pending.state = PendingInboundDeliveryState::AckInFlight;
         }
 
-        let payload: Arc<dyn FlotsyncSerializable> = Arc::new(EncodedDeliveryPayload(encoded));
+        let payload: Arc<dyn FlotsyncSerializable> = Arc::new(boundary);
         let send = RouteTransportSend {
             send_id: RouteSendId(Uuid::new_v4()),
             route,
@@ -617,23 +612,8 @@ impl ReliableDeliveryComponent {
             return;
         };
 
-        let encoded = match self.sender_work_items.get(&message_id) {
-            Some(work_item) => {
-                match encode_reliable_envelope_boundary(&work_item.submit.envelope) {
-                    Ok(encoded) => encoded,
-                    Err(error) => {
-                        self.mark_sender_work_pending_retry(
-                            message_id,
-                            PendingRouteReason::LocalResourcePressure,
-                        );
-                        warn!(
-                            self.log(),
-                            "Reliable delivery failed to encode outbound envelope for {message_id}: {error}"
-                        );
-                        return;
-                    }
-                }
-            }
+        let boundary = match self.sender_work_items.get(&message_id) {
+            Some(work_item) => work_item.submit.envelope.to_wire_format(),
             None => {
                 return;
             }
@@ -647,7 +627,7 @@ impl ReliableDeliveryComponent {
 
         let route_transport = self.route_transport.clone();
         self.spawn_local(async move |mut async_self| {
-            let payload: Arc<dyn FlotsyncSerializable> = Arc::new(EncodedDeliveryPayload(encoded));
+            let payload: Arc<dyn FlotsyncSerializable> = Arc::new(boundary);
             let send = RouteTransportSend {
                 send_id,
                 route,
@@ -1007,131 +987,37 @@ fn sender_retry_reason(reason: &RouteTransportNackReason) -> PendingRouteReason 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delivery::{
-        ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-        route_transport::{
-            DatagramRouteScope,
-            RoutePreferenceRank,
-            RouteTransportPort,
-            UdpRouteKey,
-            manager::RouteTransportManager,
+    use crate::{
+        GroupMemberships,
+        SharedGroupMemberships,
+        delivery::{
+            ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
+            route_transport::{
+                DatagramRouteScope,
+                RoutePreferenceRank,
+                RouteTransportPort,
+                UdpRouteKey,
+            },
+            test_support::{
+                DiscoveryRouteSource,
+                FULL_STACK_WAIT_TIMEOUT,
+                TransportHarnessCore,
+                bind_ephemeral_local_socket,
+                build_delivery_test_system,
+                default_udpour_config,
+                member_identity,
+                wait_for_transport_settle,
+            },
         },
     };
-    use arc_swap::ArcSwap;
-    use flotsync_core::member::IdentifierBuf;
-    use flotsync_io::{
-        prelude::{
-            DriverConfig,
-            IoBridge,
-            IoBridgeHandle,
-            IoDriverComponent,
-            UdpIndication,
-            UdpLocalBind,
-            UdpOpenRequestId,
-            UdpPort,
-            UdpRequest,
-        },
-        test_support::{
-            UdpObserver,
-            WAIT_TIMEOUT,
-            build_test_kompact_system_with,
-            localhost,
-            start_component,
-        },
-    };
-    use flotsync_udpour::{ReceiverConfig, SenderConfig, UDPourConfig};
+    use flotsync_io::test_support::{WAIT_TIMEOUT, start_component};
     use std::{
-        cell::RefCell,
-        collections::{HashSet, VecDeque},
+        collections::HashSet,
         net::SocketAddr,
-        num::NonZeroUsize,
         sync::mpsc,
         thread,
         time::{Duration, Instant},
     };
-
-    #[derive(Debug)]
-    struct BufferedReceiver<T> {
-        receiver: mpsc::Receiver<T>,
-        deferred: RefCell<VecDeque<T>>,
-    }
-
-    impl<T> BufferedReceiver<T> {
-        fn new(receiver: mpsc::Receiver<T>) -> Self {
-            Self {
-                receiver,
-                deferred: RefCell::new(VecDeque::new()),
-            }
-        }
-
-        fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
-            let mut deferred = self.deferred.borrow_mut();
-            let deferred_len = deferred.len();
-            for _ in 0..deferred_len {
-                let event = deferred
-                    .pop_front()
-                    .expect("deferred length was just measured");
-                if predicate(&event) {
-                    return Some(event);
-                }
-                deferred.push_back(event);
-            }
-            None
-        }
-
-        fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Some(event) = self.take_deferred_match(&mut predicate) {
-                    return event;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let event = self
-                    .receiver
-                    .recv_timeout(remaining)
-                    .expect("timed out waiting for buffered test event");
-                if predicate(&event) {
-                    return event;
-                }
-                self.deferred.borrow_mut().push_back(event);
-            }
-        }
-    }
-
-    #[derive(ComponentDefinition)]
-    struct DiscoveryRouteSource {
-        ctx: ComponentContext<Self>,
-        discovery: ProvidedPort<TransportRouteDiscoveryPort>,
-    }
-
-    impl DiscoveryRouteSource {
-        fn new() -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                discovery: ProvidedPort::uninitialised(),
-            }
-        }
-    }
-
-    ignore_lifecycle!(DiscoveryRouteSource);
-
-    impl Provide<TransportRouteDiscoveryPort> for DiscoveryRouteSource {
-        fn handle(&mut self, _request: Never) -> Handled {
-            unreachable!("route discovery source never receives requests")
-        }
-    }
-
-    impl Actor for DiscoveryRouteSource {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
-            unreachable!("Never type is empty")
-        }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("route discovery tests do not use network actor messages")
-        }
-    }
 
     #[derive(ComponentDefinition)]
     struct ReliableDeliveryClientProbe {
@@ -1174,127 +1060,63 @@ mod tests {
     }
 
     struct FullStackHarness {
-        system: KompactSystem,
-        driver: Arc<Component<IoDriverComponent>>,
-        bridge: Arc<Component<IoBridge>>,
-        manager: Arc<Component<RouteTransportManager>>,
+        core: TransportHarnessCore,
         ingress: Arc<Component<DeliveryIngressComponent>>,
         reliable: Arc<Component<ReliableDeliveryComponent>>,
         discovery_source: Arc<Component<DiscoveryRouteSource>>,
         client: Arc<Component<ReliableDeliveryClientProbe>>,
-        observer: Arc<Component<UdpObserver>>,
-        _bridge_to_manager: TwoWayChannel<UdpPort, IoBridge, RouteTransportManager>,
-        _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
-        _manager_to_ingress: TwoWayChannel<
-            RouteTransportPort<TransportRouteKey>,
-            RouteTransportManager,
-            DeliveryIngressComponent,
-        >,
-        _ingress_to_reliable: TwoWayChannel<
-            TransportReliableDeliveryInboundPort,
-            DeliveryIngressComponent,
-            ReliableDeliveryComponent,
-        >,
-        _discovery_to_reliable: TwoWayChannel<
-            TransportRouteDiscoveryPort,
-            DiscoveryRouteSource,
-            ReliableDeliveryComponent,
-        >,
-        _reliable_to_client: TwoWayChannel<
-            ReliableDeliveryPort,
-            ReliableDeliveryComponent,
-            ReliableDeliveryClientProbe,
-        >,
         client_rx: mpsc::Receiver<ReliableDeliveryPortIndication>,
         local_addr: SocketAddr,
     }
 
     impl FullStackHarness {
         fn new(local_member: MemberIdentity) -> Self {
-            let system = build_test_kompact_system_with(|config| {
-                config.load_config_str("flotsync.route-transport.udp-activation-policy = 1");
-            });
-            let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
-            let driver_for_bridge = driver.clone();
-            let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
-            let bridge_handle = IoBridgeHandle::from_component(&bridge);
-            let manager_system = system.clone();
-            let manager = system.create(move || {
-                RouteTransportManager::new(manager_system, bridge_handle, udpour_config())
-            });
-            let manager_ref = manager
-                .actor_ref()
-                .hold()
-                .expect("route transport manager must expose a strong actor ref");
-            let ingress = system.create(|| {
+            let system = build_delivery_test_system();
+            let core = TransportHarnessCore::new(system, default_udpour_config());
+            let manager_ref = core.manager_ref();
+            let ingress = core.system().create(|| {
                 DeliveryIngressComponent::new(DeliveryInterestConfig {
-                    active_groups: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                    group_memberships: SharedGroupMemberships::new(GroupMemberships::new()),
                     local_members: Arc::new([local_member.clone()].into_iter().collect()),
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
-            let reliable = system.create(move || ReliableDeliveryComponent::new(manager_ref));
-            let discovery_source = system.create(DiscoveryRouteSource::new);
+            let reliable = core
+                .system()
+                .create(move || ReliableDeliveryComponent::new(manager_ref.clone()));
+            let discovery_source = core.system().create(DiscoveryRouteSource::new);
             let (client_tx, client_rx) = mpsc::channel();
-            let client = system.create(move || ReliableDeliveryClientProbe::new(client_tx));
-            let (observer_tx, observer_rx) = mpsc::channel();
-            let observer = system.create(move || UdpObserver::new(observer_tx));
+            let client = core
+                .system()
+                .create(move || ReliableDeliveryClientProbe::new(client_tx));
 
-            let bridge_to_manager = biconnect_components::<UdpPort, _, _>(&bridge, &manager)
-                .expect("bridge must connect to route transport manager");
-            let bridge_to_observer = biconnect_components::<UdpPort, _, _>(&bridge, &observer)
-                .expect("bridge must connect to UDP observer");
-            let manager_to_ingress =
-                biconnect_components::<RouteTransportPort<TransportRouteKey>, _, _>(
-                    &manager, &ingress,
-                )
-                .expect("route transport manager must connect to delivery ingress");
-            let ingress_to_reliable =
-                biconnect_components::<TransportReliableDeliveryInboundPort, _, _>(
-                    &ingress, &reliable,
-                )
-                .expect("delivery ingress must connect to reliable delivery");
-            let discovery_to_reliable = biconnect_components::<TransportRouteDiscoveryPort, _, _>(
-                &discovery_source,
-                &reliable,
+            biconnect_components::<RouteTransportPort<TransportRouteKey>, _, _>(
+                core.manager(),
+                &ingress,
             )
-            .expect("discovery source must connect to reliable delivery");
-            let reliable_to_client =
-                biconnect_components::<ReliableDeliveryPort, _, _>(&reliable, &client)
-                    .expect("reliable delivery must connect to the external client probe");
+            .expect("route transport manager must connect to delivery ingress");
+            biconnect_components::<TransportReliableDeliveryInboundPort, _, _>(&ingress, &reliable)
+                .expect("delivery ingress must connect to reliable delivery");
+            biconnect_components::<TransportRouteDiscoveryPort, _, _>(&discovery_source, &reliable)
+                .expect("discovery source must connect to reliable delivery");
+            biconnect_components::<ReliableDeliveryPort, _, _>(&reliable, &client)
+                .expect("reliable delivery must connect to the external client probe");
 
-            start_component(&system, &driver);
-            start_component(&system, &bridge);
-            start_component(&system, &manager);
-            start_component(&system, &ingress);
-            start_component(&system, &reliable);
-            start_component(&system, &discovery_source);
-            start_component(&system, &client);
-            start_component(&system, &observer);
+            core.start();
+            start_component(core.system(), &ingress);
+            start_component(core.system(), &reliable);
+            start_component(core.system(), &discovery_source);
+            start_component(core.system(), &client);
 
-            let observer_rx = BufferedReceiver::new(observer_rx);
-            let local_addr = bind_external_socket(&observer, &observer_rx);
-            // This fixed delay is a known harness compromise until
-            // flotsync-jgg introduces mockable time and a cleaner readiness
-            // signal for the route-transport bind path.
-            thread::sleep(Duration::from_millis(20));
+            let local_addr = bind_ephemeral_local_socket(&core, FULL_STACK_WAIT_TIMEOUT);
+            wait_for_transport_settle();
 
             Self {
-                system,
-                driver,
-                bridge,
-                manager,
+                core,
                 ingress,
                 reliable,
                 discovery_source,
                 client,
-                observer,
-                _bridge_to_manager: bridge_to_manager,
-                _bridge_to_observer: bridge_to_observer,
-                _manager_to_ingress: manager_to_ingress,
-                _ingress_to_reliable: ingress_to_reliable,
-                _discovery_to_reliable: discovery_to_reliable,
-                _reliable_to_client: reliable_to_client,
                 client_rx,
                 local_addr,
             }
@@ -1443,44 +1265,35 @@ mod tests {
     impl Drop for FullStackHarness {
         fn drop(&mut self) {
             let _ = self
-                .system
+                .core
+                .system()
                 .kill_notify(self.client.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
-                .system
+                .core
+                .system()
                 .kill_notify(self.discovery_source.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
-                .system
+                .core
+                .system()
                 .kill_notify(self.reliable.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
-                .system
+                .core
+                .system()
                 .kill_notify(self.ingress.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.observer.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.manager.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.bridge.clone())
-                .wait_timeout(WAIT_TIMEOUT);
-            let _ = self
-                .system
-                .kill_notify(self.driver.clone())
                 .wait_timeout(WAIT_TIMEOUT);
         }
     }
 
     #[test]
     fn reliable_delivery_round_trips_direct_envelope_and_processed_ack() {
-        let alice = member(&["alice"]);
-        let bob = member(&["bob"]);
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
         let sender = FullStackHarness::new(alice.clone());
         let receiver = FullStackHarness::new(bob.clone());
 
@@ -1518,6 +1331,9 @@ mod tests {
 
     #[test]
     fn retry_queue_keeps_overdue_entries_ready_after_timer_reset() {
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut queue = RetryQueue::new();
         let first = RetryKey::Sender(MessageId(Uuid::from_u128(1)));
         let second = RetryKey::InboundAck(MessageId(Uuid::from_u128(2)));
@@ -1534,8 +1350,11 @@ mod tests {
 
     #[test]
     fn duplicate_submit_keeps_the_original_work_item() {
-        let alice = member(&["alice"]);
-        let bob = member(&["bob"]);
+        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
         let sender = FullStackHarness::new(alice.clone());
         let message_id = MessageId(Uuid::from_u128(7));
 
@@ -1567,57 +1386,5 @@ mod tests {
         });
 
         sender.wait_for_sender_ciphertext(message_id, Bytes::from_static(b"first payload"));
-    }
-
-    fn bind_external_socket(
-        observer: &Arc<Component<UdpObserver>>,
-        observer_rx: &BufferedReceiver<UdpIndication>,
-    ) -> SocketAddr {
-        let request_id = UdpOpenRequestId::new();
-        observer.on_definition(|component| {
-            component.udp.trigger(UdpRequest::Bind {
-                request_id,
-                bind: UdpLocalBind::Exact(localhost(0)),
-            });
-        });
-        match observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
-            matches!(
-                event,
-                UdpIndication::Bound {
-                    request_id: observed_request_id,
-                    ..
-                } if *observed_request_id == request_id
-            )
-        }) {
-            UdpIndication::Bound { local_addr, .. } => local_addr,
-            other => unreachable!("filtered to Bound, got {other:?}"),
-        }
-    }
-
-    fn member(segments: &[&str]) -> MemberIdentity {
-        let mut buffer = IdentifierBuf::new();
-        for segment in segments {
-            buffer
-                .push_checked((*segment).to_owned())
-                .expect("test identifier segment must be valid");
-        }
-        buffer.into_identifier()
-    }
-
-    fn udpour_config() -> UDPourConfig {
-        let sender = SenderConfig {
-            max_part_payload_len: NonZeroUsize::new(1024)
-                .expect("test UDPour config must use a non-zero part payload length"),
-            retention_timeout: Duration::from_secs(1),
-            id_reuse_cooldown: Duration::from_millis(100),
-            eager_ack_cleanup: false,
-        };
-        let receiver = ReceiverConfig {
-            max_need_parts_frame_len: 1024,
-            repair_interval: Duration::from_millis(100),
-            give_up_timeout: Duration::from_secs(1),
-            delivered_tombstone_timeout: Duration::ZERO,
-        };
-        UDPourConfig::new(sender, receiver).expect("valid datagram config")
     }
 }
