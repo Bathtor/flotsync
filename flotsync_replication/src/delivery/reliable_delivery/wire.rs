@@ -74,7 +74,7 @@ pub(super) fn encode_reliable_envelope_boundary(
     };
     let wire = delivery_proto::ReliableEnvelopeWire {
         public_header: MessageField::some(header),
-        encrypted_payload: envelope.payload.ciphertext.to_vec(),
+        encrypted_payload: envelope.payload.ciphertext.clone(),
         footer: MessageField::some(encode_signature_wire(&envelope.footer)),
         ..delivery_proto::ReliableEnvelopeWire::default()
     };
@@ -157,7 +157,7 @@ pub(super) fn decode_reliable_envelope(
             message_id,
         },
         payload: EncryptedPayload {
-            ciphertext: Bytes::from(envelope.encrypted_payload),
+            ciphertext: envelope.encrypted_payload,
         },
         footer: decode_signature_wire(footer, "ReliableEnvelopeWire.footer")?,
     })
@@ -208,7 +208,7 @@ fn encode_signature_wire(footer: &SignedEnvelopeFooter) -> delivery_proto::Signa
                 delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519
             }
         }),
-        signature_bytes: footer.signature.bytes.to_vec(),
+        signature_bytes: footer.signature.bytes.clone(),
         ..delivery_proto::SignatureWire::default()
     }
 }
@@ -234,7 +234,7 @@ fn decode_signature_wire(
     Ok(SignedEnvelopeFooter {
         signature: DetachedSignature {
             scheme,
-            bytes: Bytes::from(wire.signature_bytes),
+            bytes: wire.signature_bytes,
         },
     })
 }

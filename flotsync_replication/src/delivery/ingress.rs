@@ -244,6 +244,7 @@ type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<Transpor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flotsync_core::member::IdentifierBuf;
     use flotsync_io::{
         prelude::IoPayload,
@@ -558,7 +559,7 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: b"ciphertext".to_vec(),
+            encrypted_payload: Bytes::from_static(b"ciphertext"),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {

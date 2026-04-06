@@ -595,6 +595,7 @@ struct RelevantShallowClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flotsync_messages::buffa::{Message, MessageField};
 
     fn group_id(value: u128) -> GroupId {
@@ -650,7 +651,7 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: vec![0x5a; 32 * 1024],
+            encrypted_payload: Bytes::from(vec![0x5a; 32 * 1024]),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {
@@ -694,7 +695,7 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: b"ciphertext".to_vec(),
+            encrypted_payload: Bytes::from_static(b"ciphertext"),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {

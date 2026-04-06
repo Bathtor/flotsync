@@ -1076,6 +1076,7 @@ version = "0.1.0"
 dependencies = [
  "buffa",
  "buffa-build",
+ "bytes",
  "criterion",
  "flotsync_core",
  "flotsync_data_types",

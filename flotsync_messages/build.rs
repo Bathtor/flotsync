@@ -24,6 +24,15 @@ fn main() {
     buffa_build::Config::new()
         .files(&proto_files)
         .descriptor_set(&descriptor_set)
+        // Keep this list narrow: only add protobuf bytes fields whose
+        // handwritten Rust transport/domain representation already uses
+        // `bytes::Bytes`, so generated types avoid avoidable `Bytes <-> Vec`
+        // churn without forcing wider API changes elsewhere.
+        .use_bytes_type_in(&[
+            ".flotsync.delivery.v1.GroupEnvelopeWire.encrypted_payload",
+            ".flotsync.delivery.v1.ReliableEnvelopeWire.encrypted_payload",
+            ".flotsync.delivery.v1.SignatureWire.signature_bytes",
+        ])
         .include_file("flotsync_messages.rs")
         .generate_json(false)
         .generate_text(false)
