@@ -370,6 +370,27 @@ impl IoLease {
         })
     }
 
+    /// Returns the readable payload bytes when the visible lease range is already contiguous.
+    ///
+    /// This borrows directly from the underlying storage and therefore performs no allocation.
+    /// It returns `None` when the visible range spans more than one pooled segment.
+    pub fn try_as_contiguous_slice(&self) -> Option<&[u8]> {
+        if self.is_empty() {
+            return Some(&[]);
+        }
+
+        match &self.inner {
+            IoLeaseInner::External(chunk_ref) => {
+                let chunk = chunk_ref.chunk();
+                let end = self.offset.checked_add(self.len)?;
+                chunk.get(self.offset..end)
+            }
+            IoLeaseInner::Pooled(payload) => {
+                try_slice_one_pooled_segment(payload, self.offset, self.len)
+            }
+        }
+    }
+
     /// Creates a byte-clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
         Bytes::from(self.to_vec())
@@ -407,6 +428,34 @@ impl From<ChunkRef> for IoLease {
     fn from(chunk_ref: ChunkRef) -> Self {
         Self::from_chunk_ref(chunk_ref)
     }
+}
+
+fn try_slice_one_pooled_segment(
+    payload: &PooledPayload,
+    offset: usize,
+    len: usize,
+) -> Option<&[u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+
+    let mut skipped = 0usize;
+    for segment in &payload.segments {
+        let segment_len = segment.written_len;
+        if skipped + segment_len <= offset {
+            skipped += segment_len;
+            continue;
+        }
+
+        let segment_offset = offset.saturating_sub(skipped);
+        let segment_end = segment_offset.checked_add(len)?;
+        if segment_end > segment_len {
+            return None;
+        }
+        return Some(&segment.chunk[segment_offset..segment_end]);
+    }
+
+    None
 }
 
 impl fmt::Debug for IoLease {
@@ -905,6 +954,60 @@ mod tests {
             b"llo"[..]
         );
         assert_eq!(second_bytes, Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn io_payload_as_contiguous_slice_returns_correct_bytes() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve contiguous payload")).expect("ready");
+        let lease = reservation
+            .copy_bytes(b"hello")
+            .expect("write contiguous payload");
+        let mut contiguous = IoPayload::Lease(lease);
+        assert_eq!(contiguous.try_as_contiguous_slice(), Some(&b"hello"[..]));
+        assert_eq!(contiguous.as_contiguous_slice(), b"hello");
+        assert!(matches!(contiguous, IoPayload::Lease(_)));
+
+        let mut fragmented = IoPayload::chain([
+            IoPayload::from_static(b"he"),
+            IoPayload::from_static(b"llo"),
+        ]);
+        assert!(fragmented.try_as_contiguous_slice().is_none());
+        assert_eq!(fragmented.as_contiguous_slice(), b"hello");
+        assert!(matches!(&fragmented, IoPayload::Bytes(bytes) if bytes.as_ref() == b"hello"));
+    }
+
+    #[test]
+    fn io_payload_as_contiguous_slice_releases_pooled_capacity_after_coalescing() {
+        init_test_logger();
+
+        let config = IoPoolConfig {
+            max_chunk_count: 1,
+            ..tiny_config()
+        };
+        let pool = IngressPool::new(
+            config,
+            default_runtime_logger(),
+            PoolAvailabilityNotifier::new(|| {}),
+        );
+
+        let mut buffer = pool
+            .try_acquire()
+            .expect("ingress pool lock")
+            .expect("acquire ingress buffer");
+        buffer.writable()[..4].copy_from_slice(b"ping");
+        let lease = buffer.commit(4).expect("commit ingress buffer");
+
+        assert!(pool.try_acquire().expect("ingress pool lock").is_none());
+
+        let mut payload = IoPayload::chain([IoPayload::Lease(lease), IoPayload::from_static(b"!")]);
+        assert_eq!(payload.as_contiguous_slice(), b"ping!");
+        assert!(matches!(&payload, IoPayload::Bytes(bytes) if bytes.as_ref() == b"ping!"));
+
+        assert!(pool.try_acquire().expect("ingress pool lock").is_some());
     }
 
     #[test]

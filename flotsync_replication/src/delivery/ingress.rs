@@ -154,7 +154,7 @@ impl DeliveryIngressComponent {
 
     fn handle_transport_inbound(
         &mut self,
-        inbound: RouteTransportInboundDeliver<TransportRouteKey>,
+        mut inbound: RouteTransportInboundDeliver<TransportRouteKey>,
     ) -> Handled {
         let active_groups = self.interest.active_groups.load();
         let route = inbound.transport.route;
@@ -162,7 +162,7 @@ impl DeliveryIngressComponent {
         // classify, but the shallow public header showed it is irrelevant to
         // the current local-interest snapshot.
         match decode_boundary_frame_if_interested(
-            &inbound.payload,
+            &mut inbound.payload,
             DeliveryInterestView {
                 active_groups: active_groups.as_ref(),
                 local_members: self.interest.local_members.as_ref(),

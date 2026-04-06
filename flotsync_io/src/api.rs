@@ -178,6 +178,37 @@ impl IoPayload {
         IoPayloadCursor::new(self)
     }
 
+    /// Returns the readable payload bytes when the payload is already contiguous.
+    ///
+    /// This performs no allocation. It returns `None` for fragmented chained payloads and for
+    /// multi-segment pooled leases.
+    pub fn try_as_contiguous_slice(&self) -> Option<&[u8]> {
+        match self {
+            Self::Lease(lease) => lease.try_as_contiguous_slice(),
+            Self::Bytes(bytes) => Some(bytes.as_ref()),
+            Self::Chain(parts) => match parts.as_ref() {
+                [] => Some(&[]),
+                [part] => part.try_as_contiguous_slice(),
+                _ => None,
+            },
+        }
+    }
+
+    /// Returns the readable payload bytes as one contiguous slice.
+    ///
+    /// When the payload is already contiguous, this borrows the existing storage directly. When
+    /// the payload is fragmented, it is coalesced into one owned `Bytes` value first, and the
+    /// payload is rewritten to keep reusing that contiguous representation.
+    pub fn as_contiguous_slice(&mut self) -> &[u8] {
+        if self.try_as_contiguous_slice().is_none() {
+            let bytes = self.create_byte_clone();
+            *self = Self::Bytes(bytes);
+        }
+
+        self.try_as_contiguous_slice()
+            .expect("IoPayload::as_contiguous_slice must always return one slice")
+    }
+
     /// Creates a byte clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
         Bytes::from(self.to_vec())

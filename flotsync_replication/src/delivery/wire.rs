@@ -41,11 +41,10 @@ use uuid::Uuid;
 /// `Ok(None)` is therefore an expected fast-path outcome for valid but
 /// irrelevant traffic.
 pub(crate) fn decode_boundary_frame_if_interested(
-    payload: &IoPayload,
+    payload: &mut IoPayload,
     interest: DeliveryInterestView<'_>,
 ) -> Result<Option<DecodedDeliveryFrame>, DeliveryWireError> {
-    let payload_bytes = payload.create_byte_clone();
-    let payload_slice = payload_bytes.as_ref();
+    let payload_slice = payload.as_contiguous_slice();
 
     let Some(classification) = classify_boundary_frame(payload_slice, interest)? else {
         return Ok(None);
@@ -670,8 +669,9 @@ mod tests {
         let active_groups = active_groups([]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
+        let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
-            &encode_boundary_frame(boundary),
+            &mut payload,
             DeliveryInterestView {
                 active_groups: &active_groups,
                 local_members: &local_members,
@@ -714,8 +714,9 @@ mod tests {
         let active_groups = active_groups([group_id]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
+        let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
-            &encode_boundary_frame(boundary),
+            &mut payload,
             DeliveryInterestView {
                 active_groups: &active_groups,
                 local_members: &local_members,
@@ -766,8 +767,9 @@ mod tests {
         let active_groups = active_groups([]);
         let local_members = members([member(&["charlie"])]);
         let hosted_mailboxes = members([]);
+        let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
-            &encode_boundary_frame(boundary),
+            &mut payload,
             DeliveryInterestView {
                 active_groups: &active_groups,
                 local_members: &local_members,
@@ -807,8 +809,9 @@ mod tests {
         let active_groups = active_groups([]);
         let local_members = members([]);
         let hosted_mailboxes = members([recipient.clone()]);
+        let mut payload = encode_boundary_frame(boundary);
         let decoded = decode_boundary_frame_if_interested(
-            &encode_boundary_frame(boundary),
+            &mut payload,
             DeliveryInterestView {
                 active_groups: &active_groups,
                 local_members: &local_members,
