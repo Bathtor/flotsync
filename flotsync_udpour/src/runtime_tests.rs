@@ -828,9 +828,12 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
         matches!(frame, UDPourFrame::Ack(_))
     });
     assert!(matches!(ack, UDPourFrame::Ack(_)));
+    // Once the receiver has delivered and the sender has observed the ACK,
+    // the repair path must stay dormant instead of emitting a spurious
+    // `NeedParts` request later on.
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
-        Duration::from_millis(100),
+        Duration::from_millis(500),
         |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
     harness.shutdown();
@@ -906,9 +909,11 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         frame.payload.to_vec().as_slice() == b"efgh"
     });
     assert!(matches!(retransmit, UDPourFrame::Payload(_)));
+    // This transfer is missing exactly one part, so the repair path must stop
+    // after retransmitting that part instead of leaking extra payload frames.
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
-        Duration::from_millis(100),
+        Duration::from_millis(500),
         |frame| matches!(frame, UDPourFrame::Payload(_)),
     );
 
@@ -966,6 +971,9 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     let retransmitted_parts = wait_for_retransmitted_parts(&harness, message_id, part_count);
     assert_eq!(retransmitted_parts, vec![0, 1, 2]);
 
+    // This wait has to stay inside the current tombstone lifetime. It proves
+    // that late shared-route repairs do not redeliver before duplicate
+    // suppression expires.
     harness.assert_no_receiver_deliver(Duration::from_millis(60));
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::Ack(_))
@@ -1017,6 +1025,9 @@ fn send_delay_and_window_pace_multipart_transmission() {
         )
     });
     assert!(matches!(first, UDPourFrame::Payload(_)));
+    // This short window is the pacing assertion itself: with the current
+    // `send_delay`, the next payload part must not already be on the bridge
+    // yet.
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
         Duration::from_millis(15),
@@ -1030,6 +1041,8 @@ fn send_delay_and_window_pace_multipart_transmission() {
         )
     });
     assert!(matches!(second, UDPourFrame::Payload(_)));
+    // The second gap proves the sender keeps pacing subsequent parts rather
+    // than only delaying the initial burst.
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
         Duration::from_millis(15),
@@ -1086,7 +1099,9 @@ fn no_longer_available_after_sender_retention_expiry() {
         matches!(frame, UDPourFrame::NoLongerAvailable(_))
     });
     assert!(matches!(nla, UDPourFrame::NoLongerAvailable(_)));
-    harness.assert_no_receiver_deliver(Duration::from_millis(100));
+    // After `NoLongerAvailable`, the receiver must never assemble and deliver
+    // the transfer from the partial state it still holds.
+    harness.assert_no_receiver_deliver(Duration::from_millis(500));
     harness.shutdown();
 }
 
@@ -1204,9 +1219,11 @@ fn runtime_duplicate_payload_datagrams_do_not_break_delivery() {
 
     let deliver = harness.wait_for_receiver_deliver();
     assert_eq!(deliver.payload.to_vec().as_slice(), b"abcdefghijkl");
+    // Duplicate payload datagrams should be absorbed by the completed
+    // transfer state instead of provoking a repair request.
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
-        Duration::from_millis(100),
+        Duration::from_millis(500),
         |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
     harness.shutdown();
@@ -1233,10 +1250,12 @@ fn runtime_conflicting_duplicates_purge_without_requesting_repair() {
         harness.send(IoPayload::from_static(b"abcdefgh")),
         UDPourSubmitResult::Sent
     ));
-    harness.assert_no_receiver_deliver(Duration::from_millis(150));
+    // Conflicting duplicates must be purged locally. The receiver should
+    // neither redeliver the corrupted transfer nor ask the sender for repair.
+    harness.assert_no_receiver_deliver(Duration::from_millis(500));
     harness.assert_no_bridge_frame(
         harness.sender_socket_id,
-        Duration::from_millis(150),
+        Duration::from_millis(500),
         |frame| matches!(frame, UDPourFrame::NeedParts(_)),
     );
 

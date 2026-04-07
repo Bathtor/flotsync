@@ -1002,14 +1002,16 @@ mod tests {
                 DiscoveryRouteSource,
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
-                bind_ephemeral_local_socket,
                 build_delivery_test_system,
                 default_udpour_config,
                 member_identity,
             },
         },
     };
-    use flotsync_io::test_support::{WAIT_TIMEOUT, eventually, start_component};
+    use flotsync_io::{
+        prelude::UdpLocalBind,
+        test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
+    };
     use std::{collections::HashSet, net::SocketAddr, sync::mpsc, time::Duration};
 
     #[derive(ComponentDefinition)]
@@ -1101,7 +1103,13 @@ mod tests {
             start_component(core.system(), &discovery_source);
             start_component(core.system(), &client);
 
-            let local_addr = bind_ephemeral_local_socket(&core, FULL_STACK_WAIT_TIMEOUT);
+            let (socket_id, local_addr) = core
+                .bind_external_socket(UdpLocalBind::Exact(localhost(0)), FULL_STACK_WAIT_TIMEOUT);
+            core.wait_for_manager_external_socket_binding(
+                socket_id,
+                local_addr,
+                FULL_STACK_WAIT_TIMEOUT,
+            );
 
             Self {
                 core,
@@ -1154,43 +1162,34 @@ mod tests {
         }
 
         fn wait_for_sender_ack_observed(&self, message_id: MessageId) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.reliable.on_definition(|component| {
-                        component
-                            .sender_work_item(message_id)
-                            .is_some_and(|work_item| {
-                                matches!(
-                                    work_item.recipient_ack,
-                                    RecipientAckStatus::Observed { .. }
-                                )
-                            })
-                    })
+                &self.reliable,
+                |component| {
+                    component
+                        .sender_work_item(message_id)
+                        .is_some_and(|work_item| {
+                            matches!(work_item.recipient_ack, RecipientAckStatus::Observed { .. })
+                        })
                 },
-                || {
-                    format!(
-                        "timed out waiting for sender-side recipient ack observation for {message_id:?}"
-                    )
-                },
+                format_args!(
+                    "timed out waiting for sender-side recipient ack observation for {message_id:?}"
+                ),
             );
         }
 
         fn wait_for_sender_route_state(&self, message_id: MessageId, expected: RouteActiveState) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.reliable.on_definition(|component| {
-                        component
-                            .sender_work_item(message_id)
-                            .is_some_and(|work_item| work_item.recipient_route.state == expected)
-                    })
+                &self.reliable,
+                |component| {
+                    component
+                        .sender_work_item(message_id)
+                        .is_some_and(|work_item| work_item.recipient_route.state == expected)
                 },
-                || {
-                    format!(
-                        "timed out waiting for sender-side route state {expected:?} for {message_id:?}"
-                    )
-                },
+                format_args!(
+                    "timed out waiting for sender-side route state {expected:?} for {message_id:?}"
+                ),
             );
         }
 
@@ -1199,46 +1198,37 @@ mod tests {
             message_id: MessageId,
             expected: PendingInboundDeliveryState,
         ) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.reliable.on_definition(|component| {
-                        component.inbound_delivery_state(message_id) == Some(expected)
-                    })
-                },
-                || format!("timed out waiting for inbound state {expected:?} for {message_id:?}"),
+                &self.reliable,
+                |component| component.inbound_delivery_state(message_id) == Some(expected),
+                format_args!("timed out waiting for inbound state {expected:?} for {message_id:?}"),
             );
         }
 
         fn wait_for_inbound_clear(&self, message_id: MessageId) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.reliable.on_definition(|component| {
-                        component.inbound_delivery_state(message_id).is_none()
-                    })
-                },
-                || format!("timed out waiting for inbound delivery cleanup for {message_id:?}"),
+                &self.reliable,
+                |component| component.inbound_delivery_state(message_id).is_none(),
+                format_args!("timed out waiting for inbound delivery cleanup for {message_id:?}"),
             );
         }
 
         fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: Bytes) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.reliable.on_definition(|component| {
-                        component
-                            .sender_work_item(message_id)
-                            .is_some_and(|work_item| {
-                                work_item.submit.envelope.payload.ciphertext == expected
-                            })
-                    })
+                &self.reliable,
+                |component| {
+                    component
+                        .sender_work_item(message_id)
+                        .is_some_and(|work_item| {
+                            work_item.submit.envelope.payload.ciphertext == expected
+                        })
                 },
-                || {
-                    format!(
-                        "timed out waiting for sender-side ciphertext {expected:?} for {message_id}"
-                    )
-                },
+                format_args!(
+                    "timed out waiting for sender-side ciphertext {expected:?} for {message_id}"
+                ),
             );
         }
     }

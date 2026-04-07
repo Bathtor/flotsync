@@ -766,6 +766,28 @@ impl RouteTransportManager {
             );
         }
     }
+
+    /// Test-only probe for whether one externally bound socket has been
+    /// incorporated into the manager's current UDP socket state yet.
+    #[cfg(test)]
+    pub(crate) fn knows_external_udp_socket_binding(
+        &self,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) -> bool {
+        let socket_key = UdpSocketKey { local_addr };
+        self.udp_dormant_sockets
+            .get(&socket_key)
+            .is_some_and(|handle| handle.socket_id == socket_id)
+            || self
+                .udp_starting_sockets
+                .get(&socket_key)
+                .is_some_and(|handle| handle.socket_id == socket_id)
+            || self
+                .udp_sockets
+                .get(&socket_key)
+                .is_some_and(|handle| handle.socket_id == socket_id)
+    }
 }
 
 impl ComponentLifecycle for RouteTransportManager {
@@ -1108,7 +1130,7 @@ mod tests {
         test_support::{
             WAIT_TIMEOUT,
             build_test_kompact_system_with,
-            eventually,
+            eventually_component_state,
             eventually_value,
             localhost,
         },
@@ -1122,6 +1144,7 @@ mod tests {
     use flotsync_utils::BoxFuture;
     use std::{
         cell::Cell,
+        fmt::{self, Display},
         net::{SocketAddr, UdpSocket},
         num::NonZeroUsize,
         time::Duration,
@@ -1169,6 +1192,24 @@ mod tests {
                     .map_err(|source| FlotsyncSerializeError::Io { source })?;
                 Ok(())
             })
+        }
+    }
+
+    struct StartupBufferedDatagramsTimeout<'a> {
+        socket_key: UdpSocketKey,
+        min_count: usize,
+        max_observed: &'a Cell<usize>,
+    }
+
+    impl Display for StartupBufferedDatagramsTimeout<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "timed out waiting for the manager to buffer {} startup datagrams for {:?}; max observed was {}",
+                self.min_count,
+                self.socket_key,
+                self.max_observed.get()
+            )
         }
     }
 
@@ -1278,14 +1319,11 @@ mod tests {
         }
 
         fn wait_for_dormant_socket(&self, socket_key: UdpSocketKey) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.manager.on_definition(|component| {
-                        component.udp_dormant_sockets.contains_key(&socket_key)
-                    })
-                },
-                || format!("timed out waiting for dormant UDP socket {socket_key:?}"),
+                &self.manager,
+                |component| component.udp_dormant_sockets.contains_key(&socket_key),
+                format_args!("timed out waiting for dormant UDP socket {socket_key:?}"),
             );
         }
 
@@ -1294,6 +1332,10 @@ mod tests {
             socket_key: UdpSocketKey,
             min_count: usize,
         ) -> usize {
+            // `eventually_value` owns both the polling closure and the deferred
+            // failure message. `Cell` lets the closure update the best
+            // diagnostic sample while the display helper still reads the final
+            // value if the wait times out.
             let max_observed = Cell::new(0usize);
             eventually_value(
                 WAIT_TIMEOUT,
@@ -1326,23 +1368,20 @@ mod tests {
                     }
                     None
                 },
-                || {
-                    format!(
-                        "timed out waiting for the manager to buffer {min_count} startup datagrams; max observed was {}",
-                        max_observed.get()
-                    )
+                StartupBufferedDatagramsTimeout {
+                    socket_key,
+                    min_count,
+                    max_observed: &max_observed,
                 },
             )
         }
 
         fn wait_for_live_udp_socket(&self, socket_key: UdpSocketKey) {
-            eventually(
+            eventually_component_state(
                 WAIT_TIMEOUT,
-                || {
-                    self.manager
-                        .on_definition(|component| component.udp_sockets.contains_key(&socket_key))
-                },
-                || format!("timed out waiting for live UDP socket {socket_key:?}"),
+                &self.manager,
+                |component| component.udp_sockets.contains_key(&socket_key),
+                format_args!("timed out waiting for live UDP socket {socket_key:?}"),
             );
         }
 

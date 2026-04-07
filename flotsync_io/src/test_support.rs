@@ -9,6 +9,7 @@ use slog::{Drain, Logger, PushFnValue, o};
 use std::{
     cell::RefCell,
     collections::VecDeque,
+    fmt::{Debug, Display},
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, OnceLock, mpsc},
@@ -83,23 +84,28 @@ pub fn localhost(port: u16) -> SocketAddr {
 }
 
 /// Waits until `probe` returns one value or `timeout` elapses.
-pub fn eventually_value<T>(
+pub fn eventually_value<T, M>(
     timeout: Duration,
     probe: impl FnMut() -> Option<T>,
-    failure_message: impl FnOnce() -> String,
-) -> T {
+    failure_message: M,
+) -> T
+where
+    M: Display,
+{
     eventually_value_with_poll(timeout, EVENTUALLY_POLL_INTERVAL, probe, failure_message)
 }
 
 /// Waits until `probe` returns one value using the supplied poll cadence.
-pub fn eventually_value_with_poll<T>(
+pub fn eventually_value_with_poll<T, M>(
     timeout: Duration,
     poll_interval: Duration,
     mut probe: impl FnMut() -> Option<T>,
-    failure_message: impl FnOnce() -> String,
-) -> T {
+    failure_message: M,
+) -> T
+where
+    M: Display,
+{
     let deadline = Instant::now() + timeout;
-    let mut failure_message = Some(failure_message);
     loop {
         if let Some(value) = probe() {
             return value;
@@ -107,10 +113,7 @@ pub fn eventually_value_with_poll<T>(
 
         let now = Instant::now();
         if now >= deadline {
-            let failure_message = failure_message
-                .take()
-                .expect("eventually failure message must still be available");
-            panic!("{}", failure_message());
+            panic!("{failure_message}");
         }
 
         thread::sleep(deadline.saturating_duration_since(now).min(poll_interval));
@@ -118,28 +121,40 @@ pub fn eventually_value_with_poll<T>(
 }
 
 /// Waits until `predicate` becomes true or `timeout` elapses.
-pub fn eventually(
-    timeout: Duration,
-    mut predicate: impl FnMut() -> bool,
-    failure_message: impl FnOnce() -> String,
-) {
+pub fn eventually<M>(timeout: Duration, mut predicate: impl FnMut() -> bool, failure_message: M)
+where
+    M: Display,
+{
     eventually_value(timeout, || predicate().then_some(()), failure_message);
 }
 
+/// Waits until one component-state predicate becomes true or `timeout`
+/// elapses.
+pub fn eventually_component_state<C, M>(
+    timeout: Duration,
+    component: &Arc<Component<C>>,
+    mut predicate: impl FnMut(&mut C) -> bool,
+    failure_message: M,
+) where
+    C: ComponentDefinition + Sized + 'static,
+    M: Display,
+{
+    eventually(
+        timeout,
+        || component.on_definition(|definition| predicate(definition)),
+        failure_message,
+    );
+}
+
 /// Asserts that `predicate` never becomes true during `duration`.
-pub fn assert_never(
-    duration: Duration,
-    mut predicate: impl FnMut() -> bool,
-    failure_message: impl FnOnce() -> String,
-) {
+pub fn assert_never<M>(duration: Duration, mut predicate: impl FnMut() -> bool, failure_message: M)
+where
+    M: Display,
+{
     let deadline = Instant::now() + duration;
-    let mut failure_message = Some(failure_message);
     loop {
         if predicate() {
-            let failure_message = failure_message
-                .take()
-                .expect("negative assertion failure message must still be available");
-            panic!("{}", failure_message());
+            panic!("{failure_message}");
         }
 
         let now = Instant::now();
@@ -164,7 +179,7 @@ pub fn wait_for_driver_request<T>(mut request: DriverRequest<T>) -> T {
             Ok(None) => None,
             Err(error) => panic!("driver request failed: {error}"),
         },
-        || "timed out waiting for driver request reply".to_owned(),
+        "timed out waiting for driver request reply",
     )
 }
 
@@ -187,7 +202,7 @@ pub fn wait_for_driver_event(
             Ok(None) => None,
             Err(error) => panic!("driver event retrieval failed: {error}"),
         },
-        || "timed out waiting for driver event".to_owned(),
+        "timed out waiting for driver event",
     )
 }
 
@@ -200,7 +215,7 @@ pub fn assert_no_driver_event(driver: &IoDriver, duration: Duration) {
             Ok(None) => false,
             Err(error) => panic!("driver event retrieval failed: {error}"),
         },
-        || "unexpected driver event while expecting silence".to_owned(),
+        "unexpected driver event while expecting silence",
     );
 }
 
@@ -296,9 +311,21 @@ impl<T> BufferedReceiver<T> {
 
     /// Asserts that no buffered or newly received event satisfies
     /// `predicate` for the whole `duration`.
-    pub fn assert_no_match(&self, duration: Duration, mut predicate: impl FnMut(&T) -> bool) {
-        if self.deferred.borrow().iter().any(&mut predicate) {
-            panic!("unexpected buffered test event matched negative assertion");
+    ///
+    /// A disconnected sender is treated as a harness failure rather than as
+    /// silence because negative assertions rely on the probe staying live for
+    /// the entire observation window.
+    pub fn assert_no_match(&self, duration: Duration, mut predicate: impl FnMut(&T) -> bool)
+    where
+        T: Debug,
+    {
+        if let Some(matching_event) = self
+            .deferred
+            .borrow()
+            .iter()
+            .find(|event| predicate(*event))
+        {
+            panic!("unexpected buffered test event matched negative assertion: {matching_event:?}");
         }
 
         let deadline = Instant::now() + duration;
@@ -315,11 +342,11 @@ impl<T> BufferedReceiver<T> {
                 Ok(event) => event,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("buffered test event sender disconnected unexpectedly")
+                    panic!("buffered test event sender disconnected during negative assertion")
                 }
             };
             if predicate(&event) {
-                panic!("unexpected test event matched negative assertion");
+                panic!("unexpected test event matched negative assertion: {event:?}");
             }
             self.deferred.borrow_mut().push_back(event);
         }

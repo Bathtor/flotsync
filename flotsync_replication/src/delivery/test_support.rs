@@ -29,7 +29,7 @@ use flotsync_io::{
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
-        localhost,
+        eventually_component_state,
         start_component,
     },
 };
@@ -194,6 +194,24 @@ impl TransportHarnessCore {
         }
     }
 
+    /// Wait for the route-transport manager to record one externally bound
+    /// socket before tests publish routes that rely on reusing it.
+    pub(crate) fn wait_for_manager_external_socket_binding(
+        &self,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+        timeout: Duration,
+    ) {
+        eventually_component_state(
+            timeout,
+            &self.manager,
+            |component| component.knows_external_udp_socket_binding(socket_id, local_addr),
+            format_args!(
+                "timed out waiting for route transport manager to observe external UDP socket {socket_id:?} at {local_addr}"
+            ),
+        );
+    }
+
     /// Wait for the next UDP bind indication observed by the bridge observer.
     pub(crate) fn wait_for_new_bound_socket(&self, timeout: Duration) -> (SocketId, SocketAddr) {
         match self.observer_rx.recv_matching(timeout, |event| {
@@ -271,14 +289,4 @@ pub(crate) fn member_identity(segments: &[&str]) -> MemberIdentity {
             .expect("test member identifier segment must be valid");
     }
     identifier.into_identifier()
-}
-
-/// Convenience helper for binding an ephemeral loopback UDP socket in the
-/// shared observer harness.
-pub(crate) fn bind_ephemeral_local_socket(
-    core: &TransportHarnessCore,
-    timeout: Duration,
-) -> SocketAddr {
-    core.bind_external_socket(UdpLocalBind::Exact(localhost(0)), timeout)
-        .1
 }

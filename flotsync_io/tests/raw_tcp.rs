@@ -281,7 +281,10 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
     accepted_client
         .write_all(b"pending")
         .expect("write pending TCP payload");
-    assert_no_driver_event(&driver, Duration::from_millis(50));
+    // The listener must not surface readable session data before the pending
+    // connection is explicitly adopted, even though bytes are already queued
+    // in the kernel receive buffer.
+    assert_no_driver_event(&driver, Duration::from_millis(500));
 
     driver
         .dispatch(DriverCommand::Tcp(TcpCommand::AdoptAccepted {

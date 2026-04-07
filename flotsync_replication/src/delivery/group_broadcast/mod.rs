@@ -417,7 +417,6 @@ mod tests {
                 DiscoveryRouteSource,
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
-                bind_ephemeral_local_socket,
                 build_delivery_test_system,
                 default_udpour_config,
                 member_identity,
@@ -425,7 +424,10 @@ mod tests {
         },
     };
     use bytes::Bytes;
-    use flotsync_io::test_support::{WAIT_TIMEOUT, eventually, start_component};
+    use flotsync_io::{
+        prelude::UdpLocalBind,
+        test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
+    };
     use std::{
         net::SocketAddr,
         sync::{Arc, mpsc},
@@ -531,7 +533,16 @@ mod tests {
             start_component(core.system(), &client);
 
             let local_addr = if bind_external_socket {
-                Some(bind_ephemeral_local_socket(&core, FULL_STACK_WAIT_TIMEOUT))
+                let (socket_id, local_addr) = core.bind_external_socket(
+                    UdpLocalBind::Exact(localhost(0)),
+                    FULL_STACK_WAIT_TIMEOUT,
+                );
+                core.wait_for_manager_external_socket_binding(
+                    socket_id,
+                    local_addr,
+                    FULL_STACK_WAIT_TIMEOUT,
+                );
+                Some(local_addr)
             } else {
                 None
             };
@@ -567,13 +578,11 @@ mod tests {
                         routes: vec![route],
                     });
             });
-            eventually(
+            eventually_component_state(
                 FULL_STACK_WAIT_TIMEOUT,
-                || {
-                    self.broadcast
-                        .on_definition(|component| component.knows_direct_route(&peer))
-                },
-                || "timed out waiting for group-broadcast route publication".to_owned(),
+                &self.broadcast,
+                |component| component.knows_direct_route(&peer),
+                "timed out waiting for group-broadcast route publication",
             );
         }
 
@@ -596,19 +605,25 @@ mod tests {
         }
 
         fn expect_no_delivery(&self, timeout: Duration) {
-            assert!(self.client_rx.recv_timeout(timeout).is_err());
-        }
-
-        fn knows_submit(&self, message_id: MessageId) -> bool {
-            self.broadcast
-                .on_definition(|component| component.knows_submit(message_id))
+            match self.client_rx.recv_timeout(timeout) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("group-broadcast test client disconnected while expecting silence")
+                }
+                Ok(indication) => {
+                    panic!(
+                        "unexpected group-broadcast indication while expecting silence: {indication:?}"
+                    )
+                }
+            }
         }
 
         fn wait_for_known_submit(&self, message_id: MessageId) {
-            eventually(
+            eventually_component_state(
                 FULL_STACK_WAIT_TIMEOUT,
-                || self.knows_submit(message_id),
-                || "timed out waiting for group-broadcast submit admission".to_owned(),
+                &self.broadcast,
+                |component| component.knows_submit(message_id),
+                "timed out waiting for group-broadcast submit admission",
             );
         }
     }
@@ -724,7 +739,9 @@ mod tests {
         );
         sender.submit(submit.clone());
 
-        sender.expect_no_delivery(Duration::from_millis(100));
+        // `suppress_self_delivery` is only observable by proving the sender's
+        // client port stays silent after the submit is accepted.
+        sender.expect_no_delivery(Duration::from_millis(500));
         assert_eq!(receiver_bob.wait_for_delivery().envelope, submit.envelope);
         assert_eq!(
             receiver_charlie.wait_for_delivery().envelope,
@@ -765,7 +782,9 @@ mod tests {
 
         assert_eq!(sender.wait_for_delivery().envelope, submit.envelope);
         assert_eq!(receiver_bob.wait_for_delivery().envelope, submit.envelope);
-        receiver_charlie.expect_no_delivery(Duration::from_millis(150));
+        // Charlie has no direct route at submit time, so the message must be
+        // dropped rather than queued for a later delivery.
+        receiver_charlie.expect_no_delivery(Duration::from_millis(500));
 
         sender.publish_direct_route(
             charlie,
@@ -773,7 +792,9 @@ mod tests {
                 .local_addr
                 .expect("receiver harness must bind an external socket"),
         );
-        receiver_charlie.expect_no_delivery(Duration::from_millis(150));
+        // Publishing a route after the submit must not retroactively fan out
+        // the already dropped message.
+        receiver_charlie.expect_no_delivery(Duration::from_millis(500));
     }
 
     fn group_memberships(

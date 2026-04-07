@@ -471,6 +471,8 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
         other => unreachable!("filtered to UDP SendNack event, got {other:?}"),
     }
 
-    assert_no_driver_event(&driver, Duration::from_millis(25));
+    // Once a send on the closed socket has already been nacked, the driver
+    // must stay quiet instead of surfacing any delayed follow-up outcome.
+    assert_no_driver_event(&driver, Duration::from_millis(500));
     driver.shutdown().expect("driver shuts down");
 }
