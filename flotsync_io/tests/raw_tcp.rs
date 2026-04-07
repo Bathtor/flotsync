@@ -11,7 +11,7 @@ use flotsync_io::{
 };
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::Duration,
@@ -309,7 +309,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 
     let mut rejected_client = TcpStream::connect(listener_addr).expect("connect rejected client");
     rejected_client
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .expect("set rejected client read timeout");
     let rejected_connection_id = match wait_for_driver_event(&driver, |event| {
         matches!(
@@ -331,7 +331,6 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
         }))
         .expect("dispatch reject accepted connection");
 
-    thread::sleep(Duration::from_millis(50));
     let mut rejected_buf = [0_u8; 1];
     let rejected_read = rejected_client.read(&mut rejected_buf);
     match rejected_read {
@@ -342,8 +341,6 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
                 std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::TimedOut
             ) => {}
         other => panic!("unexpected rejected-client read result: {other:?}"),
     }
@@ -436,7 +433,9 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
         stream
             .write_all(&vec![b'a'; 300])
             .expect("write TCP ingress payload");
-        thread::sleep(Duration::from_millis(50));
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("shutdown TCP write half after ingress payload");
     });
 
     let driver = IoDriver::start(DriverConfig {

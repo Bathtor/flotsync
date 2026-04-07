@@ -1298,7 +1298,7 @@ mod tests {
         test_support::init_test_logger,
     };
     use std::{
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+        net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
         sync::mpsc,
         time::{Duration, Instant},
     };
@@ -1492,6 +1492,9 @@ mod tests {
         };
 
         let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set TCP client read timeout");
         let accepted_connection_id = loop {
             match wait_for_event(&driver) {
                 DriverEvent::Tcp(TcpEvent::Accepted {
@@ -1511,7 +1514,6 @@ mod tests {
             }))
             .expect("dispatch TCP reject accepted");
 
-        std::thread::sleep(Duration::from_millis(50));
         let mut buf = [0_u8; 1];
         let read_result = client.read(&mut buf);
         match read_result {
@@ -2003,7 +2005,9 @@ mod tests {
             stream
                 .write_all(&vec![b'a'; 300])
                 .expect("server write payload");
-            std::thread::sleep(Duration::from_millis(50));
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("shutdown TCP write half after payload");
         });
 
         let driver_config = crate::driver::DriverConfig {
