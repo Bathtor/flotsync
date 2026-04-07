@@ -4,7 +4,7 @@
 
 ## Rust Rules
 
-- Do not run multiple `cargo` instances in parallel. They anyway lock.
+- Do not run multiple `cargo` instances in parallel! They anyway lock.
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical.
 - Prefer readable control flow over chained iterator side effects.
@@ -38,6 +38,11 @@
 - Git-friendly: Dolt-powered version control with native sync
 - Agent-optimized: JSON output, ready work detection, discovered-from links
 - Prevents duplicate tracking systems and confusion
+
+### Important Rules
+
+- Do not access `bd` in parallel!
+- Always access it outside the sandbox. (It starts a server and it gets confused otherwise.)
 
 ### Quick Start
 
