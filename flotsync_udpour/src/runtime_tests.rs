@@ -49,12 +49,14 @@ use flotsync_io::{
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
+        build_test_kompact_system_with_manual_timer,
+        eventually_component_state,
         kill_component,
         localhost,
         start_component,
     },
 };
-use kompact::prelude::*;
+use kompact::{prelude::*, timer::ManualTimer as KompactManualTimer};
 use roaring::RoaringBitmap;
 use std::{
     cmp::Reverse,
@@ -351,6 +353,7 @@ impl Actor for ScriptedUdpProxy {
 
 struct RuntimeHarness {
     system: KompactSystem,
+    manual_timer: Option<KompactManualTimer>,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     observer: Arc<Component<UdpObserver>>,
@@ -396,6 +399,25 @@ impl RuntimeHarness {
         )
     }
 
+    fn new_manual_time(
+        sender_request_behavior: ProxyRequestBehavior,
+        sender_indication_behavior: ProxyIndicationBehavior,
+        receiver_request_behavior: ProxyRequestBehavior,
+        receiver_indication_behavior: ProxyIndicationBehavior,
+        sender_config: SenderConfig,
+        receiver_config: ReceiverConfig,
+    ) -> Self {
+        Self::with_send_rate_control_manual_time(
+            sender_request_behavior,
+            sender_indication_behavior,
+            receiver_request_behavior,
+            receiver_indication_behavior,
+            sender_config,
+            receiver_config,
+            TestSendRateControl::default(),
+        )
+    }
+
     fn with_send_rate_control(
         sender_request_behavior: ProxyRequestBehavior,
         sender_indication_behavior: ProxyIndicationBehavior,
@@ -405,7 +427,52 @@ impl RuntimeHarness {
         receiver_config: ReceiverConfig,
         send_rate_control: TestSendRateControl,
     ) -> Self {
-        let system = build_runtime_test_kompact_system(send_rate_control);
+        Self::build(
+            sender_request_behavior,
+            sender_indication_behavior,
+            receiver_request_behavior,
+            receiver_indication_behavior,
+            sender_config,
+            receiver_config,
+            send_rate_control,
+            false,
+        )
+    }
+
+    fn with_send_rate_control_manual_time(
+        sender_request_behavior: ProxyRequestBehavior,
+        sender_indication_behavior: ProxyIndicationBehavior,
+        receiver_request_behavior: ProxyRequestBehavior,
+        receiver_indication_behavior: ProxyIndicationBehavior,
+        sender_config: SenderConfig,
+        receiver_config: ReceiverConfig,
+        send_rate_control: TestSendRateControl,
+    ) -> Self {
+        Self::build(
+            sender_request_behavior,
+            sender_indication_behavior,
+            receiver_request_behavior,
+            receiver_indication_behavior,
+            sender_config,
+            receiver_config,
+            send_rate_control,
+            true,
+        )
+    }
+
+    fn build(
+        sender_request_behavior: ProxyRequestBehavior,
+        sender_indication_behavior: ProxyIndicationBehavior,
+        receiver_request_behavior: ProxyRequestBehavior,
+        receiver_indication_behavior: ProxyIndicationBehavior,
+        sender_config: SenderConfig,
+        receiver_config: ReceiverConfig,
+        send_rate_control: TestSendRateControl,
+        manual_time: bool,
+    ) -> Self {
+        let (system, manual_timer) =
+            build_runtime_test_kompact_system(send_rate_control, manual_time);
+
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
         let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -486,6 +553,7 @@ impl RuntimeHarness {
 
         Self {
             system,
+            manual_timer,
             driver,
             bridge,
             observer,
@@ -510,6 +578,13 @@ impl RuntimeHarness {
             receiver_socket_id,
             receiver_addr,
         }
+    }
+
+    fn advance_time(&self, duration: Duration) {
+        self.manual_timer
+            .as_ref()
+            .expect("manual timer harness required for explicit time control")
+            .advance_by(duration);
     }
 
     fn send(&self, payload: IoPayload) -> UDPourSubmitResult {
@@ -615,6 +690,15 @@ impl RuntimeHarness {
         self.receiver_rx.assert_no_match(duration, |_| true);
     }
 
+    fn wait_for_sender_dispatch_timer(&self) {
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &self.sender_runtime,
+            |component| component.is_waiting_for_dispatch_timer(),
+            "timed out waiting for sender dispatch timer to be armed",
+        );
+    }
+
     fn shutdown(self) {
         kill_component(&self.system, self.receiver_probe);
         kill_component(&self.system, self.sender_probe);
@@ -629,8 +713,11 @@ impl RuntimeHarness {
     }
 }
 
-fn build_runtime_test_kompact_system(send_rate_control: TestSendRateControl) -> KompactSystem {
-    build_test_kompact_system_with(|config| {
+fn build_runtime_test_kompact_system(
+    send_rate_control: TestSendRateControl,
+    manual_time: bool,
+) -> (KompactSystem, Option<KompactManualTimer>) {
+    let configure = |config: &mut KompactConfig| {
         config.set_config_value(&config_keys::SEND_DELAY, send_rate_control.send_delay);
         config.set_config_value(
             &config_keys::BACKPRESSURE_RETRY_DELAY,
@@ -640,7 +727,14 @@ fn build_runtime_test_kompact_system(send_rate_control: TestSendRateControl) -> 
             &config_keys::MAX_IN_FLIGHT_DATAGRAMS,
             send_rate_control.max_in_flight_datagrams,
         );
-    })
+    };
+
+    if manual_time {
+        let (system, timer) = build_test_kompact_system_with_manual_timer(configure);
+        (system, Some(timer))
+    } else {
+        (build_test_kompact_system_with(configure), None)
+    }
 }
 
 fn bind_socket(
@@ -841,7 +935,7 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
 
 #[test]
 fn backpressure_is_retried_without_failing_logical_send() {
-    let harness = RuntimeHarness::new(
+    let harness = RuntimeHarness::new_manual_time(
         ProxyRequestBehavior::NackFirstSend {
             reason: SendFailureReason::Backpressure,
             fired: false,
@@ -853,8 +947,13 @@ fn backpressure_is_retried_without_failing_logical_send() {
         default_receiver_config(Duration::from_millis(40)),
     );
 
+    let submit = harness.submit_async(IoPayload::from_static(b"hello world"));
+    harness.wait_for_sender_dispatch_timer();
+    harness.advance_time(TestSendRateControl::default().backpressure_retry_delay);
     assert!(matches!(
-        harness.send(IoPayload::from_static(b"hello world")),
+        submit
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for backpressure retry submit result"),
         UDPourSubmitResult::Sent
     ));
 
@@ -868,7 +967,7 @@ fn backpressure_is_retried_without_failing_logical_send() {
 
 #[test]
 fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
-    let harness = RuntimeHarness::new(
+    let harness = RuntimeHarness::new_manual_time(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
@@ -889,6 +988,8 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
             matches!(frame, UDPourFrame::Payload(_))
         });
     }
+
+    harness.advance_time(Duration::from_millis(20));
 
     let need_parts = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
@@ -929,7 +1030,7 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
         Duration::from_millis(80),
         Duration::from_millis(40),
     );
-    let harness = RuntimeHarness::new(
+    let harness = RuntimeHarness::new_manual_time(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
@@ -974,12 +1075,13 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     // This wait has to stay inside the current tombstone lifetime. It proves
     // that late shared-route repairs do not redeliver before duplicate
     // suppression expires.
-    harness.assert_no_receiver_deliver(Duration::from_millis(60));
+    harness.advance_time(Duration::from_millis(60));
+    harness.assert_no_receiver_deliver(Duration::from_millis(100));
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::Ack(_))
     });
 
-    std::thread::sleep(Duration::from_millis(140));
+    harness.advance_time(Duration::from_millis(140));
 
     for (part_number, payload) in [
         (PartNumber(0), IoPayload::from_static(b"abcd")),
@@ -1002,7 +1104,7 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
 
 #[test]
 fn send_delay_and_window_pace_multipart_transmission() {
-    let harness = RuntimeHarness::with_send_rate_control(
+    let harness = RuntimeHarness::with_send_rate_control_manual_time(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
@@ -1028,11 +1130,14 @@ fn send_delay_and_window_pace_multipart_transmission() {
     // This short window is the pacing assertion itself: with the current
     // `send_delay`, the next payload part must not already be on the bridge
     // yet.
+    harness.wait_for_sender_dispatch_timer();
+    harness.advance_time(Duration::from_millis(15));
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
-        Duration::from_millis(15),
+        Duration::from_millis(100),
         |frame| matches!(frame, UDPourFrame::Payload(_)),
     );
+    harness.advance_time(Duration::from_millis(25));
 
     let second = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(
@@ -1043,11 +1148,14 @@ fn send_delay_and_window_pace_multipart_transmission() {
     assert!(matches!(second, UDPourFrame::Payload(_)));
     // The second gap proves the sender keeps pacing subsequent parts rather
     // than only delaying the initial burst.
+    harness.wait_for_sender_dispatch_timer();
+    harness.advance_time(Duration::from_millis(15));
     harness.assert_no_bridge_frame(
         harness.receiver_socket_id,
-        Duration::from_millis(15),
+        Duration::from_millis(100),
         |frame| matches!(frame, UDPourFrame::Payload(_)),
     );
+    harness.advance_time(Duration::from_millis(25));
 
     let third = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(
@@ -1071,7 +1179,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
 
 #[test]
 fn no_longer_available_after_sender_retention_expiry() {
-    let harness = RuntimeHarness::new(
+    let harness = RuntimeHarness::new_manual_time(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
@@ -1092,6 +1200,7 @@ fn no_longer_available_after_sender_retention_expiry() {
             matches!(frame, UDPourFrame::Payload(_))
         });
     }
+    harness.advance_time(Duration::from_millis(20));
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
     });
@@ -1101,7 +1210,8 @@ fn no_longer_available_after_sender_retention_expiry() {
     assert!(matches!(nla, UDPourFrame::NoLongerAvailable(_)));
     // After `NoLongerAvailable`, the receiver must never assemble and deliver
     // the transfer from the partial state it still holds.
-    harness.assert_no_receiver_deliver(Duration::from_millis(500));
+    harness.advance_time(Duration::from_millis(500));
+    harness.assert_no_receiver_deliver(Duration::from_millis(100));
     harness.shutdown();
 }
 

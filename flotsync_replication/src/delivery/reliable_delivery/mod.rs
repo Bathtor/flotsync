@@ -224,6 +224,10 @@ impl ReliableDeliveryComponent {
         }
     }
 
+    fn now(&self) -> Instant {
+        self.ctx.system().now()
+    }
+
     fn new_direct_route_record(
         recipient: &MemberIdentity,
         message_id: MessageId,
@@ -719,14 +723,14 @@ impl ReliableDeliveryComponent {
     }
 
     fn schedule_retry(&mut self, key: RetryKey, delay: Duration) {
-        let now = Instant::now();
+        let now = self.now();
         self.retry_queue.schedule(key, now + delay);
         self.set_retry_timer(now);
     }
 
     fn cancel_retry(&mut self, key: RetryKey) {
         self.retry_queue.cancel(key);
-        self.set_retry_timer(Instant::now());
+        self.set_retry_timer(self.now());
     }
 
     fn set_retry_timer(&mut self, now: Instant) {
@@ -752,7 +756,7 @@ impl ReliableDeliveryComponent {
             self.retry_timer = Some(active_timer);
             return Handled::Ok;
         }
-        let now = Instant::now();
+        let now = self.now();
         let ready = self.retry_queue.take_ready(now);
         for key in ready {
             match key {

@@ -4,7 +4,7 @@
 //! probes, wait helpers, and captured logging setup that the crate's own tests use.
 
 use crate::prelude::*;
-use kompact::{KompactLogger, prelude::*};
+use kompact::{KompactLogger, default_components::install_manual_timer, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
 use std::{
     cell::RefCell,
@@ -49,6 +49,20 @@ pub fn build_test_kompact_system_with(configure: impl FnOnce(&mut KompactConfig)
     configure(&mut config);
     config.logger(captured_kompact_logger());
     config.build().expect("build KompactSystem")
+}
+
+/// Builds a Kompact system with a manually-driven timer after applying extra config.
+pub fn build_test_kompact_system_with_manual_timer(
+    configure: impl FnOnce(&mut KompactConfig),
+) -> (KompactSystem, kompact::timer::ManualTimer) {
+    init_test_logger();
+
+    let mut config = KompactConfig::default();
+    configure(&mut config);
+    let timer = install_manual_timer(&mut config);
+    config.logger(captured_kompact_logger());
+    let system = config.build().expect("build KompactSystem");
+    (system, timer)
 }
 
 fn captured_log_logger() -> Logger {

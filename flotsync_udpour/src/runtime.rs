@@ -282,8 +282,11 @@ struct OutboundDispatcherState {
     queue: VecDeque<QueuedDatagram>,
     /// True while one spawned async task is encoding and dispatching the next queue head.
     dispatch_in_progress: bool,
-    /// Earliest time at which the next UDP send attempt may start.
-    next_send_allowed_at: Instant,
+    /// Earliest time at which the next UDP send attempt may start once the component is live.
+    ///
+    /// This stays unset until `on_start`, because timer-aligned time is only
+    /// available once the component has a live Kompact context.
+    next_send_allowed_at: Option<Instant>,
     /// Timer used to resume dispatch once `next_send_allowed_at` is reached.
     dispatch_timer: Option<ScheduledTimer>,
 }
@@ -294,7 +297,7 @@ impl OutboundDispatcherState {
             send_rate: UDPourSendRateControl::default(),
             queue: VecDeque::new(),
             dispatch_in_progress: false,
-            next_send_allowed_at: Instant::now(),
+            next_send_allowed_at: None,
             dispatch_timer: None,
         }
     }
@@ -373,6 +376,21 @@ impl UDPourComponent {
             socket_closed: false,
             poll_timer: None,
         }
+    }
+
+    fn now(&self) -> Instant {
+        self.ctx.system().now()
+    }
+
+    fn next_send_allowed_at(&self) -> Instant {
+        self.dispatcher.next_send_allowed_at.expect(
+            "dispatch pacing must be initialised in on_start before the UDPour runtime handles traffic",
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_waiting_for_dispatch_timer(&self) -> bool {
+        !self.dispatcher.dispatch_in_progress && self.dispatcher.dispatch_timer.is_some()
     }
 
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
@@ -468,9 +486,10 @@ impl UDPourComponent {
             self.clear_dispatch_timer();
             return;
         }
-        let now = Instant::now();
-        if now < self.dispatcher.next_send_allowed_at {
-            self.set_dispatch_timer(self.dispatcher.next_send_allowed_at - now);
+        let now = self.now();
+        let next_send_allowed_at = self.next_send_allowed_at();
+        if now < next_send_allowed_at {
+            self.set_dispatch_timer(next_send_allowed_at - now);
             return;
         }
 
@@ -536,7 +555,7 @@ impl UDPourComponent {
             async_self.pending_transmissions.insert(transmission_id, datagram);
             async_self.dispatcher.dispatch_in_progress = false;
             async_self.dispatcher.next_send_allowed_at =
-                Instant::now() + async_self.dispatcher.send_rate.send_delay;
+                Some(async_self.now() + async_self.dispatcher.send_rate.send_delay);
             async_self.udp_port.trigger(UdpRequest::Send {
                 socket_id,
                 transmission_id,
@@ -581,7 +600,7 @@ impl UDPourComponent {
             });
             return Handled::Ok;
         }
-        let now = Instant::now();
+        let now = self.now();
         match self.sender.start_transfer(send.payload, now) {
             Ok(SenderAction::SendPayloads { message_id, frames }) => {
                 self.outbound.insert(
@@ -642,7 +661,7 @@ impl UDPourComponent {
                 return Handled::Ok;
             }
         };
-        let now = Instant::now();
+        let now = self.now();
 
         match frame {
             UDPourFrame::Payload(frame) => match self.receiver.accept_payload(source, frame, now) {
@@ -712,7 +731,7 @@ impl UDPourComponent {
                     }
                     if report_sent {
                         self.sender
-                            .mark_initial_send_complete(message_id, Instant::now());
+                            .mark_initial_send_complete(message_id, self.now());
                     }
                     if let Some(promise) = promise {
                         let _ = promise.fulfil(UDPourSubmitResult::Sent);
@@ -729,10 +748,10 @@ impl UDPourComponent {
                     return Handled::Ok;
                 };
                 if reason == SendFailureReason::Backpressure {
-                    self.dispatcher.next_send_allowed_at = self
-                        .dispatcher
-                        .next_send_allowed_at
-                        .max(Instant::now() + self.dispatcher.send_rate.backpressure_retry_delay);
+                    self.dispatcher.next_send_allowed_at = Some(
+                        self.next_send_allowed_at()
+                            .max(self.now() + self.dispatcher.send_rate.backpressure_retry_delay),
+                    );
                     self.enqueue_front(pending);
                     return Handled::Ok;
                 }
@@ -867,7 +886,7 @@ impl UDPourComponent {
                 reason: reason.expect("submit promise can only be present when reporting failure"),
             });
         }
-        let Some(action) = self.sender.abort_transfer(message_id, Instant::now()) else {
+        let Some(action) = self.sender.abort_transfer(message_id, self.now()) else {
             return;
         };
         self.handle_sender_action(action, None);
@@ -896,7 +915,7 @@ impl UDPourComponent {
     }
 
     fn poll_runtime(&mut self) {
-        let now = Instant::now();
+        let now = self.now();
         for action in self.sender.poll_timeouts(now) {
             self.handle_sender_action(action, None);
         }
@@ -944,7 +963,7 @@ impl UDPourComponent {
 impl ComponentLifecycle for UDPourComponent {
     fn on_start(&mut self) -> Handled {
         self.dispatcher.send_rate = self.load_send_rate_control();
-        self.dispatcher.next_send_allowed_at = Instant::now();
+        self.dispatcher.next_send_allowed_at = Some(self.now());
         self.set_poll_timer();
         Handled::Ok
     }

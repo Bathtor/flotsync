@@ -1342,8 +1342,6 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 [[package]]
 name = "hierarchical_hash_wheel_timer"
 version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf653d57c559812a3d936bcb210700410c0d79c5e10fd222970d1b7d44b9defc"
 dependencies = [
  "crossbeam-channel",
  "rustc-hash 2.1.1",
@@ -1549,8 +1547,6 @@ dependencies = [
 [[package]]
 name = "kompact"
 version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72e53f2031095827a482438424a663c8ffb4fddce8b2cbe0eb1f7d19d8a95d72"
 dependencies = [
  "arc-swap",
  "as_num",
