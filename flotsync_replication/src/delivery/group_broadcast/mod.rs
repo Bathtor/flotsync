@@ -421,17 +421,15 @@ mod tests {
                 build_delivery_test_system,
                 default_udpour_config,
                 member_identity,
-                wait_for_transport_settle,
             },
         },
     };
     use bytes::Bytes;
-    use flotsync_io::test_support::{WAIT_TIMEOUT, start_component};
+    use flotsync_io::test_support::{WAIT_TIMEOUT, eventually, start_component};
     use std::{
         net::SocketAddr,
         sync::{Arc, mpsc},
-        thread,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
     #[derive(ComponentDefinition)]
@@ -537,7 +535,6 @@ mod tests {
             } else {
                 None
             };
-            wait_for_transport_settle();
 
             Self {
                 core,
@@ -570,20 +567,14 @@ mod tests {
                         routes: vec![route],
                     });
             });
-
-            let deadline = Instant::now() + FULL_STACK_WAIT_TIMEOUT;
-            loop {
-                if self
-                    .broadcast
-                    .on_definition(|component| component.knows_direct_route(&peer))
-                {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for group-broadcast route publication");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
+            eventually(
+                FULL_STACK_WAIT_TIMEOUT,
+                || {
+                    self.broadcast
+                        .on_definition(|component| component.knows_direct_route(&peer))
+                },
+                || "timed out waiting for group-broadcast route publication".to_owned(),
+            );
         }
 
         fn submit(&self, submit: GroupBroadcastSubmit) {
@@ -614,16 +605,11 @@ mod tests {
         }
 
         fn wait_for_known_submit(&self, message_id: MessageId) {
-            let deadline = Instant::now() + FULL_STACK_WAIT_TIMEOUT;
-            loop {
-                if self.knows_submit(message_id) {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for group-broadcast submit admission");
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
+            eventually(
+                FULL_STACK_WAIT_TIMEOUT,
+                || self.knows_submit(message_id),
+                || "timed out waiting for group-broadcast submit admission".to_owned(),
+            );
         }
     }
 

@@ -7,6 +7,8 @@ use crate::prelude::*;
 use kompact::{KompactLogger, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
 use std::{
+    cell::RefCell,
+    collections::VecDeque,
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{Arc, OnceLock, mpsc},
@@ -16,6 +18,9 @@ use std::{
 
 /// Shared timeout used by the crate's synchronous test wait helpers.
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Default poll cadence for eventually-style synchronous test waits.
+pub const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Installs the captured test logger once for both the `log` facade and Kompact's `slog` logger.
 pub fn init_test_logger() {
@@ -77,20 +82,90 @@ pub fn localhost(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
 
+/// Waits until `probe` returns one value or `timeout` elapses.
+pub fn eventually_value<T>(
+    timeout: Duration,
+    probe: impl FnMut() -> Option<T>,
+    failure_message: impl FnOnce() -> String,
+) -> T {
+    eventually_value_with_poll(timeout, EVENTUALLY_POLL_INTERVAL, probe, failure_message)
+}
+
+/// Waits until `probe` returns one value using the supplied poll cadence.
+pub fn eventually_value_with_poll<T>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut probe: impl FnMut() -> Option<T>,
+    failure_message: impl FnOnce() -> String,
+) -> T {
+    let deadline = Instant::now() + timeout;
+    let mut failure_message = Some(failure_message);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let failure_message = failure_message
+                .take()
+                .expect("eventually failure message must still be available");
+            panic!("{}", failure_message());
+        }
+
+        thread::sleep(deadline.saturating_duration_since(now).min(poll_interval));
+    }
+}
+
+/// Waits until `predicate` becomes true or `timeout` elapses.
+pub fn eventually(
+    timeout: Duration,
+    mut predicate: impl FnMut() -> bool,
+    failure_message: impl FnOnce() -> String,
+) {
+    eventually_value(timeout, || predicate().then_some(()), failure_message);
+}
+
+/// Asserts that `predicate` never becomes true during `duration`.
+pub fn assert_never(
+    duration: Duration,
+    mut predicate: impl FnMut() -> bool,
+    failure_message: impl FnOnce() -> String,
+) {
+    let deadline = Instant::now() + duration;
+    let mut failure_message = Some(failure_message);
+    loop {
+        if predicate() {
+            let failure_message = failure_message
+                .take()
+                .expect("negative assertion failure message must still be available");
+            panic!("{}", failure_message());
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+
+        thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(EVENTUALLY_POLL_INTERVAL),
+        );
+    }
+}
+
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].
 pub fn wait_for_driver_request<T>(mut request: DriverRequest<T>) -> T {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        match request.try_receive() {
-            Ok(Some(reply)) => return reply,
-            Ok(None) => {}
+    eventually_value(
+        WAIT_TIMEOUT,
+        || match request.try_receive() {
+            Ok(Some(reply)) => Some(reply),
+            Ok(None) => None,
             Err(error) => panic!("driver request failed: {error}"),
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for driver request reply");
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+        },
+        || "timed out waiting for driver request reply".to_owned(),
+    )
 }
 
 /// Waits for the next driver event matching `predicate`.
@@ -98,40 +173,35 @@ pub fn wait_for_driver_event(
     driver: &IoDriver,
     mut predicate: impl FnMut(&DriverEvent) -> bool,
 ) -> DriverEvent {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        match driver.try_next_event() {
-            Ok(Some(event)) if predicate(&event) => return event,
+    eventually_value(
+        WAIT_TIMEOUT,
+        || match driver.try_next_event() {
+            Ok(Some(event)) if predicate(&event) => Some(event),
             Ok(Some(other)) => {
                 log::debug!(
                     "ignoring unrelated driver event while waiting in integration test: {:?}",
                     other
                 );
+                None
             }
-            Ok(None) => {}
+            Ok(None) => None,
             Err(error) => panic!("driver event retrieval failed: {error}"),
-        }
-        if Instant::now() >= deadline {
-            panic!("timed out waiting for driver event");
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+        },
+        || "timed out waiting for driver event".to_owned(),
+    )
 }
 
 /// Asserts that no driver event arrives for `duration`.
 pub fn assert_no_driver_event(driver: &IoDriver, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    loop {
-        match driver.try_next_event() {
+    assert_never(
+        duration,
+        || match driver.try_next_event() {
             Ok(Some(event)) => panic!("unexpected driver event while expecting silence: {event:?}"),
-            Ok(None) => {}
+            Ok(None) => false,
             Err(error) => panic!("driver event retrieval failed: {error}"),
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(1));
-    }
+        },
+        || "unexpected driver event while expecting silence".to_owned(),
+    );
 }
 
 /// Receives until `predicate` selects a value.
@@ -166,6 +236,94 @@ where
         .kill_notify(component)
         .wait_timeout(WAIT_TIMEOUT)
         .expect("component kill");
+}
+
+/// Buffered synchronous receiver for test probes.
+///
+/// Some harnesses need to observe only one subset of events while preserving
+/// the rest for later assertions. This helper keeps unmatched events in a local
+/// deferred queue instead of dropping them.
+#[derive(Debug)]
+pub struct BufferedReceiver<T> {
+    receiver: mpsc::Receiver<T>,
+    deferred: RefCell<VecDeque<T>>,
+}
+
+impl<T> BufferedReceiver<T> {
+    /// Wraps one plain channel receiver with deferred-match support.
+    pub fn new(receiver: mpsc::Receiver<T>) -> Self {
+        Self {
+            receiver,
+            deferred: RefCell::new(VecDeque::new()),
+        }
+    }
+
+    fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
+        let mut deferred = self.deferred.borrow_mut();
+        let deferred_len = deferred.len();
+        for _ in 0..deferred_len {
+            let event = deferred
+                .pop_front()
+                .expect("deferred length was just measured");
+            if predicate(&event) {
+                return Some(event);
+            }
+            deferred.push_back(event);
+        }
+        None
+    }
+
+    /// Waits for the next event that satisfies `predicate`, preserving
+    /// unrelated events for later checks.
+    pub fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.take_deferred_match(&mut predicate) {
+                return event;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .receiver
+                .recv_timeout(remaining)
+                .expect("timed out waiting for buffered test event");
+            if predicate(&event) {
+                return event;
+            }
+            self.deferred.borrow_mut().push_back(event);
+        }
+    }
+
+    /// Asserts that no buffered or newly received event satisfies
+    /// `predicate` for the whole `duration`.
+    pub fn assert_no_match(&self, duration: Duration, mut predicate: impl FnMut(&T) -> bool) {
+        if self.deferred.borrow().iter().any(&mut predicate) {
+            panic!("unexpected buffered test event matched negative assertion");
+        }
+
+        let deadline = Instant::now() + duration;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+
+            let timeout = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(10));
+            let event = match self.receiver.recv_timeout(timeout) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("buffered test event sender disconnected unexpectedly")
+                }
+            };
+            if predicate(&event) {
+                panic!("unexpected test event matched negative assertion");
+            }
+            self.deferred.borrow_mut().push_back(event);
+        }
+    }
 }
 
 /// Test observer that forwards UDP indications to an `mpsc` channel.

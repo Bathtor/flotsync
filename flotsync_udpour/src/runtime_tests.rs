@@ -45,6 +45,7 @@ use flotsync_io::{
         UdpSendResult,
     },
     test_support::{
+        BufferedReceiver,
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
@@ -56,13 +57,11 @@ use flotsync_io::{
 use kompact::prelude::*;
 use roaring::RoaringBitmap;
 use std::{
-    cell::RefCell,
     cmp::Reverse,
-    collections::VecDeque,
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, mpsc},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -347,74 +346,6 @@ impl Actor for ScriptedUdpProxy {
 
     fn receive_network(&mut self, _msg: NetMessage) -> Handled {
         unimplemented!("ScriptedUdpProxy does not use network actor messages")
-    }
-}
-
-#[derive(Debug)]
-struct BufferedReceiver<T> {
-    receiver: mpsc::Receiver<T>,
-    deferred: RefCell<VecDeque<T>>,
-}
-
-impl<T> BufferedReceiver<T> {
-    fn new(receiver: mpsc::Receiver<T>) -> Self {
-        Self {
-            receiver,
-            deferred: RefCell::new(VecDeque::new()),
-        }
-    }
-
-    fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
-        let mut deferred = self.deferred.borrow_mut();
-        let deferred_len = deferred.len();
-        for _ in 0..deferred_len {
-            let event = deferred
-                .pop_front()
-                .expect("deferred length was just measured");
-            if predicate(&event) {
-                return Some(event);
-            }
-            deferred.push_back(event);
-        }
-        None
-    }
-
-    fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(event) = self.take_deferred_match(&mut predicate) {
-                return event;
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let event = self
-                .receiver
-                .recv_timeout(remaining)
-                .expect("timed out waiting for buffered test event");
-            if predicate(&event) {
-                return event;
-            }
-            self.deferred.borrow_mut().push_back(event);
-        }
-    }
-
-    fn assert_no_match(&self, duration: Duration, mut predicate: impl FnMut(&T) -> bool) {
-        if self.deferred.borrow().iter().any(&mut predicate) {
-            panic!("unexpected buffered test event matched negative assertion");
-        }
-
-        let deadline = Instant::now() + duration;
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout = remaining.min(Duration::from_millis(10));
-            let Ok(event) = self.receiver.recv_timeout(timeout) else {
-                continue;
-            };
-            if predicate(&event) {
-                panic!("unexpected test event matched negative assertion");
-            }
-            self.deferred.borrow_mut().push_back(event);
-        }
     }
 }
 

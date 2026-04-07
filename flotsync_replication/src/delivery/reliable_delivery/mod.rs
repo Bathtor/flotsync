@@ -1006,18 +1006,11 @@ mod tests {
                 build_delivery_test_system,
                 default_udpour_config,
                 member_identity,
-                wait_for_transport_settle,
             },
         },
     };
-    use flotsync_io::test_support::{WAIT_TIMEOUT, start_component};
-    use std::{
-        collections::HashSet,
-        net::SocketAddr,
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
+    use flotsync_io::test_support::{WAIT_TIMEOUT, eventually, start_component};
+    use std::{collections::HashSet, net::SocketAddr, sync::mpsc, time::Duration};
 
     #[derive(ComponentDefinition)]
     struct ReliableDeliveryClientProbe {
@@ -1109,7 +1102,6 @@ mod tests {
             start_component(core.system(), &client);
 
             let local_addr = bind_ephemeral_local_socket(&core, FULL_STACK_WAIT_TIMEOUT);
-            wait_for_transport_settle();
 
             Self {
                 core,
@@ -1162,45 +1154,44 @@ mod tests {
         }
 
         fn wait_for_sender_ack_observed(&self, message_id: MessageId) {
-            let deadline = Instant::now() + WAIT_TIMEOUT;
-            loop {
-                let observed = self.reliable.on_definition(|component| {
-                    component
-                        .sender_work_item(message_id)
-                        .is_some_and(|work_item| {
-                            matches!(work_item.recipient_ack, RecipientAckStatus::Observed { .. })
-                        })
-                });
-                if observed {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!(
+            eventually(
+                WAIT_TIMEOUT,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component
+                            .sender_work_item(message_id)
+                            .is_some_and(|work_item| {
+                                matches!(
+                                    work_item.recipient_ack,
+                                    RecipientAckStatus::Observed { .. }
+                                )
+                            })
+                    })
+                },
+                || {
+                    format!(
                         "timed out waiting for sender-side recipient ack observation for {message_id:?}"
-                    );
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
+                    )
+                },
+            );
         }
 
         fn wait_for_sender_route_state(&self, message_id: MessageId, expected: RouteActiveState) {
-            let deadline = Instant::now() + WAIT_TIMEOUT;
-            loop {
-                let matches_state = self.reliable.on_definition(|component| {
-                    component
-                        .sender_work_item(message_id)
-                        .is_some_and(|work_item| work_item.recipient_route.state == expected)
-                });
-                if matches_state {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!(
+            eventually(
+                WAIT_TIMEOUT,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component
+                            .sender_work_item(message_id)
+                            .is_some_and(|work_item| work_item.recipient_route.state == expected)
+                    })
+                },
+                || {
+                    format!(
                         "timed out waiting for sender-side route state {expected:?} for {message_id:?}"
-                    );
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
+                    )
+                },
+            );
         }
 
         fn wait_for_inbound_state(
@@ -1208,57 +1199,47 @@ mod tests {
             message_id: MessageId,
             expected: PendingInboundDeliveryState,
         ) {
-            let deadline = Instant::now() + WAIT_TIMEOUT;
-            loop {
-                let matches_state = self.reliable.on_definition(|component| {
-                    component.inbound_delivery_state(message_id) == Some(expected)
-                });
-                if matches_state {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for inbound state {expected:?} for {message_id:?}");
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
+            eventually(
+                WAIT_TIMEOUT,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component.inbound_delivery_state(message_id) == Some(expected)
+                    })
+                },
+                || format!("timed out waiting for inbound state {expected:?} for {message_id:?}"),
+            );
         }
 
         fn wait_for_inbound_clear(&self, message_id: MessageId) {
-            let deadline = Instant::now() + WAIT_TIMEOUT;
-            loop {
-                let cleared = self.reliable.on_definition(|component| {
-                    component.inbound_delivery_state(message_id).is_none()
-                });
-                if cleared {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!("timed out waiting for inbound delivery cleanup for {message_id:?}");
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
+            eventually(
+                WAIT_TIMEOUT,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component.inbound_delivery_state(message_id).is_none()
+                    })
+                },
+                || format!("timed out waiting for inbound delivery cleanup for {message_id:?}"),
+            );
         }
 
         fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: Bytes) {
-            let deadline = Instant::now() + WAIT_TIMEOUT;
-            loop {
-                let matches_payload = self.reliable.on_definition(|component| {
-                    component
-                        .sender_work_item(message_id)
-                        .is_some_and(|work_item| {
-                            work_item.submit.envelope.payload.ciphertext == expected
-                        })
-                });
-                if matches_payload {
-                    return;
-                }
-                if Instant::now() >= deadline {
-                    panic!(
+            eventually(
+                WAIT_TIMEOUT,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component
+                            .sender_work_item(message_id)
+                            .is_some_and(|work_item| {
+                                work_item.submit.envelope.payload.ciphertext == expected
+                            })
+                    })
+                },
+                || {
+                    format!(
                         "timed out waiting for sender-side ciphertext {expected:?} for {message_id}"
-                    );
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
+                    )
+                },
+            );
         }
     }
 

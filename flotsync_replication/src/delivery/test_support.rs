@@ -25,6 +25,7 @@ use flotsync_io::{
         UdpRequest,
     },
     test_support::{
+        BufferedReceiver,
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
@@ -35,84 +36,14 @@ use flotsync_io::{
 use flotsync_udpour::{ReceiverConfig, SenderConfig, UDPourConfig};
 use kompact::prelude::*;
 use std::{
-    cell::RefCell,
-    collections::VecDeque,
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, mpsc},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
-
-/// Short fixed delay used after opening an external socket in the test
-/// harnesses.
-///
-/// This is a known compromise until the route-transport bind path exposes a
-/// cleaner readiness signal or mockable time.
-pub(crate) const STARTUP_SETTLE_DELAY: Duration = Duration::from_millis(20);
 
 /// Longer timeout used by the semantic full-stack delivery tests.
 pub(crate) const FULL_STACK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Buffered synchronous receiver for test probes.
-///
-/// Some harnesses need to observe only one subset of events while preserving
-/// the rest for later assertions. This helper keeps unmatched events in a local
-/// deferred queue instead of dropping them.
-#[derive(Debug)]
-pub(crate) struct BufferedReceiver<T> {
-    receiver: mpsc::Receiver<T>,
-    deferred: RefCell<VecDeque<T>>,
-}
-
-impl<T> BufferedReceiver<T> {
-    /// Wrap one plain channel receiver with deferred-match support.
-    pub(crate) fn new(receiver: mpsc::Receiver<T>) -> Self {
-        Self {
-            receiver,
-            deferred: RefCell::new(VecDeque::new()),
-        }
-    }
-
-    fn take_deferred_match(&self, predicate: &mut impl FnMut(&T) -> bool) -> Option<T> {
-        let mut deferred = self.deferred.borrow_mut();
-        let deferred_len = deferred.len();
-        for _ in 0..deferred_len {
-            let event = deferred
-                .pop_front()
-                .expect("deferred length was just measured");
-            if predicate(&event) {
-                return Some(event);
-            }
-            deferred.push_back(event);
-        }
-        None
-    }
-
-    /// Wait for the next event that satisfies `predicate`, preserving
-    /// unrelated events for later checks.
-    pub(crate) fn recv_matching(
-        &self,
-        timeout: Duration,
-        mut predicate: impl FnMut(&T) -> bool,
-    ) -> T {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(event) = self.take_deferred_match(&mut predicate) {
-                return event;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let event = self
-                .receiver
-                .recv_timeout(remaining)
-                .expect("timed out waiting for buffered test event");
-            if predicate(&event) {
-                return event;
-            }
-            self.deferred.borrow_mut().push_back(event);
-        }
-    }
-}
 
 /// Minimal test-only discovery source that publishes route updates into one
 /// semantic owner.
@@ -350,10 +281,4 @@ pub(crate) fn bind_ephemeral_local_socket(
 ) -> SocketAddr {
     core.bind_external_socket(UdpLocalBind::Exact(localhost(0)), timeout)
         .1
-}
-
-/// Small convenience wrapper for the common route-transport startup settle
-/// delay used by the full-stack harnesses.
-pub(crate) fn wait_for_transport_settle() {
-    thread::sleep(STARTUP_SETTLE_DELAY);
 }
