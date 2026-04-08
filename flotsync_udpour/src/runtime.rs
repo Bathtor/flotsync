@@ -353,6 +353,25 @@ pub struct UDPourComponent {
     /// after the runtime has already failed every outstanding submit.
     socket_closed: bool,
     poll_timer: Option<ScheduledTimer>,
+    #[cfg(test)]
+    /// Logical deadline of the active poll timer, mirrored only for the
+    /// manual-time test harness.
+    next_poll_at: Option<Instant>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveTimerSnapshot {
+    pub(crate) handle: ScheduledTimer,
+    pub(crate) due_at: Instant,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeTimerSnapshot {
+    pub(crate) now: Instant,
+    pub(crate) dispatch_timer: Option<ActiveTimerSnapshot>,
+    pub(crate) poll_timer: Option<ActiveTimerSnapshot>,
 }
 
 impl UDPourComponent {
@@ -375,6 +394,8 @@ impl UDPourComponent {
             dispatcher: OutboundDispatcherState::new(),
             socket_closed: false,
             poll_timer: None,
+            #[cfg(test)]
+            next_poll_at: None,
         }
     }
 
@@ -391,6 +412,29 @@ impl UDPourComponent {
     #[cfg(test)]
     pub(crate) fn is_waiting_for_dispatch_timer(&self) -> bool {
         !self.dispatcher.dispatch_in_progress && self.dispatcher.dispatch_timer.is_some()
+    }
+
+    #[cfg(test)]
+    /// Returns the currently armed runtime timers together with the logical
+    /// `now()` seen by this component.
+    ///
+    /// The manual-time test harness uses this to wait for timer callbacks that
+    /// were already armed before one logical-time advance.
+    pub(crate) fn timer_snapshot(&self) -> RuntimeTimerSnapshot {
+        RuntimeTimerSnapshot {
+            now: self.now(),
+            dispatch_timer: self.dispatcher.dispatch_timer.clone().map(|handle| {
+                ActiveTimerSnapshot {
+                    handle,
+                    due_at: self.next_send_allowed_at(),
+                }
+            }),
+            poll_timer: self
+                .poll_timer
+                .clone()
+                .zip(self.next_poll_at)
+                .map(|(handle, due_at)| ActiveTimerSnapshot { handle, due_at }),
+        }
     }
 
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
@@ -936,6 +980,10 @@ impl UDPourComponent {
 
     fn set_poll_timer(&mut self) {
         self.clear_poll_timer();
+        #[cfg(test)]
+        {
+            self.next_poll_at = Some(self.now() + self.config.poll_interval);
+        }
         let timer = self.schedule_once(self.config.poll_interval, Self::handle_poll_timeout);
         self.poll_timer = Some(timer);
     }
@@ -943,6 +991,10 @@ impl UDPourComponent {
     fn clear_poll_timer(&mut self) {
         if let Some(timer) = self.poll_timer.take() {
             self.cancel_timer(timer);
+        }
+        #[cfg(test)]
+        {
+            self.next_poll_at = None;
         }
     }
 

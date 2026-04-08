@@ -4,6 +4,8 @@ use crate::{
     codec::{decode_frame, encode_frame},
     config_keys,
     runtime::{
+        ActiveTimerSnapshot,
+        RuntimeTimerSnapshot,
         UDPourComponent,
         UDPourComponentMessage,
         UDPourConfig,
@@ -49,6 +51,7 @@ use flotsync_io::{
         ReservedSocketKind,
         ReservedSocketLease,
         UdpObserver,
+        UdpObserverMessage,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
         build_test_kompact_system_with_manual_timer,
@@ -67,7 +70,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, mpsc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -100,6 +103,13 @@ struct TransferProbe {
     indications: mpsc::Sender<UDPourDeliver>,
 }
 
+#[derive(Debug)]
+enum TransferProbeMessage {
+    /// Completes once the probe has processed every mailbox item that was
+    /// queued before this barrier.
+    Barrier(KPromise<()>),
+}
+
 impl TransferProbe {
     fn new(indications: mpsc::Sender<UDPourDeliver>) -> Self {
         Self {
@@ -122,10 +132,15 @@ impl Require<UDPourPort> for TransferProbe {
 }
 
 impl Actor for TransferProbe {
-    type Message = Never;
+    type Message = TransferProbeMessage;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
-        unreachable!("Never type is empty")
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        match msg {
+            TransferProbeMessage::Barrier(promise) => {
+                let _ = promise.fulfil(());
+                Handled::Ok
+            }
+        }
     }
 
     fn receive_network(&mut self, _msg: NetMessage) -> Handled {
@@ -362,6 +377,7 @@ struct RuntimeHarness {
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     observer: Arc<Component<UdpObserver>>,
+    observer_ref: ActorRefStrong<UdpObserverMessage>,
     sender_proxy: Arc<Component<ScriptedUdpProxy>>,
     receiver_proxy: Arc<Component<ScriptedUdpProxy>>,
     sender_runtime: Arc<Component<UDPourComponent>>,
@@ -369,6 +385,7 @@ struct RuntimeHarness {
     sender_runtime_ref: ActorRefStrong<UDPourComponentMessage>,
     sender_probe: Arc<Component<TransferProbe>>,
     receiver_probe: Arc<Component<TransferProbe>>,
+    receiver_probe_ref: ActorRefStrong<TransferProbeMessage>,
     _bridge_to_observer: TwoWayChannel<UdpPort, IoBridge, UdpObserver>,
     _bridge_to_sender_proxy: TwoWayChannel<UdpPort, IoBridge, ScriptedUdpProxy>,
     _bridge_to_receiver_proxy: TwoWayChannel<UdpPort, IoBridge, ScriptedUdpProxy>,
@@ -488,6 +505,10 @@ impl RuntimeHarness {
 
         let (observer_tx, observer_rx) = mpsc::channel();
         let observer = system.create(move || UdpObserver::new(observer_tx));
+        let observer_ref = observer
+            .actor_ref()
+            .hold()
+            .expect("observer must expose a strong actor ref in tests");
         let bridge_to_observer = biconnect_components::<UdpPort, _, _>(&bridge, &observer)
             .expect("bridge/observer connection");
 
@@ -534,6 +555,10 @@ impl RuntimeHarness {
         let sender_probe = system.create(move || TransferProbe::new(sender_tx));
         let (receiver_tx, receiver_rx) = mpsc::channel();
         let receiver_probe = system.create(move || TransferProbe::new(receiver_tx));
+        let receiver_probe_ref = receiver_probe
+            .actor_ref()
+            .hold()
+            .expect("receiver probe must expose a strong actor ref in tests");
 
         let bridge_to_sender_proxy = biconnect_components::<UdpPort, _, _>(&bridge, &sender_proxy)
             .expect("bridge/sender_proxy connection");
@@ -567,6 +592,7 @@ impl RuntimeHarness {
             driver,
             bridge,
             observer,
+            observer_ref,
             sender_proxy,
             receiver_proxy,
             sender_runtime,
@@ -574,6 +600,7 @@ impl RuntimeHarness {
             sender_runtime_ref,
             sender_probe,
             receiver_probe,
+            receiver_probe_ref,
             _bridge_to_observer: bridge_to_observer,
             _bridge_to_sender_proxy: bridge_to_sender_proxy,
             _bridge_to_receiver_proxy: bridge_to_receiver_proxy,
@@ -595,6 +622,27 @@ impl RuntimeHarness {
             .as_ref()
             .expect("manual timer harness required for explicit time control")
             .advance_by(duration);
+    }
+
+    fn advance_time_and_process_due_timers(&self, duration: Duration) {
+        let sender_before = self
+            .sender_runtime
+            .on_definition(|component| component.timer_snapshot());
+        let receiver_before = self
+            .receiver_runtime
+            .on_definition(|component| component.timer_snapshot());
+        self.advance_time(duration);
+        self.wait_for_due_timers_to_process(&self.sender_runtime, sender_before, "sender");
+        self.wait_for_due_timers_to_process(&self.receiver_runtime, receiver_before, "receiver");
+        // This is intentionally scoped to timers that were already armed
+        // before the logical-time advance. The helper assumes the harness was
+        // otherwise settled before it was called.
+        //
+        // Once every previously due timer has changed, flush the observing
+        // probes so any resulting indication already emitted is guaranteed to
+        // be buffered before negative checks run.
+        self.flush_observer_probe();
+        self.flush_receiver_probe();
     }
 
     fn send(&self, payload: IoPayload) -> UDPourSubmitResult {
@@ -727,6 +775,57 @@ impl RuntimeHarness {
             |component| component.is_waiting_for_dispatch_timer(),
             "timed out waiting for sender dispatch timer to be armed",
         );
+    }
+
+    fn wait_for_due_timers_to_process(
+        &self,
+        component: &Arc<Component<UDPourComponent>>,
+        before: RuntimeTimerSnapshot,
+        component_name: &str,
+    ) {
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            component,
+            |component| {
+                let after = component.timer_snapshot();
+                Self::timer_processed(&before.dispatch_timer, &after.dispatch_timer, after.now)
+                    && Self::timer_processed(&before.poll_timer, &after.poll_timer, after.now)
+            },
+            format_args!(
+                "timed out waiting for {component_name} runtime to process timers due during manual-time advance"
+            ),
+        );
+    }
+
+    fn timer_processed(
+        before: &Option<ActiveTimerSnapshot>,
+        after: &Option<ActiveTimerSnapshot>,
+        now: Instant,
+    ) -> bool {
+        let Some(before) = before else {
+            return true;
+        };
+        if before.due_at > now {
+            return true;
+        }
+        !matches!(after, Some(after) if after.handle == before.handle)
+    }
+
+    fn flush_observer_probe(&self) {
+        let (promise, future) = promise::<()>();
+        self.observer_ref.tell(UdpObserverMessage::Barrier(promise));
+        future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for observer probe barrier");
+    }
+
+    fn flush_receiver_probe(&self) {
+        let (promise, future) = promise::<()>();
+        self.receiver_probe_ref
+            .tell(TransferProbeMessage::Barrier(promise));
+        future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for receiver probe barrier");
     }
 
     fn shutdown(self) {
@@ -1120,13 +1219,13 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     // This wait has to stay inside the current tombstone lifetime. It proves
     // that late shared-route repairs do not redeliver before duplicate
     // suppression expires.
-    harness.advance_time(Duration::from_millis(60));
-    harness.assert_no_receiver_deliver(Duration::from_millis(100));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(60));
+    harness.assert_no_receiver_deliver(Duration::ZERO);
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::Ack(_))
     });
 
-    harness.advance_time(Duration::from_millis(140));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(140));
 
     for (part_number, payload) in [
         (PartNumber(0), IoPayload::from_static(b"abcd")),
@@ -1176,12 +1275,10 @@ fn send_delay_and_window_pace_multipart_transmission() {
     // `send_delay`, the next payload part must not already be on the bridge
     // yet.
     harness.wait_for_sender_dispatch_timer();
-    harness.advance_time(Duration::from_millis(15));
-    harness.assert_no_bridge_frame(
-        harness.receiver_socket_id,
-        Duration::from_millis(100),
-        |frame| matches!(frame, UDPourFrame::Payload(_)),
-    );
+    harness.advance_time_and_process_due_timers(Duration::from_millis(15));
+    harness.assert_no_bridge_frame(harness.receiver_socket_id, Duration::ZERO, |frame| {
+        matches!(frame, UDPourFrame::Payload(_))
+    });
     harness.advance_time(Duration::from_millis(25));
 
     let second = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
@@ -1194,12 +1291,10 @@ fn send_delay_and_window_pace_multipart_transmission() {
     // The second gap proves the sender keeps pacing subsequent parts rather
     // than only delaying the initial burst.
     harness.wait_for_sender_dispatch_timer();
-    harness.advance_time(Duration::from_millis(15));
-    harness.assert_no_bridge_frame(
-        harness.receiver_socket_id,
-        Duration::from_millis(100),
-        |frame| matches!(frame, UDPourFrame::Payload(_)),
-    );
+    harness.advance_time_and_process_due_timers(Duration::from_millis(15));
+    harness.assert_no_bridge_frame(harness.receiver_socket_id, Duration::ZERO, |frame| {
+        matches!(frame, UDPourFrame::Payload(_))
+    });
     harness.advance_time(Duration::from_millis(25));
 
     let third = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {

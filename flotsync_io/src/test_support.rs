@@ -745,6 +745,14 @@ pub struct UdpObserver {
     indications: mpsc::Sender<UdpIndication>,
 }
 
+/// Local actor messages understood by [`UdpObserver`].
+#[derive(Debug)]
+pub enum UdpObserverMessage {
+    /// Completes once the observer has processed every mailbox item that was
+    /// queued before this barrier.
+    Barrier(KPromise<()>),
+}
+
 impl UdpObserver {
     /// Creates a new UDP observer.
     pub fn new(indications: mpsc::Sender<UdpIndication>) -> Self {
@@ -768,10 +776,15 @@ impl Require<UdpPort> for UdpObserver {
 }
 
 impl Actor for UdpObserver {
-    type Message = Never;
+    type Message = UdpObserverMessage;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
-        unreachable!("Never type is empty")
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        match msg {
+            UdpObserverMessage::Barrier(promise) => {
+                let _ = promise.fulfil(());
+                Handled::Ok
+            }
+        }
     }
 
     fn receive_network(&mut self, _msg: NetMessage) -> Handled {
