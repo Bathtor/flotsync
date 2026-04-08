@@ -1128,11 +1128,15 @@ mod tests {
         pool::PayloadWriter,
         prelude::{SocketId, UdpIndication, UdpLocalBind},
         test_support::{
+            ReservedSocketKind,
             WAIT_TIMEOUT,
+            bind_reserved_udp_socket,
             build_test_kompact_system_with,
+            enable_bind_reuse_address,
             eventually_component_state,
             eventually_value,
             localhost,
+            reserve_sockets,
         },
     };
     use flotsync_udpour::{
@@ -1145,7 +1149,7 @@ mod tests {
     use std::{
         cell::Cell,
         fmt::{self, Display},
-        net::{SocketAddr, UdpSocket},
+        net::SocketAddr,
         num::NonZeroUsize,
         time::Duration,
     };
@@ -1397,26 +1401,9 @@ mod tests {
             let _ = self
                 .core
                 .observer_rx()
-                .recv_matching(WAIT_TIMEOUT, |indication| {
-                    let UdpIndication::Received {
-                        socket_id: indicated_socket_id,
-                        payload,
-                        ..
-                    } = indication
-                    else {
-                        return false;
-                    };
-                    *indicated_socket_id == socket_id
-                        && payload.to_vec().first().copied() == Some(frame_type)
-                });
-        }
-
-        fn wait_for_bridge_payload_frames(&self, socket_id: SocketId, min_count: usize) {
-            for _ in 0..min_count {
-                let _ = self
-                    .core
-                    .observer_rx()
-                    .recv_matching(WAIT_TIMEOUT, |indication| {
+                .recv_matching_or_fail(
+                    WAIT_TIMEOUT,
+                    |indication| {
                         let UdpIndication::Received {
                             socket_id: indicated_socket_id,
                             payload,
@@ -1426,19 +1413,75 @@ mod tests {
                             return false;
                         };
                         *indicated_socket_id == socket_id
-                            && payload.to_vec().first().copied() == Some(0x01)
-                    });
+                            && payload.to_vec().first().copied() == Some(frame_type)
+                    },
+                    |indication| match indication {
+                        UdpIndication::BindFailed {
+                            request_id,
+                            local_addr,
+                            reason,
+                        } => Some(format!(
+                            "route-transport UDP bind request {request_id:?} failed at {local_addr} while waiting for frame type 0x{frame_type:02x}: {reason:?}"
+                        )),
+                        UdpIndication::Closed {
+                            socket_id: indicated_socket_id,
+                            remote_addr,
+                            reason,
+                        } if *indicated_socket_id == socket_id => Some(format!(
+                            "UDP socket {socket_id:?} closed while waiting for frame type 0x{frame_type:02x}: remote={remote_addr:?}, reason={reason:?}"
+                        )),
+                        _ => None,
+                    },
+                );
+        }
+
+        fn wait_for_bridge_payload_frames(&self, socket_id: SocketId, min_count: usize) {
+            for _ in 0..min_count {
+                let _ = self
+                    .core
+                    .observer_rx()
+                    .recv_matching_or_fail(
+                        WAIT_TIMEOUT,
+                        |indication| {
+                            let UdpIndication::Received {
+                                socket_id: indicated_socket_id,
+                                payload,
+                                ..
+                            } = indication
+                            else {
+                                return false;
+                            };
+                            *indicated_socket_id == socket_id
+                                && payload.to_vec().first().copied() == Some(0x01)
+                        },
+                        |indication| match indication {
+                            UdpIndication::BindFailed {
+                                request_id,
+                                local_addr,
+                                reason,
+                            } => Some(format!(
+                                "route-transport UDP bind request {request_id:?} failed at {local_addr} while waiting for payload frames on {socket_id:?}: {reason:?}"
+                            )),
+                            UdpIndication::Closed {
+                                socket_id: indicated_socket_id,
+                                remote_addr,
+                                reason,
+                            } if *indicated_socket_id == socket_id => Some(format!(
+                                "UDP socket {socket_id:?} closed while waiting for payload frames: remote={remote_addr:?}, reason={reason:?}"
+                            )),
+                            _ => None,
+                        },
+                    );
             }
         }
     }
 
     #[test]
     fn udp_manager_sends_payload_over_real_socket() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
-        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind raw UDP receiver");
+        let receiver_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let receiver =
+            bind_reserved_udp_socket(&receiver_lease, 0).expect("bind reserved raw UDP receiver");
         receiver
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set UDP read timeout");
@@ -1467,12 +1510,13 @@ mod tests {
 
     #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
-        let receiver1 = UdpSocket::bind("127.0.0.1:0").expect("bind first raw UDP receiver");
-        let receiver2 = UdpSocket::bind("127.0.0.1:0").expect("bind second raw UDP receiver");
+        let receiver_lease =
+            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+        let receiver1 = bind_reserved_udp_socket(&receiver_lease, 0)
+            .expect("bind first reserved raw UDP receiver");
+        let receiver2 = bind_reserved_udp_socket(&receiver_lease, 1)
+            .expect("bind second reserved raw UDP receiver");
         receiver1
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set first UDP read timeout");
@@ -1522,9 +1566,6 @@ mod tests {
 
     #[test]
     fn udp_manager_buffers_inbound_datagrams_while_socket_is_starting() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::new();
         let socket_id = SocketId(7);
         let socket_key = UdpSocketKey {
@@ -1575,9 +1616,6 @@ mod tests {
 
     #[test]
     fn udp_manager_starts_dormant_socket_on_first_inbound_udpour_message() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let receiver_harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
@@ -1626,9 +1664,6 @@ mod tests {
 
     #[test]
     fn udp_manager_restores_dormant_external_socket_after_activation_failure() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
@@ -1712,6 +1747,7 @@ mod tests {
         send_rate_control: TestSendRateControl,
     ) -> KompactSystem {
         build_test_kompact_system_with(|config| {
+            enable_bind_reuse_address(config);
             let activation_policy_value = match activation_policy {
                 UdpActivationPolicy::OnBind => 0usize,
                 UdpActivationPolicy::OnFirstUse => 1usize,

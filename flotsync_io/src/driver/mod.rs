@@ -87,6 +87,12 @@ pub struct DriverConfig {
     /// `None` means the driver blocks until either a registered resource becomes ready or the
     /// control-plane waker fires.
     pub poll_timeout: Option<Duration>,
+    /// Whether TCP listener and UDP bind paths should enable platform socket re-use options before
+    /// binding.
+    ///
+    /// This defaults to `false` because the shared driver should not change bind semantics unless
+    /// a caller explicitly opts into test-oriented external port reservation.
+    pub bind_reuse_address: bool,
 }
 
 impl Default for DriverConfig {
@@ -96,6 +102,7 @@ impl Default for DriverConfig {
             buffer_config: IoBufferConfig::default(),
             events_capacity: DEFAULT_EVENTS_CAPACITY,
             poll_timeout: None,
+            bind_reuse_address: false,
         }
     }
 }
@@ -104,6 +111,7 @@ impl Default for DriverConfig {
 pub(super) struct DriverThreadConfig {
     events_capacity: usize,
     poll_timeout: Option<Duration>,
+    bind_reuse_address: bool,
 }
 
 impl From<&DriverConfig> for DriverThreadConfig {
@@ -111,6 +119,7 @@ impl From<&DriverConfig> for DriverThreadConfig {
         Self {
             events_capacity: config.events_capacity,
             poll_timeout: config.poll_timeout,
+            bind_reuse_address: config.bind_reuse_address,
         }
     }
 }

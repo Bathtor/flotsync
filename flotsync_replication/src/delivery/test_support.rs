@@ -26,10 +26,14 @@ use flotsync_io::{
     },
     test_support::{
         BufferedReceiver,
+        ReservedSocketKind,
+        ReservedSocketLease,
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
+        enable_bind_reuse_address,
         eventually_component_state,
+        reserve_sockets,
         start_component,
     },
 };
@@ -91,6 +95,7 @@ impl Actor for DiscoveryRouteSource {
 /// harnesses layer ingress, probes, and route-discovery fixtures on top.
 pub(crate) struct TransportHarnessCore {
     system: KompactSystem,
+    external_socket_lease: ReservedSocketLease,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     manager: Arc<Component<RouteTransportManager>>,
@@ -105,6 +110,7 @@ impl TransportHarnessCore {
     /// The caller is responsible for connecting any semantic-owner ports before
     /// calling [`start`](Self::start).
     pub(crate) fn new(system: KompactSystem, udpour_config: UDPourConfig) -> Self {
+        let external_socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
         let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -122,6 +128,7 @@ impl TransportHarnessCore {
 
         Self {
             system,
+            external_socket_lease,
             driver,
             bridge,
             manager,
@@ -169,19 +176,38 @@ impl TransportHarnessCore {
         bind: UdpLocalBind,
         timeout: Duration,
     ) -> (SocketId, SocketAddr) {
+        let bind = match bind {
+            UdpLocalBind::Exact(addr) if addr.port() == 0 => {
+                UdpLocalBind::Exact(self.external_socket_lease.addr(0))
+            }
+            other => other,
+        };
         let request_id = UdpOpenRequestId::new();
         self.observer.on_definition(|component| {
             component.udp.trigger(UdpRequest::Bind { request_id, bind });
         });
-        match self.observer_rx.recv_matching(timeout, |event| {
-            matches!(
-                event,
-                UdpIndication::Bound {
+        match self.observer_rx.recv_matching_or_fail(
+            timeout,
+            |event| {
+                matches!(
+                    event,
+                    UdpIndication::Bound {
+                        request_id: indicated_request_id,
+                        ..
+                    } if *indicated_request_id == request_id
+                )
+            },
+            |event| match event {
+                UdpIndication::BindFailed {
                     request_id: indicated_request_id,
-                    ..
-                } if *indicated_request_id == request_id
-            )
-        }) {
+                    local_addr,
+                    reason,
+                } if *indicated_request_id == request_id => Some(format!(
+                    "external UDP socket bind failed for request {request_id:?} at {local_addr}: {reason:?}"
+                )),
+                _ => None,
+            },
+        ) {
             UdpIndication::Bound {
                 request_id: indicated_request_id,
                 socket_id,
@@ -214,9 +240,20 @@ impl TransportHarnessCore {
 
     /// Wait for the next UDP bind indication observed by the bridge observer.
     pub(crate) fn wait_for_new_bound_socket(&self, timeout: Duration) -> (SocketId, SocketAddr) {
-        match self.observer_rx.recv_matching(timeout, |event| {
-            matches!(event, UdpIndication::Bound { .. })
-        }) {
+        match self.observer_rx.recv_matching_or_fail(
+            timeout,
+            |event| matches!(event, UdpIndication::Bound { .. }),
+            |event| match event {
+                UdpIndication::BindFailed {
+                    request_id,
+                    local_addr,
+                    reason,
+                } => Some(format!(
+                    "route-transport UDP bind request {request_id:?} failed at {local_addr}: {reason:?}"
+                )),
+                _ => None,
+            },
+        ) {
             UdpIndication::Bound {
                 socket_id,
                 local_addr,
@@ -257,6 +294,7 @@ impl Drop for TransportHarnessCore {
 /// Build a Kompact system for the semantic delivery full-stack tests.
 pub(crate) fn build_delivery_test_system() -> KompactSystem {
     build_test_kompact_system_with(|config| {
+        enable_bind_reuse_address(config);
         config.load_config_str("flotsync.route-transport.udp-activation-policy = 1");
     })
 }

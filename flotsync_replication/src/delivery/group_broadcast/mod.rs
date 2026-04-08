@@ -655,9 +655,6 @@ mod tests {
 
     #[test]
     fn group_broadcast_fans_out_to_two_receivers_and_self() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let group_id = GroupId(Uuid::from_u128(1));
         let alice = member_identity(&["alice"]);
         let bob = member_identity(&["bob"]);
@@ -704,9 +701,6 @@ mod tests {
 
     #[test]
     fn suppress_self_delivery_keeps_remote_fanout() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let group_id = GroupId(Uuid::from_u128(11));
         let alice = member_identity(&["alice"]);
         let bob = member_identity(&["bob"]);
@@ -751,9 +745,6 @@ mod tests {
 
     #[test]
     fn currently_unreachable_member_is_dropped_without_retry_state() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let group_id = GroupId(Uuid::from_u128(21));
         let alice = member_identity(&["alice"]);
         let bob = member_identity(&["bob"]);

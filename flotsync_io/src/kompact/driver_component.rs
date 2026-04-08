@@ -16,12 +16,13 @@ use crate::{
         UdpCommand,
         UdpEvent,
     },
+    config_keys,
     driver::{DriverCommand, DriverConfig, DriverEvent, DriverEventSink, IoDriver},
     errors::{Error, Result},
     logging::erased_runtime_logger,
     pool::{EgressPool, IoBufferPools},
 };
-use ::kompact::prelude::*;
+use ::kompact::{config::HoconExt, prelude::*};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 /// Internal mailbox for the shared Kompact driver component.
@@ -889,8 +890,24 @@ impl ComponentLifecycle for IoDriverComponent {
             .expect("IoDriverComponent must be live during startup");
         let sink: Arc<dyn DriverEventSink> = Arc::new(ActorBackedDriverEventSink { target: actor });
         let logger = erased_runtime_logger(self.log());
+        let bind_reuse_address = match self
+            .ctx
+            .config()
+            .get_or_default(&config_keys::BIND_REUSE_ADDRESS)
+        {
+            Ok(bind_reuse_address) => bind_reuse_address,
+            Err(error) => {
+                error!(
+                    self.log(),
+                    "failed to load flotsync_io bind reuse config: {}", error
+                );
+                return Handled::DieNow;
+            }
+        };
+        let mut config = self.config.clone();
+        config.bind_reuse_address = config.bind_reuse_address || bind_reuse_address;
         match IoDriver::start_with_logger_buffers_and_event_sink(
-            self.config.clone(),
+            config,
             logger,
             self.buffers.clone(),
             sink,

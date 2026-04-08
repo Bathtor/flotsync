@@ -3,16 +3,21 @@
 //! This module is public behind the `test-support` feature so other crates can reuse the same
 //! probes, wait helpers, and captured logging setup that the crate's own tests use.
 
-use crate::prelude::*;
+use crate::{
+    config_keys,
+    prelude::*,
+    socket_support::{configure_bind_reuse, socket_domain},
+};
 use kompact::{KompactLogger, default_components::install_manual_timer, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
+use socket2::{Protocol, SockAddr, Socket, Type};
 use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt::{Debug, Display},
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::{Arc, OnceLock, mpsc},
+    sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +27,121 @@ pub const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default poll cadence for eventually-style synchronous test waits.
 pub const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Retry cadence for the reserved-socket broker while waiting for the OS to
+/// make more loopback sockets available.
+pub const RESERVED_SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Maximum time one test will wait for its full reserved-socket request before
+/// failing.
+pub const RESERVED_SOCKET_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One socket kind that the reserved-socket broker can hold on behalf of one
+/// test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservedSocketKind {
+    TcpListener,
+    UdpSocket,
+}
+
+/// Lease over one reserved-socket request.
+///
+/// Each entry keeps one live reservation socket open for the whole test so the
+/// OS continues to account for that port while the actual driver, bridge, or
+/// child process binds against the same address with the test-only re-use
+/// option enabled.
+#[derive(Debug)]
+pub struct ReservedSocketLease {
+    reserved: Vec<ReservedSocket>,
+}
+
+impl ReservedSocketLease {
+    /// Returns the reserved socket address at `index`.
+    pub fn addr(&self, index: usize) -> SocketAddr {
+        self.reserved[index].addr
+    }
+
+    /// Returns the reserved socket kind at `index`.
+    pub fn kind(&self, index: usize) -> ReservedSocketKind {
+        self.reserved[index].kind
+    }
+
+    /// Returns how many reserved sockets this lease holds.
+    pub fn len(&self) -> usize {
+        self.reserved.len()
+    }
+
+    /// Returns whether this lease holds no reserved sockets.
+    pub fn is_empty(&self) -> bool {
+        self.reserved.is_empty()
+    }
+}
+
+impl Drop for ReservedSocketLease {
+    fn drop(&mut self) {
+        RESERVED_SOCKET_BROKER.release(std::mem::take(&mut self.reserved));
+    }
+}
+
+/// Reserves one ordered set of socket addresses for the duration of one test.
+///
+/// This broker is currently process-local. It can still deadlock across test
+/// executables if multiple processes each hold partial reservations while
+/// waiting for more sockets. We intentionally keep the first cut simple and
+/// rely on the OS as the only global coordinator for now.
+pub fn reserve_sockets(kinds: &[ReservedSocketKind]) -> ReservedSocketLease {
+    RESERVED_SOCKET_BROKER.reserve(kinds)
+}
+
+/// Enables the `flotsync_io` test-only bind re-use mode on one Kompact config.
+pub fn enable_bind_reuse_address(config: &mut KompactConfig) {
+    config.set_config_value(&config_keys::BIND_REUSE_ADDRESS, true);
+}
+
+/// Binds one blocking `TcpListener` at the reserved address held by `lease`.
+pub fn bind_reserved_tcp_listener(
+    lease: &ReservedSocketLease,
+    index: usize,
+) -> io::Result<std::net::TcpListener> {
+    let reserved = &lease.reserved[index];
+    assert_eq!(
+        reserved.kind,
+        ReservedSocketKind::TcpListener,
+        "reserved socket {index} is not a TCP listener reservation"
+    );
+
+    let socket = Socket::new(
+        socket_domain(reserved.addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
+    configure_bind_reuse(&socket)?;
+    socket.bind(&SockAddr::from(reserved.addr))?;
+    socket.listen(128)?;
+    Ok(socket.into())
+}
+
+/// Binds one blocking `UdpSocket` at the reserved address held by `lease`.
+pub fn bind_reserved_udp_socket(
+    lease: &ReservedSocketLease,
+    index: usize,
+) -> io::Result<std::net::UdpSocket> {
+    let reserved = &lease.reserved[index];
+    assert_eq!(
+        reserved.kind,
+        ReservedSocketKind::UdpSocket,
+        "reserved socket {index} is not a UDP socket reservation"
+    );
+
+    let socket = Socket::new(
+        socket_domain(reserved.addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+    configure_bind_reuse(&socket)?;
+    socket.bind(&SockAddr::from(reserved.addr))?;
+    Ok(socket.into())
+}
 
 /// Installs the captured test logger once for both the `log` facade and Kompact's `slog` logger.
 pub fn init_test_logger() {
@@ -90,6 +210,201 @@ fn captured_kompact_logger() -> KompactLogger {
             })
         ),
     )
+}
+
+/// Process-local broker for reservation sockets used by one test binary.
+static RESERVED_SOCKET_BROKER: LazyLock<ReservedSocketBroker> =
+    LazyLock::new(ReservedSocketBroker::new);
+
+/// Coordinates process-local socket reservations across concurrently running
+/// tests.
+///
+/// The broker keeps live reservation sockets open until the corresponding
+/// lease is dropped. That means the OS continues to account for those ports
+/// while the real driver, bridge, or child process binds the same address with
+/// the test-only re-use option enabled.
+#[derive(Debug)]
+struct ReservedSocketBroker {
+    state: Mutex<ReservedSocketBrokerState>,
+    changed: Condvar,
+}
+
+impl ReservedSocketBroker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ReservedSocketBrokerState::default()),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn reserve(&self, kinds: &[ReservedSocketKind]) -> ReservedSocketLease {
+        let requested_tcp = kinds
+            .iter()
+            .filter(|kind| matches!(kind, ReservedSocketKind::TcpListener))
+            .count();
+        let requested_udp = kinds
+            .iter()
+            .filter(|kind| matches!(kind, ReservedSocketKind::UdpSocket))
+            .count();
+        let deadline = Instant::now() + RESERVED_SOCKET_ACQUIRE_TIMEOUT;
+        let mut state = self
+            .state
+            .lock()
+            .expect("reserved-socket broker state lock");
+        state.waiting_tcp += requested_tcp;
+        state.waiting_udp += requested_udp;
+
+        // Each caller declares its full socket requirement up front. That keeps
+        // the process-local broker free of hold-and-wait deadlocks.
+        'wait_for_request: loop {
+            let mut acquired = Vec::with_capacity(kinds.len());
+            let mut failure = None;
+
+            'acquire_requested_kinds: for kind in kinds.iter().copied() {
+                if let Some(reserved) = state.take_idle(kind) {
+                    acquired.push(reserved);
+                    continue;
+                }
+
+                match ReservedSocket::open(kind) {
+                    Ok(reserved) => acquired.push(reserved),
+                    Err(error) => {
+                        failure = Some(error);
+                        break 'acquire_requested_kinds;
+                    }
+                }
+            }
+
+            if let Some(error) = failure {
+                // If one requested kind cannot be acquired yet, hand back any
+                // partial progress before waiting again. Otherwise one blocked
+                // test could hoard enough sockets to starve the next request.
+                for reserved in acquired {
+                    state.reclaim_idle(reserved);
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    state.waiting_tcp -= requested_tcp;
+                    state.waiting_udp -= requested_udp;
+                    state.trim_idle_to_waiting();
+                    panic!(
+                        "timed out waiting to reserve {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {error}"
+                    );
+                }
+                let wait = deadline
+                    .saturating_duration_since(now)
+                    .min(RESERVED_SOCKET_RETRY_INTERVAL);
+                let (next_state, _) = self
+                    .changed
+                    .wait_timeout(state, wait)
+                    .expect("reserved-socket broker condvar wait");
+                state = next_state;
+                continue 'wait_for_request;
+            }
+
+            state.waiting_tcp -= requested_tcp;
+            state.waiting_udp -= requested_udp;
+            state.trim_idle_to_waiting();
+            return ReservedSocketLease { reserved: acquired };
+        }
+    }
+
+    fn release(&self, reserved: Vec<ReservedSocket>) {
+        if reserved.is_empty() {
+            return;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("reserved-socket broker state lock");
+        for reserved in reserved {
+            state.reclaim_idle(reserved);
+        }
+        state.trim_idle_to_waiting();
+        self.changed.notify_all();
+    }
+}
+
+/// Mutable broker state guarded by [`ReservedSocketBroker::state`].
+///
+/// `waiting_*` tracks how much unsatisfied demand currently exists across
+/// blocked callers. Idle pools are trimmed back to those counts so one process
+/// does not keep more ports reserved than any current waiter still needs.
+#[derive(Debug, Default)]
+struct ReservedSocketBrokerState {
+    idle_tcp: Vec<ReservedSocket>,
+    idle_udp: Vec<ReservedSocket>,
+    waiting_tcp: usize,
+    waiting_udp: usize,
+}
+
+impl ReservedSocketBrokerState {
+    fn take_idle(&mut self, kind: ReservedSocketKind) -> Option<ReservedSocket> {
+        match kind {
+            ReservedSocketKind::TcpListener => self.idle_tcp.pop(),
+            ReservedSocketKind::UdpSocket => self.idle_udp.pop(),
+        }
+    }
+
+    fn reclaim_idle(&mut self, reserved: ReservedSocket) {
+        let idle = match reserved.kind {
+            ReservedSocketKind::TcpListener => &mut self.idle_tcp,
+            ReservedSocketKind::UdpSocket => &mut self.idle_udp,
+        };
+        let waiting = match reserved.kind {
+            ReservedSocketKind::TcpListener => self.waiting_tcp,
+            ReservedSocketKind::UdpSocket => self.waiting_udp,
+        };
+        if idle.len() < waiting {
+            idle.push(reserved);
+        }
+    }
+
+    fn trim_idle_to_waiting(&mut self) {
+        self.idle_tcp.truncate(self.waiting_tcp);
+        self.idle_udp.truncate(self.waiting_udp);
+    }
+}
+
+/// One live reservation socket held on behalf of one test.
+///
+/// `_socket` is intentionally never used directly after construction. Its only
+/// job is to keep the reserved port allocated until the owning lease is
+/// dropped.
+#[derive(Debug)]
+struct ReservedSocket {
+    kind: ReservedSocketKind,
+    addr: SocketAddr,
+    _socket: Socket,
+}
+
+impl ReservedSocket {
+    fn open(kind: ReservedSocketKind) -> io::Result<Self> {
+        let socket = match kind {
+            ReservedSocketKind::TcpListener => Socket::new(
+                socket_domain(localhost(0)),
+                Type::STREAM,
+                Some(Protocol::TCP),
+            )?,
+            ReservedSocketKind::UdpSocket => Socket::new(
+                socket_domain(localhost(0)),
+                Type::DGRAM,
+                Some(Protocol::UDP),
+            )?,
+        };
+        configure_bind_reuse(&socket)?;
+        socket.bind(&SockAddr::from(localhost(0)))?;
+        let addr = socket
+            .local_addr()?
+            .as_socket()
+            .expect("reserved test socket must use an IP socket address");
+        Ok(Self {
+            kind,
+            addr,
+            _socket: socket,
+        })
+    }
 }
 
 /// Returns the loopback address for the supplied port.
@@ -302,6 +617,28 @@ impl<T> BufferedReceiver<T> {
         None
     }
 
+    fn take_deferred_match_or_failure(
+        &self,
+        predicate: &mut impl FnMut(&T) -> bool,
+        fail_fast: &mut impl FnMut(&T) -> Option<String>,
+    ) -> Result<Option<T>, String> {
+        let mut deferred = self.deferred.borrow_mut();
+        let deferred_len = deferred.len();
+        for _ in 0..deferred_len {
+            let event = deferred
+                .pop_front()
+                .expect("deferred length was just measured");
+            if let Some(message) = fail_fast(&event) {
+                return Err(message);
+            }
+            if predicate(&event) {
+                return Ok(Some(event));
+            }
+            deferred.push_back(event);
+        }
+        Ok(None)
+    }
+
     /// Waits for the next event that satisfies `predicate`, preserving
     /// unrelated events for later checks.
     pub fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
@@ -316,6 +653,38 @@ impl<T> BufferedReceiver<T> {
                 .receiver
                 .recv_timeout(remaining)
                 .expect("timed out waiting for buffered test event");
+            if predicate(&event) {
+                return event;
+            }
+            self.deferred.borrow_mut().push_back(event);
+        }
+    }
+
+    /// Waits for the next event that satisfies `predicate`, but aborts early
+    /// if `fail_fast` identifies one event that proves the expected state
+    /// transition cannot happen anymore.
+    pub fn recv_matching_or_fail(
+        &self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&T) -> bool,
+        mut fail_fast: impl FnMut(&T) -> Option<String>,
+    ) -> T {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.take_deferred_match_or_failure(&mut predicate, &mut fail_fast) {
+                Ok(Some(event)) => return event,
+                Ok(None) => {}
+                Err(message) => panic!("{message}"),
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .receiver
+                .recv_timeout(remaining)
+                .expect("timed out waiting for buffered test event");
+            if let Some(message) = fail_fast(&event) {
+                panic!("{message}");
+            }
             if predicate(&event) {
                 return event;
             }

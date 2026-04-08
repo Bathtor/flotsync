@@ -10,12 +10,6 @@
 //! direct group broadcast and reliable delivery. Relay, mailbox, and durable
 //! queue integration remain follow-up work.
 
-// TODO(flotsync-t0a): Replace this crate-local mutex with the chosen
-// cross-crate socket-test serialisation mechanism.
-#[cfg(test)]
-pub(crate) static FULL_STACK_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
 pub mod contracts;
 pub mod group_broadcast;
 pub mod ingress;

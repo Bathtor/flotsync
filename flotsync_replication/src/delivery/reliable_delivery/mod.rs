@@ -1264,9 +1264,6 @@ mod tests {
 
     #[test]
     fn reliable_delivery_round_trips_direct_envelope_and_processed_ack() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let alice = member_identity(&["alice"]);
         let bob = member_identity(&["bob"]);
         let sender = FullStackHarness::new(alice.clone());
@@ -1306,9 +1303,6 @@ mod tests {
 
     #[test]
     fn retry_queue_keeps_overdue_entries_ready_after_timer_reset() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut queue = RetryQueue::new();
         let first = RetryKey::Sender(MessageId(Uuid::from_u128(1)));
         let second = RetryKey::InboundAck(MessageId(Uuid::from_u128(2)));
@@ -1325,9 +1319,6 @@ mod tests {
 
     #[test]
     fn duplicate_submit_keeps_the_original_work_item() {
-        let _full_stack_test_guard = crate::delivery::FULL_STACK_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let alice = member_identity(&["alice"]);
         let bob = member_identity(&["bob"]);
         let sender = FullStackHarness::new(alice.clone());

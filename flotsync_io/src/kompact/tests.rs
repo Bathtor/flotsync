@@ -2,6 +2,7 @@ use super::{
     IoBridge,
     IoBridgeHandle,
     IoDriverComponent,
+    OpenFailureReason,
     OpenTcpListener,
     OpenTcpSession,
     TcpListenerEvent,
@@ -16,25 +17,32 @@ use super::{
 use crate::{
     api::{CloseReason, IoPayload, TransmissionId, UdpLocalBind, UdpSocketOption},
     driver::DriverConfig,
+    socket_support::configure_bind_reuse,
     test_support::{
+        ReservedSocketKind,
         TcpListenerEventProbe,
         TcpSessionEventProbe,
         UdpObserver,
         UdpSendResultProbe,
         WAIT_TIMEOUT,
+        bind_reserved_tcp_listener,
         build_test_kompact_system,
+        build_test_kompact_system_with,
+        enable_bind_reuse_address,
         init_test_logger,
         kill_component,
         localhost,
         recv_until,
+        reserve_sockets,
         start_component,
     },
 };
 use ::kompact::prelude::*;
 use bytes::Bytes;
+use socket2::{Protocol, SockAddr, Socket, Type};
 use std::{
     io::{Read, Write},
-    net::{Ipv4Addr, TcpListener},
+    net::SocketAddr,
     sync::mpsc,
     thread,
     time::Duration,
@@ -48,6 +56,44 @@ struct TaggedSessionEvent {
 
 fn wrap_tagged_session_event(tag: usize, event: TcpSessionEvent) -> TaggedSessionEvent {
     TaggedSessionEvent { tag, event }
+}
+
+fn hold_reusable_tcp_reservation() -> (Socket, SocketAddr) {
+    let socket = Socket::new(
+        crate::socket_support::socket_domain(localhost(0)),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )
+    .expect("create reusable TCP reservation socket");
+    configure_bind_reuse(&socket).expect("enable TCP re-use on reservation socket");
+    socket
+        .bind(&SockAddr::from(localhost(0)))
+        .expect("bind reusable TCP reservation socket");
+    let local_addr = socket
+        .local_addr()
+        .expect("TCP reservation local addr")
+        .as_socket()
+        .expect("TCP reservation must use an IP socket address");
+    (socket, local_addr)
+}
+
+fn hold_reusable_udp_reservation() -> (Socket, SocketAddr) {
+    let socket = Socket::new(
+        crate::socket_support::socket_domain(localhost(0)),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )
+    .expect("create reusable UDP reservation socket");
+    configure_bind_reuse(&socket).expect("enable UDP re-use on reservation socket");
+    socket
+        .bind(&SockAddr::from(localhost(0)))
+        .expect("bind reusable UDP reservation socket");
+    let local_addr = socket
+        .local_addr()
+        .expect("UDP reservation local addr")
+        .as_socket()
+        .expect("UDP reservation must use an IP socket address");
+    (socket, local_addr)
 }
 
 #[derive(ComponentDefinition)]
@@ -83,10 +129,181 @@ impl Actor for TaggedSessionEventProbe {
 }
 
 #[test]
+fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
+    init_test_logger();
+
+    let (_reservation, reserved_addr) = hold_reusable_udp_reservation();
+
+    let system = build_test_kompact_system();
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (observer_tx, observer_rx) = mpsc::channel();
+    let observer = system.create(move || UdpObserver::new(observer_tx));
+    let _bridge_to_observer =
+        biconnect_components::<UdpPort, _, _>(&bridge, &observer).expect("bridge/observer");
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &observer);
+
+    let request_id = UdpOpenRequestId::new();
+    observer.on_definition(|component| {
+        component.udp.trigger(UdpRequest::Bind {
+            request_id,
+            bind: UdpLocalBind::Exact(reserved_addr),
+        });
+    });
+    match recv_until(&observer_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Bound { request_id: event_request_id, .. }
+                | UdpIndication::BindFailed { request_id: event_request_id, .. }
+                if *event_request_id == request_id
+        )
+    }) {
+        UdpIndication::BindFailed {
+            request_id: failed_request_id,
+            local_addr,
+            ..
+        } => {
+            assert_eq!(failed_request_id, request_id);
+            assert_eq!(local_addr, reserved_addr);
+        }
+        other => panic!("reserved UDP bind without reuse config unexpectedly produced {other:?}"),
+    }
+
+    kill_component(&system, observer);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (observer_tx, observer_rx) = mpsc::channel();
+    let observer = system.create(move || UdpObserver::new(observer_tx));
+    let _bridge_to_observer =
+        biconnect_components::<UdpPort, _, _>(&bridge, &observer).expect("bridge/observer");
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &observer);
+
+    let request_id = UdpOpenRequestId::new();
+    observer.on_definition(|component| {
+        component.udp.trigger(UdpRequest::Bind {
+            request_id,
+            bind: UdpLocalBind::Exact(reserved_addr),
+        });
+    });
+    match recv_until(&observer_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Bound { request_id: event_request_id, .. }
+                | UdpIndication::BindFailed { request_id: event_request_id, .. }
+                if *event_request_id == request_id
+        )
+    }) {
+        UdpIndication::Bound {
+            request_id: bound_request_id,
+            local_addr,
+            ..
+        } => {
+            assert_eq!(bound_request_id, request_id);
+            assert_eq!(local_addr, reserved_addr);
+        }
+        other => panic!("reserved UDP bind with reuse config unexpectedly produced {other:?}"),
+    }
+
+    kill_component(&system, observer);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
+fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
+    init_test_logger();
+
+    let (_reservation, reserved_addr) = hold_reusable_tcp_reservation();
+
+    let system = build_test_kompact_system();
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (listener_tx, _listener_rx) = mpsc::channel();
+    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_tx));
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &listener_probe);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let open_result = bridge_handle
+        .open_tcp_listener(OpenTcpListener {
+            local_addr: reserved_addr,
+            incoming_to: listener_probe.actor_ref().recipient(),
+        })
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("open TCP listener future")
+        .expect_err("reserved TCP port should fail without reuse config");
+    assert!(matches!(open_result, OpenFailureReason::Io(_)));
+
+    drop(bridge_handle);
+    kill_component(&system, listener_probe);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (listener_tx, listener_rx) = mpsc::channel();
+    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_tx));
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &listener_probe);
+
+    let bridge_handle = IoBridgeHandle::from_component(&bridge);
+    let opened_listener = bridge_handle
+        .open_tcp_listener(OpenTcpListener {
+            local_addr: reserved_addr,
+            incoming_to: listener_probe.actor_ref().recipient(),
+        })
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("open TCP listener future")
+        .expect("reserved TCP port should open with reuse config");
+    assert_eq!(opened_listener.local_addr, reserved_addr);
+
+    opened_listener
+        .listener
+        .tell(super::TcpListenerRequest::Close);
+    match recv_until(&listener_rx, |event| {
+        matches!(event, TcpListenerEvent::Closed)
+    }) {
+        TcpListenerEvent::Closed => {}
+        other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
+    }
+
+    drop(opened_listener);
+    drop(bridge_handle);
+    kill_component(&system, listener_probe);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().expect("Kompact shutdown");
+}
+
+#[test]
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let socket_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -119,7 +336,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id: receiver_request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(0)),
         });
     });
     let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
@@ -166,7 +383,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id: sender_request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(1)),
         });
     });
     let sender_id = match recv_until(&observer1_rx, |event| {
@@ -283,7 +500,8 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
 fn udp_bridge_broadcasts_socket_configuration_indications() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -309,7 +527,7 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(0)),
         });
     });
     let socket_id = match recv_until(&observer1_rx, |event| {
@@ -400,7 +618,9 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
 fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     init_test_logger();
 
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind TCP listener");
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener =
+        bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
     let remote_addr = listener.local_addr().expect("listener address");
     let (server_tx, server_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -498,7 +718,8 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
 fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -515,7 +736,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
     let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
-            local_addr: localhost(0),
+            local_addr: listener_lease.addr(0),
             incoming_to: listener_probe.actor_ref().recipient(),
         })
         .wait_timeout(WAIT_TIMEOUT)
@@ -593,7 +814,8 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -610,7 +832,7 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
     let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
-            local_addr: localhost(0),
+            local_addr: listener_lease.addr(0),
             incoming_to: listener_probe.actor_ref().recipient(),
         })
         .wait_timeout(WAIT_TIMEOUT)
@@ -687,7 +909,8 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
 fn dropping_pending_tcp_session_rejects_the_connection() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -701,7 +924,7 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
     let bridge_handle = IoBridgeHandle::from_component(&bridge);
     let opened_listener = bridge_handle
         .open_tcp_listener(OpenTcpListener {
-            local_addr: localhost(0),
+            local_addr: listener_lease.addr(0),
             incoming_to: listener_probe.actor_ref().recipient(),
         })
         .wait_timeout(WAIT_TIMEOUT)

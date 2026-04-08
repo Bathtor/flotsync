@@ -46,13 +46,17 @@ use flotsync_io::{
     },
     test_support::{
         BufferedReceiver,
+        ReservedSocketKind,
+        ReservedSocketLease,
         UdpObserver,
         WAIT_TIMEOUT,
         build_test_kompact_system_with,
         build_test_kompact_system_with_manual_timer,
+        enable_bind_reuse_address,
         eventually_component_state,
         kill_component,
         localhost,
+        reserve_sockets,
         start_component,
     },
 };
@@ -354,6 +358,7 @@ impl Actor for ScriptedUdpProxy {
 struct RuntimeHarness {
     system: KompactSystem,
     manual_timer: Option<KompactManualTimer>,
+    _socket_lease: ReservedSocketLease,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     observer: Arc<Component<UdpObserver>>,
@@ -472,6 +477,8 @@ impl RuntimeHarness {
     ) -> Self {
         let (system, manual_timer) =
             build_runtime_test_kompact_system(send_rate_control, manual_time);
+        let socket_lease =
+            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
 
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
@@ -489,8 +496,10 @@ impl RuntimeHarness {
         start_component(&system, &observer);
 
         let observer_rx = BufferedReceiver::new(observer_rx);
-        let (sender_socket_id, sender_addr) = bind_socket(&observer, &observer_rx);
-        let (receiver_socket_id, receiver_addr) = bind_socket(&observer, &observer_rx);
+        let (sender_socket_id, sender_addr) =
+            bind_socket(&observer, &observer_rx, socket_lease.addr(0));
+        let (receiver_socket_id, receiver_addr) =
+            bind_socket(&observer, &observer_rx, socket_lease.addr(1));
 
         let config = UDPourConfig::new(sender_config, receiver_config).unwrap();
         let sender_proxy = system.create(move || {
@@ -554,6 +563,7 @@ impl RuntimeHarness {
         Self {
             system,
             manual_timer,
+            _socket_lease: socket_lease,
             driver,
             bridge,
             observer,
@@ -634,23 +644,43 @@ impl RuntimeHarness {
         socket_id: SocketId,
         mut predicate: impl FnMut(&UDPourFrame) -> bool,
     ) -> UDPourFrame {
-        let indication = self.observer_rx.recv_matching(WAIT_TIMEOUT, |indication| {
-            let UdpIndication::Received {
-                socket_id: indicated_socket_id,
-                payload,
-                ..
-            } = indication
-            else {
-                return false;
-            };
-            if *indicated_socket_id != socket_id {
-                return false;
-            }
-            let Ok(frame) = decode_frame(payload.clone()) else {
-                return false;
-            };
-            predicate(&frame)
-        });
+        let indication = self.observer_rx.recv_matching_or_fail(
+            WAIT_TIMEOUT,
+            |indication| {
+                let UdpIndication::Received {
+                    socket_id: indicated_socket_id,
+                    payload,
+                    ..
+                } = indication
+                else {
+                    return false;
+                };
+                if *indicated_socket_id != socket_id {
+                    return false;
+                }
+                let Ok(frame) = decode_frame(payload.clone()) else {
+                    return false;
+                };
+                predicate(&frame)
+            },
+            |indication| match indication {
+                UdpIndication::BindFailed {
+                    request_id,
+                    local_addr,
+                    reason,
+                } => Some(format!(
+                    "UDPour test UDP bind request {request_id:?} failed at {local_addr} while waiting for a bridge frame on {socket_id:?}: {reason:?}"
+                )),
+                UdpIndication::Closed {
+                    socket_id: indicated_socket_id,
+                    remote_addr,
+                    reason,
+                } if *indicated_socket_id == socket_id => Some(format!(
+                    "UDPour test socket {socket_id:?} closed while waiting for a bridge frame: remote={remote_addr:?}, reason={reason:?}"
+                )),
+                _ => None,
+            },
+        );
         let UdpIndication::Received { payload, .. } = indication else {
             unreachable!("recv_matching filtered to Received");
         };
@@ -718,6 +748,7 @@ fn build_runtime_test_kompact_system(
     manual_time: bool,
 ) -> (KompactSystem, Option<KompactManualTimer>) {
     let configure = |config: &mut KompactConfig| {
+        enable_bind_reuse_address(config);
         config.set_config_value(&config_keys::SEND_DELAY, send_rate_control.send_delay);
         config.set_config_value(
             &config_keys::BACKPRESSURE_RETRY_DELAY,
@@ -740,23 +771,37 @@ fn build_runtime_test_kompact_system(
 fn bind_socket(
     observer: &Arc<Component<UdpObserver>>,
     observer_rx: &BufferedReceiver<UdpIndication>,
+    local_addr: SocketAddr,
 ) -> (SocketId, SocketAddr) {
     let request_id = UdpOpenRequestId::new();
     observer.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(local_addr),
         });
     });
-    match observer_rx.recv_matching(WAIT_TIMEOUT, |event| {
-        matches!(
-            event,
-            UdpIndication::Bound {
+    match observer_rx.recv_matching_or_fail(
+        WAIT_TIMEOUT,
+        |event| {
+            matches!(
+                event,
+                UdpIndication::Bound {
+                    request_id: indicated_request_id,
+                    ..
+                } if *indicated_request_id == request_id
+            )
+        },
+        |event| match event {
+            UdpIndication::BindFailed {
                 request_id: indicated_request_id,
-                ..
-            } if *indicated_request_id == request_id
-        )
-    }) {
+                local_addr,
+                reason,
+            } if *indicated_request_id == request_id => Some(format!(
+                "UDPour runtime test socket bind failed for request {request_id:?} at {local_addr}: {reason:?}"
+            )),
+            _ => None,
+        },
+    ) {
         UdpIndication::Bound {
             request_id: indicated_request_id,
             socket_id,

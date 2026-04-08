@@ -2,9 +2,12 @@ use bytes::Bytes;
 use flotsync_io::{
     prelude::*,
     test_support::{
+        ReservedSocketKind,
         assert_no_driver_event,
+        bind_reserved_tcp_listener,
         init_test_logger,
         localhost,
+        reserve_sockets,
         wait_for_driver_event,
         wait_for_driver_request,
     },
@@ -31,11 +34,15 @@ fn reserve_listener(driver: &IoDriver) -> ListenerId {
     wait_for_driver_request(request)
 }
 
-fn listen_at(driver: &IoDriver, listener_id: ListenerId) -> std::net::SocketAddr {
+fn listen_at(
+    driver: &IoDriver,
+    listener_id: ListenerId,
+    local_addr: std::net::SocketAddr,
+) -> std::net::SocketAddr {
     driver
         .dispatch(DriverCommand::Tcp(TcpCommand::Listen {
             listener_id,
-            local_addr: localhost(0),
+            local_addr,
         }))
         .expect("dispatch TCP listen");
 
@@ -104,7 +111,9 @@ fn tcp_driver_reports_connect_failure() {
 fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close() {
     init_test_logger();
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind TCP listener");
+    let server_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener =
+        bind_reserved_tcp_listener(&server_listener_lease, 0).expect("bind reserved TCP listener");
     let remote_addr = listener.local_addr().expect("listener addr");
     let (server_payload_tx, server_payload_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -190,7 +199,9 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
     assert_eq!(server_payload_rx.recv().expect("server payload"), *b"hello");
     server.join().expect("join server thread");
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind second TCP listener");
+    let abort_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener = bind_reserved_tcp_listener(&abort_listener_lease, 0)
+        .expect("bind reserved second TCP listener");
     let remote_addr = listener.local_addr().expect("second listener addr");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept second TCP stream");
@@ -253,9 +264,14 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
  {
     init_test_logger();
 
-    let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let driver = IoDriver::start(DriverConfig {
+        bind_reuse_address: true,
+        ..DriverConfig::default()
+    })
+    .expect("driver starts");
     let listener_id = reserve_listener(&driver);
-    let listener_addr = listen_at(&driver, listener_id);
+    let listener_addr = listen_at(&driver, listener_id, listener_lease.addr(0));
 
     let mut accepted_client = TcpStream::connect(listener_addr).expect("connect accepted client");
     let accepted_connection_id = match wait_for_driver_event(&driver, |event| {
@@ -418,7 +434,9 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 fn tcp_driver_reports_read_and_write_flow_control_transitions() {
     init_test_logger();
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind flow-control TCP listener");
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener = bind_reserved_tcp_listener(&listener_lease, 0)
+        .expect("bind reserved flow-control TCP listener");
     let remote_addr = listener.local_addr().expect("flow-control listener addr");
     let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
