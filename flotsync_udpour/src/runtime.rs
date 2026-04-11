@@ -357,6 +357,13 @@ pub struct UDPourComponent {
     /// Logical deadline of the active poll timer, mirrored only for the
     /// manual-time test harness.
     next_poll_at: Option<Instant>,
+    #[cfg(test)]
+    /// Last `NeedParts` request that this runtime already handled locally.
+    ///
+    /// Runtime tests use this to distinguish "the bridge observed a
+    /// `NeedParts` frame on the sender socket" from "the sender runtime
+    /// consumed that frame and queued the corresponding repair response".
+    last_processed_need_parts: Option<ProcessedNeedPartsSnapshot>,
 }
 
 #[cfg(test)]
@@ -372,6 +379,13 @@ pub(crate) struct RuntimeTimerSnapshot {
     pub(crate) now: Instant,
     pub(crate) dispatch_timer: Option<ActiveTimerSnapshot>,
     pub(crate) poll_timer: Option<ActiveTimerSnapshot>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcessedNeedPartsSnapshot {
+    source: SocketAddr,
+    frame: NeedPartsFrame,
 }
 
 impl UDPourComponent {
@@ -396,6 +410,8 @@ impl UDPourComponent {
             poll_timer: None,
             #[cfg(test)]
             next_poll_at: None,
+            #[cfg(test)]
+            last_processed_need_parts: None,
         }
     }
 
@@ -446,6 +462,19 @@ impl UDPourComponent {
         header: UDPourHeader,
     ) -> bool {
         self.receiver.has_reflected_payload(source, header)
+    }
+
+    #[cfg(test)]
+    /// Returns whether the sender runtime already handled one concrete
+    /// `NeedParts` request from `source`.
+    pub(crate) fn sender_has_processed_need_parts(
+        &self,
+        source: SocketAddr,
+        frame: &NeedPartsFrame,
+    ) -> bool {
+        self.last_processed_need_parts
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.source == source && snapshot.frame.eq(frame))
     }
 
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
@@ -740,6 +769,11 @@ impl UDPourComponent {
             UDPourFrame::NeedParts(frame) => match self.sender.handle_need_parts(&frame) {
                 Ok(action) => {
                     self.handle_sender_action(action, Some(source));
+                    #[cfg(test)]
+                    {
+                        self.last_processed_need_parts =
+                            Some(ProcessedNeedPartsSnapshot { source, frame });
+                    }
                 }
                 Err(error) => {
                     error!(

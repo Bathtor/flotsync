@@ -789,6 +789,19 @@ impl RuntimeHarness {
         );
     }
 
+    fn wait_for_sender_runtime_need_parts(&self, source: SocketAddr, frame: &NeedPartsFrame) {
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &self.sender_runtime,
+            |component| component.sender_has_processed_need_parts(source, frame),
+            format_args!(
+                "timed out waiting for sender runtime to process NeedParts for message_id={:?} from {source} with missing parts {:?}",
+                frame.header.message_id,
+                frame.missing_parts.iter().collect::<Vec<_>>(),
+            ),
+        );
+    }
+
     fn wait_for_due_timers_to_process(
         &self,
         component: &Arc<Component<UDPourComponent>>,
@@ -1155,6 +1168,7 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
     };
     let missing: Vec<_> = need_parts.missing_parts.iter().collect();
     assert_eq!(missing, vec![1]);
+    harness.wait_for_sender_runtime_need_parts(harness.receiver_addr, &need_parts);
 
     let retransmit = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         let UDPourFrame::Payload(frame) = frame else {
