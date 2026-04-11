@@ -90,7 +90,7 @@ version = "0.9"
 version = "0.3"
 
 [dependencies.hierarchical_hash_wheel_timer]
-version = "1.2"
+version = "1.4.0"
 
 [dependencies.hocon]
 version = "0.9"

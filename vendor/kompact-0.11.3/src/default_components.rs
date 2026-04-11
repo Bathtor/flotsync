@@ -112,7 +112,7 @@ impl TimerRefFactory for ManualTimerComponent {
 
 impl TimerComponent for ManualTimerComponent {
     fn shutdown(&self) -> Result<(), String> {
-        self.inner.shutdown();
+        self.inner.stop();
         Ok(())
     }
 }

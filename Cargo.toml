@@ -25,4 +25,3 @@ kompact = "0.11"
 
 [patch.crates-io]
 kompact = { path = "vendor/kompact-0.11.3" }
-hierarchical_hash_wheel_timer = { path = "vendor/hierarchical_hash_wheel_timer-1.3.0" }
