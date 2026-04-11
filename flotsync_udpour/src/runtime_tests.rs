@@ -777,6 +777,18 @@ impl RuntimeHarness {
         );
     }
 
+    fn wait_for_receiver_runtime_payload(&self, source: SocketAddr, header: UDPourHeader) {
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &self.receiver_runtime,
+            |component| component.receiver_has_reflected_payload(source, header),
+            format_args!(
+                "timed out waiting for receiver runtime to reflect payload part {:?} for message_id={:?} from {source}",
+                header.part_number, header.message_id,
+            ),
+        );
+    }
+
     fn wait_for_due_timers_to_process(
         &self,
         component: &Arc<Component<UDPourComponent>>,
@@ -913,22 +925,19 @@ fn bind_socket(
     }
 }
 
-fn default_sender_config(retention_timeout: Duration) -> SenderConfig {
-    SenderConfig::new(
-        NonZeroUsize::new(4).unwrap(),
-        retention_timeout,
-        Duration::from_millis(100),
-    )
-}
+const DEFAULT_SENDER_CONFIG: SenderConfig = SenderConfig {
+    max_part_payload_len: NonZeroUsize::new(4).expect("part size is non-zero"),
+    retention_timeout: Duration::from_millis(200),
+    id_reuse_cooldown: Duration::from_millis(100),
+    eager_ack_cleanup: false,
+};
 
-fn default_receiver_config(repair_interval: Duration) -> ReceiverConfig {
-    ReceiverConfig {
-        repair_interval,
-        give_up_timeout: Duration::from_millis(200),
-        max_need_parts_frame_len: 256,
-        delivered_tombstone_timeout: Duration::from_millis(300),
-    }
-}
+const DEFAULT_RECEIVER_CONFIG: ReceiverConfig = ReceiverConfig {
+    repair_interval: Duration::from_millis(40),
+    give_up_timeout: Duration::from_millis(200),
+    max_need_parts_frame_len: 256,
+    delivered_tombstone_timeout: Duration::from_millis(300),
+};
 
 fn wait_for_retransmitted_parts(
     harness: &RuntimeHarness,
@@ -1050,8 +1059,8 @@ fn basic_component_smoke_send_deliver_ack_without_repair() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(
@@ -1087,8 +1096,8 @@ fn backpressure_is_retried_without_failing_logical_send() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     let submit = harness.submit_async(IoPayload::from_static(b"hello world"));
@@ -1119,8 +1128,11 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
             part_number: PartNumber(1),
             dropped: false,
         },
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(20)),
+        DEFAULT_SENDER_CONFIG,
+        ReceiverConfig {
+            repair_interval: Duration::from_millis(20),
+            ..DEFAULT_RECEIVER_CONFIG
+        },
     );
 
     assert!(matches!(
@@ -1169,18 +1181,21 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
 
 #[test]
 fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
-    let sender_config = SenderConfig::new(
-        NonZeroUsize::new(4).unwrap(),
-        Duration::from_millis(80),
-        Duration::from_millis(40),
-    );
+    let sender_config = SenderConfig {
+        retention_timeout: Duration::from_millis(80),
+        id_reuse_cooldown: Duration::from_millis(40),
+        ..DEFAULT_SENDER_CONFIG
+    };
     let harness = RuntimeHarness::new_manual_time(
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
         sender_config,
-        default_receiver_config(Duration::from_millis(20)),
+        ReceiverConfig {
+            repair_interval: Duration::from_millis(20),
+            ..DEFAULT_RECEIVER_CONFIG
+        },
     );
 
     assert!(matches!(
@@ -1253,8 +1268,14 @@ fn send_delay_and_window_pace_multipart_transmission() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        // This test isolates sender-side pacing. Receiver repair must stay out
+        // of the way, otherwise `NeedParts` retransmissions can overlap with
+        // the paced sends and stop testing the behaviour we actually care about.
+        ReceiverConfig {
+            repair_interval: Duration::from_secs(60),
+            ..DEFAULT_RECEIVER_CONFIG
+        },
         TestSendRateControl {
             send_delay: Duration::from_millis(40),
             backpressure_retry_delay: Duration::from_millis(10),
@@ -1270,7 +1291,10 @@ fn send_delay_and_window_pace_multipart_transmission() {
             UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(0)
         )
     });
-    assert!(matches!(first, UDPourFrame::Payload(_)));
+    let UDPourFrame::Payload(first_payload) = first else {
+        unreachable!("filtered to Payload");
+    };
+    harness.wait_for_receiver_runtime_payload(harness.sender_addr, first_payload.header);
     // This short window is the pacing assertion itself: with the current
     // `send_delay`, the next payload part must not already be on the bridge
     // yet.
@@ -1279,7 +1303,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
     harness.assert_no_bridge_frame(harness.receiver_socket_id, Duration::ZERO, |frame| {
         matches!(frame, UDPourFrame::Payload(_))
     });
-    harness.advance_time(Duration::from_millis(25));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(25));
 
     let second = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(
@@ -1287,7 +1311,10 @@ fn send_delay_and_window_pace_multipart_transmission() {
             UDPourFrame::Payload(frame) if frame.header.part_number == PartNumber(1)
         )
     });
-    assert!(matches!(second, UDPourFrame::Payload(_)));
+    let UDPourFrame::Payload(second_payload) = second else {
+        unreachable!("filtered to Payload");
+    };
+    harness.wait_for_receiver_runtime_payload(harness.sender_addr, second_payload.header);
     // The second gap proves the sender keeps pacing subsequent parts rather
     // than only delaying the initial burst.
     harness.wait_for_sender_dispatch_timer();
@@ -1295,7 +1322,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
     harness.assert_no_bridge_frame(harness.receiver_socket_id, Duration::ZERO, |frame| {
         matches!(frame, UDPourFrame::Payload(_))
     });
-    harness.advance_time(Duration::from_millis(25));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(25));
 
     let third = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(
@@ -1327,8 +1354,14 @@ fn no_longer_available_after_sender_retention_expiry() {
             part_number: PartNumber(1),
             dropped: false,
         },
-        default_sender_config(Duration::from_millis(10)),
-        default_receiver_config(Duration::from_millis(20)),
+        SenderConfig {
+            retention_timeout: Duration::from_millis(10),
+            ..DEFAULT_SENDER_CONFIG
+        },
+        ReceiverConfig {
+            repair_interval: Duration::from_millis(20),
+            ..DEFAULT_RECEIVER_CONFIG
+        },
     );
 
     assert!(matches!(
@@ -1365,8 +1398,8 @@ fn runtime_nack_reports_one_send_failed_with_correct_identity() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     let failed = harness.send(IoPayload::from_static(b"x"));
@@ -1386,8 +1419,8 @@ fn socket_close_fails_submit_while_datagrams_are_still_queued() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
         TestSendRateControl {
             send_delay: Duration::from_millis(50),
             backpressure_retry_delay: Duration::from_millis(10),
@@ -1428,8 +1461,8 @@ fn runtime_out_of_order_payloads_still_reassemble_and_ack() {
             expected_parts: None,
             flushed: false,
         },
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(
@@ -1458,8 +1491,8 @@ fn runtime_duplicate_payload_datagrams_do_not_break_delivery() {
             drop_later_payloads: false,
             duplicated_message_id: None,
         },
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(
@@ -1492,8 +1525,8 @@ fn runtime_conflicting_duplicates_purge_without_requesting_repair() {
             drop_later_payloads: true,
             duplicated_message_id: None,
         },
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(
@@ -1525,8 +1558,8 @@ fn malformed_frames_are_dropped_without_poisoning_valid_traffic() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::InjectMalformedFramesOnce { injected: false },
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(
@@ -1552,8 +1585,8 @@ fn zero_length_payload_round_trips_through_runtime() {
         ProxyIndicationBehavior::Pass,
         ProxyRequestBehavior::Pass,
         ProxyIndicationBehavior::Pass,
-        default_sender_config(Duration::from_millis(200)),
-        default_receiver_config(Duration::from_millis(40)),
+        DEFAULT_SENDER_CONFIG,
+        DEFAULT_RECEIVER_CONFIG,
     );
 
     assert!(matches!(

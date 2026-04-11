@@ -217,6 +217,31 @@ impl ReceiverMachine {
         })
     }
 
+    #[cfg(test)]
+    /// Returns whether receiver state already reflects one observed payload
+    /// header from `source`.
+    ///
+    /// This lets runtime tests distinguish "the bridge observer saw the frame"
+    /// from "the receiving UDPour state machine already consumed the frame and
+    /// reset any dependent repair deadlines".
+    pub(crate) fn has_reflected_payload(&self, source: SocketAddr, header: UDPourHeader) -> bool {
+        let key = ReceiverTransferKey {
+            source,
+            message_id: header.message_id,
+        };
+        match self.transfers.get(&key) {
+            Some(InboundState::Pending(transfer)) => {
+                transfer.part_count == header.part_count
+                    && transfer.checksum == header.checksum
+                    && !transfer.missing_parts.contains(header.part_number.0)
+            }
+            Some(InboundState::Delivered(tombstone)) => {
+                tombstone.matches(header.part_count, header.checksum)
+            }
+            None => false,
+        }
+    }
+
     /// Advances timeout-driven repair and purge behavior.
     pub fn poll_timeouts(&mut self, now: Instant) -> Result<Vec<ReceiverAction>, ReceiverError> {
         let keys: Vec<_> = self.transfers.keys().copied().collect();

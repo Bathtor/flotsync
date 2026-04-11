@@ -437,6 +437,17 @@ impl UDPourComponent {
         }
     }
 
+    #[cfg(test)]
+    /// Returns whether receiver state has already reflected one observed
+    /// payload header from `source`.
+    pub(crate) fn receiver_has_reflected_payload(
+        &self,
+        source: SocketAddr,
+        header: UDPourHeader,
+    ) -> bool {
+        self.receiver.has_reflected_payload(source, header)
+    }
+
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
         let defaults = UDPourSendRateControl::default();
         let send_delay = match self.ctx.config().get_or_default(&config_keys::SEND_DELAY) {
