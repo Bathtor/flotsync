@@ -25,7 +25,7 @@
     2. traits
     3. functions
     4. structs/enums, each followed immediately by all associated `impl` blocks
-- Imports should remain at the very top of the file.
+- Imports should remain at the very top of the file/module/function.
 
 <!-- BEGIN BEADS INTEGRATION -->
 
