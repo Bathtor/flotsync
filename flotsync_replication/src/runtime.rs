@@ -1138,6 +1138,10 @@ impl DeliveryLoop {
                     match indication {
                         GroupBroadcastPortIndication::Deliver(deliver) => {
                             if let Err(error) = shared.handle_group_delivery(deliver) {
+                                // Temporary conservative failure mode for the
+                                // first replication slice. See flotsync-4x8
+                                // for relaxing transient inbound ordering
+                                // errors without terminating the runtime.
                                 shared.record_terminal_fault("group delivery", &error);
                                 return;
                             }
