@@ -106,13 +106,6 @@ pub struct GroupMembers {
 }
 
 impl GroupMembers {
-    /// Create one empty indexed member set.
-    pub fn new() -> Self {
-        Self {
-            member_indices: TrieMap::new(),
-        }
-    }
-
     /// Build one indexed member set from the canonical group member order.
     pub fn from_ordered_members(
         ordered_members: impl IntoIterator<Item = MemberIdentity>,
@@ -125,7 +118,6 @@ impl GroupMembers {
             .fail();
         }
 
-        let mut members = Self::new();
         let mut member_indices = TrieMap::new();
         for (index, member) in ordered_members.iter().cloned().enumerate() {
             let index = MemberIndex::try_from(index).expect("checked group size above");
@@ -133,8 +125,7 @@ impl GroupMembers {
                 return DuplicateMemberSnafu { member }.fail();
             }
         }
-        members.member_indices = member_indices;
-        Ok(members)
+        Ok(Self { member_indices })
     }
 
     /// Return whether this group currently includes `member`.
@@ -174,12 +165,6 @@ impl GroupMembers {
     /// Return the number of members in this group.
     pub fn len(&self) -> usize {
         self.member_indices.len()
-    }
-}
-
-impl Default for GroupMembers {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

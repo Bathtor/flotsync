@@ -13,7 +13,10 @@ pub use group_vector::*;
 /// The id of a concrete update from a single node at `node_index` in the group member object.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UpdateId {
-    /// The version of this update at this node. E.g. the first update of every node is version = 0.
+    /// The monotonically increasing per-node version of this update.
+    ///
+    /// Version `0` is reserved for the initial empty frontier before any update
+    /// was produced for that node.
     pub version: u64,
     /// The index of the not in the replication group. This is shorter than encoding the actual
     /// node id and updates are bound to a fixed group instance with fixed membership.

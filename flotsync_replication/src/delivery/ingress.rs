@@ -393,7 +393,8 @@ mod tests {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
                 group_memberships: SharedGroupMemberships::new(GroupMemberships::from_groups([(
                     active_group,
-                    Default::default(),
+                    crate::GroupMembers::from_ordered_members([member(&["probe"])])
+                        .expect("probe group members should build"),
                 )])),
                 local_members: Arc::new(HashSet::new()),
                 hosted_mailboxes: Arc::new(HashSet::new()),

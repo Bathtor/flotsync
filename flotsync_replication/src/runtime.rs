@@ -52,7 +52,10 @@ use crate::{
         },
     },
 };
-use flotsync_core::{member::Identifier, versions::UpdateId};
+use flotsync_core::{
+    member::Identifier,
+    versions::{UpdateId, VersionVector},
+};
 use flotsync_data_types::{
     InitialFieldValue,
     OperationError,
@@ -79,8 +82,9 @@ use messages::{
 };
 use snafu::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, btree_map::Entry},
     io,
+    num::NonZeroUsize,
     sync::{
         Arc,
         Mutex,
@@ -126,6 +130,7 @@ async fn load_replication_runtime_inner(
         listener,
         host,
         state: Mutex::new(RuntimeState::default()),
+        terminal_fault: Mutex::new(None),
     });
     let delivery_loop = DeliveryLoop::spawn(shared.clone());
     Ok(Arc::new(ReplicationRuntime {
@@ -162,6 +167,7 @@ struct RuntimeShared {
     listener: Arc<dyn ReplicationEventListener>,
     host: Arc<DeliveryRuntimeHost>,
     state: Mutex<RuntimeState>,
+    terminal_fault: Mutex<Option<TerminalRuntimeFault>>,
 }
 
 /// Mutable runtime-owned state for the first end-to-end replication slice.
@@ -188,8 +194,9 @@ impl RuntimeState {
 struct HostedGroup {
     members: GroupMembers,
     local_member_index: MemberIndex,
-    next_local_version: u64,
+    version_vector: VersionVector,
     datasets: HashMap<DatasetId, HostedDataset>,
+    pending_updates: BTreeMap<UpdateId, PendingInboundUpdate>,
 }
 
 impl HostedGroup {
@@ -203,19 +210,79 @@ impl HostedGroup {
                 .context(LocalMemberIndexMissingSnafu {
                     local_member: local_member.clone(),
                 })?;
+        let member_count = NonZeroUsize::new(members.len())
+            .expect("group installation must only happen for non-empty member sets");
         Ok(Self {
             members,
             local_member_index,
-            next_local_version: 0,
+            version_vector: initial_version_vector(member_count),
             datasets: HashMap::new(),
+            pending_updates: BTreeMap::new(),
         })
     }
 
-    fn candidate_update_id(&self) -> UpdateId {
-        UpdateId {
-            version: self.next_local_version,
-            node_index: self.local_member_index.as_u32(),
+    fn applied_version(&self, member_index: MemberIndex) -> u64 {
+        version_vector_entry(&self.version_vector, member_index)
+    }
+
+    fn expected_next_version(&self, member_index: MemberIndex) -> u64 {
+        self.applied_version(member_index)
+            .checked_add(1)
+            .expect("member version counter must not overflow")
+    }
+
+    fn has_applied(&self, update_id: UpdateId) -> bool {
+        self.applied_version(MemberIndex::new(update_id.node_index)) >= update_id.version
+    }
+
+    fn buffer_update(
+        &mut self,
+        pending_update: PendingInboundUpdate,
+    ) -> Result<(), InboundDeliveryError> {
+        let update_id = pending_update.message.update_id;
+        match self.pending_updates.entry(update_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(pending_update);
+                Ok(())
+            }
+            Entry::Occupied(entry) => {
+                if entry.get().message == pending_update.message {
+                    Ok(())
+                } else {
+                    ConflictingBufferedUpdateSnafu {
+                        group_id: pending_update.message.group_id,
+                        update_id,
+                    }
+                    .fail()
+                }
+            }
         }
+    }
+
+    fn take_next_actionable_pending_update(&mut self) -> Option<PendingUpdateAction> {
+        let mut duplicate_key = None;
+        let mut ready_key = None;
+        for (update_id, pending_update) in &self.pending_updates {
+            if self.has_applied(*update_id) {
+                duplicate_key = Some(*update_id);
+                break;
+            }
+            let producer_index = MemberIndex::new(update_id.node_index);
+            if version_vector_covers(&self.version_vector, &pending_update.message.read_vv)
+                && self.expected_next_version(producer_index) == update_id.version
+            {
+                ready_key = Some(*update_id);
+                break;
+            }
+        }
+
+        if let Some(update_id) = duplicate_key {
+            self.pending_updates.remove(&update_id);
+            return Some(PendingUpdateAction::DropDuplicate);
+        }
+        ready_key
+            .and_then(|update_id| self.pending_updates.remove(&update_id))
+            .map(PendingUpdateAction::Apply)
     }
 }
 
@@ -269,7 +336,63 @@ struct PreparedPublish {
     payload: bytes::Bytes,
 }
 
+/// One inbound update batch buffered until its causal dependencies are met.
+struct PendingInboundUpdate {
+    message: UpdateBatchMessage,
+    loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
+}
+
+enum PendingUpdateAction {
+    DropDuplicate,
+    Apply(PendingInboundUpdate),
+}
+
+#[derive(Clone, Debug)]
+struct TerminalRuntimeFault {
+    operation: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for TerminalRuntimeFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.operation, self.message)
+    }
+}
+
 impl RuntimeShared {
+    fn ensure_running(&self) -> Result<(), ApiError> {
+        let fault = self
+            .terminal_fault
+            .lock()
+            .expect("runtime fault mutex must not be poisoned")
+            .clone();
+        if let Some(fault) = fault {
+            return Err(ApiError::external(io::Error::other(format!(
+                "replication runtime terminated after inbound delivery failure: {fault}"
+            ))));
+        }
+        Ok(())
+    }
+
+    fn record_terminal_fault(&self, operation: &'static str, error: &InboundDeliveryError) {
+        let fault = {
+            let mut slot = self
+                .terminal_fault
+                .lock()
+                .expect("runtime fault mutex must not be poisoned");
+            if slot.is_some() {
+                return;
+            }
+            let fault = TerminalRuntimeFault {
+                operation,
+                message: error.to_string(),
+            };
+            *slot = Some(fault.clone());
+            fault
+        };
+        eprintln!("[flotsync_replication] terminal runtime failure: {fault}");
+    }
+
     async fn load_missing_dataset_schemas_for_publish(
         &self,
         group_id: GroupId,
@@ -408,11 +531,15 @@ impl RuntimeShared {
             .get_mut(&group_id)
             .context(UnknownGroupSnafu { group_id })?;
 
-        ensure!(
-            hosted_group.next_local_version < u64::MAX,
-            ExhaustedUpdateIdsSnafu { group_id }
-        );
-        let update_id = hosted_group.candidate_update_id();
+        let read_vv = hosted_group.version_vector.clone();
+        let next_local_version = hosted_group
+            .applied_version(hosted_group.local_member_index)
+            .checked_add(1)
+            .context(ExhaustedUpdateIdsSnafu { group_id })?;
+        let update_id = UpdateId {
+            version: next_local_version,
+            node_index: hosted_group.local_member_index.as_u32(),
+        };
 
         let mut dataset_order = Vec::new();
         let mut staged_datasets = HashMap::<DatasetId, HostedDataset>::new();
@@ -466,7 +593,9 @@ impl RuntimeShared {
         for (dataset_id, staged_dataset) in staged_datasets {
             hosted_group.datasets.insert(dataset_id, staged_dataset);
         }
-        hosted_group.next_local_version += 1;
+        hosted_group
+            .version_vector
+            .increment_at(hosted_group.local_member_index.as_u32() as usize);
 
         let dataset_updates = dataset_order
             .into_iter()
@@ -482,6 +611,7 @@ impl RuntimeShared {
         let payload = RuntimeMessage::UpdateBatch(UpdateBatchMessage {
             group_id,
             update_id,
+            read_vv,
             dataset_updates,
         })
         .encode_to_bytes();
@@ -547,7 +677,7 @@ impl RuntimeShared {
         let loaded_schemas =
             self.load_missing_dataset_schemas_blocking(message.group_id, &dataset_ids)?;
 
-        let row_changes = {
+        let event_batches = {
             let mut state = self
                 .state
                 .lock()
@@ -574,54 +704,65 @@ impl RuntimeShared {
                     actual_index: MemberIndex::new(message.update_id.node_index),
                 }
             );
+            ensure!(
+                message.update_id.version > 0,
+                InvalidUpdateVersionSnafu {
+                    group_id: message.group_id,
+                    update_id: message.update_id,
+                }
+            );
+            ensure!(
+                version_vector_num_members(&message.read_vv) == hosted_group.members.len(),
+                ReadVersionVectorSizeMismatchSnafu {
+                    group_id: message.group_id,
+                    expected_members: hosted_group.members.len(),
+                    actual_members: version_vector_num_members(&message.read_vv),
+                }
+            );
+            if hosted_group.has_applied(message.update_id) {
+                return Ok(());
+            }
+            if !version_vector_covers(&hosted_group.version_vector, &message.read_vv)
+                || hosted_group.expected_next_version(expected_sender_index)
+                    < message.update_id.version
+            {
+                hosted_group.buffer_update(PendingInboundUpdate {
+                    message,
+                    loaded_schemas,
+                })?;
+                return Ok(());
+            }
 
-            let mut staged_datasets = HashMap::<DatasetId, HostedDataset>::new();
-            let mut row_changes = Vec::new();
-            for dataset_update in message.dataset_updates {
-                let staged_dataset = staged_dataset_for_inbound(
-                    &mut staged_datasets,
+            let mut event_batches = Vec::new();
+            let row_changes = apply_one_update_batch(hosted_group, message, &loaded_schemas)?;
+            if !row_changes.is_empty() {
+                event_batches.push(row_changes);
+            }
+            while let Some(action) = hosted_group.take_next_actionable_pending_update() {
+                let pending_update = match action {
+                    PendingUpdateAction::DropDuplicate => {
+                        continue;
+                    }
+                    PendingUpdateAction::Apply(pending_update) => pending_update,
+                };
+                let row_changes = apply_one_update_batch(
                     hosted_group,
-                    &loaded_schemas,
-                    &dataset_update.dataset_id,
+                    pending_update.message,
+                    &pending_update.loaded_schemas,
                 )?;
-                for operation in dataset_update.operations {
-                    let schema = staged_dataset.data.schema().clone();
-                    let operation = decode_schema_operation(operation, &schema).context(
-                        DecodeSchemaOperationSnafu {
-                            dataset_id: dataset_update.dataset_id.clone(),
-                        },
-                    )?;
-                    ensure!(
-                        operation.change_id == message.update_id,
-                        MismatchedOperationUpdateIdSnafu {
-                            dataset_id: dataset_update.dataset_id.clone(),
-                            expected: message.update_id,
-                            actual: operation.change_id,
-                        }
-                    );
-                    let row_change = apply_remote_operation(
-                        staged_dataset,
-                        message.group_id,
-                        &dataset_update.dataset_id,
-                        operation,
-                    )?;
-                    row_changes.push(row_change);
+                if !row_changes.is_empty() {
+                    event_batches.push(row_changes);
                 }
             }
-
-            for (dataset_id, staged_dataset) in staged_datasets {
-                hosted_group.datasets.insert(dataset_id, staged_dataset);
-            }
-            row_changes
+            event_batches
         };
 
-        if row_changes.is_empty() {
-            return Ok(());
+        for row_changes in event_batches {
+            block_on(self.listener.on_event(ReplicationEvent::DataChanged {
+                rows: Box::new(VecRowProvider::new(row_changes)),
+            }))
+            .context(NotifyListenerSnafu)?;
         }
-        block_on(self.listener.on_event(ReplicationEvent::DataChanged {
-            rows: Box::new(VecRowProvider::new(row_changes)),
-        }))
-        .context(NotifyListenerSnafu)?;
         Ok(())
     }
 
@@ -731,6 +872,82 @@ fn staged_dataset_for_inbound<'a>(
     Ok(staged_datasets
         .get_mut(dataset_id)
         .expect("staged inbound dataset must exist after insertion"))
+}
+
+fn initial_version_vector(num_members: NonZeroUsize) -> VersionVector {
+    VersionVector::Synced {
+        num_members,
+        version: 0,
+    }
+}
+
+fn version_vector_num_members(version_vector: &VersionVector) -> usize {
+    version_vector.num_members().get()
+}
+
+fn version_vector_entry(version_vector: &VersionVector, member_index: MemberIndex) -> u64 {
+    version_vector
+        .iter()
+        .nth(member_index.as_u32() as usize)
+        .expect("member index must be within the group's version vector")
+}
+
+fn version_vector_covers(local: &VersionVector, required: &VersionVector) -> bool {
+    if version_vector_num_members(local) != version_vector_num_members(required) {
+        return false;
+    }
+    local
+        .iter()
+        .zip(required.iter())
+        .all(|(local_version, required_version)| local_version >= required_version)
+}
+
+fn apply_one_update_batch(
+    hosted_group: &mut HostedGroup,
+    message: UpdateBatchMessage,
+    loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
+) -> Result<Vec<RowChange>, InboundDeliveryError> {
+    let mut staged_datasets = HashMap::<DatasetId, HostedDataset>::new();
+    let mut row_changes = Vec::new();
+    for dataset_update in message.dataset_updates {
+        let staged_dataset = staged_dataset_for_inbound(
+            &mut staged_datasets,
+            hosted_group,
+            loaded_schemas,
+            &dataset_update.dataset_id,
+        )?;
+        for operation in dataset_update.operations {
+            let schema = staged_dataset.data.schema().clone();
+            let operation = decode_schema_operation(operation, &schema).context(
+                DecodeSchemaOperationSnafu {
+                    dataset_id: dataset_update.dataset_id.clone(),
+                },
+            )?;
+            ensure!(
+                operation.change_id == message.update_id,
+                MismatchedOperationUpdateIdSnafu {
+                    dataset_id: dataset_update.dataset_id.clone(),
+                    expected: message.update_id,
+                    actual: operation.change_id,
+                }
+            );
+            let row_change = apply_remote_operation(
+                staged_dataset,
+                message.group_id,
+                &dataset_update.dataset_id,
+                operation,
+            )?;
+            row_changes.push(row_change);
+        }
+    }
+
+    for (dataset_id, staged_dataset) in staged_datasets {
+        hosted_group.datasets.insert(dataset_id, staged_dataset);
+    }
+    hosted_group
+        .version_vector
+        .increment_at(message.update_id.node_index as usize);
+    Ok(row_changes)
 }
 
 fn build_initial_values<'schema>(
@@ -909,7 +1126,10 @@ impl DeliveryLoop {
                     made_progress = true;
                     match indication {
                         ReliableDeliveryPortIndication::Deliver(deliver) => {
-                            let _ = shared.handle_reliable_delivery(deliver);
+                            if let Err(error) = shared.handle_reliable_delivery(deliver) {
+                                shared.record_terminal_fault("reliable delivery", &error);
+                                return;
+                            }
                         }
                     }
                 }
@@ -917,7 +1137,10 @@ impl DeliveryLoop {
                     made_progress = true;
                     match indication {
                         GroupBroadcastPortIndication::Deliver(deliver) => {
-                            let _ = shared.handle_group_delivery(deliver);
+                            if let Err(error) = shared.handle_group_delivery(deliver) {
+                                shared.record_terminal_fault("group delivery", &error);
+                                return;
+                            }
                         }
                     }
                 }
@@ -1091,6 +1314,31 @@ enum InboundDeliveryError {
         expected_index: MemberIndex,
         actual_index: MemberIndex,
     },
+    #[snafu(display(
+        "Inbound update for group {:?} carried invalid version 0 in update id {update_id}.",
+        group_id
+    ))]
+    InvalidUpdateVersion {
+        group_id: GroupId,
+        update_id: UpdateId,
+    },
+    #[snafu(display(
+        "Inbound update for group {:?} carried read VV of length {actual_members}, expected {expected_members}.",
+        group_id
+    ))]
+    ReadVersionVectorSizeMismatch {
+        group_id: GroupId,
+        expected_members: usize,
+        actual_members: usize,
+    },
+    #[snafu(display(
+        "Inbound update for group {:?} buffered two different payloads for update id {update_id}.",
+        group_id
+    ))]
+    ConflictingBufferedUpdate {
+        group_id: GroupId,
+        update_id: UpdateId,
+    },
     #[snafu(display("Failed to decode inbound schema operation for dataset '{dataset_id}'."))]
     DecodeSchemaOperation {
         dataset_id: DatasetId,
@@ -1134,15 +1382,19 @@ impl ReplicationApi for ReplicationRuntime {
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>> {
         let shared = self.shared.clone();
         Box::pin(async move {
+            shared.ensure_running()?;
             let (group_id, dataset_ids) = publish_scope(&changes).map_err(ApiError::external)?;
             let loaded_schemas = shared
                 .load_missing_dataset_schemas_for_publish(group_id, &dataset_ids)
                 .await
                 .map_err(ApiError::external)?;
+            shared.ensure_running()?;
             let prepared_publish = shared
                 .prepare_local_publish(changes, &loaded_schemas)
                 .map_err(ApiError::external)?;
 
+            // From here on the update has been accepted locally. A concurrent
+            // inbound runtime fault must not turn this publish into an API error.
             shared.host.submit_group_broadcast(GroupBroadcastSubmit {
                 delivery_class: DeliveryClass::BestEffort,
                 envelope: GroupMessageEnvelope {
@@ -1170,7 +1422,10 @@ impl ReplicationApi for ReplicationRuntime {
         req: CreateGroupRequest,
     ) -> BoxFuture<'_, Result<crate::api::GroupId, ApiError>> {
         let shared = self.shared.clone();
-        Box::pin(async move { shared.create_group(req).map_err(ApiError::external) })
+        Box::pin(async move {
+            shared.ensure_running()?;
+            shared.create_group(req).map_err(ApiError::external)
+        })
     }
 
     fn change_group_membership(
@@ -1178,7 +1433,11 @@ impl ReplicationApi for ReplicationRuntime {
         req: ChangeGroupMembershipRequest,
     ) -> BoxFuture<'_, Result<GroupMigration, ApiError>> {
         let _ = req;
-        Box::pin(async move { Err(Self::unavailable("change_group_membership")) })
+        let shared = self.shared.clone();
+        Box::pin(async move {
+            shared.ensure_running()?;
+            Err(Self::unavailable("change_group_membership"))
+        })
     }
 }
 
@@ -1209,7 +1468,7 @@ mod tests {
     use bytes::Bytes;
     use flotsync_data_types::{Field, Schema};
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         future::Future,
         pin::pin,
         sync::{LazyLock, Mutex},
@@ -1291,7 +1550,7 @@ mod tests {
 
     #[derive(Default)]
     struct ListenerStub {
-        data_changes: Mutex<Vec<CapturedDataChange>>,
+        data_changes: Mutex<VecDeque<CapturedDataChange>>,
     }
 
     impl ListenerStub {
@@ -1302,7 +1561,7 @@ mod tests {
                     .data_changes
                     .lock()
                     .expect("listener capture mutex must not be poisoned")
-                    .pop()
+                    .pop_front()
                 {
                     return change;
                 }
@@ -1312,6 +1571,35 @@ mod tests {
                 );
                 thread::sleep(Duration::from_millis(10));
             }
+        }
+
+        fn wait_for_data_change_count(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if self
+                    .data_changes
+                    .lock()
+                    .expect("listener capture mutex must not be poisoned")
+                    .len()
+                    >= count
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {count} listener data-change events"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn captured_data_changes(&self) -> Vec<CapturedDataChange> {
+            self.data_changes
+                .lock()
+                .expect("listener capture mutex must not be poisoned")
+                .iter()
+                .cloned()
+                .collect()
         }
     }
 
@@ -1336,7 +1624,7 @@ mod tests {
                         self.data_changes
                             .lock()
                             .expect("listener capture mutex must not be poisoned")
-                            .push(CapturedDataChange {
+                            .push_back(CapturedDataChange {
                                 rows: captured_rows,
                             });
                     }
@@ -1637,7 +1925,7 @@ mod tests {
         assert_eq!(
             receipt.update_id,
             UpdateId {
-                version: 0,
+                version: 1,
                 node_index: 0,
             }
         );
@@ -1677,5 +1965,273 @@ mod tests {
                 .into_owned(),
             "hello from alice"
         );
+    }
+
+    #[test]
+    fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicates() {
+        let alice_member = member(["alice"]);
+        let bob_member = member(["bob"]);
+        let dataset_id = DatasetId::try_new("docs").expect("dataset id should be valid");
+        let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+        let bob_listener = Arc::new(ListenerStub::default());
+        let bob_store = Arc::new(
+            StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+        );
+        let bob = load_runtime_with_parts(
+            Identifier::from_array(["app", "bob"]),
+            bob_store,
+            bob_listener.clone(),
+        );
+        let group_id = GroupId(Uuid::from_u128(22));
+        bob.shared
+            .install_group(
+                group_id,
+                GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                    .expect("group should build"),
+            )
+            .expect("group should install");
+
+        let row_id = crate::api::RowId {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            row_key: crate::api::RowKey(Uuid::from_u128(23)),
+        };
+        let mut source_dataset = HostedDataset::new(schema);
+        let first_operation = apply_local_upsert(
+            &mut source_dataset,
+            &row_id,
+            &crate::row_values! { "title" => "first" },
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+        )
+        .expect("first operation should build")
+        .expect("first operation should apply");
+        let second_operation = apply_local_upsert(
+            &mut source_dataset,
+            &row_id,
+            &crate::row_values! { "title" => "second" },
+            UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+        )
+        .expect("second operation should build")
+        .expect("second operation should apply");
+
+        let member_count = NonZeroUsize::new(2).expect("group has two members");
+        let first_message = UpdateBatchMessage {
+            group_id,
+            update_id: UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+            read_vv: initial_version_vector(member_count),
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id: dataset_id.clone(),
+                operations: vec![first_operation],
+            }],
+        };
+        let mut second_read_vv = initial_version_vector(member_count);
+        second_read_vv.increment_at(0);
+        let second_message = UpdateBatchMessage {
+            group_id,
+            update_id: UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+            read_vv: second_read_vv,
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id: dataset_id.clone(),
+                operations: vec![second_operation],
+            }],
+        };
+
+        bob.shared
+            .apply_update_batch(alice_member.clone(), second_message)
+            .expect("out-of-order update should buffer");
+        assert!(bob_listener.captured_data_changes().is_empty());
+        {
+            let state = bob
+                .shared
+                .state
+                .lock()
+                .expect("runtime state mutex must not be poisoned");
+            let hosted_group = state
+                .groups
+                .get(&group_id)
+                .expect("group should still be hosted");
+            assert_eq!(hosted_group.pending_updates.len(), 1);
+            assert_eq!(hosted_group.applied_version(MemberIndex::new(0)), 0);
+        }
+
+        bob.shared
+            .apply_update_batch(alice_member.clone(), first_message.clone())
+            .expect("first update should apply and drain the pending second update");
+        bob_listener.wait_for_data_change_count(2);
+        assert_eq!(
+            bob_listener.captured_data_changes(),
+            vec![
+                CapturedDataChange {
+                    rows: vec![CapturedRowChange::Upsert {
+                        row_id: row_id.clone(),
+                        title: "first".to_owned(),
+                    }],
+                },
+                CapturedDataChange {
+                    rows: vec![CapturedRowChange::Upsert {
+                        row_id: row_id.clone(),
+                        title: "second".to_owned(),
+                    }],
+                },
+            ]
+        );
+        {
+            let state = bob
+                .shared
+                .state
+                .lock()
+                .expect("runtime state mutex must not be poisoned");
+            let hosted_group = state
+                .groups
+                .get(&group_id)
+                .expect("group should still be hosted");
+            assert!(hosted_group.pending_updates.is_empty());
+            assert_eq!(hosted_group.applied_version(MemberIndex::new(0)), 2);
+            let hosted_dataset = hosted_group
+                .datasets
+                .get(&dataset_id)
+                .expect("dataset should be materialised after apply");
+            let hosted_row = hosted_dataset
+                .clone_row(row_id.row_key)
+                .expect("row should exist after buffered apply");
+            assert_eq!(
+                (&hosted_row as &dyn RowRead)
+                    .get_field_value::<str>("title")
+                    .expect("title field should decode")
+                    .into_owned(),
+                "second"
+            );
+        }
+
+        bob.shared
+            .apply_update_batch(alice_member, first_message)
+            .expect("duplicate update should be ignored");
+        assert_eq!(bob_listener.captured_data_changes().len(), 2);
+    }
+
+    #[test]
+    fn buffered_updates_reject_conflicting_duplicate_payloads() {
+        let alice_member = member(["alice"]);
+        let bob_member = member(["bob"]);
+        let dataset_id = DatasetId::try_new("docs").expect("dataset id should be valid");
+        let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+        let bob_store = Arc::new(
+            StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+        );
+        let bob = load_runtime_with_parts(
+            Identifier::from_array(["app", "bob"]),
+            bob_store,
+            Arc::new(ListenerStub::default()),
+        );
+        let group_id = GroupId(Uuid::from_u128(24));
+        bob.shared
+            .install_group(
+                group_id,
+                GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                    .expect("group should build"),
+            )
+            .expect("group should install");
+
+        let row_id = crate::api::RowId {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            row_key: crate::api::RowKey(Uuid::from_u128(25)),
+        };
+        let member_count = NonZeroUsize::new(2).expect("group has two members");
+
+        let mut first_source_dataset = HostedDataset::new(schema.clone());
+        let first_operation = apply_local_upsert(
+            &mut first_source_dataset,
+            &row_id,
+            &crate::row_values! { "title" => "first" },
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+        )
+        .expect("first operation should build")
+        .expect("first operation should apply");
+
+        let mut conflicting_source_dataset = HostedDataset::new(schema);
+        let conflicting_operation = apply_local_upsert(
+            &mut conflicting_source_dataset,
+            &row_id,
+            &crate::row_values! { "title" => "conflict" },
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+        )
+        .expect("conflicting operation should build")
+        .expect("conflicting operation should apply");
+
+        let buffered_message = UpdateBatchMessage {
+            group_id,
+            update_id: UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+            read_vv: {
+                let mut read_vv = initial_version_vector(member_count);
+                read_vv.increment_at(0);
+                read_vv
+            },
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id: dataset_id.clone(),
+                operations: vec![first_operation],
+            }],
+        };
+        let conflicting_message = UpdateBatchMessage {
+            group_id,
+            update_id: UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+            read_vv: {
+                let mut read_vv = initial_version_vector(member_count);
+                read_vv.increment_at(0);
+                read_vv
+            },
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id,
+                operations: vec![conflicting_operation],
+            }],
+        };
+
+        bob.shared
+            .apply_update_batch(alice_member.clone(), buffered_message)
+            .expect("first out-of-order update should buffer");
+        let error = bob
+            .shared
+            .apply_update_batch(alice_member, conflicting_message)
+            .expect_err("conflicting duplicate payload should fail");
+        match error {
+            InboundDeliveryError::ConflictingBufferedUpdate {
+                group_id: actual_group_id,
+                update_id,
+            } => {
+                assert_eq!(actual_group_id, group_id);
+                assert_eq!(
+                    update_id,
+                    UpdateId {
+                        version: 2,
+                        node_index: 0,
+                    }
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

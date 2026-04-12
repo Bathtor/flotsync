@@ -6,12 +6,13 @@ use crate::{
         member_identity_to_wire_format,
     },
 };
-use flotsync_core::versions::UpdateId;
+use flotsync_core::versions::{PureVersionVector, UpdateId, VersionVector};
 use flotsync_messages::{
     buffa::{Message, MessageField},
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
     datamodel as datamodel_proto,
     replication as replication_proto,
+    versions as versions_proto,
 };
 use snafu::prelude::*;
 
@@ -33,6 +34,8 @@ pub(crate) enum RuntimeMessageError {
     EmptyDatasetUpdate { dataset_id: String },
     #[snafu(display("Update batch message did not include an update id."))]
     MissingUpdateId,
+    #[snafu(display("Update batch message did not include a read version vector."))]
+    MissingReadVersionVector,
     #[snafu(display("Bootstrap group message field '{field}' was invalid: {source}"))]
     InvalidWireValue {
         field: &'static str,
@@ -43,6 +46,8 @@ pub(crate) enum RuntimeMessageError {
         field: &'static str,
         source: DatamodelCodecError,
     },
+    #[snafu(display("Update batch field '{field}' was invalid: {reason}"))]
+    InvalidReadVersionVector { field: &'static str, reason: String },
     #[snafu(display("Update batch dataset id '{value}' was invalid: {source}"))]
     InvalidDatasetId {
         value: String,
@@ -66,6 +71,7 @@ pub(crate) struct BootstrapGroupMessage {
 pub(crate) struct UpdateBatchMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
+    pub(crate) read_vv: VersionVector,
     pub(crate) dataset_updates: Vec<DatasetUpdateMessage>,
 }
 
@@ -98,6 +104,7 @@ impl RuntimeMessage {
                     Box::new(replication_proto::UpdateBatch {
                         group_id: message.group_id.0.as_bytes().to_vec(),
                         update_id: MessageField::some(encode_update_id(message.update_id)),
+                        read_vv: MessageField::some(encode_version_vector(&message.read_vv)),
                         dataset_updates: message
                             .dataset_updates
                             .iter()
@@ -155,6 +162,15 @@ impl RuntimeMessage {
                 let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
                     field: "update_batch.update_id",
                 })?;
+                let Some(read_vv) = message.read_vv.take() else {
+                    return MissingReadVersionVectorSnafu.fail();
+                };
+                let read_vv = decode_version_vector(read_vv).map_err(|reason| {
+                    RuntimeMessageError::InvalidReadVersionVector {
+                        field: "update_batch.read_vv",
+                        reason,
+                    }
+                })?;
                 if message.dataset_updates.is_empty() {
                     return EmptyUpdateBatchSnafu.fail();
                 }
@@ -178,9 +194,47 @@ impl RuntimeMessage {
                 Ok(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
                     group_id,
                     update_id,
+                    read_vv,
                     dataset_updates,
                 }))
             }
         }
+    }
+}
+
+fn encode_version_vector(version_vector: &VersionVector) -> versions_proto::VersionVector {
+    // This first replication slice keeps the wire shape intentionally simple and
+    // always serialises the full VV. That avoids having to reconstruct the
+    // member count from compact representations on decode.
+    versions_proto::VersionVector {
+        versions: Some(versions_proto::version_vector::Versions::Full(Box::new(
+            versions_proto::FullVersionVector {
+                entries: version_vector.iter().collect(),
+                ..versions_proto::FullVersionVector::default()
+            },
+        ))),
+        ..versions_proto::VersionVector::default()
+    }
+}
+
+fn decode_version_vector(
+    version_vector: versions_proto::VersionVector,
+) -> Result<VersionVector, String> {
+    let Some(versions) = version_vector.versions else {
+        return Err("missing version-vector body".to_owned());
+    };
+    match versions {
+        versions_proto::version_vector::Versions::Full(full) => {
+            if full.entries.is_empty() {
+                return Err("full version vector must include at least one entry".to_owned());
+            }
+            Ok(VersionVector::Full(PureVersionVector::from(full.entries)))
+        }
+        versions_proto::version_vector::Versions::Override(_) => Err(
+            "compact override version vectors are not supported on the runtime wire yet".to_owned(),
+        ),
+        versions_proto::version_vector::Versions::Synced(_) => Err(
+            "compact synced version vectors are not supported on the runtime wire yet".to_owned(),
+        ),
     }
 }
