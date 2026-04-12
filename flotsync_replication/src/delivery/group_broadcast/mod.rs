@@ -7,10 +7,11 @@ use super::{
     shared::{DeliveryClass, EncryptedPayload, MessageId, RouteSendId, SignedEnvelopeFooter},
 };
 use crate::{
+    GroupMembers,
     SharedGroupMemberships,
     api::{GroupId, MemberIdentity},
 };
-use flotsync_core::member::{TrieMap, TrieSet};
+use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
 use flotsync_utils::{LocalActor, NonOwningPhantomData, impl_local_actor, option_when};
 use kompact::prelude::*;
@@ -187,14 +188,14 @@ impl GroupBroadcastComponent {
     /// every returned entry represents exactly one recipient-specific send.
     fn collect_reachable_remote_recipients(
         &self,
-        group_members: &TrieSet,
+        group_members: &GroupMembers,
         header: &GroupMessageHeader,
     ) -> Vec<(MemberIdentity, SendRouteCandidate<TransportRouteKey>)> {
         // This slice is intentionally stateless with respect to retries: we
         // look up the currently best direct route at submit time and drop
         // unreachable recipients immediately.
         let mut recipients = Vec::new();
-        'group_loop: for recipient in group_members {
+        'group_loop: for recipient in group_members.iter() {
             if recipient == header.sender {
                 continue 'group_loop;
             }
@@ -792,10 +793,8 @@ mod tests {
         group_id: GroupId,
         members: impl IntoIterator<Item = MemberIdentity>,
     ) -> GroupMemberships {
-        let mut group_members = TrieSet::new();
-        for member in members {
-            group_members.insert(member);
-        }
+        let group_members =
+            GroupMembers::from_ordered_members(members).expect("test memberships should build");
         GroupMemberships::from_groups([(group_id, group_members)])
     }
 

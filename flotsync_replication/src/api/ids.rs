@@ -5,6 +5,34 @@ use uuid::Uuid;
 /// Member identity in group membership APIs.
 pub type MemberIdentity = Identifier;
 
+/// Fixed canonical member position within one replication group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MemberIndex(u32);
+
+impl MemberIndex {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<MemberIndex> for u32 {
+    fn from(value: MemberIndex) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<usize> for MemberIndex {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        u32::try_from(value).map(Self)
+    }
+}
+
 /// A stable identifier for a replication group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupId(pub Uuid);

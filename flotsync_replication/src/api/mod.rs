@@ -3,7 +3,7 @@ use flotsync_data_types::{
     Decode,
     DecodeValueError,
     InMemoryFieldValue,
-    schema::datamodel::NullableBasicValue,
+    schema::{Schema, datamodel::NullableBasicValue},
 };
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
@@ -297,5 +297,12 @@ pub trait ReplicationApi: Send + Sync {
 
 /// Persistence extension point.
 pub trait ReplicationStore: Send + Sync {
-    // TODO(`flotsync-73q`): Complete the storage contract.
+    /// Return the member identity hosted by this replication runtime instance.
+    fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>>;
+
+    /// Load one application-defined dataset schema when available locally.
+    fn load_dataset_schema(
+        &self,
+        dataset_id: &DatasetId,
+    ) -> BoxFuture<'_, Result<Option<Arc<Schema>>, StoreError>>;
 }

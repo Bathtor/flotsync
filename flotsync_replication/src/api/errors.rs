@@ -47,6 +47,14 @@ pub enum ApiError {
 }
 
 #[derive(Debug, Snafu)]
+pub enum StoreError {
+    #[snafu(display("Replication store failed: {source}"))]
+    StoreExternal {
+        source: Box<dyn Error + Send + Sync + 'static>,
+    },
+}
+
+#[derive(Debug, Snafu)]
 pub enum LoadError {
     #[snafu(display("Failed to load replication for application '{application_id}': {source}"))]
     Runtime {

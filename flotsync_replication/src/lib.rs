@@ -1,6 +1,7 @@
 //! Application-facing replication runtime and API contracts.
 use arc_swap::ArcSwap;
-use flotsync_core::member::TrieSet;
+use flotsync_core::member::TrieMap;
+use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
 pub mod api;
@@ -15,7 +16,7 @@ pub use runtime::load_replication_runtime;
 #[derive(Clone, Debug, Default)]
 pub struct GroupMemberships {
     /// One immutable member snapshot per locally hosted group.
-    groups: HashMap<GroupId, TrieSet>,
+    groups: HashMap<GroupId, GroupMembers>,
 }
 
 impl GroupMemberships {
@@ -25,7 +26,7 @@ impl GroupMemberships {
     }
 
     /// Build one snapshot from the provided full group-to-members mapping.
-    pub fn from_groups(groups: impl IntoIterator<Item = (GroupId, TrieSet)>) -> Self {
+    pub fn from_groups(groups: impl IntoIterator<Item = (GroupId, GroupMembers)>) -> Self {
         Self {
             groups: groups.into_iter().collect(),
         }
@@ -38,12 +39,12 @@ impl GroupMemberships {
     }
 
     /// Return the currently known members for the given group when present.
-    pub fn members(&self, group_id: &GroupId) -> Option<&TrieSet> {
+    pub fn members(&self, group_id: &GroupId) -> Option<&GroupMembers> {
         self.groups.get(group_id)
     }
 
     /// Replace the membership set for one group inside this snapshot.
-    pub fn insert(&mut self, group_id: GroupId, members: TrieSet) -> Option<TrieSet> {
+    pub fn insert(&mut self, group_id: GroupId, members: GroupMembers) -> Option<GroupMembers> {
         self.groups.insert(group_id, members)
     }
 }
@@ -77,5 +78,160 @@ impl SharedGroupMemberships {
 impl Default for SharedGroupMemberships {
     fn default() -> Self {
         Self::new(GroupMemberships::new())
+    }
+}
+
+/// Construction failures for indexed group member sets.
+#[derive(Debug, Snafu)]
+pub enum GroupMembersError {
+    #[snafu(display(
+        "Group member set contains duplicate member {member} in its canonical order."
+    ))]
+    DuplicateMember { member: MemberIdentity },
+    #[snafu(display(
+        "Group member set has {member_count} members, which exceeds UpdateId node index capacity."
+    ))]
+    TooManyMembers { member_count: usize },
+}
+
+/// Indexed members for one replication group.
+///
+/// The trie remains the authoritative membership representation. The value part
+/// stores the fixed canonical member index from the group's bootstrap order so
+/// delivery and replication can both query membership and producer positions
+/// from one shared snapshot.
+#[derive(Clone, Debug)]
+pub struct GroupMembers {
+    member_indices: TrieMap<MemberIndex>,
+}
+
+impl GroupMembers {
+    /// Create one empty indexed member set.
+    pub fn new() -> Self {
+        Self {
+            member_indices: TrieMap::new(),
+        }
+    }
+
+    /// Build one indexed member set from the canonical group member order.
+    pub fn from_ordered_members(
+        ordered_members: impl IntoIterator<Item = MemberIdentity>,
+    ) -> Result<Self, GroupMembersError> {
+        let ordered_members: Vec<_> = ordered_members.into_iter().collect();
+        if ordered_members.len() > (u32::MAX as usize) {
+            return TooManyMembersSnafu {
+                member_count: ordered_members.len(),
+            }
+            .fail();
+        }
+
+        let mut members = Self::new();
+        let mut member_indices = TrieMap::new();
+        for (index, member) in ordered_members.iter().cloned().enumerate() {
+            let index = MemberIndex::try_from(index).expect("checked group size above");
+            if member_indices.insert(member.clone(), index).is_some() {
+                return DuplicateMemberSnafu { member }.fail();
+            }
+        }
+        members.member_indices = member_indices;
+        Ok(members)
+    }
+
+    /// Return whether this group currently includes `member`.
+    pub fn contains(&self, member: &MemberIdentity) -> bool {
+        self.member_indices.get(member).is_some()
+    }
+
+    /// Return the fixed producer index assigned to `member`, if present.
+    pub fn member_index(&self, member: &MemberIdentity) -> Option<MemberIndex> {
+        self.member_indices.get(member).copied()
+    }
+
+    /// Iterate all members currently in this group.
+    pub fn iter(&self) -> impl Iterator<Item = MemberIdentity> + '_ {
+        self.member_indices.iter_keys()
+    }
+
+    /// Insert or replace one member with its fixed canonical index.
+    pub fn insert(
+        &mut self,
+        member: MemberIdentity,
+        member_index: MemberIndex,
+    ) -> Option<MemberIndex> {
+        self.member_indices.insert(member, member_index)
+    }
+
+    /// Return whether this member set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.member_indices.is_empty()
+    }
+
+    /// Return the number of members in this group.
+    pub fn len(&self) -> usize {
+        self.member_indices.len()
+    }
+}
+
+impl Default for GroupMembers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotsync_core::member::Identifier;
+    use uuid::Uuid;
+
+    fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
+        Identifier::from_array(segments)
+    }
+
+    #[test]
+    fn group_members_preserve_canonical_indices() {
+        let alice = member(["alice"]);
+        let bob = member(["bob"]);
+        let charlie = member(["charlie"]);
+
+        let members =
+            GroupMembers::from_ordered_members(vec![bob.clone(), alice.clone(), charlie.clone()])
+                .expect("group members should build");
+
+        assert_eq!(members.member_index(&bob), Some(MemberIndex::new(0)));
+        assert_eq!(members.member_index(&alice), Some(MemberIndex::new(1)));
+        assert_eq!(members.member_index(&charlie), Some(MemberIndex::new(2)));
+        assert!(members.contains(&bob));
+    }
+
+    #[test]
+    fn group_members_reject_duplicate_members() {
+        let alice = member(["alice"]);
+
+        let error = GroupMembers::from_ordered_members(vec![alice.clone(), alice])
+            .expect_err("duplicate members must be rejected");
+
+        assert!(matches!(error, GroupMembersError::DuplicateMember { .. }));
+    }
+
+    #[test]
+    fn group_memberships_store_indexed_members_authoritatively() {
+        let group_id = GroupId(Uuid::from_u128(3));
+        let alice = member(["alice"]);
+        let bob = member(["bob"]);
+        let snapshot = GroupMemberships::from_groups([(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice.clone(), bob.clone()])
+                .expect("group members should build"),
+        )]);
+        let members = snapshot
+            .members(&group_id)
+            .expect("group must exist in delivery snapshot");
+
+        assert!(snapshot.contains_group(&group_id));
+        assert!(members.contains(&alice));
+        assert!(members.contains(&bob));
+        assert_eq!(members.member_index(&alice), Some(MemberIndex::new(0)));
+        assert_eq!(members.member_index(&bob), Some(MemberIndex::new(1)));
     }
 }

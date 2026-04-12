@@ -17,8 +17,10 @@ pub async fn load_replication_runtime(
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
-    // TODO: Fill out with further implementation.
-    let _ = store;
+    let _local_member = store
+        .local_member_identity()
+        .await
+        .map_err(|source| LoadError::runtime(application_id.clone(), source))?;
     let _ = listener;
     let _ = config;
     Err(LoadError::Unavailable { application_id })
