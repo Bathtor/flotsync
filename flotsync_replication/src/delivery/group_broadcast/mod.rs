@@ -337,7 +337,7 @@ impl GroupBroadcastComponent {
     }
 
     #[cfg(test)]
-    fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
+    pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
         self.direct_peer_routes.get(peer).is_some()
     }
 }

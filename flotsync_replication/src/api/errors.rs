@@ -38,6 +38,17 @@ pub enum ListenerError {
     },
 }
 
+impl ListenerError {
+    pub fn external<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::ListenerExternal {
+            source: Box::new(source),
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum ApiError {
     #[snafu(display("Replication API operation failed: {source}"))]
@@ -46,12 +57,34 @@ pub enum ApiError {
     },
 }
 
+impl ApiError {
+    pub fn external<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::ApiExternal {
+            source: Box::new(source),
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 pub enum StoreError {
     #[snafu(display("Replication store failed: {source}"))]
     StoreExternal {
         source: Box<dyn Error + Send + Sync + 'static>,
     },
+}
+
+impl StoreError {
+    pub fn external<E>(source: E) -> Self
+    where
+        E: Error + Send + Sync + 'static,
+    {
+        Self::StoreExternal {
+            source: Box::new(source),
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]

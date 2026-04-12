@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package flotsync.replication.v1;
+
+import "flotsync/datamodel/v1/datamodel.proto";
+import "flotsync/discovery/v1/discovery.proto";
+
+message RuntimeMessage {
+  oneof body {
+    BootstrapGroup bootstrap_group = 1;
+    UpdateBatch update_batch = 2;
+  }
+}
+
+message BootstrapGroup {
+  bytes group_id = 1;
+  repeated flotsync.discovery.v1.Identifier members = 2;
+}
+
+message UpdateBatch {
+  bytes group_id = 1;
+  flotsync.datamodel.v1.HistoryId update_id = 2;
+  repeated DatasetUpdate dataset_updates = 3;
+}
+
+message DatasetUpdate {
+  string dataset_id = 1;
+  repeated flotsync.datamodel.v1.SchemaOperation operations = 2;
+}

@@ -7,7 +7,13 @@ use flotsync_data_types::{
 };
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
-use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 mod errors;
 mod ids;
@@ -208,9 +214,24 @@ impl Default for GroupMigrationPolicy {
 }
 
 /// Runtime configuration passed during `load`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicationConfig {
     pub group_migration_policy: GroupMigrationPolicy,
+    /// Concrete local UDP socket address used for the runtime's externally
+    /// reachable delivery socket.
+    ///
+    /// A wildcard bind keeps the runtime ready for off-host communication once
+    /// discovery advertises a routable endpoint.
+    pub external_udp_bind_addr: SocketAddr,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            group_migration_policy: GroupMigrationPolicy::default(),
+            external_udp_bind_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        }
+    }
 }
 
 /// Request to create a new replication group.

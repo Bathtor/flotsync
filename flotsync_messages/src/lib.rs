@@ -13,6 +13,7 @@ pub use flotsync::{
     datamodel::v1 as datamodel,
     delivery::v1 as delivery,
     discovery::v1 as discovery,
+    replication::v1 as replication,
     versions::v1 as versions,
 };
 

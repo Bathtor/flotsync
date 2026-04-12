@@ -152,13 +152,18 @@ impl GroupMembers {
         self.member_indices.iter_keys()
     }
 
-    /// Insert or replace one member with its fixed canonical index.
-    pub fn insert(
-        &mut self,
-        member: MemberIdentity,
-        member_index: MemberIndex,
-    ) -> Option<MemberIndex> {
-        self.member_indices.insert(member, member_index)
+    /// Return the canonical bootstrap order for this group.
+    pub fn ordered_members(&self) -> Vec<MemberIdentity> {
+        let mut ordered_members: Vec<_> = self
+            .member_indices
+            .iter()
+            .map(|(member, index)| (*index, member.clone()))
+            .collect();
+        ordered_members.sort_by_key(|(index, _)| *index);
+        ordered_members
+            .into_iter()
+            .map(|(_, member)| member)
+            .collect()
     }
 
     /// Return whether this member set is empty.
@@ -177,6 +182,19 @@ impl Default for GroupMembers {
         Self::new()
     }
 }
+
+impl PartialEq for GroupMembers {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        self.member_indices
+            .iter()
+            .all(|(member, index)| other.member_index(&member) == Some(*index))
+    }
+}
+
+impl Eq for GroupMembers {}
 
 #[cfg(test)]
 mod tests {
