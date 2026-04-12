@@ -401,6 +401,17 @@ struct RuntimeHarness {
     receiver_addr: SocketAddr,
 }
 
+struct RuntimeHarnessBuildConfig {
+    sender_request_behavior: ProxyRequestBehavior,
+    sender_indication_behavior: ProxyIndicationBehavior,
+    receiver_request_behavior: ProxyRequestBehavior,
+    receiver_indication_behavior: ProxyIndicationBehavior,
+    sender_config: SenderConfig,
+    receiver_config: ReceiverConfig,
+    send_rate_control: TestSendRateControl,
+    manual_time: bool,
+}
+
 impl RuntimeHarness {
     fn new(
         sender_request_behavior: ProxyRequestBehavior,
@@ -449,7 +460,7 @@ impl RuntimeHarness {
         receiver_config: ReceiverConfig,
         send_rate_control: TestSendRateControl,
     ) -> Self {
-        Self::build(
+        Self::build(RuntimeHarnessBuildConfig {
             sender_request_behavior,
             sender_indication_behavior,
             receiver_request_behavior,
@@ -457,8 +468,8 @@ impl RuntimeHarness {
             sender_config,
             receiver_config,
             send_rate_control,
-            false,
-        )
+            manual_time: false,
+        })
     }
 
     fn with_send_rate_control_manual_time(
@@ -470,7 +481,7 @@ impl RuntimeHarness {
         receiver_config: ReceiverConfig,
         send_rate_control: TestSendRateControl,
     ) -> Self {
-        Self::build(
+        Self::build(RuntimeHarnessBuildConfig {
             sender_request_behavior,
             sender_indication_behavior,
             receiver_request_behavior,
@@ -478,20 +489,21 @@ impl RuntimeHarness {
             sender_config,
             receiver_config,
             send_rate_control,
-            true,
-        )
+            manual_time: true,
+        })
     }
 
-    fn build(
-        sender_request_behavior: ProxyRequestBehavior,
-        sender_indication_behavior: ProxyIndicationBehavior,
-        receiver_request_behavior: ProxyRequestBehavior,
-        receiver_indication_behavior: ProxyIndicationBehavior,
-        sender_config: SenderConfig,
-        receiver_config: ReceiverConfig,
-        send_rate_control: TestSendRateControl,
-        manual_time: bool,
-    ) -> Self {
+    fn build(config: RuntimeHarnessBuildConfig) -> Self {
+        let RuntimeHarnessBuildConfig {
+            sender_request_behavior,
+            sender_indication_behavior,
+            receiver_request_behavior,
+            receiver_indication_behavior,
+            sender_config,
+            receiver_config,
+            send_rate_control,
+            manual_time,
+        } = config;
         let (system, manual_timer) =
             build_runtime_test_kompact_system(send_rate_control, manual_time);
         let socket_lease =

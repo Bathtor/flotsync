@@ -494,7 +494,8 @@ impl SpawnedNetcat {
 
     fn collect_exited_output(&mut self) -> (Vec<u8>, Vec<u8>) {
         self.stdin.take();
-        let _child = self.child.take().expect("live child process");
+        let mut child = self.child.take().expect("live child process");
+        let _status = child.wait().expect("wait for exited child process");
         let stdout = self.join_stdout();
         let stderr = self.join_stderr();
         (stdout, stderr)
