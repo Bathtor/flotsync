@@ -24,7 +24,7 @@ pub(super) fn run_driver_thread(
     startup_tx: std::sync::mpsc::SyncSender<Result<()>>,
     ingress_pool: IngressPool,
 ) -> Result<()> {
-    let mut state = DriverRuntimeState::new(logger.clone());
+    let mut state = DriverRuntimeState::new(logger.clone(), config.bind_reuse_address);
     let mut events = Events::with_capacity(config.events_capacity.max(1));
     // This scratch buffer is stack-allocated on purpose: 1472 bytes is small for a dedicated
     // driver thread stack, avoids a permanent heap allocation in the hot path, and matches the

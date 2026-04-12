@@ -1,12 +1,39 @@
+use clap::Args;
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
 use kompact::prelude::{Component, KompactConfig, KompactSystem};
 use slog::{Drain, Level, Logger, o};
 use snafu::{FromString, Whatever, prelude::*};
-use std::sync::{Arc, OnceLock};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 /// Result type used by the example binaries.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type Error = Whatever;
+
+/// Shared CLI options for configuring the example binaries' Kompact runtime.
+#[derive(Args, Clone, Debug, Default)]
+pub struct RuntimeConfigArgs {
+    /// Inline Kompact configuration string loaded after any config file.
+    #[arg(long = "kompact-config")]
+    pub kompact_config: Option<String>,
+    /// Path to one Kompact configuration file.
+    #[arg(long = "kompact-config-file")]
+    pub kompact_config_file: Option<PathBuf>,
+}
+
+impl RuntimeConfigArgs {
+    /// Applies the requested Kompact config sources to one runtime config.
+    pub fn apply_to(&self, config: &mut KompactConfig) {
+        if let Some(path) = &self.kompact_config_file {
+            config.load_config_file(path.clone());
+        }
+        if let Some(config_str) = &self.kompact_config {
+            config.load_config_str(config_str.clone());
+        }
+    }
+}
 
 /// Shared Kompact runtime used by the example binaries.
 ///
@@ -25,10 +52,12 @@ impl ExampleRuntime {
     ///
     /// This only constructs the shared runtime graph. Startup is deferred until the example has
     /// created and wired its transport-specific netcat component.
-    pub fn setup() -> Result<Self> {
+    pub fn setup(runtime_config: &RuntimeConfigArgs) -> Result<Self> {
         init_logging();
 
-        let system = KompactConfig::default().build().map_err(|error| {
+        let mut config = KompactConfig::default();
+        runtime_config.apply_to(&mut config);
+        let system = config.build().map_err(|error| {
             Whatever::without_source(format!("failed to build Kompact system: {error}"))
         })?;
 

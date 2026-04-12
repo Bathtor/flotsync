@@ -3,10 +3,11 @@ use flotsync_io::{
     api::UdpCloseReason,
     prelude::*,
     test_support::{
+        ReservedSocketKind,
         assert_no_driver_event,
         init_test_logger,
         localhost,
-        payload_bytes,
+        reserve_sockets,
         wait_for_driver_event,
         wait_for_driver_request,
     },
@@ -53,13 +54,19 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
 fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
     init_test_logger();
 
-    let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+    let socket_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let driver = IoDriver::start(DriverConfig {
+        bind_reuse_address: true,
+        ..DriverConfig::default()
+    })
+    .expect("driver starts");
     let receiver_id = reserve_socket(&driver);
     let sender_id = reserve_socket(&driver);
     let connected_sender_id = reserve_socket(&driver);
 
-    let receiver_addr = bind_socket_at(&driver, receiver_id, localhost(0));
-    let sender_addr = bind_socket_at(&driver, sender_id, localhost(0));
+    let receiver_addr = bind_socket_at(&driver, receiver_id, socket_lease.addr(0));
+    let sender_addr = bind_socket_at(&driver, sender_id, socket_lease.addr(1));
 
     driver
         .dispatch(DriverCommand::Udp(UdpCommand::Send {
@@ -86,7 +93,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 payload,
             }) if socket_id == receiver_id => {
                 assert_eq!(source, sender_addr);
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+                assert_eq!(payload.to_vec().as_slice(), b"hello");
                 saw_unconnected_receive = true;
             }
             other => {
@@ -149,7 +156,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 payload,
             }) if socket_id == receiver_id => {
                 assert_eq!(source, connected_sender_addr);
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_connected_receive = true;
             }
             other => {
@@ -310,6 +317,8 @@ fn udp_driver_reports_bind_failures_and_socket_configuration_changes() {
 fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
     init_test_logger();
 
+    let socket_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let pool_config = IoPoolConfig {
         chunk_size: MAX_UDP_PAYLOAD_BYTES,
         initial_chunk_count: 1,
@@ -321,14 +330,15 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
             ingress: pool_config.clone(),
             egress: pool_config,
         },
+        bind_reuse_address: true,
         ..DriverConfig::default()
     })
     .expect("driver starts");
 
     let receiver_id = reserve_socket(&driver);
     let sender_id = reserve_socket(&driver);
-    let receiver_addr = bind_socket_at(&driver, receiver_id, localhost(0));
-    bind_socket_at(&driver, sender_id, localhost(0));
+    let receiver_addr = bind_socket_at(&driver, receiver_id, socket_lease.addr(0));
+    bind_socket_at(&driver, sender_id, socket_lease.addr(1));
 
     for (transmission_id, payload) in [
         (TransmissionId(10), Bytes::from_static(b"first")),
@@ -405,7 +415,7 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
             DriverEvent::Udp(UdpEvent::Received {
                 socket_id, payload, ..
             }) if socket_id == receiver_id => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"third"));
+                assert_eq!(payload.to_vec().as_slice(), b"third");
                 saw_third_payload = true;
             }
             other => {
@@ -472,6 +482,8 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
         other => unreachable!("filtered to UDP SendNack event, got {other:?}"),
     }
 
-    assert_no_driver_event(&driver, Duration::from_millis(25));
+    // Once a send on the closed socket has already been nacked, the driver
+    // must stay quiet instead of surfacing any delayed follow-up outcome.
+    assert_no_driver_event(&driver, Duration::from_millis(500));
     driver.shutdown().expect("driver shuts down");
 }

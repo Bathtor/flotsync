@@ -93,12 +93,12 @@ pub(super) struct DriverRuntimeState {
 }
 
 impl DriverRuntimeState {
-    pub(super) fn new(logger: RuntimeLogger) -> Self {
+    pub(super) fn new(logger: RuntimeLogger, bind_reuse_address: bool) -> Self {
         Self {
             logger: logger.clone(),
             readiness_keys: SlotRegistry::default(),
-            tcp: TcpRuntimeState::new(logger.clone()),
-            udp: UdpRuntimeState::new(logger),
+            tcp: TcpRuntimeState::new(logger.clone(), bind_reuse_address),
+            udp: UdpRuntimeState::new(logger, bind_reuse_address),
             #[cfg(test)]
             test_state: DriverTestState::default(),
         }

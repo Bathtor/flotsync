@@ -53,6 +53,15 @@ impl<V> TrieMap<V> {
         node.value.as_ref()
     }
 
+    pub fn remove(&mut self, key: &Identifier) -> Option<V> {
+        let removed = Self::remove_from_node(&mut self.root, key.segments_iter());
+        debug_assert!(
+            self.root.value.is_none(),
+            "trie root must stay valueless after keyed removal"
+        );
+        removed
+    }
+
     #[allow(dead_code)] // for later
     pub fn get_mut(&mut self, key: &Identifier) -> Option<&mut V> {
         let mut node = &mut self.root;
@@ -73,6 +82,27 @@ impl<V> TrieMap<V> {
 
     pub fn iter_keys(&self) -> TrieIdentifierIter<'_, V> {
         TrieIdentifierIter { inner: self.iter() }
+    }
+
+    fn remove_from_node<'a>(
+        node: &mut TrieNode<V>,
+        mut path: impl Iterator<Item = &'a IdentifierSegment>,
+    ) -> Option<V> {
+        if let Some(segment) = path.next() {
+            let child = node.children.get_mut(segment)?;
+            let removed = Self::remove_from_node(child, path);
+            if child.value.is_none() && child.children.is_empty() {
+                node.children.remove(segment);
+            }
+            removed
+        } else {
+            node.value.take()
+        }
+    }
+}
+impl<V> Default for TrieMap<V> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -262,5 +292,26 @@ mod tests {
         expected.sort_by_key(|id| id.0.clone());
 
         assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn test_remove_prunes_empty_branches() {
+        let mut trie_map = TrieMap::new();
+        let a = id(["a"]);
+        let ab = id(["a", "b"]);
+        let abc = id(["a", "b", "c"]);
+
+        trie_map.insert(a.clone(), 1);
+        trie_map.insert(ab.clone(), 2);
+        trie_map.insert(abc.clone(), 3);
+
+        assert_eq!(trie_map.remove(&abc), Some(3));
+        assert_eq!(trie_map.get(&abc), None);
+        assert_eq!(trie_map.get(&ab), Some(&2));
+        assert_eq!(trie_map.remove(&ab), Some(2));
+        assert_eq!(trie_map.get(&ab), None);
+        assert_eq!(trie_map.get(&a), Some(&1));
+        assert_eq!(trie_map.remove(&a), Some(1));
+        assert!(trie_map.is_empty());
     }
 }

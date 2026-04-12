@@ -1,7 +1,7 @@
 # HistorySnapshot Benchmark Baseline
 
 This document records the current benchmark baseline for the canonical protobuf
-[`HistorySnapshot`](../messages/proto/datamodel.proto) format.
+[`HistorySnapshot`](../messages/proto/flotsync/datamodel/v1/datamodel.proto) format.
 
 It is no longer an experiment comparison document. The purpose of this benchmark is to catch
 performance and encoded-size regressions in the shipped columnar history transport.

@@ -15,6 +15,7 @@ use crate::{
     errors::{Error, Result, UpdateTcpInterestSnafu},
     logging::RuntimeLogger,
     pool::IngressPool,
+    socket_support::{configure_bind_reuse, socket_domain},
 };
 use bytes::Buf;
 #[cfg(test)]
@@ -27,17 +28,23 @@ use mio::{
 };
 use slog::{debug, error, warn};
 use snafu::ResultExt;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Protocol, SockAddr, Socket, Type};
 use std::{
     io,
     io::{ErrorKind, Read, Write},
-    net::{SocketAddr, TcpStream as StdTcpStream},
+    net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream},
 };
+
+/// Backlog used when the reuse-enabled test bind path has to construct listeners via `socket2`.
+const TCP_LISTEN_BACKLOG: i32 = 1024;
 
 /// TCP-side runtime state owned by the shared driver.
 #[derive(Debug)]
 pub(super) struct TcpRuntimeState {
     logger: RuntimeLogger,
+    /// Mirrors the driver-wide bind policy so tests can opt listener binds into platform socket
+    /// re-use options.
+    bind_reuse_address: bool,
     listeners: SlotRegistry<TcpListenerEntry>,
     connections: SlotRegistry<TcpConnectionEntry>,
 }
@@ -227,9 +234,10 @@ impl PendingTcpSend {
 }
 
 impl TcpRuntimeState {
-    pub(super) fn new(logger: RuntimeLogger) -> Self {
+    pub(super) fn new(logger: RuntimeLogger, bind_reuse_address: bool) -> Self {
         Self {
             logger,
+            bind_reuse_address,
             listeners: SlotRegistry::default(),
             connections: SlotRegistry::default(),
         }
@@ -432,7 +440,7 @@ impl TcpRuntimeState {
             return Ok(());
         }
 
-        let listener_result = MioTcpListener::bind(local_addr);
+        let listener_result = bind_tcp_listener(local_addr, self.bind_reuse_address);
         let mut listener = match listener_result {
             Ok(listener) => listener,
             Err(error) => {
@@ -1256,6 +1264,26 @@ fn connect_tcp_stream(
     MioTcpStream::connect(remote_addr)
 }
 
+/// Binds one TCP listener, optionally opting into platform socket re-use for test-only port
+/// reservation.
+fn bind_tcp_listener(
+    local_addr: SocketAddr,
+    bind_reuse_address: bool,
+) -> io::Result<MioTcpListener> {
+    if !bind_reuse_address {
+        return MioTcpListener::bind(local_addr);
+    }
+
+    let socket = Socket::new(socket_domain(local_addr), Type::STREAM, Some(Protocol::TCP))?;
+    configure_bind_reuse(&socket)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(local_addr))?;
+    socket.listen(TCP_LISTEN_BACKLOG)?;
+
+    let listener: StdTcpListener = socket.into();
+    Ok(MioTcpListener::from_std(listener))
+}
+
 /// Connects one TCP stream after first binding it to a caller-selected local address.
 ///
 /// `mio` does not currently expose this path directly, so the implementation uses `socket2` and
@@ -1264,11 +1292,11 @@ fn connect_tcp_stream_with_local_addr(
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
 ) -> io::Result<MioTcpStream> {
-    let domain = match remote_addr {
-        SocketAddr::V4(_) => Domain::IPV4,
-        SocketAddr::V6(_) => Domain::IPV6,
-    };
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    let socket = Socket::new(
+        socket_domain(remote_addr),
+        Type::STREAM,
+        Some(Protocol::TCP),
+    )?;
     socket.set_nonblocking(true)?;
     socket.bind(&SockAddr::from(local_addr))?;
 
@@ -1295,10 +1323,15 @@ mod tests {
             wait_for_request,
         },
         prelude::Result,
-        test_support::init_test_logger,
+        test_support::{
+            ReservedSocketKind,
+            bind_reserved_tcp_listener,
+            init_test_logger,
+            reserve_sockets,
+        },
     };
     use std::{
-        net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
+        net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
         sync::mpsc,
         time::{Duration, Instant},
     };
@@ -1346,8 +1379,12 @@ mod tests {
         }
     }
 
-    fn payload_bytes(payload: IoPayload) -> Bytes {
-        payload.create_byte_clone()
+    fn start_bind_reuse_driver() -> IoDriver {
+        IoDriver::start(DriverConfig {
+            bind_reuse_address: true,
+            ..DriverConfig::default()
+        })
+        .expect("driver starts")
     }
 
     #[test]
@@ -1389,15 +1426,46 @@ mod tests {
     }
 
     #[test]
+    fn socket2_tcp_reuse_address_allows_rebinding_on_the_same_thread() {
+        let reservation = Socket::new(
+            crate::socket_support::socket_domain(localhost(0)),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .expect("create first TCP socket");
+        configure_bind_reuse(&reservation).expect("enable TCP re-use on first TCP socket");
+        reservation
+            .bind(&SockAddr::from(localhost(0)))
+            .expect("bind first TCP socket");
+        let reserved_addr = reservation
+            .local_addr()
+            .expect("first TCP socket local addr")
+            .as_socket()
+            .expect("TCP reservation must use an IP socket address");
+
+        let rebound = Socket::new(
+            crate::socket_support::socket_domain(localhost(0)),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .expect("create second TCP socket");
+        configure_bind_reuse(&rebound).expect("enable TCP re-use on second TCP socket");
+        rebound
+            .bind(&SockAddr::from(reserved_addr))
+            .expect("rebind TCP socket with SO_REUSEADDR");
+    }
+
+    #[test]
     fn tcp_listener_accept_requires_adoption_before_reads() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let driver = start_bind_reuse_driver();
         let listener_id = resolve_request(driver.reserve_listener());
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Listen {
                 listener_id,
-                local_addr: localhost(0),
+                local_addr: listener_lease.addr(0),
             }))
             .expect("dispatch TCP listen");
 
@@ -1454,7 +1522,7 @@ mod tests {
                     connection_id,
                     payload,
                 }) if connection_id == accepted_connection_id => {
-                    assert_eq!(payload_bytes(payload), b"pending"[..]);
+                    assert_eq!(payload.to_vec().as_slice(), b"pending");
                     break;
                 }
                 other => {
@@ -1474,12 +1542,13 @@ mod tests {
     fn tcp_listener_reject_closes_pending_connection() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let driver = start_bind_reuse_driver();
         let listener_id = resolve_request(driver.reserve_listener());
         driver
             .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Listen {
                 listener_id,
-                local_addr: localhost(0),
+                local_addr: listener_lease.addr(0),
             }))
             .expect("dispatch TCP listen");
 
@@ -1496,6 +1565,9 @@ mod tests {
         };
 
         let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set TCP client read timeout");
         let accepted_connection_id = loop {
             match wait_for_event(&driver) {
                 DriverEvent::Tcp(TcpEvent::Accepted {
@@ -1515,7 +1587,6 @@ mod tests {
             }))
             .expect("dispatch TCP reject accepted");
 
-        std::thread::sleep(Duration::from_millis(50));
         let mut buf = [0_u8; 1];
         let read_result = client.read(&mut buf);
         match read_result {
@@ -1538,7 +1609,9 @@ mod tests {
     fn tcp_connect_send_and_receive_work() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let (server_tx, server_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1601,7 +1674,7 @@ mod tests {
                     connection_id: received_id,
                     payload,
                 }) if received_id == connection_id => {
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated TCP event: {:?}", other);
@@ -1661,7 +1734,9 @@ mod tests {
     fn tcp_send_while_another_send_is_pending_is_nacked() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (_stream, _) = listener.accept().expect("accept TCP stream");
@@ -1742,7 +1817,9 @@ mod tests {
     fn tcp_write_resumes_after_pending_send_drains() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1839,7 +1916,9 @@ mod tests {
     fn tcp_graceful_close_waits_for_pending_send() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let (server_tx, server_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1922,7 +2001,9 @@ mod tests {
     fn tcp_send_and_close_supports_chained_payloads() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept TCP stream");
@@ -2000,14 +2081,18 @@ mod tests {
     fn tcp_read_suspends_and_resumes_when_ingress_capacity_returns() {
         init_test_logger();
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind TCP listener");
+        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let listener =
+            bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept TCP stream");
             stream
                 .write_all(&vec![b'a'; 300])
                 .expect("server write payload");
-            std::thread::sleep(Duration::from_millis(50));
+            stream
+                .shutdown(Shutdown::Write)
+                .expect("shutdown TCP write half after payload");
         });
 
         let driver_config = crate::driver::DriverConfig {
@@ -2105,7 +2190,7 @@ mod tests {
                     connection_id: received_id,
                     payload,
                 }) if received_id == connection_id => {
-                    third_payload = Some(payload_bytes(payload));
+                    third_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!(

@@ -1,9 +1,13 @@
+use flotsync_io::{
+    config_keys,
+    test_support::{ReservedSocketKind, ReservedSocketLease, reserve_sockets},
+};
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    process::{Child, ChildStdin, Command, Output, Stdio},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
+    sync::{Arc, Mutex},
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -11,18 +15,9 @@ use std::{
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn smoke_test_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 #[test]
 fn get_root_returns_hello_response() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(addr, &[b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"]);
@@ -41,8 +36,7 @@ fn get_root_returns_hello_response() {
 
 #[test]
 fn head_root_returns_headers_without_body() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(addr, &[b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n"]);
@@ -60,8 +54,7 @@ fn head_root_returns_headers_without_body() {
 
 #[test]
 fn post_echo_returns_exact_body() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(
@@ -82,8 +75,7 @@ fn post_echo_returns_exact_body() {
 
 #[test]
 fn post_echo_handles_split_writes() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(
@@ -103,8 +95,7 @@ fn post_echo_handles_split_writes() {
 
 #[test]
 fn pipelined_second_request_still_receives_first_response() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(
@@ -121,8 +112,7 @@ fn pipelined_second_request_still_receives_first_response() {
 
 #[test]
 fn malformed_request_with_trailing_bytes_still_returns_bad_request() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(
@@ -143,8 +133,7 @@ fn malformed_request_with_trailing_bytes_still_returns_bad_request() {
 
 #[test]
 fn post_echo_accepts_large_single_payload_body() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let body = vec![b'x'; 20 * 1024];
@@ -170,8 +159,7 @@ fn post_echo_accepts_large_single_payload_body() {
 
 #[test]
 fn unknown_path_returns_not_found() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(addr, &[b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n"]);
@@ -185,8 +173,7 @@ fn unknown_path_returns_not_found() {
 
 #[test]
 fn wrong_method_returns_allow_header() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(
@@ -203,8 +190,7 @@ fn wrong_method_returns_allow_header() {
 
 #[test]
 fn missing_host_returns_bad_request() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(addr, &[b"GET / HTTP/1.1\r\n\r\n"]);
@@ -217,8 +203,7 @@ fn missing_host_returns_bad_request() {
 
 #[test]
 fn http_10_returns_version_not_supported() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let response = exchange(addr, &[b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"]);
@@ -234,8 +219,7 @@ fn http_10_returns_version_not_supported() {
 
 #[test]
 fn stdin_eof_shuts_the_server_down() {
-    let _guard = smoke_test_guard();
-    let server = spawn_http_server();
+    let mut server = spawn_http_server();
     let _addr = server.wait_for_socket_addr("HTTP listening on ");
 
     let output = server.close_stdin_and_wait();
@@ -298,6 +282,7 @@ fn exchange(addr: SocketAddr, chunks: &[&[u8]]) -> Vec<u8> {
 }
 
 struct SpawnedHttpServer {
+    _socket_lease: ReservedSocketLease,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -307,15 +292,35 @@ struct SpawnedHttpServer {
 }
 
 impl SpawnedHttpServer {
-    fn wait_for_socket_addr(&self, marker: &str) -> SocketAddr {
+    fn wait_for_socket_addr(&mut self, marker: &str) -> SocketAddr {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             if let Some(addr) = self.find_socket_addr(marker) {
                 return addr;
             }
 
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .expect("live http_server child process")
+                .try_wait()
+                .expect("poll http_server child process")
+            {
+                self.panic_with_child_diagnostics(
+                    format!(
+                        "http_server exited before reporting socket address after marker: {marker}"
+                    ),
+                    Some(status),
+                );
+            }
+
             if Instant::now() >= deadline {
-                panic!("timed out waiting for HTTP server socket address after marker: {marker}");
+                self.panic_with_child_diagnostics(
+                    format!(
+                        "timed out waiting for HTTP server socket address after marker: {marker}"
+                    ),
+                    None,
+                );
             }
 
             thread::sleep(Duration::from_millis(20));
@@ -323,6 +328,10 @@ impl SpawnedHttpServer {
     }
 
     fn kill_and_collect(mut self) -> Output {
+        self.kill_and_collect_in_place()
+    }
+
+    fn kill_and_collect_in_place(&mut self) -> Output {
         self.stdin.take();
         let mut child = self.child.take().expect("live child process");
         let _ = child.kill();
@@ -391,11 +400,54 @@ impl SpawnedHttpServer {
         }
         None
     }
+
+    fn collect_exited_output(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.stdin.take();
+        let mut child = self.child.take().expect("live child process");
+        let _status = child.wait().expect("wait for exited child process");
+        let stdout = self.join_stdout();
+        let stderr = self.join_stderr();
+        (stdout, stderr)
+    }
+
+    fn panic_with_child_diagnostics(
+        &mut self,
+        context: String,
+        observed_status: Option<ExitStatus>,
+    ) -> ! {
+        let (status, stdout, stderr) = match observed_status {
+            Some(status) => {
+                let (stdout, stderr) = self.collect_exited_output();
+                (status, stdout, stderr)
+            }
+            None => {
+                let output = self.kill_and_collect_in_place();
+                (output.status, output.stdout, output.stderr)
+            }
+        };
+        panic!(
+            "{context}\nexit status: {}\nstdout:\n{}\nstderr:\n{}",
+            format_exit_status(status),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+fn format_exit_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("code {code}"),
+        None => "terminated by signal".to_owned(),
+    }
 }
 
 fn spawn_http_server() -> SpawnedHttpServer {
+    let socket_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let bind_addr = socket_lease.addr(0);
     let mut command = Command::new(env!("CARGO_BIN_EXE_http_server"));
-    command.args(["--bind", "127.0.0.1:0"]);
+    let bind_reuse_config = bind_reuse_config_string();
+    command.args(["--kompact-config", bind_reuse_config.as_str()]);
+    command.args(["--bind", &bind_addr.to_string()]);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -432,6 +484,7 @@ fn spawn_http_server() -> SpawnedHttpServer {
         }
     });
     SpawnedHttpServer {
+        _socket_lease: socket_lease,
         child: Some(child),
         stdin: Some(stdin),
         stdout,
@@ -439,4 +492,8 @@ fn spawn_http_server() -> SpawnedHttpServer {
         stdout_thread: Some(stdout_thread),
         stderr_thread: Some(stderr_thread),
     }
+}
+
+fn bind_reuse_config_string() -> String {
+    format!("{} = true", config_keys::BIND_REUSE_ADDRESS.key)
 }

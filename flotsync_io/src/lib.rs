@@ -1,12 +1,26 @@
 //! Freeform network I/O skeleton for the upcoming mio-backed Kompact integration.
 
 pub mod api;
+/// Kompact configuration keys consumed by `flotsync_io` components.
+pub mod config_keys {
+    use kompact::{config::BooleanValue, kompact_config};
+
+    kompact_config! {
+        BIND_REUSE_ADDRESS,
+        key = "flotsync.io.bind-reuse-address",
+        type = BooleanValue,
+        default = false,
+        doc = "Whether flotsync_io bind paths should opt into platform socket re-use options. This is intended for tests that coordinate reserved ports outside the driver.",
+        version = "0.1.0"
+    }
+}
 pub mod driver;
 pub mod errors;
 pub mod framing;
 pub mod kompact;
 mod logging;
 pub mod pool;
+pub mod socket_support;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -70,6 +84,7 @@ pub mod prelude {
             EgressAsyncWriter,
             EgressPool,
             EgressReservation,
+            EgressReservedWriter,
             IngressBuffer,
             IngressPool,
             IoBufferConfig,

@@ -14,7 +14,7 @@ use flotsync_io::prelude::{
     UdpSendResult,
     UdpSocketOption,
 };
-use flotsync_messages::{discovery::Peer, protobuf::Message};
+use flotsync_messages::{buffa::Message, discovery::Peer};
 use itertools::Itertools;
 use pnet::{
     datalink::{self, NetworkInterface},
@@ -314,10 +314,8 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn encoded_broadcast_message(&self) -> Result<Vec<u8>> {
-        self.broadcast_message()
-            .write_to_bytes()
-            .context(ProtoSnafu)
+    fn encoded_broadcast_message(&self) -> Vec<u8> {
+        self.broadcast_message().encode_to_vec()
     }
 
     fn send_announcement_to_known_targets(&mut self) -> Handled {
@@ -334,17 +332,7 @@ impl PeerAnnouncementComponent {
             return Handled::Ok;
         }
 
-        let payload = match self.encoded_broadcast_message() {
-            Ok(payload) => payload,
-            Err(error) => {
-                error!(
-                    self.log(),
-                    "Could not encode peer announcement broadcast payload: {error}"
-                );
-                self.request_close();
-                return Handled::DieNow;
-            }
-        };
+        let payload = self.encoded_broadcast_message();
         let reply_to = self
             .actor_ref()
             .recipient_with(PeerAnnouncementMessage::SendResult);
@@ -746,8 +734,8 @@ mod tests {
                     )))
                 );
 
-                let message = Peer::parse_from_bytes(&payload.create_byte_clone())
-                    .expect("decode peer announcement");
+                let payload = payload.to_vec();
+                let message = Peer::decode_from_slice(&payload).expect("decode peer announcement");
                 assert_eq!(message.instance_uuid, expected_instance_id.as_bytes());
             }
             other => unreachable!("filtered to send request, got {other:?}"),

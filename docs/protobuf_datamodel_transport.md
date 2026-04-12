@@ -10,7 +10,7 @@ schema/datamodel snapshots and operations.
 - Snapshot decoding is schema-driven. In practice, callers are expected to decode with the same
   logical schema that was used to encode.
 - The current canonical history representation is the columnar
-  [`HistorySnapshot`](../messages/proto/datamodel.proto), not the
+  [`HistorySnapshot`](../messages/proto/flotsync/datamodel/v1/datamodel.proto), not the
   earlier row-oriented node message shape.
 
 ## Compatibility Expectations

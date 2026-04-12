@@ -1,14 +1,31 @@
 # Agent Instructions
 
+- Always assume I made manual changes since the last time you ran. Be careful not to accidentally overwrite those changes by regenerating from outdated state.
+
 ## Rust Rules
 
+- Do not run multiple `cargo` instances in parallel! They anyway lock.
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical.
 - Prefer readable control flow over chained iterator side effects.
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
-- Add developer-facing docs or comments to non-public Rust types, fields, and helper functions when their role, invariants, or lifecycle are not obvious from local context.
+- Add developer-facing docs or comments to non-public Rust types, fields, variants, and helper functions when their role, invariants, or lifecycle are not totally obvious from local context.
+- Add loop labels when control flow spans non-trivial nested loops or retries.
+- Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:
+    1. public items (`pub`)
+    2. restricted-visibility items (`pub(<qualifier>)`)
+    3. macros
+    4. private items
+    5. exposed test helpers
+    6. tests
+- Within each group, use this order:
+    1. constants
+    2. traits
+    3. functions
+    4. structs/enums, each followed immediately by all associated `impl` blocks
+- Imports should remain at the very top of the file/module/function.
 
 <!-- BEGIN BEADS INTEGRATION -->
 
@@ -22,6 +39,11 @@
 - Git-friendly: Dolt-powered version control with native sync
 - Agent-optimized: JSON output, ready work detection, discovered-from links
 - Prevents duplicate tracking systems and confusion
+
+### Important Rules
+
+- Do not access `bd` in parallel!
+- Always access it outside the sandbox. (It starts a server and it gets confused otherwise.)
 
 ### Quick Start
 

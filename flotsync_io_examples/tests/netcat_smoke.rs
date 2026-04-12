@@ -1,8 +1,12 @@
+use flotsync_io::{
+    config_keys,
+    test_support::{ReservedSocketKind, ReservedSocketLease, reserve_sockets},
+};
 use std::{
     io::Read,
     net::SocketAddr,
-    process::{Child, ChildStdin, Command, Output, Stdio},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
+    sync::{Arc, Mutex},
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -10,22 +14,10 @@ use std::{
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn smoke_test_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    // These smoke tests spawn real child processes that briefly reserve loopback ports and infer
-    // readiness from their stdout/stderr. Running them concurrently makes the "closed port" and
-    // listener/client assumptions race with each other, so keep the whole suite process-local and
-    // serial.
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("smoke-test guard lock")
-}
-
 #[test]
 fn udp_bind_pair_exchanges_one_scripted_line() {
-    let _guard = smoke_test_guard();
-    let receiver = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);
+    let mut receiver =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
     let receiver_addr = receiver.wait_for_socket_addr("UDP bound ");
 
     let sender = spawn_netcat(&[
@@ -56,8 +48,8 @@ fn udp_bind_pair_exchanges_one_scripted_line() {
 
 #[test]
 fn udp_sendto_interactive_mode_stays_alive_until_explicit_shutdown() {
-    let _guard = smoke_test_guard();
-    let receiver = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);
+    let mut receiver =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
     let receiver_addr = receiver.wait_for_socket_addr("UDP bound ");
 
     let mut sender = spawn_netcat(&["udp", "sendto", "--target", &receiver_addr.to_string()]);
@@ -85,8 +77,8 @@ fn udp_sendto_interactive_mode_stays_alive_until_explicit_shutdown() {
 
 #[test]
 fn udp_connect_client_exchanges_one_scripted_line() {
-    let _guard = smoke_test_guard();
-    let receiver = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);
+    let mut receiver =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
     let receiver_addr = receiver.wait_for_socket_addr("UDP bound ");
 
     let sender = spawn_netcat(&[
@@ -118,8 +110,8 @@ fn udp_connect_client_exchanges_one_scripted_line() {
 #[cfg(target_os = "macos")]
 #[test]
 fn udp_connect_client_exits_after_server_disappears() {
-    let _guard = smoke_test_guard();
-    let server = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);
+    let mut server =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
     let server_addr = server.wait_for_socket_addr("UDP bound ");
 
     let mut client = spawn_netcat(&["udp", "connect", "--remote", &server_addr.to_string()]);
@@ -145,7 +137,6 @@ fn udp_connect_client_exits_after_server_disappears() {
 
 #[test]
 fn tcp_connect_to_closed_port_fails() {
-    let _guard = smoke_test_guard();
     let closed_addr = closed_loopback_tcp_addr();
     let client = spawn_netcat(&[
         "--send",
@@ -173,8 +164,8 @@ fn tcp_connect_to_closed_port_fails() {
 
 #[test]
 fn tcp_listener_and_client_exchange_one_scripted_line() {
-    let _guard = smoke_test_guard();
-    let listener = spawn_netcat(&["tcp", "listen", "--bind", "127.0.0.1:0"]);
+    let mut listener =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::TcpListener, &["tcp", "listen"]);
     let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
 
     let client = spawn_netcat(&[
@@ -204,8 +195,8 @@ fn tcp_listener_and_client_exchange_one_scripted_line() {
 
 #[test]
 fn tcp_connect_empty_scripted_line_exits_cleanly() {
-    let _guard = smoke_test_guard();
-    let listener = spawn_netcat(&["tcp", "listen", "--bind", "127.0.0.1:0"]);
+    let mut listener =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::TcpListener, &["tcp", "listen"]);
     let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
 
     let client = spawn_netcat(&[
@@ -238,16 +229,10 @@ fn tcp_connect_empty_scripted_line_exits_cleanly() {
 
 #[test]
 fn tcp_listener_empty_scripted_line_closes_cleanly() {
-    let _guard = smoke_test_guard();
-    let listener = spawn_netcat(&[
-        "--send",
-        "",
-        "--exit-after-send",
-        "tcp",
-        "listen",
-        "--bind",
-        "127.0.0.1:0",
-    ]);
+    let mut listener = spawn_netcat_with_reserved_bind(
+        ReservedSocketKind::TcpListener,
+        &["--send", "", "--exit-after-send", "tcp", "listen"],
+    );
     let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
@@ -276,8 +261,8 @@ fn tcp_listener_empty_scripted_line_closes_cleanly() {
 
 #[test]
 fn udp_bind_replies_to_the_last_sender_without_explicit_target() {
-    let _guard = smoke_test_guard();
-    let mut listener = spawn_netcat(&["udp", "bind", "--bind", "127.0.0.1:0"]);
+    let mut listener =
+        spawn_netcat_with_reserved_bind(ReservedSocketKind::UdpSocket, &["udp", "bind"]);
     let listener_addr = listener.wait_for_socket_addr("UDP bound ");
 
     let mut sender = spawn_netcat(&["udp", "sendto", "--target", &listener_addr.to_string()]);
@@ -305,6 +290,7 @@ fn udp_bind_replies_to_the_last_sender_without_explicit_target() {
 }
 
 struct SpawnedNetcat {
+    _socket_lease: Option<ReservedSocketLease>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -322,7 +308,7 @@ impl SpawnedNetcat {
         stdin.flush().expect("flush child stdin");
     }
 
-    fn wait_for_stdout(&self, pattern: &str) {
+    fn wait_for_stdout(&mut self, pattern: &str) {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             let stdout = self.stdout.lock().expect("stdout lock");
@@ -331,8 +317,24 @@ impl SpawnedNetcat {
             }
             drop(stdout);
 
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .expect("live netcat child process")
+                .try_wait()
+                .expect("poll netcat child process")
+            {
+                self.panic_with_child_diagnostics(
+                    format!("netcat exited before stdout contained pattern: {pattern}"),
+                    Some(status),
+                );
+            }
+
             if Instant::now() >= deadline {
-                panic!("timed out waiting for stdout pattern: {pattern}");
+                self.panic_with_child_diagnostics(
+                    format!("timed out waiting for stdout pattern: {pattern}"),
+                    None,
+                );
             }
 
             thread::sleep(Duration::from_millis(20));
@@ -340,7 +342,7 @@ impl SpawnedNetcat {
     }
 
     #[allow(dead_code)] // for later
-    fn wait_for_stderr(&self, pattern: &str) {
+    fn wait_for_stderr(&mut self, pattern: &str) {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             let stderr = self.stderr.lock().expect("stderr lock");
@@ -349,23 +351,55 @@ impl SpawnedNetcat {
             }
             drop(stderr);
 
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .expect("live netcat child process")
+                .try_wait()
+                .expect("poll netcat child process")
+            {
+                self.panic_with_child_diagnostics(
+                    format!("netcat exited before stderr contained pattern: {pattern}"),
+                    Some(status),
+                );
+            }
+
             if Instant::now() >= deadline {
-                panic!("timed out waiting for stderr pattern: {pattern}");
+                self.panic_with_child_diagnostics(
+                    format!("timed out waiting for stderr pattern: {pattern}"),
+                    None,
+                );
             }
 
             thread::sleep(Duration::from_millis(20));
         }
     }
 
-    fn wait_for_socket_addr(&self, marker: &str) -> SocketAddr {
+    fn wait_for_socket_addr(&mut self, marker: &str) -> SocketAddr {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             if let Some(addr) = self.find_socket_addr(marker) {
                 return addr;
             }
 
+            if let Some(status) = self
+                .child
+                .as_mut()
+                .expect("live netcat child process")
+                .try_wait()
+                .expect("poll netcat child process")
+            {
+                self.panic_with_child_diagnostics(
+                    format!("netcat exited before reporting socket address after marker: {marker}"),
+                    Some(status),
+                );
+            }
+
             if Instant::now() >= deadline {
-                panic!("timed out waiting for stderr socket address after marker: {marker}");
+                self.panic_with_child_diagnostics(
+                    format!("timed out waiting for stderr socket address after marker: {marker}"),
+                    None,
+                );
             }
 
             thread::sleep(Duration::from_millis(20));
@@ -386,7 +420,17 @@ impl SpawnedNetcat {
                 }
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
-                    panic!("timed out waiting for netcat example process");
+                    let mut output = child
+                        .wait_with_output()
+                        .expect("collect killed netcat child output");
+                    output.stdout = self.join_stdout();
+                    output.stderr = self.join_stderr();
+                    panic!(
+                        "timed out waiting for netcat example process\nexit status: {}\nstdout:\n{}\nstderr:\n{}",
+                        format_exit_status(output.status),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
                 }
                 None => thread::sleep(Duration::from_millis(20)),
             }
@@ -399,6 +443,10 @@ impl SpawnedNetcat {
     }
 
     fn kill_and_collect(mut self) -> Output {
+        self.kill_and_collect_in_place()
+    }
+
+    fn kill_and_collect_in_place(&mut self) -> Output {
         self.stdin.take();
         let mut child = self.child.take().expect("live child process");
         let _ = child.kill();
@@ -443,6 +491,45 @@ impl SpawnedNetcat {
         let stderr = self.stderr.lock().expect("stderr lock");
         String::from_utf8_lossy(&stderr).into_owned()
     }
+
+    fn collect_exited_output(&mut self) -> (Vec<u8>, Vec<u8>) {
+        self.stdin.take();
+        let mut child = self.child.take().expect("live child process");
+        let _status = child.wait().expect("wait for exited child process");
+        let stdout = self.join_stdout();
+        let stderr = self.join_stderr();
+        (stdout, stderr)
+    }
+
+    fn panic_with_child_diagnostics(
+        &mut self,
+        context: String,
+        observed_status: Option<ExitStatus>,
+    ) -> ! {
+        let (status, stdout, stderr) = match observed_status {
+            Some(status) => {
+                let (stdout, stderr) = self.collect_exited_output();
+                (status, stdout, stderr)
+            }
+            None => {
+                let output = self.kill_and_collect_in_place();
+                (output.status, output.stdout, output.stderr)
+            }
+        };
+        panic!(
+            "{context}\nexit status: {}\nstdout:\n{}\nstderr:\n{}",
+            format_exit_status(status),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+fn format_exit_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("code {code}"),
+        None => "terminated by signal".to_owned(),
+    }
 }
 
 fn closed_loopback_tcp_addr() -> SocketAddr {
@@ -453,8 +540,27 @@ fn closed_loopback_tcp_addr() -> SocketAddr {
 }
 
 fn spawn_netcat(args: &[&str]) -> SpawnedNetcat {
+    spawn_netcat_owned(args.iter().map(|arg| (*arg).to_owned()).collect(), None)
+}
+
+fn spawn_netcat_with_reserved_bind(kind: ReservedSocketKind, args: &[&str]) -> SpawnedNetcat {
+    let socket_lease = reserve_sockets(&[kind]);
+    let bind_addr = socket_lease.addr(0).to_string();
+    let mut command_args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    command_args.splice(
+        0..0,
+        ["--kompact-config".to_owned(), bind_reuse_config_string()],
+    );
+    command_args.extend(["--bind".to_owned(), bind_addr]);
+    spawn_netcat_owned(command_args, Some(socket_lease))
+}
+
+fn spawn_netcat_owned(
+    command_args: Vec<String>,
+    socket_lease: Option<ReservedSocketLease>,
+) -> SpawnedNetcat {
     let mut command = Command::new(env!("CARGO_BIN_EXE_netcat"));
-    command.args(args);
+    command.args(&command_args);
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
@@ -491,6 +597,7 @@ fn spawn_netcat(args: &[&str]) -> SpawnedNetcat {
         }
     });
     SpawnedNetcat {
+        _socket_lease: socket_lease,
         child: Some(child),
         stdin: Some(stdin),
         stdout,
@@ -498,4 +605,8 @@ fn spawn_netcat(args: &[&str]) -> SpawnedNetcat {
         stdout_thread: Some(stdout_thread),
         stderr_thread: Some(stderr_thread),
     }
+}
+
+fn bind_reuse_config_string() -> String {
+    format!("{} = true", config_keys::BIND_REUSE_ADDRESS.key)
 }

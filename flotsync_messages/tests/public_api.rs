@@ -28,12 +28,12 @@ use flotsync_data_types::{
 use flotsync_messages::{
     InMemoryData,
     Uuid,
+    buffa::Message,
     codecs::{
         datamodel::{decode_schema_operation, encode_schema_operation},
         schema::{decode_schema_definition, encode_schema_definition},
     },
     datamodel as proto,
-    protobuf::Message,
     snapshots::datamodel::{ProtoDataSnapshotDecoder, ProtoDataSnapshotEncoder},
 };
 use std::{borrow::Cow, sync::LazyLock};
@@ -131,8 +131,8 @@ fn public_snapshot_transport_roundtrips_dataset() {
     let mut encoder = ProtoDataSnapshotEncoder::new(schema);
     data.encode_data_snapshots(&mut encoder).unwrap();
     let snapshot = encoder.into_snapshot().unwrap();
-    let bytes = snapshot.write_to_bytes().unwrap();
-    let snapshot = proto::DataSnapshot::parse_from_bytes(&bytes).unwrap();
+    let bytes = snapshot.encode_to_vec();
+    let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
     let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
     let roundtrip =
@@ -155,8 +155,8 @@ fn public_schema_transport_roundtrips_exhaustive_schema() {
         .insert("field-meta".to_owned(), "present".to_owned());
 
     let encoded = encode_schema_definition(&schema).unwrap();
-    let bytes = encoded.write_to_bytes().unwrap();
-    let encoded = proto::SchemaDefinition::parse_from_bytes(&bytes).unwrap();
+    let bytes = encoded.encode_to_vec();
+    let encoded = proto::SchemaDefinition::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_definition(encoded).unwrap();
 
     assert_eq!(decoded, schema);
@@ -177,8 +177,8 @@ fn public_schema_transport_roundtrips_field_defaults() {
     ]);
 
     let encoded = encode_schema_definition(&schema).unwrap();
-    let bytes = encoded.write_to_bytes().unwrap();
-    let encoded = proto::SchemaDefinition::parse_from_bytes(&bytes).unwrap();
+    let bytes = encoded.encode_to_vec();
+    let encoded = proto::SchemaDefinition::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_definition(encoded).unwrap();
 
     assert_eq!(decoded, schema);
@@ -209,8 +209,8 @@ fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
         )
         .unwrap();
     let encoded = encode_schema_operation(&insert, &old_schema).unwrap();
-    let bytes = encoded.write_to_bytes().unwrap();
-    let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+    let bytes = encoded.encode_to_vec();
+    let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_operation(encoded, &new_schema).unwrap();
 
     let target = InMemoryData::with_owned_schema(new_schema.clone())
@@ -234,8 +234,8 @@ fn public_operation_transport_roundtrips_exhaustive_examples() {
 
     for operation in operations {
         let encoded = encode_schema_operation(&operation, &schema).unwrap();
-        let bytes = encoded.write_to_bytes().unwrap();
-        let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+        let bytes = encoded.encode_to_vec();
+        let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
         let decoded = decode_schema_operation(encoded, &schema).unwrap();
         assert_eq!(decoded, operation);
     }
@@ -247,8 +247,8 @@ fn public_operation_transport_roundtrips_exhaustive_multi_field_example() {
     let operation = exhaustive_schema_operation(row_id(999), operation_ids()).unwrap();
 
     let encoded = encode_schema_operation(&operation, &schema).unwrap();
-    let bytes = encoded.write_to_bytes().unwrap();
-    let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+    let bytes = encoded.encode_to_vec();
+    let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_operation(encoded, &schema).unwrap();
 
     assert_eq!(decoded, operation);
@@ -276,8 +276,8 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
             )
             .unwrap();
         let encoded = encode_schema_operation(&insert, schema).unwrap();
-        let bytes = encoded.write_to_bytes().unwrap();
-        let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+        let bytes = encoded.encode_to_vec();
+        let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
         decode_schema_operation(encoded, schema).unwrap()
     };
     let decoded_update = match source
@@ -292,8 +292,8 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
     {
         OperationOutcome::Applied(operation) => {
             let encoded = encode_schema_operation(&operation, schema).unwrap();
-            let bytes = encoded.write_to_bytes().unwrap();
-            let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+            let bytes = encoded.encode_to_vec();
+            let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
             decode_schema_operation(encoded, schema).unwrap()
         }
         OperationOutcome::NoChanges => panic!("expected an update operation"),
@@ -301,8 +301,8 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
     let decoded_delete = {
         let delete = source.delete_row(update_id(102, 0), row_id).unwrap();
         let encoded = encode_schema_operation(&delete, schema).unwrap();
-        let bytes = encoded.write_to_bytes().unwrap();
-        let encoded = proto::SchemaOperation::parse_from_bytes(&bytes).unwrap();
+        let bytes = encoded.encode_to_vec();
+        let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
         decode_schema_operation(encoded, schema).unwrap()
     };
 

@@ -1,4 +1,4 @@
-use crate::app::ExampleRuntime;
+use crate::app::{ExampleRuntime, RuntimeConfigArgs};
 pub(crate) use crate::support::{
     OutcomePromise,
     complete_outcome,
@@ -31,6 +31,8 @@ pub type Error = Whatever;
 #[derive(Debug, Parser)]
 #[command(name = "netcat", version, about = "flotsync_io netcat-style example")]
 pub struct NetcatArgs {
+    #[command(flatten)]
+    runtime: RuntimeConfigArgs,
     /// Strings to send without reading stdin.
     #[arg(long = "send")]
     send: Vec<String>,
@@ -124,7 +126,7 @@ struct ShutdownTimerState {
 
 /// Runs the netcat-style example according to `args`.
 pub fn run(args: NetcatArgs) -> Result<()> {
-    let runtime = ExampleRuntime::setup()?;
+    let runtime = ExampleRuntime::setup(&args.runtime)?;
     let run_result = match args.mode {
         NetcatMode::Udp(udp) => udp::run_udp(&runtime, args.send, args.exit_after_send, udp.mode),
         NetcatMode::Tcp(tcp) => tcp::run_tcp(&runtime, args.send, args.exit_after_send, tcp.mode),

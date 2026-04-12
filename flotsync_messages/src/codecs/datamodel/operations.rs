@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    buffa::MessageField,
     datamodel as proto,
     snapshots::datamodel::{
         ProtoSchemaSnapshotDecoder,
@@ -18,7 +19,6 @@ use flotsync_data_types::{
         values,
     },
 };
-use protobuf::MessageField;
 use snafu::prelude::*;
 use std::{borrow::Cow, collections::HashSet};
 use uuid::Uuid;
@@ -55,7 +55,7 @@ pub enum OperationCodecError {
 trait RequiredMessageFieldExt<T> {
     fn take_required(&mut self, message: &'static str, field: &'static str) -> OperationResult<T>;
 }
-impl<T> RequiredMessageFieldExt<T> for MessageField<T> {
+impl<T: Default> RequiredMessageFieldExt<T> for MessageField<T> {
     fn take_required(&mut self, message: &'static str, field: &'static str) -> OperationResult<T> {
         self.take()
             .context(MissingFieldSnafu { message, field })
@@ -77,28 +77,36 @@ pub fn encode_schema_operation(
     operation: &model::SchemaOperation<'_, Uuid, UpdateId>,
     schema: &Schema,
 ) -> OperationResult<proto::SchemaOperation> {
-    let mut encoded = proto::SchemaOperation::new();
-    encoded.change_id = MessageField::some(encode_update_id(operation.change_id));
-    match &operation.operation {
+    let encoded_operation = match &operation.operation {
         RowOperation::Insert { row_id, snapshot } => {
-            let mut insert = proto::InsertRowOperation::new();
-            insert.row_id = encode_row_id(*row_id);
-            insert.snapshot = MessageField::some(encode_row_snapshot(snapshot, schema)?);
-            encoded.set_insert(insert);
+            let insert = proto::InsertRowOperation {
+                row_id: encode_row_id(*row_id),
+                snapshot: MessageField::some(encode_row_snapshot(snapshot, schema)?),
+                ..proto::InsertRowOperation::default()
+            };
+            proto::schema_operation::Operation::Insert(Box::new(insert))
         }
         RowOperation::Update { row_id, fields } => {
-            let mut update = proto::UpdateRowOperation::new();
-            update.row_id = encode_row_id(*row_id);
-            update.fields = fields.iter().map(encode_operation_field).try_collect()?;
-            encoded.set_update(update);
+            let update = proto::UpdateRowOperation {
+                row_id: encode_row_id(*row_id),
+                fields: fields.iter().map(encode_operation_field).try_collect()?,
+                ..proto::UpdateRowOperation::default()
+            };
+            proto::schema_operation::Operation::Update(Box::new(update))
         }
         RowOperation::Delete { row_id } => {
-            let mut delete = proto::DeleteRowOperation::new();
-            delete.row_id = encode_row_id(*row_id);
-            encoded.set_delete(delete);
+            let delete = proto::DeleteRowOperation {
+                row_id: encode_row_id(*row_id),
+                ..proto::DeleteRowOperation::default()
+            };
+            proto::schema_operation::Operation::Delete(Box::new(delete))
         }
-    }
-    Ok(encoded)
+    };
+    Ok(proto::SchemaOperation {
+        change_id: MessageField::some(encode_update_id(operation.change_id)),
+        operation: Some(encoded_operation),
+        ..proto::SchemaOperation::default()
+    })
 }
 
 /// Decode a schema operation from protobuf, validating it against the provided schema.
@@ -118,21 +126,21 @@ pub fn decode_schema_operation<'schema>(
 
     let operation = match operation {
         proto::schema_operation::Operation::Insert(insert) => {
-            let operation = decode_insert_row_operation(insert, schema)?;
+            let operation = decode_insert_row_operation(*insert, schema)?;
             model::SchemaOperation {
                 change_id,
                 operation,
             }
         }
         proto::schema_operation::Operation::Update(update) => {
-            let operation = decode_update_row_operation(update, schema)?;
+            let operation = decode_update_row_operation(*update, schema)?;
             model::SchemaOperation {
                 change_id,
                 operation,
             }
         }
         proto::schema_operation::Operation::Delete(delete) => {
-            let operation = decode_delete_row_operation(delete)?;
+            let operation = decode_delete_row_operation(*delete)?;
             model::SchemaOperation {
                 change_id,
                 operation,
@@ -186,7 +194,7 @@ fn decode_single_row_snapshot_field(
     schema_field: &flotsync_data_types::schema::Field,
 ) -> OperationResult<model::InMemoryFieldValue<UpdateId>> {
     let single_field_schema = Schema::from_fields([schema_field.clone()]);
-    let mut snapshot = proto::RowSnapshot::new();
+    let mut snapshot = proto::RowSnapshot::default();
     snapshot.fields.push(field);
 
     let mut decoder = ProtoSchemaSnapshotDecoder::new(snapshot).context(SnapshotAdapterSnafu)?;
@@ -235,31 +243,41 @@ fn decode_delete_row_operation(
 pub fn encode_operation_field(
     field: &model::OperationFieldValue<'_, UpdateId>,
 ) -> OperationResult<proto::OperationField> {
-    let mut encoded = proto::OperationField::new();
-    encoded.field_name = field.field_name.to_string();
-    match &field.value {
+    let encoded_value = match &field.value {
         model::OperationValue::LatestValueWins(value) => {
-            encoded.set_latest_value_wins(encode_latest_value_wins_operation(value))
+            proto::operation_field::Value::LatestValueWins(Box::new(
+                encode_latest_value_wins_operation(value),
+            ))
         }
         model::OperationValue::LinearString(values) => {
             let encoded_op = encode_linear_string_operation(values)?;
-            encoded.set_linear_string(encoded_op)
+            proto::operation_field::Value::LinearString(Box::new(encoded_op))
         }
         model::OperationValue::LinearList(values) => {
             let encoded_op = encode_linear_list_operation(values)?;
-            encoded.set_linear_list(encoded_op)
+            proto::operation_field::Value::LinearList(Box::new(encoded_op))
         }
-        model::OperationValue::MonotonicCounterIncrement(value) => encoded
-            .set_monotonic_counter_increment(encode_monotonic_counter_increment_operation(*value)),
+        model::OperationValue::MonotonicCounterIncrement(value) => {
+            proto::operation_field::Value::MonotonicCounterIncrement(Box::new(
+                encode_monotonic_counter_increment_operation(*value),
+            ))
+        }
         model::OperationValue::TotalOrderRegisterSet(value) => {
-            encoded.set_total_order_register_set(encode_total_order_register_set_operation(value))
+            proto::operation_field::Value::TotalOrderRegisterSet(Box::new(
+                encode_total_order_register_set_operation(value),
+            ))
         }
-        model::OperationValue::TotalOrderFiniteStateRegisterSet(value) => encoded
-            .set_total_order_finite_state_register_set(
+        model::OperationValue::TotalOrderFiniteStateRegisterSet(value) => {
+            proto::operation_field::Value::TotalOrderFiniteStateRegisterSet(Box::new(
                 encode_total_order_finite_state_register_set_operation(value),
-            ),
-    }
-    Ok(encoded)
+            ))
+        }
+    };
+    Ok(proto::OperationField {
+        field_name: field.field_name.to_string(),
+        value: Some(encoded_value),
+        ..proto::OperationField::default()
+    })
 }
 
 fn decode_operation_field<'schema>(
@@ -282,27 +300,27 @@ fn decode_operation_field<'schema>(
 
     let value = match value {
         proto::operation_field::Value::LatestValueWins(value) => {
-            let decoded_op = decode_latest_value_wins_operation(value)?;
+            let decoded_op = decode_latest_value_wins_operation(*value)?;
             model::OperationValue::LatestValueWins(decoded_op)
         }
         proto::operation_field::Value::LinearString(value) => {
-            let decoded_op = decode_linear_string_operation(value)?;
+            let decoded_op = decode_linear_string_operation(*value)?;
             model::OperationValue::LinearString(decoded_op)
         }
         proto::operation_field::Value::LinearList(value) => {
-            let decoded_op = decode_linear_list_operation(value)?;
+            let decoded_op = decode_linear_list_operation(*value)?;
             model::OperationValue::LinearList(decoded_op)
         }
         proto::operation_field::Value::MonotonicCounterIncrement(value) => {
-            let decoded_op = decode_monotonic_counter_increment_operation(value)?;
+            let decoded_op = decode_monotonic_counter_increment_operation(*value)?;
             model::OperationValue::MonotonicCounterIncrement(decoded_op)
         }
         proto::operation_field::Value::TotalOrderRegisterSet(value) => {
-            let decoded_op = decode_total_order_register_set_operation(value)?;
+            let decoded_op = decode_total_order_register_set_operation(*value)?;
             model::OperationValue::TotalOrderRegisterSet(decoded_op)
         }
         proto::operation_field::Value::TotalOrderFiniteStateRegisterSet(value) => {
-            let decoded_op = decode_total_order_finite_state_register_set_operation(value)?;
+            let decoded_op = decode_total_order_finite_state_register_set_operation(*value)?;
             model::OperationValue::TotalOrderFiniteStateRegisterSet(decoded_op)
         }
     };
@@ -316,12 +334,13 @@ fn decode_operation_field<'schema>(
 fn encode_latest_value_wins_operation(
     operation: &UpdateOperation<IdWithIndex<UpdateId>, model::NullableBasicValue>,
 ) -> proto::LatestValueWinsOperation {
-    let mut encoded = proto::LatestValueWinsOperation::new();
-    encoded.id = MessageField::some(encode_indexed_update_id(&operation.id));
-    encoded.pred = MessageField::some(encode_indexed_update_id(&operation.pred));
-    encoded.succ = MessageField::some(encode_indexed_update_id(&operation.succ));
-    encoded.value = MessageField::some(encode_nullable_basic_value(operation.value.as_ref()));
-    encoded
+    proto::LatestValueWinsOperation {
+        id: MessageField::some(encode_indexed_update_id(&operation.id)),
+        pred: MessageField::some(encode_indexed_update_id(&operation.pred)),
+        succ: MessageField::some(encode_indexed_update_id(&operation.succ)),
+        value: MessageField::some(encode_nullable_basic_value(operation.value.as_ref())),
+        ..proto::LatestValueWinsOperation::default()
+    }
 }
 
 fn decode_latest_value_wins_operation(
@@ -367,13 +386,14 @@ fn encode_linear_string_operation(
     actions: &[DataOperation<UpdateIdWithIndex, String>],
 ) -> OperationResult<proto::LinearStringOperation> {
     ensure_non_empty_batch(actions)?;
-
-    let mut encoded = proto::LinearStringOperation::new();
-    encoded.actions = actions
+    let actions = actions
         .iter()
         .map(encode_linear_string_action)
         .try_collect()?;
-    Ok(encoded)
+    Ok(proto::LinearStringOperation {
+        actions,
+        ..proto::LinearStringOperation::default()
+    })
 }
 
 fn decode_linear_string_operation(
@@ -390,17 +410,23 @@ fn decode_linear_string_operation(
 fn encode_linear_string_action(
     action: &DataOperation<UpdateIdWithIndex, String>,
 ) -> OperationResult<proto::LinearStringAction> {
-    let mut encoded = proto::LinearStringAction::new();
+    let mut encoded = proto::LinearStringAction::default();
     match action {
         DataOperation::Insert {
             id,
             pred,
             succ,
             value,
-        } => encoded.set_insert(encode_linear_string_insert_operation(id, pred, succ, value)),
+        } => {
+            encoded.value = Some(proto::linear_string_action::Value::Insert(Box::new(
+                encode_linear_string_insert_operation(id, pred, succ, value),
+            )))
+        }
         DataOperation::Delete { start, end } => {
             let encoded_op = encode_linear_delete_operation(start, end.as_ref())?;
-            encoded.set_delete(encoded_op)
+            encoded.value = Some(proto::linear_string_action::Value::Delete(Box::new(
+                encoded_op,
+            )))
         }
     }
     Ok(encoded)
@@ -415,9 +441,9 @@ fn decode_linear_string_action(
         .take_required_oneof("LinearStringAction.value")?;
     match value {
         proto::linear_string_action::Value::Insert(value) => {
-            decode_linear_string_insert_operation(value)
+            decode_linear_string_insert_operation(*value)
         }
-        proto::linear_string_action::Value::Delete(value) => decode_linear_delete_operation(value),
+        proto::linear_string_action::Value::Delete(value) => decode_linear_delete_operation(*value),
     }
 }
 
@@ -428,12 +454,13 @@ fn encode_linear_string_insert_operation(
     succ: &UpdateIdWithIndex,
     value: &str,
 ) -> proto::LinearStringInsertOperation {
-    let mut encoded = proto::LinearStringInsertOperation::new();
-    encoded.id = MessageField::some(encode_indexed_update_id(id));
-    encoded.pred = MessageField::some(encode_indexed_update_id(pred));
-    encoded.succ = MessageField::some(encode_indexed_update_id(succ));
-    encoded.value = value.to_owned();
-    encoded
+    proto::LinearStringInsertOperation {
+        id: MessageField::some(encode_indexed_update_id(id)),
+        pred: MessageField::some(encode_indexed_update_id(pred)),
+        succ: MessageField::some(encode_indexed_update_id(succ)),
+        value: value.to_owned(),
+        ..proto::LinearStringInsertOperation::default()
+    }
 }
 
 fn decode_linear_string_insert_operation(
@@ -464,13 +491,14 @@ fn encode_linear_list_operation(
     actions: &[DataOperation<UpdateIdWithIndex, values::PrimitiveValueArray>],
 ) -> OperationResult<proto::LinearListOperation> {
     ensure_non_empty_batch(actions)?;
-
-    let mut encoded = proto::LinearListOperation::new();
-    encoded.actions = actions
+    let actions = actions
         .iter()
         .map(encode_linear_list_action)
         .try_collect()?;
-    Ok(encoded)
+    Ok(proto::LinearListOperation {
+        actions,
+        ..proto::LinearListOperation::default()
+    })
 }
 
 fn decode_linear_list_operation(
@@ -487,16 +515,22 @@ fn decode_linear_list_operation(
 fn encode_linear_list_action(
     action: &DataOperation<UpdateIdWithIndex, values::PrimitiveValueArray>,
 ) -> OperationResult<proto::LinearListAction> {
-    let mut encoded = proto::LinearListAction::new();
+    let mut encoded = proto::LinearListAction::default();
     match action {
         DataOperation::Insert {
             id,
             pred,
             succ,
             value,
-        } => encoded.set_insert(encode_linear_list_insert_operation(id, pred, succ, value)),
+        } => {
+            encoded.value = Some(proto::linear_list_action::Value::Insert(Box::new(
+                encode_linear_list_insert_operation(id, pred, succ, value),
+            )))
+        }
         DataOperation::Delete { start, end } => {
-            encoded.set_delete(encode_linear_delete_operation(start, end.as_ref())?)
+            encoded.value = Some(proto::linear_list_action::Value::Delete(Box::new(
+                encode_linear_delete_operation(start, end.as_ref())?,
+            )))
         }
     }
     Ok(encoded)
@@ -511,9 +545,9 @@ fn decode_linear_list_action(
         .take_required_oneof("LinearListAction.value")?;
     match value {
         proto::linear_list_action::Value::Insert(value) => {
-            decode_linear_list_insert_operation(value)
+            decode_linear_list_insert_operation(*value)
         }
-        proto::linear_list_action::Value::Delete(value) => decode_linear_delete_operation(value),
+        proto::linear_list_action::Value::Delete(value) => decode_linear_delete_operation(*value),
     }
 }
 
@@ -523,12 +557,13 @@ fn encode_linear_list_insert_operation(
     succ: &UpdateIdWithIndex,
     value: &values::PrimitiveValueArray,
 ) -> proto::LinearListInsertOperation {
-    let mut encoded = proto::LinearListInsertOperation::new();
-    encoded.id = MessageField::some(encode_indexed_update_id(id));
-    encoded.pred = MessageField::some(encode_indexed_update_id(pred));
-    encoded.succ = MessageField::some(encode_indexed_update_id(succ));
-    encoded.value = MessageField::some(encode_primitive_array(value.as_ref()));
-    encoded
+    proto::LinearListInsertOperation {
+        id: MessageField::some(encode_indexed_update_id(id)),
+        pred: MessageField::some(encode_indexed_update_id(pred)),
+        succ: MessageField::some(encode_indexed_update_id(succ)),
+        value: MessageField::some(encode_primitive_array(value.as_ref())),
+        ..proto::LinearListInsertOperation::default()
+    }
 }
 
 fn decode_linear_list_insert_operation(
@@ -567,10 +602,11 @@ fn encode_linear_delete_operation(
         ensure!(start.id == end.id, DeleteRangeCrossesUpdateBoundarySnafu);
     }
 
-    let mut encoded = proto::LinearDeleteOperation::new();
-    encoded.start = MessageField::some(encode_indexed_update_id(start));
-    encoded.end_chunk_index = end.map(|end| end.index);
-    Ok(encoded)
+    Ok(proto::LinearDeleteOperation {
+        start: MessageField::some(encode_indexed_update_id(start)),
+        end_chunk_index: end.map(|end| end.index),
+        ..proto::LinearDeleteOperation::default()
+    })
 }
 
 fn decode_linear_delete_operation<Value>(
@@ -591,9 +627,10 @@ fn decode_linear_delete_operation<Value>(
 fn encode_monotonic_counter_increment_operation(
     value: model::CounterValue,
 ) -> proto::MonotonicCounterIncrementOperation {
-    let mut encoded = proto::MonotonicCounterIncrementOperation::new();
-    encoded.value = MessageField::some(encode_counter_value(value.as_ref()));
-    encoded
+    proto::MonotonicCounterIncrementOperation {
+        value: MessageField::some(encode_counter_value(value.as_ref())),
+        ..proto::MonotonicCounterIncrementOperation::default()
+    }
 }
 
 fn decode_monotonic_counter_increment_operation(
@@ -608,9 +645,10 @@ fn decode_monotonic_counter_increment_operation(
 fn encode_total_order_register_set_operation(
     value: &values::PrimitiveValue,
 ) -> proto::TotalOrderRegisterSetOperation {
-    let mut encoded = proto::TotalOrderRegisterSetOperation::new();
-    encoded.value = MessageField::some(encode_primitive_value(value.as_ref()));
-    encoded
+    proto::TotalOrderRegisterSetOperation {
+        value: MessageField::some(encode_primitive_value(value.as_ref())),
+        ..proto::TotalOrderRegisterSetOperation::default()
+    }
 }
 
 fn decode_total_order_register_set_operation(
@@ -625,9 +663,10 @@ fn decode_total_order_register_set_operation(
 fn encode_total_order_finite_state_register_set_operation(
     value: &values::NullablePrimitiveValue,
 ) -> proto::TotalOrderFiniteStateRegisterSetOperation {
-    let mut encoded = proto::TotalOrderFiniteStateRegisterSetOperation::new();
-    encoded.value = MessageField::some(encode_nullable_primitive_value(value.as_ref()));
-    encoded
+    proto::TotalOrderFiniteStateRegisterSetOperation {
+        value: MessageField::some(encode_nullable_primitive_value(value.as_ref())),
+        ..proto::TotalOrderFiniteStateRegisterSetOperation::default()
+    }
 }
 
 fn decode_total_order_finite_state_register_set_operation(
@@ -803,19 +842,24 @@ mod tests {
     #[test]
     fn decode_rejects_empty_linear_batches() {
         let schema = exhaustive_schema();
-        let mut field = proto::OperationField::new();
-        field.field_name = "linear_string".to_owned();
-        field.set_linear_string(proto::LinearStringOperation::new());
-
-        let mut operation = proto::SchemaOperation::new();
-        operation.change_id = MessageField::some(encode_update_id(UpdateId {
-            version: 300,
-            node_index: 0,
-        }));
-        let mut update = proto::UpdateRowOperation::new();
-        update.row_id = encode_row_id(row_id(301));
-        update.fields.push(field);
-        operation.set_update(update);
+        let field = proto::OperationField {
+            field_name: "linear_string".to_owned(),
+            value: Some(proto::operation_field::Value::LinearString(Box::default())),
+            ..proto::OperationField::default()
+        };
+        let update = proto::UpdateRowOperation {
+            row_id: encode_row_id(row_id(301)),
+            fields: vec![field],
+            ..proto::UpdateRowOperation::default()
+        };
+        let operation = proto::SchemaOperation {
+            change_id: MessageField::some(encode_update_id(UpdateId {
+                version: 300,
+                node_index: 0,
+            })),
+            operation: Some(proto::schema_operation::Operation::Update(Box::new(update))),
+            ..proto::SchemaOperation::default()
+        };
 
         let err = decode_schema_operation(operation, &schema).unwrap_err();
         assert_matches!(
@@ -829,25 +873,32 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_field_variant_for_schema() {
         let schema = exhaustive_schema();
-        let mut field = proto::OperationField::new();
-        field.field_name = "linear_string".to_owned();
-        field.set_total_order_register_set({
-            let mut operation = proto::TotalOrderRegisterSetOperation::new();
-            operation.value = MessageField::some(encode_primitive_value(
+        let operation = proto::TotalOrderRegisterSetOperation {
+            value: MessageField::some(encode_primitive_value(
                 PrimitiveValue::String("wrong".to_owned()).as_ref(),
-            ));
-            operation
-        });
-
-        let mut operation = proto::SchemaOperation::new();
-        operation.change_id = MessageField::some(encode_update_id(UpdateId {
-            version: 302,
-            node_index: 0,
-        }));
-        let mut update = proto::UpdateRowOperation::new();
-        update.row_id = encode_row_id(row_id(303));
-        update.fields.push(field);
-        operation.set_update(update);
+            )),
+            ..proto::TotalOrderRegisterSetOperation::default()
+        };
+        let field = proto::OperationField {
+            field_name: "linear_string".to_owned(),
+            value: Some(proto::operation_field::Value::TotalOrderRegisterSet(
+                Box::new(operation),
+            )),
+            ..proto::OperationField::default()
+        };
+        let update = proto::UpdateRowOperation {
+            row_id: encode_row_id(row_id(303)),
+            fields: vec![field],
+            ..proto::UpdateRowOperation::default()
+        };
+        let operation = proto::SchemaOperation {
+            change_id: MessageField::some(encode_update_id(UpdateId {
+                version: 302,
+                node_index: 0,
+            })),
+            operation: Some(proto::schema_operation::Operation::Update(Box::new(update))),
+            ..proto::SchemaOperation::default()
+        };
 
         let err = decode_schema_operation(operation, &schema).unwrap_err();
         assert_matches!(

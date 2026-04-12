@@ -110,7 +110,7 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
-            row: proto::RowSnapshot::new(),
+            row: proto::RowSnapshot::default(),
             expected_field_count: None,
             seen_fields: HashSet::new(),
         }
@@ -174,15 +174,23 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
     ) -> Result<(), SnapshotAdapterError> {
         let mut field = proto::SnapshotField {
             field_name: field_name.to_string(),
-            ..proto::SnapshotField::new()
+            ..proto::SnapshotField::default()
         };
         match wire_value {
-            StateSnapshotWireValue::MonotonicCounter(value) => field.set_monotonic_counter(value),
+            StateSnapshotWireValue::MonotonicCounter(value) => {
+                field.value = Some(proto::snapshot_field::Value::MonotonicCounter(Box::new(
+                    value,
+                )));
+            }
             StateSnapshotWireValue::TotalOrderRegister(value) => {
-                field.set_total_order_register(value)
+                field.value = Some(proto::snapshot_field::Value::TotalOrderRegister(Box::new(
+                    value,
+                )));
             }
             StateSnapshotWireValue::TotalOrderFiniteStateRegister(value) => {
-                field.set_total_order_finite_state_register(value)
+                field.value = Some(proto::snapshot_field::Value::TotalOrderFiniteStateRegister(
+                    Box::new(value),
+                ));
             }
         }
         self.row.fields.push(field);
@@ -338,12 +346,19 @@ impl HistoryFieldKind {
     ) -> proto::SnapshotField {
         let mut field = proto::SnapshotField {
             field_name: field_name.to_string(),
-            ..proto::SnapshotField::new()
+            ..proto::SnapshotField::default()
         };
+        let boxed_history = Box::new(history);
         match self {
-            Self::LatestValueWins => field.set_latest_value_wins(history),
-            Self::LinearString => field.set_linear_string(history),
-            Self::LinearList => field.set_linear_list(history),
+            Self::LatestValueWins => {
+                field.value = Some(proto::snapshot_field::Value::LatestValueWins(boxed_history));
+            }
+            Self::LinearString => {
+                field.value = Some(proto::snapshot_field::Value::LinearString(boxed_history));
+            }
+            Self::LinearList => {
+                field.value = Some(proto::snapshot_field::Value::LinearList(boxed_history));
+            }
         }
         field
     }
@@ -651,13 +666,13 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
         let value = self.take_field_value(field_name)?;
         let wire = match value {
             proto::snapshot_field::Value::MonotonicCounter(value) => {
-                StateSnapshotWireValue::MonotonicCounter(value)
+                StateSnapshotWireValue::MonotonicCounter(*value)
             }
             proto::snapshot_field::Value::TotalOrderRegister(value) => {
-                StateSnapshotWireValue::TotalOrderRegister(value)
+                StateSnapshotWireValue::TotalOrderRegister(*value)
             }
             proto::snapshot_field::Value::TotalOrderFiniteStateRegister(value) => {
-                StateSnapshotWireValue::TotalOrderFiniteStateRegister(value)
+                StateSnapshotWireValue::TotalOrderFiniteStateRegister(*value)
             }
             other => {
                 return UnexpectedFieldKindSnafu {
@@ -688,8 +703,9 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
                 .fail();
             }
         };
-        let nodes = decode_columnar_latest_value_wins_history_snapshot(history, value_type.clone())
-            .context(HistoryCodecSnafu)?;
+        let nodes =
+            decode_columnar_latest_value_wins_history_snapshot(*history, value_type.clone())
+                .context(HistoryCodecSnafu)?;
         Ok(LatestValueWinsHistoryFieldSource {
             nodes: nodes.into_iter(),
         })
@@ -712,7 +728,7 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
             }
         };
         Ok(LinearStringHistoryFieldSource {
-            nodes: decode_columnar_linear_string_history_snapshot(history)
+            nodes: decode_columnar_linear_string_history_snapshot(*history)
                 .context(HistoryCodecSnafu)?
                 .into_iter(),
         })
@@ -736,7 +752,7 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
             }
         };
         Ok(LinearListHistoryFieldSource {
-            nodes: decode_columnar_linear_list_history_snapshot(history, value_type)
+            nodes: decode_columnar_linear_list_history_snapshot(*history, value_type)
                 .context(HistoryCodecSnafu)?
                 .into_iter(),
         })
@@ -913,7 +929,7 @@ impl<'schema> ProtoDataSnapshotEncoder<'schema> {
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
-            snapshot: proto::DataSnapshot::new(),
+            snapshot: proto::DataSnapshot::default(),
             expected_row_count: None,
             current_row_index: None,
             current_row: None,
@@ -1129,7 +1145,7 @@ fn expected_state_field_kind(data_type: &ReplicatedDataType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protobuf::Message;
+    use crate::buffa::Message;
     use flotsync_data_types::{
         NULL,
         any_data::{LinearLatestValueWins, list::LinearList},
@@ -1169,7 +1185,7 @@ mod tests {
         proto::SnapshotField {
             field_name: name.to_owned(),
             value: Some(value),
-            ..proto::SnapshotField::new()
+            ..proto::SnapshotField::default()
         }
     }
 
@@ -1240,8 +1256,8 @@ mod tests {
         let mut encoder = ProtoDataSnapshotEncoder::new(schema);
         data.encode_data_snapshots(&mut encoder).unwrap();
         let snapshot = encoder.into_snapshot().unwrap();
-        let bytes = snapshot.write_to_bytes().unwrap();
-        let snapshot = proto::DataSnapshot::parse_from_bytes(&bytes).unwrap();
+        let bytes = snapshot.encode_to_vec();
+        let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
         let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
         let roundtrip =
@@ -1255,22 +1271,22 @@ mod tests {
             fields: vec![
                 state_field(
                     "counter",
-                    proto::snapshot_field::Value::MonotonicCounter(
+                    proto::snapshot_field::Value::MonotonicCounter(Box::new(
                         crate::codecs::datamodel::encode_counter_value(
                             flotsync_data_types::schema::datamodel::CounterValueRef::UInt(1),
                         ),
-                    ),
+                    )),
                 ),
                 state_field(
                     "counter",
-                    proto::snapshot_field::Value::MonotonicCounter(
+                    proto::snapshot_field::Value::MonotonicCounter(Box::new(
                         crate::codecs::datamodel::encode_counter_value(
                             flotsync_data_types::schema::datamodel::CounterValueRef::UInt(2),
                         ),
-                    ),
+                    )),
                 ),
             ],
-            ..proto::RowSnapshot::new()
+            ..proto::RowSnapshot::default()
         };
 
         let err = ProtoSchemaSnapshotDecoder::new(row).unwrap_err();
@@ -1285,9 +1301,9 @@ mod tests {
         let row = proto::RowSnapshot {
             fields: vec![state_field(
                 "counter",
-                proto::snapshot_field::Value::LinearString(proto::HistorySnapshot::new()),
+                proto::snapshot_field::Value::LinearString(Box::default()),
             )],
-            ..proto::RowSnapshot::new()
+            ..proto::RowSnapshot::default()
         };
         let mut decoder = ProtoSchemaSnapshotDecoder::new(row).unwrap();
         decoder.begin(1).unwrap();
@@ -1316,22 +1332,22 @@ mod tests {
             fields: vec![
                 state_field(
                     "counter",
-                    proto::snapshot_field::Value::MonotonicCounter(
+                    proto::snapshot_field::Value::MonotonicCounter(Box::new(
                         crate::codecs::datamodel::encode_counter_value(
                             flotsync_data_types::schema::datamodel::CounterValueRef::UInt(1),
                         ),
-                    ),
+                    )),
                 ),
                 state_field(
                     "extra",
-                    proto::snapshot_field::Value::TotalOrderRegister(
+                    proto::snapshot_field::Value::TotalOrderRegister(Box::new(
                         crate::codecs::datamodel::encode_primitive_value(
                             flotsync_data_types::schema::values::PrimitiveValueRef::UInt(7),
                         ),
-                    ),
+                    )),
                 ),
             ],
-            ..proto::RowSnapshot::new()
+            ..proto::RowSnapshot::default()
         };
         let mut decoder = ProtoSchemaSnapshotDecoder::new(row).unwrap();
         decoder.begin(2).unwrap();
@@ -1363,22 +1379,22 @@ mod tests {
             fields: vec![
                 state_field(
                     "counter",
-                    proto::snapshot_field::Value::MonotonicCounter(
+                    proto::snapshot_field::Value::MonotonicCounter(Box::new(
                         crate::codecs::datamodel::encode_counter_value(
                             flotsync_data_types::schema::datamodel::CounterValueRef::UInt(1),
                         ),
-                    ),
+                    )),
                 ),
                 state_field(
                     "extra",
-                    proto::snapshot_field::Value::TotalOrderRegister(
+                    proto::snapshot_field::Value::TotalOrderRegister(Box::new(
                         crate::codecs::datamodel::encode_primitive_value(
                             flotsync_data_types::schema::values::PrimitiveValueRef::UInt(7),
                         ),
-                    ),
+                    )),
                 ),
             ],
-            ..proto::RowSnapshot::new()
+            ..proto::RowSnapshot::default()
         };
         let mut decoder = ProtoSchemaSnapshotDecoder::new(row).unwrap();
         decoder.begin(2).unwrap();
@@ -1400,8 +1416,8 @@ mod tests {
     #[test]
     fn dataset_decoder_rejects_remaining_rows() {
         let snapshot = proto::DataSnapshot {
-            rows: vec![proto::RowSnapshot::new()],
-            ..proto::DataSnapshot::new()
+            rows: vec![proto::RowSnapshot::default()],
+            ..proto::DataSnapshot::default()
         };
         let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
         let row_count = decoder.begin().unwrap();

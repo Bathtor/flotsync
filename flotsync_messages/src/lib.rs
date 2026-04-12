@@ -1,14 +1,20 @@
 #![feature(iterator_try_collect)]
 
-// Re-export protobuf, so we use a consistent version.
-pub use protobuf;
+// Re-export buffa, so we use a consistent version.
+pub use buffa;
 pub use uuid::Uuid;
 
 pub mod codecs;
 pub mod snapshots;
 
-// Export the generated modules.
-include!(concat!(env!("OUT_DIR"), "/protos/mod.rs"));
+include!(concat!(env!("OUT_DIR"), "/flotsync_messages.rs"));
+
+pub use flotsync::{
+    datamodel::v1 as datamodel,
+    delivery::v1 as delivery,
+    discovery::v1 as discovery,
+    versions::v1 as versions,
+};
 
 pub type InMemoryData =
     flotsync_data_types::schema::datamodel::InMemoryData<Uuid, flotsync_core::versions::UpdateId>;
@@ -24,12 +30,19 @@ mod tests {
 
     #[test]
     fn construct_versions() {
-        let mut synced = SyncedVersionVector::new();
-        synced.group_version = 1;
+        let synced = SyncedVersionVector {
+            group_version: 1,
+            ..SyncedVersionVector::default()
+        };
         assert_eq!(synced.group_version, 1);
 
-        let mut v = VersionVector::new();
-        v.set_synced(synced);
-        assert_eq!(v.synced().group_version, 1);
+        let v = VersionVector {
+            versions: Some(version_vector::Versions::Synced(Box::new(synced))),
+            ..VersionVector::default()
+        };
+        assert!(matches!(
+            v.versions,
+            Some(version_vector::Versions::Synced(ref value)) if value.group_version == 1
+        ));
     }
 }

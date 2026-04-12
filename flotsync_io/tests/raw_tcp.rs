@@ -2,17 +2,19 @@ use bytes::Bytes;
 use flotsync_io::{
     prelude::*,
     test_support::{
+        ReservedSocketKind,
         assert_no_driver_event,
+        bind_reserved_tcp_listener,
         init_test_logger,
         localhost,
-        payload_bytes,
+        reserve_sockets,
         wait_for_driver_event,
         wait_for_driver_request,
     },
 };
 use std::{
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::Duration,
@@ -32,11 +34,15 @@ fn reserve_listener(driver: &IoDriver) -> ListenerId {
     wait_for_driver_request(request)
 }
 
-fn listen_at(driver: &IoDriver, listener_id: ListenerId) -> std::net::SocketAddr {
+fn listen_at(
+    driver: &IoDriver,
+    listener_id: ListenerId,
+    local_addr: std::net::SocketAddr,
+) -> std::net::SocketAddr {
     driver
         .dispatch(DriverCommand::Tcp(TcpCommand::Listen {
             listener_id,
-            local_addr: localhost(0),
+            local_addr,
         }))
         .expect("dispatch TCP listen");
 
@@ -105,7 +111,9 @@ fn tcp_driver_reports_connect_failure() {
 fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close() {
     init_test_logger();
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind TCP listener");
+    let server_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener =
+        bind_reserved_tcp_listener(&server_listener_lease, 0).expect("bind reserved TCP listener");
     let remote_addr = listener.local_addr().expect("listener addr");
     let (server_payload_tx, server_payload_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -172,7 +180,7 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
                 connection_id: observed_connection_id,
                 payload,
             }) if observed_connection_id == connection_id => {
-                assert_eq!(payload_bytes(payload), Bytes::from_static(b"world"));
+                assert_eq!(payload.to_vec().as_slice(), b"world");
                 saw_receive = true;
             }
             DriverEvent::Tcp(TcpEvent::Closed {
@@ -191,7 +199,9 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
     assert_eq!(server_payload_rx.recv().expect("server payload"), *b"hello");
     server.join().expect("join server thread");
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind second TCP listener");
+    let abort_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener = bind_reserved_tcp_listener(&abort_listener_lease, 0)
+        .expect("bind reserved second TCP listener");
     let remote_addr = listener.local_addr().expect("second listener addr");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept second TCP stream");
@@ -254,9 +264,14 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
  {
     init_test_logger();
 
-    let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let driver = IoDriver::start(DriverConfig {
+        bind_reuse_address: true,
+        ..DriverConfig::default()
+    })
+    .expect("driver starts");
     let listener_id = reserve_listener(&driver);
-    let listener_addr = listen_at(&driver, listener_id);
+    let listener_addr = listen_at(&driver, listener_id, listener_lease.addr(0));
 
     let mut accepted_client = TcpStream::connect(listener_addr).expect("connect accepted client");
     let accepted_connection_id = match wait_for_driver_event(&driver, |event| {
@@ -282,7 +297,10 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
     accepted_client
         .write_all(b"pending")
         .expect("write pending TCP payload");
-    assert_no_driver_event(&driver, Duration::from_millis(50));
+    // The listener must not surface readable session data before the pending
+    // connection is explicitly adopted, even though bytes are already queued
+    // in the kernel receive buffer.
+    assert_no_driver_event(&driver, Duration::from_millis(500));
 
     driver
         .dispatch(DriverCommand::Tcp(TcpCommand::AdoptAccepted {
@@ -303,14 +321,14 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
             payload,
         }) => {
             assert_eq!(observed_connection_id, accepted_connection_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"pending"));
+            assert_eq!(payload.to_vec().as_slice(), b"pending");
         }
         other => unreachable!("filtered to adopted TCP receive event, got {other:?}"),
     }
 
     let mut rejected_client = TcpStream::connect(listener_addr).expect("connect rejected client");
     rejected_client
-        .set_read_timeout(Some(Duration::from_millis(200)))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .expect("set rejected client read timeout");
     let rejected_connection_id = match wait_for_driver_event(&driver, |event| {
         matches!(
@@ -332,7 +350,6 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
         }))
         .expect("dispatch reject accepted connection");
 
-    thread::sleep(Duration::from_millis(50));
     let mut rejected_buf = [0_u8; 1];
     let rejected_read = rejected_client.read(&mut rejected_buf);
     match rejected_read {
@@ -343,8 +360,6 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
                 std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::TimedOut
             ) => {}
         other => panic!("unexpected rejected-client read result: {other:?}"),
     }
@@ -387,7 +402,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
             payload,
         }) => {
             assert_eq!(observed_connection_id, accepted_connection_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"again"));
+            assert_eq!(payload.to_vec().as_slice(), b"again");
         }
         other => unreachable!("filtered to post-listener-close TCP receive, got {other:?}"),
     }
@@ -419,7 +434,9 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 fn tcp_driver_reports_read_and_write_flow_control_transitions() {
     init_test_logger();
 
-    let listener = TcpListener::bind(localhost(0)).expect("bind flow-control TCP listener");
+    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let listener = bind_reserved_tcp_listener(&listener_lease, 0)
+        .expect("bind reserved flow-control TCP listener");
     let remote_addr = listener.local_addr().expect("flow-control listener addr");
     let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -437,7 +454,9 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
         stream
             .write_all(&vec![b'a'; 300])
             .expect("write TCP ingress payload");
-        thread::sleep(Duration::from_millis(50));
+        stream
+            .shutdown(Shutdown::Write)
+            .expect("shutdown TCP write half after ingress payload");
     });
 
     let driver = IoDriver::start(DriverConfig {
@@ -592,7 +611,7 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
                 connection_id: observed_connection_id,
                 payload,
             }) if observed_connection_id == connection_id => {
-                assert_eq!(payload_bytes(payload).len(), 44);
+                assert_eq!(payload.to_vec().len(), 44);
                 saw_third_payload = true;
             }
             other => {

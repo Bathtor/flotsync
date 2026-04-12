@@ -6,6 +6,7 @@ use std::{
     fmt,
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    ops::Range,
     sync::Arc,
 };
 
@@ -125,26 +126,27 @@ impl IoPayload {
     }
 
     /// Returns a sliced view over the readable payload bytes.
-    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
+    pub fn try_slice(self, range: Range<usize>) -> Option<Self> {
         let payload_len = self.len();
-        if offset > payload_len || len > payload_len.saturating_sub(offset) {
+        if range.start > range.end || range.end > payload_len {
             return None;
         }
-        if len == 0 {
+        if range.is_empty() {
             return Some(Self::Bytes(Bytes::new()));
         }
-        if offset == 0 && len == payload_len {
+        if range.start == 0 && range.end == payload_len {
             return Some(self);
         }
         match self {
-            Self::Lease(lease) => Some(Self::Lease(lease.try_slice(offset, len)?)),
-            Self::Bytes(bytes) => Some(Self::Bytes(bytes.slice(offset..offset + len))),
+            Self::Lease(lease) => Some(Self::Lease(lease.try_slice(range.clone())?)),
+            Self::Bytes(bytes) => Some(Self::Bytes(bytes.slice(range))),
             Self::Chain(parts) => {
+                let offset = range.start;
+                let mut remaining = range.len();
                 let mut skipped = 0;
-                let mut remaining_len = len;
                 let mut sliced_parts = Vec::new();
                 for part in parts.iter() {
-                    if remaining_len == 0 {
+                    if remaining == 0 {
                         break;
                     }
 
@@ -155,12 +157,15 @@ impl IoPayload {
                     }
 
                     let part_offset = offset.saturating_sub(skipped);
-                    let visible_len = remaining_len.min(part_len.saturating_sub(part_offset));
-                    sliced_parts.push(part.clone().try_slice(part_offset, visible_len)?);
-                    remaining_len -= visible_len;
+                    let visible_len = remaining.min(part_len - part_offset);
+                    sliced_parts.push(
+                        part.clone()
+                            .try_slice(part_offset..part_offset + visible_len)?,
+                    );
+                    remaining -= visible_len;
                     skipped += part_len;
                 }
-                if remaining_len != 0 {
+                if remaining != 0 {
                     return None;
                 }
                 Some(Self::chain(sliced_parts))
@@ -173,10 +178,46 @@ impl IoPayload {
         IoPayloadCursor::new(self)
     }
 
+    /// Returns the readable payload bytes when the payload is already contiguous.
+    ///
+    /// This performs no allocation. It returns `None` for fragmented chained payloads and for
+    /// multi-segment pooled leases.
+    pub fn try_as_contiguous_slice(&self) -> Option<&[u8]> {
+        match self {
+            Self::Lease(lease) => lease.try_as_contiguous_slice(),
+            Self::Bytes(bytes) => Some(bytes.as_ref()),
+            Self::Chain(parts) => match parts.as_ref() {
+                [] => Some(&[]),
+                [part] => part.try_as_contiguous_slice(),
+                _ => None,
+            },
+        }
+    }
+
+    /// Returns the readable payload bytes as one contiguous slice.
+    ///
+    /// When the payload is already contiguous, this borrows the existing storage directly. When
+    /// the payload is fragmented, it is coalesced into one owned `Bytes` value first, and the
+    /// payload is rewritten to keep reusing that contiguous representation.
+    pub fn as_contiguous_slice(&mut self) -> &[u8] {
+        if self.try_as_contiguous_slice().is_none() {
+            let bytes = self.create_byte_clone();
+            *self = Self::Bytes(bytes);
+        }
+
+        self.try_as_contiguous_slice()
+            .expect("IoPayload::as_contiguous_slice must always return one slice")
+    }
+
     /// Creates a byte clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
+        Bytes::from(self.to_vec())
+    }
+
+    /// Copies the full readable payload contents into one owned `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
         if self.is_empty() {
-            return Bytes::new();
+            return Vec::new();
         }
 
         let mut bytes = Vec::with_capacity(self.len());
@@ -191,7 +232,7 @@ impl IoPayload {
             bytes.extend_from_slice(chunk);
             cursor.advance(chunk_len);
         }
-        Bytes::from(bytes)
+        bytes
     }
 }
 
@@ -291,6 +332,28 @@ impl Buf for IoPayloadCursor {
     }
 }
 
+impl io::Read for IoPayloadCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let mut written = 0usize;
+        while written < buf.len() && self.has_remaining() {
+            let chunk = self.chunk();
+            let num_bytes_to_copy = chunk.len().min(buf.len() - written);
+            if num_bytes_to_copy == 0 {
+                break;
+            }
+            buf[written..written + num_bytes_to_copy].copy_from_slice(&chunk[..num_bytes_to_copy]);
+            self.advance(num_bytes_to_copy);
+            written += num_bytes_to_copy;
+        }
+
+        Ok(written)
+    }
+}
+
 fn collect_cursor_parts(
     payload: &IoPayload,
     offset: usize,
@@ -307,7 +370,7 @@ fn collect_cursor_parts(
 
     match payload {
         IoPayload::Lease(lease) => {
-            let lease = lease.clone().try_slice(offset, len)?;
+            let lease = lease.clone().try_slice(offset..offset + len)?;
             out.push(IoPayloadCursorPart::Lease(lease.cursor()));
         }
         IoPayload::Bytes(bytes) => {

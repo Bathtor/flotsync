@@ -24,6 +24,7 @@ use std::{
     collections::VecDeque,
     fmt,
     future::Future,
+    ops::Range,
     pin::Pin,
     sync::{Arc, Mutex, Weak},
     task::{Context, Poll as TaskPoll},
@@ -34,7 +35,13 @@ mod ingress;
 
 use self::{egress::EgressPoolState, ingress::IngressPoolState};
 pub use self::{
-    egress::{EgressAsyncWriter, EgressPool, EgressReservation, PayloadWriter},
+    egress::{
+        EgressAsyncWriter,
+        EgressPool,
+        EgressReservation,
+        EgressReservedWriter,
+        PayloadWriter,
+    },
     ingress::{IngressBuffer, IngressPool},
 };
 
@@ -352,21 +359,47 @@ impl IoLease {
     }
 
     /// Returns one sliced view over the readable payload bytes.
-    pub fn try_slice(self, offset: usize, len: usize) -> Option<Self> {
-        if offset > self.len || len > self.len.saturating_sub(offset) {
+    pub fn try_slice(self, range: Range<usize>) -> Option<Self> {
+        if range.start > range.end || range.end > self.len {
             return None;
         }
         Some(Self {
             inner: self.inner,
-            offset: self.offset + offset,
-            len,
+            offset: self.offset + range.start,
+            len: range.len(),
         })
+    }
+
+    /// Returns the readable payload bytes when the visible lease range is already contiguous.
+    ///
+    /// This borrows directly from the underlying storage and therefore performs no allocation.
+    /// It returns `None` when the visible range spans more than one pooled segment.
+    pub fn try_as_contiguous_slice(&self) -> Option<&[u8]> {
+        if self.is_empty() {
+            return Some(&[]);
+        }
+
+        match &self.inner {
+            IoLeaseInner::External(chunk_ref) => {
+                let chunk = chunk_ref.chunk();
+                let end = self.offset.checked_add(self.len)?;
+                chunk.get(self.offset..end)
+            }
+            IoLeaseInner::Pooled(payload) => {
+                try_slice_one_pooled_segment(payload, self.offset, self.len)
+            }
+        }
     }
 
     /// Creates a byte-clone of the full readable payload contents.
     pub fn create_byte_clone(&self) -> Bytes {
+        Bytes::from(self.to_vec())
+    }
+
+    /// Copies the full readable payload contents into one owned `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
         if self.is_empty() {
-            return Bytes::new();
+            return Vec::new();
         }
 
         let mut bytes = Vec::with_capacity(self.len());
@@ -381,7 +414,7 @@ impl IoLease {
             bytes.extend_from_slice(chunk);
             cursor.advance(chunk_len);
         }
-        Bytes::from(bytes)
+        bytes
     }
 }
 
@@ -395,6 +428,34 @@ impl From<ChunkRef> for IoLease {
     fn from(chunk_ref: ChunkRef) -> Self {
         Self::from_chunk_ref(chunk_ref)
     }
+}
+
+fn try_slice_one_pooled_segment(
+    payload: &PooledPayload,
+    offset: usize,
+    len: usize,
+) -> Option<&[u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+
+    let mut skipped = 0usize;
+    for segment in &payload.segments {
+        let segment_len = segment.written_len;
+        if skipped + segment_len <= offset {
+            skipped += segment_len;
+            continue;
+        }
+
+        let segment_offset = offset.saturating_sub(skipped);
+        let segment_end = segment_offset.checked_add(len)?;
+        if segment_end > segment_len {
+            return None;
+        }
+        return Some(&segment.chunk[segment_offset..segment_end]);
+    }
+
+    None
 }
 
 impl fmt::Debug for IoLease {
@@ -753,6 +814,7 @@ where
 mod tests {
     use super::*;
     use crate::{api::IoPayload, logging::default_runtime_logger, test_support::init_test_logger};
+    use bytes::BufMut;
 
     fn tiny_config() -> IoPoolConfig {
         IoPoolConfig {
@@ -761,6 +823,22 @@ mod tests {
             max_chunk_count: 2,
             encode_buf_min_free_space: 8,
         }
+    }
+
+    fn assert_exactly_one_chunk_of_quota_remains(pool: &EgressPool) {
+        let chunk_size = pool.config().chunk_size;
+        let second = wait_for_request(pool.reserve(chunk_size).expect("reserve remaining chunk"))
+            .expect("exactly one chunk of quota should remain");
+        let mut blocked = pool
+            .reserve(chunk_size)
+            .expect("request over the remaining quota should enqueue");
+        assert!(
+            blocked
+                .try_receive()
+                .expect("queued request channel must stay live")
+                .is_none()
+        );
+        drop(second);
     }
 
     #[test]
@@ -852,10 +930,7 @@ mod tests {
 
         let second = wait_for_request(second).expect("second ready after drop");
         let second_lease = second.copy_bytes(b"world").expect("write second");
-        assert_eq!(
-            second_lease.create_byte_clone(),
-            Bytes::from_static(b"world")
-        );
+        assert_eq!(second_lease.to_vec().as_slice(), b"world");
     }
 
     #[test]
@@ -882,6 +957,60 @@ mod tests {
     }
 
     #[test]
+    fn io_payload_as_contiguous_slice_returns_correct_bytes() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve contiguous payload")).expect("ready");
+        let lease = reservation
+            .copy_bytes(b"hello")
+            .expect("write contiguous payload");
+        let mut contiguous = IoPayload::Lease(lease);
+        assert_eq!(contiguous.try_as_contiguous_slice(), Some(&b"hello"[..]));
+        assert_eq!(contiguous.as_contiguous_slice(), b"hello");
+        assert!(matches!(contiguous, IoPayload::Lease(_)));
+
+        let mut fragmented = IoPayload::chain([
+            IoPayload::from_static(b"he"),
+            IoPayload::from_static(b"llo"),
+        ]);
+        assert!(fragmented.try_as_contiguous_slice().is_none());
+        assert_eq!(fragmented.as_contiguous_slice(), b"hello");
+        assert!(matches!(&fragmented, IoPayload::Bytes(bytes) if bytes.as_ref() == b"hello"));
+    }
+
+    #[test]
+    fn io_payload_as_contiguous_slice_releases_pooled_capacity_after_coalescing() {
+        init_test_logger();
+
+        let config = IoPoolConfig {
+            max_chunk_count: 1,
+            ..tiny_config()
+        };
+        let pool = IngressPool::new(
+            config,
+            default_runtime_logger(),
+            PoolAvailabilityNotifier::new(|| {}),
+        );
+
+        let mut buffer = pool
+            .try_acquire()
+            .expect("ingress pool lock")
+            .expect("acquire ingress buffer");
+        buffer.writable()[..4].copy_from_slice(b"ping");
+        let lease = buffer.commit(4).expect("commit ingress buffer");
+
+        assert!(pool.try_acquire().expect("ingress pool lock").is_none());
+
+        let mut payload = IoPayload::chain([IoPayload::Lease(lease), IoPayload::from_static(b"!")]);
+        assert_eq!(payload.as_contiguous_slice(), b"ping!");
+        assert!(matches!(&payload, IoPayload::Bytes(bytes) if bytes.as_ref() == b"ping!"));
+
+        assert!(pool.try_acquire().expect("ingress pool lock").is_some());
+    }
+
+    #[test]
     fn egress_writer_returns_unused_chunks_immediately() {
         init_test_logger();
 
@@ -901,14 +1030,8 @@ mod tests {
             wait_for_request(pool.reserve(128).expect("reserve second")).expect("second ready");
         let second_lease = second.copy_bytes(b"next").expect("next write");
 
-        assert_eq!(
-            lease.create_byte_clone(),
-            Bytes::from_static(b"small payload")
-        );
-        assert_eq!(
-            second_lease.create_byte_clone(),
-            Bytes::from_static(b"next")
-        );
+        assert_eq!(lease.to_vec().as_slice(), b"small payload");
+        assert_eq!(second_lease.to_vec().as_slice(), b"next");
     }
 
     #[test]
@@ -944,7 +1067,7 @@ mod tests {
             .expect("finish async payload")
             .expect("non-empty async payload");
 
-        assert_eq!(payload.create_byte_clone(), Bytes::from(bytes));
+        assert_eq!(payload.to_vec(), bytes);
     }
 
     #[test]
@@ -980,7 +1103,7 @@ mod tests {
             .finish()
             .expect("finish async payload")
             .expect("non-empty async payload");
-        assert_eq!(payload.create_byte_clone(), Bytes::from_static(b"later"));
+        assert_eq!(payload.to_vec().as_slice(), b"later");
     }
 
     #[test]
@@ -1003,9 +1126,89 @@ mod tests {
             .expect("finish typed helper payload")
             .expect("typed helper payload is non-empty");
         assert_eq!(
-            payload.create_byte_clone(),
-            Bytes::from_static(&[1, 0x12, 0x34, 0x78, 0x56, b'o', b'k'])
+            payload.to_vec(),
+            vec![1, 0x12, 0x34, 0x78, 0x56, b'o', b'k']
         );
+    }
+
+    #[test]
+    fn reserved_sync_writer_can_interleave_with_async_writes() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let mut writer = pool.writer(Some(32));
+
+        wait_for_future(async {
+            {
+                let mut reserved = writer
+                    .write_with_reserved(3)
+                    .await
+                    .expect("reserve sync prefix");
+                reserved.put_slice(b"abc");
+            }
+            writer.write_slice(b"de").await?;
+            {
+                let mut reserved = writer
+                    .write_with_reserved(3)
+                    .await
+                    .expect("reserve sync suffix");
+                reserved.put_slice(b"fgh");
+            }
+            Ok::<_, Error>(())
+        })
+        .expect("mixed sync/async writes succeed");
+
+        let payload = writer
+            .finish()
+            .expect("finish mixed payload")
+            .expect("mixed payload is non-empty");
+        assert_eq!(payload.to_vec().as_slice(), b"abcdefgh");
+    }
+
+    #[test]
+    fn reserved_sync_writer_leaves_unused_capacity_for_later_writes() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let mut writer = pool.writer(Some(16));
+
+        wait_for_future(async {
+            {
+                let mut reserved = writer
+                    .write_with_reserved(4)
+                    .await
+                    .expect("reserve sync bytes");
+                reserved.put_slice(b"ab");
+                assert_eq!(reserved.reserved_remaining(), 2);
+            }
+            writer.write_slice(b"cd").await
+        })
+        .expect("writer should reuse unused reserved capacity");
+
+        let payload = writer
+            .finish()
+            .expect("finish payload with reused reservation")
+            .expect("payload is non-empty");
+        assert_eq!(payload.to_vec().as_slice(), b"abcd");
+    }
+
+    #[test]
+    #[should_panic(expected = "EgressReservedWriter overflowed its reserved budget")]
+    fn reserved_sync_writer_panics_when_written_past_reserved_budget() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let mut writer = pool.writer(Some(8));
+
+        wait_for_future(async {
+            let mut reserved = writer
+                .write_with_reserved(2)
+                .await
+                .expect("reserve sync bytes");
+            reserved.put_slice(b"toolong");
+            Ok::<_, Error>(())
+        })
+        .expect("overflow panic should unwind through future");
     }
 
     #[test]
@@ -1026,10 +1229,7 @@ mod tests {
             .finish()
             .expect("finish spliced payload")
             .expect("spliced payload is non-empty");
-        assert_eq!(
-            payload.create_byte_clone(),
-            Bytes::from_static(b"head-tail")
-        );
+        assert_eq!(payload.to_vec().as_slice(), b"head-tail");
         let parts = match &payload {
             IoPayload::Chain(parts) => parts,
             other => panic!("expected chained payload after splice helpers, got {other:?}"),
@@ -1045,8 +1245,10 @@ mod tests {
         init_test_logger();
 
         let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let foreign_pool = EgressPool::new(tiny_config(), default_runtime_logger());
         let reservation =
-            wait_for_request(pool.reserve(8).expect("reserve shared payload")).expect("ready");
+            wait_for_request(foreign_pool.reserve(8).expect("reserve shared payload"))
+                .expect("ready");
         let shared_lease = reservation
             .copy_bytes(b"-tail")
             .expect("write shared payload");
@@ -1068,14 +1270,107 @@ mod tests {
             .finish()
             .expect("finish fallback payload")
             .expect("fallback payload is non-empty");
-        assert_eq!(
-            payload.create_byte_clone(),
-            Bytes::from_static(b"head-tail")
-        );
+        assert_eq!(payload.to_vec().as_slice(), b"head-tail");
         assert!(
             matches!(payload, IoPayload::Lease(_)),
             "failed adopt should not have sealed a separate payload part"
         );
+    }
+
+    #[test]
+    fn shared_payload_already_owned_by_same_egress_pool_is_adopted() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve shared payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let shared_payload = IoPayload::Lease(owned_lease.clone());
+
+        let adopted = pool
+            .adopt_payload(shared_payload.clone())
+            .expect("same-pool shared payload should adopt without copying");
+
+        assert_eq!(adopted.to_vec().as_slice(), b"tail");
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn shared_chain_already_owned_by_same_egress_pool_is_adopted() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve pooled payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let owned_payload = IoPayload::Lease(owned_lease.clone());
+        let shared_chain = IoPayload::chain([
+            IoPayload::from_static(b"head"),
+            owned_payload.clone(),
+            IoPayload::from_static(b"!"),
+        ]);
+
+        let adopted = pool
+            .adopt_payload(shared_chain.clone())
+            .expect("same-pool shared chain should adopt without copying");
+
+        assert_eq!(adopted.to_vec().as_slice(), b"headtail!");
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn writer_adopts_shared_payload_already_owned_by_same_egress_pool_zero_copy() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(pool.reserve(8).expect("reserve pooled payload")).expect("ready");
+        let owned_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write owned payload");
+        let shared_payload = IoPayload::Lease(owned_lease.clone());
+
+        let mut writer = pool.writer(Some(16));
+        wait_for_future(async { writer.adopt_payload(shared_payload.clone()).await })
+            .expect("same-pool shared payload adopt should succeed");
+
+        let payload = writer
+            .finish()
+            .expect("finish adopted payload")
+            .expect("adopted payload is non-empty");
+        assert_eq!(payload.to_vec().as_slice(), b"tail");
+        assert!(
+            matches!(payload, IoPayload::Lease(_)),
+            "same-pool adopt should preserve the pooled lease without copying"
+        );
+        assert_exactly_one_chunk_of_quota_remains(&pool);
+    }
+
+    #[test]
+    fn shared_chain_with_foreign_pooled_fragment_still_fails_adopt() {
+        init_test_logger();
+
+        let pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let foreign_pool = EgressPool::new(tiny_config(), default_runtime_logger());
+        let reservation =
+            wait_for_request(foreign_pool.reserve(8).expect("reserve foreign payload"))
+                .expect("ready");
+        let foreign_lease = reservation
+            .copy_bytes(b"tail")
+            .expect("write foreign payload");
+        let shared_chain = IoPayload::chain([
+            IoPayload::from_static(b"head"),
+            IoPayload::Lease(foreign_lease.clone()),
+        ]);
+
+        let error = pool
+            .adopt_payload(shared_chain.clone())
+            .expect_err("shared foreign pooled fragment must still fail adoption");
+        assert!(matches!(error, Error::SharedIoPayloadOwnership));
     }
 
     #[test]
@@ -1145,7 +1440,7 @@ mod tests {
         let leased = reservation
             .copy_bytes(b"next")
             .expect("write next egress payload");
-        assert_eq!(leased.create_byte_clone(), Bytes::from_static(b"next"));
+        assert_eq!(leased.to_vec().as_slice(), b"next");
     }
 
     #[test]

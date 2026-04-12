@@ -4,9 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arc-swap = { workspace = true }
+bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
+flotsync_messages = { path = "../flotsync_messages" }
+flotsync_udpour = { path = "../flotsync_udpour" }
+flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
+kompact = { workspace = true }
 smallvec = "1"
 snafu = { workspace = true }
 uuid = { workspace = true }

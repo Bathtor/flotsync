@@ -272,9 +272,9 @@ impl ColumnarValueBuffer {
     fn into_proto_values(self) -> proto::history_snapshot::Values {
         match self.values {
             ColumnarValueBufferKind::Primitive(values) => {
-                proto::history_snapshot::Values::PrimitiveValues(encode_primitive_array(
+                proto::history_snapshot::Values::PrimitiveValues(Box::new(encode_primitive_array(
                     values.as_ref(),
-                ))
+                )))
             }
             ColumnarValueBufferKind::String(values) => {
                 proto::history_snapshot::Values::StringValues(values)
@@ -313,15 +313,18 @@ pub fn encode_columnar_latest_value_wins_history_snapshot(
     let data_type = ReplicatedDataType::LatestValueWins {
         value_type: value_type.clone(),
     };
-    let records = nodes.iter().map(|node| ColumnarHistoryNodeRecord {
-        id: encode_indexed_update_id(&node.id),
-        left: node.left.as_ref().map(encode_indexed_update_id),
-        right: node.right.as_ref().map(encode_indexed_update_id),
-        deleted: node.deleted,
-        value: node
+    let records = nodes.iter().map(|node| {
+        let value = node
             .value
             .as_ref()
-            .map(|value| ColumnarHistoryNodeValueRef::LatestValueWins(value.as_ref())),
+            .map(|value| ColumnarHistoryNodeValueRef::LatestValueWins(value.as_ref()));
+        ColumnarHistoryNodeRecord {
+            id: encode_indexed_update_id(&node.id),
+            left: node.left.as_ref().map(encode_indexed_update_id),
+            right: node.right.as_ref().map(encode_indexed_update_id),
+            deleted: node.deleted,
+            value,
+        }
     });
     encode_columnar_history_snapshot(&data_type, records)
 }
@@ -362,15 +365,18 @@ pub fn encode_columnar_linear_string_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, String>],
 ) -> ColumnarResult<proto::HistorySnapshot> {
     let data_type = ReplicatedDataType::LinearString;
-    let records = nodes.iter().map(|node| ColumnarHistoryNodeRecord {
-        id: encode_indexed_update_id(&node.id),
-        left: node.left.as_ref().map(encode_indexed_update_id),
-        right: node.right.as_ref().map(encode_indexed_update_id),
-        deleted: node.deleted,
-        value: node
+    let records = nodes.iter().map(|node| {
+        let value = node
             .value
             .as_deref()
-            .map(ColumnarHistoryNodeValueRef::LinearString),
+            .map(ColumnarHistoryNodeValueRef::LinearString);
+        ColumnarHistoryNodeRecord {
+            id: encode_indexed_update_id(&node.id),
+            left: node.left.as_ref().map(encode_indexed_update_id),
+            right: node.right.as_ref().map(encode_indexed_update_id),
+            deleted: node.deleted,
+            value,
+        }
     });
     encode_columnar_history_snapshot(&data_type, records)
 }
@@ -411,15 +417,18 @@ pub fn encode_columnar_linear_list_history_snapshot(
     value_type: PrimitiveType,
 ) -> ColumnarResult<proto::HistorySnapshot> {
     let data_type = ReplicatedDataType::LinearList { value_type };
-    let records = nodes.iter().map(|node| ColumnarHistoryNodeRecord {
-        id: encode_indexed_update_id(&node.id),
-        left: node.left.as_ref().map(encode_indexed_update_id),
-        right: node.right.as_ref().map(encode_indexed_update_id),
-        deleted: node.deleted,
-        value: node
+    let records = nodes.iter().map(|node| {
+        let value = node
             .value
             .as_ref()
-            .map(|value| ColumnarHistoryNodeValueRef::LinearList(value.as_ref())),
+            .map(|value| ColumnarHistoryNodeValueRef::LinearList(value.as_ref()));
+        ColumnarHistoryNodeRecord {
+            id: encode_indexed_update_id(&node.id),
+            left: node.left.as_ref().map(encode_indexed_update_id),
+            right: node.right.as_ref().map(encode_indexed_update_id),
+            deleted: node.deleted,
+            value,
+        }
     });
     encode_columnar_history_snapshot(&data_type, records)
 }
@@ -467,7 +476,7 @@ fn encode_columnar_history_snapshot<'a>(
             None => (0usize, false),
             Some(value) => encode_value_span(data_type, value, &mut values)?,
         };
-        let mut meta = proto::HistoryNodeMeta::new();
+        let mut meta = proto::HistoryNodeMeta::default();
         set_self_id_fields(&mut meta, node.id);
         set_origin_left_fields(&mut meta, node.left);
         set_origin_right_fields(&mut meta, node.right);
@@ -481,7 +490,7 @@ fn encode_columnar_history_snapshot<'a>(
     Ok(proto::HistorySnapshot {
         nodes: metas,
         values: Some(values.into_proto_values()),
-        ..proto::HistorySnapshot::new()
+        ..proto::HistorySnapshot::default()
     })
 }
 
@@ -537,7 +546,7 @@ fn decode_columnar_value_buffer(
                     actual: "primitive_values",
                 }
             );
-            let values = decode_primitive_array(values).context(CodecSnafu)?;
+            let values = decode_primitive_array(*values).context(CodecSnafu)?;
             let expected_primitive_type = history_primitive_type(data_type)?;
             ensure!(
                 values.primitive_type() == expected_primitive_type,
@@ -572,7 +581,7 @@ fn decode_columnar_history_node<Id>(
         version: meta.version,
         node_index: meta.node_index,
         chunk_index: meta.chunk_index,
-        ..proto::HistoryId::new()
+        ..proto::HistoryId::default()
     })
     .context(CodecSnafu)?;
     let left = decode_optional_origin_id(
@@ -806,7 +815,7 @@ fn decode_optional_origin_id<Id>(
             version,
             node_index,
             chunk_index: chunk_index.unwrap_or(0),
-            ..proto::HistoryId::new()
+            ..proto::HistoryId::default()
         })
         .context(CodecSnafu)
         .map(Some),
@@ -1261,10 +1270,12 @@ mod tests {
     fn decode_rejects_malformed_null_metadata() {
         let value_type =
             NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::String));
-        let mut snapshot = proto::HistorySnapshot::new();
-        snapshot.values = Some(proto::history_snapshot::Values::PrimitiveValues(
-            encode_primitive_array(ModelPrimitiveValueArray::String(Vec::new()).as_ref()),
-        ));
+        let mut snapshot = proto::HistorySnapshot {
+            values: Some(proto::history_snapshot::Values::PrimitiveValues(Box::new(
+                encode_primitive_array(ModelPrimitiveValueArray::String(Vec::new()).as_ref()),
+            ))),
+            ..proto::HistorySnapshot::default()
+        };
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 1,
             node_index: 0,
@@ -1278,7 +1289,7 @@ mod tests {
             deleted: false,
             value_len: 1,
             value_is_null: true,
-            ..proto::HistoryNodeMeta::new()
+            ..proto::HistoryNodeMeta::default()
         });
 
         let err =
@@ -1344,10 +1355,12 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_utf8_byte_slice_boundaries() {
-        let mut snapshot = proto::HistorySnapshot::new();
-        snapshot.values = Some(proto::history_snapshot::Values::StringValues(
-            "a\u{00E9}".to_owned(),
-        ));
+        let mut snapshot = proto::HistorySnapshot {
+            values: Some(proto::history_snapshot::Values::StringValues(
+                "a\u{00E9}".to_owned(),
+            )),
+            ..proto::HistorySnapshot::default()
+        };
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 1,
             node_index: 0,
@@ -1358,7 +1371,7 @@ mod tests {
             origin_right_chunk_index: Some(0),
             value_len: 0,
             value_is_null: false,
-            ..proto::HistoryNodeMeta::new()
+            ..proto::HistoryNodeMeta::default()
         });
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 2,
@@ -1373,7 +1386,7 @@ mod tests {
             deleted: false,
             value_len: 1,
             value_is_null: false,
-            ..proto::HistoryNodeMeta::new()
+            ..proto::HistoryNodeMeta::default()
         });
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 3,
@@ -1388,7 +1401,7 @@ mod tests {
             deleted: false,
             value_len: 1,
             value_is_null: false,
-            ..proto::HistoryNodeMeta::new()
+            ..proto::HistoryNodeMeta::default()
         });
         snapshot.nodes.push(proto::HistoryNodeMeta {
             version: 4,
@@ -1400,7 +1413,7 @@ mod tests {
             origin_left_chunk_index: Some(1),
             value_len: 0,
             value_is_null: false,
-            ..proto::HistoryNodeMeta::new()
+            ..proto::HistoryNodeMeta::default()
         });
 
         let err = decode_columnar_linear_string_history_snapshot(snapshot).unwrap_err();

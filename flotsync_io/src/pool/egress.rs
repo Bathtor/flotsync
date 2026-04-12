@@ -14,9 +14,11 @@ use crate::{
     errors::{Error, Result},
     logging::RuntimeLogger,
 };
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, buf::UninitSlice};
 use slog::{error, warn};
 use std::{
+    io,
+    ops::Range,
     pin::Pin,
     sync::{Arc, Mutex, MutexGuard, Weak},
     task::{Context, Poll},
@@ -144,7 +146,8 @@ impl EgressPool {
     ///
     /// This works recursively for chained payloads and for lease-backed fragments produced through
     /// payload slicing as long as each pooled fragment is uniquely owned. Shared pooled fragments
-    /// fail with [`Error::SharedIoPayloadOwnership`].
+    /// fail with [`Error::SharedIoPayloadOwnership`] unless the payload is already fully owned by
+    /// this egress pool, in which case adoption is a no-op.
     pub fn adopt_payload(&self, mut payload: IoPayload) -> Result<IoPayload> {
         self.adopt_payload_in_place(&mut payload)?;
         Ok(payload)
@@ -171,12 +174,12 @@ impl EgressPool {
         let IoLeaseInner::Pooled(payload) = &mut lease.inner else {
             return Ok(());
         };
-        let Some(payload) = Arc::get_mut(payload) else {
-            return Err(Error::SharedIoPayloadOwnership);
-        };
         if payload.recycler.is_owned_by_egress(&self.inner) {
             return Ok(());
         }
+        let Some(payload) = Arc::get_mut(payload) else {
+            return Err(Error::SharedIoPayloadOwnership);
+        };
 
         let chunk_count = payload.segment_count();
         self.import_live_chunks(chunk_count)?;
@@ -192,6 +195,9 @@ impl EgressPool {
     }
 
     fn adopt_payload_in_place(&self, payload: &mut IoPayload) -> Result<()> {
+        if self.payload_is_already_owned(payload) {
+            return Ok(());
+        }
         match payload {
             IoPayload::Lease(lease) => self.adopt_lease_in_place(lease),
             IoPayload::Bytes(_) => Ok(()),
@@ -204,6 +210,21 @@ impl EgressPool {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Returns whether `payload` already needs no retargeting or copying for this egress pool.
+    ///
+    /// This covers plain byte payloads, external leases, and pooled fragments already owned by the
+    /// same egress pool even when they are shared behind `Arc`.
+    fn payload_is_already_owned(&self, payload: &IoPayload) -> bool {
+        match payload {
+            IoPayload::Bytes(_) => true,
+            IoPayload::Lease(lease) => match &lease.inner {
+                IoLeaseInner::External(_) => true,
+                IoLeaseInner::Pooled(payload) => payload.recycler.is_owned_by_egress(&self.inner),
+            },
+            IoPayload::Chain(parts) => parts.iter().all(|part| self.payload_is_already_owned(part)),
         }
     }
 }
@@ -232,15 +253,10 @@ pub trait PayloadWriter {
     }
 
     /// Writes one readable sub-range from an existing payload by copying it into this writer.
-    async fn copy_payload_slice(
-        &mut self,
-        payload: &IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()> {
+    async fn copy_payload_slice(&mut self, payload: &IoPayload, range: Range<usize>) -> Result<()> {
         let payload_len = payload.len();
-        let Some(slice) = payload.clone().try_slice(offset, len) else {
-            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        let Some(slice) = payload.clone().try_slice(range.clone()) else {
+            return Err(invalid_payload_slice_range(payload_len, range));
         };
         self.copy_payload(&slice).await
     }
@@ -270,12 +286,7 @@ pub trait PayloadWriter {
     }
 
     /// Adopts one readable sub-range from an owned payload fragment.
-    async fn adopt_payload_slice(
-        &mut self,
-        payload: IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()>;
+    async fn adopt_payload_slice(&mut self, payload: IoPayload, range: Range<usize>) -> Result<()>;
 
     /// Writes a boolean as `0` or `1`.
     async fn write_bool(&mut self, value: bool) -> Result<()> {
@@ -592,6 +603,28 @@ impl EgressAsyncWriter {
         Ok(())
     }
 
+    /// Reserves enough staged pooled capacity for one bounded synchronous write window.
+    ///
+    /// The returned writer is only a temporary proxy into this writer's current pooled fragment.
+    /// It may write at most `reserved_bytes`, advances this writer immediately as bytes are
+    /// written, and leaves any unused reserved capacity available for later async or sync writes.
+    ///
+    /// This is intended for serializers that already know an exact size or a hard upper bound and
+    /// want to reuse one sync `BufMut` / `Write` implementation without giving up pooled memory.
+    pub async fn write_with_reserved(
+        &mut self,
+        reserved_bytes: usize,
+    ) -> Result<EgressReservedWriter<'_>> {
+        if reserved_bytes > self.pool.config.total_capacity_bytes() {
+            return Err(Error::EgressReservationTooLarge {
+                requested_bytes: reserved_bytes,
+                max_bytes: self.pool.config.total_capacity_bytes(),
+            });
+        }
+        std::future::poll_fn(|cx| self.poll_reserve_for_sync(cx, reserved_bytes)).await?;
+        Ok(EgressReservedWriter::new(self, reserved_bytes))
+    }
+
     fn adopt_payload_part(&mut self, payload: IoPayload) -> Result<()> {
         if payload.is_empty() {
             return Ok(());
@@ -652,6 +685,21 @@ impl EgressAsyncWriter {
         }
     }
 
+    fn poll_reserve_for_sync(
+        &mut self,
+        cx: &mut Context<'_>,
+        reserved_bytes: usize,
+    ) -> Poll<Result<()>> {
+        while self.remaining_staged_capacity() < reserved_bytes {
+            match self.poll_acquire_more(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_acquire_more(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         if self.pending_request.is_none() {
             let request = self.pool.reserve_up_to(self.next_preferred_bytes)?;
@@ -686,6 +734,27 @@ impl EgressAsyncWriter {
             return 0;
         }
         self.chunks[self.chunk_index].len() - self.chunk_offset
+    }
+
+    fn remaining_staged_capacity(&self) -> usize {
+        if self.chunk_index >= self.chunks.len() {
+            return 0;
+        }
+        let current = self.current_chunk_remaining();
+        let rest = self.chunks[self.chunk_index + 1..]
+            .iter()
+            .map(|chunk| chunk.len())
+            .sum::<usize>();
+        current + rest
+    }
+
+    fn advance_to_next_writable_chunk(&mut self) {
+        while self.chunk_index < self.chunks.len()
+            && self.chunk_offset == self.chunks[self.chunk_index].len()
+        {
+            self.chunk_index += 1;
+            self.chunk_offset = 0;
+        }
     }
 
     fn flush_current_part(&mut self) -> Result<()> {
@@ -738,24 +807,163 @@ impl PayloadWriter for EgressAsyncWriter {
         self.adopt_payload_part(payload)
     }
 
-    async fn adopt_payload_slice(
-        &mut self,
-        payload: IoPayload,
-        offset: usize,
-        len: usize,
-    ) -> Result<()> {
+    async fn adopt_payload_slice(&mut self, payload: IoPayload, range: Range<usize>) -> Result<()> {
         let payload_len = payload.len();
-        let Some(slice) = payload.try_slice(offset, len) else {
-            return Err(invalid_payload_slice_range(payload_len, offset, len));
+        let Some(slice) = payload.try_slice(range.clone()) else {
+            return Err(invalid_payload_slice_range(payload_len, range));
         };
         self.adopt_payload_part(slice)
     }
 }
 
-fn invalid_payload_slice_range(payload_len: usize, offset: usize, len: usize) -> Error {
+/// Temporary bounded synchronous writer over one reserved window inside an [`EgressAsyncWriter`].
+///
+/// This type does not own memory on its own. It is only a scoped mutable view into the parent
+/// writer's current pooled fragment. As bytes are written, the parent writer advances
+/// immediately. Any unused reserved budget remains available to the parent once this proxy drops.
+pub struct EgressReservedWriter<'a> {
+    writer: &'a mut EgressAsyncWriter,
+    reserved_remaining: usize,
+}
+
+impl<'a> EgressReservedWriter<'a> {
+    fn new(writer: &'a mut EgressAsyncWriter, reserved_remaining: usize) -> Self {
+        Self {
+            writer,
+            reserved_remaining,
+        }
+    }
+
+    /// Returns how many bytes may still be written through this bounded proxy.
+    pub fn reserved_remaining(&self) -> usize {
+        self.reserved_remaining
+    }
+
+    fn ensure_writable_chunk(&mut self) {
+        self.writer.advance_to_next_writable_chunk();
+        assert!(
+            self.reserved_remaining == 0 || self.writer.current_chunk_remaining() > 0,
+            "EgressReservedWriter ran out of pooled capacity before exhausting its reserved budget"
+        );
+    }
+
+    fn panic_overflow(&self, attempted_bytes: usize) -> ! {
+        panic!(
+            "EgressReservedWriter overflowed its reserved budget: attempted {attempted_bytes} bytes with only {} bytes remaining",
+            self.reserved_remaining
+        );
+    }
+}
+
+// Safety:
+//
+// - `write_with_reserved` only constructs this proxy after the parent writer has acquired at
+//   least `reserved_remaining` bytes of staged pooled capacity.
+// - the proxy holds the only `&mut EgressAsyncWriter`, so `chunk_mut` cannot alias another
+//   mutable view into the same chunks while the proxy is alive.
+// - every successful write path reduces `reserved_remaining` and advances the parent writer's
+//   `(written_bytes, chunk_index, chunk_offset)` in lock-step, so the proxy never exposes bytes
+//   beyond its reserved window.
+// - `advance_to_next_writable_chunk` only skips fully consumed chunks, so the returned pointer in
+//   `chunk_mut` always targets the current live writable region.
+unsafe impl BufMut for EgressReservedWriter<'_> {
+    fn remaining_mut(&self) -> usize {
+        self.reserved_remaining
+    }
+
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        if cnt > self.reserved_remaining {
+            self.panic_overflow(cnt);
+        }
+
+        let mut remaining = cnt;
+        while remaining > 0 {
+            self.ensure_writable_chunk();
+            let available = self.writer.current_chunk_remaining();
+            let advance = available.min(remaining);
+            self.writer.written_bytes += advance;
+            self.writer.chunk_offset += advance;
+            self.reserved_remaining -= advance;
+            remaining -= advance;
+            self.writer.advance_to_next_writable_chunk();
+        }
+    }
+
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        self.ensure_writable_chunk();
+        let chunk_len = self
+            .writer
+            .current_chunk_remaining()
+            .min(self.reserved_remaining);
+        if chunk_len == 0 {
+            // Safety: a zero-length slice may use a dangling pointer because it is never
+            // dereferenced. This is only the `BufMut` empty-chunk case once the reserved window
+            // is exhausted.
+            return unsafe {
+                UninitSlice::from_raw_parts_mut(std::ptr::NonNull::<u8>::dangling().as_ptr(), 0)
+            };
+        }
+
+        let chunk = &mut self.writer.chunks[self.writer.chunk_index];
+        let ptr = chunk.as_mut_ptr();
+        // Safety: `ensure_writable_chunk` guarantees that `chunk_offset` points at the current
+        // writable prefix inside `chunk`, and `chunk_len` is capped to both the remaining bytes in
+        // this chunk and the proxy's remaining reserved budget.
+        unsafe { UninitSlice::from_raw_parts_mut(ptr.add(self.writer.chunk_offset), chunk_len) }
+    }
+
+    fn put<T: Buf>(&mut self, mut src: T)
+    where
+        Self: Sized,
+    {
+        while src.has_remaining() {
+            let chunk = src.chunk();
+            let chunk_len = chunk.len();
+            self.put_slice(chunk);
+            src.advance(chunk_len);
+        }
+    }
+
+    fn put_slice(&mut self, src: &[u8]) {
+        if src.len() > self.reserved_remaining {
+            self.panic_overflow(src.len());
+        }
+
+        let mut offset = 0usize;
+        while offset < src.len() {
+            self.ensure_writable_chunk();
+            let available = self
+                .writer
+                .current_chunk_remaining()
+                .min(self.reserved_remaining);
+            let to_copy = available.min(src.len() - offset);
+            let chunk = &mut self.writer.chunks[self.writer.chunk_index];
+            chunk[self.writer.chunk_offset..self.writer.chunk_offset + to_copy]
+                .copy_from_slice(&src[offset..offset + to_copy]);
+            self.writer.written_bytes += to_copy;
+            self.writer.chunk_offset += to_copy;
+            self.reserved_remaining -= to_copy;
+            offset += to_copy;
+            self.writer.advance_to_next_writable_chunk();
+        }
+    }
+}
+
+impl io::Write for EgressReservedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.put_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn invalid_payload_slice_range(payload_len: usize, range: Range<usize>) -> Error {
     Error::InvalidIoPayloadSliceRange {
-        offset,
-        len,
+        start: range.start,
+        end: range.end,
         payload_len,
     }
 }

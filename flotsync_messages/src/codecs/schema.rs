@@ -1,4 +1,5 @@
 use crate::{
+    buffa::{EnumValue, MessageField},
     codecs::datamodel::{CodecError, decode_nullable_basic_value, encode_nullable_basic_value},
     datamodel as proto,
 };
@@ -19,7 +20,6 @@ use flotsync_data_types::{
     },
 };
 use ordered_float::OrderedFloat;
-use protobuf::{EnumOrUnknown, MessageField};
 use snafu::prelude::*;
 use std::collections::HashMap;
 
@@ -28,7 +28,7 @@ type SchemaResult<T> = Result<T, SchemaCodecError>;
 trait RequiredMessageFieldExt<T> {
     fn take_required(&mut self, message: &'static str, field: &'static str) -> SchemaResult<T>;
 }
-impl<T> RequiredMessageFieldExt<T> for MessageField<T> {
+impl<T: Default> RequiredMessageFieldExt<T> for MessageField<T> {
     fn take_required(&mut self, message: &'static str, field: &'static str) -> SchemaResult<T> {
         self.take().context(MissingFieldSnafu { message, field })
     }
@@ -120,7 +120,7 @@ pub enum SchemaCodecError {
 
 /// Encode a `Schema` into its protobuf schema transport form.
 pub fn encode_schema_definition(schema: &Schema) -> SchemaResult<proto::SchemaDefinition> {
-    let mut encoded = proto::SchemaDefinition::new();
+    let mut encoded = proto::SchemaDefinition::default();
     let mut fields = schema.columns.values().collect::<Vec<_>>();
     fields.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     encoded.fields = fields
@@ -148,15 +148,18 @@ pub fn decode_schema_definition(mut schema: proto::SchemaDefinition) -> SchemaRe
 }
 
 fn encode_field_definition(field: &Field) -> SchemaResult<proto::FieldDefinition> {
-    let mut encoded = proto::FieldDefinition::new();
-    encoded.name = field.name.clone();
-    encoded.data_type = MessageField::some(encode_replicated_data_type(&field.data_type)?);
-    if let Some(default_value) = field.default_value.as_ref() {
-        encoded.default_value =
-            MessageField::some(encode_nullable_basic_value(default_value.as_ref()));
-    }
-    encoded.metadata = field.metadata.clone();
-    Ok(encoded)
+    let default_value = field
+        .default_value
+        .as_ref()
+        .map(|default_value| encode_nullable_basic_value(default_value.as_ref()))
+        .into();
+    Ok(proto::FieldDefinition {
+        name: field.name.clone(),
+        data_type: MessageField::some(encode_replicated_data_type(&field.data_type)?),
+        default_value,
+        metadata: field.metadata.clone(),
+        ..proto::FieldDefinition::default()
+    })
 }
 
 fn decode_field_definition(mut field: proto::FieldDefinition) -> SchemaResult<Field> {
@@ -189,23 +192,23 @@ fn decode_field_definition(mut field: proto::FieldDefinition) -> SchemaResult<Fi
 fn encode_replicated_data_type(
     data_type: &ReplicatedDataType,
 ) -> SchemaResult<proto::ReplicatedDataType> {
-    let mut encoded = proto::ReplicatedDataType::new();
+    let mut encoded = proto::ReplicatedDataType::default();
     match data_type {
         ReplicatedDataType::LatestValueWins { value_type } => {
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_LATEST_VALUE_WINS,
             );
             encoded.detail = Some(proto::replicated_data_type::Detail::NullableBasicValueType(
-                encode_nullable_basic_data_type(value_type),
+                Box::new(encode_nullable_basic_data_type(value_type)),
             ));
         }
         ReplicatedDataType::LinearString => {
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_LINEAR_STRING,
             );
         }
         ReplicatedDataType::LinearList { value_type } => {
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_LINEAR_LIST,
             );
             encoded.detail = Some(proto::replicated_data_type::Detail::PrimitiveValueType(
@@ -213,7 +216,7 @@ fn encode_replicated_data_type(
             ));
         }
         ReplicatedDataType::MonotonicCounter { small_range } => {
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_MONOTONIC_COUNTER,
             );
             encoded.detail =
@@ -223,7 +226,7 @@ fn encode_replicated_data_type(
             value_type,
             direction,
         } => {
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_TOTAL_ORDER_REGISTER,
             );
             encoded.detail = Some(proto::replicated_data_type::Detail::PrimitiveValueType(
@@ -233,11 +236,11 @@ fn encode_replicated_data_type(
         }
         ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states } => {
             validate_finite_state_definition(*value_type, states)?;
-            encoded.kind = EnumOrUnknown::new(
+            encoded.kind = EnumValue::from(
                 proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_TOTAL_ORDER_FINITE_STATE_REGISTER,
             );
             encoded.detail = Some(proto::replicated_data_type::Detail::FiniteStateStates(
-                encode_nullable_primitive_value_array(states)?,
+                Box::new(encode_nullable_primitive_value_array(states)?),
             ));
             encoded.finite_state_value_type =
                 MessageField::some(encode_nullable_primitive_type(*value_type));
@@ -282,7 +285,7 @@ fn decode_replicated_data_type(
                 }
                 .fail();
             };
-            let value_type = decode_nullable_basic_data_type(value_type)?;
+            let value_type = decode_nullable_basic_data_type(*value_type)?;
             Ok(ReplicatedDataType::LatestValueWins { value_type })
         }
         proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_LINEAR_STRING => {
@@ -379,7 +382,7 @@ fn decode_replicated_data_type(
                 }
                 .fail();
             };
-            let states = decode_nullable_primitive_value_array(states)?;
+            let states = decode_nullable_primitive_value_array(*states)?;
             let value_type = finite_state_value_type.context(MissingFiniteStateValueTypeSnafu {
                 kind: kind_name,
             })?;
@@ -395,17 +398,17 @@ fn decode_replicated_data_type(
 fn encode_nullable_basic_data_type(
     value_type: &NullableBasicDataType,
 ) -> proto::NullableBasicDataType {
-    let mut encoded = proto::NullableBasicDataType::new();
+    let mut encoded = proto::NullableBasicDataType::default();
     match value_type {
         NullableBasicDataType::NonNull(value_type) => {
-            encoded.value = Some(proto::nullable_basic_data_type::Value::NonNull(
+            encoded.value = Some(proto::nullable_basic_data_type::Value::NonNull(Box::new(
                 encode_basic_data_type(value_type),
-            ));
+            )));
         }
         NullableBasicDataType::Nullable(value_type) => {
-            encoded.value = Some(proto::nullable_basic_data_type::Value::Nullable(
+            encoded.value = Some(proto::nullable_basic_data_type::Value::Nullable(Box::new(
                 encode_basic_data_type(value_type),
-            ));
+            )));
         }
     }
     encoded
@@ -420,16 +423,16 @@ fn decode_nullable_basic_data_type(
         .take_required_oneof("NullableBasicDataType.value")?;
     match value {
         proto::nullable_basic_data_type::Value::NonNull(value_type) => {
-            decode_basic_data_type(value_type).map(NullableBasicDataType::NonNull)
+            decode_basic_data_type(*value_type).map(NullableBasicDataType::NonNull)
         }
         proto::nullable_basic_data_type::Value::Nullable(value_type) => {
-            decode_basic_data_type(value_type).map(NullableBasicDataType::Nullable)
+            decode_basic_data_type(*value_type).map(NullableBasicDataType::Nullable)
         }
     }
 }
 
 fn encode_basic_data_type(value_type: &BasicDataType) -> proto::BasicDataType {
-    let mut encoded = proto::BasicDataType::new();
+    let mut encoded = proto::BasicDataType::default();
     match value_type {
         BasicDataType::Primitive(value_type) => {
             encoded.value = Some(proto::basic_data_type::Value::Primitive(
@@ -464,7 +467,7 @@ fn decode_basic_data_type(mut value_type: proto::BasicDataType) -> SchemaResult<
 fn encode_nullable_primitive_type(
     value_type: NullablePrimitiveType,
 ) -> proto::NullablePrimitiveType {
-    let mut encoded = proto::NullablePrimitiveType::new();
+    let mut encoded = proto::NullablePrimitiveType::default();
     match value_type {
         NullablePrimitiveType::NonNull(value_type) => {
             encoded.value = Some(proto::nullable_primitive_type::Value::NonNull(
@@ -500,7 +503,7 @@ fn decode_nullable_primitive_type(
 fn encode_nullable_primitive_value_array(
     states: &NullablePrimitiveValueArray,
 ) -> SchemaResult<proto::NullablePrimitiveValueArray> {
-    let mut encoded = proto::NullablePrimitiveValueArray::new();
+    let mut encoded = proto::NullablePrimitiveValueArray::default();
     match states {
         NullablePrimitiveValueArray::NonNull(values) => {
             encoded.values = MessageField::some(encode_primitive_array(values));
@@ -572,55 +575,75 @@ fn validate_finite_state_definition(
 }
 
 fn encode_primitive_array(value: &PrimitiveValueArray) -> proto::PrimitiveArrayValue {
-    let mut encoded = proto::PrimitiveArrayValue::new();
-    match value {
+    let encoded_value = match value {
         PrimitiveValueArray::String(values) => {
-            let mut message = proto::StringArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::String(message));
+            let message = proto::StringArrayValue {
+                values: values.to_vec(),
+                ..proto::StringArrayValue::default()
+            };
+            proto::primitive_array_value::Value::String(Box::new(message))
         }
         PrimitiveValueArray::UInt(values) => {
-            let mut message = proto::UIntArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Uint(message));
+            let message = proto::UIntArrayValue {
+                values: values.to_vec(),
+                ..proto::UIntArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Uint(Box::new(message))
         }
         PrimitiveValueArray::Int(values) => {
-            let mut message = proto::IntArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Int(message));
+            let message = proto::IntArrayValue {
+                values: values.to_vec(),
+                ..proto::IntArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Int(Box::new(message))
         }
         PrimitiveValueArray::Byte(values) => {
-            let mut message = proto::ByteArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Byte(message));
+            let message = proto::ByteArrayValue {
+                values: values.to_vec(),
+                ..proto::ByteArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Byte(Box::new(message))
         }
         PrimitiveValueArray::Float(values) => {
-            let mut message = proto::FloatArrayValue::new();
-            message.values = values.iter().map(|value| value.0).collect();
-            encoded.value = Some(proto::primitive_array_value::Value::Float(message));
+            let message = proto::FloatArrayValue {
+                values: values.iter().map(|value| value.0).collect(),
+                ..proto::FloatArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Float(Box::new(message))
         }
         PrimitiveValueArray::Boolean(values) => {
-            let mut message = proto::BooleanArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Boolean(message));
+            let message = proto::BooleanArrayValue {
+                values: values.to_vec(),
+                ..proto::BooleanArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Boolean(Box::new(message))
         }
         PrimitiveValueArray::Binary(values) => {
-            let mut message = proto::BinaryArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Binary(message));
+            let message = proto::BinaryArrayValue {
+                values: values.to_vec(),
+                ..proto::BinaryArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Binary(Box::new(message))
         }
         PrimitiveValueArray::Date(values) => {
-            let mut message = proto::DateArrayValue::new();
-            message.values = values.iter().copied().map(encode_date).collect();
-            encoded.value = Some(proto::primitive_array_value::Value::Date(message));
+            let message = proto::DateArrayValue {
+                values: values.iter().copied().map(encode_date).collect(),
+                ..proto::DateArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Date(Box::new(message))
         }
         PrimitiveValueArray::Timestamp(values) => {
-            let mut message = proto::TimestampArrayValue::new();
-            message.values = values.to_vec();
-            encoded.value = Some(proto::primitive_array_value::Value::Timestamp(message));
+            let message = proto::TimestampArrayValue {
+                values: values.to_vec(),
+                ..proto::TimestampArrayValue::default()
+            };
+            proto::primitive_array_value::Value::Timestamp(Box::new(message))
         }
+    };
+    proto::PrimitiveArrayValue {
+        value: Some(encoded_value),
+        ..proto::PrimitiveArrayValue::default()
     }
-    encoded
 }
 
 fn decode_primitive_array(
@@ -667,7 +690,7 @@ fn encode_date(value: NaiveDate) -> proto::Date {
         year: value.year(),
         month: value.month(),
         day: value.day(),
-        ..proto::Date::new()
+        ..proto::Date::default()
     }
 }
 
@@ -679,7 +702,7 @@ fn decode_date(value: proto::Date) -> SchemaResult<NaiveDate> {
     })
 }
 
-fn encode_primitive_type(value: PrimitiveType) -> EnumOrUnknown<proto::PrimitiveType> {
+fn encode_primitive_type(value: PrimitiveType) -> EnumValue<proto::PrimitiveType> {
     let value = match value {
         PrimitiveType::String => proto::PrimitiveType::PRIMITIVE_TYPE_STRING,
         PrimitiveType::UInt => proto::PrimitiveType::PRIMITIVE_TYPE_UINT,
@@ -691,15 +714,15 @@ fn encode_primitive_type(value: PrimitiveType) -> EnumOrUnknown<proto::Primitive
         PrimitiveType::Date => proto::PrimitiveType::PRIMITIVE_TYPE_DATE,
         PrimitiveType::Timestamp => proto::PrimitiveType::PRIMITIVE_TYPE_TIMESTAMP,
     };
-    EnumOrUnknown::new(value)
+    EnumValue::from(value)
 }
 
-fn decode_primitive_type(
-    value: EnumOrUnknown<proto::PrimitiveType>,
-) -> SchemaResult<PrimitiveType> {
+fn decode_primitive_type(value: EnumValue<proto::PrimitiveType>) -> SchemaResult<PrimitiveType> {
     let value = value
-        .enum_value()
-        .map_err(|value| SchemaCodecError::UnknownPrimitiveType { value })?;
+        .as_known()
+        .ok_or_else(|| SchemaCodecError::UnknownPrimitiveType {
+            value: value.to_i32(),
+        })?;
     match value {
         proto::PrimitiveType::PRIMITIVE_TYPE_UNSPECIFIED => UnspecifiedPrimitiveTypeSnafu.fail(),
         proto::PrimitiveType::PRIMITIVE_TYPE_STRING => Ok(PrimitiveType::String),
@@ -714,18 +737,20 @@ fn decode_primitive_type(
     }
 }
 
-fn encode_direction(value: Direction) -> EnumOrUnknown<proto::Direction> {
+fn encode_direction(value: Direction) -> EnumValue<proto::Direction> {
     let value = match value {
         Direction::Ascending => proto::Direction::DIRECTION_ASCENDING,
         Direction::Descending => proto::Direction::DIRECTION_DESCENDING,
     };
-    EnumOrUnknown::new(value)
+    EnumValue::from(value)
 }
 
-fn decode_direction(value: EnumOrUnknown<proto::Direction>) -> SchemaResult<Direction> {
+fn decode_direction(value: EnumValue<proto::Direction>) -> SchemaResult<Direction> {
     let value = value
-        .enum_value()
-        .map_err(|value| SchemaCodecError::UnknownDirection { value })?;
+        .as_known()
+        .ok_or_else(|| SchemaCodecError::UnknownDirection {
+            value: value.to_i32(),
+        })?;
     match value {
         proto::Direction::DIRECTION_UNSPECIFIED => UnspecifiedDirectionSnafu.fail(),
         proto::Direction::DIRECTION_ASCENDING => Ok(Direction::Ascending),
@@ -734,11 +759,14 @@ fn decode_direction(value: EnumOrUnknown<proto::Direction>) -> SchemaResult<Dire
 }
 
 fn decode_replicated_data_type_kind(
-    value: EnumOrUnknown<proto::ReplicatedDataTypeKind>,
+    value: EnumValue<proto::ReplicatedDataTypeKind>,
 ) -> SchemaResult<proto::ReplicatedDataTypeKind> {
-    let value = value
-        .enum_value()
-        .map_err(|value| SchemaCodecError::UnknownReplicatedDataTypeKind { value })?;
+    let value =
+        value
+            .as_known()
+            .ok_or_else(|| SchemaCodecError::UnknownReplicatedDataTypeKind {
+                value: value.to_i32(),
+            })?;
     if value == proto::ReplicatedDataTypeKind::REPLICATED_DATA_TYPE_KIND_UNSPECIFIED {
         return UnspecifiedReplicatedDataTypeKindSnafu.fail();
     }

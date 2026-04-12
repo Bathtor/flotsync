@@ -1,5 +1,5 @@
 use crate::{
-    app::ExampleRuntime,
+    app::{ExampleRuntime, RuntimeConfigArgs},
     support::{OutcomePromise, complete_outcome, new_outcome_promise, wait_for_component_outcome},
 };
 use bytes::Buf;
@@ -49,6 +49,8 @@ const ROOT_BODY: &[u8] = b"hello from flotsync_io\n";
     about = "Minimal HTTP/1.1 server example on top of flotsync_io"
 )]
 pub struct HttpServerArgs {
+    #[command(flatten)]
+    runtime: RuntimeConfigArgs,
     /// Local address to bind the TCP listener to.
     #[arg(long)]
     bind: SocketAddr,
@@ -56,7 +58,7 @@ pub struct HttpServerArgs {
 
 /// Runs the HTTP server example until stdin reaches EOF or the listener fails.
 pub fn run(args: HttpServerArgs) -> Result<()> {
-    let runtime = ExampleRuntime::setup()?;
+    let runtime = ExampleRuntime::setup(&args.runtime)?;
     let (outcome_promise, outcome_future) = new_outcome_promise();
     let bridge_handle = runtime.bridge_handle().clone();
     let http_component = runtime
@@ -958,7 +960,7 @@ fn build_echo_body_payload(
                 )
             });
         let payload = payload
-            .try_slice(slice.offset, slice.len)
+            .try_slice(slice.offset..slice.offset + slice.len)
             .unwrap_or_else(|| {
                 panic!(
                     "echo response slice {}..{} fell outside retained payload {}",

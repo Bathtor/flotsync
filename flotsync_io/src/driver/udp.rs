@@ -16,18 +16,26 @@ use crate::{
     errors::{Error, Result},
     logging::RuntimeLogger,
     pool::IngressPool,
+    socket_support::{configure_bind_reuse, socket_domain},
 };
 use bytes::Buf;
 use flotsync_utils::option_when;
 use mio::{Interest, Registry, net::UdpSocket as MioUdpSocket};
 use slog::{debug, error, warn};
-use socket2::SockRef;
-use std::{io, io::ErrorKind, net::SocketAddr};
+use socket2::{Protocol, SockAddr, SockRef, Socket, Type};
+use std::{
+    io,
+    io::ErrorKind,
+    net::{SocketAddr, UdpSocket as StdUdpSocket},
+};
 
 /// UDP-side runtime state owned by the shared driver.
 #[derive(Debug)]
 pub(super) struct UdpRuntimeState {
     logger: RuntimeLogger,
+    /// Mirrors the driver-wide bind policy so tests can opt bind paths into platform socket
+    /// re-use options.
+    bind_reuse_address: bool,
     sockets: SlotRegistry<UdpSocketEntry>,
 }
 
@@ -104,9 +112,10 @@ enum UdpSendTarget {
 }
 
 impl UdpRuntimeState {
-    pub(super) fn new(logger: RuntimeLogger) -> Self {
+    pub(super) fn new(logger: RuntimeLogger, bind_reuse_address: bool) -> Self {
         Self {
             logger,
+            bind_reuse_address,
             sockets: SlotRegistry::default(),
         }
     }
@@ -181,7 +190,7 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let socket = match bind_udp_socket(local_addr) {
+        let socket = match bind_udp_socket(local_addr, self.bind_reuse_address) {
             Ok(socket) => socket,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
@@ -259,7 +268,7 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let socket = match bind_udp_socket(local_addr) {
+        let socket = match bind_udp_socket(local_addr, self.bind_reuse_address) {
             Ok(socket) => socket,
             Err(error) => {
                 event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
@@ -693,8 +702,20 @@ impl UdpRuntimeState {
     }
 }
 
-fn bind_udp_socket(local_addr: SocketAddr) -> io::Result<MioUdpSocket> {
-    MioUdpSocket::bind(local_addr)
+/// Binds one UDP socket, optionally opting into platform socket re-use for test-only port
+/// reservation.
+fn bind_udp_socket(local_addr: SocketAddr, bind_reuse_address: bool) -> io::Result<MioUdpSocket> {
+    if !bind_reuse_address {
+        return MioUdpSocket::bind(local_addr);
+    }
+
+    let socket = Socket::new(socket_domain(local_addr), Type::DGRAM, Some(Protocol::UDP))?;
+    configure_bind_reuse(&socket)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SockAddr::from(local_addr))?;
+
+    let socket: StdUdpSocket = socket.into();
+    Ok(MioUdpSocket::from_std(socket))
 }
 
 fn apply_socket_interest(entry: &mut UdpSocketEntry, registry: &Registry) -> io::Result<()> {
@@ -885,7 +906,12 @@ mod tests {
         logging::default_runtime_logger,
         pool::{IoBufferConfig, IoPoolConfig},
         prelude::Result,
-        test_support::init_test_logger,
+        test_support::{
+            ReservedSocketKind,
+            bind_reserved_udp_socket,
+            init_test_logger,
+            reserve_sockets,
+        },
     };
     use bytes::Bytes;
     use mio::{Poll, Token};
@@ -939,8 +965,12 @@ mod tests {
         }
     }
 
-    fn payload_bytes(payload: IoPayload) -> Bytes {
-        payload.create_byte_clone()
+    fn start_bind_reuse_driver(config: DriverConfig) -> IoDriver {
+        IoDriver::start(DriverConfig {
+            bind_reuse_address: true,
+            ..config
+        })
+        .expect("driver starts")
     }
 
     fn bind_udp_socket_at(
@@ -972,20 +1002,48 @@ mod tests {
         }
     }
 
-    fn bind_udp_socket(driver: &IoDriver, socket_id: SocketId) -> SocketAddr {
-        bind_udp_socket_at(driver, socket_id, localhost(0))
+    #[test]
+    fn socket2_udp_reuse_address_allows_rebinding_on_the_same_thread() {
+        let reservation = Socket::new(
+            crate::socket_support::socket_domain(localhost(0)),
+            Type::DGRAM,
+            Some(Protocol::UDP),
+        )
+        .expect("create first UDP socket");
+        configure_bind_reuse(&reservation).expect("enable UDP re-use on first UDP socket");
+        reservation
+            .bind(&SockAddr::from(localhost(0)))
+            .expect("bind first UDP socket");
+        let reserved_addr = reservation
+            .local_addr()
+            .expect("first UDP socket local addr")
+            .as_socket()
+            .expect("UDP reservation must use an IP socket address");
+
+        let rebound = Socket::new(
+            crate::socket_support::socket_domain(localhost(0)),
+            Type::DGRAM,
+            Some(Protocol::UDP),
+        )
+        .expect("create second UDP socket");
+        configure_bind_reuse(&rebound).expect("enable UDP re-use on second UDP socket");
+        rebound
+            .bind(&SockAddr::from(reserved_addr))
+            .expect("rebind UDP socket with SO_REUSEADDR");
     }
 
     #[test]
     fn udp_unconnected_bind_send_and_receive_work() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_lease =
+            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(DriverConfig::default());
         let receiver_id = resolve_request(driver.reserve_socket());
         let sender_id = resolve_request(driver.reserve_socket());
 
-        let receiver_addr = bind_udp_socket(&driver, receiver_id);
-        let sender_addr = bind_udp_socket(&driver, sender_id);
+        let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
+        let sender_addr = bind_udp_socket_at(&driver, sender_id, socket_lease.addr(1));
         let transmission_id = TransmissionId(1);
 
         driver
@@ -1013,7 +1071,7 @@ mod tests {
                     payload,
                 }) if socket_id == receiver_id => {
                     assert_eq!(source, sender_addr);
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated UDP event: {:?}", other);
@@ -1030,11 +1088,12 @@ mod tests {
     fn udp_connected_send_and_receive_work() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(DriverConfig::default());
         let receiver_id = resolve_request(driver.reserve_socket());
         let sender_id = resolve_request(driver.reserve_socket());
 
-        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+        let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
 
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Connect {
@@ -1089,7 +1148,7 @@ mod tests {
                     payload,
                 }) if socket_id == receiver_id => {
                     assert_eq!(source, sender_addr);
-                    received_payload = Some(payload_bytes(payload));
+                    received_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!("ignoring unrelated UDP event: {:?}", other);
@@ -1106,9 +1165,10 @@ mod tests {
     fn udp_missing_target_for_unconnected_socket_is_nacked() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(DriverConfig::default());
         let socket_id = resolve_request(driver.reserve_socket());
-        bind_udp_socket(&driver, socket_id);
+        bind_udp_socket_at(&driver, socket_id, socket_lease.addr(0));
 
         let transmission_id = TransmissionId(3);
         driver
@@ -1146,11 +1206,12 @@ mod tests {
     fn udp_unexpected_target_for_connected_socket_is_nacked() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(DriverConfig::default());
         let receiver_id = resolve_request(driver.reserve_socket());
         let sender_id = resolve_request(driver.reserve_socket());
 
-        let receiver_addr = bind_udp_socket(&driver, receiver_id);
+        let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
 
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Connect {
@@ -1215,9 +1276,10 @@ mod tests {
     fn udp_broadcast_configuration_is_reported() {
         init_test_logger();
 
-        let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+        let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(DriverConfig::default());
         let socket_id = resolve_request(driver.reserve_socket());
-        bind_udp_socket(&driver, socket_id);
+        bind_udp_socket_at(&driver, socket_id, socket_lease.addr(0));
         let option = UdpSocketOption::Broadcast(true);
 
         driver
@@ -1339,12 +1401,14 @@ mod tests {
             },
             ..DriverConfig::default()
         };
-        let driver = IoDriver::start(driver_config).expect("driver starts");
+        let socket_lease =
+            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+        let driver = start_bind_reuse_driver(driver_config);
         let receiver_id = resolve_request(driver.reserve_socket());
         let sender_id = resolve_request(driver.reserve_socket());
 
-        let receiver_addr = bind_udp_socket(&driver, receiver_id);
-        bind_udp_socket(&driver, sender_id);
+        let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
+        bind_udp_socket_at(&driver, sender_id, socket_lease.addr(1));
 
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Send {
@@ -1436,7 +1500,7 @@ mod tests {
                 DriverEvent::Udp(UdpEvent::Received {
                     socket_id, payload, ..
                 }) if socket_id == receiver_id => {
-                    third_payload = Some(payload_bytes(payload));
+                    third_payload = Some(payload.to_vec());
                 }
                 other => {
                     log::debug!(
@@ -1456,20 +1520,23 @@ mod tests {
     fn udp_write_resumes_after_suspended_socket_becomes_writable() {
         init_test_logger();
 
+        let socket_lease =
+            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
         let poll = Poll::new().expect("create mio poll");
-        let mut state = UdpRuntimeState::new(default_runtime_logger());
+        let mut state = UdpRuntimeState::new(default_runtime_logger(), true);
         let event_sink = RecordingEventSink::default();
         let socket_id = SocketId(0);
         let transmission_id = TransmissionId(20);
         let resumed_transmission_id = TransmissionId(21);
-        let receiver = std::net::UdpSocket::bind(localhost(0)).expect("bind UDP receiver");
+        let receiver =
+            bind_reserved_udp_socket(&socket_lease, 0).expect("bind reserved UDP receiver");
         let receiver_addr = receiver.local_addr().expect("receiver addr");
 
         state.reserve_socket(socket_id, Token(1));
         state
             .handle_bind(
                 socket_id,
-                UdpLocalBind::Exact(localhost(0)),
+                UdpLocalBind::Exact(socket_lease.addr(1)),
                 poll.registry(),
                 &event_sink,
             )

@@ -1,4 +1,4 @@
-use flotsync_messages::protobuf;
+use flotsync_messages::buffa;
 use snafu::prelude::*;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
@@ -15,8 +15,8 @@ pub enum ServiceError {
     Io { source: std::io::Error },
     #[snafu(display("A thread panicked"))]
     ThreadJoin,
-    #[snafu(display("Error during protobuf operations: {source}"))]
-    Proto { source: protobuf::Error },
+    #[snafu(display("Error during buffa decoding operations: {source}"))]
+    Proto { source: buffa::DecodeError },
     #[cfg(feature = "zeroconf-support")]
     #[snafu(display("Error with a zeroconf service operation: {source}"))]
     Zeroconf {

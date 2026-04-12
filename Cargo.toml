@@ -5,6 +5,7 @@ members = [
     "flotsync_discovery",
     "flotsync_discovery_cli",
     "flotsync_data_types",
+    "flotsync_udpour",
     "flotsync_utils",
     "flotsync_replication",
     "flotsync_io",
@@ -13,8 +14,14 @@ members = [
 resolver = "3"
 
 [workspace.dependencies]
+arc-swap = "1"
+bytes = "1"
+smallvec = "1"
 snafu = "0.9"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
 uuid = "1"
 kompact = "0.11"
+
+[patch.crates-io]
+kompact = { git = "https://github.com/kompics/kompact", branch = "master" }

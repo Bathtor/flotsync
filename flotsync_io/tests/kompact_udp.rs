@@ -2,14 +2,15 @@ use bytes::Bytes;
 use flotsync_io::{
     prelude::*,
     test_support::{
+        ReservedSocketKind,
         UdpObserver,
         UdpSendResultProbe,
-        build_test_kompact_system,
+        build_test_kompact_system_with,
+        enable_bind_reuse_address,
         init_test_logger,
         kill_component,
-        localhost,
-        payload_bytes,
         recv_until,
+        reserve_sockets,
         start_component,
     },
 };
@@ -20,7 +21,9 @@ use std::{sync::mpsc, time::Duration};
 fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let socket_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
     let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
@@ -53,7 +56,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id: receiver_request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(0)),
         });
     });
     let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
@@ -100,7 +103,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     observer2.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id: sender_request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(1)),
         });
     });
     let sender_id = match recv_until(&observer1_rx, |event| {
@@ -204,7 +207,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
             socket_id, payload, ..
         } => {
             assert_eq!(socket_id, receiver_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to first UDP Received indication, got {other:?}"),
     }
@@ -221,7 +224,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
             socket_id, payload, ..
         } => {
             assert_eq!(socket_id, receiver_id);
-            assert_eq!(payload_bytes(payload), Bytes::from_static(b"hello"));
+            assert_eq!(payload.to_vec().as_slice(), b"hello");
         }
         other => unreachable!("filtered to mirrored UDP Received indication, got {other:?}"),
     }
@@ -242,7 +245,8 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
 fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     init_test_logger();
 
-    let system = build_test_kompact_system();
+    let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     start_component(&system, &driver_component);
 
@@ -261,7 +265,7 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
-            bind: UdpLocalBind::Exact(localhost(0)),
+            bind: UdpLocalBind::Exact(socket_lease.addr(0)),
         });
     });
     let bound_addr = match recv_until(&observer1_rx, |event| {

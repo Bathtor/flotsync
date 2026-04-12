@@ -19,6 +19,7 @@ use flotsync_data_types::{
     text::LinearString,
 };
 use flotsync_messages::{
+    buffa::Message,
     codecs::datamodel::{
         ColumnarHistoryCodecError,
         decode_columnar_latest_value_wins_history_snapshot,
@@ -29,7 +30,6 @@ use flotsync_messages::{
         encode_columnar_linear_string_history_snapshot,
     },
     datamodel as proto,
-    protobuf::Message,
 };
 use std::time::Duration;
 
@@ -230,34 +230,31 @@ fn build_linear_list_fixture(
 fn lvw_bytes(fixture: &LvwFixture) -> Vec<u8> {
     encode_columnar_latest_value_wins_history_snapshot(&fixture.nodes, &fixture.value_type)
         .unwrap()
-        .write_to_bytes()
-        .unwrap()
+        .encode_to_vec()
 }
 
 fn string_bytes(fixture: &LinearStringFixture) -> Vec<u8> {
     encode_columnar_linear_string_history_snapshot(&fixture.nodes)
         .unwrap()
-        .write_to_bytes()
-        .unwrap()
+        .encode_to_vec()
 }
 
 fn list_bytes(fixture: &LinearListFixture) -> Vec<u8> {
     encode_columnar_linear_list_history_snapshot(&fixture.nodes, fixture.value_type)
         .unwrap()
-        .write_to_bytes()
-        .unwrap()
+        .encode_to_vec()
 }
 
 fn decode_lvw(
     bytes: &[u8],
     fixture: &LvwFixture,
 ) -> Vec<SnapshotNode<IdWithIndex<UpdateId>, ModelNullableBasicValue>> {
-    let history = proto::HistorySnapshot::parse_from_bytes(bytes).unwrap();
+    let history = proto::HistorySnapshot::decode_from_slice(bytes).unwrap();
     decode_columnar_latest_value_wins_history_snapshot(history, fixture.value_type.clone()).unwrap()
 }
 
 fn decode_string(bytes: &[u8]) -> Vec<SnapshotNode<IdWithIndex<UpdateId>, String>> {
-    let history = proto::HistorySnapshot::parse_from_bytes(bytes).unwrap();
+    let history = proto::HistorySnapshot::decode_from_slice(bytes).unwrap();
     decode_columnar_linear_string_history_snapshot(history).unwrap()
 }
 
@@ -265,7 +262,7 @@ fn decode_list(
     bytes: &[u8],
     fixture: &LinearListFixture,
 ) -> Vec<SnapshotNode<IdWithIndex<UpdateId>, ModelPrimitiveValueArray>> {
-    let history = proto::HistorySnapshot::parse_from_bytes(bytes).unwrap();
+    let history = proto::HistorySnapshot::decode_from_slice(bytes).unwrap();
     decode_columnar_linear_list_history_snapshot(history, fixture.value_type).unwrap()
 }
 
