@@ -514,6 +514,11 @@ impl Actor for RuntimeDiscoverySource {
     }
 }
 
+/// Temporary side-channel for the externally owned UDP bind path.
+///
+/// This remains connected after startup in the first replication slice, so
+/// inbound `UdpIndication`s can accumulate in the shared queue. See
+/// `flotsync-36j` for removing or draining this observer after bind setup.
 #[derive(ComponentDefinition)]
 struct RuntimeUdpObserver {
     ctx: ComponentContext<Self>,
