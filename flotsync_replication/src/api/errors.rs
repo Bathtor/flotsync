@@ -2,6 +2,8 @@ use flotsync_core::member::Identifier;
 use snafu::prelude::*;
 use std::error::Error;
 
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+
 #[derive(Debug, Snafu)]
 pub enum DatasetIdError {
     #[snafu(display("Dataset identifier must not be empty."))]
@@ -21,91 +23,43 @@ pub enum DatasetIdError {
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum RowProviderError {
     #[snafu(display("Row provider failed: {source}"))]
-    ProviderExternal {
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
+    ProviderExternal { source: BoxError },
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum ListenerError {
     #[snafu(display("Listener rejected event: {message}"))]
     Rejected { message: String },
     #[snafu(display("Listener failed: {source}"))]
-    ListenerExternal {
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
-}
-
-impl ListenerError {
-    pub fn external<E>(source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::ListenerExternal {
-            source: Box::new(source),
-        }
-    }
+    ListenerExternal { source: BoxError },
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum ApiError {
     #[snafu(display("Replication API operation failed: {source}"))]
-    ApiExternal {
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
-}
-
-impl ApiError {
-    pub fn external<E>(source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::ApiExternal {
-            source: Box::new(source),
-        }
-    }
+    ApiExternal { source: BoxError },
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum StoreError {
     #[snafu(display("Replication store failed: {source}"))]
-    StoreExternal {
-        source: Box<dyn Error + Send + Sync + 'static>,
-    },
-}
-
-impl StoreError {
-    pub fn external<E>(source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::StoreExternal {
-            source: Box::new(source),
-        }
-    }
+    StoreExternal { source: BoxError },
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
 pub enum LoadError {
     #[snafu(display("Failed to load replication for application '{application_id}': {source}"))]
     Runtime {
         application_id: Identifier,
-        source: Box<dyn Error + Send + Sync + 'static>,
+        source: BoxError,
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
     Unavailable { application_id: Identifier },
-}
-
-impl LoadError {
-    pub fn runtime<E>(application_id: Identifier, source: E) -> Self
-    where
-        E: Error + Send + Sync + 'static,
-    {
-        Self::Runtime {
-            application_id,
-            source: Box::new(source),
-        }
-    }
 }

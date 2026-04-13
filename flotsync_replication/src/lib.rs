@@ -106,6 +106,11 @@ pub struct GroupMembers {
 }
 
 impl GroupMembers {
+    /// Build one single-member group with that member at canonical index `0`.
+    pub fn singleton(member: MemberIdentity) -> Result<Self, GroupMembersError> {
+        Self::from_ordered_members([member])
+    }
+
     /// Build one indexed member set from the canonical group member order.
     pub fn from_ordered_members(
         ordered_members: impl IntoIterator<Item = MemberIdentity>,
@@ -183,6 +188,8 @@ impl Eq for GroupMembers {}
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     use flotsync_core::member::Identifier;
     use uuid::Uuid;
@@ -214,7 +221,35 @@ mod tests {
         let error = GroupMembers::from_ordered_members(vec![alice.clone(), alice])
             .expect_err("duplicate members must be rejected");
 
-        assert!(matches!(error, GroupMembersError::DuplicateMember { .. }));
+        assert_matches!(error, GroupMembersError::DuplicateMember { .. });
+    }
+
+    #[test]
+    fn group_members_preserve_multi_segment_member_ids() {
+        let alice_phone = member(["alice", "phone"]);
+        let alice_laptop = member(["alice", "laptop"]);
+        let bob_tablet = member(["bob", "tablet"]);
+
+        let members = GroupMembers::from_ordered_members(vec![
+            alice_phone.clone(),
+            bob_tablet.clone(),
+            alice_laptop.clone(),
+        ])
+        .expect("group members should build");
+
+        assert_eq!(
+            members.member_index(&alice_phone),
+            Some(MemberIndex::new(0))
+        );
+        assert_eq!(members.member_index(&bob_tablet), Some(MemberIndex::new(1)));
+        assert_eq!(
+            members.member_index(&alice_laptop),
+            Some(MemberIndex::new(2))
+        );
+        assert_eq!(
+            members.ordered_members(),
+            vec![alice_phone, bob_tablet, alice_laptop]
+        );
     }
 
     #[test]

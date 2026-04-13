@@ -1,12 +1,13 @@
 use crate::{
     api::{DatasetId, GroupId, MemberIdentity},
     delivery::wire::{
+        WireValueDecodeError,
         group_id_from_wire,
         member_identity_from_wire,
         member_identity_to_wire_format,
     },
 };
-use flotsync_core::versions::{PureVersionVector, UpdateId, VersionVector};
+use flotsync_core::versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector};
 use flotsync_messages::{
     buffa::{Message, MessageField},
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
@@ -15,6 +16,7 @@ use flotsync_messages::{
     versions as versions_proto,
 };
 use snafu::prelude::*;
+use std::num::NonZeroUsize;
 
 #[derive(Debug, Snafu)]
 pub(crate) enum RuntimeMessageError {
@@ -34,20 +36,23 @@ pub(crate) enum RuntimeMessageError {
     EmptyDatasetUpdate { dataset_id: String },
     #[snafu(display("Update batch message did not include an update id."))]
     MissingUpdateId,
-    #[snafu(display("Update batch message did not include a read version vector."))]
-    MissingReadVersionVector,
+    #[snafu(display("Update batch message did not include read versions."))]
+    MissingReadVersions,
     #[snafu(display("Bootstrap group message field '{field}' was invalid: {source}"))]
     InvalidWireValue {
         field: &'static str,
-        source: crate::delivery::wire::WireValueDecodeError,
+        source: WireValueDecodeError,
     },
     #[snafu(display("Update batch field '{field}' was invalid: {source}"))]
     InvalidUpdateId {
         field: &'static str,
         source: DatamodelCodecError,
     },
-    #[snafu(display("Update batch field '{field}' was invalid: {reason}"))]
-    InvalidReadVersionVector { field: &'static str, reason: String },
+    #[snafu(display("Update batch field '{field}' was invalid: {source}"))]
+    InvalidReadVersions {
+        field: &'static str,
+        source: WireVersionVectorError,
+    },
     #[snafu(display("Update batch dataset id '{value}' was invalid: {source}"))]
     InvalidDatasetId {
         value: String,
@@ -55,10 +60,46 @@ pub(crate) enum RuntimeMessageError {
     },
 }
 
+#[derive(Debug, Snafu)]
+pub(crate) enum WireVersionVectorError {
+    #[snafu(display("Version-vector payload was missing."))]
+    MissingVersionsBody,
+    #[snafu(display("Full version vector must include at least one entry."))]
+    EmptyFullVector,
+    #[snafu(display(
+        "Compact read versions expected {expected_members} members, but the hosted group has {actual_members}."
+    ))]
+    MemberCountMismatch {
+        expected_members: usize,
+        actual_members: usize,
+    },
+    #[snafu(display(
+        "Override read versions used invalid override position {override_position} for {num_members} members."
+    ))]
+    InvalidOverridePosition {
+        num_members: usize,
+        override_position: u32,
+    },
+    #[snafu(display(
+        "Override read versions were invalid: group version {group_version}, override position {override_position}, override version {override_version}."
+    ))]
+    InvalidOverride {
+        group_version: u64,
+        override_position: u32,
+        override_version: u64,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuntimeMessage {
     BootstrapGroup(BootstrapGroupMessage),
     UpdateBatch(UpdateBatchMessage),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum WireRuntimeMessage {
+    BootstrapGroup(BootstrapGroupMessage),
+    UpdateBatch(WireUpdateBatchMessage),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,8 +112,29 @@ pub(crate) struct BootstrapGroupMessage {
 pub(crate) struct UpdateBatchMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
-    pub(crate) read_vv: VersionVector,
+    pub(crate) read_versions: VersionVector,
     pub(crate) dataset_updates: Vec<DatasetUpdateMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WireUpdateBatchMessage {
+    pub(crate) group_id: GroupId,
+    pub(crate) update_id: UpdateId,
+    read_versions: WireVersionVector,
+    pub(crate) dataset_updates: Vec<DatasetUpdateMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WireVersionVector {
+    Full(PureVersionVector),
+    Override {
+        group_version: u64,
+        override_position: u32,
+        override_version: u64,
+    },
+    Synced {
+        group_version: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,7 +144,7 @@ pub(crate) struct DatasetUpdateMessage {
 }
 
 impl RuntimeMessage {
-    pub(crate) fn encode_to_bytes(&self) -> bytes::Bytes {
+    pub(crate) fn encode_to_proto(&self) -> replication_proto::RuntimeMessage {
         match self {
             RuntimeMessage::BootstrapGroup(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
@@ -97,14 +159,15 @@ impl RuntimeMessage {
                     }),
                 )),
                 ..replication_proto::RuntimeMessage::default()
-            }
-            .encode_to_bytes(),
+            },
             RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::UpdateBatch(
                     Box::new(replication_proto::UpdateBatch {
                         group_id: message.group_id.0.as_bytes().to_vec(),
                         update_id: MessageField::some(encode_update_id(message.update_id)),
-                        read_vv: MessageField::some(encode_version_vector(&message.read_vv)),
+                        read_versions: MessageField::some(
+                            WireVersionVector::from_runtime(&message.read_versions).to_proto(),
+                        ),
                         dataset_updates: message
                             .dataset_updates
                             .iter()
@@ -118,14 +181,19 @@ impl RuntimeMessage {
                     }),
                 )),
                 ..replication_proto::RuntimeMessage::default()
-            }
-            .encode_to_bytes(),
+            },
         }
     }
+}
 
+impl WireRuntimeMessage {
     pub(crate) fn decode_from_slice(payload: &[u8]) -> Result<Self, RuntimeMessageError> {
         let message =
             replication_proto::RuntimeMessage::decode_from_slice(payload).context(DecodeSnafu)?;
+        Self::from_proto(message)
+    }
+
+    fn from_proto(message: replication_proto::RuntimeMessage) -> Result<Self, RuntimeMessageError> {
         let Some(body) = message.body else {
             return MissingBodySnafu.fail();
         };
@@ -146,7 +214,7 @@ impl RuntimeMessage {
                         })?;
                     members.push(member);
                 }
-                Ok(RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
+                Ok(WireRuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
                     group_id,
                     members,
                 }))
@@ -162,15 +230,14 @@ impl RuntimeMessage {
                 let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
                     field: "update_batch.update_id",
                 })?;
-                let Some(read_vv) = message.read_vv.take() else {
-                    return MissingReadVersionVectorSnafu.fail();
+                let Some(read_versions) = message.read_versions.take() else {
+                    return MissingReadVersionsSnafu.fail();
                 };
-                let read_vv = decode_version_vector(read_vv).map_err(|reason| {
-                    RuntimeMessageError::InvalidReadVersionVector {
-                        field: "update_batch.read_vv",
-                        reason,
-                    }
-                })?;
+                let read_versions = WireVersionVector::from_proto(read_versions).context(
+                    InvalidReadVersionsSnafu {
+                        field: "update_batch.read_versions",
+                    },
+                )?;
                 if message.dataset_updates.is_empty() {
                     return EmptyUpdateBatchSnafu.fail();
                 }
@@ -191,10 +258,10 @@ impl RuntimeMessage {
                         operations: dataset_update.operations,
                     });
                 }
-                Ok(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+                Ok(WireRuntimeMessage::UpdateBatch(WireUpdateBatchMessage {
                     group_id,
                     update_id,
-                    read_vv,
+                    read_versions,
                     dataset_updates,
                 }))
             }
@@ -202,39 +269,185 @@ impl RuntimeMessage {
     }
 }
 
-fn encode_version_vector(version_vector: &VersionVector) -> versions_proto::VersionVector {
-    // This first replication slice keeps the wire shape intentionally simple and
-    // always serialises the full VV. That avoids having to reconstruct the
-    // member count from compact representations on decode.
-    versions_proto::VersionVector {
-        versions: Some(versions_proto::version_vector::Versions::Full(Box::new(
-            versions_proto::FullVersionVector {
-                entries: version_vector.iter().collect(),
-                ..versions_proto::FullVersionVector::default()
-            },
-        ))),
-        ..versions_proto::VersionVector::default()
+impl WireUpdateBatchMessage {
+    pub(crate) fn into_runtime(
+        self,
+        num_members: NonZeroUsize,
+    ) -> Result<UpdateBatchMessage, RuntimeMessageError> {
+        let read_versions =
+            self.read_versions
+                .to_runtime(num_members)
+                .context(InvalidReadVersionsSnafu {
+                    field: "update_batch.read_versions",
+                })?;
+        Ok(UpdateBatchMessage {
+            group_id: self.group_id,
+            update_id: self.update_id,
+            read_versions,
+            dataset_updates: self.dataset_updates,
+        })
     }
 }
 
-fn decode_version_vector(
-    version_vector: versions_proto::VersionVector,
-) -> Result<VersionVector, String> {
-    let Some(versions) = version_vector.versions else {
-        return Err("missing version-vector body".to_owned());
-    };
-    match versions {
-        versions_proto::version_vector::Versions::Full(full) => {
-            if full.entries.is_empty() {
-                return Err("full version vector must include at least one entry".to_owned());
-            }
-            Ok(VersionVector::Full(PureVersionVector::from(full.entries)))
+impl WireVersionVector {
+    fn from_runtime(version_vector: &VersionVector) -> Self {
+        match version_vector {
+            VersionVector::Full(vector) => Self::Full(vector.clone()),
+            VersionVector::Override { version, .. } => Self::Override {
+                group_version: version.group_version(),
+                override_position: version.override_position as u32,
+                override_version: version.override_version(),
+            },
+            VersionVector::Synced { version, .. } => Self::Synced {
+                group_version: *version,
+            },
         }
-        versions_proto::version_vector::Versions::Override(_) => Err(
-            "compact override version vectors are not supported on the runtime wire yet".to_owned(),
-        ),
-        versions_proto::version_vector::Versions::Synced(_) => Err(
-            "compact synced version vectors are not supported on the runtime wire yet".to_owned(),
-        ),
+    }
+
+    fn to_proto(&self) -> versions_proto::VersionVector {
+        let versions = match self {
+            WireVersionVector::Full(vector) => versions_proto::version_vector::Versions::Full(
+                Box::new(versions_proto::FullVersionVector {
+                    entries: vector.0.to_vec(),
+                    ..versions_proto::FullVersionVector::default()
+                }),
+            ),
+            WireVersionVector::Override {
+                group_version,
+                override_position,
+                override_version,
+            } => versions_proto::version_vector::Versions::Override(Box::new(
+                versions_proto::OverrideVersionVector {
+                    group_version: *group_version,
+                    override_position: *override_position,
+                    override_version: *override_version,
+                    ..versions_proto::OverrideVersionVector::default()
+                },
+            )),
+            WireVersionVector::Synced { group_version } => {
+                versions_proto::version_vector::Versions::Synced(Box::new(
+                    versions_proto::SyncedVersionVector {
+                        group_version: *group_version,
+                        ..versions_proto::SyncedVersionVector::default()
+                    },
+                ))
+            }
+        };
+        versions_proto::VersionVector {
+            versions: Some(versions),
+            ..versions_proto::VersionVector::default()
+        }
+    }
+
+    fn from_proto(
+        version_vector: versions_proto::VersionVector,
+    ) -> Result<Self, WireVersionVectorError> {
+        let Some(versions) = version_vector.versions else {
+            return MissingVersionsBodySnafu.fail();
+        };
+        match versions {
+            versions_proto::version_vector::Versions::Full(full) => {
+                if full.entries.is_empty() {
+                    return EmptyFullVectorSnafu.fail();
+                }
+                Ok(WireVersionVector::Full(PureVersionVector::from(
+                    full.entries,
+                )))
+            }
+            versions_proto::version_vector::Versions::Override(override_vector) => {
+                Ok(WireVersionVector::Override {
+                    group_version: override_vector.group_version,
+                    override_position: override_vector.override_position,
+                    override_version: override_vector.override_version,
+                })
+            }
+            versions_proto::version_vector::Versions::Synced(synced) => {
+                Ok(WireVersionVector::Synced {
+                    group_version: synced.group_version,
+                })
+            }
+        }
+    }
+
+    fn to_runtime(
+        &self,
+        num_members: NonZeroUsize,
+    ) -> Result<VersionVector, WireVersionVectorError> {
+        match self {
+            WireVersionVector::Full(vector) => {
+                let actual_members = vector.len().get();
+                let expected_members = num_members.get();
+                ensure!(
+                    actual_members == expected_members,
+                    MemberCountMismatchSnafu {
+                        expected_members,
+                        actual_members,
+                    }
+                );
+                Ok(VersionVector::Full(vector.clone()))
+            }
+            WireVersionVector::Override {
+                group_version,
+                override_position,
+                override_version,
+            } => {
+                let override_position_index = usize::try_from(*override_position)
+                    .expect("wire override position must fit in usize");
+                ensure!(
+                    override_position_index < num_members.get(),
+                    InvalidOverridePositionSnafu {
+                        num_members: num_members.get(),
+                        override_position: *override_position,
+                    }
+                );
+                let version = OverrideVersion::new_opt(
+                    *group_version,
+                    override_position_index,
+                    *override_version,
+                )
+                .context(InvalidOverrideSnafu {
+                    group_version: *group_version,
+                    override_position: *override_position,
+                    override_version: *override_version,
+                })?;
+                Ok(VersionVector::Override {
+                    num_members,
+                    version,
+                })
+            }
+            WireVersionVector::Synced { group_version } => Ok(VersionVector::Synced {
+                num_members,
+                version: *group_version,
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_version_vector_round_trips_full_override_and_synced() {
+        let full = VersionVector::Full(PureVersionVector::from([2, 3, 4]));
+        let override_vector = VersionVector::Override {
+            num_members: NonZeroUsize::new(3).expect("three members"),
+            version: OverrideVersion::new(7, 1, 8),
+        };
+        let synced = VersionVector::Synced {
+            num_members: NonZeroUsize::new(3).expect("three members"),
+            version: 11,
+        };
+
+        for vector in [full, override_vector, synced] {
+            let wire = WireVersionVector::from_runtime(&vector);
+            let proto = wire.to_proto();
+            let decoded_wire =
+                WireVersionVector::from_proto(proto).expect("wire decode should work");
+            let decoded_vector = decoded_wire
+                .to_runtime(vector.num_members())
+                .expect("runtime decode should work");
+            assert_eq!(decoded_vector, vector);
+        }
     }
 }

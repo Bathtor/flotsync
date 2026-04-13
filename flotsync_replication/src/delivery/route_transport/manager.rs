@@ -910,6 +910,27 @@ enum UdpActivationPolicy {
     OnFirstUse,
 }
 
+impl UdpActivationPolicy {
+    const fn config_value(self) -> usize {
+        match self {
+            Self::OnBind => 0,
+            Self::OnFirstUse => 1,
+        }
+    }
+}
+
+/// Configure the route-transport runtime for the replication full-stack host.
+///
+/// The current replication runtime keeps per-socket UDPour children dormant
+/// until a concrete route is first used. That avoids unnecessary startup churn
+/// for sockets that may never carry delivery traffic.
+pub(crate) fn configure_replication_runtime(config: &mut KompactConfig) {
+    config.set_config_value(
+        &config_keys::UDP_ACTIVATION_POLICY,
+        UdpActivationPolicy::OnFirstUse.config_value(),
+    );
+}
+
 /// Live UDP route handle owned by the manager.
 struct LiveUdpSocketHandle {
     socket_id: SocketId,

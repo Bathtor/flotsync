@@ -46,6 +46,18 @@ impl SenderConfig {
     }
 }
 
+impl Default for SenderConfig {
+    fn default() -> Self {
+        Self {
+            max_part_payload_len: NonZeroUsize::new(1024)
+                .expect("default UDPour sender config must use a non-zero part payload length"),
+            retention_timeout: Duration::from_secs(1),
+            id_reuse_cooldown: Duration::from_millis(100),
+            eager_ack_cleanup: false,
+        }
+    }
+}
+
 /// One sender-owned multiplexed multipart state machine.
 #[derive(Debug)]
 pub(crate) struct SenderMachine {

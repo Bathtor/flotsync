@@ -8,7 +8,7 @@ use super::route_transport::{
     RouteDiscoveryPort,
     RouteTransportActorMessage,
     TransportRouteKey,
-    manager::RouteTransportManager,
+    manager::{RouteTransportManager, configure_replication_runtime},
 };
 use crate::api::MemberIdentity;
 use flotsync_core::member::IdentifierBuf;
@@ -37,11 +37,10 @@ use flotsync_io::{
         start_component,
     },
 };
-use flotsync_udpour::{ReceiverConfig, SenderConfig, UDPourConfig};
+use flotsync_udpour::UDPourConfig;
 use kompact::prelude::*;
 use std::{
     net::SocketAddr,
-    num::NonZeroUsize,
     sync::{Arc, mpsc},
     time::Duration,
 };
@@ -295,26 +294,13 @@ impl Drop for TransportHarnessCore {
 pub(crate) fn build_delivery_test_system() -> KompactSystem {
     build_test_kompact_system_with(|config| {
         enable_bind_reuse_address(config);
-        config.load_config_str("flotsync.route-transport.udp-activation-policy = 1");
+        configure_replication_runtime(config);
     })
 }
 
 /// Build the shared UDPour config used by the semantic full-stack tests.
 pub(crate) fn default_udpour_config() -> UDPourConfig {
-    let sender = SenderConfig {
-        max_part_payload_len: NonZeroUsize::new(1024)
-            .expect("test UDPour config must use a non-zero part payload length"),
-        retention_timeout: Duration::from_secs(1),
-        id_reuse_cooldown: Duration::from_millis(100),
-        eager_ack_cleanup: false,
-    };
-    let receiver = ReceiverConfig {
-        max_need_parts_frame_len: 1024,
-        repair_interval: Duration::from_millis(100),
-        give_up_timeout: Duration::from_secs(1),
-        delivered_tombstone_timeout: Duration::ZERO,
-    };
-    UDPourConfig::new(sender, receiver).expect("valid datagram config")
+    UDPourConfig::default()
 }
 
 /// Build one loopback member identity for tests from the supplied path
