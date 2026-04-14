@@ -51,8 +51,8 @@ impl Default for SenderConfig {
         Self {
             max_part_payload_len: NonZeroUsize::new(1024)
                 .expect("default UDPour sender config must use a non-zero part payload length"),
-            retention_timeout: Duration::from_secs(1),
-            id_reuse_cooldown: Duration::from_millis(100),
+            retention_timeout: Duration::from_secs(5),
+            id_reuse_cooldown: Duration::from_secs(60 * 10),
             eager_ack_cleanup: false,
         }
     }

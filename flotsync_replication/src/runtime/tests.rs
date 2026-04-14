@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    handle::{ReplicationRuntime, load_replication_runtime_typed, wait_for_test_future},
+    *,
+};
 use crate::{
     GroupMembers,
     GroupMemberships,
@@ -201,7 +204,7 @@ fn load_runtime_with_parts(
     store: Arc<StoreStub>,
     listener: Arc<ListenerStub>,
 ) -> Arc<ReplicationRuntime> {
-    poll_ready(load_replication_runtime_inner(
+    poll_ready(load_replication_runtime_typed(
         application_id,
         store,
         listener,
