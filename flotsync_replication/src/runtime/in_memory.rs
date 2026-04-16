@@ -1,4 +1,20 @@
-use super::{errors::*, *};
+use super::{component::BufferedInboundUpdate, errors::*, messages::UpdateBatchMessage};
+use crate::{
+    GroupMembers,
+    GroupMemberships,
+    api::{
+        DatasetId,
+        GroupId,
+        MemberIdentity,
+        MemberIndex,
+        MutableRow,
+        RowChange,
+        RowId,
+        RowKey,
+        RowMutation,
+    },
+};
+use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::{
     InitialFieldValue,
     OperationOutcome,
@@ -8,7 +24,12 @@ use flotsync_data_types::{
     TableOperations,
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
-use std::collections::HashSet;
+use snafu::prelude::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 /// In-memory local-group state for the current replication runtime.
 ///
@@ -60,41 +81,50 @@ impl LocalGroupState {
         })
     }
 
-    pub(super) fn missing_dataset_ids(&self, dataset_ids: &[DatasetId]) -> Vec<DatasetId> {
-        let mut missing_dataset_ids = Vec::new();
-        let mut seen_dataset_ids = HashSet::with_capacity(dataset_ids.len());
-        for dataset_id in dataset_ids {
-            if self.datasets.contains_key(dataset_id) {
-                continue;
-            }
-            if seen_dataset_ids.insert(dataset_id.clone()) {
-                missing_dataset_ids.push(dataset_id.clone());
-            }
-        }
-        missing_dataset_ids
+    /// Return the subset of `dataset_ids` that is not hosted locally yet.
+    pub(super) fn missing_dataset_ids(
+        &self,
+        dataset_ids: &BTreeSet<DatasetId>,
+    ) -> BTreeSet<DatasetId> {
+        dataset_ids
+            .iter()
+            .filter(|dataset_id| !self.datasets.contains_key(*dataset_id))
+            .cloned()
+            .collect()
     }
 
+    /// Return the fixed member count for this hosted group.
+    pub(super) fn member_count(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.members.len()).expect("hosted group must be non-empty")
+    }
+
+    /// Return the locally applied version for the given member index.
     pub(super) fn applied_version(&self, member_index: MemberIndex) -> u64 {
         self.version_vector
             .version_at(member_index.as_u32() as usize)
     }
 
+    /// Return the next producer version expected from the given member.
     pub(super) fn expected_next_version(&self, member_index: MemberIndex) -> u64 {
         self.applied_version(member_index)
             .checked_add(1)
             .expect("member version counter must not overflow")
     }
 
+    /// Return `true` when `update_id` is already reflected in the local VV.
     pub(super) fn has_applied(&self, update_id: UpdateId) -> bool {
         self.applied_version(MemberIndex::new(update_id.node_index)) >= update_id.version
     }
 
+    /// Return `true` when `message` is causally ready and is the next version
+    /// expected from its producer.
     pub(super) fn can_apply(&self, message: &UpdateBatchMessage) -> bool {
         let producer_index = MemberIndex::new(message.update_id.node_index);
         self.version_vector.covers(&message.read_versions)
             && self.expected_next_version(producer_index) == message.update_id.version
     }
 
+    /// Buffer one inbound update until its causal dependencies become ready.
     pub(super) fn buffer_update(
         &mut self,
         pending_update: BufferedInboundUpdate,
@@ -119,6 +149,8 @@ impl LocalGroupState {
         }
     }
 
+    /// Drop already-applied duplicates, then return one causally-ready pending
+    /// update when any exist.
     pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<BufferedInboundUpdate> {
         let duplicate_keys: Vec<_> = self
             .pending_updates
@@ -154,7 +186,7 @@ impl LocalDataset {
         }
     }
 
-    fn clone_row(&self, row_key: crate::api::RowKey) -> Option<OwnedReadRow> {
+    fn clone_row(&self, row_key: RowKey) -> Option<flotsync_data_types::OwnedRow<UpdateId>> {
         let row = self.data.get_row(&row_key.0)?;
         let mut fields = HashMap::with_capacity(self.data.num_fields());
         for field_name in self.data.field_names() {
@@ -163,7 +195,7 @@ impl LocalDataset {
                 .expect("dataset field iteration must resolve against the same row");
             fields.insert(field_name.to_owned(), value.clone());
         }
-        Some(OwnedReadRow::new(fields))
+        Some(flotsync_data_types::OwnedRow::new(fields))
     }
 }
 
@@ -171,7 +203,7 @@ impl MutableRow {
     fn into_initial_values<'schema>(
         self,
         schema: &'schema Schema,
-        row_id: &crate::api::RowId,
+        row_id: &RowId,
     ) -> Result<Vec<InitialFieldValue<'schema>>, PublishChangesError> {
         let mut initial_values = Vec::with_capacity(self.fields.len());
         for (field_name, value) in self.fields {
@@ -200,7 +232,7 @@ impl MutableRow {
     fn into_pending_updates<'schema>(
         self,
         schema: &'schema Schema,
-        row_id: &crate::api::RowId,
+        row_id: &RowId,
     ) -> Result<Vec<PendingFieldUpdate<'schema>>, PublishChangesError> {
         let mut pending_updates = Vec::with_capacity(self.fields.len());
         for (field_name, value) in self.fields {
@@ -228,16 +260,15 @@ impl MutableRow {
 }
 
 /// Validates that one publish call targets exactly one group and returns the
-/// affected datasets in first-seen order.
+/// affected dataset ids.
 pub(super) fn collect_group_dataset_scope(
     changes: &[RowMutation],
-) -> Result<(GroupId, Vec<DatasetId>), PublishChangesError> {
+) -> Result<(GroupId, BTreeSet<DatasetId>), PublishChangesError> {
     let Some(first_change) = changes.first() else {
         return EmptyChangesSnafu.fail();
     };
     let group_id = first_change.row_id().group_id;
-    let mut dataset_ids = Vec::new();
-    let mut seen_dataset_ids = HashSet::new();
+    let mut dataset_ids = BTreeSet::new();
     for change in changes {
         let row_id = change.row_id();
         ensure!(
@@ -247,9 +278,7 @@ pub(super) fn collect_group_dataset_scope(
                 other_group_id: row_id.group_id,
             }
         );
-        if seen_dataset_ids.insert(row_id.dataset_id.clone()) {
-            dataset_ids.push(row_id.dataset_id.clone());
-        }
+        dataset_ids.insert(row_id.dataset_id.clone());
     }
     Ok((group_id, dataset_ids))
 }

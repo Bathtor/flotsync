@@ -20,6 +20,7 @@ pub enum VersionVector {
     },
 }
 impl VersionVector {
+    /// Construct the initial all-zero version vector for a fixed member set.
     pub const fn initial(num_members: NonZeroUsize) -> Self {
         Self::Synced {
             num_members,
@@ -92,12 +93,17 @@ impl VersionVector {
         self.into_iter()
     }
 
+    /// Return the version stored at `position`.
+    ///
+    /// Panics when `position` is outside the fixed member range.
     pub fn version_at(&self, position: usize) -> u64 {
         self.iter()
             .nth(position)
             .expect("version-vector position must be within range")
     }
 
+    /// Return `true` when every position in `self` is greater than or equal to
+    /// the corresponding position in `other`.
     pub fn covers(&self, other: &Self) -> bool {
         if self.num_members() != other.num_members() {
             return false;

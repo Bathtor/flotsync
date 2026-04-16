@@ -5,9 +5,9 @@ use crate::{
     api::{MemberIdentity, ReplicationEventListener, ReplicationStore},
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
-        group_broadcast::GroupBroadcastComponent,
+        group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
         ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-        reliable_delivery::ReliableDeliveryComponent,
+        reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},
         route_transport::{
             DiscoveryRouteUpdate,
             RouteDiscoveryPort,
@@ -17,14 +17,9 @@ use crate::{
         },
     },
 };
-use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, SocketId};
+use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
 use flotsync_udpour::UDPourConfig;
-use flotsync_utils::{LocalActor, impl_local_actor};
-use kompact::{
-    config::{DurationValue, HoconExt, StringValue},
-    kompact_config,
-    prelude::*,
-};
+use kompact::{config::HoconExt, prelude::*};
 use snafu::prelude::*;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -35,13 +30,15 @@ use discovery::{RuntimeDiscoverySource, RuntimeDiscoverySourceMessage};
 use local_endpoint::{LocalEndpointManager, ensure_local_endpoint_bound};
 
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
-type GroupBroadcastInboundRoutePort =
-    crate::delivery::group_broadcast::GroupBroadcastInboundPort<TransportRouteKey>;
-type ReliableDeliveryInboundRoutePort =
-    crate::delivery::reliable_delivery::ReliableDeliveryInboundPort<TransportRouteKey>;
+type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
+type ReliableDeliveryInboundRoutePort = ReliableDeliveryInboundPort<TransportRouteKey>;
 
 mod config_keys {
-    use super::*;
+    use kompact::{
+        config::{DurationValue, StringValue},
+        kompact_config,
+    };
+    use std::time::Duration;
 
     fn default_local_endpoint_bind_addr() -> String {
         if cfg!(test) {
@@ -134,11 +131,12 @@ impl DeliveryRuntimeHostConfig {
 /// surface that later replication logic can build on without knowing transport
 /// internals.
 ///
-/// TODO(flotsync-3ht): Revisit whether this imperative host should remain the
-/// top-level orchestrator at all, or whether ReplicationRuntimeComponent
-/// should own more of the topology startup and wiring directly.
+/// TODO(flotsync-3ht): Revisit whether this external host should keep owning
+/// topology startup and shutdown at all, or whether that lifecycle should move
+/// into `ReplicationRuntimeComponent` itself. This does not defer treating the
+/// runtime component as a normal topology node in the current runtime.
 pub(crate) struct DeliveryRuntimeHost {
-    system: KompactSystem,
+    system: Option<KompactSystem>,
     topology: Option<RuntimeTopology>,
     group_memberships: SharedGroupMemberships,
     control_timeout: Duration,
@@ -156,7 +154,7 @@ struct RuntimeTopology {
     discovery_source: Arc<Component<RuntimeDiscoverySource>>,
     discovery_source_ref: ActorRefStrong<RuntimeDiscoverySourceMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
-    runtime_component: Option<Arc<Component<ReplicationRuntimeComponent>>>,
+    runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
 impl RuntimeTopology {
@@ -164,6 +162,8 @@ impl RuntimeTopology {
         system: &KompactSystem,
         group_memberships: &SharedGroupMemberships,
         local_member: &MemberIdentity,
+        store: Arc<dyn ReplicationStore>,
+        listener: Arc<dyn ReplicationEventListener>,
         local_endpoint_bind_addr: SocketAddr,
     ) -> Self {
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -202,6 +202,16 @@ impl RuntimeTopology {
             .expect("runtime discovery source must expose a strong actor ref");
         let local_endpoint_manager =
             system.create(move || LocalEndpointManager::new(local_endpoint_bind_addr));
+        let runtime_memberships = group_memberships.clone();
+        let runtime_local_member = local_member.clone();
+        let runtime_component = system.create(move || {
+            ReplicationRuntimeComponent::new(
+                runtime_local_member.clone(),
+                store.clone(),
+                listener.clone(),
+                runtime_memberships.clone(),
+            )
+        });
 
         Self {
             driver,
@@ -213,7 +223,7 @@ impl RuntimeTopology {
             discovery_source,
             discovery_source_ref,
             local_endpoint_manager,
-            runtime_component: None,
+            runtime_component,
         }
     }
 
@@ -242,6 +252,16 @@ impl RuntimeTopology {
             &self.discovery_source,
             &self.reliable_delivery,
             "discovery -> reliable delivery",
+        )?;
+        self.connect_components::<GroupBroadcastPort, _, _>(
+            &self.group_broadcast,
+            &self.runtime_component,
+            "group broadcast -> replication runtime",
+        )?;
+        self.connect_components::<ReliableDeliveryPort, _, _>(
+            &self.reliable_delivery,
+            &self.runtime_component,
+            "reliable delivery -> replication runtime",
         )?;
         Ok(())
     }
@@ -290,39 +310,17 @@ impl RuntimeTopology {
             "local_endpoint_manager",
             control_timeout,
         )?;
-        Ok(())
-    }
-
-    fn attach_runtime_component(
-        &mut self,
-        system: &KompactSystem,
-        runtime_component: &Arc<Component<ReplicationRuntimeComponent>>,
-        control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError> {
-        self.connect_components::<GroupBroadcastPort, _, _>(
-            &self.group_broadcast,
-            runtime_component,
-            "group broadcast -> replication runtime",
-        )?;
-        self.connect_components::<ReliableDeliveryPort, _, _>(
-            &self.reliable_delivery,
-            runtime_component,
-            "reliable delivery -> replication runtime",
-        )?;
         self.start_component(
             system,
-            runtime_component,
+            &self.runtime_component,
             "replication_runtime",
             control_timeout,
         )?;
-        self.runtime_component = Some(runtime_component.clone());
         Ok(())
     }
 
     fn stop_all(&self, system: &KompactSystem, control_timeout: Duration) {
-        if let Some(runtime_component) = &self.runtime_component {
-            self.stop_component(system, runtime_component, control_timeout);
-        }
+        self.stop_component(system, &self.runtime_component, control_timeout);
         self.stop_component(system, &self.reliable_delivery, control_timeout);
         self.stop_component(system, &self.group_broadcast, control_timeout);
         self.stop_component(system, &self.ingress, control_timeout);
@@ -395,7 +393,7 @@ impl DeliveryRuntimeHost {
         external_udp_addr: SocketAddr,
     ) -> Self {
         Self {
-            system,
+            system: Some(system),
             topology: Some(topology),
             group_memberships,
             control_timeout,
@@ -409,8 +407,16 @@ impl DeliveryRuntimeHost {
             .expect("delivery runtime host topology must still be live")
     }
 
+    pub(crate) fn runtime_component(&self) -> &Arc<Component<ReplicationRuntimeComponent>> {
+        &self.topology().runtime_component
+    }
+
     /// Start one new delivery runtime host for a single local member.
-    pub(crate) fn start(local_member: MemberIdentity) -> Result<Self, RuntimeHostError> {
+    pub(crate) fn start(
+        local_member: MemberIdentity,
+        store: Arc<dyn ReplicationStore>,
+        listener: Arc<dyn ReplicationEventListener>,
+    ) -> Result<Self, RuntimeHostError> {
         let system = build_runtime_system()?;
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let group_memberships = SharedGroupMemberships::default();
@@ -418,6 +424,8 @@ impl DeliveryRuntimeHost {
             &system,
             &group_memberships,
             &local_member,
+            store,
+            listener,
             host_config.local_endpoint_bind_addr,
         );
         topology.connect_all()?;
@@ -436,35 +444,16 @@ impl DeliveryRuntimeHost {
         ))
     }
 
-    pub(crate) fn start_runtime_component(
-        &mut self,
-        local_member: MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-    ) -> Result<Arc<Component<ReplicationRuntimeComponent>>, RuntimeHostError> {
-        let runtime_memberships = self.group_memberships.clone();
-        let runtime_component = self.system.create(move || {
-            ReplicationRuntimeComponent::new(
-                local_member.clone(),
-                store.clone(),
-                listener.clone(),
-                runtime_memberships.clone(),
-            )
-        });
-        self.topology
-            .as_mut()
-            .expect("delivery runtime host topology must still be live")
-            .attach_runtime_component(&self.system, &runtime_component, self.control_timeout)?;
-        Ok(runtime_component)
-    }
-
     pub(crate) fn shutdown(&mut self) {
         let Some(topology) = self.topology.take() else {
             return;
         };
-        topology.stop_all(&self.system, self.control_timeout);
+        let Some(system) = self.system.take() else {
+            return;
+        };
+        topology.stop_all(&system, self.control_timeout);
         drop(topology);
-        let _ = self.system.clone().kill_system();
+        let _ = system.kill_system();
     }
 
     /// Replace the authoritative shared group-membership snapshot.
@@ -504,9 +493,22 @@ impl Drop for DeliveryRuntimeHost {
         let Some(topology) = self.topology.take() else {
             return;
         };
+        let Some(system) = self.system.take() else {
+            return;
+        };
         drop(topology);
-        let _ = self.system.clone().kill_system();
+        let _ = system.kill_system();
     }
+}
+
+fn build_runtime_system() -> Result<KompactSystem, RuntimeHostError> {
+    let mut config = KompactConfig::default();
+    configure_replication_runtime(&mut config);
+    config
+        .build()
+        .map_err(|error| RuntimeHostError::BuildSystem {
+            message: error.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -522,12 +524,15 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use crate::delivery::route_transport::{
-            DatagramRouteScope,
-            RoutePreferenceRank,
-            RouteSharingKind,
-            SendRouteCandidate,
-            UdpRouteKey,
+        use crate::delivery::{
+            route_transport::{
+                DatagramRouteScope,
+                RoutePreferenceRank,
+                RouteSharingKind,
+                SendRouteCandidate,
+                UdpRouteKey,
+            },
+            shared::ReachabilityClass,
         };
 
         let route = SendRouteCandidate {
@@ -541,7 +546,7 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         };
         self.publish_route_update(DiscoveryRouteUpdate::PeerRoutes {
             peer: peer.clone(),
-            classification: crate::delivery::shared::ReachabilityClass::Reachable,
+            classification: ReachabilityClass::Reachable,
             routes: vec![route],
         });
         wait_for_direct_peer_route(self.topology(), &peer);
@@ -580,14 +585,4 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
         |component| component.knows_direct_route(&reliable_peer),
         format_args!("timed out waiting for reliable-delivery route publication for peer={peer}"),
     );
-}
-
-fn build_runtime_system() -> Result<KompactSystem, RuntimeHostError> {
-    let mut config = KompactConfig::default();
-    configure_replication_runtime(&mut config);
-    config
-        .build()
-        .map_err(|error| RuntimeHostError::BuildSystem {
-            message: error.to_string(),
-        })
 }

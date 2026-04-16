@@ -1,4 +1,38 @@
-use super::*;
+use super::{ApiResult, ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
+use crate::api::{
+    ApiError,
+    ChangeGroupMembershipRequest,
+    CreateGroupRequest,
+    GroupMigration,
+    LoadError,
+    PublishReceipt,
+    ReplicationApi,
+    ReplicationConfig,
+    ReplicationEventListener,
+    ReplicationStore,
+    RowMutation,
+    RuntimeSnafu,
+};
+use flotsync_core::member::Identifier;
+use flotsync_utils::BoxFuture;
+use futures_util::FutureExt;
+use kompact::prelude::*;
+use snafu::prelude::*;
+use std::sync::Arc;
+
+#[cfg(test)]
+use super::{
+    errors::{GroupInstallError, InboundDeliveryError},
+    messages::UpdateBatchMessage,
+};
+#[cfg(test)]
+use crate::{
+    GroupMembers,
+    api::{GroupId, MemberIdentity},
+};
+#[cfg(test)]
+use std::future::Future;
+
 type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
 
 /// Create one concrete replication runtime for the given application identity.
@@ -33,17 +67,12 @@ pub(super) async fn load_replication_runtime_typed(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let mut host = DeliveryRuntimeHost::start(local_member.clone())
+    let host = DeliveryRuntimeHost::start(local_member, store, listener)
         .boxed()
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let runtime_component = host
-        .start_runtime_component(local_member, store, listener)
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let runtime_component = host.runtime_component().clone();
     let runtime_ref = runtime_component
         .actor_ref()
         .hold()
@@ -81,12 +110,13 @@ impl ReplicationRuntime {
         T: Send + 'static,
     {
         let future = self.runtime_ref().ask_with(build);
-        Box::pin(async move {
+        async move {
             match future.await {
                 Ok(reply) => reply,
                 Err(_) => Err(ApiError::RuntimeUnavailable),
             }
-        })
+        }
+        .boxed()
     }
 }
 

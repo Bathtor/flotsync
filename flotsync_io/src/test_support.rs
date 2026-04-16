@@ -8,6 +8,7 @@ use crate::{
     prelude::*,
     socket_support::{configure_bind_reuse, socket_domain},
 };
+use futures_util::FutureExt;
 use kompact::{KompactLogger, default_components::install_manual_timer, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
 use socket2::{Protocol, SockAddr, Socket, Type};
@@ -20,7 +21,6 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::pin,
     sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc},
-    task::{Context, Poll, Waker},
     thread,
     time::{Duration, Instant},
 };
@@ -467,18 +467,7 @@ where
     M: Display,
 {
     let mut future = pin!(future);
-    eventually_value(
-        timeout,
-        || {
-            let waker = Waker::noop();
-            let mut context = Context::from_waker(waker);
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(value) => Some(value),
-                Poll::Pending => None,
-            }
-        },
-        failure_message,
-    )
+    eventually_value(timeout, || future.as_mut().now_or_never(), failure_message)
 }
 
 /// Waits until one component-state predicate becomes true or `timeout`

@@ -1,30 +1,63 @@
 use super::{
+    errors::InboundDeliveryError,
     handle::{ReplicationRuntime, load_replication_runtime_typed, wait_for_test_reply},
-    *,
+    host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt},
+    in_memory::{LocalDataset, apply_local_upsert},
+    load_replication_runtime,
+    messages::{DatasetUpdateMessage, UpdateBatchMessage},
 };
 use crate::{
     GroupMembers,
     GroupMemberships,
-    api::{DatasetId, ListenerError, MemberIndex},
+    api::{
+        CreateGroupRequest,
+        DatasetId,
+        GroupId,
+        ListenerError,
+        MemberIdentity,
+        MemberIndex,
+        ReplicationApi,
+        ReplicationConfig,
+        RowChange,
+        RowMutation,
+    },
+};
+use flotsync_core::{
+    member::Identifier,
+    versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, Schema};
 use flotsync_io::test_support::eventually;
+use flotsync_utils::BoxFuture;
+use snafu::ResultExt;
 use std::{
     collections::HashMap,
-    sync::{Mutex, mpsc},
+    num::NonZeroUsize,
+    sync::{Arc, Mutex, mpsc},
     time::Duration,
 };
 use uuid::Uuid;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const ALICE_MEMBER_SEGMENTS: [&str; 1] = ["alice"];
+const BOB_MEMBER_SEGMENTS: [&str; 1] = ["bob"];
+const PROBE_MEMBER_SEGMENTS: [&str; 1] = ["probe"];
+const APP_ALICE_SEGMENTS: [&str; 2] = ["app", "alice"];
+const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
+const APP_PROBE_SEGMENTS: [&str; 2] = ["app", "probe"];
+
+struct RuntimeFixture {
+    runtime: Arc<ReplicationRuntime>,
+    listener: Arc<ListenerStub>,
+}
 
 struct StoreStub {
-    local_member: crate::api::MemberIdentity,
+    local_member: MemberIdentity,
     schemas: HashMap<DatasetId, Arc<Schema>>,
 }
 
 impl StoreStub {
-    fn new(local_member: crate::api::MemberIdentity) -> Self {
+    fn new(local_member: MemberIdentity) -> Self {
         Self {
             local_member,
             schemas: HashMap::new(),
@@ -40,7 +73,7 @@ impl StoreStub {
 impl crate::api::ReplicationStore for StoreStub {
     fn local_member_identity(
         &self,
-    ) -> BoxFuture<'_, Result<crate::api::MemberIdentity, crate::api::StoreError>> {
+    ) -> BoxFuture<'_, Result<MemberIdentity, crate::api::StoreError>> {
         let local_member = self.local_member.clone();
         Box::pin(async move { Ok(local_member) })
     }
@@ -198,6 +231,26 @@ fn docs_dataset_id() -> DatasetId {
     DatasetId::try_new("docs").expect("dataset id should be valid")
 }
 
+fn alice_member() -> Identifier {
+    Identifier::from_array(ALICE_MEMBER_SEGMENTS)
+}
+
+fn bob_member() -> Identifier {
+    Identifier::from_array(BOB_MEMBER_SEGMENTS)
+}
+
+fn app_alice_id() -> Identifier {
+    Identifier::from_array(APP_ALICE_SEGMENTS)
+}
+
+fn app_bob_id() -> Identifier {
+    Identifier::from_array(APP_BOB_SEGMENTS)
+}
+
+fn app_probe_id() -> Identifier {
+    Identifier::from_array(APP_PROBE_SEGMENTS)
+}
+
 fn title_schema() -> Arc<Schema> {
     Arc::new(Schema::from_fields([Field::linear_string("title")]))
 }
@@ -212,11 +265,31 @@ fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> crate::ap
 
 fn load_runtime(
     application_id: Identifier,
-    local_member: crate::api::MemberIdentity,
+    local_member: MemberIdentity,
 ) -> Arc<ReplicationRuntime> {
     let store = Arc::new(StoreStub::new(local_member));
     let listener = Arc::new(ListenerStub::default());
     load_runtime_with_parts(application_id, store, listener)
+}
+
+fn load_runtime_fixture(
+    application_id: Identifier,
+    local_member: MemberIdentity,
+    schemas: impl IntoIterator<Item = (DatasetId, Arc<Schema>)>,
+) -> RuntimeFixture {
+    let listener = Arc::new(ListenerStub::default());
+    let mut store = StoreStub::new(local_member);
+    for (dataset_id, schema) in schemas {
+        store = store.with_schema(dataset_id, schema);
+    }
+    let runtime = load_runtime_with_parts(application_id, Arc::new(store), listener.clone());
+    RuntimeFixture { runtime, listener }
+}
+
+fn start_host(local_member: MemberIdentity) -> DeliveryRuntimeHost {
+    let store = Arc::new(StoreStub::new(local_member.clone()));
+    let listener = Arc::new(ListenerStub::default());
+    DeliveryRuntimeHost::start(local_member, store, listener).expect("host should start")
 }
 
 fn load_runtime_with_parts(
@@ -248,8 +321,8 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
 
 #[test]
 fn delivery_runtime_host_updates_shared_group_memberships() {
-    let local_member = Identifier::from_array(["alice"]);
-    let mut host = DeliveryRuntimeHost::start(local_member.clone()).expect("host should start");
+    let local_member = Identifier::from_array(ALICE_MEMBER_SEGMENTS);
+    let mut host = start_host(local_member.clone());
     let group_id = crate::api::GroupId(Uuid::from_u128(1));
     let memberships = GroupMemberships::from_groups([(
         group_id,
@@ -264,8 +337,8 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 
 #[test]
 fn load_replication_runtime_returns_concrete_runtime() {
-    let application_id = Identifier::from_array(["app"]);
-    let store = Arc::new(StoreStub::new(Identifier::from_array(["alice"])));
+    let application_id = app_probe_id();
+    let store = Arc::new(StoreStub::new(alice_member()));
     let listener = Arc::new(ListenerStub::default());
 
     let runtime = wait_for_test_reply(load_replication_runtime(
@@ -282,8 +355,7 @@ fn load_replication_runtime_returns_concrete_runtime() {
 
 #[test]
 fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
-    let mut host =
-        DeliveryRuntimeHost::start(Identifier::from_array(["probe"])).expect("host should start");
+    let mut host = start_host(Identifier::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     host.shutdown();
@@ -291,13 +363,10 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 
 #[test]
 fn create_group_bootstrap_installs_remote_membership() {
-    let alice_member = Identifier::from_array(["alice"]);
-    let bob_member = Identifier::from_array(["bob"]);
-    let alice_runtime = load_runtime(
-        Identifier::from_array(["app", "alice"]),
-        alice_member.clone(),
-    );
-    let bob_runtime = load_runtime(Identifier::from_array(["app", "bob"]), bob_member.clone());
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let alice_runtime = load_runtime(app_alice_id(), alice_member.clone());
+    let bob_runtime = load_runtime(app_bob_id(), bob_member.clone());
 
     assert!(
         alice_runtime
@@ -365,28 +434,22 @@ fn publish_changes_delivers_remote_data_changed_event() {
     // 3. create one fixed-membership group from Alice,
     // 4. publish one upsert from Alice, and
     // 5. assert that Bob observes the replicated row change.
-    let alice_member = Identifier::from_array(["alice"]);
-    let bob_member = Identifier::from_array(["bob"]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
-    let alice_listener = Arc::new(ListenerStub::default());
-    let bob_listener = Arc::new(ListenerStub::default());
-    let alice_store = Arc::new(
-        StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), schema.clone())],
     );
-    let bob_store = Arc::new(
-        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), schema.clone())],
     );
-    let alice_runtime = load_runtime_with_parts(
-        Identifier::from_array(["app", "alice"]),
-        alice_store,
-        alice_listener,
-    );
-    let bob_runtime = load_runtime_with_parts(
-        Identifier::from_array(["app", "bob"]),
-        bob_store,
-        bob_listener.clone(),
-    );
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
 
     alice_runtime.host().publish_direct_peer_route(
         bob_member.clone(),
@@ -402,7 +465,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
         initial_state: None,
     }))
     .expect("create_group should succeed");
-    wait_for_group_install(&bob_runtime, group_id);
+    wait_for_group_install(bob_runtime, group_id);
     let row_id = test_row_id(group_id, dataset_id.clone(), 11);
 
     let receipt = wait_for_test_reply(alice_runtime.publish_changes(vec![RowMutation::Upsert {
@@ -421,7 +484,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
         }
     );
 
-    let delivered = bob_listener.wait_for_next_data_change();
+    let delivered = bob_fixture.listener.wait_for_next_data_change();
     assert_eq!(
         delivered,
         CapturedDataChange {
@@ -449,19 +512,16 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     // 3. deliver the missing first update,
     // 4. assert that Bob drains the buffered update in causal order, and
     // 5. verify a duplicate of the first update is ignored.
-    let alice_member = Identifier::from_array(["alice"]);
-    let bob_member = Identifier::from_array(["bob"]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
-    let bob_listener = Arc::new(ListenerStub::default());
-    let bob_store = Arc::new(
-        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), schema.clone())],
     );
-    let bob_runtime = load_runtime_with_parts(
-        Identifier::from_array(["app", "bob"]),
-        bob_store,
-        bob_listener.clone(),
-    );
+    let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22));
     bob_runtime
         .install_group_for_test(
@@ -527,14 +587,14 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     bob_runtime
         .apply_update_batch_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should buffer");
-    assert!(bob_listener.captured_data_changes().is_empty());
+    assert!(bob_fixture.listener.captured_data_changes().is_empty());
 
     bob_runtime
         .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
         .expect("first update should apply and drain the pending second update");
-    bob_listener.wait_for_data_change_count(2);
+    bob_fixture.listener.wait_for_data_change_count(2);
     assert_eq!(
-        bob_listener.captured_data_changes(),
+        bob_fixture.listener.captured_data_changes(),
         vec![
             CapturedDataChange {
                 rows: vec![CapturedRowChange::Upsert {
@@ -553,7 +613,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     bob_runtime
         .apply_update_batch_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
-    assert_eq!(bob_listener.captured_data_changes().len(), 2);
+    assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
 }
 
 #[test]
@@ -562,18 +622,16 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     // 1. buffer one out-of-order update on Bob,
     // 2. deliver a second message with the same UpdateId but different payload,
     // 3. assert that the runtime rejects the conflicting duplicate explicitly.
-    let alice_member = Identifier::from_array(["alice"]);
-    let bob_member = Identifier::from_array(["bob"]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
-    let bob_store = Arc::new(
-        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    let bob_runtime = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), schema.clone())],
     );
-    let bob_runtime = load_runtime_with_parts(
-        Identifier::from_array(["app", "bob"]),
-        bob_store,
-        Arc::new(ListenerStub::default()),
-    );
+    let bob_runtime = bob_runtime.runtime;
     let group_id = GroupId(Uuid::from_u128(24));
     bob_runtime
         .install_group_for_test(

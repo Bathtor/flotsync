@@ -3,6 +3,7 @@ use flotsync_data_types::{
     Decode,
     DecodeValueError,
     InMemoryFieldValue,
+    OwnedRow,
     schema::{Schema, datamodel::NullableBasicValue},
 };
 use flotsync_utils::BoxFuture;
@@ -70,24 +71,11 @@ impl MutableRow {
     }
 }
 
-/// Owned immutable row snapshot used when surfacing listener events.
-///
-/// Listener callbacks outlive the runtime's internal staging buffers, so event
-/// emission clones field values into this owned adapter before handing a row to
-/// application code.
-pub(crate) struct OwnedReadRow {
-    fields: HashMap<String, InMemoryFieldValue<UpdateId>>,
-}
-
-impl OwnedReadRow {
-    pub(crate) fn new(fields: HashMap<String, InMemoryFieldValue<UpdateId>>) -> Self {
-        Self { fields }
-    }
-}
-
-impl RowRead for OwnedReadRow {
+impl RowRead for OwnedRow<UpdateId> {
     fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>> {
-        self.fields.get(field_name)
+        <OwnedRow<UpdateId> as flotsync_data_types::RowOperations<UpdateId>>::get_field(
+            self, field_name,
+        )
     }
 }
 

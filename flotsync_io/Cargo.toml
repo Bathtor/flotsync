@@ -16,6 +16,7 @@ flotsync_utils = { path = "../flotsync_utils" }
 bytes = { workspace = true }
 crossbeam-channel = "0.5"
 futures-channel = "0.3"
+futures-util = "0.3"
 kompact = { workspace = true }
 log = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }

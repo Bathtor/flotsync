@@ -1,6 +1,87 @@
-use super::*;
-use flotsync_messages::buffa::Message as _;
-use std::collections::HashSet;
+use super::{
+    errors::*,
+    in_memory::{
+        LocalDataset,
+        LocalGroupState,
+        LocalRuntimeState,
+        apply_local_delete,
+        apply_local_upsert,
+        apply_one_update_batch,
+        collect_group_dataset_scope,
+        working_dataset_for_publish,
+    },
+    messages::{
+        BootstrapGroupMessage,
+        DatasetUpdateMessage,
+        RuntimeMessage,
+        UpdateBatchMessage,
+        WireRuntimeMessage,
+        WireUpdateBatchMessage,
+    },
+};
+use crate::{
+    GroupMembers,
+    SharedGroupMemberships,
+    api::{
+        ApiError,
+        ApiExternalSnafu,
+        ChangeGroupMembershipRequest,
+        CreateGroupRequest,
+        DatasetId,
+        GroupId,
+        GroupMigration,
+        MemberIdentity,
+        MemberIndex,
+        PublishReceipt,
+        ReplicationEvent,
+        ReplicationEventListener,
+        ReplicationStore,
+        RowChange,
+        RowMutation,
+        StoreError,
+        providers::VecRowProvider,
+    },
+    delivery::{
+        contracts::{
+            GroupBroadcastPort,
+            GroupBroadcastPortIndication,
+            GroupBroadcastPortRequest,
+            ReliableDeliveryPort,
+            ReliableDeliveryPortIndication,
+            ReliableDeliveryPortRequest,
+        },
+        group_broadcast::{
+            GroupBroadcastDeliver,
+            GroupBroadcastSubmit,
+            GroupMessageEnvelope,
+            GroupMessageHeader,
+        },
+        reliable_delivery::{
+            ReliableDeliveryDeliver,
+            ReliableDeliverySubmit,
+            ReliableMessageEnvelope,
+            ReliableMessageHeader,
+        },
+        shared::{
+            DeliveryClass,
+            DetachedSignature,
+            EncryptedPayload,
+            MessageId,
+            SignatureScheme,
+            SignedEnvelopeFooter,
+        },
+    },
+};
+use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_data_types::Schema;
+use flotsync_messages::buffa::Message as BuffaMessage;
+use flotsync_utils::{LocalActor, impl_local_actor};
+use kompact::prelude::*;
+use snafu::prelude::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Debug)]
@@ -34,18 +115,39 @@ struct PreparedDatasetUpdates {
     working_datasets: HashMap<DatasetId, LocalDataset>,
 }
 
+enum DatasetSchemaLoadError {
+    Load {
+        dataset_id: DatasetId,
+        source: StoreError,
+    },
+    Missing {
+        dataset_id: DatasetId,
+    },
+}
+
+/// Local-actor messages understood by [`ReplicationRuntimeComponent`].
+///
+/// This is the imperative bridge surface between the public async runtime
+/// handle and the Kompact-hosted replication component.
 #[derive(Debug)]
-pub(super) enum ReplicationRuntimeMessage {
-    PublishChanges(Ask<Vec<RowMutation>, ApiResult<PublishReceipt>>),
-    CreateGroup(Ask<CreateGroupRequest, ApiResult<GroupId>>),
-    ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, ApiResult<GroupMigration>>),
+pub enum ReplicationRuntimeMessage {
+    /// Submit one local publish request through the component interface.
+    PublishChanges(Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>),
+    /// Create one new fixed-membership group through the component interface.
+    CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
+    /// Request one group-membership change through the component interface.
+    ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>),
     #[cfg(test)]
     Test(ReplicationRuntimeTestMessage),
 }
 
 #[cfg(test)]
 #[derive(Debug)]
-pub(super) enum ReplicationRuntimeTestMessage {
+#[allow(
+    private_interfaces,
+    reason = "test-only ask plumbing reuses internal error types"
+)]
+pub enum ReplicationRuntimeTestMessage {
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
     ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
 }
@@ -76,10 +178,15 @@ impl ReplicationRuntimeMessage {
 }
 
 #[derive(ComponentDefinition)]
-pub(super) struct ReplicationRuntimeComponent {
+/// Stateful Kompact component that hosts one in-memory replication runtime.
+///
+/// It owns the local replicated group state, speaks to the delivery-layer
+/// components through required ports, and translates the public replication
+/// API into deterministic local state transitions plus outbound delivery work.
+pub struct ReplicationRuntimeComponent {
     ctx: ComponentContext<Self>,
-    group_broadcast: RequiredPort<crate::delivery::contracts::GroupBroadcastPort>,
-    reliable_delivery: RequiredPort<crate::delivery::contracts::ReliableDeliveryPort>,
+    group_broadcast: RequiredPort<GroupBroadcastPort>,
+    reliable_delivery: RequiredPort<ReliableDeliveryPort>,
     local_member: MemberIdentity,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
@@ -89,7 +196,8 @@ pub(super) struct ReplicationRuntimeComponent {
 }
 
 impl ReplicationRuntimeComponent {
-    pub(super) fn new(
+    /// Construct one replication runtime component for one local member.
+    pub fn new(
         local_member: MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
@@ -132,9 +240,9 @@ impl ReplicationRuntimeComponent {
 
     fn reply_api<T>(
         &self,
-        promise: KPromise<ApiResult<T>>,
+        promise: KPromise<Result<T, ApiError>>,
         operation: &'static str,
-        reply: ApiResult<T>,
+        reply: Result<T, ApiError>,
     ) where
         T: Send + 'static,
     {
@@ -143,7 +251,9 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<Vec<DatasetId>, ApiError> {
+    /// Validate one publish request locally and return the missing dataset
+    /// schemas that must be loaded before local staging can proceed.
+    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<BTreeSet<DatasetId>, ApiError> {
         let (group_id, dataset_ids) = collect_group_dataset_scope(changes)
             .boxed()
             .context(ApiExternalSnafu)?;
@@ -157,50 +267,64 @@ impl ReplicationRuntimeComponent {
         Ok(local_group.missing_dataset_ids(&dataset_ids))
     }
 
-    async fn load_publish_schemas(
+    async fn load_dataset_schemas(
         store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: Vec<DatasetId>,
-    ) -> Result<HashMap<DatasetId, Arc<Schema>>, PublishChangesError> {
+        missing_dataset_ids: BTreeSet<DatasetId>,
+    ) -> Result<HashMap<DatasetId, Arc<Schema>>, DatasetSchemaLoadError> {
         let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
         for dataset_id in missing_dataset_ids {
-            let schema =
-                store
-                    .load_dataset_schema(&dataset_id)
-                    .await
-                    .context(LoadDatasetSchemaSnafu {
-                        dataset_id: dataset_id.clone(),
-                    })?;
-            let schema = schema.context(MissingDatasetSchemaSnafu {
+            let schema = store
+                .load_dataset_schema(&dataset_id)
+                .await
+                .map_err(|source| DatasetSchemaLoadError::Load {
+                    dataset_id: dataset_id.clone(),
+                    source,
+                })?;
+            let schema = schema.ok_or_else(|| DatasetSchemaLoadError::Missing {
                 dataset_id: dataset_id.clone(),
             })?;
             loaded_schemas.insert(dataset_id, schema);
         }
         Ok(loaded_schemas)
+    }
+
+    async fn load_publish_schemas(
+        store: Arc<dyn ReplicationStore>,
+        missing_dataset_ids: BTreeSet<DatasetId>,
+    ) -> Result<HashMap<DatasetId, Arc<Schema>>, PublishChangesError> {
+        Self::load_dataset_schemas(store, missing_dataset_ids)
+            .await
+            .map_err(|error| match error {
+                DatasetSchemaLoadError::Load { dataset_id, source } => {
+                    PublishChangesError::LoadDatasetSchema { dataset_id, source }
+                }
+                DatasetSchemaLoadError::Missing { dataset_id } => {
+                    PublishChangesError::MissingDatasetSchema { dataset_id }
+                }
+            })
     }
 
     async fn load_inbound_schemas(
         store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: Vec<DatasetId>,
+        missing_dataset_ids: BTreeSet<DatasetId>,
     ) -> Result<HashMap<DatasetId, Arc<Schema>>, InboundDeliveryError> {
-        let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
-        for dataset_id in missing_dataset_ids {
-            let schema = store.load_dataset_schema(&dataset_id).await.context(
-                InboundLoadDatasetSchemaSnafu {
-                    dataset_id: dataset_id.clone(),
-                },
-            )?;
-            let schema = schema.context(InboundMissingDatasetSchemaSnafu {
-                dataset_id: dataset_id.clone(),
-            })?;
-            loaded_schemas.insert(dataset_id, schema);
-        }
-        Ok(loaded_schemas)
+        Self::load_dataset_schemas(store, missing_dataset_ids)
+            .await
+            .map_err(|error| match error {
+                DatasetSchemaLoadError::Load { dataset_id, source } => {
+                    InboundDeliveryError::InboundLoadDatasetSchema { dataset_id, source }
+                }
+                DatasetSchemaLoadError::Missing { dataset_id } => {
+                    InboundDeliveryError::InboundMissingDatasetSchema { dataset_id }
+                }
+            })
     }
 
+    /// Submit one encoded live update to the group-broadcast layer.
     fn submit_group_update(&mut self, prepared_publish: PreparedLocalPublish) {
         let local_member = self.local_member.clone();
-        self.group_broadcast.trigger(
-            crate::delivery::contracts::GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
+        self.group_broadcast
+            .trigger(GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
                 delivery_class: DeliveryClass::BestEffort,
                 envelope: GroupMessageEnvelope {
                     header: GroupMessageHeader {
@@ -214,16 +338,18 @@ impl ReplicationRuntimeComponent {
                     footer: placeholder_signed_footer(),
                 },
                 suppress_self_delivery: true,
-            }),
-        );
+            }));
     }
 
+    /// Encode one runtime message into the temporary byte payload expected by
+    /// the current delivery-envelope boundary.
     fn encode_runtime_payload(message: RuntimeMessage) -> bytes::Bytes {
         // Temporary byte serialisation at the delivery-envelope boundary.
         // See flotsync-ylo for the payload/encryption redesign.
         message.encode_to_proto().encode_to_bytes()
     }
 
+    /// Submit the reliable bootstrap fan-out for one newly created group.
     fn submit_group_bootstrap(&mut self, group_id: GroupId, members: &GroupMembers) {
         let payload =
             Self::encode_runtime_payload(RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
@@ -235,8 +361,8 @@ impl ReplicationRuntimeComponent {
             .into_iter()
             .filter(|member| member != &self.local_member)
         {
-            self.reliable_delivery.trigger(
-                crate::delivery::contracts::ReliableDeliveryPortRequest::Submit(
+            self.reliable_delivery
+                .trigger(ReliableDeliveryPortRequest::Submit(
                     ReliableDeliverySubmit {
                         envelope: ReliableMessageEnvelope {
                             header: ReliableMessageHeader {
@@ -250,20 +376,15 @@ impl ReplicationRuntimeComponent {
                             footer: placeholder_signed_footer(),
                         },
                     },
-                ),
-            );
+                ));
         }
     }
 
-    fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> Vec<DatasetId> {
-        let mut dataset_ids = Vec::new();
-        let mut seen_dataset_ids = HashSet::new();
-        for dataset_update in dataset_updates {
-            if seen_dataset_ids.insert(dataset_update.dataset_id.clone()) {
-                dataset_ids.push(dataset_update.dataset_id.clone());
-            }
-        }
-        dataset_ids
+    fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> BTreeSet<DatasetId> {
+        dataset_updates
+            .iter()
+            .map(|dataset_update| dataset_update.dataset_id.clone())
+            .collect()
     }
 
     fn create_group(&mut self, req: CreateGroupRequest) -> Result<GroupId, CreateGroupError> {
@@ -365,17 +486,12 @@ impl ReplicationRuntimeComponent {
         changes: Vec<RowMutation>,
         update_id: UpdateId,
     ) -> Result<PreparedDatasetUpdates, PublishChangesError> {
-        let mut dataset_order = Vec::new();
-        let mut seen_datasets = HashSet::new();
         let mut working_datasets = HashMap::<DatasetId, LocalDataset>::new();
         let mut encoded_operations =
-            HashMap::<DatasetId, Vec<flotsync_messages::datamodel::SchemaOperation>>::new();
+            BTreeMap::<DatasetId, Vec<flotsync_messages::datamodel::SchemaOperation>>::new();
 
         for mutation in changes {
             let row_id = mutation.row_id().clone();
-            if seen_datasets.insert(row_id.dataset_id.clone()) {
-                dataset_order.push(row_id.dataset_id.clone());
-            }
             let working_dataset = working_dataset_for_publish(
                 &mut working_datasets,
                 local_group,
@@ -404,15 +520,11 @@ impl ReplicationRuntimeComponent {
             !encoded_operations.is_empty(),
             NoEffectiveChangesSnafu { group_id }
         );
-        let dataset_updates = dataset_order
+        let dataset_updates = encoded_operations
             .into_iter()
-            .filter_map(|dataset_id| {
-                encoded_operations
-                    .remove(&dataset_id)
-                    .map(|operations| DatasetUpdateMessage {
-                        dataset_id,
-                        operations,
-                    })
+            .map(|(dataset_id, operations)| DatasetUpdateMessage {
+                dataset_id,
+                operations,
             })
             .collect();
         Ok(PreparedDatasetUpdates {
@@ -472,7 +584,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         sender: MemberIdentity,
         message: WireUpdateBatchMessage,
-        missing_dataset_ids: Vec<DatasetId>,
+        missing_dataset_ids: BTreeSet<DatasetId>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
         let loaded_schemas =
             Self::load_inbound_schemas(self.store.clone(), missing_dataset_ids).await?;
@@ -523,23 +635,16 @@ impl ReplicationRuntimeComponent {
         loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
         let group_id = message.group_id;
-        let member_count = self.member_count_for_group(group_id)?;
+        let member_count = self
+            .state
+            .groups
+            .get(&group_id)
+            .context(UnknownHostedGroupSnafu { group_id })?
+            .member_count();
         let message = message
             .into_runtime(member_count)
             .context(DecodeReadVersionsSnafu { group_id })?;
         self.apply_update_batch_loaded(sender, message, loaded_schemas)
-    }
-
-    fn member_count_for_group(
-        &self,
-        group_id: GroupId,
-    ) -> Result<NonZeroUsize, InboundDeliveryError> {
-        let local_group = self
-            .state
-            .groups
-            .get(&group_id)
-            .context(UnknownHostedGroupSnafu { group_id })?;
-        Ok(NonZeroUsize::new(local_group.members.len()).expect("hosted group must be non-empty"))
     }
 
     fn apply_update_batch_loaded(
@@ -592,9 +697,7 @@ impl ReplicationRuntimeComponent {
         if !row_changes.is_empty() {
             event_batches.push(row_changes);
         }
-        'pending_updates: while let Some(pending_update) =
-            local_group.take_next_actionable_pending_update()
-        {
+        while let Some(pending_update) = local_group.take_next_actionable_pending_update() {
             let row_changes = apply_one_update_batch(
                 local_group,
                 pending_update.message,
@@ -603,7 +706,6 @@ impl ReplicationRuntimeComponent {
             if !row_changes.is_empty() {
                 event_batches.push(row_changes);
             }
-            continue 'pending_updates;
         }
 
         Ok(event_batches)
@@ -630,7 +732,7 @@ impl ReplicationRuntimeComponent {
 
     fn handle_publish_changes(
         &mut self,
-        ask: Ask<Vec<RowMutation>, ApiResult<PublishReceipt>>,
+        ask: Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>,
     ) -> Handled {
         let (promise, changes) = ask.take();
         let missing_dataset_ids = match self
@@ -670,7 +772,10 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    fn handle_create_group(&mut self, ask: Ask<CreateGroupRequest, ApiResult<GroupId>>) -> Handled {
+    fn handle_create_group(
+        &mut self,
+        ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
+    ) -> Handled {
         let (promise, req) = ask.take();
         let reply = self
             .ensure_running()
@@ -681,7 +786,7 @@ impl ReplicationRuntimeComponent {
 
     fn handle_change_group_membership(
         &mut self,
-        ask: Ask<ChangeGroupMembershipRequest, ApiResult<GroupMigration>>,
+        ask: Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>,
     ) -> Handled {
         let (promise, req) = ask.take();
         let _ = req;
@@ -742,7 +847,7 @@ impl ReplicationRuntimeComponent {
 
 ignore_lifecycle!(ReplicationRuntimeComponent);
 
-impl Require<crate::delivery::contracts::ReliableDeliveryPort> for ReplicationRuntimeComponent {
+impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
     fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
         if self.terminal_fault.is_some() {
             return Handled::Ok;
@@ -755,7 +860,7 @@ impl Require<crate::delivery::contracts::ReliableDeliveryPort> for ReplicationRu
     }
 }
 
-impl Require<crate::delivery::contracts::GroupBroadcastPort> for ReplicationRuntimeComponent {
+impl Require<GroupBroadcastPort> for ReplicationRuntimeComponent {
     fn handle(&mut self, indication: GroupBroadcastPortIndication) -> Handled {
         if self.terminal_fault.is_some() {
             return Handled::Ok;

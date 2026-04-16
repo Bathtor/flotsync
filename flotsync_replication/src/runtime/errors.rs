@@ -1,6 +1,13 @@
-use super::*;
+use super::messages::RuntimeMessageError;
+use crate::{
+    GroupMembersError,
+    api::{DatasetId, GroupId, ListenerError, MemberIdentity, MemberIndex, RowId, StoreError},
+};
+use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
 use flotsync_messages::codecs::datamodel::OperationCodecError;
+use kompact::prelude::PromiseErr;
+use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
@@ -10,7 +17,7 @@ pub(super) enum CreateGroupError {
     #[snafu(display("Group members must include the local member {local_member}."))]
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group member list is invalid."))]
-    InvalidMembers { source: crate::GroupMembersError },
+    InvalidMembers { source: GroupMembersError },
     #[snafu(display("Failed to install the created group locally."))]
     InstallGroup { source: GroupInstallError },
 }
@@ -51,19 +58,19 @@ pub(super) enum PublishChangesError {
         "Row {row_id} referenced unknown schema field '{field_name}' in dataset '{dataset_id}'.",
     ))]
     UnknownSchemaField {
-        row_id: crate::api::RowId,
+        row_id: RowId,
         dataset_id: DatasetId,
         field_name: String,
     },
     #[snafu(display("Row {row_id} carried a value incompatible with dataset '{dataset_id}'.",))]
     InvalidFieldValue {
-        row_id: crate::api::RowId,
+        row_id: RowId,
         dataset_id: DatasetId,
         source: Box<FieldValueBuildError>,
     },
     #[snafu(display("Applying local mutation for row {row_id} failed."))]
     ApplyLocalMutation {
-        row_id: crate::api::RowId,
+        row_id: RowId,
         source: OperationError,
     },
     #[snafu(display("Encoding dataset '{dataset_id}' update for transport failed."))]
@@ -89,7 +96,7 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display("Group broadcast unexpectedly carried a reliable bootstrap message."))]
     UnexpectedGroupMessage,
     #[snafu(display("Inbound bootstrap message carried an invalid group member set."))]
-    InvalidBootstrapMembers { source: crate::GroupMembersError },
+    InvalidBootstrapMembers { source: GroupMembersError },
     #[snafu(display(
         "Inbound bootstrap for group {group_id} did not include the local member {local_member}.",
     ))]
@@ -153,7 +160,7 @@ pub(super) enum InboundDeliveryError {
     },
     #[snafu(display("Applying inbound mutation for row {row_id} failed."))]
     ApplyInboundMutation {
-        row_id: crate::api::RowId,
+        row_id: RowId,
         source: OperationError,
     },
     #[snafu(display("Listener rejected one inbound data-change event."))]

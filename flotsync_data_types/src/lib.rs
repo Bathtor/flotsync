@@ -3,7 +3,7 @@
 #![deny(clippy::dbg_macro)]
 pub use chrono;
 use snafu::{Location, prelude::*};
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::HashMap};
 
 pub mod any_data;
 #[allow(unused, reason = "Might re-use some already implemented things later.")]
@@ -139,6 +139,55 @@ pub trait RowOperations<OperationId> {
     ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
     where
         T: ?Sized + Decode<OperationId>;
+}
+
+/// Owned immutable row snapshot that can outlive any backing in-memory store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OwnedRow<OperationId> {
+    fields: HashMap<String, InMemoryFieldValue<OperationId>>,
+}
+
+impl<OperationId> OwnedRow<OperationId> {
+    pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
+        Self { fields }
+    }
+}
+
+impl<OperationId> RowOperations<OperationId> for OwnedRow<OperationId> {
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
+        self.fields.get(field_name)
+    }
+
+    fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>
+    where
+        T: ?Sized + Decode<OperationId>,
+    {
+        let field_value =
+            self.get_field(field_name)
+                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
+                    field_name: field_name.to_owned(),
+                })?;
+        T::decode(field_value)
+    }
+
+    fn get_nullable_field_value<T>(
+        &self,
+        field_name: &str,
+    ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
+    where
+        T: ?Sized + Decode<OperationId>,
+    {
+        let field_value =
+            self.get_field(field_name)
+                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
+                    field_name: field_name.to_owned(),
+                })?;
+        match T::decode(field_value) {
+            Ok(value) => Ok(Some(value)),
+            Err(DecodeValueError::NullValue { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 /// This is equivalent to [[RowOperations]] but operating directly on schema fields.
