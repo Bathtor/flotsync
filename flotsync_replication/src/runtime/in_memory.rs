@@ -54,7 +54,7 @@ impl LocalGroupState {
         Ok(Self {
             members,
             local_member_index,
-            version_vector: initial_version_vector(member_count),
+            version_vector: VersionVector::initial(member_count),
             datasets: HashMap::new(),
             pending_updates: BTreeMap::new(),
         })
@@ -154,7 +154,7 @@ impl LocalDataset {
         }
     }
 
-    fn clone_row(&self, row_key: crate::api::RowKey) -> Option<OwnedRow> {
+    fn clone_row(&self, row_key: crate::api::RowKey) -> Option<OwnedReadRow> {
         let row = self.data.get_row(&row_key.0)?;
         let mut fields = HashMap::with_capacity(self.data.num_fields());
         for field_name in self.data.field_names() {
@@ -163,24 +163,67 @@ impl LocalDataset {
                 .expect("dataset field iteration must resolve against the same row");
             fields.insert(field_name.to_owned(), value.clone());
         }
-        Some(OwnedRow { fields })
+        Some(OwnedReadRow::new(fields))
     }
 }
 
-/// Owned row snapshot used when surfacing delivered changes to listeners.
-///
-/// The listener interface is object-safe and outlives internal staging
-/// buffers, so inbound apply clones the current row image into this adapter.
-struct OwnedRow {
-    fields: HashMap<String, flotsync_data_types::InMemoryFieldValue<UpdateId>>,
-}
+impl MutableRow {
+    fn into_initial_values<'schema>(
+        self,
+        schema: &'schema Schema,
+        row_id: &crate::api::RowId,
+    ) -> Result<Vec<InitialFieldValue<'schema>>, PublishChangesError> {
+        let mut initial_values = Vec::with_capacity(self.fields.len());
+        for (field_name, value) in self.fields {
+            let field =
+                schema
+                    .columns
+                    .get(field_name.as_str())
+                    .context(UnknownSchemaFieldSnafu {
+                        row_id: row_id.clone(),
+                        dataset_id: row_id.dataset_id.clone(),
+                        field_name,
+                    })?;
+            let initial_value =
+                field
+                    .initial(value)
+                    .map_err(Box::new)
+                    .context(InvalidFieldValueSnafu {
+                        row_id: row_id.clone(),
+                        dataset_id: row_id.dataset_id.clone(),
+                    })?;
+            initial_values.push(initial_value);
+        }
+        Ok(initial_values)
+    }
 
-impl RowRead for OwnedRow {
-    fn get_field(
-        &self,
-        field_name: &str,
-    ) -> Option<&flotsync_data_types::InMemoryFieldValue<UpdateId>> {
-        self.fields.get(field_name)
+    fn into_pending_updates<'schema>(
+        self,
+        schema: &'schema Schema,
+        row_id: &crate::api::RowId,
+    ) -> Result<Vec<PendingFieldUpdate<'schema>>, PublishChangesError> {
+        let mut pending_updates = Vec::with_capacity(self.fields.len());
+        for (field_name, value) in self.fields {
+            let field =
+                schema
+                    .columns
+                    .get(field_name.as_str())
+                    .context(UnknownSchemaFieldSnafu {
+                        row_id: row_id.clone(),
+                        dataset_id: row_id.dataset_id.clone(),
+                        field_name,
+                    })?;
+            let pending_update =
+                field
+                    .set(value)
+                    .map_err(Box::new)
+                    .context(InvalidFieldValueSnafu {
+                        row_id: row_id.clone(),
+                        dataset_id: row_id.dataset_id.clone(),
+                    })?;
+            pending_updates.push(pending_update);
+        }
+        Ok(pending_updates)
     }
 }
 
@@ -275,13 +318,6 @@ fn working_dataset_for_inbound<'a>(
         .expect("working inbound dataset must exist after insertion"))
 }
 
-pub(super) fn initial_version_vector(num_members: NonZeroUsize) -> VersionVector {
-    VersionVector::Synced {
-        num_members,
-        version: 0,
-    }
-}
-
 /// Applies one causally-ready inbound batch against one local group state.
 ///
 /// All touched datasets are first materialised into working copies so the batch
@@ -308,13 +344,10 @@ pub(super) fn apply_one_update_batch(
                     dataset_id: dataset_update.dataset_id.clone(),
                 },
             )?;
-            ensure!(
-                operation.change_id == message.update_id,
-                MismatchedOperationUpdateIdSnafu {
-                    dataset_id: dataset_update.dataset_id.clone(),
-                    expected: message.update_id,
-                    actual: operation.change_id,
-                }
+            assert_eq!(
+                operation.change_id, message.update_id,
+                "decoded inbound operation for dataset '{}' carried change id {}, expected {}",
+                dataset_update.dataset_id, operation.change_id, message.update_id,
             );
             let row_change = apply_remote_operation(
                 working_dataset,
@@ -335,62 +368,6 @@ pub(super) fn apply_one_update_batch(
     Ok(row_changes)
 }
 
-fn build_initial_values<'schema>(
-    schema: &'schema Schema,
-    row_id: &crate::api::RowId,
-    row: &MutableRow,
-) -> Result<Vec<InitialFieldValue<'schema>>, PublishChangesError> {
-    let mut initial_values = Vec::with_capacity(row.fields.len());
-    for (field_name, value) in &row.fields {
-        let field = schema
-            .columns
-            .get(field_name.as_str())
-            .context(UnknownSchemaFieldSnafu {
-                row_id: row_id.clone(),
-                dataset_id: row_id.dataset_id.clone(),
-                field_name: field_name.clone(),
-            })?;
-        let initial_value =
-            field
-                .initial(value.clone())
-                .map_err(Box::new)
-                .context(InvalidFieldValueSnafu {
-                    row_id: row_id.clone(),
-                    dataset_id: row_id.dataset_id.clone(),
-                })?;
-        initial_values.push(initial_value);
-    }
-    Ok(initial_values)
-}
-
-fn build_pending_updates<'schema>(
-    schema: &'schema Schema,
-    row_id: &crate::api::RowId,
-    row: &MutableRow,
-) -> Result<Vec<PendingFieldUpdate<'schema>>, PublishChangesError> {
-    let mut pending_updates = Vec::with_capacity(row.fields.len());
-    for (field_name, value) in &row.fields {
-        let field = schema
-            .columns
-            .get(field_name.as_str())
-            .context(UnknownSchemaFieldSnafu {
-                row_id: row_id.clone(),
-                dataset_id: row_id.dataset_id.clone(),
-                field_name: field_name.clone(),
-            })?;
-        let pending_update =
-            field
-                .set(value.clone())
-                .map_err(Box::new)
-                .context(InvalidFieldValueSnafu {
-                    row_id: row_id.clone(),
-                    dataset_id: row_id.dataset_id.clone(),
-                })?;
-        pending_updates.push(pending_update);
-    }
-    Ok(pending_updates)
-}
-
 /// Applies one local upsert and returns the encoded schema operation, if any.
 ///
 /// A local upsert may still produce no transport operation when the new row
@@ -398,12 +375,12 @@ fn build_pending_updates<'schema>(
 pub(super) fn apply_local_upsert(
     dataset: &mut LocalDataset,
     row_id: &crate::api::RowId,
-    row: &MutableRow,
+    row: MutableRow,
     update_id: UpdateId,
 ) -> Result<Option<flotsync_messages::datamodel::SchemaOperation>, PublishChangesError> {
     let schema = dataset.data.schema().clone();
     let operation = if dataset.data.get_row(&row_id.row_key.0).is_some() {
-        let pending_updates = build_pending_updates(&schema, row_id, row)?;
+        let pending_updates = row.into_pending_updates(&schema, row_id)?;
         match dataset
             .data
             .modify_row(update_id, row_id.row_key.0, pending_updates)
@@ -414,7 +391,7 @@ pub(super) fn apply_local_upsert(
             OperationOutcome::NoChanges => None,
         }
     } else {
-        let initial_values = build_initial_values(&schema, row_id, row)?;
+        let initial_values = row.into_initial_values(&schema, row_id)?;
         let operation = dataset
             .data
             .insert_row(update_id, row_id.row_key.0, initial_values)

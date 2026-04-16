@@ -103,6 +103,7 @@ pub(crate) enum RuntimeMessage {
 /// hosted group member count before they can become a full `VersionVector`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WireRuntimeMessage {
+    /// Bootstrap messages already have their full runtime shape once decoded.
     BootstrapGroup(BootstrapGroupMessage),
     UpdateBatch(WireUpdateBatchMessage),
 }
@@ -134,7 +135,9 @@ pub(crate) struct WireUpdateBatchMessage {
 ///
 /// The runtime message model keeps a full `VersionVector`, while the protobuf
 /// wire shape prefers more compact encodings such as "all members synced" or
-/// "one member ahead" when possible.
+/// "one member ahead" when possible. This stays separate from the generated
+/// protobuf type so the runtime can validate and normalise wire values before
+/// they become a domain `VersionVector`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WireVersionVector {
     Full(PureVersionVector),
@@ -332,6 +335,17 @@ impl WireUpdateBatchMessage {
             read_versions,
             dataset_updates: self.dataset_updates,
         })
+    }
+}
+
+impl From<UpdateBatchMessage> for WireUpdateBatchMessage {
+    fn from(message: UpdateBatchMessage) -> Self {
+        Self {
+            group_id: message.group_id,
+            update_id: message.update_id,
+            read_versions: WireVersionVector::from_runtime(&message.read_versions),
+            dataset_updates: message.dataset_updates,
+        }
     }
 }
 

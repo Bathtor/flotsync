@@ -20,6 +20,13 @@ pub enum VersionVector {
     },
 }
 impl VersionVector {
+    pub const fn initial(num_members: NonZeroUsize) -> Self {
+        Self::Synced {
+            num_members,
+            version: 0,
+        }
+    }
+
     pub const fn num_members(&self) -> NonZeroUsize {
         match self {
             VersionVector::Full(v) => v.len(),

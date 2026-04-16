@@ -194,10 +194,6 @@ impl crate::api::ReplicationEventListener for ListenerStub {
     }
 }
 
-fn member<const N: usize>(segments: [&str; N]) -> crate::api::MemberIdentity {
-    Identifier::from_array(segments)
-}
-
 fn docs_dataset_id() -> DatasetId {
     DatasetId::try_new("docs").expect("dataset id should be valid")
 }
@@ -252,7 +248,7 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
 
 #[test]
 fn delivery_runtime_host_updates_shared_group_memberships() {
-    let local_member = member(["alice"]);
+    let local_member = Identifier::from_array(["alice"]);
     let mut host = DeliveryRuntimeHost::start(local_member.clone()).expect("host should start");
     let group_id = crate::api::GroupId(Uuid::from_u128(1));
     let memberships = GroupMemberships::from_groups([(
@@ -269,7 +265,7 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 #[test]
 fn load_replication_runtime_returns_concrete_runtime() {
     let application_id = Identifier::from_array(["app"]);
-    let store = Arc::new(StoreStub::new(member(["alice"])));
+    let store = Arc::new(StoreStub::new(Identifier::from_array(["alice"])));
     let listener = Arc::new(ListenerStub::default());
 
     let runtime = wait_for_test_reply(load_replication_runtime(
@@ -286,7 +282,8 @@ fn load_replication_runtime_returns_concrete_runtime() {
 
 #[test]
 fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
-    let mut host = DeliveryRuntimeHost::start(member(["probe"])).expect("host should start");
+    let mut host =
+        DeliveryRuntimeHost::start(Identifier::from_array(["probe"])).expect("host should start");
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     host.shutdown();
@@ -294,8 +291,8 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 
 #[test]
 fn create_group_bootstrap_installs_remote_membership() {
-    let alice_member = member(["alice"]);
-    let bob_member = member(["bob"]);
+    let alice_member = Identifier::from_array(["alice"]);
+    let bob_member = Identifier::from_array(["bob"]);
     let alice_runtime = load_runtime(
         Identifier::from_array(["app", "alice"]),
         alice_member.clone(),
@@ -368,8 +365,8 @@ fn publish_changes_delivers_remote_data_changed_event() {
     // 3. create one fixed-membership group from Alice,
     // 4. publish one upsert from Alice, and
     // 5. assert that Bob observes the replicated row change.
-    let alice_member = member(["alice"]);
-    let bob_member = member(["bob"]);
+    let alice_member = Identifier::from_array(["alice"]);
+    let bob_member = Identifier::from_array(["bob"]);
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
     let alice_listener = Arc::new(ListenerStub::default());
@@ -452,8 +449,8 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     // 3. deliver the missing first update,
     // 4. assert that Bob drains the buffered update in causal order, and
     // 5. verify a duplicate of the first update is ignored.
-    let alice_member = member(["alice"]);
-    let bob_member = member(["bob"]);
+    let alice_member = Identifier::from_array(["alice"]);
+    let bob_member = Identifier::from_array(["bob"]);
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
     let bob_listener = Arc::new(ListenerStub::default());
@@ -479,7 +476,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     let first_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
-        &crate::row_values! { "title" => "first" },
+        crate::row_values! { "title" => "first" },
         UpdateId {
             version: 1,
             node_index: 0,
@@ -490,7 +487,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     let second_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
-        &crate::row_values! { "title" => "second" },
+        crate::row_values! { "title" => "second" },
         UpdateId {
             version: 2,
             node_index: 0,
@@ -506,13 +503,13 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
             version: 1,
             node_index: 0,
         },
-        read_versions: initial_version_vector(member_count),
+        read_versions: VersionVector::initial(member_count),
         dataset_updates: vec![DatasetUpdateMessage {
             dataset_id: dataset_id.clone(),
             operations: vec![first_operation],
         }],
     };
-    let mut second_read_versions = initial_version_vector(member_count);
+    let mut second_read_versions = VersionVector::initial(member_count);
     second_read_versions.increment_at(0);
     let second_message = UpdateBatchMessage {
         group_id,
@@ -565,8 +562,8 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     // 1. buffer one out-of-order update on Bob,
     // 2. deliver a second message with the same UpdateId but different payload,
     // 3. assert that the runtime rejects the conflicting duplicate explicitly.
-    let alice_member = member(["alice"]);
-    let bob_member = member(["bob"]);
+    let alice_member = Identifier::from_array(["alice"]);
+    let bob_member = Identifier::from_array(["bob"]);
     let dataset_id = docs_dataset_id();
     let schema = title_schema();
     let bob_store = Arc::new(
@@ -593,7 +590,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let first_operation = apply_local_upsert(
         &mut first_source_dataset,
         &row_id,
-        &crate::row_values! { "title" => "first" },
+        crate::row_values! { "title" => "first" },
         UpdateId {
             version: 1,
             node_index: 0,
@@ -606,7 +603,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let conflicting_operation = apply_local_upsert(
         &mut conflicting_source_dataset,
         &row_id,
-        &crate::row_values! { "title" => "conflict" },
+        crate::row_values! { "title" => "conflict" },
         UpdateId {
             version: 1,
             node_index: 0,
@@ -622,7 +619,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
             node_index: 0,
         },
         read_versions: {
-            let mut read_versions = initial_version_vector(member_count);
+            let mut read_versions = VersionVector::initial(member_count);
             read_versions.increment_at(0);
             read_versions
         },
@@ -638,7 +635,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
             node_index: 0,
         },
         read_versions: {
-            let mut read_versions = initial_version_vector(member_count);
+            let mut read_versions = VersionVector::initial(member_count);
             read_versions.increment_at(0);
             read_versions
         },

@@ -70,6 +70,27 @@ impl MutableRow {
     }
 }
 
+/// Owned immutable row snapshot used when surfacing listener events.
+///
+/// Listener callbacks outlive the runtime's internal staging buffers, so event
+/// emission clones field values into this owned adapter before handing a row to
+/// application code.
+pub(crate) struct OwnedReadRow {
+    fields: HashMap<String, InMemoryFieldValue<UpdateId>>,
+}
+
+impl OwnedReadRow {
+    pub(crate) fn new(fields: HashMap<String, InMemoryFieldValue<UpdateId>>) -> Self {
+        Self { fields }
+    }
+}
+
+impl RowRead for OwnedReadRow {
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>> {
+        self.fields.get(field_name)
+    }
+}
+
 /// Convenience macro to build a [`MutableRow`] inline.
 #[macro_export]
 macro_rules! row_values {

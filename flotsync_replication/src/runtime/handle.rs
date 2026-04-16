@@ -125,17 +125,9 @@ pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let mut future = pin!(future);
-    flotsync_io::test_support::eventually_value(
+    flotsync_io::test_support::wait_for_future(
         std::time::Duration::from_secs(5),
-        || {
-            let waker = Waker::noop();
-            let mut context = Context::from_waker(waker);
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(value) => Some(value),
-                Poll::Pending => None,
-            }
-        },
+        future,
         "timed out waiting for test future to resolve",
     )
 }

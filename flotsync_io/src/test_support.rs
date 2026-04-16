@@ -15,9 +15,12 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt::{Debug, Display},
+    future::Future,
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    pin::pin,
     sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc},
+    task::{Context, Poll, Waker},
     thread,
     time::{Duration, Instant},
 };
@@ -455,6 +458,27 @@ where
     M: Display,
 {
     eventually_value(timeout, || predicate().then_some(()), failure_message);
+}
+
+/// Waits for one future to resolve within `timeout`.
+pub fn wait_for_future<F, M>(timeout: Duration, future: F, failure_message: M) -> F::Output
+where
+    F: Future,
+    M: Display,
+{
+    let mut future = pin!(future);
+    eventually_value(
+        timeout,
+        || {
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
+            }
+        },
+        failure_message,
+    )
 }
 
 /// Waits until one component-state predicate becomes true or `timeout`

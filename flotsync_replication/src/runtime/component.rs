@@ -147,9 +147,14 @@ impl ReplicationRuntimeComponent {
         let (group_id, dataset_ids) = collect_group_dataset_scope(changes)
             .boxed()
             .context(ApiExternalSnafu)?;
-        self.missing_dataset_ids_for_publish(group_id, &dataset_ids)
+        let local_group = self
+            .state
+            .groups
+            .get(&group_id)
+            .context(UnknownGroupSnafu { group_id })
             .boxed()
-            .context(ApiExternalSnafu)
+            .context(ApiExternalSnafu)?;
+        Ok(local_group.missing_dataset_ids(&dataset_ids))
     }
 
     async fn load_publish_schemas(
@@ -211,32 +216,6 @@ impl ReplicationRuntimeComponent {
                 suppress_self_delivery: true,
             }),
         );
-    }
-
-    fn missing_dataset_ids_for_publish(
-        &self,
-        group_id: GroupId,
-        dataset_ids: &[DatasetId],
-    ) -> Result<Vec<DatasetId>, PublishChangesError> {
-        let local_group = self
-            .state
-            .groups
-            .get(&group_id)
-            .context(UnknownGroupSnafu { group_id })?;
-        Ok(local_group.missing_dataset_ids(dataset_ids))
-    }
-
-    fn missing_dataset_ids_for_inbound(
-        &self,
-        group_id: GroupId,
-        dataset_ids: &[DatasetId],
-    ) -> Result<Vec<DatasetId>, InboundDeliveryError> {
-        let local_group = self
-            .state
-            .groups
-            .get(&group_id)
-            .context(UnknownHostedGroupSnafu { group_id })?;
-        Ok(local_group.missing_dataset_ids(dataset_ids))
     }
 
     fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> Vec<DatasetId> {
@@ -388,7 +367,7 @@ impl ReplicationRuntimeComponent {
 
             let encoded_operation = match mutation {
                 RowMutation::Upsert { row, .. } => {
-                    apply_local_upsert(working_dataset, &row_id, &row, update_id)?
+                    apply_local_upsert(working_dataset, &row_id, row, update_id)?
                 }
                 RowMutation::Delete { .. } => {
                     Some(apply_local_delete(working_dataset, &row_id, update_id)?)
@@ -435,13 +414,13 @@ impl ReplicationRuntimeComponent {
                 let group_id = message.group_id;
                 let members = GroupMembers::from_ordered_members(message.members)
                     .context(InvalidBootstrapMembersSnafu)?;
-                if !members.contains(&self.local_member) {
-                    return BootstrapMissingLocalMemberSnafu {
+                ensure!(
+                    members.contains(&self.local_member),
+                    BootstrapMissingLocalMemberSnafu {
                         group_id,
                         local_member: self.local_member.clone(),
                     }
-                    .fail();
-                }
+                );
                 self.install_group(group_id, members)
                     .context(InstallBootstrapGroupSnafu { group_id })?;
                 // Dropping `deliver` without completing `processed` intentionally
@@ -471,6 +450,17 @@ impl ReplicationRuntimeComponent {
         }
     }
 
+    async fn load_and_apply_update_batch(
+        &mut self,
+        sender: MemberIdentity,
+        message: WireUpdateBatchMessage,
+        missing_dataset_ids: Vec<DatasetId>,
+    ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
+        let loaded_schemas =
+            Self::load_inbound_schemas(self.store.clone(), missing_dataset_ids).await?;
+        self.apply_wire_update_batch_loaded(sender, message, loaded_schemas)
+    }
+
     fn handle_update_batch(
         &mut self,
         sender: MemberIdentity,
@@ -478,22 +468,20 @@ impl ReplicationRuntimeComponent {
     ) -> Handled {
         let dataset_ids = Self::collect_dataset_ids(&message.dataset_updates);
         let missing_dataset_ids =
-            match self.missing_dataset_ids_for_inbound(message.group_id, &dataset_ids) {
-                Ok(missing_dataset_ids) => missing_dataset_ids,
-                Err(error) => {
-                    self.record_terminal_fault("group delivery", &error);
-                    return Handled::Ok;
+            if let Some(local_group) = self.state.groups.get(&message.group_id) {
+                local_group.missing_dataset_ids(&dataset_ids)
+            } else {
+                let error = UnknownHostedGroupSnafu {
+                    group_id: message.group_id,
                 }
+                .build();
+                self.record_terminal_fault("group delivery", &error);
+                return Handled::Ok;
             };
         Handled::block_on(self, async move |mut async_self| {
-            let loaded_schemas =
-                Self::load_inbound_schemas(async_self.store.clone(), missing_dataset_ids).await;
-            let reply = match loaded_schemas {
-                Ok(loaded_schemas) => {
-                    async_self.apply_wire_update_batch_loaded(sender, message, loaded_schemas)
-                }
-                Err(error) => Err(error),
-            };
+            let reply = async_self
+                .load_and_apply_update_batch(sender, message, missing_dataset_ids)
+                .await;
             if let Ok(event_batches) = reply {
                 if let Err(error) =
                     notify_listener_batches(async_self.listener.clone(), event_batches).await
@@ -695,31 +683,30 @@ impl ReplicationRuntimeComponent {
         let (promise, (sender, message)) = ask.take();
         let dataset_ids = Self::collect_dataset_ids(&message.dataset_updates);
         let missing_dataset_ids =
-            match self.missing_dataset_ids_for_inbound(message.group_id, &dataset_ids) {
-                Ok(missing_dataset_ids) => missing_dataset_ids,
-                Err(error) => {
-                    let _ = promise.fulfil(Err(error));
-                    return Handled::Ok;
+            if let Some(local_group) = self.state.groups.get(&message.group_id) {
+                local_group.missing_dataset_ids(&dataset_ids)
+            } else {
+                let error = UnknownHostedGroupSnafu {
+                    group_id: message.group_id,
                 }
+                .build();
+                let _ = promise.fulfil(Err(error));
+                return Handled::Ok;
             };
         Handled::block_on(self, async move |mut async_self| {
-            let reply =
-                match Self::load_inbound_schemas(async_self.store.clone(), missing_dataset_ids)
-                    .await
-                {
-                    Ok(loaded_schemas) => {
-                        let event_batches =
-                            async_self.apply_update_batch_loaded(sender, message, loaded_schemas);
-                        match event_batches {
-                            Ok(event_batches) => {
-                                notify_listener_batches(async_self.listener.clone(), event_batches)
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
+            let reply = match async_self
+                .load_and_apply_update_batch(
+                    sender,
+                    WireUpdateBatchMessage::from(message),
+                    missing_dataset_ids,
+                )
+                .await
+            {
+                Ok(event_batches) => {
+                    notify_listener_batches(async_self.listener.clone(), event_batches).await
+                }
+                Err(error) => Err(error),
+            };
             let _ = promise.fulfil(reply);
         })
     }

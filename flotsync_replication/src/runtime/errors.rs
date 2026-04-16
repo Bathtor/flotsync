@@ -140,7 +140,7 @@ pub(super) enum InboundDeliveryError {
         source: RuntimeMessageError,
     },
     #[snafu(display(
-        "Inbound update for group {group_id} received conflicting payloads for buffered update id {update_id}.",
+        "Buffered inbound update collision in group {group_id}: update id {update_id} arrived with a different payload than the one already buffered.",
     ))]
     ConflictingBufferedUpdate {
         group_id: GroupId,
@@ -150,14 +150,6 @@ pub(super) enum InboundDeliveryError {
     DecodeSchemaOperation {
         dataset_id: DatasetId,
         source: OperationCodecError,
-    },
-    #[snafu(display(
-        "Inbound operation for dataset '{dataset_id}' had change id {actual}, expected {expected}.",
-    ))]
-    MismatchedOperationUpdateId {
-        dataset_id: DatasetId,
-        expected: UpdateId,
-        actual: UpdateId,
     },
     #[snafu(display("Applying inbound mutation for row {row_id} failed."))]
     ApplyInboundMutation {

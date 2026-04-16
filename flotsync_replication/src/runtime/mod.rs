@@ -40,11 +40,6 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
-#[cfg(test)]
-use std::{
-    pin::pin,
-    task::{Context, Poll, Waker},
-};
 
 mod component;
 mod errors;
