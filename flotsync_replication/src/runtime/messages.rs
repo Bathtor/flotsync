@@ -143,45 +143,93 @@ pub(crate) struct DatasetUpdateMessage {
     pub(crate) operations: Vec<datamodel_proto::SchemaOperation>,
 }
 
+impl DatasetUpdateMessage {
+    fn to_proto(&self) -> replication_proto::DatasetUpdate {
+        replication_proto::DatasetUpdate {
+            dataset_id: self.dataset_id.as_str().to_owned(),
+            operations: self.operations.clone(),
+            ..replication_proto::DatasetUpdate::default()
+        }
+    }
+
+    fn decode_proto_vec(
+        dataset_updates: Vec<replication_proto::DatasetUpdate>,
+    ) -> Result<Vec<Self>, RuntimeMessageError> {
+        if dataset_updates.is_empty() {
+            return EmptyUpdateBatchSnafu.fail();
+        }
+
+        let mut decoded_updates = Vec::with_capacity(dataset_updates.len());
+        for dataset_update in dataset_updates {
+            if dataset_update.operations.is_empty() {
+                return EmptyDatasetUpdateSnafu {
+                    dataset_id: dataset_update.dataset_id,
+                }
+                .fail();
+            }
+
+            let dataset_id = DatasetId::try_new(dataset_update.dataset_id.clone()).context(
+                InvalidDatasetIdSnafu {
+                    value: dataset_update.dataset_id,
+                },
+            )?;
+            decoded_updates.push(Self {
+                dataset_id,
+                operations: dataset_update.operations,
+            });
+        }
+        Ok(decoded_updates)
+    }
+}
+
 impl RuntimeMessage {
     pub(crate) fn encode_to_proto(&self) -> replication_proto::RuntimeMessage {
         match self {
             RuntimeMessage::BootstrapGroup(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
-                    Box::new(replication_proto::BootstrapGroup {
-                        group_id: message.group_id.0.as_bytes().to_vec(),
-                        members: message
-                            .members
-                            .iter()
-                            .map(member_identity_to_wire_format)
-                            .collect(),
-                        ..replication_proto::BootstrapGroup::default()
-                    }),
+                    Box::new(message.to_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::UpdateBatch(
-                    Box::new(replication_proto::UpdateBatch {
-                        group_id: message.group_id.0.as_bytes().to_vec(),
-                        update_id: MessageField::some(encode_update_id(message.update_id)),
-                        read_versions: MessageField::some(
-                            WireVersionVector::from_runtime(&message.read_versions).to_proto(),
-                        ),
-                        dataset_updates: message
-                            .dataset_updates
-                            .iter()
-                            .map(|dataset| replication_proto::DatasetUpdate {
-                                dataset_id: dataset.dataset_id.as_str().to_owned(),
-                                operations: dataset.operations.clone(),
-                                ..replication_proto::DatasetUpdate::default()
-                            })
-                            .collect(),
-                        ..replication_proto::UpdateBatch::default()
-                    }),
+                    Box::new(message.to_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
+        }
+    }
+}
+
+impl BootstrapGroupMessage {
+    fn to_proto(&self) -> replication_proto::BootstrapGroup {
+        let members = self
+            .members
+            .iter()
+            .map(member_identity_to_wire_format)
+            .collect();
+        replication_proto::BootstrapGroup {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            members,
+            ..replication_proto::BootstrapGroup::default()
+        }
+    }
+}
+
+impl UpdateBatchMessage {
+    fn to_proto(&self) -> replication_proto::UpdateBatch {
+        let read_versions = WireVersionVector::from_runtime(&self.read_versions).to_proto();
+        let dataset_updates = self
+            .dataset_updates
+            .iter()
+            .map(DatasetUpdateMessage::to_proto)
+            .collect();
+        replication_proto::UpdateBatch {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            update_id: MessageField::some(encode_update_id(self.update_id)),
+            read_versions: MessageField::some(read_versions),
+            dataset_updates,
+            ..replication_proto::UpdateBatch::default()
         }
     }
 }
@@ -219,57 +267,44 @@ impl WireRuntimeMessage {
                     members,
                 }))
             }
-            replication_proto::runtime_message::Body::UpdateBatch(mut message) => {
-                let group_id = group_id_from_wire(&message.group_id, "update_batch.group_id")
-                    .context(InvalidWireValueSnafu {
-                        field: "update_batch.group_id",
-                    })?;
-                let Some(update_id) = message.update_id.take() else {
-                    return MissingUpdateIdSnafu.fail();
-                };
-                let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
-                    field: "update_batch.update_id",
-                })?;
-                let Some(read_versions) = message.read_versions.take() else {
-                    return MissingReadVersionsSnafu.fail();
-                };
-                let read_versions = WireVersionVector::from_proto(read_versions).context(
-                    InvalidReadVersionsSnafu {
-                        field: "update_batch.read_versions",
-                    },
-                )?;
-                if message.dataset_updates.is_empty() {
-                    return EmptyUpdateBatchSnafu.fail();
-                }
-                let mut dataset_updates = Vec::with_capacity(message.dataset_updates.len());
-                for dataset_update in message.dataset_updates {
-                    if dataset_update.operations.is_empty() {
-                        return EmptyDatasetUpdateSnafu {
-                            dataset_id: dataset_update.dataset_id,
-                        }
-                        .fail();
-                    }
-                    let dataset_id = DatasetId::try_new(dataset_update.dataset_id.clone())
-                        .context(InvalidDatasetIdSnafu {
-                            value: dataset_update.dataset_id,
-                        })?;
-                    dataset_updates.push(DatasetUpdateMessage {
-                        dataset_id,
-                        operations: dataset_update.operations,
-                    });
-                }
-                Ok(WireRuntimeMessage::UpdateBatch(WireUpdateBatchMessage {
-                    group_id,
-                    update_id,
-                    read_versions,
-                    dataset_updates,
-                }))
-            }
+            replication_proto::runtime_message::Body::UpdateBatch(message) => Ok(
+                WireRuntimeMessage::UpdateBatch(WireUpdateBatchMessage::from_proto(*message)?),
+            ),
         }
     }
 }
 
 impl WireUpdateBatchMessage {
+    fn from_proto(
+        mut message: replication_proto::UpdateBatch,
+    ) -> Result<Self, RuntimeMessageError> {
+        let group_id = group_id_from_wire(&message.group_id, "update_batch.group_id").context(
+            InvalidWireValueSnafu {
+                field: "update_batch.group_id",
+            },
+        )?;
+        let Some(update_id) = message.update_id.take() else {
+            return MissingUpdateIdSnafu.fail();
+        };
+        let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
+            field: "update_batch.update_id",
+        })?;
+        let Some(read_versions) = message.read_versions.take() else {
+            return MissingReadVersionsSnafu.fail();
+        };
+        let read_versions =
+            WireVersionVector::from_proto(read_versions).context(InvalidReadVersionsSnafu {
+                field: "update_batch.read_versions",
+            })?;
+        let dataset_updates = DatasetUpdateMessage::decode_proto_vec(message.dataset_updates)?;
+        Ok(Self {
+            group_id,
+            update_id,
+            read_versions,
+            dataset_updates,
+        })
+    }
+
     pub(crate) fn into_runtime(
         self,
         num_members: NonZeroUsize,

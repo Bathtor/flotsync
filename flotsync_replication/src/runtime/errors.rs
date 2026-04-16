@@ -16,15 +16,10 @@ pub(super) enum CreateGroupError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum GroupInstallError {
-    #[snafu(display(
-        "Group {:?} already exists with a different canonical member order.",
-        group_id
-    ))]
+    #[snafu(display("Group {group_id} already exists with a different canonical member order."))]
     ConflictingExistingGroup { group_id: GroupId },
-    #[snafu(display(
-        "Group members did not expose a canonical index for the local member {local_member}."
-    ))]
-    LocalMemberIndexMissing { local_member: MemberIdentity },
+    #[snafu(display("Group members do not include the local member {local_member}."))]
+    MissingLocalMember { local_member: MemberIdentity },
 }
 
 #[derive(Debug, Snafu)]
@@ -33,15 +28,13 @@ pub(super) enum PublishChangesError {
     #[snafu(display("publish_changes requires at least one row mutation."))]
     EmptyChanges,
     #[snafu(display(
-        "publish_changes only supports one group per call in the first replication slice; saw both {:?} and {:?}.",
-        first_group_id,
-        other_group_id
+        "publish_changes only supports one group per call in the first replication slice; saw both {first_group_id} and {other_group_id}.",
     ))]
     MixedGroups {
         first_group_id: GroupId,
         other_group_id: GroupId,
     },
-    #[snafu(display("Group {:?} is not hosted by this runtime.", group_id))]
+    #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
     #[snafu(display(
         "Failed to load schema for dataset '{dataset_id}' from the replication store."
@@ -53,26 +46,22 @@ pub(super) enum PublishChangesError {
     #[snafu(display("No schema was available for dataset '{dataset_id}'."))]
     MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
-        "Row {:?} referenced unknown schema field '{field_name}' in dataset '{dataset_id}'.",
-        row_id
+        "Row {row_id} referenced unknown schema field '{field_name}' in dataset '{dataset_id}'.",
     ))]
     UnknownSchemaField {
-        row_id: Box<crate::api::RowId>,
+        row_id: crate::api::RowId,
         dataset_id: DatasetId,
         field_name: String,
     },
-    #[snafu(display(
-        "Row {:?} carried a value incompatible with dataset '{dataset_id}'.",
-        row_id
-    ))]
+    #[snafu(display("Row {row_id} carried a value incompatible with dataset '{dataset_id}'.",))]
     InvalidFieldValue {
-        row_id: Box<crate::api::RowId>,
+        row_id: crate::api::RowId,
         dataset_id: DatasetId,
-        source: FieldValueBuildError,
+        source: Box<FieldValueBuildError>,
     },
-    #[snafu(display("Applying local mutation for row {:?} failed.", row_id))]
+    #[snafu(display("Applying local mutation for row {row_id} failed."))]
     ApplyLocalMutation {
-        row_id: Box<crate::api::RowId>,
+        row_id: crate::api::RowId,
         source: OperationError,
     },
     #[snafu(display("Encoding dataset '{dataset_id}' update for transport failed."))]
@@ -81,11 +70,10 @@ pub(super) enum PublishChangesError {
         source: OperationCodecError,
     },
     #[snafu(display(
-        "publish_changes produced no effective schema operations for group {:?}.",
-        group_id
+        "publish_changes produced no effective schema operations for group {group_id}.",
     ))]
-    NoEffectiveChanges { group_id: GroupId },
-    #[snafu(display("Group {:?} exhausted its local update id range.", group_id))]
+    NoAppliedChanges { group_id: GroupId },
+    #[snafu(display("Group {group_id} exhausted its local update id range."))]
     ExhaustedUpdateIds { group_id: GroupId },
 }
 
@@ -101,24 +89,23 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display("Inbound bootstrap message carried an invalid group member set."))]
     InvalidBootstrapMembers { source: crate::GroupMembersError },
     #[snafu(display(
-        "Inbound bootstrap for group {:?} did not include the local member {local_member}.",
-        group_id
+        "Inbound bootstrap for group {group_id} did not include the local member {local_member}.",
     ))]
     BootstrapMissingLocalMember {
         group_id: GroupId,
         local_member: MemberIdentity,
     },
-    #[snafu(display("Failed to install inbound bootstrap group {:?} locally.", group_id))]
+    #[snafu(display("Failed to install inbound bootstrap group {group_id} locally."))]
     InstallBootstrapGroup {
         group_id: GroupId,
         source: GroupInstallError,
     },
-    #[snafu(display("Failed to complete the processed promise for group {:?}.", group_id))]
+    #[snafu(display("Failed to complete the processed promise for group {group_id}."))]
     CompleteProcessedPromise {
         group_id: GroupId,
         source: PromiseErr,
     },
-    #[snafu(display("Inbound update targeted unknown hosted group {:?}.", group_id))]
+    #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
     #[snafu(display(
         "Failed to load schema for inbound dataset '{dataset_id}' from the replication store."
@@ -130,16 +117,14 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display("No schema was available for inbound dataset '{dataset_id}'."))]
     InboundMissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
-        "Inbound update for group {:?} came from sender {sender}, which is not a group member.",
-        group_id
+        "Inbound update for group {group_id} came from sender {sender}, which is not a group member.",
     ))]
     UpdateSenderNotInGroup {
         group_id: GroupId,
         sender: MemberIdentity,
     },
     #[snafu(display(
-        "Inbound update for group {:?} claimed sender index {actual_index:?}, but sender {sender} is canonically at {expected_index:?}.",
-        group_id
+        "Inbound update for group {group_id} claimed sender index {actual_index}, but sender {sender} is canonically at {expected_index}.",
     ))]
     UpdateIdSenderMismatch {
         group_id: GroupId,
@@ -147,25 +132,13 @@ pub(super) enum InboundDeliveryError {
         expected_index: MemberIndex,
         actual_index: MemberIndex,
     },
-    #[snafu(display(
-        "Inbound update for group {:?} carried invalid version 0 in update id {update_id}.",
-        group_id
-    ))]
-    InvalidUpdateVersion {
-        group_id: GroupId,
-        update_id: UpdateId,
-    },
-    #[snafu(display(
-        "Inbound update for group {:?} carried invalid read versions.",
-        group_id
-    ))]
+    #[snafu(display("Inbound update for group {group_id} carried invalid read versions.",))]
     DecodeReadVersions {
         group_id: GroupId,
         source: RuntimeMessageError,
     },
     #[snafu(display(
-        "Inbound update for group {:?} buffered two different payloads for update id {update_id}.",
-        group_id
+        "Inbound update for group {group_id} received conflicting payloads for buffered update id {update_id}.",
     ))]
     ConflictingBufferedUpdate {
         group_id: GroupId,
@@ -184,14 +157,13 @@ pub(super) enum InboundDeliveryError {
         expected: UpdateId,
         actual: UpdateId,
     },
-    #[snafu(display("Applying inbound mutation for row {:?} failed.", row_id))]
+    #[snafu(display("Applying inbound mutation for row {row_id} failed."))]
     ApplyInboundMutation {
         row_id: crate::api::RowId,
         source: OperationError,
     },
     #[snafu(display(
-        "Inbound mutation for row {:?} applied, but the resulting row could not be read back.",
-        row_id
+        "Inbound mutation for row {row_id} applied, but the resulting row could not be read back.",
     ))]
     MissingAppliedRow { row_id: crate::api::RowId },
     #[snafu(display("Listener rejected one inbound data-change event."))]

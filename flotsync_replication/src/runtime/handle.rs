@@ -1,13 +1,16 @@
 use super::*;
 
+type ApiResult<T> = Result<T, ApiError>;
+type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
+
 /// Create one concrete replication runtime for the given application identity.
 ///
 /// `application_id` scopes the loaded runtime instance for diagnostics and future
 /// multi-application hosting.
 /// `store` provides the local member identity and dataset schemas needed by the
-/// first replication slice.
+/// current replication runtime.
 /// `listener` receives replication events produced by inbound delivery.
-/// `config` carries public runtime policy knobs; the first slice only honours
+/// `config` carries public runtime policy knobs; the current runtime only honours
 /// the migration-policy shape while the deeper protocol remains unimplemented.
 pub async fn load_replication_runtime(
     application_id: Identifier,
@@ -65,7 +68,7 @@ pub(super) struct ReplicationRuntime {
     _application_id: Identifier,
     runtime_ref: Option<ActorRefStrong<ReplicationRuntimeMessage>>,
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(super) host: Arc<DeliveryRuntimeHost>,
+    host: Arc<DeliveryRuntimeHost>,
     _config: ReplicationConfig,
 }
 
@@ -74,6 +77,22 @@ impl ReplicationRuntime {
         self.runtime_ref
             .as_ref()
             .expect("replication runtime actor ref must exist while the handle is live")
+    }
+
+    fn ask<T>(
+        &self,
+        build: impl FnOnce(KPromise<ApiResult<T>>) -> ReplicationRuntimeMessage + Send + 'static,
+    ) -> ApiFuture<'static, T>
+    where
+        T: Send + 'static,
+    {
+        let future = self.runtime_ref().ask_with(build);
+        Box::pin(async move {
+            match future.await {
+                Ok(reply) => reply,
+                Err(_) => Err(ApiError::RuntimeUnavailable),
+            }
+        })
     }
 }
 
@@ -87,58 +106,28 @@ impl Drop for ReplicationRuntime {
 }
 
 impl ReplicationApi for ReplicationRuntime {
-    fn publish_changes(
-        &self,
-        changes: Vec<RowMutation>,
-    ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>> {
-        let (promise, future) = promise::<Result<PublishReceipt, ApiError>>();
-        self.runtime_ref()
-            .tell(ReplicationRuntimeMessage::PublishChanges(Ask::new(
-                promise, changes,
-            )));
-        Box::pin(async move { resolve_runtime_future(future).await })
+    fn publish_changes(&self, changes: Vec<RowMutation>) -> ApiFuture<'_, PublishReceipt> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, changes))
+        })
     }
 
-    fn create_group(
-        &self,
-        req: CreateGroupRequest,
-    ) -> BoxFuture<'_, Result<crate::api::GroupId, ApiError>> {
-        let (promise, future) = promise::<Result<GroupId, ApiError>>();
-        self.runtime_ref()
-            .tell(ReplicationRuntimeMessage::CreateGroup(Ask::new(
-                promise, req,
-            )));
-        Box::pin(async move { resolve_runtime_future(future).await })
+    fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, crate::api::GroupId> {
+        self.ask(move |promise| ReplicationRuntimeMessage::CreateGroup(Ask::new(promise, req)))
     }
 
     fn change_group_membership(
         &self,
         req: ChangeGroupMembershipRequest,
-    ) -> BoxFuture<'_, Result<GroupMigration, ApiError>> {
-        let (promise, future) = promise::<Result<GroupMigration, ApiError>>();
-        self.runtime_ref()
-            .tell(ReplicationRuntimeMessage::ChangeGroupMembership(Ask::new(
-                promise, req,
-            )));
-        Box::pin(async move { resolve_runtime_future(future).await })
-    }
-}
-
-async fn resolve_runtime_future<T: Send>(
-    future: KFuture<Result<T, ApiError>>,
-) -> Result<T, ApiError> {
-    match future.await {
-        Ok(reply) => reply,
-        Err(_) => Err(ApiError::ApiExternal {
-            source: Box::new(io::Error::other(
-                "replication runtime component became unavailable",
-            )),
-        }),
+    ) -> ApiFuture<'_, GroupMigration> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::ChangeGroupMembership(Ask::new(promise, req))
+        })
     }
 }
 
 #[cfg(test)]
-pub(super) fn wait_for_test_future<F>(future: F) -> F::Output
+pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
     F: Future,
 {
@@ -162,18 +151,22 @@ where
 
 #[cfg(test)]
 impl ReplicationRuntime {
+    pub(super) fn host(&self) -> &DeliveryRuntimeHost {
+        self.host.as_ref()
+    }
+
     pub(super) fn install_group_for_test(
         &self,
         group_id: GroupId,
         members: GroupMembers,
     ) -> Result<(), GroupInstallError> {
-        let (promise, future) = promise::<Result<(), GroupInstallError>>();
-        self.runtime_ref()
-            .tell(ReplicationRuntimeMessage::InstallGroupForTest(Ask::new(
+        let future = self.runtime_ref().ask_with(|promise| {
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(Ask::new(
                 promise,
                 TestInstallGroup { group_id, members },
-            )));
-        match wait_for_test_future(future) {
+            )))
+        });
+        match wait_for_test_reply(future) {
             Ok(reply) => reply,
             Err(_) => {
                 panic!("replication runtime component became unavailable during test install")
@@ -186,12 +179,12 @@ impl ReplicationRuntime {
         sender: MemberIdentity,
         message: UpdateBatchMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let (promise, future) = promise::<Result<(), InboundDeliveryError>>();
-        self.runtime_ref()
-            .tell(ReplicationRuntimeMessage::ApplyUpdateBatchForTest(
+        let future = self.runtime_ref().ask_with(|promise| {
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
                 Ask::new(promise, TestApplyUpdateBatch { sender, message }),
-            ));
-        match wait_for_test_future(future) {
+            ))
+        });
+        match wait_for_test_reply(future) {
             Ok(reply) => reply,
             Err(_) => {
                 panic!(

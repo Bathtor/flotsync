@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub(super) struct TerminalRuntimeFault {
@@ -18,9 +19,14 @@ pub(super) enum ReplicationRuntimeMessage {
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>),
     #[cfg(test)]
-    InstallGroupForTest(Ask<TestInstallGroup, Result<(), GroupInstallError>>),
-    #[cfg(test)]
-    ApplyUpdateBatchForTest(Ask<TestApplyUpdateBatch, Result<(), InboundDeliveryError>>),
+    Test(ReplicationRuntimeTestMessage),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) enum ReplicationRuntimeTestMessage {
+    InstallGroup(Ask<TestInstallGroup, Result<(), GroupInstallError>>),
+    ApplyUpdateBatch(Ask<TestApplyUpdateBatch, Result<(), InboundDeliveryError>>),
 }
 
 #[cfg(test)]
@@ -39,15 +45,15 @@ pub(super) struct TestApplyUpdateBatch {
 
 #[derive(ComponentDefinition)]
 pub(super) struct ReplicationRuntimeComponent {
-    pub(super) ctx: ComponentContext<Self>,
-    pub(super) group_broadcast: RequiredPort<crate::delivery::contracts::GroupBroadcastPort>,
-    pub(super) reliable_delivery: RequiredPort<crate::delivery::contracts::ReliableDeliveryPort>,
-    pub(super) local_member: MemberIdentity,
-    pub(super) store: Arc<dyn ReplicationStore>,
-    pub(super) listener: Arc<dyn ReplicationEventListener>,
-    pub(super) group_memberships: SharedGroupMemberships,
-    pub(super) state: RuntimeState,
-    pub(super) terminal_fault: Option<TerminalRuntimeFault>,
+    ctx: ComponentContext<Self>,
+    group_broadcast: RequiredPort<crate::delivery::contracts::GroupBroadcastPort>,
+    reliable_delivery: RequiredPort<crate::delivery::contracts::ReliableDeliveryPort>,
+    local_member: MemberIdentity,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    group_memberships: SharedGroupMemberships,
+    state: LocalRuntimeState,
+    terminal_fault: Option<TerminalRuntimeFault>,
 }
 
 impl ReplicationRuntimeComponent {
@@ -65,17 +71,15 @@ impl ReplicationRuntimeComponent {
             store,
             listener,
             group_memberships,
-            state: RuntimeState::default(),
+            state: LocalRuntimeState::default(),
             terminal_fault: None,
         }
     }
 
     fn ensure_running(&self) -> Result<(), ApiError> {
         if let Some(fault) = self.terminal_fault.clone() {
-            return Err(ApiError::ApiExternal {
-                source: Box::new(io::Error::other(format!(
-                    "replication runtime terminated after inbound delivery failure: {fault}"
-                ))),
+            return Err(ApiError::RuntimeTerminated {
+                fault: fault.to_string(),
             });
         }
         Ok(())
@@ -93,26 +97,60 @@ impl ReplicationRuntimeComponent {
         self.terminal_fault = Some(fault);
     }
 
+    fn reply_api<T>(
+        &self,
+        promise: KPromise<Result<T, ApiError>>,
+        operation: &'static str,
+        reply: Result<T, ApiError>,
+    ) where
+        T: Send + 'static,
+    {
+        if promise.fulfil(reply).is_err() {
+            warn!(self.log(), "dropping {operation} reply");
+        }
+    }
+
+    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<Vec<DatasetId>, ApiError> {
+        let (group_id, dataset_ids) = collect_publish_scope(changes)
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        self.missing_dataset_ids_for_publish(group_id, &dataset_ids)
+            .boxed()
+            .context(ApiExternalSnafu)
+    }
+
+    fn submit_group_update(&mut self, prepared_publish: PreparedLocalPublish) {
+        let local_member = self.local_member.clone();
+        self.group_broadcast.trigger(
+            crate::delivery::contracts::GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
+                delivery_class: DeliveryClass::BestEffort,
+                envelope: GroupMessageEnvelope {
+                    header: GroupMessageHeader {
+                        group_id: prepared_publish.group_id,
+                        sender: local_member,
+                        message_id: MessageId(Uuid::new_v4()),
+                    },
+                    payload: EncryptedPayload {
+                        ciphertext: prepared_publish.payload,
+                    },
+                    footer: placeholder_signed_footer(),
+                },
+                suppress_self_delivery: true,
+            }),
+        );
+    }
+
     fn missing_dataset_ids_for_publish(
         &self,
         group_id: GroupId,
         dataset_ids: &[DatasetId],
     ) -> Result<Vec<DatasetId>, PublishChangesError> {
-        let hosted_group = self
+        let local_group = self
             .state
             .groups
             .get(&group_id)
             .context(UnknownGroupSnafu { group_id })?;
-        let mut missing_dataset_ids = Vec::new();
-        for dataset_id in dataset_ids {
-            if hosted_group.datasets.contains_key(dataset_id)
-                || missing_dataset_ids.contains(dataset_id)
-            {
-                continue;
-            }
-            missing_dataset_ids.push(dataset_id.clone());
-        }
-        Ok(missing_dataset_ids)
+        Ok(local_group.missing_dataset_ids(dataset_ids))
     }
 
     fn missing_dataset_ids_for_inbound(
@@ -120,21 +158,12 @@ impl ReplicationRuntimeComponent {
         group_id: GroupId,
         dataset_ids: &[DatasetId],
     ) -> Result<Vec<DatasetId>, InboundDeliveryError> {
-        let hosted_group = self
+        let local_group = self
             .state
             .groups
             .get(&group_id)
             .context(UnknownHostedGroupSnafu { group_id })?;
-        let mut missing_dataset_ids = Vec::new();
-        for dataset_id in dataset_ids {
-            if hosted_group.datasets.contains_key(dataset_id)
-                || missing_dataset_ids.contains(dataset_id)
-            {
-                continue;
-            }
-            missing_dataset_ids.push(dataset_id.clone());
-        }
-        Ok(missing_dataset_ids)
+        Ok(local_group.missing_dataset_ids(dataset_ids))
     }
 
     fn create_group(&mut self, req: CreateGroupRequest) -> Result<GroupId, CreateGroupError> {
@@ -192,37 +221,38 @@ impl ReplicationRuntimeComponent {
         &mut self,
         changes: Vec<RowMutation>,
         loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
-    ) -> Result<PreparedPublish, PublishChangesError> {
-        let (group_id, _) = publish_scope(&changes)?;
-        let hosted_group = self
+    ) -> Result<PreparedLocalPublish, PublishChangesError> {
+        let (group_id, _) = collect_publish_scope(&changes)?;
+        let local_group = self
             .state
             .groups
             .get_mut(&group_id)
             .context(UnknownGroupSnafu { group_id })?;
 
-        let read_versions = hosted_group.version_vector.clone();
-        let next_local_version = hosted_group
-            .applied_version(hosted_group.local_member_index)
+        let read_versions = local_group.version_vector.clone();
+        let next_local_version = local_group
+            .applied_version(local_group.local_member_index)
             .checked_add(1)
             .context(ExhaustedUpdateIdsSnafu { group_id })?;
         let update_id = UpdateId {
             version: next_local_version,
-            node_index: hosted_group.local_member_index.as_u32(),
+            node_index: local_group.local_member_index.as_u32(),
         };
 
         let mut dataset_order = Vec::new();
-        let mut staged_datasets = HashMap::<DatasetId, HostedDataset>::new();
+        let mut seen_datasets = HashSet::new();
+        let mut staged_datasets = HashMap::<DatasetId, LocalDataset>::new();
         let mut encoded_operations =
             HashMap::<DatasetId, Vec<flotsync_messages::datamodel::SchemaOperation>>::new();
         for mutation in changes {
             match mutation {
                 RowMutation::Upsert { row_id, row } => {
-                    if !dataset_order.contains(&row_id.dataset_id) {
+                    if seen_datasets.insert(row_id.dataset_id.clone()) {
                         dataset_order.push(row_id.dataset_id.clone());
                     }
                     let staged_dataset = staged_dataset_for_publish(
                         &mut staged_datasets,
-                        hosted_group,
+                        local_group,
                         loaded_schemas,
                         &row_id.dataset_id,
                     )?;
@@ -236,12 +266,12 @@ impl ReplicationRuntimeComponent {
                     }
                 }
                 RowMutation::Delete { row_id } => {
-                    if !dataset_order.contains(&row_id.dataset_id) {
+                    if seen_datasets.insert(row_id.dataset_id.clone()) {
                         dataset_order.push(row_id.dataset_id.clone());
                     }
                     let staged_dataset = staged_dataset_for_publish(
                         &mut staged_datasets,
-                        hosted_group,
+                        local_group,
                         loaded_schemas,
                         &row_id.dataset_id,
                     )?;
@@ -256,15 +286,15 @@ impl ReplicationRuntimeComponent {
 
         ensure!(
             !encoded_operations.is_empty(),
-            NoEffectiveChangesSnafu { group_id }
+            NoAppliedChangesSnafu { group_id }
         );
 
         for (dataset_id, staged_dataset) in staged_datasets {
-            hosted_group.datasets.insert(dataset_id, staged_dataset);
+            local_group.datasets.insert(dataset_id, staged_dataset);
         }
-        hosted_group
+        local_group
             .version_vector
-            .increment_at(hosted_group.local_member_index.as_u32() as usize);
+            .increment_at(local_group.local_member_index.as_u32() as usize);
 
         let dataset_updates = dataset_order
             .into_iter()
@@ -287,7 +317,7 @@ impl ReplicationRuntimeComponent {
         })
         .encode_to_proto()
         .encode_to_bytes();
-        Ok(PreparedPublish {
+        Ok(PreparedLocalPublish {
             group_id,
             update_id,
             payload,
@@ -364,22 +394,12 @@ impl ReplicationRuntimeComponent {
                 async_self.apply_wire_update_batch_loaded(sender, message, loaded_schemas)
             });
             match reply {
-                Ok(event_batches) => {
-                    for row_changes in event_batches {
-                        let notify_result = listener
-                            .on_event(ReplicationEvent::DataChanged {
-                                rows: Box::new(VecRowProvider::new(row_changes)),
-                            })
-                            .await;
-                        if let Err(error) = notify_result {
-                            async_self.record_terminal_fault(
-                                "group delivery",
-                                &InboundDeliveryError::NotifyListener { source: error },
-                            );
-                            return;
-                        }
+                Ok(event_batches) => match notify_listener_batches(listener, event_batches).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        async_self.record_terminal_fault("group delivery", &error);
                     }
-                }
+                },
                 Err(error) => {
                     // Temporary conservative failure mode for the
                     // first replication slice. See flotsync-4x8
@@ -398,13 +418,13 @@ impl ReplicationRuntimeComponent {
         loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
         let group_id = message.group_id;
-        let hosted_group = self
+        let local_group = self
             .state
             .groups
             .get_mut(&group_id)
             .context(UnknownHostedGroupSnafu { group_id })?;
         let member_count =
-            NonZeroUsize::new(hosted_group.members.len()).expect("hosted group must be non-empty");
+            NonZeroUsize::new(local_group.members.len()).expect("hosted group must be non-empty");
         let message = message
             .into_runtime(member_count)
             .context(DecodeReadVersionsSnafu { group_id })?;
@@ -417,7 +437,7 @@ impl ReplicationRuntimeComponent {
         message: UpdateBatchMessage,
         loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
-        let hosted_group =
+        let local_group =
             self.state
                 .groups
                 .get_mut(&message.group_id)
@@ -425,7 +445,7 @@ impl ReplicationRuntimeComponent {
                     group_id: message.group_id,
                 })?;
         let expected_sender_index =
-            hosted_group
+            local_group
                 .members
                 .member_index(&sender)
                 .context(UpdateSenderNotInGroupSnafu {
@@ -441,20 +461,11 @@ impl ReplicationRuntimeComponent {
                 actual_index: MemberIndex::new(message.update_id.node_index),
             }
         );
-        ensure!(
-            message.update_id.version > 0,
-            InvalidUpdateVersionSnafu {
-                group_id: message.group_id,
-                update_id: message.update_id,
-            }
-        );
-        if hosted_group.has_applied(message.update_id) {
+        if local_group.has_applied(message.update_id) {
             return Ok(Vec::new());
         }
-        if !version_vector_covers(&hosted_group.version_vector, &message.read_versions)
-            || hosted_group.expected_next_version(expected_sender_index) < message.update_id.version
-        {
-            hosted_group.buffer_update(PendingInboundUpdate {
+        if !local_group.can_apply(&message) {
+            local_group.buffer_update(BufferedInboundUpdate {
                 message,
                 loaded_schemas,
             })?;
@@ -462,19 +473,19 @@ impl ReplicationRuntimeComponent {
         }
 
         let mut event_batches = Vec::new();
-        let row_changes = apply_one_update_batch(hosted_group, message, &loaded_schemas)?;
+        let row_changes = apply_one_update_batch(local_group, message, &loaded_schemas)?;
         if !row_changes.is_empty() {
             event_batches.push(row_changes);
         }
-        while let Some(action) = hosted_group.take_next_actionable_pending_update() {
+        while let Some(action) = local_group.take_next_actionable_pending_update() {
             let pending_update = match action {
-                PendingUpdateAction::DropDuplicate => {
+                BufferedUpdateAction::DropDuplicate => {
                     continue;
                 }
-                PendingUpdateAction::Apply(pending_update) => pending_update,
+                BufferedUpdateAction::Apply(pending_update) => pending_update,
             };
             let row_changes = apply_one_update_batch(
-                hosted_group,
+                local_group,
                 pending_update.message,
                 &pending_update.loaded_schemas,
             )?;
@@ -498,7 +509,7 @@ impl ReplicationRuntimeComponent {
             return ConflictingExistingGroupSnafu { group_id }.fail();
         }
 
-        let hosted_group = HostedGroup::new(&self.local_member, members)?;
+        let hosted_group = LocalGroupState::new(&self.local_member, members)?;
         self.state.groups.insert(group_id, hosted_group);
         self.group_memberships
             .replace(self.state.membership_snapshot());
@@ -510,21 +521,13 @@ impl ReplicationRuntimeComponent {
         ask: Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>,
     ) -> Handled {
         let (promise, changes) = ask.take();
-        let preflight = self.ensure_running().and_then(|()| {
-            let (group_id, dataset_ids) =
-                publish_scope(&changes).boxed().context(ApiExternalSnafu)?;
-            let missing_dataset_ids = self
-                .missing_dataset_ids_for_publish(group_id, &dataset_ids)
-                .boxed()
-                .context(ApiExternalSnafu)?;
-            Ok(missing_dataset_ids)
-        });
-        let missing_dataset_ids = match preflight {
+        let missing_dataset_ids = match self
+            .ensure_running()
+            .and_then(|()| self.preflight_publish(&changes))
+        {
             Ok(missing_dataset_ids) => missing_dataset_ids,
             Err(error) => {
-                if promise.fulfil(Err(error)).is_err() {
-                    debug!(self.log(), "dropping publish_changes reply");
-                }
+                self.reply_api(promise, "publish_changes", Err(error));
                 return Handled::Ok;
             }
         };
@@ -537,33 +540,11 @@ impl ReplicationRuntimeComponent {
                     .prepare_local_publish(changes, &loaded_schemas)
                     .boxed()
                     .context(ApiExternalSnafu)?;
-                let local_member = async_self.local_member.clone();
-                async_self.group_broadcast.trigger(
-                    crate::delivery::contracts::GroupBroadcastPortRequest::Submit(
-                        GroupBroadcastSubmit {
-                            delivery_class: DeliveryClass::BestEffort,
-                            envelope: GroupMessageEnvelope {
-                                header: GroupMessageHeader {
-                                    group_id: prepared_publish.group_id,
-                                    sender: local_member,
-                                    message_id: MessageId(Uuid::new_v4()),
-                                },
-                                payload: EncryptedPayload {
-                                    ciphertext: prepared_publish.payload,
-                                },
-                                footer: placeholder_signed_footer(),
-                            },
-                            suppress_self_delivery: true,
-                        },
-                    ),
-                );
-                Ok(PublishReceipt {
-                    update_id: prepared_publish.update_id,
-                })
+                let update_id = prepared_publish.update_id;
+                async_self.submit_group_update(prepared_publish);
+                Ok(PublishReceipt { update_id })
             })();
-            if promise.fulfil(reply).is_err() {
-                debug!(async_self.log(), "dropping publish_changes reply");
-            }
+            async_self.reply_api(promise, "publish_changes", reply);
         })
     }
 
@@ -575,9 +556,7 @@ impl ReplicationRuntimeComponent {
         let reply = self
             .ensure_running()
             .and_then(|()| self.create_group(req).boxed().context(ApiExternalSnafu));
-        if promise.fulfil(reply).is_err() {
-            debug!(self.log(), "dropping create_group reply");
-        }
+        self.reply_api(promise, "create_group", reply);
         Handled::Ok
     }
 
@@ -590,9 +569,7 @@ impl ReplicationRuntimeComponent {
         let reply = self
             .ensure_running()
             .and_then(|()| Err(unavailable_api("change_group_membership")));
-        if promise.fulfil(reply).is_err() {
-            debug!(self.log(), "dropping change_group_membership reply");
-        }
+        self.reply_api(promise, "change_group_membership", reply);
         Handled::Ok
     }
 
@@ -638,26 +615,7 @@ impl ReplicationRuntimeComponent {
                         request.message,
                         loaded_schemas,
                     ) {
-                        Ok(event_batches) => {
-                            let mut notify_error = None;
-                            for row_changes in event_batches {
-                                let notify_result = listener
-                                    .on_event(ReplicationEvent::DataChanged {
-                                        rows: Box::new(VecRowProvider::new(row_changes)),
-                                    })
-                                    .await;
-                                if let Err(error) = notify_result {
-                                    notify_error = Some(InboundDeliveryError::NotifyListener {
-                                        source: error,
-                                    });
-                                    break;
-                                }
-                            }
-                            match notify_error {
-                                Some(error) => Err(error),
-                                None => Ok(()),
-                            }
-                        }
+                        Ok(event_batches) => notify_listener_batches(listener, event_batches).await,
                         Err(error) => Err(error),
                     }
                 }
@@ -716,13 +674,13 @@ impl LocalActor for ReplicationRuntimeComponent {
                 self.handle_change_group_membership(ask)
             }
             #[cfg(test)]
-            ReplicationRuntimeMessage::InstallGroupForTest(ask) => {
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {
                 self.handle_test_install_group(ask)
             }
             #[cfg(test)]
-            ReplicationRuntimeMessage::ApplyUpdateBatchForTest(ask) => {
-                self.handle_test_apply_update_batch(ask)
-            }
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
+                ask,
+            )) => self.handle_test_apply_update_batch(ask),
         }
     }
 }
@@ -730,11 +688,7 @@ impl LocalActor for ReplicationRuntimeComponent {
 impl_local_actor!(ReplicationRuntimeComponent);
 
 fn unavailable_api(operation: &'static str) -> ApiError {
-    ApiError::ApiExternal {
-        source: Box::new(io::Error::other(format!(
-            "replication runtime host is ready, but {operation} is not implemented yet"
-        ))),
-    }
+    ApiError::UnsupportedOperation { operation }
 }
 
 fn placeholder_signed_footer() -> SignedEnvelopeFooter {
@@ -744,4 +698,19 @@ fn placeholder_signed_footer() -> SignedEnvelopeFooter {
             bytes: bytes::Bytes::from_static(b"runtime-placeholder-signature"),
         },
     }
+}
+
+async fn notify_listener_batches(
+    listener: Arc<dyn ReplicationEventListener>,
+    event_batches: Vec<Vec<RowChange>>,
+) -> Result<(), InboundDeliveryError> {
+    for row_changes in event_batches {
+        listener
+            .on_event(ReplicationEvent::DataChanged {
+                rows: Box::new(VecRowProvider::new(row_changes)),
+            })
+            .await
+            .map_err(|source| InboundDeliveryError::NotifyListener { source })?;
+    }
+    Ok(())
 }

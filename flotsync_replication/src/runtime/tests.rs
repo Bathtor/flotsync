@@ -1,5 +1,5 @@
 use super::{
-    handle::{ReplicationRuntime, load_replication_runtime_typed, wait_for_test_future},
+    handle::{ReplicationRuntime, load_replication_runtime_typed, wait_for_test_reply},
     *,
 };
 use crate::{
@@ -9,13 +9,16 @@ use crate::{
 };
 use flotsync_data_types::{Field, Schema};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     future::Future,
-    sync::Mutex,
+    sync::{Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const TEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct StoreStub {
     local_member: crate::api::MemberIdentity,
@@ -88,58 +91,72 @@ impl CapturedRowChange {
     }
 }
 
-#[derive(Default)]
 struct ListenerStub {
-    data_changes: Mutex<VecDeque<CapturedDataChange>>,
+    data_changes: Mutex<Vec<CapturedDataChange>>,
+    buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
+    buffered_event_tx: mpsc::Sender<CapturedDataChange>,
+}
+
+impl Default for ListenerStub {
+    fn default() -> Self {
+        let (buffered_event_tx, buffered_events) = mpsc::channel();
+        Self {
+            data_changes: Mutex::new(Vec::new()),
+            buffered_events: Mutex::new(buffered_events),
+            buffered_event_tx,
+        }
+    }
 }
 
 impl ListenerStub {
+    fn drain_buffered_events(&self) {
+        let receiver = self
+            .buffered_events
+            .lock()
+            .expect("listener event receiver mutex must not be poisoned");
+        let mut data_changes = self
+            .data_changes
+            .lock()
+            .expect("listener capture mutex must not be poisoned");
+        while let Ok(change) = receiver.try_recv() {
+            data_changes.push(change);
+        }
+    }
+
     fn wait_for_next_data_change(&self) -> CapturedDataChange {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(change) = self
-                .data_changes
-                .lock()
-                .expect("listener capture mutex must not be poisoned")
-                .pop_front()
-            {
-                return change;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for listener data-change event"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn wait_for_data_change_count(&self, count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if self
-                .data_changes
-                .lock()
-                .expect("listener capture mutex must not be poisoned")
-                .len()
-                >= count
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {count} listener data-change events"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn captured_data_changes(&self) -> Vec<CapturedDataChange> {
+        let change = self
+            .buffered_events
+            .lock()
+            .expect("listener event receiver mutex must not be poisoned")
+            .recv_timeout(TEST_WAIT_TIMEOUT)
+            .expect("timed out waiting for listener data-change event");
         self.data_changes
             .lock()
             .expect("listener capture mutex must not be poisoned")
-            .iter()
-            .cloned()
-            .collect()
+            .push(change.clone());
+        change
+    }
+
+    fn wait_for_data_change_count(&self, count: usize) {
+        wait_until(
+            || format!("{count} listener data-change events"),
+            || {
+                self.drain_buffered_events();
+                self.data_changes
+                    .lock()
+                    .expect("listener capture mutex must not be poisoned")
+                    .len()
+                    >= count
+            },
+        );
+    }
+
+    fn captured_data_changes(&self) -> Vec<CapturedDataChange> {
+        self.drain_buffered_events();
+        self.data_changes
+            .lock()
+            .expect("listener capture mutex must not be poisoned")
+            .clone()
     }
 }
 
@@ -165,12 +182,11 @@ impl crate::api::ReplicationEventListener for ListenerStub {
                             captured_rows.push(CapturedRowChange::capture(change)?);
                         }
                     }
-                    self.data_changes
-                        .lock()
-                        .expect("listener capture mutex must not be poisoned")
-                        .push_back(CapturedDataChange {
+                    self.buffered_event_tx
+                        .send(CapturedDataChange {
                             rows: captured_rows,
-                        });
+                        })
+                        .expect("listener event channel must remain open while tests are running");
                 }
                 crate::api::ReplicationEvent::GroupInvitation { .. } => {}
             }
@@ -187,11 +203,11 @@ fn poll_ready<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    wait_for_test_future(future)
+    wait_for_test_reply(future)
 }
 
 fn load_runtime(
-    application_id: crate::api::MemberIdentity,
+    application_id: Identifier,
     local_member: crate::api::MemberIdentity,
 ) -> Arc<ReplicationRuntime> {
     let store = Arc::new(StoreStub::new(local_member));
@@ -200,7 +216,7 @@ fn load_runtime(
 }
 
 fn load_runtime_with_parts(
-    application_id: crate::api::MemberIdentity,
+    application_id: Identifier,
     store: Arc<StoreStub>,
     listener: Arc<ListenerStub>,
 ) -> Arc<ReplicationRuntime> {
@@ -214,16 +230,29 @@ fn load_runtime_with_parts(
 }
 
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_until(
+        || "runtime to install group".to_owned(),
+        || {
+            runtime
+                .host()
+                .membership_snapshot()
+                .contains_group(&group_id)
+        },
+    );
+}
+
+fn wait_until(description: impl Fn() -> String, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     loop {
-        if runtime.host.membership_snapshot().contains_group(&group_id) {
-            break;
+        if condition() {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for runtime to install group"
+            "timed out waiting for {}",
+            description()
         );
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(TEST_POLL_INTERVAL);
     }
 }
 
@@ -279,15 +308,16 @@ fn create_group_bootstrap_installs_remote_membership() {
     );
     let bob = load_runtime(Identifier::from_array(["app", "bob"]), bob_member.clone());
 
-    assert!(alice.host.external_udp_bind_addr().ip().is_loopback());
-    assert!(bob.host.external_udp_bind_addr().ip().is_loopback());
+    assert!(alice.host().external_udp_bind_addr().ip().is_loopback());
+    assert!(bob.host().external_udp_bind_addr().ip().is_loopback());
 
-    alice
-        .host
-        .publish_direct_peer_route(bob_member.clone(), bob.host.advertised_loopback_udp_addr());
-    bob.host.publish_direct_peer_route(
+    alice.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob.host().advertised_loopback_udp_addr(),
+    );
+    bob.host().publish_direct_peer_route(
         alice_member.clone(),
-        alice.host.advertised_loopback_udp_addr(),
+        alice.host().advertised_loopback_udp_addr(),
     );
 
     let group_id = poll_ready(alice.create_group(CreateGroupRequest {
@@ -297,8 +327,8 @@ fn create_group_bootstrap_installs_remote_membership() {
     .expect("create_group should succeed");
     wait_for_group_install(&bob, group_id);
 
-    let alice_snapshot = alice.host.membership_snapshot();
-    let bob_snapshot = bob.host.membership_snapshot();
+    let alice_snapshot = alice.host().membership_snapshot();
+    let bob_snapshot = bob.host().membership_snapshot();
     let alice_members = alice_snapshot
         .members(&group_id)
         .expect("local runtime should host the created group");
@@ -349,12 +379,13 @@ fn publish_changes_delivers_remote_data_changed_event() {
         bob_listener.clone(),
     );
 
-    alice
-        .host
-        .publish_direct_peer_route(bob_member.clone(), bob.host.advertised_loopback_udp_addr());
-    bob.host.publish_direct_peer_route(
+    alice.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob.host().advertised_loopback_udp_addr(),
+    );
+    bob.host().publish_direct_peer_route(
         alice_member.clone(),
-        alice.host.advertised_loopback_udp_addr(),
+        alice.host().advertised_loopback_udp_addr(),
     );
 
     let group_id = poll_ready(alice.create_group(CreateGroupRequest {
@@ -397,7 +428,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
     );
 
     assert!(
-        bob.host.membership_snapshot().contains_group(&group_id),
+        bob.host().membership_snapshot().contains_group(&group_id),
         "remote runtime should still host the replicated group"
     );
 }
@@ -430,7 +461,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         dataset_id: dataset_id.clone(),
         row_key: crate::api::RowKey(Uuid::from_u128(23)),
     };
-    let mut source_dataset = HostedDataset::new(schema);
+    let mut source_dataset = LocalDataset::new(schema);
     let first_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
@@ -540,7 +571,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     };
     let member_count = NonZeroUsize::new(2).expect("group has two members");
 
-    let mut first_source_dataset = HostedDataset::new(schema.clone());
+    let mut first_source_dataset = LocalDataset::new(schema.clone());
     let first_operation = apply_local_upsert(
         &mut first_source_dataset,
         &row_id,
@@ -553,7 +584,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     .expect("first operation should build")
     .expect("first operation should apply");
 
-    let mut conflicting_source_dataset = HostedDataset::new(schema);
+    let mut conflicting_source_dataset = LocalDataset::new(schema);
     let conflicting_operation = apply_local_upsert(
         &mut conflicting_source_dataset,
         &row_id,

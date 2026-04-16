@@ -1,15 +1,16 @@
 use super::{errors::*, *};
+use std::collections::HashSet;
 
-/// In-memory hosted-group state for the first replication slice.
+/// In-memory local-group state for the current replication runtime.
 ///
 /// This is the temporary runtime backend until a persistent store-backed
 /// implementation takes over the same responsibilities.
 #[derive(Default)]
-pub(super) struct RuntimeState {
-    pub(super) groups: HashMap<GroupId, HostedGroup>,
+pub(super) struct LocalRuntimeState {
+    pub(super) groups: HashMap<GroupId, LocalGroupState>,
 }
 
-impl RuntimeState {
+impl LocalRuntimeState {
     pub(super) fn membership_snapshot(&self) -> GroupMemberships {
         GroupMemberships::from_groups(
             self.groups
@@ -19,16 +20,16 @@ impl RuntimeState {
     }
 }
 
-/// One fixed-membership replication group currently hosted by this runtime.
-pub(super) struct HostedGroup {
+/// One fixed-membership replication group currently hosted locally.
+pub(super) struct LocalGroupState {
     pub(super) members: GroupMembers,
     pub(super) local_member_index: MemberIndex,
     pub(super) version_vector: VersionVector,
-    pub(super) datasets: HashMap<DatasetId, HostedDataset>,
-    pub(super) pending_updates: BTreeMap<UpdateId, PendingInboundUpdate>,
+    pub(super) datasets: HashMap<DatasetId, LocalDataset>,
+    pub(super) pending_updates: BTreeMap<UpdateId, BufferedInboundUpdate>,
 }
 
-impl HostedGroup {
+impl LocalGroupState {
     pub(super) fn new(
         local_member: &MemberIdentity,
         members: GroupMembers,
@@ -36,7 +37,7 @@ impl HostedGroup {
         let local_member_index =
             members
                 .member_index(local_member)
-                .context(LocalMemberIndexMissingSnafu {
+                .context(MissingLocalMemberSnafu {
                     local_member: local_member.clone(),
                 })?;
         let member_count = NonZeroUsize::new(members.len())
@@ -48,6 +49,20 @@ impl HostedGroup {
             datasets: HashMap::new(),
             pending_updates: BTreeMap::new(),
         })
+    }
+
+    pub(super) fn missing_dataset_ids(&self, dataset_ids: &[DatasetId]) -> Vec<DatasetId> {
+        let mut missing_dataset_ids = Vec::new();
+        let mut seen_dataset_ids = HashSet::with_capacity(dataset_ids.len());
+        for dataset_id in dataset_ids {
+            if self.datasets.contains_key(dataset_id) {
+                continue;
+            }
+            if seen_dataset_ids.insert(dataset_id.clone()) {
+                missing_dataset_ids.push(dataset_id.clone());
+            }
+        }
+        missing_dataset_ids
     }
 
     pub(super) fn applied_version(&self, member_index: MemberIndex) -> u64 {
@@ -64,9 +79,15 @@ impl HostedGroup {
         self.applied_version(MemberIndex::new(update_id.node_index)) >= update_id.version
     }
 
+    pub(super) fn can_apply(&self, message: &UpdateBatchMessage) -> bool {
+        let producer_index = MemberIndex::new(message.update_id.node_index);
+        version_vector_covers(&self.version_vector, &message.read_versions)
+            && self.expected_next_version(producer_index) == message.update_id.version
+    }
+
     pub(super) fn buffer_update(
         &mut self,
-        pending_update: PendingInboundUpdate,
+        pending_update: BufferedInboundUpdate,
     ) -> Result<(), InboundDeliveryError> {
         let update_id = pending_update.message.update_id;
         match self.pending_updates.entry(update_id) {
@@ -88,40 +109,37 @@ impl HostedGroup {
         }
     }
 
-    pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<PendingUpdateAction> {
+    pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<BufferedUpdateAction> {
         let mut duplicate_key = None;
         let mut ready_key = None;
-        for (update_id, pending_update) in &self.pending_updates {
+        'pending_updates: for (update_id, pending_update) in &self.pending_updates {
             if self.has_applied(*update_id) {
                 duplicate_key = Some(*update_id);
                 break;
             }
-            let producer_index = MemberIndex::new(update_id.node_index);
-            if version_vector_covers(&self.version_vector, &pending_update.message.read_versions)
-                && self.expected_next_version(producer_index) == update_id.version
-            {
+            if self.can_apply(&pending_update.message) {
                 ready_key = Some(*update_id);
-                break;
+                break 'pending_updates;
             }
         }
 
         if let Some(update_id) = duplicate_key {
             self.pending_updates.remove(&update_id);
-            return Some(PendingUpdateAction::DropDuplicate);
+            return Some(BufferedUpdateAction::DropDuplicate);
         }
         ready_key
             .and_then(|update_id| self.pending_updates.remove(&update_id))
-            .map(PendingUpdateAction::Apply)
+            .map(BufferedUpdateAction::Apply)
     }
 }
 
-/// One hosted dataset together with its current replicated in-memory contents.
+/// One local dataset together with its current replicated in-memory contents.
 #[derive(Clone)]
-pub(super) struct HostedDataset {
+pub(super) struct LocalDataset {
     pub(super) data: flotsync_messages::InMemoryData,
 }
 
-impl HostedDataset {
+impl LocalDataset {
     pub(super) fn new(schema: Arc<Schema>) -> Self {
         Self {
             data: flotsync_messages::InMemoryData::with_owned_schema(schema.as_ref().clone()),
@@ -159,21 +177,21 @@ impl RowRead for OwnedRow {
 }
 
 /// Fully prepared outbound publish batch ready for group fan-out.
-pub(super) struct PreparedPublish {
+pub(super) struct PreparedLocalPublish {
     pub(super) group_id: GroupId,
     pub(super) update_id: UpdateId,
     pub(super) payload: bytes::Bytes,
 }
 
 /// One inbound update batch buffered until its causal dependencies are met.
-pub(super) struct PendingInboundUpdate {
+pub(super) struct BufferedInboundUpdate {
     pub(super) message: UpdateBatchMessage,
     pub(super) loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
 }
 
-pub(super) enum PendingUpdateAction {
+pub(super) enum BufferedUpdateAction {
     DropDuplicate,
-    Apply(PendingInboundUpdate),
+    Apply(BufferedInboundUpdate),
 }
 
 pub(super) async fn load_publish_schemas(
@@ -216,22 +234,25 @@ pub(super) async fn load_inbound_schemas(
     Ok(loaded_schemas)
 }
 
-fn mutation_row_id(mutation: &RowMutation) -> &crate::api::RowId {
-    match mutation {
-        RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
+impl RowMutation {
+    fn row_id(&self) -> &crate::api::RowId {
+        match self {
+            RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
+        }
     }
 }
 
-pub(super) fn publish_scope(
+pub(super) fn collect_publish_scope(
     changes: &[RowMutation],
 ) -> Result<(GroupId, Vec<DatasetId>), PublishChangesError> {
     let Some(first_change) = changes.first() else {
         return EmptyChangesSnafu.fail();
     };
-    let group_id = mutation_row_id(first_change).group_id;
+    let group_id = first_change.row_id().group_id;
     let mut dataset_ids = Vec::new();
+    let mut seen_dataset_ids = HashSet::new();
     for change in changes {
-        let row_id = mutation_row_id(change);
+        let row_id = change.row_id();
         ensure!(
             row_id.group_id == group_id,
             MixedGroupsSnafu {
@@ -239,7 +260,7 @@ pub(super) fn publish_scope(
                 other_group_id: row_id.group_id,
             }
         );
-        if !dataset_ids.contains(&row_id.dataset_id) {
+        if seen_dataset_ids.insert(row_id.dataset_id.clone()) {
             dataset_ids.push(row_id.dataset_id.clone());
         }
     }
@@ -247,13 +268,13 @@ pub(super) fn publish_scope(
 }
 
 pub(super) fn staged_dataset_for_publish<'a>(
-    staged_datasets: &'a mut HashMap<DatasetId, HostedDataset>,
-    hosted_group: &HostedGroup,
+    staged_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
+    local_group: &LocalGroupState,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
-) -> Result<&'a mut HostedDataset, PublishChangesError> {
+) -> Result<&'a mut LocalDataset, PublishChangesError> {
     if !staged_datasets.contains_key(dataset_id) {
-        let staged_dataset = hosted_group
+        let staged_dataset = local_group
             .datasets
             .get(dataset_id)
             .cloned()
@@ -261,7 +282,7 @@ pub(super) fn staged_dataset_for_publish<'a>(
                 loaded_schemas
                     .get(dataset_id)
                     .cloned()
-                    .map(HostedDataset::new)
+                    .map(LocalDataset::new)
             })
             .context(MissingDatasetSchemaSnafu {
                 dataset_id: dataset_id.clone(),
@@ -274,13 +295,13 @@ pub(super) fn staged_dataset_for_publish<'a>(
 }
 
 fn staged_dataset_for_inbound<'a>(
-    staged_datasets: &'a mut HashMap<DatasetId, HostedDataset>,
-    hosted_group: &HostedGroup,
+    staged_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
+    local_group: &LocalGroupState,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
-) -> Result<&'a mut HostedDataset, InboundDeliveryError> {
+) -> Result<&'a mut LocalDataset, InboundDeliveryError> {
     if !staged_datasets.contains_key(dataset_id) {
-        let staged_dataset = hosted_group
+        let staged_dataset = local_group
             .datasets
             .get(dataset_id)
             .cloned()
@@ -288,7 +309,7 @@ fn staged_dataset_for_inbound<'a>(
                 loaded_schemas
                     .get(dataset_id)
                     .cloned()
-                    .map(HostedDataset::new)
+                    .map(LocalDataset::new)
             })
             .context(InboundMissingDatasetSchemaSnafu {
                 dataset_id: dataset_id.clone(),
@@ -329,16 +350,16 @@ pub(super) fn version_vector_covers(local: &VersionVector, required: &VersionVec
 }
 
 pub(super) fn apply_one_update_batch(
-    hosted_group: &mut HostedGroup,
+    local_group: &mut LocalGroupState,
     message: UpdateBatchMessage,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
 ) -> Result<Vec<RowChange>, InboundDeliveryError> {
-    let mut staged_datasets = HashMap::<DatasetId, HostedDataset>::new();
+    let mut staged_datasets = HashMap::<DatasetId, LocalDataset>::new();
     let mut row_changes = Vec::new();
     for dataset_update in message.dataset_updates {
         let staged_dataset = staged_dataset_for_inbound(
             &mut staged_datasets,
-            hosted_group,
+            local_group,
             loaded_schemas,
             &dataset_update.dataset_id,
         )?;
@@ -368,9 +389,9 @@ pub(super) fn apply_one_update_batch(
     }
 
     for (dataset_id, staged_dataset) in staged_datasets {
-        hosted_group.datasets.insert(dataset_id, staged_dataset);
+        local_group.datasets.insert(dataset_id, staged_dataset);
     }
-    hosted_group
+    local_group
         .version_vector
         .increment_at(message.update_id.node_index as usize);
     Ok(row_changes)
@@ -387,16 +408,18 @@ fn build_initial_values<'schema>(
             .columns
             .get(field_name.as_str())
             .context(UnknownSchemaFieldSnafu {
-                row_id: Box::new(row_id.clone()),
+                row_id: row_id.clone(),
                 dataset_id: row_id.dataset_id.clone(),
                 field_name: field_name.clone(),
             })?;
-        let initial_value = field
-            .initial(value.clone())
-            .context(InvalidFieldValueSnafu {
-                row_id: Box::new(row_id.clone()),
-                dataset_id: row_id.dataset_id.clone(),
-            })?;
+        let initial_value =
+            field
+                .initial(value.clone())
+                .map_err(Box::new)
+                .context(InvalidFieldValueSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                })?;
         initial_values.push(initial_value);
     }
     Ok(initial_values)
@@ -413,21 +436,25 @@ fn build_pending_updates<'schema>(
             .columns
             .get(field_name.as_str())
             .context(UnknownSchemaFieldSnafu {
-                row_id: Box::new(row_id.clone()),
+                row_id: row_id.clone(),
                 dataset_id: row_id.dataset_id.clone(),
                 field_name: field_name.clone(),
             })?;
-        let pending_update = field.set(value.clone()).context(InvalidFieldValueSnafu {
-            row_id: Box::new(row_id.clone()),
-            dataset_id: row_id.dataset_id.clone(),
-        })?;
+        let pending_update =
+            field
+                .set(value.clone())
+                .map_err(Box::new)
+                .context(InvalidFieldValueSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                })?;
         pending_updates.push(pending_update);
     }
     Ok(pending_updates)
 }
 
 pub(super) fn apply_local_upsert(
-    dataset: &mut HostedDataset,
+    dataset: &mut LocalDataset,
     row_id: &crate::api::RowId,
     row: &MutableRow,
     update_id: UpdateId,
@@ -439,7 +466,7 @@ pub(super) fn apply_local_upsert(
             .data
             .modify_row(update_id, row_id.row_key.0, pending_updates)
             .context(ApplyLocalMutationSnafu {
-                row_id: Box::new(row_id.clone()),
+                row_id: row_id.clone(),
             })? {
             OperationOutcome::Applied(operation) => Some(operation),
             OperationOutcome::NoChanges => None,
@@ -450,7 +477,7 @@ pub(super) fn apply_local_upsert(
             .data
             .insert_row(update_id, row_id.row_key.0, initial_values)
             .context(ApplyLocalMutationSnafu {
-                row_id: Box::new(row_id.clone()),
+                row_id: row_id.clone(),
             })?;
         Some(operation)
     };
@@ -466,7 +493,7 @@ pub(super) fn apply_local_upsert(
 }
 
 pub(super) fn apply_local_delete(
-    dataset: &mut HostedDataset,
+    dataset: &mut LocalDataset,
     row_id: &crate::api::RowId,
     update_id: UpdateId,
 ) -> Result<flotsync_messages::datamodel::SchemaOperation, PublishChangesError> {
@@ -475,7 +502,7 @@ pub(super) fn apply_local_delete(
         .data
         .delete_row(update_id, row_id.row_key.0)
         .context(ApplyLocalMutationSnafu {
-            row_id: Box::new(row_id.clone()),
+            row_id: row_id.clone(),
         })?;
     let encoded_operation =
         encode_schema_operation(&operation, &schema).context(EncodeOperationSnafu {
@@ -485,7 +512,7 @@ pub(super) fn apply_local_delete(
 }
 
 fn apply_remote_operation(
-    dataset: &mut HostedDataset,
+    dataset: &mut LocalDataset,
     group_id: GroupId,
     dataset_id: &DatasetId,
     operation: flotsync_messages::SchemaOperation<'_>,

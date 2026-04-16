@@ -50,7 +50,6 @@ use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap, btree_map::Entry},
-    io,
     num::NonZeroUsize,
     sync::Arc,
 };

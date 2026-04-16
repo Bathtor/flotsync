@@ -144,6 +144,10 @@ struct LocalEndpointBinding {
 /// This owns the concrete Kompact/io graph and exposes a small imperative
 /// surface that later replication logic can build on without knowing transport
 /// internals.
+///
+/// TODO(flotsync-3ht): Revisit whether this imperative host should remain the
+/// top-level orchestrator at all, or whether ReplicationRuntimeComponent
+/// should own more of the topology startup and wiring directly.
 pub(crate) struct DeliveryRuntimeHost {
     system: KompactSystem,
     graph: Option<DeliveryRuntimeGraph>,

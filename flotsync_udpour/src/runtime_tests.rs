@@ -630,6 +630,8 @@ impl RuntimeHarness {
     }
 
     fn advance_time(&self, duration: Duration) {
+        // This only advances the logical manual clock. It does not wait for any
+        // newly due timers to fire or for their resulting probe events to drain.
         self.manual_timer
             .as_ref()
             .expect("manual timer harness required for explicit time control")
@@ -1170,7 +1172,7 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         });
     }
 
-    harness.advance_time(Duration::from_millis(20));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(20));
 
     let need_parts = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
@@ -1399,7 +1401,7 @@ fn no_longer_available_after_sender_retention_expiry() {
             matches!(frame, UDPourFrame::Payload(_))
         });
     }
-    harness.advance_time(Duration::from_millis(20));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(20));
     harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
     });
@@ -1409,7 +1411,7 @@ fn no_longer_available_after_sender_retention_expiry() {
     assert!(matches!(nla, UDPourFrame::NoLongerAvailable(_)));
     // After `NoLongerAvailable`, the receiver must never assemble and deliver
     // the transfer from the partial state it still holds.
-    harness.advance_time(Duration::from_millis(500));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(500));
     harness.assert_no_receiver_deliver(Duration::from_millis(100));
     harness.shutdown();
 }
