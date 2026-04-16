@@ -288,38 +288,6 @@ impl ReplicationRuntimeComponent {
         Ok(loaded_schemas)
     }
 
-    async fn load_publish_schemas(
-        store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: BTreeSet<DatasetId>,
-    ) -> Result<HashMap<DatasetId, Arc<Schema>>, PublishChangesError> {
-        Self::load_dataset_schemas(store, missing_dataset_ids)
-            .await
-            .map_err(|error| match error {
-                DatasetSchemaLoadError::Load { dataset_id, source } => {
-                    PublishChangesError::LoadDatasetSchema { dataset_id, source }
-                }
-                DatasetSchemaLoadError::Missing { dataset_id } => {
-                    PublishChangesError::MissingDatasetSchema { dataset_id }
-                }
-            })
-    }
-
-    async fn load_inbound_schemas(
-        store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: BTreeSet<DatasetId>,
-    ) -> Result<HashMap<DatasetId, Arc<Schema>>, InboundDeliveryError> {
-        Self::load_dataset_schemas(store, missing_dataset_ids)
-            .await
-            .map_err(|error| match error {
-                DatasetSchemaLoadError::Load { dataset_id, source } => {
-                    InboundDeliveryError::InboundLoadDatasetSchema { dataset_id, source }
-                }
-                DatasetSchemaLoadError::Missing { dataset_id } => {
-                    InboundDeliveryError::InboundMissingDatasetSchema { dataset_id }
-                }
-            })
-    }
-
     /// Submit one encoded live update to the group-broadcast layer.
     fn submit_group_update(&mut self, prepared_publish: PreparedLocalPublish) {
         let local_member = self.local_member.clone();
@@ -586,8 +554,16 @@ impl ReplicationRuntimeComponent {
         message: WireUpdateBatchMessage,
         missing_dataset_ids: BTreeSet<DatasetId>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
-        let loaded_schemas =
-            Self::load_inbound_schemas(self.store.clone(), missing_dataset_ids).await?;
+        let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), missing_dataset_ids)
+            .await
+            .map_err(|error| match error {
+                DatasetSchemaLoadError::Load { dataset_id, source } => {
+                    InboundDeliveryError::InboundLoadDatasetSchema { dataset_id, source }
+                }
+                DatasetSchemaLoadError::Missing { dataset_id } => {
+                    InboundDeliveryError::InboundMissingDatasetSchema { dataset_id }
+                }
+            })?;
         self.apply_wire_update_batch_loaded(sender, message, loaded_schemas)
     }
 
@@ -747,9 +723,16 @@ impl ReplicationRuntimeComponent {
         };
         Handled::block_on(self, async move |mut async_self| {
             let reply =
-                match Self::load_publish_schemas(async_self.store.clone(), missing_dataset_ids)
+                match Self::load_dataset_schemas(async_self.store.clone(), missing_dataset_ids)
                     .await
-                {
+                    .map_err(|error| match error {
+                        DatasetSchemaLoadError::Load { dataset_id, source } => {
+                            PublishChangesError::LoadDatasetSchema { dataset_id, source }
+                        }
+                        DatasetSchemaLoadError::Missing { dataset_id } => {
+                            PublishChangesError::MissingDatasetSchema { dataset_id }
+                        }
+                    }) {
                     Ok(loaded_schemas) => {
                         let prepared_publish = async_self
                             .prepare_local_publish(changes, &loaded_schemas)
