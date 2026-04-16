@@ -218,6 +218,43 @@ impl ReplicationRuntimeComponent {
         );
     }
 
+    fn encode_runtime_payload(message: RuntimeMessage) -> bytes::Bytes {
+        // Temporary byte serialisation at the delivery-envelope boundary.
+        // See flotsync-ylo for the payload/encryption redesign.
+        message.encode_to_proto().encode_to_bytes()
+    }
+
+    fn submit_group_bootstrap(&mut self, group_id: GroupId, members: &GroupMembers) {
+        let payload =
+            Self::encode_runtime_payload(RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
+                group_id,
+                members: members.ordered_members(),
+            }));
+        for recipient in members
+            .ordered_members()
+            .into_iter()
+            .filter(|member| member != &self.local_member)
+        {
+            self.reliable_delivery.trigger(
+                crate::delivery::contracts::ReliableDeliveryPortRequest::Submit(
+                    ReliableDeliverySubmit {
+                        envelope: ReliableMessageEnvelope {
+                            header: ReliableMessageHeader {
+                                sender: self.local_member.clone(),
+                                recipient,
+                                message_id: MessageId(Uuid::new_v4()),
+                            },
+                            payload: EncryptedPayload {
+                                ciphertext: payload.clone(),
+                            },
+                            footer: placeholder_signed_footer(),
+                        },
+                    },
+                ),
+            );
+        }
+    }
+
     fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> Vec<DatasetId> {
         let mut dataset_ids = Vec::new();
         let mut seen_dataset_ids = HashSet::new();
@@ -246,37 +283,7 @@ impl ReplicationRuntimeComponent {
         let group_id = GroupId(Uuid::new_v4());
         self.install_group(group_id, members.clone())
             .context(InstallGroupSnafu)?;
-
-        let bootstrap = RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
-            group_id,
-            members: members.ordered_members(),
-        });
-        // Temporary byte serialisation at the delivery-envelope boundary.
-        // See flotsync-ylo for the payload/encryption redesign.
-        let payload = bootstrap.encode_to_proto().encode_to_bytes();
-        for recipient in members
-            .ordered_members()
-            .into_iter()
-            .filter(|member| member != &self.local_member)
-        {
-            self.reliable_delivery.trigger(
-                crate::delivery::contracts::ReliableDeliveryPortRequest::Submit(
-                    ReliableDeliverySubmit {
-                        envelope: ReliableMessageEnvelope {
-                            header: ReliableMessageHeader {
-                                sender: self.local_member.clone(),
-                                recipient,
-                                message_id: MessageId(Uuid::new_v4()),
-                            },
-                            payload: EncryptedPayload {
-                                ciphertext: payload.clone(),
-                            },
-                            footer: placeholder_signed_footer(),
-                        },
-                    },
-                ),
-            );
-        }
+        self.submit_group_bootstrap(group_id, &members);
         Ok(group_id)
     }
 
@@ -301,7 +308,27 @@ impl ReplicationRuntimeComponent {
             changes,
             update_id,
         )?;
+        let payload = Self::finalise_local_publish(
+            local_group,
+            group_id,
+            update_id,
+            read_versions,
+            prepared_datasets,
+        );
+        Ok(PreparedLocalPublish {
+            group_id,
+            update_id,
+            payload,
+        })
+    }
 
+    fn finalise_local_publish(
+        local_group: &mut LocalGroupState,
+        group_id: GroupId,
+        update_id: UpdateId,
+        read_versions: VersionVector,
+        prepared_datasets: PreparedDatasetUpdates,
+    ) -> bytes::Bytes {
         for (dataset_id, working_dataset) in prepared_datasets.working_datasets {
             local_group.datasets.insert(dataset_id, working_dataset);
         }
@@ -309,21 +336,12 @@ impl ReplicationRuntimeComponent {
             .version_vector
             .increment_at(local_group.local_member_index.as_u32() as usize);
 
-        // Temporary byte serialisation at the delivery-envelope boundary.
-        // See flotsync-ylo for the payload/encryption redesign.
-        let payload = RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+        Self::encode_runtime_payload(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
             group_id,
             update_id,
             read_versions,
             dataset_updates: prepared_datasets.dataset_updates,
-        })
-        .encode_to_proto()
-        .encode_to_bytes();
-        Ok(PreparedLocalPublish {
-            group_id,
-            update_id,
-            payload,
-        })
+        }))
     }
 
     fn next_local_update_id(
@@ -505,17 +523,23 @@ impl ReplicationRuntimeComponent {
         loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
         let group_id = message.group_id;
-        let local_group = self
-            .state
-            .groups
-            .get_mut(&group_id)
-            .context(UnknownHostedGroupSnafu { group_id })?;
-        let member_count =
-            NonZeroUsize::new(local_group.members.len()).expect("hosted group must be non-empty");
+        let member_count = self.member_count_for_group(group_id)?;
         let message = message
             .into_runtime(member_count)
             .context(DecodeReadVersionsSnafu { group_id })?;
         self.apply_update_batch_loaded(sender, message, loaded_schemas)
+    }
+
+    fn member_count_for_group(
+        &self,
+        group_id: GroupId,
+    ) -> Result<NonZeroUsize, InboundDeliveryError> {
+        let local_group = self
+            .state
+            .groups
+            .get(&group_id)
+            .context(UnknownHostedGroupSnafu { group_id })?;
+        Ok(NonZeroUsize::new(local_group.members.len()).expect("hosted group must be non-empty"))
     }
 
     fn apply_update_batch_loaded(
@@ -559,6 +583,10 @@ impl ReplicationRuntimeComponent {
             return Ok(Vec::new());
         }
 
+        // Listener notifications are emitted only after the whole drain
+        // succeeds. If one later buffered batch fails after an earlier batch
+        // already committed locally, the listener can temporarily lag the
+        // runtime state. Tracked in flotsync-46i.
         let mut event_batches = Vec::new();
         let row_changes = apply_one_update_batch(local_group, message, &loaded_schemas)?;
         if !row_changes.is_empty() {
