@@ -1,4 +1,13 @@
 use super::{errors::*, *};
+use flotsync_data_types::{
+    InitialFieldValue,
+    OperationOutcome,
+    PendingFieldUpdate,
+    RowOperations,
+    Schema,
+    TableOperations,
+};
+use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use std::collections::HashSet;
 
 /// In-memory local-group state for the current replication runtime.
@@ -37,7 +46,7 @@ impl LocalGroupState {
         let local_member_index =
             members
                 .member_index(local_member)
-                .context(MissingLocalMemberSnafu {
+                .context(InstallMissingLocalMemberSnafu {
                     local_member: local_member.clone(),
                 })?;
         let member_count = NonZeroUsize::new(members.len())
@@ -66,7 +75,8 @@ impl LocalGroupState {
     }
 
     pub(super) fn applied_version(&self, member_index: MemberIndex) -> u64 {
-        version_vector_entry(&self.version_vector, member_index)
+        self.version_vector
+            .version_at(member_index.as_u32() as usize)
     }
 
     pub(super) fn expected_next_version(&self, member_index: MemberIndex) -> u64 {
@@ -81,7 +91,7 @@ impl LocalGroupState {
 
     pub(super) fn can_apply(&self, message: &UpdateBatchMessage) -> bool {
         let producer_index = MemberIndex::new(message.update_id.node_index);
-        version_vector_covers(&self.version_vector, &message.read_versions)
+        self.version_vector.covers(&message.read_versions)
             && self.expected_next_version(producer_index) == message.update_id.version
     }
 
@@ -109,27 +119,25 @@ impl LocalGroupState {
         }
     }
 
-    pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<BufferedUpdateAction> {
-        let mut duplicate_key = None;
-        let mut ready_key = None;
-        'pending_updates: for (update_id, pending_update) in &self.pending_updates {
-            if self.has_applied(*update_id) {
-                duplicate_key = Some(*update_id);
-                break;
-            }
-            if self.can_apply(&pending_update.message) {
-                ready_key = Some(*update_id);
-                break 'pending_updates;
-            }
+    pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<BufferedInboundUpdate> {
+        let duplicate_keys: Vec<_> = self
+            .pending_updates
+            .keys()
+            .copied()
+            .filter(|update_id| self.has_applied(*update_id))
+            .collect();
+        for update_id in duplicate_keys {
+            self.pending_updates.remove(&update_id);
         }
 
-        if let Some(update_id) = duplicate_key {
-            self.pending_updates.remove(&update_id);
-            return Some(BufferedUpdateAction::DropDuplicate);
-        }
-        ready_key
-            .and_then(|update_id| self.pending_updates.remove(&update_id))
-            .map(BufferedUpdateAction::Apply)
+        let ready_key = self
+            .pending_updates
+            .iter()
+            .find_map(|(update_id, pending_update)| {
+                self.can_apply(&pending_update.message)
+                    .then_some(*update_id)
+            });
+        ready_key.and_then(|update_id| self.pending_updates.remove(&update_id))
     }
 }
 
@@ -176,73 +184,9 @@ impl RowRead for OwnedRow {
     }
 }
 
-/// Fully prepared outbound publish batch ready for group fan-out.
-pub(super) struct PreparedLocalPublish {
-    pub(super) group_id: GroupId,
-    pub(super) update_id: UpdateId,
-    pub(super) payload: bytes::Bytes,
-}
-
-/// One inbound update batch buffered until its causal dependencies are met.
-pub(super) struct BufferedInboundUpdate {
-    pub(super) message: UpdateBatchMessage,
-    pub(super) loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
-}
-
-pub(super) enum BufferedUpdateAction {
-    DropDuplicate,
-    Apply(BufferedInboundUpdate),
-}
-
-pub(super) async fn load_publish_schemas(
-    store: Arc<dyn ReplicationStore>,
-    missing_dataset_ids: Vec<DatasetId>,
-) -> Result<HashMap<DatasetId, Arc<Schema>>, PublishChangesError> {
-    let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
-    for dataset_id in missing_dataset_ids {
-        let schema =
-            store
-                .load_dataset_schema(&dataset_id)
-                .await
-                .context(LoadDatasetSchemaSnafu {
-                    dataset_id: dataset_id.clone(),
-                })?;
-        let schema = schema.context(MissingDatasetSchemaSnafu {
-            dataset_id: dataset_id.clone(),
-        })?;
-        loaded_schemas.insert(dataset_id, schema);
-    }
-    Ok(loaded_schemas)
-}
-
-pub(super) async fn load_inbound_schemas(
-    store: Arc<dyn ReplicationStore>,
-    missing_dataset_ids: Vec<DatasetId>,
-) -> Result<HashMap<DatasetId, Arc<Schema>>, InboundDeliveryError> {
-    let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
-    for dataset_id in missing_dataset_ids {
-        let schema = store.load_dataset_schema(&dataset_id).await.context(
-            InboundLoadDatasetSchemaSnafu {
-                dataset_id: dataset_id.clone(),
-            },
-        )?;
-        let schema = schema.context(InboundMissingDatasetSchemaSnafu {
-            dataset_id: dataset_id.clone(),
-        })?;
-        loaded_schemas.insert(dataset_id, schema);
-    }
-    Ok(loaded_schemas)
-}
-
-impl RowMutation {
-    fn row_id(&self) -> &crate::api::RowId {
-        match self {
-            RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
-        }
-    }
-}
-
-pub(super) fn collect_publish_scope(
+/// Validates that one publish call targets exactly one group and returns the
+/// affected datasets in first-seen order.
+pub(super) fn collect_group_dataset_scope(
     changes: &[RowMutation],
 ) -> Result<(GroupId, Vec<DatasetId>), PublishChangesError> {
     let Some(first_change) = changes.first() else {
@@ -267,14 +211,19 @@ pub(super) fn collect_publish_scope(
     Ok((group_id, dataset_ids))
 }
 
-pub(super) fn staged_dataset_for_publish<'a>(
-    staged_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
+/// Returns the mutable working dataset image used for one outbound publish batch.
+///
+/// The batch may touch a mix of already-hosted datasets and newly-loaded schema
+/// definitions, so this helper either clones the current local dataset image or
+/// seeds one from a freshly loaded schema.
+pub(super) fn working_dataset_for_publish<'a>(
+    working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
     local_group: &LocalGroupState,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
 ) -> Result<&'a mut LocalDataset, PublishChangesError> {
-    if !staged_datasets.contains_key(dataset_id) {
-        let staged_dataset = local_group
+    if !working_datasets.contains_key(dataset_id) {
+        let working_dataset = local_group
             .datasets
             .get(dataset_id)
             .cloned()
@@ -287,21 +236,26 @@ pub(super) fn staged_dataset_for_publish<'a>(
             .context(MissingDatasetSchemaSnafu {
                 dataset_id: dataset_id.clone(),
             })?;
-        staged_datasets.insert(dataset_id.clone(), staged_dataset);
+        working_datasets.insert(dataset_id.clone(), working_dataset);
     }
-    Ok(staged_datasets
+    Ok(working_datasets
         .get_mut(dataset_id)
-        .expect("staged publish dataset must exist after insertion"))
+        .expect("working publish dataset must exist after insertion"))
 }
 
-fn staged_dataset_for_inbound<'a>(
-    staged_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
+/// Returns the mutable working dataset image used for one inbound apply batch.
+///
+/// The caller passes already-loaded schemas for datasets that were not hosted
+/// locally yet, while existing datasets are cloned so the whole batch can apply
+/// against one isolated working set before committing back into local state.
+fn working_dataset_for_inbound<'a>(
+    working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
     local_group: &LocalGroupState,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
 ) -> Result<&'a mut LocalDataset, InboundDeliveryError> {
-    if !staged_datasets.contains_key(dataset_id) {
-        let staged_dataset = local_group
+    if !working_datasets.contains_key(dataset_id) {
+        let working_dataset = local_group
             .datasets
             .get(dataset_id)
             .cloned()
@@ -314,11 +268,11 @@ fn staged_dataset_for_inbound<'a>(
             .context(InboundMissingDatasetSchemaSnafu {
                 dataset_id: dataset_id.clone(),
             })?;
-        staged_datasets.insert(dataset_id.clone(), staged_dataset);
+        working_datasets.insert(dataset_id.clone(), working_dataset);
     }
-    Ok(staged_datasets
+    Ok(working_datasets
         .get_mut(dataset_id)
-        .expect("staged inbound dataset must exist after insertion"))
+        .expect("working inbound dataset must exist after insertion"))
 }
 
 pub(super) fn initial_version_vector(num_members: NonZeroUsize) -> VersionVector {
@@ -328,43 +282,27 @@ pub(super) fn initial_version_vector(num_members: NonZeroUsize) -> VersionVector
     }
 }
 
-fn version_vector_num_members(version_vector: &VersionVector) -> usize {
-    version_vector.num_members().get()
-}
-
-fn version_vector_entry(version_vector: &VersionVector, member_index: MemberIndex) -> u64 {
-    version_vector
-        .iter()
-        .nth(member_index.as_u32() as usize)
-        .expect("member index must be within the group's version vector")
-}
-
-pub(super) fn version_vector_covers(local: &VersionVector, required: &VersionVector) -> bool {
-    if version_vector_num_members(local) != version_vector_num_members(required) {
-        return false;
-    }
-    local
-        .iter()
-        .zip(required.iter())
-        .all(|(local_version, required_version)| local_version >= required_version)
-}
-
+/// Applies one causally-ready inbound batch against one local group state.
+///
+/// All touched datasets are first materialised into working copies so the batch
+/// either commits atomically into local state or returns an error without
+/// partially replacing dataset maps.
 pub(super) fn apply_one_update_batch(
     local_group: &mut LocalGroupState,
     message: UpdateBatchMessage,
     loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
 ) -> Result<Vec<RowChange>, InboundDeliveryError> {
-    let mut staged_datasets = HashMap::<DatasetId, LocalDataset>::new();
+    let mut working_datasets = HashMap::<DatasetId, LocalDataset>::new();
     let mut row_changes = Vec::new();
     for dataset_update in message.dataset_updates {
-        let staged_dataset = staged_dataset_for_inbound(
-            &mut staged_datasets,
+        let working_dataset = working_dataset_for_inbound(
+            &mut working_datasets,
             local_group,
             loaded_schemas,
             &dataset_update.dataset_id,
         )?;
         for operation in dataset_update.operations {
-            let schema = staged_dataset.data.schema().clone();
+            let schema = working_dataset.data.schema().clone();
             let operation = decode_schema_operation(operation, &schema).context(
                 DecodeSchemaOperationSnafu {
                     dataset_id: dataset_update.dataset_id.clone(),
@@ -379,7 +317,7 @@ pub(super) fn apply_one_update_batch(
                 }
             );
             let row_change = apply_remote_operation(
-                staged_dataset,
+                working_dataset,
                 message.group_id,
                 &dataset_update.dataset_id,
                 operation,
@@ -388,8 +326,8 @@ pub(super) fn apply_one_update_batch(
         }
     }
 
-    for (dataset_id, staged_dataset) in staged_datasets {
-        local_group.datasets.insert(dataset_id, staged_dataset);
+    for (dataset_id, working_dataset) in working_datasets {
+        local_group.datasets.insert(dataset_id, working_dataset);
     }
     local_group
         .version_vector
@@ -453,6 +391,10 @@ fn build_pending_updates<'schema>(
     Ok(pending_updates)
 }
 
+/// Applies one local upsert and returns the encoded schema operation, if any.
+///
+/// A local upsert may still produce no transport operation when the new row
+/// image is identical to what is already stored locally.
 pub(super) fn apply_local_upsert(
     dataset: &mut LocalDataset,
     row_id: &crate::api::RowId,
@@ -492,6 +434,7 @@ pub(super) fn apply_local_upsert(
     Ok(Some(encoded_operation))
 }
 
+/// Applies one local delete and encodes the resulting schema operation for transport.
 pub(super) fn apply_local_delete(
     dataset: &mut LocalDataset,
     row_id: &crate::api::RowId,
@@ -533,6 +476,9 @@ fn apply_remote_operation(
         RowOperation::Insert { .. } | RowOperation::Update { .. } => AppliedChangeKind::Upsert,
     };
 
+    // flotsync_messages::InMemoryData currently consumes `self` when applying
+    // one schema operation, so the runtime must clone the current dataset image
+    // before replacing it with the updated result.
     dataset.data = dataset
         .data
         .clone()
@@ -544,11 +490,9 @@ fn apply_remote_operation(
     match change_kind {
         AppliedChangeKind::Delete => Ok(RowChange::Delete { row_id: api_row_id }),
         AppliedChangeKind::Upsert => {
-            let row = dataset
-                .clone_row(api_row_id.row_key)
-                .context(MissingAppliedRowSnafu {
-                    row_id: api_row_id.clone(),
-                })?;
+            let row = dataset.clone_row(api_row_id.row_key).unwrap_or_else(|| {
+                panic!("applied inbound upsert must leave row {api_row_id} readable")
+            });
             Ok(RowChange::Upsert {
                 row_id: api_row_id,
                 row: Arc::new(row),

@@ -9,7 +9,7 @@ use crate::{
 };
 use flotsync_core::versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector};
 use flotsync_messages::{
-    buffa::{Message, MessageField},
+    buffa::{Message as _, MessageField},
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
     datamodel as datamodel_proto,
     replication as replication_proto,
@@ -96,6 +96,11 @@ pub(crate) enum RuntimeMessage {
     UpdateBatch(UpdateBatchMessage),
 }
 
+/// One decoded wire message before all runtime context is available.
+///
+/// Bootstrap messages can decode directly into their runtime form, but inbound
+/// update batches may still carry compact read-version encodings that need the
+/// hosted group member count before they can become a full `VersionVector`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WireRuntimeMessage {
     BootstrapGroup(BootstrapGroupMessage),
@@ -120,10 +125,16 @@ pub(crate) struct UpdateBatchMessage {
 pub(crate) struct WireUpdateBatchMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
+    /// Compact wire representation kept until the hosted group member count is known.
     read_versions: WireVersionVector,
     pub(crate) dataset_updates: Vec<DatasetUpdateMessage>,
 }
 
+/// Compact wire-only form for version vectors used inside inbound update batches.
+///
+/// The runtime message model keeps a full `VersionVector`, while the protobuf
+/// wire shape prefers more compact encodings such as "all members synced" or
+/// "one member ahead" when possible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WireVersionVector {
     Full(PureVersionVector),

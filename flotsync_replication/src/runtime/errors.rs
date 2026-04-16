@@ -1,4 +1,6 @@
 use super::*;
+use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
+use flotsync_messages::codecs::datamodel::OperationCodecError;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
@@ -19,7 +21,7 @@ pub(super) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different canonical member order."))]
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
-    MissingLocalMember { local_member: MemberIdentity },
+    InstallMissingLocalMember { local_member: MemberIdentity },
 }
 
 #[derive(Debug, Snafu)]
@@ -72,7 +74,7 @@ pub(super) enum PublishChangesError {
     #[snafu(display(
         "publish_changes produced no effective schema operations for group {group_id}.",
     ))]
-    NoAppliedChanges { group_id: GroupId },
+    NoEffectiveChanges { group_id: GroupId },
     #[snafu(display("Group {group_id} exhausted its local update id range."))]
     ExhaustedUpdateIds { group_id: GroupId },
 }
@@ -126,7 +128,7 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display(
         "Inbound update for group {group_id} claimed sender index {actual_index}, but sender {sender} is canonically at {expected_index}.",
     ))]
-    UpdateIdSenderMismatch {
+    UpdateSenderIndexMismatch {
         group_id: GroupId,
         sender: MemberIdentity,
         expected_index: MemberIndex,
@@ -162,10 +164,6 @@ pub(super) enum InboundDeliveryError {
         row_id: crate::api::RowId,
         source: OperationError,
     },
-    #[snafu(display(
-        "Inbound mutation for row {row_id} applied, but the resulting row could not be read back.",
-    ))]
-    MissingAppliedRow { row_id: crate::api::RowId },
     #[snafu(display("Listener rejected one inbound data-change event."))]
     NotifyListener { source: ListenerError },
 }

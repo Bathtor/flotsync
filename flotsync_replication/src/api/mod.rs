@@ -92,6 +92,14 @@ pub enum RowMutation {
     Delete { row_id: RowId },
 }
 
+impl RowMutation {
+    pub fn row_id(&self) -> &RowId {
+        match self {
+            RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
+        }
+    }
+}
+
 /// Row-level change emitted by the framework to an application listener.
 pub enum RowChange {
     Upsert {

@@ -84,6 +84,21 @@ impl VersionVector {
     pub fn iter(&self) -> impl Iterator<Item = u64> {
         self.into_iter()
     }
+
+    pub fn version_at(&self, position: usize) -> u64 {
+        self.iter()
+            .nth(position)
+            .expect("version-vector position must be within range")
+    }
+
+    pub fn covers(&self, other: &Self) -> bool {
+        if self.num_members() != other.num_members() {
+            return false;
+        }
+        self.iter()
+            .zip(other.iter())
+            .all(|(local_version, required_version)| local_version >= required_version)
+    }
 }
 impl fmt::Display for VersionVector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

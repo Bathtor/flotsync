@@ -1,0 +1,149 @@
+use super::*;
+use flotsync_io::prelude::{UdpIndication, UdpLocalBind, UdpOpenRequestId, UdpPort, UdpRequest};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct LocalEndpointBinding {
+    pub(super) socket_id: SocketId,
+    pub(super) local_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+pub(super) enum LocalEndpointManagerMessage {
+    EnsureBound(Ask<(), Result<LocalEndpointBinding, RuntimeHostError>>),
+}
+
+/// Single local delivery-endpoint owner for the current runtime slice.
+///
+/// This is a deliberate stub until `flotsync-665` lands. It owns one
+/// configured UDP bind, records the concrete local address assigned by the
+/// system, and is the place where later rebinding/network-change logic should
+/// grow rather than scattering bind handling across the host.
+#[derive(ComponentDefinition)]
+pub(super) struct LocalEndpointManager {
+    ctx: ComponentContext<Self>,
+    udp: RequiredPort<UdpPort>,
+    configured_bind_addr: SocketAddr,
+    state: LocalEndpointManagerState,
+}
+
+impl LocalEndpointManager {
+    pub(super) fn new(configured_bind_addr: SocketAddr) -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            udp: RequiredPort::uninitialised(),
+            configured_bind_addr,
+            state: LocalEndpointManagerState::Unbound,
+        }
+    }
+}
+
+ignore_lifecycle!(LocalEndpointManager);
+
+impl Require<UdpPort> for LocalEndpointManager {
+    fn handle(&mut self, indication: UdpIndication) -> Handled {
+        let current_state = std::mem::replace(&mut self.state, LocalEndpointManagerState::Unbound);
+        self.state = match (current_state, indication) {
+            (
+                LocalEndpointManagerState::Binding {
+                    request_id,
+                    promise,
+                },
+                UdpIndication::Bound {
+                    request_id: indicated_request_id,
+                    socket_id,
+                    local_addr,
+                },
+            ) if request_id == indicated_request_id => {
+                let binding = LocalEndpointBinding {
+                    socket_id,
+                    local_addr,
+                };
+                if promise.fulfil(Ok(binding)).is_ok() {
+                    LocalEndpointManagerState::Bound(binding)
+                } else {
+                    LocalEndpointManagerState::Unbound
+                }
+            }
+            (
+                LocalEndpointManagerState::Binding {
+                    request_id,
+                    promise,
+                },
+                UdpIndication::BindFailed {
+                    request_id: indicated_request_id,
+                    local_addr,
+                    reason,
+                },
+            ) if request_id == indicated_request_id => {
+                let _ = promise.fulfil(Err(RuntimeHostError::BindLocalEndpoint {
+                    message: format!("bind at {local_addr} failed: {reason:?}"),
+                }));
+                LocalEndpointManagerState::Unbound
+            }
+            (state, _) => state,
+        };
+        Handled::Ok
+    }
+}
+
+impl LocalActor for LocalEndpointManager {
+    type Message = LocalEndpointManagerMessage;
+
+    fn receive(&mut self, msg: Self::Message) -> Handled {
+        match msg {
+            LocalEndpointManagerMessage::EnsureBound(ask) => {
+                let (promise, ()) = ask.take();
+                match &self.state {
+                    LocalEndpointManagerState::Unbound => {
+                        let request_id = UdpOpenRequestId::new();
+                        self.state = LocalEndpointManagerState::Binding {
+                            request_id,
+                            promise,
+                        };
+                        self.udp.trigger(UdpRequest::Bind {
+                            request_id,
+                            bind: UdpLocalBind::Exact(self.configured_bind_addr),
+                        });
+                    }
+                    LocalEndpointManagerState::Binding { .. } => {
+                        let _ = promise.fulfil(Err(RuntimeHostError::BindLocalEndpoint {
+                            message: "local endpoint bind already in progress".to_owned(),
+                        }));
+                    }
+                    LocalEndpointManagerState::Bound(binding) => {
+                        let _ = promise.fulfil(Ok(*binding));
+                    }
+                }
+                Handled::Ok
+            }
+        }
+    }
+}
+
+impl_local_actor!(LocalEndpointManager);
+
+enum LocalEndpointManagerState {
+    Unbound,
+    Binding {
+        request_id: UdpOpenRequestId,
+        promise: KPromise<Result<LocalEndpointBinding, RuntimeHostError>>,
+    },
+    Bound(LocalEndpointBinding),
+}
+
+pub(super) fn ensure_local_endpoint_bound(
+    local_endpoint_manager: &Arc<Component<LocalEndpointManager>>,
+    control_timeout: Duration,
+) -> Result<LocalEndpointBinding, RuntimeHostError> {
+    let local_endpoint_ref = local_endpoint_manager
+        .actor_ref()
+        .hold()
+        .expect("local endpoint manager must expose a strong actor ref");
+    let future = local_endpoint_ref
+        .ask_with(|promise| LocalEndpointManagerMessage::EnsureBound(Ask::new(promise, ())));
+    future
+        .wait_timeout(control_timeout)
+        .map_err(|error| RuntimeHostError::BindLocalEndpoint {
+            message: format!("{error:?}"),
+        })?
+}

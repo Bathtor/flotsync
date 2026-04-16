@@ -1,6 +1,4 @@
 use super::*;
-
-type ApiResult<T> = Result<T, ApiError>;
 type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
 
 /// Create one concrete replication runtime for the given application identity.
@@ -35,7 +33,7 @@ pub(super) async fn load_replication_runtime_typed(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let mut host = DeliveryRuntimeHost::new(local_member.clone())
+    let mut host = DeliveryRuntimeHost::start(local_member.clone())
         .boxed()
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
@@ -60,10 +58,6 @@ pub(super) async fn load_replication_runtime_typed(
 }
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
-///
-/// The current slice supports one real end-to-end path:
-/// creating a fixed-membership group and installing that membership remotely
-/// through reliable delivery bootstrap messages.
 pub(super) struct ReplicationRuntime {
     _application_id: Identifier,
     runtime_ref: Option<ActorRefStrong<ReplicationRuntimeMessage>>,
@@ -76,7 +70,7 @@ impl ReplicationRuntime {
     fn runtime_ref(&self) -> &ActorRefStrong<ReplicationRuntimeMessage> {
         self.runtime_ref
             .as_ref()
-            .expect("replication runtime actor ref must exist while the handle is live")
+            .expect("replication runtime shut down already")
     }
 
     fn ask<T>(
@@ -131,22 +125,19 @@ pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let waker = Waker::noop();
-    let mut context = Context::from_waker(waker);
     let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for test future to resolve"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
+    flotsync_io::test_support::eventually_value(
+        std::time::Duration::from_secs(5),
+        || {
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
             }
-        }
-    }
+        },
+        "timed out waiting for test future to resolve",
+    )
 }
 
 #[cfg(test)]
@@ -161,10 +152,7 @@ impl ReplicationRuntime {
         members: GroupMembers,
     ) -> Result<(), GroupInstallError> {
         let future = self.runtime_ref().ask_with(|promise| {
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(Ask::new(
-                promise,
-                TestInstallGroup { group_id, members },
-            )))
+            ReplicationRuntimeMessage::test_install_group(promise, group_id, members)
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
@@ -180,9 +168,7 @@ impl ReplicationRuntime {
         message: UpdateBatchMessage,
     ) -> Result<(), InboundDeliveryError> {
         let future = self.runtime_ref().ask_with(|promise| {
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
-                Ask::new(promise, TestApplyUpdateBatch { sender, message }),
-            ))
+            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,

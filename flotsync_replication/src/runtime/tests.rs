@@ -8,17 +8,15 @@ use crate::{
     api::{DatasetId, ListenerError, MemberIndex},
 };
 use flotsync_data_types::{Field, Schema};
+use flotsync_io::test_support::eventually;
 use std::{
     collections::HashMap,
-    future::Future,
     sync::{Mutex, mpsc},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use uuid::Uuid;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const TEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 struct StoreStub {
     local_member: crate::api::MemberIdentity,
@@ -138,8 +136,8 @@ impl ListenerStub {
     }
 
     fn wait_for_data_change_count(&self, count: usize) {
-        wait_until(
-            || format!("{count} listener data-change events"),
+        eventually(
+            TEST_WAIT_TIMEOUT,
             || {
                 self.drain_buffered_events();
                 self.data_changes
@@ -148,6 +146,7 @@ impl ListenerStub {
                     .len()
                     >= count
             },
+            format!("timed out waiting for {count} listener data-change events"),
         );
     }
 
@@ -199,11 +198,20 @@ fn member<const N: usize>(segments: [&str; N]) -> crate::api::MemberIdentity {
     Identifier::from_array(segments)
 }
 
-fn poll_ready<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    wait_for_test_reply(future)
+fn docs_dataset_id() -> DatasetId {
+    DatasetId::try_new("docs").expect("dataset id should be valid")
+}
+
+fn title_schema() -> Arc<Schema> {
+    Arc::new(Schema::from_fields([Field::linear_string("title")]))
+}
+
+fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> crate::api::RowId {
+    crate::api::RowId {
+        group_id,
+        dataset_id,
+        row_key: crate::api::RowKey(Uuid::from_u128(raw)),
+    }
 }
 
 fn load_runtime(
@@ -220,7 +228,7 @@ fn load_runtime_with_parts(
     store: Arc<StoreStub>,
     listener: Arc<ListenerStub>,
 ) -> Arc<ReplicationRuntime> {
-    poll_ready(load_replication_runtime_typed(
+    wait_for_test_reply(load_replication_runtime_typed(
         application_id,
         store,
         listener,
@@ -230,36 +238,22 @@ fn load_runtime_with_parts(
 }
 
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
-    wait_until(
-        || "runtime to install group".to_owned(),
+    eventually(
+        TEST_WAIT_TIMEOUT,
         || {
             runtime
                 .host()
                 .membership_snapshot()
                 .contains_group(&group_id)
         },
+        "timed out waiting for runtime to install group",
     );
-}
-
-fn wait_until(description: impl Fn() -> String, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
-    loop {
-        if condition() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            description()
-        );
-        thread::sleep(TEST_POLL_INTERVAL);
-    }
 }
 
 #[test]
 fn delivery_runtime_host_updates_shared_group_memberships() {
     let local_member = member(["alice"]);
-    let mut host = DeliveryRuntimeHost::new(local_member.clone()).expect("host should start");
+    let mut host = DeliveryRuntimeHost::start(local_member.clone()).expect("host should start");
     let group_id = crate::api::GroupId(Uuid::from_u128(1));
     let memberships = GroupMemberships::from_groups([(
         group_id,
@@ -278,7 +272,7 @@ fn load_replication_runtime_returns_concrete_runtime() {
     let store = Arc::new(StoreStub::new(member(["alice"])));
     let listener = Arc::new(ListenerStub::default());
 
-    let runtime = poll_ready(load_replication_runtime(
+    let runtime = wait_for_test_reply(load_replication_runtime(
         application_id,
         store,
         listener,
@@ -292,7 +286,7 @@ fn load_replication_runtime_returns_concrete_runtime() {
 
 #[test]
 fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
-    let mut host = DeliveryRuntimeHost::new(member(["probe"])).expect("host should start");
+    let mut host = DeliveryRuntimeHost::start(member(["probe"])).expect("host should start");
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     host.shutdown();
@@ -302,33 +296,45 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = member(["alice"]);
     let bob_member = member(["bob"]);
-    let alice = load_runtime(
+    let alice_runtime = load_runtime(
         Identifier::from_array(["app", "alice"]),
         alice_member.clone(),
     );
-    let bob = load_runtime(Identifier::from_array(["app", "bob"]), bob_member.clone());
+    let bob_runtime = load_runtime(Identifier::from_array(["app", "bob"]), bob_member.clone());
 
-    assert!(alice.host().external_udp_bind_addr().ip().is_loopback());
-    assert!(bob.host().external_udp_bind_addr().ip().is_loopback());
+    assert!(
+        alice_runtime
+            .host()
+            .external_udp_bind_addr()
+            .ip()
+            .is_loopback()
+    );
+    assert!(
+        bob_runtime
+            .host()
+            .external_udp_bind_addr()
+            .ip()
+            .is_loopback()
+    );
 
-    alice.host().publish_direct_peer_route(
+    alice_runtime.host().publish_direct_peer_route(
         bob_member.clone(),
-        bob.host().advertised_loopback_udp_addr(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
     );
-    bob.host().publish_direct_peer_route(
+    bob_runtime.host().publish_direct_peer_route(
         alice_member.clone(),
-        alice.host().advertised_loopback_udp_addr(),
+        alice_runtime.host().advertised_loopback_udp_addr(),
     );
 
-    let group_id = poll_ready(alice.create_group(CreateGroupRequest {
+    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         initial_state: None,
     }))
     .expect("create_group should succeed");
-    wait_for_group_install(&bob, group_id);
+    wait_for_group_install(&bob_runtime, group_id);
 
-    let alice_snapshot = alice.host().membership_snapshot();
-    let bob_snapshot = bob.host().membership_snapshot();
+    let alice_snapshot = alice_runtime.host().membership_snapshot();
+    let bob_snapshot = bob_runtime.host().membership_snapshot();
     let alice_members = alice_snapshot
         .members(&group_id)
         .expect("local runtime should host the created group");
@@ -356,10 +362,16 @@ fn create_group_bootstrap_installs_remote_membership() {
 
 #[test]
 fn publish_changes_delivers_remote_data_changed_event() {
+    // End-to-end happy path:
+    // 1. start two runtimes with the same dataset schema,
+    // 2. connect them with direct peer routes,
+    // 3. create one fixed-membership group from Alice,
+    // 4. publish one upsert from Alice, and
+    // 5. assert that Bob observes the replicated row change.
     let alice_member = member(["alice"]);
     let bob_member = member(["bob"]);
-    let dataset_id = DatasetId::try_new("docs").expect("dataset id should be valid");
-    let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
     let alice_listener = Arc::new(ListenerStub::default());
     let bob_listener = Arc::new(ListenerStub::default());
     let alice_store = Arc::new(
@@ -368,39 +380,35 @@ fn publish_changes_delivers_remote_data_changed_event() {
     let bob_store = Arc::new(
         StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
     );
-    let alice = load_runtime_with_parts(
+    let alice_runtime = load_runtime_with_parts(
         Identifier::from_array(["app", "alice"]),
         alice_store,
         alice_listener,
     );
-    let bob = load_runtime_with_parts(
+    let bob_runtime = load_runtime_with_parts(
         Identifier::from_array(["app", "bob"]),
         bob_store,
         bob_listener.clone(),
     );
 
-    alice.host().publish_direct_peer_route(
+    alice_runtime.host().publish_direct_peer_route(
         bob_member.clone(),
-        bob.host().advertised_loopback_udp_addr(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
     );
-    bob.host().publish_direct_peer_route(
+    bob_runtime.host().publish_direct_peer_route(
         alice_member.clone(),
-        alice.host().advertised_loopback_udp_addr(),
+        alice_runtime.host().advertised_loopback_udp_addr(),
     );
 
-    let group_id = poll_ready(alice.create_group(CreateGroupRequest {
+    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         initial_state: None,
     }))
     .expect("create_group should succeed");
-    wait_for_group_install(&bob, group_id);
-    let row_id = crate::api::RowId {
-        group_id,
-        dataset_id: dataset_id.clone(),
-        row_key: crate::api::RowKey(Uuid::from_u128(11)),
-    };
+    wait_for_group_install(&bob_runtime, group_id);
+    let row_id = test_row_id(group_id, dataset_id.clone(), 11);
 
-    let receipt = poll_ready(alice.publish_changes(vec![RowMutation::Upsert {
+    let receipt = wait_for_test_reply(alice_runtime.publish_changes(vec![RowMutation::Upsert {
         row_id: row_id.clone(),
         row: crate::row_values! {
             "title" => "hello from alice",
@@ -428,39 +436,45 @@ fn publish_changes_delivers_remote_data_changed_event() {
     );
 
     assert!(
-        bob.host().membership_snapshot().contains_group(&group_id),
+        bob_runtime
+            .host()
+            .membership_snapshot()
+            .contains_group(&group_id),
         "remote runtime should still host the replicated group"
     );
 }
 
 #[test]
 fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicates() {
+    // Causal buffering path:
+    // 1. install a two-member group only on Bob,
+    // 2. deliver Alice's second update first so it must buffer,
+    // 3. deliver the missing first update,
+    // 4. assert that Bob drains the buffered update in causal order, and
+    // 5. verify a duplicate of the first update is ignored.
     let alice_member = member(["alice"]);
     let bob_member = member(["bob"]);
-    let dataset_id = DatasetId::try_new("docs").expect("dataset id should be valid");
-    let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
     let bob_listener = Arc::new(ListenerStub::default());
     let bob_store = Arc::new(
         StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
     );
-    let bob = load_runtime_with_parts(
+    let bob_runtime = load_runtime_with_parts(
         Identifier::from_array(["app", "bob"]),
         bob_store,
         bob_listener.clone(),
     );
     let group_id = GroupId(Uuid::from_u128(22));
-    bob.install_group_for_test(
-        group_id,
-        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
-            .expect("group should build"),
-    )
-    .expect("group should install");
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                .expect("group should build"),
+        )
+        .expect("group should install");
 
-    let row_id = crate::api::RowId {
-        group_id,
-        dataset_id: dataset_id.clone(),
-        row_key: crate::api::RowKey(Uuid::from_u128(23)),
-    };
+    let row_id = test_row_id(group_id, dataset_id.clone(), 23);
     let mut source_dataset = LocalDataset::new(schema);
     let first_operation = apply_local_upsert(
         &mut source_dataset,
@@ -513,11 +527,13 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         }],
     };
 
-    bob.apply_update_batch_for_test(alice_member.clone(), second_message)
+    bob_runtime
+        .apply_update_batch_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should buffer");
     assert!(bob_listener.captured_data_changes().is_empty());
 
-    bob.apply_update_batch_for_test(alice_member.clone(), first_message.clone())
+    bob_runtime
+        .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
         .expect("first update should apply and drain the pending second update");
     bob_listener.wait_for_data_change_count(2);
     assert_eq!(
@@ -537,38 +553,40 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
             },
         ]
     );
-    bob.apply_update_batch_for_test(alice_member, first_message)
+    bob_runtime
+        .apply_update_batch_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_listener.captured_data_changes().len(), 2);
 }
 
 #[test]
 fn buffered_updates_reject_conflicting_duplicate_payloads() {
+    // Conflicting duplicate protection:
+    // 1. buffer one out-of-order update on Bob,
+    // 2. deliver a second message with the same UpdateId but different payload,
+    // 3. assert that the runtime rejects the conflicting duplicate explicitly.
     let alice_member = member(["alice"]);
     let bob_member = member(["bob"]);
-    let dataset_id = DatasetId::try_new("docs").expect("dataset id should be valid");
-    let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
     let bob_store = Arc::new(
         StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
     );
-    let bob = load_runtime_with_parts(
+    let bob_runtime = load_runtime_with_parts(
         Identifier::from_array(["app", "bob"]),
         bob_store,
         Arc::new(ListenerStub::default()),
     );
     let group_id = GroupId(Uuid::from_u128(24));
-    bob.install_group_for_test(
-        group_id,
-        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
-            .expect("group should build"),
-    )
-    .expect("group should install");
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                .expect("group should build"),
+        )
+        .expect("group should install");
 
-    let row_id = crate::api::RowId {
-        group_id,
-        dataset_id: dataset_id.clone(),
-        row_key: crate::api::RowKey(Uuid::from_u128(25)),
-    };
+    let row_id = test_row_id(group_id, dataset_id.clone(), 25);
     let member_count = NonZeroUsize::new(2).expect("group has two members");
 
     let mut first_source_dataset = LocalDataset::new(schema.clone());
@@ -630,9 +648,10 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         }],
     };
 
-    bob.apply_update_batch_for_test(alice_member.clone(), buffered_message)
+    bob_runtime
+        .apply_update_batch_for_test(alice_member.clone(), buffered_message)
         .expect("first out-of-order update should buffer");
-    let error = bob
+    let error = bob_runtime
         .apply_update_batch_for_test(alice_member, conflicting_message)
         .expect_err("conflicting duplicate payload should fail");
     match error {
