@@ -4,6 +4,7 @@ use flotsync_data_types::{
     DecodeValueError,
     InMemoryFieldValue,
     OwnedRow,
+    RowOperations,
     schema::{Schema, datamodel::NullableBasicValue},
 };
 use flotsync_utils::BoxFuture;
@@ -73,9 +74,7 @@ impl MutableRow {
 
 impl RowRead for OwnedRow<UpdateId> {
     fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>> {
-        <OwnedRow<UpdateId> as flotsync_data_types::RowOperations<UpdateId>>::get_field(
-            self, field_name,
-        )
+        RowOperations::get_field(self, field_name)
     }
 }
 

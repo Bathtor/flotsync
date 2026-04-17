@@ -26,7 +26,7 @@ use flotsync_data_types::{
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use snafu::prelude::*;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -84,8 +84,8 @@ impl LocalGroupState {
     /// Return the subset of `dataset_ids` that is not hosted locally yet.
     pub(super) fn missing_dataset_ids(
         &self,
-        dataset_ids: &BTreeSet<DatasetId>,
-    ) -> BTreeSet<DatasetId> {
+        dataset_ids: &HashSet<DatasetId>,
+    ) -> HashSet<DatasetId> {
         dataset_ids
             .iter()
             .filter(|dataset_id| !self.datasets.contains_key(*dataset_id))
@@ -120,7 +120,7 @@ impl LocalGroupState {
     /// expected from its producer.
     pub(super) fn can_apply(&self, message: &UpdateBatchMessage) -> bool {
         let producer_index = MemberIndex::new(message.update_id.node_index);
-        self.version_vector.covers(&message.read_versions)
+        (self.version_vector >= message.read_versions)
             && self.expected_next_version(producer_index) == message.update_id.version
     }
 
@@ -259,16 +259,16 @@ impl MutableRow {
     }
 }
 
-/// Validates that one publish call targets exactly one group and returns the
-/// affected dataset ids.
+/// Validate that one publish call targets exactly one group and collect the
+/// touched datasets without imposing any semantic ordering on them.
 pub(super) fn collect_group_dataset_scope(
     changes: &[RowMutation],
-) -> Result<(GroupId, BTreeSet<DatasetId>), PublishChangesError> {
+) -> Result<(GroupId, HashSet<DatasetId>), PublishChangesError> {
     let Some(first_change) = changes.first() else {
         return EmptyChangesSnafu.fail();
     };
     let group_id = first_change.row_id().group_id;
-    let mut dataset_ids = BTreeSet::new();
+    let mut dataset_ids = HashSet::new();
     for change in changes {
         let row_id = change.row_id();
         ensure!(

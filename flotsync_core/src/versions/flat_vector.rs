@@ -101,17 +101,6 @@ impl VersionVector {
             .nth(position)
             .expect("version-vector position must be within range")
     }
-
-    /// Return `true` when every position in `self` is greater than or equal to
-    /// the corresponding position in `other`.
-    pub fn covers(&self, other: &Self) -> bool {
-        if self.num_members() != other.num_members() {
-            return false;
-        }
-        self.iter()
-            .zip(other.iter())
-            .all(|(local_version, required_version)| local_version >= required_version)
-    }
 }
 impl fmt::Display for VersionVector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

@@ -8,7 +8,5 @@ mod messages;
 pub use component::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};
 pub use handle::load_replication_runtime;
 
-type ApiResult<T> = Result<T, crate::api::ApiError>;
-
 #[cfg(test)]
 mod tests;

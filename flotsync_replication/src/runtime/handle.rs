@@ -1,6 +1,7 @@
-use super::{ApiResult, ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
+use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
 use crate::api::{
     ApiError,
+    ApiResult,
     ChangeGroupMembershipRequest,
     CreateGroupRequest,
     GroupMigration,
@@ -17,6 +18,7 @@ use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
+use log::warn;
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -113,7 +115,10 @@ impl ReplicationRuntime {
         async move {
             match future.await {
                 Ok(reply) => reply,
-                Err(_) => Err(ApiError::RuntimeUnavailable),
+                Err(error) => {
+                    warn!("replication runtime ask failed: {error}");
+                    Err(ApiError::RuntimeUnavailable)
+                }
             }
         }
         .boxed()

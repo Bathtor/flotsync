@@ -79,7 +79,7 @@ use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -177,12 +177,12 @@ impl ReplicationRuntimeMessage {
     }
 }
 
-#[derive(ComponentDefinition)]
 /// Stateful Kompact component that hosts one in-memory replication runtime.
 ///
 /// It owns the local replicated group state, speaks to the delivery-layer
 /// components through required ports, and translates the public replication
 /// API into deterministic local state transitions plus outbound delivery work.
+#[derive(ComponentDefinition)]
 pub struct ReplicationRuntimeComponent {
     ctx: ComponentContext<Self>,
     group_broadcast: RequiredPort<GroupBroadcastPort>,
@@ -253,7 +253,7 @@ impl ReplicationRuntimeComponent {
 
     /// Validate one publish request locally and return the missing dataset
     /// schemas that must be loaded before local staging can proceed.
-    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<BTreeSet<DatasetId>, ApiError> {
+    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<HashSet<DatasetId>, ApiError> {
         let (group_id, dataset_ids) = collect_group_dataset_scope(changes)
             .boxed()
             .context(ApiExternalSnafu)?;
@@ -269,7 +269,7 @@ impl ReplicationRuntimeComponent {
 
     async fn load_dataset_schemas(
         store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: BTreeSet<DatasetId>,
+        missing_dataset_ids: HashSet<DatasetId>,
     ) -> Result<HashMap<DatasetId, Arc<Schema>>, DatasetSchemaLoadError> {
         let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
         for dataset_id in missing_dataset_ids {
@@ -348,7 +348,7 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> BTreeSet<DatasetId> {
+    fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> HashSet<DatasetId> {
         dataset_updates
             .iter()
             .map(|dataset_update| dataset_update.dataset_id.clone())
@@ -455,10 +455,12 @@ impl ReplicationRuntimeComponent {
         update_id: UpdateId,
     ) -> Result<PreparedDatasetUpdates, PublishChangesError> {
         let mut working_datasets = HashMap::<DatasetId, LocalDataset>::new();
-        let mut encoded_operations =
-            BTreeMap::<DatasetId, Vec<flotsync_messages::datamodel::SchemaOperation>>::new();
+        let mut encoded_operations: HashMap<
+            DatasetId,
+            Vec<flotsync_messages::datamodel::SchemaOperation>,
+        > = HashMap::new();
 
-        for mutation in changes {
+        'changes: for mutation in changes {
             let row_id = mutation.row_id().clone();
             let working_dataset = working_dataset_for_publish(
                 &mut working_datasets,
@@ -476,7 +478,7 @@ impl ReplicationRuntimeComponent {
                 }
             };
             let Some(encoded_operation) = encoded_operation else {
-                continue;
+                continue 'changes;
             };
             encoded_operations
                 .entry(row_id.dataset_id.clone())
@@ -552,7 +554,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         sender: MemberIdentity,
         message: WireUpdateBatchMessage,
-        missing_dataset_ids: BTreeSet<DatasetId>,
+        missing_dataset_ids: HashSet<DatasetId>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
         let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), missing_dataset_ids)
             .await
