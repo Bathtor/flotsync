@@ -26,7 +26,7 @@ use flotsync_core::{
     member::Identifier,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::{Field, Schema};
+use flotsync_data_types::{Field, RowOperations, Schema};
 use flotsync_io::test_support::eventually;
 use flotsync_utils::BoxFuture;
 use snafu::ResultExt;

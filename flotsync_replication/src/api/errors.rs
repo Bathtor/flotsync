@@ -3,7 +3,7 @@ use snafu::prelude::*;
 use std::error::Error;
 
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
-pub(crate) type ApiResult<T> = Result<T, ApiError>;
+pub type ApiResult<T> = Result<T, ApiError>;
 
 #[derive(Debug, Snafu)]
 pub enum DatasetIdError {

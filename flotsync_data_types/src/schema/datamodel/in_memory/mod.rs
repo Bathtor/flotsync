@@ -4,11 +4,9 @@ use super::{
 };
 use crate::{
     DataOperation,
-    Decode,
-    DecodeValueError,
     IdWithIndex,
     OperationOutcome,
-    RowOperations,
+    RowRead,
     TableOperations,
     any_data::{
         LinearLatestValueWins,
@@ -2159,7 +2157,7 @@ where
         }
     }
 }
-impl<'a, RowId, OperationId> RowOperations<OperationId> for InMemoryDataRow<'a, RowId, OperationId>
+impl<'a, RowId, OperationId> RowRead<OperationId> for InMemoryDataRow<'a, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -2167,37 +2165,6 @@ where
         let field_index = self.data.field_index(field_name)?;
         let row = self.data.row(self.row_index).ok()?;
         row.fields.get(field_index)
-    }
-
-    fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-    {
-        let value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        T::decode(value)
-    }
-
-    fn get_nullable_field_value<T>(
-        &self,
-        field_name: &str,
-    ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-    {
-        let value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        match T::decode(value) {
-            Ok(value) => Ok(Some(value)),
-            Err(DecodeValueError::NullValue { .. }) => Ok(None),
-            Err(err) => Err(err),
-        }
     }
 }
 

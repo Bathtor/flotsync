@@ -1101,7 +1101,6 @@ dependencies = [
  "flotsync_utils",
  "futures-util",
  "kompact",
- "log",
  "smallvec",
  "snafu",
  "uuid",

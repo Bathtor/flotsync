@@ -19,7 +19,7 @@ use crate::{
 };
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
 use flotsync_udpour::UDPourConfig;
-use kompact::{config::HoconExt, prelude::*};
+use kompact::{KompactLogger, config::HoconExt, prelude::*};
 use snafu::prelude::*;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -405,6 +405,13 @@ impl DeliveryRuntimeHost {
         self.topology
             .as_ref()
             .expect("delivery runtime host topology must still be live")
+    }
+
+    pub(crate) fn logger(&self) -> &KompactLogger {
+        self.system
+            .as_ref()
+            .expect("delivery runtime host system must still be live")
+            .logger()
     }
 
     pub(crate) fn runtime_component(&self) -> &Arc<Component<ReplicationRuntimeComponent>> {

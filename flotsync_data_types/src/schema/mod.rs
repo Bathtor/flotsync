@@ -205,6 +205,7 @@ impl<OperationId> FieldOperations<OperationId> for Field {
     where
         R: crate::RowOperations<OperationId>,
         T: ?Sized + crate::Decode<OperationId>,
+        OperationId: 'a,
     {
         row.get_field_value(&self.name)
     }
@@ -216,6 +217,7 @@ impl<OperationId> FieldOperations<OperationId> for Field {
     where
         R: crate::RowOperations<OperationId>,
         T: ?Sized + crate::Decode<OperationId>,
+        OperationId: 'a,
     {
         row.get_nullable_field_value(&self.name)
     }

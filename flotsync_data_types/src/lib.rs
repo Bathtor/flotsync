@@ -114,31 +114,81 @@ pub enum OperationOutcome<T> {
     NoChanges,
 }
 
-/// Methods to get values out of rows.
-pub trait RowOperations<OperationId> {
+/// Object-safe read-only view over row field values.
+pub trait RowRead<OperationId> {
     /// Get the current value of a field.
     ///
     /// Returns `None` if the field does not exist.
     fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>>;
+}
 
+/// Typed decode helpers layered on top of [`RowRead`].
+///
+/// The blanket implementation means these helpers are also available on
+/// `&dyn RowRead<_>` values whenever [`RowOperations`] is in scope.
+pub trait RowOperations<OperationId>: RowRead<OperationId> {
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
     /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
-    fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>
+    fn get_field_value<'a, T>(&'a self, field_name: &str) -> Result<Cow<'a, T>, DecodeValueError>
     where
-        T: ?Sized + Decode<OperationId>;
+        T: ?Sized + Decode<OperationId>,
+        OperationId: 'a;
 
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
     /// Returns `Ok(None)` if the field is `NULL`.
     ///
     /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
-    fn get_nullable_field_value<T>(
-        &self,
+    fn get_nullable_field_value<'a, T>(
+        &'a self,
         field_name: &str,
-    ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
+    ) -> Result<Option<Cow<'a, T>>, DecodeValueError>
     where
-        T: ?Sized + Decode<OperationId>;
+        T: ?Sized + Decode<OperationId>,
+        OperationId: 'a;
+}
+
+impl<T, OperationId> RowOperations<OperationId> for T
+where
+    T: ?Sized + RowRead<OperationId>,
+{
+    fn get_field_value<'a, Value>(
+        &'a self,
+        field_name: &str,
+    ) -> Result<Cow<'a, Value>, DecodeValueError>
+    where
+        Value: ?Sized + Decode<OperationId>,
+        OperationId: 'a,
+    {
+        let field_value = missing_field_error(self.get_field(field_name), field_name)?;
+        Value::decode(field_value)
+    }
+
+    fn get_nullable_field_value<'a, Value>(
+        &'a self,
+        field_name: &str,
+    ) -> Result<Option<Cow<'a, Value>>, DecodeValueError>
+    where
+        Value: ?Sized + Decode<OperationId>,
+        OperationId: 'a,
+    {
+        let field_value = missing_field_error(self.get_field(field_name), field_name)?;
+        match Value::decode(field_value) {
+            Ok(value) => Ok(Some(value)),
+            Err(DecodeValueError::NullValue { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn missing_field_error<'a, OperationId>(
+    field_value: Option<&'a InMemoryFieldValue<OperationId>>,
+    field_name: &str,
+) -> Result<&'a InMemoryFieldValue<OperationId>, DecodeValueError> {
+    field_value.ok_or_else(|| DecodeValueError::FieldDoesNotExist {
+        field_name: field_name.to_owned(),
+    })
 }
 
 /// Owned immutable row snapshot that can outlive any backing in-memory store.
@@ -151,46 +201,11 @@ impl<OperationId> OwnedRow<OperationId> {
     pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
         Self { fields }
     }
-
-    pub fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
-        self.fields.get(field_name)
-    }
 }
 
-impl<OperationId> RowOperations<OperationId> for OwnedRow<OperationId> {
+impl<OperationId> RowRead<OperationId> for OwnedRow<OperationId> {
     fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
-        self.get_field(field_name)
-    }
-
-    fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-    {
-        let field_value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        T::decode(field_value)
-    }
-
-    fn get_nullable_field_value<T>(
-        &self,
-        field_name: &str,
-    ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-    {
-        let field_value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        match T::decode(field_value) {
-            Ok(value) => Ok(Some(value)),
-            Err(DecodeValueError::NullValue { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
+        self.fields.get(field_name)
     }
 }
 
@@ -207,7 +222,8 @@ pub trait FieldOperations<OperationId> {
     fn get_value<'a, R, T>(&self, row: &'a R) -> Result<Cow<'a, T>, DecodeValueError>
     where
         R: RowOperations<OperationId>,
-        T: ?Sized + Decode<OperationId>;
+        T: ?Sized + Decode<OperationId>,
+        OperationId: 'a;
 
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
@@ -218,7 +234,8 @@ pub trait FieldOperations<OperationId> {
     ) -> Result<Option<Cow<'a, T>>, DecodeValueError>
     where
         R: RowOperations<OperationId>,
-        T: ?Sized + Decode<OperationId>;
+        T: ?Sized + Decode<OperationId>,
+        OperationId: 'a;
 }
 
 /// Operations that can be performed on table with a given [[Schema]].

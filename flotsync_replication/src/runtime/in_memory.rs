@@ -19,7 +19,7 @@ use flotsync_data_types::{
     InitialFieldValue,
     OperationOutcome,
     PendingFieldUpdate,
-    RowOperations,
+    RowRead,
     Schema,
     TableOperations,
 };

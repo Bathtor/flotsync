@@ -18,7 +18,6 @@ use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
-use log::warn;
 use snafu::prelude::*;
 use std::sync::Arc;
 
@@ -112,11 +111,12 @@ impl ReplicationRuntime {
         T: Send + 'static,
     {
         let future = self.runtime_ref().ask_with(build);
+        let logger = self.host.logger().clone();
         async move {
             match future.await {
                 Ok(reply) => reply,
                 Err(error) => {
-                    warn!("replication runtime ask failed: {error}");
+                    warn!(logger, "replication runtime ask failed: {error}");
                     Err(ApiError::RuntimeUnavailable)
                 }
             }
