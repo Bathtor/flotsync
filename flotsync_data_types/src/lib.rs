@@ -151,11 +151,15 @@ impl<OperationId> OwnedRow<OperationId> {
     pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
         Self { fields }
     }
+
+    pub fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
+        self.fields.get(field_name)
+    }
 }
 
 impl<OperationId> RowOperations<OperationId> for OwnedRow<OperationId> {
     fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
-        self.fields.get(field_name)
+        self.get_field(field_name)
     }
 
     fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>

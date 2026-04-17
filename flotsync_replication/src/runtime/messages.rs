@@ -485,7 +485,11 @@ impl WireVersionVector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::num::NonZeroUsize;
+
+    use flotsync_core::versions::{OverrideVersion, PureVersionVector, VersionVector};
+
+    use super::WireVersionVector;
 
     #[test]
     fn wire_version_vector_round_trips_full_override_and_synced() {
