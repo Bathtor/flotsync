@@ -715,9 +715,13 @@ mod tests {
     }
 
     fn group_memberships(groups: impl IntoIterator<Item = GroupId>) -> GroupMemberships {
-        let groups = groups
-            .into_iter()
-            .map(|group_id| (group_id, Default::default()));
+        let groups = groups.into_iter().map(|group_id| {
+            (
+                group_id,
+                crate::GroupMembers::from_ordered_members([member(&["probe"])])
+                    .expect("probe group members should build"),
+            )
+        });
         GroupMemberships::from_groups(groups)
     }
 

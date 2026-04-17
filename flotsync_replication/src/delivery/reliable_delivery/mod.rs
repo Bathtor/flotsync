@@ -425,6 +425,11 @@ impl ReliableDeliveryComponent {
         Handled::Ok
     }
 
+    #[cfg(test)]
+    pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
+        self.direct_peer_routes.get(peer).is_some()
+    }
+
     async fn await_processed_delivery(
         &mut self,
         message_id: MessageId,
@@ -566,6 +571,9 @@ impl ReliableDeliveryComponent {
             Ok(RouteTransportSubmitResult::Sent { .. }) => {
                 self.cancel_retry(RetryKey::Sender(message_id));
                 if let Some(work_item) = self.sender_work_items.get_mut(&message_id) {
+                    // TODO(flotsync-46r): Add a sender-side recipient-ack
+                    // timeout so a receiver that never acks cannot leave the
+                    // sender work item stuck in this state indefinitely.
                     work_item.recipient_route.state = RouteActiveState::AwaitingRecipientAck;
                 }
             }

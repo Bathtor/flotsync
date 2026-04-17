@@ -8,6 +8,7 @@ use crate::{
     prelude::*,
     socket_support::{configure_bind_reuse, socket_domain},
 };
+use futures_util::FutureExt;
 use kompact::{KompactLogger, default_components::install_manual_timer, prelude::*};
 use slog::{Drain, Logger, PushFnValue, o};
 use socket2::{Protocol, SockAddr, Socket, Type};
@@ -15,8 +16,10 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt::{Debug, Display},
+    future::Future,
     io::{self, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    pin::pin,
     sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, mpsc},
     thread,
     time::{Duration, Instant},
@@ -455,6 +458,16 @@ where
     M: Display,
 {
     eventually_value(timeout, || predicate().then_some(()), failure_message);
+}
+
+/// Waits for one future to resolve within `timeout`.
+pub fn wait_for_future<F, M>(timeout: Duration, future: F, failure_message: M) -> F::Output
+where
+    F: Future,
+    M: Display,
+{
+    let mut future = pin!(future);
+    eventually_value(timeout, || future.as_mut().now_or_never(), failure_message)
 }
 
 /// Waits until one component-state predicate becomes true or `timeout`

@@ -1,61 +1,22 @@
 use flotsync_core::versions::UpdateId;
-use flotsync_data_types::{
-    Decode,
-    DecodeValueError,
-    InMemoryFieldValue,
-    schema::datamodel::NullableBasicValue,
-};
+use flotsync_data_types::schema::{Schema, datamodel::NullableBasicValue};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
-use std::{borrow::Cow, collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
 
 mod errors;
 mod ids;
 pub mod providers;
 
 pub use errors::*;
+pub use flotsync_data_types::{
+    Decode,
+    DecodeValueError,
+    InMemoryFieldValue,
+    RowOperations,
+    RowRead,
+};
 pub use ids::*;
-
-/// Immutable row view exposed on the event/read side.
-///
-/// This trait is object-safe. `get_field_value` and `get_nullable_field_value` helpers are
-/// available on `dyn RowRead`.
-pub trait RowRead: Send + Sync {
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>>;
-}
-
-impl dyn RowRead + '_ {
-    pub fn get_field_value<T>(&self, field_name: &str) -> Result<Cow<'_, T>, DecodeValueError>
-    where
-        T: ?Sized + Decode<UpdateId>,
-    {
-        let field_value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        T::decode(field_value)
-    }
-
-    pub fn get_nullable_field_value<T>(
-        &self,
-        field_name: &str,
-    ) -> Result<Option<Cow<'_, T>>, DecodeValueError>
-    where
-        T: ?Sized + Decode<UpdateId>,
-    {
-        let field_value =
-            self.get_field(field_name)
-                .ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-                    field_name: field_name.to_owned(),
-                })?;
-        match T::decode(field_value) {
-            Ok(value) => Ok(Some(value)),
-            Err(DecodeValueError::NullValue { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
 
 /// Write-only row payload submitted by applications.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,11 +53,19 @@ pub enum RowMutation {
     Delete { row_id: RowId },
 }
 
+impl RowMutation {
+    pub fn row_id(&self) -> &RowId {
+        match self {
+            RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
+        }
+    }
+}
+
 /// Row-level change emitted by the framework to an application listener.
 pub enum RowChange {
     Upsert {
         row_id: RowId,
-        row: Arc<dyn RowRead>,
+        row: Arc<dyn RowRead<UpdateId> + Send + Sync>,
     },
     Delete {
         row_id: RowId,
@@ -110,7 +79,7 @@ impl RowChange {
         }
     }
 
-    pub fn row(&self) -> Option<&dyn RowRead> {
+    pub fn row(&self) -> Option<&(dyn RowRead<UpdateId> + Send + Sync)> {
         match self {
             RowChange::Upsert { row, .. } => Some(row.as_ref()),
             RowChange::Delete { .. } => None,
@@ -219,6 +188,15 @@ pub struct CreateGroupRequest {
     pub initial_state: Option<InitialGroupState>,
 }
 
+impl std::fmt::Debug for CreateGroupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateGroupRequest")
+            .field("members", &self.members)
+            .field("has_initial_state", &self.initial_state.is_some())
+            .finish()
+    }
+}
+
 /// Request to change membership of an existing group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeGroupMembershipRequest {
@@ -297,5 +275,12 @@ pub trait ReplicationApi: Send + Sync {
 
 /// Persistence extension point.
 pub trait ReplicationStore: Send + Sync {
-    // TODO(`flotsync-73q`): Complete the storage contract.
+    /// Return the member identity hosted by this replication runtime instance.
+    fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>>;
+
+    /// Load one application-defined dataset schema when available locally.
+    fn load_dataset_schema(
+        &self,
+        dataset_id: &DatasetId,
+    ) -> BoxFuture<'_, Result<Option<Arc<Schema>>, StoreError>>;
 }

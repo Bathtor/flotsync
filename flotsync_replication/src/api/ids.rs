@@ -5,9 +5,49 @@ use uuid::Uuid;
 /// Member identity in group membership APIs.
 pub type MemberIdentity = Identifier;
 
+/// Fixed canonical member position within one replication group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MemberIndex(u32);
+
+impl MemberIndex {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MemberIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<MemberIndex> for u32 {
+    fn from(value: MemberIndex) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<usize> for MemberIndex {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        u32::try_from(value).map(Self)
+    }
+}
+
 /// A stable identifier for a replication group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupId(pub Uuid);
+
+impl std::fmt::Display for GroupId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Dataset identifier used in public replication APIs.
 ///
@@ -98,12 +138,24 @@ fn is_dataset_id_continue_char(character: char) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RowKey(pub Uuid);
 
+impl std::fmt::Display for RowKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Public row identifier that combines group, dataset, and row identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RowId {
     pub group_id: GroupId,
     pub dataset_id: DatasetId,
     pub row_key: RowKey,
+}
+
+impl std::fmt::Display for RowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}/{}", self.group_id, self.dataset_id, self.row_key)
+    }
 }
 
 /// Migration represented as old/new group pair.

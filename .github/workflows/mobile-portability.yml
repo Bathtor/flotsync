@@ -14,6 +14,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   compile-only:
@@ -32,6 +33,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Configure GitHub auth for git dependencies
+        run: >
+          git config --global
+          url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf
+          "https://github.com/"
+
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@master
         with:
@@ -42,6 +49,7 @@ jobs:
         uses: bufbuild/buf-setup-action@v1
         with:
           version: 1.67.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2

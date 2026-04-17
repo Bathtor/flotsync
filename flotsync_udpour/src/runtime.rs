@@ -228,6 +228,13 @@ impl UDPourConfig {
     }
 }
 
+impl Default for UDPourConfig {
+    fn default() -> Self {
+        Self::new(SenderConfig::default(), ReceiverConfig::default())
+            .expect("default UDPour runtime config must be valid")
+    }
+}
+
 /// Configuration errors for the UDPour runtime.
 #[derive(Debug, Snafu)]
 pub enum UDPourConfigError {

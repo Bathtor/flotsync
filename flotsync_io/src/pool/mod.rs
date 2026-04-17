@@ -20,6 +20,8 @@ use crate::{
 };
 use ::kompact::prelude::{ChunkLease, ChunkRef};
 use bytes::{Buf, Bytes};
+#[cfg(test)]
+use futures_util::FutureExt;
 use std::{
     collections::VecDeque,
     fmt,
@@ -798,7 +800,7 @@ where
     let mut future = Box::pin(future);
 
     loop {
-        if let Some(output) = poll_future_once(future.as_mut()) {
+        if let Some(output) = future.as_mut().now_or_never() {
             return output;
         }
 

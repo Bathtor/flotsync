@@ -34,6 +34,19 @@ pub struct ReceiverConfig {
     pub delivered_tombstone_timeout: Duration,
 }
 
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self {
+            repair_interval: Duration::from_millis(100),
+            give_up_timeout: Duration::from_secs(30),
+            max_need_parts_frame_len: 1024,
+            // `UDPourConfig::new` overwrites this with the sender-derived
+            // duplicate-suppression window for normal runtime construction.
+            delivered_tombstone_timeout: Duration::ZERO,
+        }
+    }
+}
+
 /// Sender identity plus logical message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ReceiverTransferKey {
