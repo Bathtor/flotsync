@@ -1349,8 +1349,13 @@ mod tests {
                     error_kind,
                 }) if failed_socket_id == socket_id => {
                     assert_eq!(option, join_option);
-                    assert_eq!(format!("{error_kind:?}"), "Uncategorized");
-                    break;
+                    assert_eq!(error_kind, ErrorKind::Unsupported);
+                    eprintln!("This system does not support multicast. Skipping this test...");
+                    // Some container/network setups reject multicast membership with
+                    // an Uncategorized OS error; when that happens, there is no useful
+                    // leave-path behavior left to validate in this test.
+                    driver.shutdown().expect("driver shuts down");
+                    return;
                 }
                 other => {
                     log::debug!(
@@ -1379,15 +1384,6 @@ mod tests {
                     option,
                 }) if configured_socket_id == socket_id => {
                     assert_eq!(option, leave_option);
-                    break;
-                }
-                DriverEvent::Udp(UdpEvent::ConfigureFailed {
-                    socket_id: failed_socket_id,
-                    option,
-                    error_kind,
-                }) if failed_socket_id == socket_id => {
-                    assert_eq!(option, leave_option);
-                    assert_eq!(format!("{error_kind:?}"), "Uncategorized");
                     break;
                 }
                 other => {
