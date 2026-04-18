@@ -14,9 +14,8 @@ use crate::{
     wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::*;
-use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::{
-    config::{DurationValue, HoconExt, UsizeValue},
+    config::{DurationValue, UsizeValue},
     kompact_config,
     prelude::*,
 };
@@ -486,7 +485,7 @@ impl UDPourComponent {
 
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
         let defaults = UDPourSendRateControl::default();
-        let send_delay = match self.ctx.config().get_or_default(&config_keys::SEND_DELAY) {
+        let send_delay = match self.ctx.config().read_or_default(&config_keys::SEND_DELAY) {
             Ok(value) => value,
             Err(error) => {
                 warn!(
@@ -502,7 +501,7 @@ impl UDPourComponent {
         let backpressure_retry_delay = match self
             .ctx
             .config()
-            .get_or_default(&config_keys::BACKPRESSURE_RETRY_DELAY)
+            .read_or_default(&config_keys::BACKPRESSURE_RETRY_DELAY)
         {
             Ok(value) => value,
             Err(error) => {
@@ -519,7 +518,7 @@ impl UDPourComponent {
         let max_in_flight_datagrams = match self
             .ctx
             .config()
-            .get_or_default(&config_keys::MAX_IN_FLIGHT_DATAGRAMS)
+            .read_or_default(&config_keys::MAX_IN_FLIGHT_DATAGRAMS)
         {
             Ok(value) => value,
             Err(error) => {
@@ -1097,18 +1096,16 @@ impl Require<UdpPort> for UDPourComponent {
     }
 }
 
-impl LocalActor for UDPourComponent {
+impl Actor for UDPourComponent {
     type Message = UDPourComponentMessage;
 
-    fn receive(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             UDPourComponentMessage::Submit(ask) => self.handle_submit(ask),
             UDPourComponentMessage::SendResult(result) => self.handle_send_result(result),
         }
     }
 }
-
-impl_local_actor!(UDPourComponent);
 
 #[derive(Debug)]
 struct OutboundTransfer {

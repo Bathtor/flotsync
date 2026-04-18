@@ -435,10 +435,6 @@ impl Actor for TcpConnectNetcat {
             TcpConnectMessage::SessionEvent(event) => self.handle_session_event(event),
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP connect netcat does not use network actor messages")
-    }
 }
 
 /// Component that manages one TCP listener and one active accepted session at a time.
@@ -778,9 +774,5 @@ impl Actor for TcpListenNetcat {
             TcpListenMessage::SessionEvent(event) => self.handle_session_event(event),
             TcpListenMessage::ListenerEvent(event) => self.handle_listener_event(event),
         }
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP listener netcat does not use network actor messages")
     }
 }

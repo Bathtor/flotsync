@@ -13,7 +13,7 @@ use crate::{
 };
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{LocalActor, NonOwningPhantomData, impl_local_actor, option_when};
+use flotsync_utils::{NonOwningPhantomData, option_when};
 use kompact::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
@@ -364,15 +364,13 @@ impl Require<TransportRouteDiscoveryPort> for GroupBroadcastComponent {
     }
 }
 
-impl LocalActor for GroupBroadcastComponent {
+impl Actor for GroupBroadcastComponent {
     type Message = Never;
 
-    fn receive(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
         unreachable!("Message type cannot be instantiated");
     }
 }
-
-impl_local_actor!(GroupBroadcastComponent);
 
 type TransportGroupBroadcastInboundPort = GroupBroadcastInboundPort<TransportRouteKey>;
 type TransportRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
@@ -468,10 +466,6 @@ mod tests {
 
         fn receive_local(&mut self, _msg: Self::Message) -> Handled {
             unreachable!("Never type is empty")
-        }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("client probe does not use network actor messages")
         }
     }
 

@@ -7,7 +7,6 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
-use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::prelude::*;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -96,10 +95,10 @@ impl Require<UdpPort> for LocalEndpointManager {
     }
 }
 
-impl LocalActor for LocalEndpointManager {
+impl Actor for LocalEndpointManager {
     type Message = LocalEndpointManagerMessage;
 
-    fn receive(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             LocalEndpointManagerMessage::EnsureBound(ask) => {
                 let (promise, ()) = ask.take();
@@ -129,8 +128,6 @@ impl LocalActor for LocalEndpointManager {
         }
     }
 }
-
-impl_local_actor!(LocalEndpointManager);
 
 enum LocalEndpointManagerState {
     Unbound,

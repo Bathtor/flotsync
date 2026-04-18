@@ -22,7 +22,7 @@ use crate::{
     logging::erased_runtime_logger,
     pool::{EgressPool, IoBufferPools},
 };
-use ::kompact::{config::HoconExt, prelude::*};
+use ::kompact::prelude::*;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 /// Internal mailbox for the shared Kompact driver component.
@@ -893,7 +893,7 @@ impl ComponentLifecycle for IoDriverComponent {
         let bind_reuse_address = match self
             .ctx
             .config()
-            .get_or_default(&config_keys::BIND_REUSE_ADDRESS)
+            .read_or_default(&config_keys::BIND_REUSE_ADDRESS)
         {
             Ok(bind_reuse_address) => bind_reuse_address,
             Err(error) => {
@@ -940,10 +940,6 @@ impl Actor for IoDriverComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         self.handle_local_message(msg)
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("flotsync_io Kompact integration does not use network actor messages");
     }
 }
 

@@ -18,7 +18,6 @@ use crate::{
     errors::{Error, Result},
     logging::{RuntimeLogger, default_runtime_logger},
 };
-use ::kompact::prelude::{ChunkLease, ChunkRef};
 use bytes::{Buf, Bytes};
 #[cfg(test)]
 use futures_util::FutureExt;
@@ -286,8 +285,7 @@ impl fmt::Debug for PoolAvailabilityNotifier {
 /// [`IoLease::cursor`] to create an [`IoCursor`] for one consumer.
 #[derive(Clone)]
 pub struct IoLease {
-    /* `IoLease` deliberately hides whether the payload comes from a `flotsync_io` pool or from an externally produced Kompact buffer. */
-    inner: IoLeaseInner,
+    payload: Arc<PooledPayload>,
     offset: usize,
     len: usize,
 }
@@ -297,34 +295,7 @@ impl IoLease {
         let payload = Arc::new(PooledPayload::new(segments, recycler));
         let len = payload.len();
         Self {
-            inner: IoLeaseInner::Pooled(payload),
-            offset: 0,
-            len,
-        }
-    }
-
-    /// Wraps an externally produced Kompact `ChunkLease` in the `IoLease` abstraction.
-    ///
-    /// The mutable `ChunkLease` is converted into an immutable [`ChunkRef`] immediately so the
-    /// shared payload can be cloned cheaply and each consumer can create an independent cursor.
-    pub fn from_chunk_lease(lease: ChunkLease) -> Self {
-        let chunk_ref = lease.into_chunk_ref();
-        let len = chunk_ref.remaining();
-        Self {
-            inner: IoLeaseInner::External(chunk_ref),
-            offset: 0,
-            len,
-        }
-    }
-
-    /// Wraps an externally produced immutable Kompact `ChunkRef`.
-    ///
-    /// The wrapped payload starts at the `ChunkRef`'s current readable position and future cursors
-    /// will all see that same readable region.
-    pub fn from_chunk_ref(chunk_ref: ChunkRef) -> Self {
-        let len = chunk_ref.remaining();
-        Self {
-            inner: IoLeaseInner::External(chunk_ref),
+            payload,
             offset: 0,
             len,
         }
@@ -345,17 +316,12 @@ impl IoLease {
     /// Each cursor advances independently, so the same payload can be read many times before the
     /// shared memory is finally released.
     pub fn cursor(&self) -> IoCursor {
-        let mut inner = match &self.inner {
-            IoLeaseInner::External(chunk_ref) => IoCursorInner::External(chunk_ref.clone()),
-            IoLeaseInner::Pooled(payload) => {
-                IoCursorInner::Pooled(PooledCursor::new(Arc::clone(payload)))
-            }
-        };
+        let mut cursor = PooledCursor::new(Arc::clone(&self.payload));
         if self.offset > 0 {
-            inner.advance(self.offset);
+            cursor.advance(self.offset);
         }
         IoCursor {
-            inner,
+            inner: cursor,
             remaining: self.len,
         }
     }
@@ -366,7 +332,7 @@ impl IoLease {
             return None;
         }
         Some(Self {
-            inner: self.inner,
+            payload: self.payload,
             offset: self.offset + range.start,
             len: range.len(),
         })
@@ -381,16 +347,7 @@ impl IoLease {
             return Some(&[]);
         }
 
-        match &self.inner {
-            IoLeaseInner::External(chunk_ref) => {
-                let chunk = chunk_ref.chunk();
-                let end = self.offset.checked_add(self.len)?;
-                chunk.get(self.offset..end)
-            }
-            IoLeaseInner::Pooled(payload) => {
-                try_slice_one_pooled_segment(payload, self.offset, self.len)
-            }
-        }
+        try_slice_one_pooled_segment(&self.payload, self.offset, self.len)
     }
 
     /// Creates a byte-clone of the full readable payload contents.
@@ -417,18 +374,6 @@ impl IoLease {
             cursor.advance(chunk_len);
         }
         bytes
-    }
-}
-
-impl From<ChunkLease> for IoLease {
-    fn from(lease: ChunkLease) -> Self {
-        Self::from_chunk_lease(lease)
-    }
-}
-
-impl From<ChunkRef> for IoLease {
-    fn from(chunk_ref: ChunkRef) -> Self {
-        Self::from_chunk_ref(chunk_ref)
     }
 }
 
@@ -472,7 +417,7 @@ impl fmt::Debug for IoLease {
 /// duplicates the current position rather than rewinding to the start.
 #[derive(Clone)]
 pub struct IoCursor {
-    inner: IoCursorInner,
+    inner: PooledCursor,
     remaining: usize,
 }
 
@@ -493,41 +438,14 @@ impl Buf for IoCursor {
         if self.remaining == 0 {
             return &[];
         }
-        let chunk = match &self.inner {
-            IoCursorInner::External(chunk_ref) => chunk_ref.chunk(),
-            IoCursorInner::Pooled(cursor) => cursor.chunk(),
-        };
+        let chunk = self.inner.chunk();
         &chunk[..self.remaining.min(chunk.len())]
     }
 
     fn advance(&mut self, cnt: usize) {
         assert!(cnt <= self.remaining, "advanced past end of IoCursor");
-        match &mut self.inner {
-            IoCursorInner::External(chunk_ref) => chunk_ref.advance(cnt),
-            IoCursorInner::Pooled(cursor) => cursor.advance(cnt),
-        }
+        self.inner.advance(cnt);
         self.remaining -= cnt;
-    }
-}
-
-#[derive(Clone)]
-enum IoLeaseInner {
-    External(ChunkRef),
-    Pooled(Arc<PooledPayload>),
-}
-
-#[derive(Clone)]
-enum IoCursorInner {
-    External(ChunkRef),
-    Pooled(PooledCursor),
-}
-
-impl IoCursorInner {
-    fn advance(&mut self, cnt: usize) {
-        match self {
-            Self::External(chunk_ref) => chunk_ref.advance(cnt),
-            Self::Pooled(cursor) => cursor.advance(cnt),
-        }
     }
 }
 

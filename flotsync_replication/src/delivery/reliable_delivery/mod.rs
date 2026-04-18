@@ -16,8 +16,8 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{KClaimablePromise, LocalActor, NonOwningPhantomData, impl_local_actor};
-use kompact::{config::HoconExt, kompact_config, prelude::*};
+use flotsync_utils::{KClaimablePromise, NonOwningPhantomData};
+use kompact::{kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
@@ -264,7 +264,7 @@ impl ReliableDeliveryComponent {
     }
 
     fn load_retry_delay(&self) -> Duration {
-        match self.ctx.config().get_or_default(&config_keys::RETRY_DELAY) {
+        match self.ctx.config().read_or_default(&config_keys::RETRY_DELAY) {
             Ok(delay) => delay,
             Err(error) => {
                 warn!(
@@ -827,15 +827,13 @@ impl Require<TransportRouteDiscoveryPort> for ReliableDeliveryComponent {
     }
 }
 
-impl LocalActor for ReliableDeliveryComponent {
+impl Actor for ReliableDeliveryComponent {
     type Message = Never;
 
-    fn receive(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
         unreachable!("Message type cannot be instantiated");
     }
 }
-
-impl_local_actor!(ReliableDeliveryComponent);
 
 type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<TransportRouteKey>;
 type TransportRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
@@ -1059,10 +1057,6 @@ mod tests {
 
         fn receive_local(&mut self, _msg: Self::Message) -> Handled {
             unreachable!("Never type is empty")
-        }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("client probe does not use network actor messages")
         }
     }
 

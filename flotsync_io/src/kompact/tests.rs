@@ -122,10 +122,6 @@ impl Actor for TaggedSessionEventProbe {
             .expect("tagged TCP session event receiver must stay live during integration tests");
         Handled::Ok
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("tagged TCP session probe does not use network actor messages")
-    }
 }
 
 #[test]

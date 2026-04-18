@@ -1,7 +1,6 @@
 use super::{
     ChunkPoolState,
     IoLease,
-    IoLeaseInner,
     IoPoolConfig,
     LeaseRecycler,
     LeaseSegment,
@@ -171,9 +170,7 @@ impl EgressPool {
     }
 
     fn adopt_lease_in_place(&self, lease: &mut IoLease) -> Result<()> {
-        let IoLeaseInner::Pooled(payload) = &mut lease.inner else {
-            return Ok(());
-        };
+        let payload = &mut lease.payload;
         if payload.recycler.is_owned_by_egress(&self.inner) {
             return Ok(());
         }
@@ -215,15 +212,12 @@ impl EgressPool {
 
     /// Returns whether `payload` already needs no retargeting or copying for this egress pool.
     ///
-    /// This covers plain byte payloads, external leases, and pooled fragments already owned by the
-    /// same egress pool even when they are shared behind `Arc`.
+    /// This covers plain byte payloads and pooled fragments already owned by the same egress pool
+    /// even when they are shared behind `Arc`.
     fn payload_is_already_owned(&self, payload: &IoPayload) -> bool {
         match payload {
             IoPayload::Bytes(_) => true,
-            IoPayload::Lease(lease) => match &lease.inner {
-                IoLeaseInner::External(_) => true,
-                IoLeaseInner::Pooled(payload) => payload.recycler.is_owned_by_egress(&self.inner),
-            },
+            IoPayload::Lease(lease) => lease.payload.recycler.is_owned_by_egress(&self.inner),
             IoPayload::Chain(parts) => parts.iter().all(|part| self.payload_is_already_owned(part)),
         }
     }

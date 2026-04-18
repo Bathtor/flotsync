@@ -1,7 +1,5 @@
 use std::{fmt, future::Future, marker::PhantomData, pin::Pin};
 
-use kompact::prelude::{Handled, MessageBounds};
-
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
@@ -19,19 +17,6 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// parameter visible to the type system without modeling the enclosing type as
 /// logically owning a `T`.
 pub type NonOwningPhantomData<T> = PhantomData<fn() -> T>;
-
-/// Convenience actor API for components that only accept local Kompact messages.
-///
-/// This avoids repeating the same local-message handler signature in each
-/// component. Pair it with [`impl_local_actor!`] to generate the corresponding
-/// `ActorRaw` implementation with the unreachable network-message branch.
-pub trait LocalActor {
-    /// The type of local messages the actor accepts.
-    type Message: MessageBounds;
-
-    /// Handle an incoming local message.
-    fn receive(&mut self, msg: Self::Message) -> Handled;
-}
 
 pub trait OptionExt<T> {
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;
@@ -55,34 +40,6 @@ macro_rules! require {
     ($cond:expr, $err:expr) => {
         if !$cond {
             return Err($err);
-        }
-    };
-}
-
-/// Generates an [`ActorRaw`] implementation for a [`LocalActor`].
-///
-/// This keeps the per-component glue minimal for code that never uses
-/// Kompact's actor-level network message path.
-#[macro_export]
-macro_rules! impl_local_actor {
-    ($ty:ty) => {
-        impl ::kompact::prelude::ActorRaw for $ty {
-            type Message = <$ty as $crate::LocalActor>::Message;
-
-            #[allow(unreachable_code)]
-            fn receive(
-                &mut self,
-                env: ::kompact::prelude::MsgEnvelope<Self::Message>,
-            ) -> ::kompact::prelude::Handled {
-                match env {
-                    ::kompact::prelude::MsgEnvelope::Typed(msg) => {
-                        <Self as $crate::LocalActor>::receive(self, msg)
-                    }
-                    ::kompact::prelude::MsgEnvelope::Net(_) => {
-                        unreachable!("This actor only accepts local Kompact messages.");
-                    }
-                }
-            }
         }
     };
 }

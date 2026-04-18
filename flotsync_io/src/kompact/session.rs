@@ -328,10 +328,6 @@ impl Actor for TcpSession {
             TcpSessionMessage::DriverEvent(event) => self.handle_driver_event(event),
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("flotsync_io TCP sessions do not use network actor messages");
-    }
 }
 
 fn shutdown_session(session: &mut TcpSession) -> Handled {

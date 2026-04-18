@@ -27,7 +27,6 @@ use crate::{
     SharedGroupMemberships,
     api::{GroupId, MemberIdentity},
 };
-use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::{Never, prelude::*};
 use std::{collections::HashSet, sync::Arc};
 
@@ -228,14 +227,13 @@ impl Require<TransportInboundPort> for DeliveryIngressComponent {
         self.handle_transport_inbound(indication)
     }
 }
-impl LocalActor for DeliveryIngressComponent {
+impl Actor for DeliveryIngressComponent {
     type Message = Never;
 
-    fn receive(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
         unreachable!("Message type cannot be instantiated");
     }
 }
-impl_local_actor!(DeliveryIngressComponent);
 
 type TransportInboundPort = RouteTransportPort<TransportRouteKey>;
 type TransportGroupBroadcastInboundPort = GroupBroadcastInboundPort<TransportRouteKey>;
@@ -290,10 +288,6 @@ mod tests {
         fn receive_local(&mut self, _msg: Self::Message) -> Handled {
             unreachable!()
         }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("ingress tests do not use network actor messages")
-        }
     }
 
     #[derive(ComponentDefinition)]
@@ -333,10 +327,6 @@ mod tests {
         fn receive_local(&mut self, msg: Self::Message) -> Handled {
             match msg {}
         }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("ingress tests do not use network actor messages")
-        }
     }
 
     #[derive(ComponentDefinition)]
@@ -375,10 +365,6 @@ mod tests {
 
         fn receive_local(&mut self, _msg: Self::Message) -> Handled {
             unreachable!()
-        }
-
-        fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-            unreachable!("ingress tests do not use network actor messages")
         }
     }
 

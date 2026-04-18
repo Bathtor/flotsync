@@ -75,7 +75,6 @@ use crate::{
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::Schema;
 use flotsync_messages::buffa::Message as BuffaMessage;
-use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
@@ -861,10 +860,10 @@ impl Require<GroupBroadcastPort> for ReplicationRuntimeComponent {
     }
 }
 
-impl LocalActor for ReplicationRuntimeComponent {
+impl Actor for ReplicationRuntimeComponent {
     type Message = ReplicationRuntimeMessage;
 
-    fn receive(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
@@ -882,8 +881,6 @@ impl LocalActor for ReplicationRuntimeComponent {
         }
     }
 }
-
-impl_local_actor!(ReplicationRuntimeComponent);
 
 fn unavailable_api(operation: &'static str) -> ApiError {
     ApiError::UnsupportedOperation { operation }

@@ -36,13 +36,7 @@ use flotsync_udpour::{
     UDPourSendFailureReason,
     UDPourSubmitResult,
 };
-use flotsync_utils::{LocalActor, impl_local_actor};
-use kompact::{
-    Never,
-    config::{HoconExt, UsizeValue},
-    kompact_config,
-    prelude::*,
-};
+use kompact::{Never, config::UsizeValue, kompact_config, prelude::*};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -124,7 +118,7 @@ impl RouteTransportManager {
         let raw = match self
             .ctx
             .config()
-            .get_or_default(&config_keys::UDP_ACTIVATION_POLICY)
+            .read_or_default(&config_keys::UDP_ACTIVATION_POLICY)
         {
             Ok(value) => value,
             Err(error) => {
@@ -859,17 +853,15 @@ impl Require<UdpPort> for RouteTransportManager {
     }
 }
 
-impl LocalActor for RouteTransportManager {
+impl Actor for RouteTransportManager {
     type Message = TransportRouteTransportMessage;
 
-    fn receive(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             RouteTransportActorMessage::Submit(ask) => self.handle_submit(ask),
         }
     }
 }
-
-impl_local_actor!(RouteTransportManager);
 
 type TransportConnectionInfoPort = ConnectionInfoPort<TransportRouteKey>;
 type TransportRouteTransportMessage = RouteTransportActorMessage<TransportRouteKey>;
