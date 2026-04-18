@@ -8,6 +8,8 @@ readonly RUST_TOOLCHAIN="nightly-2026-04-11"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
+export CARGO_NET_GIT_FETCH_WITH_CLI="true"
+
 log() {
     printf '==> %s\n' "$*"
 }
@@ -106,6 +108,16 @@ setup_rust_toolchain() {
     )
 }
 
+prefetch_cargo_dependencies() {
+    require_command cargo
+
+    log "Fetching Cargo dependencies while network access is available"
+    (
+        cd "${repo_root}"
+        cargo fetch --locked
+    )
+}
+
 setup_buf() {
     local -a install_prefix=()
     local arch
@@ -198,6 +210,7 @@ main() {
     load_rustup_env
     setup_rust_toolchain
     setup_buf
+    prefetch_cargo_dependencies
     print_summary
 }
 

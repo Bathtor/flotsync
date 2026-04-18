@@ -65,7 +65,8 @@ If you want to reproduce the Linux CI environment from Codex web on Ubuntu, boot
 ```
 
 That setup pins the toolchain to `nightly-2026-04-11`, matching the local fmt/clippy toolchain on
-this repo.
+this repo, and it also runs `cargo fetch --locked` so the workspace dependencies are cached before
+the Codex web environment loses internet access.
 
 After the script finishes, run the same checks as `pr-linux`:
 
