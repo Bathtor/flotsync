@@ -282,7 +282,8 @@ fn exchange(addr: SocketAddr, chunks: &[&[u8]]) -> Vec<u8> {
 }
 
 struct SpawnedHttpServer {
-    _socket_lease: ReservedSocketLease,
+    socket_lease: ReservedSocketLease,
+    binding_released: bool,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -296,6 +297,7 @@ impl SpawnedHttpServer {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             if let Some(addr) = self.find_socket_addr(marker) {
+                self.release_reserved_binding();
                 return addr;
             }
 
@@ -338,6 +340,7 @@ impl SpawnedHttpServer {
         let mut output = child
             .wait_with_output()
             .expect("collect killed child output");
+        self.restore_reserved_binding();
         output.stdout = self.join_stdout();
         output.stderr = self.join_stderr();
         output
@@ -367,6 +370,7 @@ impl SpawnedHttpServer {
             }
         }
         let mut output = child.wait_with_output().expect("collect child output");
+        self.restore_reserved_binding();
         output.stdout = self.join_stdout();
         output.stderr = self.join_stderr();
         output
@@ -405,9 +409,28 @@ impl SpawnedHttpServer {
         self.stdin.take();
         let mut child = self.child.take().expect("live child process");
         let _status = child.wait().expect("wait for exited child process");
+        self.restore_reserved_binding();
         let stdout = self.join_stdout();
         let stderr = self.join_stderr();
         (stdout, stderr)
+    }
+
+    fn release_reserved_binding(&mut self) {
+        if self.binding_released {
+            return;
+        }
+        self.socket_lease.release_binding(0);
+        self.binding_released = true;
+    }
+
+    fn restore_reserved_binding(&mut self) {
+        if !self.binding_released {
+            return;
+        }
+        self.socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved HTTP listener");
+        self.binding_released = false;
     }
 
     fn panic_with_child_diagnostics(
@@ -484,7 +507,8 @@ fn spawn_http_server() -> SpawnedHttpServer {
         }
     });
     SpawnedHttpServer {
-        _socket_lease: socket_lease,
+        socket_lease,
+        binding_released: false,
         child: Some(child),
         stdin: Some(stdin),
         stdout,
