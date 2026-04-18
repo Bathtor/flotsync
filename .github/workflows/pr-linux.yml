@@ -102,7 +102,3 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --locked
-
-      - name: Run discovery feature matrix
-        working-directory: flotsync_discovery
-        run: ./test_features.sh

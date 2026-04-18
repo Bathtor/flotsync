@@ -41,7 +41,12 @@ use flotsync_udpour::UDPourConfig;
 use kompact::prelude::*;
 use std::{
     net::SocketAddr,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -90,7 +95,8 @@ impl Actor for DiscoveryRouteSource {
 /// harnesses layer ingress, probes, and route-discovery fixtures on top.
 pub(crate) struct TransportHarnessCore {
     system: KompactSystem,
-    external_socket_lease: ReservedSocketLease,
+    external_socket_lease: Mutex<ReservedSocketLease>,
+    external_socket_binding_released: AtomicBool,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     manager: Arc<Component<RouteTransportManager>>,
@@ -123,7 +129,8 @@ impl TransportHarnessCore {
 
         Self {
             system,
-            external_socket_lease,
+            external_socket_lease: Mutex::new(external_socket_lease),
+            external_socket_binding_released: AtomicBool::new(false),
             driver,
             bridge,
             manager,
@@ -172,9 +179,12 @@ impl TransportHarnessCore {
         timeout: Duration,
     ) -> (SocketId, SocketAddr) {
         let bind = match bind {
-            UdpLocalBind::Exact(addr) if addr.port() == 0 => {
-                UdpLocalBind::Exact(self.external_socket_lease.addr(0))
-            }
+            UdpLocalBind::Exact(addr) if addr.port() == 0 => UdpLocalBind::Exact(
+                self.external_socket_lease
+                    .lock()
+                    .expect("external socket lease lock")
+                    .addr(0),
+            ),
             other => other,
         };
         let request_id = UdpOpenRequestId::new();
@@ -209,10 +219,46 @@ impl TransportHarnessCore {
                 local_addr,
             } => {
                 assert_eq!(indicated_request_id, request_id);
+                self.release_external_socket_binding(local_addr);
                 (socket_id, local_addr)
             }
             other => unreachable!("filtered to Bound, got {other:?}"),
         }
+    }
+
+    fn release_external_socket_binding(&self, local_addr: SocketAddr) {
+        if self
+            .external_socket_binding_released
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut external_socket_lease = self
+            .external_socket_lease
+            .lock()
+            .expect("external socket lease lock");
+        if external_socket_lease.addr(0) != local_addr {
+            return;
+        }
+        external_socket_lease.release_binding(0);
+        self.external_socket_binding_released
+            .store(true, Ordering::Relaxed);
+    }
+
+    fn rebind_external_socket_binding(&self) {
+        if !self
+            .external_socket_binding_released
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
+        self.external_socket_lease
+            .lock()
+            .expect("external socket lease lock")
+            .rebind_binding(0)
+            .expect("rebind reserved external UDP socket");
+        self.external_socket_binding_released
+            .store(false, Ordering::Relaxed);
     }
 
     /// Wait for the route-transport manager to record one externally bound
@@ -267,6 +313,7 @@ impl TransportHarnessCore {
 
 impl Drop for TransportHarnessCore {
     fn drop(&mut self) {
+        self.rebind_external_socket_binding();
         let _ = self
             .system
             .kill_notify(self.observer.clone())

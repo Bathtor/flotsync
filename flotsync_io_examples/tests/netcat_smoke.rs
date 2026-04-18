@@ -290,7 +290,8 @@ fn udp_bind_replies_to_the_last_sender_without_explicit_target() {
 }
 
 struct SpawnedNetcat {
-    _socket_lease: Option<ReservedSocketLease>,
+    socket_lease: Option<ReservedSocketLease>,
+    binding_released: bool,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Arc<Mutex<Vec<u8>>>,
@@ -379,6 +380,7 @@ impl SpawnedNetcat {
         let deadline = Instant::now() + WAIT_TIMEOUT;
         loop {
             if let Some(addr) = self.find_socket_addr(marker) {
+                self.release_reserved_binding();
                 return addr;
             }
 
@@ -414,6 +416,7 @@ impl SpawnedNetcat {
             match child.try_wait().expect("poll child process") {
                 Some(_) => {
                     let mut output = child.wait_with_output().expect("collect child output");
+                    self.restore_reserved_binding();
                     output.stdout = self.join_stdout();
                     output.stderr = self.join_stderr();
                     return output;
@@ -453,6 +456,7 @@ impl SpawnedNetcat {
         let mut output = child
             .wait_with_output()
             .expect("collect killed child output");
+        self.restore_reserved_binding();
         output.stdout = self.join_stdout();
         output.stderr = self.join_stderr();
         output
@@ -496,9 +500,34 @@ impl SpawnedNetcat {
         self.stdin.take();
         let mut child = self.child.take().expect("live child process");
         let _status = child.wait().expect("wait for exited child process");
+        self.restore_reserved_binding();
         let stdout = self.join_stdout();
         let stderr = self.join_stderr();
         (stdout, stderr)
+    }
+
+    fn release_reserved_binding(&mut self) {
+        if self.binding_released {
+            return;
+        }
+        let Some(socket_lease) = self.socket_lease.as_mut() else {
+            return;
+        };
+        socket_lease.release_binding(0);
+        self.binding_released = true;
+    }
+
+    fn restore_reserved_binding(&mut self) {
+        if !self.binding_released {
+            return;
+        }
+        let Some(socket_lease) = self.socket_lease.as_mut() else {
+            return;
+        };
+        socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved netcat socket");
+        self.binding_released = false;
     }
 
     fn panic_with_child_diagnostics(
@@ -597,7 +626,8 @@ fn spawn_netcat_owned(
         }
     });
     SpawnedNetcat {
-        _socket_lease: socket_lease,
+        socket_lease,
+        binding_released: false,
         child: Some(child),
         stdin: Some(stdin),
         stdout,

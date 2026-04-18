@@ -111,9 +111,10 @@ fn tcp_driver_reports_connect_failure() {
 fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close() {
     init_test_logger();
 
-    let server_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut server_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener =
         bind_reserved_tcp_listener(&server_listener_lease, 0).expect("bind reserved TCP listener");
+    server_listener_lease.release_binding(0);
     let remote_addr = listener.local_addr().expect("listener addr");
     let (server_payload_tx, server_payload_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -199,9 +200,10 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
     assert_eq!(server_payload_rx.recv().expect("server payload"), *b"hello");
     server.join().expect("join server thread");
 
-    let abort_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut abort_listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener = bind_reserved_tcp_listener(&abort_listener_lease, 0)
         .expect("bind reserved second TCP listener");
+    abort_listener_lease.release_binding(0);
     let remote_addr = listener.local_addr().expect("second listener addr");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept second TCP stream");
@@ -256,6 +258,12 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
     }
 
     server.join().expect("join abort-close server thread");
+    server_listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
+    abort_listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     driver.shutdown().expect("driver shuts down");
 }
 
@@ -264,7 +272,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
  {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let driver = IoDriver::start(DriverConfig {
         bind_reuse_address: true,
         ..DriverConfig::default()
@@ -272,6 +280,7 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
     .expect("driver starts");
     let listener_id = reserve_listener(&driver);
     let listener_addr = listen_at(&driver, listener_id, listener_lease.addr(0));
+    listener_lease.release_binding(0);
 
     let mut accepted_client = TcpStream::connect(listener_addr).expect("connect accepted client");
     let accepted_connection_id = match wait_for_driver_event(&driver, |event| {
@@ -427,6 +436,9 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
         other => unreachable!("filtered to accepted-connection Closed event, got {other:?}"),
     }
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     driver.shutdown().expect("driver shuts down");
 }
 
@@ -434,9 +446,10 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 fn tcp_driver_reports_read_and_write_flow_control_transitions() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener = bind_reserved_tcp_listener(&listener_lease, 0)
         .expect("bind reserved flow-control TCP listener");
+    listener_lease.release_binding(0);
     let remote_addr = listener.local_addr().expect("flow-control listener addr");
     let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -621,5 +634,8 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
     }
 
     server.join().expect("join flow-control server thread");
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     driver.shutdown().expect("driver shuts down");
 }
