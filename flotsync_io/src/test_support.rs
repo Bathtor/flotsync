@@ -49,10 +49,11 @@ pub enum ReservedSocketKind {
 
 /// Lease over one reserved-socket request.
 ///
-/// Each entry keeps one live reservation socket open for the whole test so the
-/// OS continues to account for that port while the actual driver, bridge, or
-/// child process binds against the same address with the test-only re-use
-/// option enabled.
+/// Each entry starts with one live reservation socket open so the OS continues
+/// to account for that port while the actual driver, bridge, or child process
+/// binds against the same address with the test-only re-use option enabled.
+/// Tests may temporarily release and later re-bind the hidden reservation
+/// socket while still keeping ownership of the lease slot.
 #[derive(Debug)]
 pub struct ReservedSocketLease {
     reserved: Vec<ReservedSocket>,
@@ -78,11 +79,35 @@ impl ReservedSocketLease {
     pub fn is_empty(&self) -> bool {
         self.reserved.is_empty()
     }
+
+    /// Closes the live reservation socket at `index` without returning the
+    /// lease slot to the broker.
+    ///
+    /// Tests use this after the real system socket has bound the reserved port,
+    /// so the hidden reservation socket can no longer race to receive inbound
+    /// UDP traffic on Linux.
+    pub fn release_binding(&mut self, index: usize) {
+        self.reserved[index].release_binding();
+    }
+
+    /// Re-binds the reservation socket at `index` to its original address.
+    ///
+    /// Tests use this before teardown so the lease once again owns a live
+    /// reservation socket before the driver or bridge releases the port.
+    pub fn rebind_binding(&mut self, index: usize) -> io::Result<()> {
+        self.reserved[index].ensure_bound()
+    }
 }
 
 impl Drop for ReservedSocketLease {
     fn drop(&mut self) {
-        RESERVED_SOCKET_BROKER.release(std::mem::take(&mut self.reserved));
+        let mut rebound = Vec::with_capacity(self.reserved.len());
+        for mut reserved in std::mem::take(&mut self.reserved) {
+            if reserved.ensure_bound().is_ok() {
+                rebound.push(reserved);
+            }
+        }
+        RESERVED_SOCKET_BROKER.release(rebound);
     }
 }
 
@@ -222,10 +247,10 @@ static RESERVED_SOCKET_BROKER: LazyLock<ReservedSocketBroker> =
 /// Coordinates process-local socket reservations across concurrently running
 /// tests.
 ///
-/// The broker keeps live reservation sockets open until the corresponding
-/// lease is dropped. That means the OS continues to account for those ports
-/// while the real driver, bridge, or child process binds the same address with
-/// the test-only re-use option enabled.
+/// The broker hands out leases whose reservation sockets start out live. Leases
+/// may temporarily release those hidden sockets, but they keep ownership of the
+/// reservation slots until drop, at which point any successfully rebound
+/// sockets are returned to the broker's idle pool.
 #[derive(Debug)]
 struct ReservedSocketBroker {
     state: Mutex<ReservedSocketBrokerState>,
@@ -372,32 +397,19 @@ impl ReservedSocketBrokerState {
 
 /// One live reservation socket held on behalf of one test.
 ///
-/// `_socket` is intentionally never used directly after construction. Its only
-/// job is to keep the reserved port allocated until the owning lease is
-/// dropped.
+/// `socket` is intentionally never used directly after construction. Its only
+/// job is to keep the reserved port allocated whenever the owning lease wants
+/// the hidden reservation socket to stay bound.
 #[derive(Debug)]
 struct ReservedSocket {
     kind: ReservedSocketKind,
     addr: SocketAddr,
-    _socket: Socket,
+    socket: Option<Socket>,
 }
 
 impl ReservedSocket {
     fn open(kind: ReservedSocketKind) -> io::Result<Self> {
-        let socket = match kind {
-            ReservedSocketKind::TcpListener => Socket::new(
-                socket_domain(localhost(0)),
-                Type::STREAM,
-                Some(Protocol::TCP),
-            )?,
-            ReservedSocketKind::UdpSocket => Socket::new(
-                socket_domain(localhost(0)),
-                Type::DGRAM,
-                Some(Protocol::UDP),
-            )?,
-        };
-        configure_bind_reuse(&socket)?;
-        socket.bind(&SockAddr::from(localhost(0)))?;
+        let socket = Self::bind_socket(kind, localhost(0))?;
         let addr = socket
             .local_addr()?
             .as_socket()
@@ -405,8 +417,37 @@ impl ReservedSocket {
         Ok(Self {
             kind,
             addr,
-            _socket: socket,
+            socket: Some(socket),
         })
+    }
+
+    fn bind_socket(kind: ReservedSocketKind, addr: SocketAddr) -> io::Result<Socket> {
+        let socket = match kind {
+            ReservedSocketKind::TcpListener => {
+                Socket::new(socket_domain(addr), Type::STREAM, Some(Protocol::TCP))?
+            }
+            ReservedSocketKind::UdpSocket => {
+                Socket::new(socket_domain(addr), Type::DGRAM, Some(Protocol::UDP))?
+            }
+        };
+        configure_bind_reuse(&socket)?;
+        socket.bind(&SockAddr::from(addr))?;
+        if matches!(kind, ReservedSocketKind::TcpListener) {
+            socket.listen(128)?;
+        }
+        Ok(socket)
+    }
+
+    fn release_binding(&mut self) {
+        self.socket = None;
+    }
+
+    fn ensure_bound(&mut self) -> io::Result<()> {
+        if self.socket.is_some() {
+            return Ok(());
+        }
+        self.socket = Some(Self::bind_socket(self.kind, self.addr)?);
+        Ok(())
     }
 }
 

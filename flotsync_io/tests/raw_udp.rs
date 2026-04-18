@@ -54,7 +54,7 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
 fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
     init_test_logger();
 
-    let socket_lease =
+    let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let driver = IoDriver::start(DriverConfig {
         bind_reuse_address: true,
@@ -67,6 +67,8 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
 
     let receiver_addr = bind_socket_at(&driver, receiver_id, socket_lease.addr(0));
     let sender_addr = bind_socket_at(&driver, sender_id, socket_lease.addr(1));
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
 
     driver
         .dispatch(DriverCommand::Udp(UdpCommand::Send {
@@ -223,6 +225,12 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
         other => unreachable!("filtered to UDP SendNack event, got {other:?}"),
     }
 
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved UDP receiver");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved UDP sender");
     driver.shutdown().expect("driver shuts down");
 }
 
@@ -317,7 +325,7 @@ fn udp_driver_reports_bind_failures_and_socket_configuration_changes() {
 fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
     init_test_logger();
 
-    let socket_lease =
+    let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let pool_config = IoPoolConfig {
         chunk_size: MAX_UDP_PAYLOAD_BYTES,
@@ -339,6 +347,8 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
     let sender_id = reserve_socket(&driver);
     let receiver_addr = bind_socket_at(&driver, receiver_id, socket_lease.addr(0));
     bind_socket_at(&driver, sender_id, socket_lease.addr(1));
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
 
     for (transmission_id, payload) in [
         (TransmissionId(10), Bytes::from_static(b"first")),
@@ -485,5 +495,11 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
     // Once a send on the closed socket has already been nacked, the driver
     // must stay quiet instead of surfacing any delayed follow-up outcome.
     assert_no_driver_event(&driver, Duration::from_millis(500));
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved UDP receiver");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved UDP sender");
     driver.shutdown().expect("driver shuts down");
 }

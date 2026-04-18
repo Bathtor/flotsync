@@ -21,7 +21,7 @@ use std::{sync::mpsc, time::Duration};
 fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     init_test_logger();
 
-    let socket_lease =
+    let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -134,6 +134,8 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
             } if *request_id == sender_request_id
         )
     });
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
 
     let option = UdpSocketOption::Broadcast(true);
     observer1.on_definition(|component| {
@@ -229,6 +231,12 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
         other => unreachable!("filtered to mirrored UDP Received indication, got {other:?}"),
     }
 
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved UDP receiver");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved UDP sender");
     drop(bridge_handle);
     drop(bridge_to_observer1);
     drop(bridge_to_observer2);

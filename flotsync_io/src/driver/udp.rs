@@ -1036,7 +1036,7 @@ mod tests {
     fn udp_unconnected_bind_send_and_receive_work() {
         init_test_logger();
 
-        let socket_lease =
+        let mut socket_lease =
             reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
         let driver = start_bind_reuse_driver(DriverConfig::default());
         let receiver_id = resolve_request(driver.reserve_socket());
@@ -1044,6 +1044,8 @@ mod tests {
 
         let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
         let sender_addr = bind_udp_socket_at(&driver, sender_id, socket_lease.addr(1));
+        socket_lease.release_binding(0);
+        socket_lease.release_binding(1);
         let transmission_id = TransmissionId(1);
 
         driver
@@ -1081,6 +1083,12 @@ mod tests {
 
         assert_eq!(received_payload.expect("received payload"), b"hello"[..]);
 
+        socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved UDP receiver");
+        socket_lease
+            .rebind_binding(1)
+            .expect("rebind reserved UDP sender");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1088,12 +1096,13 @@ mod tests {
     fn udp_connected_send_and_receive_work() {
         init_test_logger();
 
-        let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let mut socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
         let driver = start_bind_reuse_driver(DriverConfig::default());
         let receiver_id = resolve_request(driver.reserve_socket());
         let sender_id = resolve_request(driver.reserve_socket());
 
         let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
+        socket_lease.release_binding(0);
 
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Connect {
@@ -1158,6 +1167,9 @@ mod tests {
 
         assert_eq!(received_payload.expect("received payload"), b"world"[..]);
 
+        socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved UDP receiver");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1415,7 +1427,7 @@ mod tests {
             },
             ..DriverConfig::default()
         };
-        let socket_lease =
+        let mut socket_lease =
             reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
         let driver = start_bind_reuse_driver(driver_config);
         let receiver_id = resolve_request(driver.reserve_socket());
@@ -1423,6 +1435,8 @@ mod tests {
 
         let receiver_addr = bind_udp_socket_at(&driver, receiver_id, socket_lease.addr(0));
         bind_udp_socket_at(&driver, sender_id, socket_lease.addr(1));
+        socket_lease.release_binding(0);
+        socket_lease.release_binding(1);
 
         driver
             .dispatch(DriverCommand::Udp(UdpCommand::Send {
@@ -1527,6 +1541,12 @@ mod tests {
 
         assert_eq!(third_payload.expect("third payload"), b"third"[..]);
 
+        socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved UDP receiver");
+        socket_lease
+            .rebind_binding(1)
+            .expect("rebind reserved UDP sender");
         driver.shutdown().expect("driver shuts down");
     }
 

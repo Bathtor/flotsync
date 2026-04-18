@@ -268,7 +268,7 @@ fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     init_test_logger();
 
-    let socket_lease =
+    let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -381,6 +381,8 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
             } if *request_id == sender_request_id
         )
     });
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
 
     observer1.on_definition(|component| {
         component.udp.trigger(UdpRequest::Send {
@@ -450,6 +452,12 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
         other => unreachable!("filtered to UDP receive, got {other:?}"),
     }
 
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved UDP receiver");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved UDP sender");
     drop(bridge_handle);
     drop(_bridge_to_observer1);
     drop(_bridge_to_observer2);
