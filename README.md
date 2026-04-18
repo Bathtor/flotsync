@@ -49,13 +49,6 @@ Run the full workspace tests:
 cargo test --workspace
 ```
 
-Run discovery feature-matrix checks:
-
-```bash
-cd flotsync_discovery
-./test_features.sh
-```
-
 ### Codex Web on Ubuntu
 
 If you want to reproduce the Linux CI environment from Codex web on Ubuntu, bootstrap the host with:
@@ -77,8 +70,6 @@ buf lint
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 cargo test --workspace --locked
-cd flotsync_discovery
-./test_features.sh
 ```
 
 ## Roadmap
