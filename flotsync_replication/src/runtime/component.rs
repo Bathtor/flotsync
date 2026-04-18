@@ -282,7 +282,7 @@ impl ReplicationRuntimeComponent {
             let schema = schema.ok_or_else(|| DatasetSchemaLoadError::Missing {
                 dataset_id: dataset_id.clone(),
             })?;
-            loaded_schemas.insert(dataset_id, schema);
+            loaded_schemas.insert(dataset_id, schema.into_shared());
         }
         Ok(loaded_schemas)
     }
