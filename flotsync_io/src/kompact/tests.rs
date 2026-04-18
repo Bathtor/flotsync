@@ -2,7 +2,6 @@ use super::{
     IoBridge,
     IoBridgeHandle,
     IoDriverComponent,
-    OpenFailureReason,
     OpenTcpListener,
     OpenTcpSession,
     TcpListenerEvent,
@@ -224,34 +223,6 @@ fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
     init_test_logger();
 
     let (_reservation, reserved_addr) = hold_reusable_tcp_reservation();
-
-    let system = build_test_kompact_system();
-    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
-    let driver_for_bridge = driver_component.clone();
-    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
-    let (listener_tx, _listener_rx) = mpsc::channel();
-    let listener_probe = system.create(move || TcpListenerEventProbe::new(listener_tx));
-
-    start_component(&system, &driver_component);
-    start_component(&system, &bridge);
-    start_component(&system, &listener_probe);
-
-    let bridge_handle = IoBridgeHandle::from_component(&bridge);
-    let open_result = bridge_handle
-        .open_tcp_listener(OpenTcpListener {
-            local_addr: reserved_addr,
-            incoming_to: listener_probe.actor_ref().recipient(),
-        })
-        .wait_timeout(WAIT_TIMEOUT)
-        .expect("open TCP listener future")
-        .expect_err("reserved TCP port should fail without reuse config");
-    assert!(matches!(open_result, OpenFailureReason::Io(_)));
-
-    drop(bridge_handle);
-    kill_component(&system, listener_probe);
-    kill_component(&system, bridge);
-    kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
 
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));

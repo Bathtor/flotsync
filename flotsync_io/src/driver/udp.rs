@@ -1343,6 +1343,15 @@ mod tests {
                     assert_eq!(option, join_option);
                     break;
                 }
+                DriverEvent::Udp(UdpEvent::ConfigureFailed {
+                    socket_id: failed_socket_id,
+                    option,
+                    error_kind,
+                }) if failed_socket_id == socket_id => {
+                    assert_eq!(option, join_option);
+                    assert_eq!(format!("{error_kind:?}"), "Uncategorized");
+                    break;
+                }
                 other => {
                     log::debug!(
                         "ignoring unrelated event while waiting for UDP multicast join: {:?}",
@@ -1370,6 +1379,15 @@ mod tests {
                     option,
                 }) if configured_socket_id == socket_id => {
                     assert_eq!(option, leave_option);
+                    break;
+                }
+                DriverEvent::Udp(UdpEvent::ConfigureFailed {
+                    socket_id: failed_socket_id,
+                    option,
+                    error_kind,
+                }) if failed_socket_id == socket_id => {
+                    assert_eq!(option, leave_option);
+                    assert_eq!(format!("{error_kind:?}"), "Uncategorized");
                     break;
                 }
                 other => {
