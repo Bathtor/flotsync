@@ -475,7 +475,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
 fn udp_bridge_broadcasts_socket_configuration_indications() {
     init_test_logger();
 
-    let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let mut socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -533,6 +533,7 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
             } if *observed_request_id == request_id
         )
     });
+    socket_lease.release_binding(0);
 
     let option = UdpSocketOption::Broadcast(true);
     observer1.on_definition(|component| {
@@ -578,6 +579,9 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
         other => unreachable!("filtered to UDP Configured, got {other:?}"),
     }
 
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved UDP socket");
     drop(bridge_handle);
     drop(_bridge_to_observer1);
     drop(_bridge_to_observer2);
@@ -593,9 +597,10 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
 fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener =
         bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+    listener_lease.release_binding(0);
     let remote_addr = listener.local_addr().expect("listener address");
     let (server_tx, server_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -681,6 +686,9 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     );
 
     server.join().expect("join TCP server thread");
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(opened_session);
     drop(bridge_handle);
     kill_component(&system, event_probe);
@@ -693,7 +701,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
 fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -718,6 +726,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
         .expect("TCP listener open future")
         .expect("TCP listener open");
     let listener_addr = opened_listener.local_addr;
+    listener_lease.release_binding(0);
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
     let pending = match recv_until(&listener_events_rx, |event| {
@@ -774,6 +783,9 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
         other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
     }
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(client);
     drop(session_ref);
     drop(opened_listener);
@@ -789,7 +801,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -814,6 +826,7 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
         .expect("TCP listener open future")
         .expect("TCP listener open");
     let listener_addr = opened_listener.local_addr;
+    listener_lease.release_binding(0);
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
     let pending = match recv_until(&listener_events_rx, |event| {
@@ -869,6 +882,9 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
         other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
     }
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(client);
     drop(session_ref);
     drop(opened_listener);
@@ -884,7 +900,7 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
 fn dropping_pending_tcp_session_rejects_the_connection() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -906,6 +922,7 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
         .expect("TCP listener open future")
         .expect("TCP listener open");
     let listener_addr = opened_listener.local_addr;
+    listener_lease.release_binding(0);
 
     let mut client = std::net::TcpStream::connect(listener_addr).expect("connect TCP client");
     client
@@ -944,6 +961,9 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
         other => unreachable!("filtered to TCP listener Closed, got {other:?}"),
     }
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(client);
     drop(opened_listener);
     drop(bridge_handle);

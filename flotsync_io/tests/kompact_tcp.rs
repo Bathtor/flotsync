@@ -29,9 +29,10 @@ use std::{
 fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_owner_only() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener =
         bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+    listener_lease.release_binding(0);
     let remote_addr = listener.local_addr().expect("listener addr");
     let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
     let server = thread::spawn(move || {
@@ -149,6 +150,9 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
     );
 
     server.join().expect("join server thread");
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(opened_session);
     drop(bridge_handle);
     kill_component(&system, session_probe1);
@@ -163,7 +167,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
  {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -188,6 +192,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         .expect("open TCP listener future")
         .expect("open TCP listener");
     let listener_addr = opened_listener.local_addr;
+    listener_lease.release_binding(0);
 
     let mut accepted_client = TcpStream::connect(listener_addr).expect("connect accepted client");
     accepted_client
@@ -271,6 +276,9 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
         matches!(event, TcpSessionEvent::Closed { .. })
     });
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(session_ref);
     drop(opened_listener);
     drop(bridge_handle);
@@ -285,7 +293,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
 fn dropping_pending_tcp_session_auto_rejects_the_connection() {
     init_test_logger();
 
-    let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+    let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
     let driver_for_bridge = driver_component.clone();
@@ -307,6 +315,7 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
         .expect("open TCP listener future")
         .expect("open TCP listener");
     let listener_addr = opened_listener.local_addr;
+    listener_lease.release_binding(0);
 
     let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
     client
@@ -341,6 +350,9 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
         matches!(event, TcpListenerEvent::Closed)
     });
 
+    listener_lease
+        .rebind_binding(0)
+        .expect("rebind reserved TCP listener");
     drop(opened_listener);
     drop(bridge_handle);
     kill_component(&system, listener_probe);

@@ -1459,7 +1459,7 @@ mod tests {
     fn tcp_listener_accept_requires_adoption_before_reads() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let driver = start_bind_reuse_driver();
         let listener_id = resolve_request(driver.reserve_listener());
         driver
@@ -1485,6 +1485,7 @@ mod tests {
                 }
             }
         };
+        listener_lease.release_binding(0);
 
         let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
         let accepted_connection_id = loop {
@@ -1535,6 +1536,9 @@ mod tests {
         }
 
         drop(client);
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1542,7 +1546,7 @@ mod tests {
     fn tcp_listener_reject_closes_pending_connection() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let driver = start_bind_reuse_driver();
         let listener_id = resolve_request(driver.reserve_listener());
         driver
@@ -1563,6 +1567,7 @@ mod tests {
                 _ => {}
             }
         };
+        listener_lease.release_binding(0);
 
         let mut client = TcpStream::connect(listener_addr).expect("connect TCP client");
         client
@@ -1601,7 +1606,9 @@ mod tests {
             other => panic!("unexpected client read result after reject: {other:?}"),
         }
         assert_no_event(&driver, Duration::from_millis(50));
-
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1609,9 +1616,10 @@ mod tests {
     fn tcp_connect_send_and_receive_work() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let (server_tx, server_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1686,6 +1694,9 @@ mod tests {
         assert_eq!(received_payload.expect("received payload"), b"world"[..]);
 
         server.join().expect("join server thread");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1734,9 +1745,10 @@ mod tests {
     fn tcp_send_while_another_send_is_pending_is_nacked() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (_stream, _) = listener.accept().expect("accept TCP stream");
@@ -1810,6 +1822,9 @@ mod tests {
         }
 
         server.join().expect("join server thread");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1817,9 +1832,10 @@ mod tests {
     fn tcp_write_resumes_after_pending_send_drains() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let (start_read_tx, start_read_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1909,6 +1925,9 @@ mod tests {
         }
 
         server.join().expect("join server thread");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -1916,9 +1935,10 @@ mod tests {
     fn tcp_graceful_close_waits_for_pending_send() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let (server_tx, server_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
@@ -1994,6 +2014,9 @@ mod tests {
         assert_eq!(server_rx.recv().expect("server payload"), *b"hello");
 
         server.join().expect("join server thread");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -2001,9 +2024,10 @@ mod tests {
     fn tcp_send_and_close_supports_chained_payloads() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept TCP stream");
@@ -2074,6 +2098,9 @@ mod tests {
 
         let received = server.join().expect("join server thread");
         assert_eq!(received, b"hello");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 
@@ -2081,9 +2108,10 @@ mod tests {
     fn tcp_read_suspends_and_resumes_when_ingress_capacity_returns() {
         init_test_logger();
 
-        let listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
+        let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
         let listener =
             bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
+        listener_lease.release_binding(0);
         let remote_addr = listener.local_addr().expect("listener addr");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept TCP stream");
@@ -2204,6 +2232,9 @@ mod tests {
         assert_eq!(third_payload.expect("third payload").len(), 44);
 
         server.join().expect("join server thread");
+        listener_lease
+            .rebind_binding(0)
+            .expect("rebind reserved TCP listener");
         driver.shutdown().expect("driver shuts down");
     }
 }
