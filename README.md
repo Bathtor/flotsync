@@ -38,6 +38,8 @@ This repository uses `bd` (beads) as the source of truth for tasks and dependenc
 
 This workspace currently uses nightly-only features in source code (for example `#![feature(...)]` in
 `flotsync_core/src/lib.rs` and `flotsync_data_types/src/lib.rs`), so a nightly Rust toolchain is currently expected.
+The Linux formatting and clippy checks are pinned to `nightly-2026-04-11` so CI matches local
+development for those tools, while the test workflows continue to follow floating `nightly`.
 
 ### Commands
 
@@ -50,6 +52,30 @@ cargo test --workspace
 Run discovery feature-matrix checks:
 
 ```bash
+cd flotsync_discovery
+./test_features.sh
+```
+
+### Codex Web on Ubuntu
+
+If you want to reproduce the Linux CI environment from Codex web on Ubuntu, bootstrap the host with:
+
+```bash
+./scripts/setup-codex-web-ubuntu.sh
+```
+
+That setup pins the toolchain to `nightly-2026-04-11`, matching the local fmt/clippy toolchain on
+this repo.
+
+After the script finishes, run the same checks as `pr-linux`:
+
+```bash
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+buf format --diff --exit-code
+buf lint
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
+cargo test --workspace --locked
 cd flotsync_discovery
 ./test_features.sh
 ```
