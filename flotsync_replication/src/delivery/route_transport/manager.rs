@@ -1492,9 +1492,10 @@ mod tests {
     #[test]
     fn udp_manager_sends_payload_over_real_socket() {
         let harness = UdpManagerHarness::new();
-        let receiver_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let mut receiver_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
         let receiver =
             bind_reserved_udp_socket(&receiver_lease, 0).expect("bind reserved raw UDP receiver");
+        receiver_lease.release_binding(0);
         receiver
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set UDP read timeout");
@@ -1519,17 +1520,22 @@ mod tests {
             .recv_from(&mut buffer)
             .expect("receive UDP datagram from managed sender");
         assert!(buffer[..len].ends_with(b"hello route transport"));
+        receiver_lease
+            .rebind_binding(0)
+            .expect("rebind reserved raw UDP receiver");
     }
 
     #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
         let harness = UdpManagerHarness::new();
-        let receiver_lease =
+        let mut receiver_lease =
             reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
         let receiver1 = bind_reserved_udp_socket(&receiver_lease, 0)
             .expect("bind first reserved raw UDP receiver");
         let receiver2 = bind_reserved_udp_socket(&receiver_lease, 1)
             .expect("bind second reserved raw UDP receiver");
+        receiver_lease.release_binding(0);
+        receiver_lease.release_binding(1);
         receiver1
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set first UDP read timeout");
@@ -1575,6 +1581,12 @@ mod tests {
         assert!(buffer1[..len1].ends_with(b"first target"));
         assert!(buffer2[..len2].ends_with(b"second target"));
         assert_eq!(source1, source2);
+        receiver_lease
+            .rebind_binding(0)
+            .expect("rebind first reserved raw UDP receiver");
+        receiver_lease
+            .rebind_binding(1)
+            .expect("rebind second reserved raw UDP receiver");
     }
 
     #[test]

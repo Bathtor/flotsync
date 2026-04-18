@@ -365,7 +365,7 @@ impl Actor for ScriptedUdpProxy {
 struct RuntimeHarness {
     system: KompactSystem,
     manual_timer: Option<KompactManualTimer>,
-    _socket_lease: ReservedSocketLease,
+    socket_lease: ReservedSocketLease,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
     observer: Arc<Component<UdpObserver>>,
@@ -498,7 +498,7 @@ impl RuntimeHarness {
         } = config;
         let (system, manual_timer) =
             build_runtime_test_kompact_system(send_rate_control, manual_time);
-        let socket_lease =
+        let mut socket_lease =
             reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
 
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -525,6 +525,8 @@ impl RuntimeHarness {
             bind_socket(&observer, &observer_rx, socket_lease.addr(0));
         let (receiver_socket_id, receiver_addr) =
             bind_socket(&observer, &observer_rx, socket_lease.addr(1));
+        socket_lease.release_binding(0);
+        socket_lease.release_binding(1);
 
         let config = UDPourConfig::new(sender_config, receiver_config).unwrap();
         let sender_proxy = system.create(move || {
@@ -592,7 +594,7 @@ impl RuntimeHarness {
         Self {
             system,
             manual_timer,
-            _socket_lease: socket_lease,
+            socket_lease,
             driver,
             bridge,
             observer,
@@ -859,7 +861,13 @@ impl RuntimeHarness {
             .expect("timed out waiting for receiver probe barrier");
     }
 
-    fn shutdown(self) {
+    fn shutdown(mut self) {
+        self.socket_lease
+            .rebind_binding(0)
+            .expect("rebind reserved sender UDP socket");
+        self.socket_lease
+            .rebind_binding(1)
+            .expect("rebind reserved receiver UDP socket");
         kill_component(&self.system, self.receiver_probe);
         kill_component(&self.system, self.sender_probe);
         kill_component(&self.system, self.receiver_runtime);
