@@ -142,10 +142,6 @@ impl Actor for TransferProbe {
             }
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TransferProbe does not use network actor messages")
-    }
 }
 
 #[derive(Debug)]
@@ -363,10 +359,6 @@ impl Actor for ScriptedUdpProxy {
 
     fn receive_local(&mut self, _msg: Self::Message) -> Handled {
         unreachable!("Never type is empty")
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("ScriptedUdpProxy does not use network actor messages")
     }
 }
 

@@ -3,7 +3,6 @@ use crate::delivery::route_transport::{
     RouteDiscoveryPort,
     TransportRouteKey,
 };
-use flotsync_utils::{LocalActor, impl_local_actor};
 use kompact::prelude::*;
 
 #[derive(Debug)]
@@ -36,10 +35,10 @@ impl Provide<RouteDiscoveryPort<TransportRouteKey>> for RuntimeDiscoverySource {
     }
 }
 
-impl LocalActor for RuntimeDiscoverySource {
+impl Actor for RuntimeDiscoverySource {
     type Message = RuntimeDiscoverySourceMessage;
 
-    fn receive(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             RuntimeDiscoverySourceMessage::Publish(update) => {
                 self.discovery.trigger(update);
@@ -48,5 +47,3 @@ impl LocalActor for RuntimeDiscoverySource {
         }
     }
 }
-
-impl_local_actor!(RuntimeDiscoverySource);

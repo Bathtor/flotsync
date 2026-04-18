@@ -279,10 +279,6 @@ impl Actor for HttpListenerComponent {
             HttpListenerMessage::ShutdownRequested => self.handle_shutdown_requested(),
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("HTTP listener example does not use network actor messages")
-    }
 }
 
 /// Session lifecycle for one accepted HTTP connection.
@@ -696,10 +692,6 @@ impl Actor for HttpConnectionComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         self.handle_session_event(msg)
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("HTTP connection example does not use network actor messages")
     }
 }
 

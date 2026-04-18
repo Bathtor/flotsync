@@ -19,7 +19,7 @@ use crate::{
 };
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
 use flotsync_udpour::UDPourConfig;
-use kompact::{KompactLogger, config::HoconExt, prelude::*};
+use kompact::{KompactLogger, prelude::*};
 use snafu::prelude::*;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -97,14 +97,14 @@ impl DeliveryRuntimeHostConfig {
     fn from_system_config(system: &KompactSystem) -> Result<Self, RuntimeHostError> {
         let control_timeout = system
             .config()
-            .get_or_default(&config_keys::CONTROL_TIMEOUT)
+            .read_or_default(&config_keys::CONTROL_TIMEOUT)
             .map_err(|error| RuntimeHostError::InvalidConfig {
                 key: config_keys::CONTROL_TIMEOUT.key,
                 message: error.to_string(),
             })?;
         let local_endpoint_bind_addr = system
             .config()
-            .get_or_default(&config_keys::LOCAL_ENDPOINT_BIND_ADDR)
+            .read_or_default(&config_keys::LOCAL_ENDPOINT_BIND_ADDR)
             .map_err(|error| RuntimeHostError::InvalidConfig {
                 key: config_keys::LOCAL_ENDPOINT_BIND_ADDR.key,
                 message: error.to_string(),

@@ -472,8 +472,4 @@ impl Actor for UdpNetcat {
             UdpNetcatMessage::SendResult(result) => self.handle_send_result(result),
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("UDP netcat does not use network actor messages")
-    }
 }

@@ -325,10 +325,6 @@ impl Actor for TcpListener {
             }
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("flotsync_io TCP listeners do not use network actor messages");
-    }
 }
 
 fn shutdown_listener(listener: &mut TcpListener) -> Handled {

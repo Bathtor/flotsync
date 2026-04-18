@@ -799,10 +799,6 @@ impl Actor for UdpObserver {
             }
         }
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("UDP observer test component does not use network actor messages")
-    }
 }
 
 /// Test actor that forwards UDP send results to an `mpsc` channel.
@@ -832,10 +828,6 @@ impl Actor for UdpSendResultProbe {
             .send(msg)
             .expect("UDP send result receiver must stay live during integration tests");
         Handled::Ok
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("UDP send result probe does not use network actor messages")
     }
 }
 
@@ -867,10 +859,6 @@ impl Actor for TcpSessionEventProbe {
             .expect("TCP session event receiver must stay live during integration tests");
         Handled::Ok
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP session probe does not use network actor messages")
-    }
 }
 
 /// Test actor that forwards TCP listener events to an `mpsc` channel.
@@ -900,10 +888,6 @@ impl Actor for TcpListenerEventProbe {
             .send(msg)
             .expect("TCP listener event receiver must stay live during integration tests");
         Handled::Ok
-    }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("TCP listener probe does not use network actor messages")
     }
 }
 

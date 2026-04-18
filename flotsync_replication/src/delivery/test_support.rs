@@ -82,10 +82,6 @@ impl Actor for DiscoveryRouteSource {
     fn receive_local(&mut self, _msg: Self::Message) -> Handled {
         unreachable!("Never type is empty")
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unreachable!("route discovery test source does not use network actor messages")
-    }
 }
 
 /// Shared transport-only harness core for delivery-domain tests.

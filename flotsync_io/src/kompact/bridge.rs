@@ -799,10 +799,6 @@ impl Actor for IoBridge {
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         self.handle_local_message(msg)
     }
-
-    fn receive_network(&mut self, _msg: NetMessage) -> Handled {
-        unimplemented!("flotsync_io bridges do not use network actor messages");
-    }
 }
 
 fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
