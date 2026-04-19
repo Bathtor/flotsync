@@ -6,7 +6,7 @@ use flotsync_utils::IString;
 use itertools::Itertools;
 use regex::Regex;
 use snafu::prelude::*;
-use std::{fmt, sync::LazyLock};
+use std::{fmt, str::FromStr, sync::LazyLock};
 use uuid::Uuid;
 
 pub type IdentifierSegment = IString;
@@ -43,6 +43,20 @@ pub enum IdentifierUuidDecodeError {
     },
     #[snafu(display("The identifier text '{input}' contains an empty segment."))]
     EmptySegmentError { input: String },
+}
+
+#[derive(Debug, Snafu)]
+pub enum IdentifierParseError {
+    #[snafu(display("The identifier text '{input}' contains an empty segment."))]
+    ParseEmptySegmentError { input: String },
+    #[snafu(display(
+        "The identifier text '{input}' contains invalid segment '{segment}': {source}"
+    ))]
+    InvalidSegment {
+        input: String,
+        segment: String,
+        source: IdentifierError,
+    },
 }
 
 /// Identifier are immutable by default.
@@ -185,6 +199,14 @@ impl fmt::Debug for Identifier {
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.segments.iter().join(SEGMENT_SEPARATOR))
+    }
+}
+
+impl FromStr for Identifier {
+    type Err = IdentifierParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        IdentifierBuf::from_str(input).map(IdentifierBuf::into_identifier)
     }
 }
 
@@ -358,6 +380,31 @@ impl fmt::Debug for IdentifierBuf {
 impl fmt::Display for IdentifierBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.segments.iter().join(SEGMENT_SEPARATOR))
+    }
+}
+
+impl FromStr for IdentifierBuf {
+    type Err = IdentifierParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input.is_empty() {
+            return Ok(Self::EMPTY);
+        }
+
+        let mut buffer = IdentifierBuf::new();
+        for segment in input.split(SEGMENT_SEPARATOR) {
+            if segment.is_empty() {
+                return ParseEmptySegmentSnafu {
+                    input: input.to_owned(),
+                }
+                .fail();
+            }
+            buffer.push_checked(segment).context(InvalidSegmentSnafu {
+                input: input.to_owned(),
+                segment: segment.to_owned(),
+            })?;
+        }
+        Ok(buffer)
     }
 }
 

@@ -1,5 +1,8 @@
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::schema::{Schema, datamodel::NullableBasicValue};
+use flotsync_data_types::schema::{
+    Schema,
+    datamodel::{NullableBasicValue, RowSnapshot},
+};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -370,19 +373,19 @@ impl std::fmt::Debug for ReplicationGroupRecord {
     }
 }
 
-/// One persisted dataset image inside a replication group.
+/// One persisted in-memory dataset view inside a replication group.
 ///
-/// The runtime uses full dataset snapshots as the durable base state for this
-/// first storage slice. Later implementations may still derive those snapshots
-/// from more granular storage internally, but this record defines the contract
-/// visible to the runtime today.
+/// `InMemoryData` here is just the materialised dataset state involved in the
+/// current store operation. Backends may persist that state as one blob or
+/// reconstruct it from more granular internal storage, and callers must not
+/// assume that the value represents every row that exists in the dataset.
 #[derive(Clone)]
 pub struct DatasetSnapshotRecord {
     /// Replication group that owns this dataset image.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
     pub dataset_id: DatasetId,
-    /// Full in-memory dataset image representing the durable local state.
+    /// In-memory dataset state materialised for this durable store operation.
     pub data: flotsync_messages::InMemoryData,
 }
 
@@ -394,6 +397,40 @@ impl std::fmt::Debug for DatasetSnapshotRecord {
             .field("schema", self.data.schema())
             .finish_non_exhaustive()
     }
+}
+
+/// One explicit storage write batch for one dataset image.
+///
+/// The actions describe the intended persistence operation for each provided
+/// row key so store implementations do not have to infer insert/update/delete
+/// semantics from the shape of an `InMemoryData` value. The row payload itself
+/// is still a schema-level snapshot, so backends remain free to encode it in a
+/// storage-specific form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetSnapshotWrite {
+    /// Replication group that owns this dataset image.
+    pub group_id: GroupId,
+    /// Dataset identifier within the replication group.
+    pub dataset_id: DatasetId,
+    /// Explicit persistence action for each touched row.
+    pub row_actions: Vec<DatasetSnapshotRowAction>,
+}
+
+/// One explicit storage action for a persisted dataset row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DatasetSnapshotRowAction {
+    /// Insert a new persisted row snapshot.
+    Insert {
+        row_key: RowKey,
+        row: RowSnapshot<'static, UpdateId>,
+    },
+    /// Replace the persisted row snapshot for an existing row.
+    Update {
+        row_key: RowKey,
+        row: RowSnapshot<'static, UpdateId>,
+    },
+    /// Remove one persisted row entirely.
+    Delete { row_key: RowKey },
 }
 
 /// One dataset-scoped batch inside a persisted replication update.
@@ -451,63 +488,71 @@ pub enum ReplicationUpdateFilter {
 /// them.
 pub trait ReplicationStoreTransaction: Send {
     /// Load one persisted replication group by id.
-    fn load_replication_group(
-        &self,
-        group_id: &GroupId,
-    ) -> BoxFuture<'_, Result<Option<ReplicationGroupRecord>, StoreError>>;
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
 
     /// Load all persisted replication groups currently known to the store.
-    fn load_replication_groups(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+    fn load_replication_groups<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
-    /// Insert or replace the persisted group-level state for one group.
-    fn store_replication_group(
-        &mut self,
+    /// Insert one new persisted replication group.
+    fn insert_replication_group<'a>(
+        &'a mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>>;
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Advance the durable version vector for one existing replication group.
+    fn update_replication_group_version_vector<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Load the durable dataset snapshot for one `(group_id, dataset_id)` pair.
-    fn load_dataset_snapshot(
-        &self,
-        group_id: &GroupId,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<DatasetSnapshotRecord>, StoreError>>;
+    fn load_dataset_snapshot<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<DatasetSnapshotRecord>, StoreError>>;
 
-    /// Insert or replace one durable dataset snapshot.
-    fn store_dataset_snapshot(
-        &mut self,
-        snapshot: DatasetSnapshotRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>>;
+    /// Apply one explicit set of durable row-level dataset storage actions.
+    fn apply_dataset_snapshot<'a>(
+        &'a mut self,
+        snapshot: DatasetSnapshotWrite,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Load one persisted replication update by `(group_id, update_id)`.
-    fn load_replication_update(
-        &self,
-        group_id: &GroupId,
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'_, Result<Option<ReplicationUpdateRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
 
     /// Load persisted replication updates for one group using the given filter.
-    fn load_replication_updates(
-        &self,
-        group_id: &GroupId,
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
 
-    /// Append or replace one persisted replication update record.
+    /// Append one new persisted replication update record.
     ///
-    /// Implementations must preserve the uniqueness of `(group_id, update_id)`.
-    fn append_replication_update(
-        &mut self,
+    /// Implementations must preserve the uniqueness of `(group_id, update_id)`
+    /// and reject attempts to overwrite an existing durable update blob.
+    fn append_replication_update<'a>(
+        &'a mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>>;
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Mark one persisted replication update as already applied locally.
-    fn mark_replication_update_applied(
-        &mut self,
-        group_id: &GroupId,
+    fn mark_replication_update_applied<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'_, Result<(), StoreError>>;
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Durably commit all writes performed in this transaction.
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;

@@ -248,6 +248,32 @@ impl UpdateBatchMessage {
     }
 }
 
+pub(crate) fn encode_update_batch_proto(
+    message: &UpdateBatchMessage,
+) -> replication_proto::UpdateBatch {
+    message.to_proto()
+}
+
+pub(crate) fn decode_update_batch_proto(
+    message: replication_proto::UpdateBatch,
+    num_members: NonZeroUsize,
+) -> Result<UpdateBatchMessage, RuntimeMessageError> {
+    WireUpdateBatchMessage::from_proto(message)?.into_runtime(num_members)
+}
+
+pub(crate) fn encode_version_vector_proto(
+    version_vector: &VersionVector,
+) -> versions_proto::VersionVector {
+    WireVersionVector::from_runtime(version_vector).to_proto()
+}
+
+pub(crate) fn decode_version_vector_proto(
+    version_vector: versions_proto::VersionVector,
+    num_members: NonZeroUsize,
+) -> Result<VersionVector, WireVersionVectorError> {
+    WireVersionVector::from_proto(version_vector)?.to_runtime(num_members)
+}
+
 impl WireRuntimeMessage {
     pub(crate) fn decode_from_slice(payload: &[u8]) -> Result<Self, RuntimeMessageError> {
         let message =

@@ -153,7 +153,8 @@ pub fn decode_schema_operation<'schema>(
     Ok(operation)
 }
 
-fn encode_row_snapshot(
+/// Encode one row snapshot into its protobuf transport form.
+pub fn encode_row_snapshot(
     snapshot: &model::RowSnapshot<'_, UpdateId>,
     schema: &Schema,
 ) -> OperationResult<proto::RowSnapshot> {
@@ -164,7 +165,8 @@ fn encode_row_snapshot(
     encoder.into_row_snapshot().context(SnapshotAdapterSnafu)
 }
 
-fn decode_row_snapshot(
+/// Decode one protobuf row snapshot against `schema`.
+pub fn decode_row_snapshot(
     snapshot: proto::RowSnapshot,
     schema: &Schema,
 ) -> OperationResult<model::RowSnapshot<'static, UpdateId>> {

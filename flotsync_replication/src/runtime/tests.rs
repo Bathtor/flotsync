@@ -13,6 +13,8 @@ use crate::{
         CreateGroupRequest,
         DatasetId,
         DatasetSnapshotRecord,
+        DatasetSnapshotRowAction,
+        DatasetSnapshotWrite,
         GroupId,
         ListenerError,
         MemberIdentity,
@@ -24,6 +26,7 @@ use crate::{
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
         RowChange,
+        RowKey,
         RowMutation,
         SchemaSource,
     },
@@ -32,12 +35,13 @@ use flotsync_core::{
     member::Identifier,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::{Field, RowOperations, Schema};
+use flotsync_data_types::{Field, RowOperations, Schema, schema::datamodel::RowSnapshot};
 use flotsync_io::test_support::eventually;
 use flotsync_utils::BoxFuture;
+use futures_util::{FutureExt, future};
 use snafu::ResultExt;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::{Arc, Mutex, mpsc},
     time::Duration,
@@ -82,16 +86,14 @@ impl crate::api::ReplicationStore for StoreStub {
     fn local_member_identity(
         &self,
     ) -> BoxFuture<'_, Result<MemberIdentity, crate::api::StoreError>> {
-        let local_member = self.local_member.clone();
-        Box::pin(async move { Ok(local_member) })
+        future::ok(self.local_member.clone()).boxed()
     }
 
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
     ) -> BoxFuture<'_, Result<Option<SchemaSource>, crate::api::StoreError>> {
-        let schema = self.schemas.get(dataset_id).cloned();
-        Box::pin(async move { Ok(schema) })
+        future::ok(self.schemas.get(dataset_id).cloned()).boxed()
     }
 
     fn begin_transaction(
@@ -104,28 +106,31 @@ impl crate::api::ReplicationStore for StoreStub {
             .clone();
         let transaction = StoreStubTransaction {
             shared_state: self.state.clone(),
+            schemas: self.schemas.clone(),
             working_state: state,
             closed: false,
         };
-        Box::pin(async move { Ok(Box::new(transaction) as Box<dyn ReplicationStoreTransaction>) })
+        future::ok(Box::new(transaction) as Box<dyn ReplicationStoreTransaction>).boxed()
     }
 }
 
 #[derive(Clone, Default)]
 struct StoreStubState {
     groups: HashMap<GroupId, ReplicationGroupRecord>,
-    snapshots: HashMap<(GroupId, DatasetId), DatasetSnapshotRecord>,
+    datasets: HashSet<(GroupId, DatasetId)>,
+    dataset_rows: HashMap<(GroupId, DatasetId, RowKey), RowSnapshot<'static, UpdateId>>,
     updates: HashMap<(GroupId, UpdateId), ReplicationUpdateRecord>,
 }
 
 struct StoreStubTransaction {
     shared_state: Arc<Mutex<StoreStubState>>,
+    schemas: HashMap<DatasetId, SchemaSource>,
     working_state: StoreStubState,
     closed: bool,
 }
 
 impl StoreStubTransaction {
-    fn ensure_open(&self) {
+    fn assert_open(&self) {
         assert!(
             !self.closed,
             "store stub transaction must not be used after commit or rollback"
@@ -134,128 +139,205 @@ impl StoreStubTransaction {
 }
 
 impl ReplicationStoreTransaction for StoreStubTransaction {
-    fn load_replication_group(
-        &self,
-        group_id: &GroupId,
-    ) -> BoxFuture<'_, Result<Option<ReplicationGroupRecord>, crate::api::StoreError>> {
-        self.ensure_open();
-        let group = self.working_state.groups.get(group_id).cloned();
-        Box::pin(async move { Ok(group) })
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, crate::api::StoreError>> {
+        self.assert_open();
+        future::ok(self.working_state.groups.get(group_id).cloned()).boxed()
     }
 
-    fn load_replication_groups(
-        &self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, crate::api::StoreError>> {
-        self.ensure_open();
+    fn load_replication_groups<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, crate::api::StoreError>> {
+        self.assert_open();
         let groups = self.working_state.groups.values().cloned().collect();
-        Box::pin(async move { Ok(groups) })
+        future::ok(groups).boxed()
     }
 
-    fn store_replication_group(
-        &mut self,
+    fn insert_replication_group<'a>(
+        &'a mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'_, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
-        self.working_state.groups.insert(group.group_id, group);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn load_dataset_snapshot(
-        &self,
-        group_id: &GroupId,
-        dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<DatasetSnapshotRecord>, crate::api::StoreError>> {
-        self.ensure_open();
-        let snapshot = self
+    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        self.assert_open();
+        if self
             .working_state
-            .snapshots
-            .get(&(*group_id, dataset_id.clone()))
-            .cloned();
-        Box::pin(async move { Ok(snapshot) })
+            .groups
+            .insert(group.group_id, group)
+            .is_some()
+        {
+            return future::err(crate::api::StoreError::StoreExternal {
+                source: Box::new(std::io::Error::other(
+                    "store stub does not allow duplicate group inserts",
+                )),
+            })
+            .boxed();
+        }
+        future::ok(()).boxed()
     }
 
-    fn store_dataset_snapshot(
-        &mut self,
-        snapshot: DatasetSnapshotRecord,
-    ) -> BoxFuture<'_, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
+    fn update_replication_group_version_vector<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        self.assert_open();
+        let Some(group) = self.working_state.groups.get_mut(group_id) else {
+            return future::err(crate::api::StoreError::StoreExternal {
+                source: Box::new(std::io::Error::other(format!(
+                    "store stub could not find group '{group_id}'"
+                ))),
+            })
+            .boxed();
+        };
+        group.version_vector = version_vector;
+        future::ok(()).boxed()
+    }
+
+    fn load_dataset_snapshot<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<DatasetSnapshotRecord>, crate::api::StoreError>> {
+        self.assert_open();
+        if !self
+            .working_state
+            .datasets
+            .contains(&(*group_id, dataset_id.clone()))
+        {
+            return future::ok(None).boxed();
+        }
+        let Some(schema) = self.schemas.get(dataset_id).cloned() else {
+            return future::ok(None).boxed();
+        };
+        let mut rows: Vec<_> = self
+            .working_state
+            .dataset_rows
+            .iter()
+            .filter(|((stored_group_id, stored_dataset_id, _), _)| {
+                *stored_group_id == *group_id && *stored_dataset_id == *dataset_id
+            })
+            .map(|((_, _, row_key), row)| (*row_key, row.clone()))
+            .collect();
+        rows.sort_by_key(|(row_key, _)| *row_key);
+        let data = flotsync_messages::InMemoryData::with_owned_schema_and_row_snapshots(
+            schema.as_schema().clone(),
+            rows.into_iter().map(|(row_key, row)| (row_key.0, row)),
+        )
+        .expect("store stub row snapshot should always materialise");
+        future::ok(Some(DatasetSnapshotRecord {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            data,
+        }))
+        .boxed()
+    }
+
+    fn apply_dataset_snapshot<'a>(
+        &'a mut self,
+        snapshot: DatasetSnapshotWrite,
+    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        self.assert_open();
         self.working_state
-            .snapshots
-            .insert((snapshot.group_id, snapshot.dataset_id.clone()), snapshot);
-        Box::pin(async { Ok(()) })
+            .datasets
+            .insert((snapshot.group_id, snapshot.dataset_id.clone()));
+        for action in snapshot.row_actions {
+            match action {
+                DatasetSnapshotRowAction::Insert { row_key, row }
+                | DatasetSnapshotRowAction::Update { row_key, row } => {
+                    self.working_state.dataset_rows.insert(
+                        (snapshot.group_id, snapshot.dataset_id.clone(), row_key),
+                        row,
+                    );
+                }
+                DatasetSnapshotRowAction::Delete { row_key } => {
+                    self.working_state.dataset_rows.remove(&(
+                        snapshot.group_id,
+                        snapshot.dataset_id.clone(),
+                        row_key,
+                    ));
+                }
+            }
+        }
+        future::ok(()).boxed()
     }
 
-    fn load_replication_update(
-        &self,
-        group_id: &GroupId,
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'_, Result<Option<ReplicationUpdateRecord>, crate::api::StoreError>> {
-        self.ensure_open();
-        let update = self.working_state.updates.get(&(*group_id, update_id)).cloned();
-        Box::pin(async move { Ok(update) })
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, crate::api::StoreError>> {
+        self.assert_open();
+        let update = self
+            .working_state
+            .updates
+            .get(&(*group_id, update_id))
+            .cloned();
+        future::ok(update).boxed()
     }
 
-    fn load_replication_updates(
-        &self,
-        group_id: &GroupId,
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationUpdateRecord>, crate::api::StoreError>> {
-        self.ensure_open();
-        let updates =
-            self.working_state
-                .updates
-                .values()
-                .filter(|update| update.group_id == *group_id)
-                .filter(|update| match filter {
-                    ReplicationUpdateFilter::All => true,
-                    ReplicationUpdateFilter::PendingApply => !update.applied_locally,
-                    ReplicationUpdateFilter::Applied => update.applied_locally,
-                })
-                .cloned()
-                .collect();
-        Box::pin(async move { Ok(updates) })
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, crate::api::StoreError>> {
+        self.assert_open();
+        let updates = self
+            .working_state
+            .updates
+            .values()
+            .filter(|update| update.group_id == *group_id)
+            .filter(|update| match filter {
+                ReplicationUpdateFilter::All => true,
+                ReplicationUpdateFilter::PendingApply => !update.applied_locally,
+                ReplicationUpdateFilter::Applied => update.applied_locally,
+            })
+            .cloned()
+            .collect();
+        future::ok(updates).boxed()
     }
 
-    fn append_replication_update(
-        &mut self,
+    fn append_replication_update<'a>(
+        &'a mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'_, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
+    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        self.assert_open();
         self.working_state
             .updates
             .insert((update.group_id, update.update_id), update);
-        Box::pin(async { Ok(()) })
+        future::ok(()).boxed()
     }
 
-    fn mark_replication_update_applied(
-        &mut self,
-        group_id: &GroupId,
+    fn mark_replication_update_applied<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'_, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
+    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        self.assert_open();
         if let Some(update) = self.working_state.updates.get_mut(&(*group_id, update_id)) {
             update.applied_locally = true;
         }
-        Box::pin(async { Ok(()) })
+        future::ok(()).boxed()
     }
 
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
+        self.assert_open();
         self.closed = true;
         let working_state = self.working_state;
         let shared_state = self.shared_state;
-        Box::pin(async move {
+        async move {
             *shared_state
                 .lock()
                 .expect("store stub state mutex must not be poisoned") = working_state;
             Ok(())
-        })
+        }
+        .boxed()
     }
 
     fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), crate::api::StoreError>> {
-        self.ensure_open();
+        self.assert_open();
         self.closed = true;
-        Box::pin(async { Ok(()) })
+        future::ok(()).boxed()
     }
 }
 

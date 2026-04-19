@@ -8,6 +8,7 @@ use crate::api::{
     RowProvider,
     RowProviderError,
 };
+use futures_util::FutureExt;
 use std::{collections::VecDeque, num::NonZeroUsize};
 
 /// Convenience `RowProvider` backed by an in-memory `Vec`.
@@ -24,10 +25,11 @@ impl VecRowProvider {
 
 impl RowProvider for VecRowProvider {
     fn next_batch<'a>(&'a mut self) -> BoxFuture<'a, Result<RowChangeBatch, RowProviderError>> {
-        Box::pin(async move {
+        async move {
             let rows = std::mem::take(&mut self.rows);
             Ok(RowChangeBatch::from_vec(rows))
-        })
+        }
+        .boxed()
     }
 }
 
@@ -49,7 +51,7 @@ impl InitialRowProvider for VecInitialRowProvider {
         mut reuse: InitialRowBatch,
         max_rows: NonZeroUsize,
     ) -> BoxFuture<'a, Result<InitialRowBatch, RowProviderError>> {
-        Box::pin(async move {
+        async move {
             reuse.clear();
             while reuse.len() < max_rows.get() {
                 let Some(row) = self.rows.pop_front() else {
@@ -58,6 +60,7 @@ impl InitialRowProvider for VecInitialRowProvider {
                 reuse.push(row);
             }
             Ok(reuse)
-        })
+        }
+        .boxed()
     }
 }

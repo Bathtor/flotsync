@@ -78,6 +78,51 @@ where
         Self::new(Cow::Owned(schema))
     }
 
+    /// Create one in-memory dataset from complete row snapshots and a `'static` schema.
+    pub fn with_static_schema_and_row_snapshots<'snapshot, I>(
+        schema: &'static Schema,
+        rows: I,
+    ) -> Result<Self, InMemoryDataError>
+    where
+        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        Self::from_row_snapshots(Cow::Borrowed(schema), rows)
+    }
+
+    /// Create one in-memory dataset from complete row snapshots and an owned schema.
+    pub fn with_owned_schema_and_row_snapshots<'snapshot, I>(
+        schema: Schema,
+        rows: I,
+    ) -> Result<Self, InMemoryDataError>
+    where
+        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        Self::from_row_snapshots(Cow::Owned(schema), rows)
+    }
+
+    /// Create one in-memory dataset from complete row snapshots.
+    ///
+    /// Each snapshot must contain the full row state for the associated schema.
+    pub fn from_row_snapshots<'snapshot, I>(
+        schema: Cow<'static, Schema>,
+        rows: I,
+    ) -> Result<Self, InMemoryDataError>
+    where
+        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        let mut data = Self::new(schema);
+        for (row_id, snapshot) in rows {
+            data.push_row_snapshot(row_id, snapshot)?;
+        }
+        Ok(data)
+    }
+
     /// Get the immutable schema associated with this dataset.
     pub fn schema(&self) -> &Schema {
         self.schema.as_ref()
@@ -146,6 +191,29 @@ where
         let row = self.row_from_named_fields(fields)?;
         self.rows.push(row);
         Ok(self.rows.len() - 1)
+    }
+
+    /// Validate and append one row represented by a complete schema snapshot.
+    pub fn push_row_snapshot<'snapshot>(
+        &mut self,
+        row_id: RowId,
+        snapshot: RowSnapshot<'snapshot, OperationId>,
+    ) -> Result<usize, InMemoryDataError>
+    where
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        if self.row_id_map.contains_key(&row_id) {
+            return Err(InMemoryDataError::DuplicateRowId {
+                row_id: row_id.to_string(),
+            });
+        }
+
+        let row = self.row_from_named_fields(snapshot.into_owned_fields())?;
+        self.rows.push(row);
+        let index = self.rows.len() - 1;
+        self.row_id_map.insert(row_id, index);
+        Ok(index)
     }
 
     /// Validate an existing row by index against this dataset's schema.
@@ -2174,6 +2242,8 @@ pub enum InMemoryDataError {
     UnknownField { field_name: String },
     #[snafu(display("Field '{field_name}' was provided more than once."))]
     DuplicateField { field_name: String },
+    #[snafu(display("Row '{row_id}' was provided more than once."))]
+    DuplicateRowId { row_id: String },
     #[snafu(display("Missing required field '{field_name}'."))]
     MissingField { field_name: String },
     #[snafu(display(

@@ -7,9 +7,11 @@ use std::{collections::HashMap, sync::Arc};
 pub mod api;
 pub mod delivery;
 pub mod runtime;
+pub mod store;
 
 pub use api::*;
 pub use runtime::load_replication_runtime;
+pub use store::SqliteReplicationStore;
 
 /// Immutable snapshot of the groups currently hosted locally and their
 /// currently known members.

@@ -367,6 +367,49 @@ fn apply_schema_operation_roundtrips_insert_update_delete() {
 }
 
 #[test]
+fn row_snapshots_can_rebuild_a_dataset_directly() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+
+    let first_insert = source
+        .insert_row(
+            200,
+            9,
+            initial_values! {
+                schema["title"] => "hello",
+                schema["numbers"] => vec![1i64, 2],
+                schema["counter"] => 1u64,
+                schema["priority"] => 3u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let second_insert = source
+        .insert_row(
+            201,
+            10,
+            initial_values! {
+                schema["title"] => "world",
+                schema["numbers"] => vec![5i64, 8],
+                schema["counter"] => 9u64,
+                schema["priority"] => 10u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+
+    let rows = [first_insert, second_insert].into_iter().map(|operation| {
+        let RowOperation::Insert { row_id, snapshot } = operation.operation else {
+            panic!("expected insert operation");
+        };
+        (row_id, snapshot)
+    });
+    let rebuilt = InMemoryData::with_static_schema_and_row_snapshots(schema, rows).unwrap();
+
+    assert_eq!(rebuilt, source);
+}
+
+#[test]
 fn apply_schema_operation_rejects_duplicate_insert_and_unknown_rows() {
     let schema = &*TEST_SCHEMA;
     let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
