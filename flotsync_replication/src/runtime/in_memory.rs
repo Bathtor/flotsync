@@ -1,7 +1,6 @@
 use super::{component::BufferedInboundUpdate, errors::*, messages::UpdateBatchMessage};
 use crate::{
     GroupMembers,
-    GroupMemberships,
     api::{
         DatasetId,
         GroupId,
@@ -31,23 +30,14 @@ use std::{
     sync::Arc,
 };
 
-/// In-memory local-group state for the current replication runtime.
+/// In-memory read model for the current replication runtime.
 ///
-/// This is the temporary runtime backend until a persistent store-backed
-/// implementation takes over the same responsibilities.
+/// The authoritative group registry now lives in `ReplicationStore`. This
+/// structure only caches the currently loaded group views plus transient
+/// runtime-only buffers.
 #[derive(Default)]
 pub(super) struct LocalRuntimeState {
     pub(super) groups: HashMap<GroupId, LocalGroupState>,
-}
-
-impl LocalRuntimeState {
-    pub(super) fn membership_snapshot(&self) -> GroupMemberships {
-        GroupMemberships::from_groups(
-            self.groups
-                .iter()
-                .map(|(group_id, group)| (*group_id, group.members.clone())),
-        )
-    }
 }
 
 /// One fixed-membership replication group currently hosted locally.
@@ -60,22 +50,45 @@ pub(super) struct LocalGroupState {
 }
 
 impl LocalGroupState {
-    pub(super) fn new(
+    /// Rebuild one local read model from a persisted group record.
+    pub(super) fn from_replication_group_record(
         local_member: &MemberIdentity,
-        members: GroupMembers,
+        group: crate::api::ReplicationGroupRecord,
     ) -> Result<Self, GroupInstallError> {
+        let group_id = group.group_id;
+        let members = GroupMembers::from_ordered_members(group.members)
+            .context(InvalidPersistedMembersSnafu { group_id })?;
         let local_member_index =
             members
                 .member_index(local_member)
                 .context(InstallMissingLocalMemberSnafu {
                     local_member: local_member.clone(),
                 })?;
-        let member_count = NonZeroUsize::new(members.len())
-            .expect("group installation must only happen for non-empty member sets");
+        ensure!(
+            local_member_index == group.local_member_index,
+            PersistedLocalMemberIndexMismatchSnafu {
+                group_id,
+                local_member: local_member.clone(),
+                persisted_local_member_index: group.local_member_index,
+                actual_local_member_index: local_member_index,
+            }
+        );
+
+        let member_count =
+            NonZeroUsize::new(members.len()).expect("persisted group members must not be empty");
+        ensure!(
+            group.version_vector.num_members() == member_count,
+            PersistedVersionVectorMemberCountMismatchSnafu {
+                group_id,
+                persisted_member_count: group.version_vector.num_members().get(),
+                actual_member_count: member_count.get(),
+            }
+        );
+
         Ok(Self {
             members,
             local_member_index,
-            version_vector: VersionVector::initial(member_count),
+            version_vector: group.version_vector,
             datasets: HashMap::new(),
             pending_updates: BTreeMap::new(),
         })

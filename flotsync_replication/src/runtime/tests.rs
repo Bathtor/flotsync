@@ -22,6 +22,7 @@ use crate::{
         ReplicationApi,
         ReplicationConfig,
         ReplicationGroupRecord,
+        ReplicationStore,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
@@ -557,6 +558,13 @@ fn load_runtime_with_parts(
     .expect("runtime should load")
 }
 
+fn persist_group_in_store(store: &StoreStub, group: ReplicationGroupRecord) {
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.insert_replication_group(group)).expect("group should persist");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+}
+
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
     eventually(
         TEST_WAIT_TIMEOUT,
@@ -610,6 +618,82 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     host.shutdown();
+}
+
+#[test]
+fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store =
+        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
+    let group_id = GroupId(Uuid::from_u128(31));
+    let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member()])
+        .expect("group should build");
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            members: members.ordered_members(),
+            local_member_index: MemberIndex::new(0),
+            version_vector: VersionVector::initial(
+                NonZeroUsize::new(2).expect("group should have two members"),
+            ),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let row_id = test_row_id(group_id, dataset_id, 32);
+
+    assert!(
+        runtime
+            .host()
+            .membership_snapshot()
+            .contains_group(&group_id)
+    );
+    wait_for_test_reply(runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id,
+        row: crate::row_values! {
+            "title" => "hydrated on startup",
+        },
+    }]))
+    .expect("publish_changes should succeed for the hydrated group");
+}
+
+#[test]
+fn create_group_persists_membership_across_runtime_restart() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store =
+        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
+    let first_listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener);
+    let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    drop(runtime);
+
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime = load_runtime_with_parts(app_alice_id(), store, restarted_listener);
+    let row_id = test_row_id(group_id, dataset_id, 33);
+
+    assert!(
+        restarted_runtime
+            .host()
+            .membership_snapshot()
+            .contains_group(&group_id),
+        "restarted runtime should hydrate the persisted group"
+    );
+    wait_for_test_reply(restarted_runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id,
+        row: crate::row_values! {
+            "title" => "after restart",
+        },
+    }]))
+    .expect("publish_changes should succeed after restart hydration");
 }
 
 #[test]

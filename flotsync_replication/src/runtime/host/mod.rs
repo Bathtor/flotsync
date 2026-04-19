@@ -426,7 +426,7 @@ impl DeliveryRuntimeHost {
     ) -> Result<Self, RuntimeHostError> {
         let system = build_runtime_system()?;
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
-        let group_memberships = SharedGroupMemberships::default();
+        let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
         let topology = RuntimeTopology::build(
             &system,
             &group_memberships,

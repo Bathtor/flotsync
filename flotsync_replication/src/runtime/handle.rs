@@ -27,10 +27,7 @@ use super::{
     messages::UpdateBatchMessage,
 };
 #[cfg(test)]
-use crate::{
-    GroupMembers,
-    api::{GroupId, MemberIdentity},
-};
+use crate::{GroupId, GroupMembers, api::MemberIdentity};
 #[cfg(test)]
 use std::time::Duration;
 

@@ -7,7 +7,7 @@ use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
 use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;
-use snafu::prelude::*;
+use snafu::{Location, prelude::*};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
@@ -18,8 +18,6 @@ pub(super) enum CreateGroupError {
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group member list is invalid."))]
     InvalidMembers { source: GroupMembersError },
-    #[snafu(display("Failed to install the created group locally."))]
-    InstallGroup { source: GroupInstallError },
 }
 
 #[derive(Debug, Snafu)]
@@ -29,6 +27,59 @@ pub(super) enum GroupInstallError {
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
     InstallMissingLocalMember { local_member: MemberIdentity },
+    #[snafu(display("Persisted group {group_id} carried an invalid canonical member set."))]
+    InvalidPersistedMembers {
+        group_id: GroupId,
+        source: GroupMembersError,
+    },
+    #[snafu(display(
+        "Persisted group {group_id} stored local member {local_member} at index {persisted_local_member_index}, but the canonical member order resolves it to {actual_local_member_index}.",
+    ))]
+    PersistedLocalMemberIndexMismatch {
+        group_id: GroupId,
+        local_member: MemberIdentity,
+        persisted_local_member_index: MemberIndex,
+        actual_local_member_index: MemberIndex,
+    },
+    #[snafu(display(
+        "Persisted group {group_id} stored {persisted_member_count} version-vector members, but the canonical member set has {actual_member_count}.",
+    ))]
+    PersistedVersionVectorMemberCountMismatch {
+        group_id: GroupId,
+        persisted_member_count: usize,
+        actual_member_count: usize,
+    },
+    #[snafu(display(
+        "Replication-store access failed while installing group {group_id} at {location}."
+    ))]
+    StoreGroup {
+        group_id: GroupId,
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(super)))]
+pub(super) enum RuntimeStartupError {
+    #[snafu(display(
+        "Replication-store access failed while hydrating runtime state at {location}."
+    ))]
+    StoreStartup {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Persisted replication runtime state contained duplicate group {group_id}."))]
+    DuplicateGroup { group_id: GroupId },
+    #[snafu(display(
+        "Persisted replication group {group_id} could not be rebuilt into the runtime read model."
+    ))]
+    InvalidGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+    },
 }
 
 #[derive(Debug, Snafu)]

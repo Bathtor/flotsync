@@ -21,6 +21,7 @@ use super::{
 };
 use crate::{
     GroupMembers,
+    GroupMemberships,
     SharedGroupMemberships,
     api::{
         ApiError,
@@ -35,6 +36,7 @@ use crate::{
         PublishReceipt,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupRecord,
         ReplicationStore,
         RowChange,
         RowMutation,
@@ -79,6 +81,7 @@ use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -112,6 +115,13 @@ pub(super) struct BufferedInboundUpdate {
 struct PreparedDatasetUpdates {
     dataset_updates: Vec<DatasetUpdateMessage>,
     working_datasets: HashMap<DatasetId, LocalDataset>,
+}
+
+/// Persisted group views loaded during component startup before any runtime
+/// traffic is processed locally.
+struct HydratedRuntimeGroups {
+    groups: HashMap<GroupId, LocalGroupState>,
+    memberships: GroupMemberships,
 }
 
 enum DatasetSchemaLoadError {
@@ -224,17 +234,22 @@ impl ReplicationRuntimeComponent {
         Ok(())
     }
 
-    fn record_terminal_fault(&mut self, operation: &'static str, error: &InboundDeliveryError) {
+    fn install_terminal_fault(&mut self, operation: &'static str, message: String) {
         if self.terminal_fault.is_some() {
             return;
         }
-        let fault = TerminalRuntimeFault {
-            operation,
-            message: error.to_string(),
-        };
+        let fault = TerminalRuntimeFault { operation, message };
         error!(self.log(), "terminal runtime failure: {}", fault);
         self.terminal_fault = Some(fault);
+    }
+
+    fn record_terminal_fault(&mut self, operation: &'static str, error: &InboundDeliveryError) {
+        self.install_terminal_fault(operation, error.to_string());
         self.ctx.suicide();
+    }
+
+    fn record_startup_fault(&mut self, operation: &'static str, error: &RuntimeStartupError) {
+        self.install_terminal_fault(operation, error.to_string());
     }
 
     fn reply_api<T>(
@@ -285,6 +300,139 @@ impl ReplicationRuntimeComponent {
             loaded_schemas.insert(dataset_id, schema.into_shared());
         }
         Ok(loaded_schemas)
+    }
+
+    /// Build the canonical persisted record for one group definition that has
+    /// already passed local membership validation.
+    fn build_replication_group_record(
+        &self,
+        group_id: GroupId,
+        members: &GroupMembers,
+    ) -> ReplicationGroupRecord {
+        let member_count = NonZeroUsize::new(members.len())
+            .expect("group installation must keep members non-empty");
+        let local_member_index = members
+            .member_index(&self.local_member)
+            .expect("group installation validates the local member before persistence");
+        ReplicationGroupRecord {
+            group_id,
+            members: members.ordered_members(),
+            local_member_index,
+            version_vector: VersionVector::initial(member_count),
+        }
+    }
+
+    /// Persist one newly observed group definition.
+    ///
+    /// If the same group already exists with the same canonical membership
+    /// definition, this returns the stored record without mutating it.
+    async fn store_new_replication_group(
+        &mut self,
+        record: ReplicationGroupRecord,
+    ) -> Result<ReplicationGroupRecord, GroupInstallError> {
+        let group_id = record.group_id;
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        let existing = transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        if let Some(existing) = existing {
+            transaction
+                .commit()
+                .await
+                .context(StoreGroupSnafu { group_id })?;
+            ensure!(
+                existing.members == record.members
+                    && existing.local_member_index == record.local_member_index,
+                ConflictingExistingGroupSnafu { group_id }
+            );
+            return Ok(existing);
+        }
+
+        transaction
+            .insert_replication_group(record.clone())
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        transaction
+            .commit()
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        Ok(record)
+    }
+
+    /// Install one validated group view into both the mutable runtime cache and
+    /// the shared delivery-membership snapshot.
+    fn install_local_group_view(
+        &mut self,
+        group: ReplicationGroupRecord,
+    ) -> Result<(), GroupInstallError> {
+        let group_id = group.group_id;
+        let local_group =
+            LocalGroupState::from_replication_group_record(&self.local_member, group)?;
+        if let Some(existing_group) = self.state.groups.get(&group_id) {
+            if existing_group.members == local_group.members {
+                return Ok(());
+            }
+            return ConflictingExistingGroupSnafu { group_id }.fail();
+        }
+
+        let mut memberships = self.group_memberships.snapshot().as_ref().clone();
+        let existing_members = memberships.insert(group_id, local_group.members.clone());
+        if let Some(existing_members) = existing_members {
+            ensure!(
+                existing_members == local_group.members,
+                ConflictingExistingGroupSnafu { group_id }
+            );
+        }
+        self.state.groups.insert(group_id, local_group);
+        self.group_memberships.replace(memberships);
+        Ok(())
+    }
+
+    /// Load the persisted group registry into the runtime cache during
+    /// component startup.
+    async fn load_hydrated_runtime_groups(
+        &mut self,
+    ) -> Result<HydratedRuntimeGroups, RuntimeStartupError> {
+        let local_member = self.local_member.clone();
+        let initial_memberships = self.group_memberships.snapshot().as_ref().clone();
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(StoreStartupSnafu)?;
+        let persisted_groups = transaction
+            .load_replication_groups()
+            .await
+            .context(StoreStartupSnafu)?;
+        transaction.commit().await.context(StoreStartupSnafu)?;
+
+        let mut groups = HashMap::with_capacity(persisted_groups.len());
+        let mut memberships = initial_memberships;
+        for persisted_group in persisted_groups {
+            let group_id = persisted_group.group_id;
+            let local_group =
+                LocalGroupState::from_replication_group_record(&local_member, persisted_group)
+                    .context(InvalidGroupSnafu { group_id })?;
+            let previous = groups.insert(group_id, local_group);
+            ensure!(previous.is_none(), DuplicateGroupSnafu { group_id });
+            let local_group = groups
+                .get(&group_id)
+                .expect("just inserted persisted group must remain available");
+            let existing_members = memberships.insert(group_id, local_group.members.clone());
+            if existing_members.is_some() {
+                return DuplicateGroupSnafu { group_id }.fail();
+            }
+        }
+
+        Ok(HydratedRuntimeGroups {
+            groups,
+            memberships,
+        })
     }
 
     /// Submit one encoded live update to the group-broadcast layer.
@@ -354,7 +502,12 @@ impl ReplicationRuntimeComponent {
             .collect()
     }
 
-    fn create_group(&mut self, req: CreateGroupRequest) -> Result<GroupId, CreateGroupError> {
+    /// Validate one create-group request and derive the canonical persisted
+    /// group record that should be written if the request succeeds.
+    fn prepare_created_group(
+        &self,
+        req: CreateGroupRequest,
+    ) -> Result<(GroupId, GroupMembers, ReplicationGroupRecord), CreateGroupError> {
         if req.initial_state.is_some() {
             return InitialStateUnsupportedSnafu.fail();
         }
@@ -369,10 +522,8 @@ impl ReplicationRuntimeComponent {
         );
 
         let group_id = GroupId(Uuid::new_v4());
-        self.install_group(group_id, members.clone())
-            .context(InstallGroupSnafu)?;
-        self.submit_group_bootstrap(group_id, &members);
-        Ok(group_id)
+        let record = self.build_replication_group_record(group_id, &members);
+        Ok((group_id, members, record))
     }
 
     fn prepare_local_publish(
@@ -505,7 +656,7 @@ impl ReplicationRuntimeComponent {
     fn handle_reliable_delivery(
         &mut self,
         deliver: ReliableDeliveryDeliver,
-    ) -> Result<(), InboundDeliveryError> {
+    ) -> Result<Handled, InboundDeliveryError> {
         let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
             .context(DecodeMessageSnafu)?;
         match message {
@@ -520,15 +671,31 @@ impl ReplicationRuntimeComponent {
                         local_member: self.local_member.clone(),
                     }
                 );
-                self.install_group(group_id, members)
-                    .context(InstallBootstrapGroupSnafu { group_id })?;
-                // Dropping `deliver` without completing `processed` intentionally
-                // withholds the recipient acknowledgement from reliable delivery.
-                // Sender-side timeout/retry semantics are tracked in flotsync-46r.
-                deliver.processed.complete().map_err(|source| {
-                    InboundDeliveryError::CompleteProcessedPromise { group_id, source }
-                })?;
-                Ok(())
+                let record = self.build_replication_group_record(group_id, &members);
+                Ok(Handled::block_on(self, async move |mut async_self| {
+                    let reply = async {
+                        let persisted_group = async_self
+                            .store_new_replication_group(record)
+                            .await
+                            .context(InstallBootstrapGroupSnafu { group_id })?;
+                        async_self
+                            .install_local_group_view(persisted_group)
+                            .context(InstallBootstrapGroupSnafu { group_id })?;
+                        // Dropping `deliver` without completing `processed`
+                        // intentionally withholds the recipient acknowledgement
+                        // from reliable delivery. Sender-side timeout/retry
+                        // semantics are tracked in flotsync-46r.
+                        deliver
+                            .processed
+                            .complete()
+                            .context(CompleteProcessedPromiseSnafu { group_id })?;
+                        Ok::<(), InboundDeliveryError>(())
+                    }
+                    .await;
+                    if let Err(error) = reply {
+                        async_self.record_terminal_fault("reliable delivery", &error);
+                    }
+                }))
             }
             WireRuntimeMessage::UpdateBatch(_) => UnexpectedReliableMessageSnafu.fail(),
         }
@@ -688,25 +855,6 @@ impl ReplicationRuntimeComponent {
         Ok(event_batches)
     }
 
-    fn install_group(
-        &mut self,
-        group_id: GroupId,
-        members: GroupMembers,
-    ) -> Result<(), GroupInstallError> {
-        if let Some(existing_group) = self.state.groups.get(&group_id) {
-            if existing_group.members == members {
-                return Ok(());
-            }
-            return ConflictingExistingGroupSnafu { group_id }.fail();
-        }
-
-        let local_group = LocalGroupState::new(&self.local_member, members)?;
-        self.state.groups.insert(group_id, local_group);
-        self.group_memberships
-            .replace(self.state.membership_snapshot());
-        Ok(())
-    }
-
     fn handle_publish_changes(
         &mut self,
         ask: Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>,
@@ -761,11 +909,38 @@ impl ReplicationRuntimeComponent {
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
     ) -> Handled {
         let (promise, req) = ask.take();
-        let reply = self
-            .ensure_running()
-            .and_then(|()| self.create_group(req).boxed().context(ApiExternalSnafu));
-        self.reply_api(promise, "create_group", reply);
-        Handled::Ok
+        if let Err(error) = self.ensure_running() {
+            self.reply_api(promise, "create_group", Err(error));
+            return Handled::Ok;
+        }
+        let created_group = self.prepare_created_group(req);
+        let (group_id, members, record) = match created_group {
+            Ok(created_group) => created_group,
+            Err(error) => {
+                let reply = Err(ApiError::ApiExternal {
+                    source: Box::new(error),
+                });
+                self.reply_api(promise, "create_group", reply);
+                return Handled::Ok;
+            }
+        };
+        Handled::block_on(self, async move |mut async_self| {
+            let persisted_group = async_self.store_new_replication_group(record).await;
+            let reply = match persisted_group {
+                Ok(persisted_group) => {
+                    let install_result = async_self.install_local_group_view(persisted_group);
+                    let reply = install_result.map(|()| {
+                        async_self.submit_group_bootstrap(group_id, &members);
+                        group_id
+                    });
+                    reply.boxed().context(ApiExternalSnafu)
+                }
+                Err(error) => Err(ApiError::ApiExternal {
+                    source: Box::new(error),
+                }),
+            };
+            async_self.reply_api(promise, "create_group", reply);
+        })
     }
 
     fn handle_change_group_membership(
@@ -787,9 +962,15 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
     ) -> Handled {
         let (promise, (group_id, members)) = ask.take();
-        let reply = self.install_group(group_id, members);
-        let _ = promise.fulfil(reply);
-        Handled::Ok
+        let record = self.build_replication_group_record(group_id, &members);
+        Handled::block_on(self, async move |mut async_self| {
+            let persisted_group = async_self.store_new_replication_group(record).await;
+            let reply = match persisted_group {
+                Ok(persisted_group) => async_self.install_local_group_view(persisted_group),
+                Err(error) => Err(error),
+            };
+            let _ = promise.fulfil(reply);
+        })
     }
 
     #[cfg(test)]
@@ -829,7 +1010,33 @@ impl ReplicationRuntimeComponent {
     }
 }
 
-ignore_lifecycle!(ReplicationRuntimeComponent);
+impl ComponentLifecycle for ReplicationRuntimeComponent {
+    fn on_start(&mut self) -> Handled {
+        Handled::block_on(self, async move |mut async_self| {
+            let hydrated_groups = async_self.load_hydrated_runtime_groups().await;
+            match hydrated_groups {
+                Ok(hydrated_groups) => {
+                    async_self.state.groups = hydrated_groups.groups;
+                    async_self
+                        .group_memberships
+                        .replace(hydrated_groups.memberships);
+                }
+                Err(error) => {
+                    async_self.record_startup_fault("runtime startup", &error);
+                    async_self.ctx.suicide();
+                }
+            }
+        })
+    }
+
+    fn on_stop(&mut self) -> Handled {
+        Handled::Ok
+    }
+
+    fn on_kill(&mut self) -> Handled {
+        Handled::Ok
+    }
+}
 
 impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
     fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
@@ -837,10 +1044,13 @@ impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
             return Handled::Ok;
         }
         let ReliableDeliveryPortIndication::Deliver(deliver) = indication;
-        if let Err(error) = self.handle_reliable_delivery(deliver) {
-            self.record_terminal_fault("reliable delivery", &error);
+        match self.handle_reliable_delivery(deliver) {
+            Ok(handled) => handled,
+            Err(error) => {
+                self.record_terminal_fault("reliable delivery", &error);
+                Handled::DieNow
+            }
         }
-        Handled::Ok
     }
 }
 
