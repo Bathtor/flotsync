@@ -21,8 +21,8 @@ pub(super) enum CreateGroupError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(super)))]
-pub(super) enum GroupInstallError {
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different canonical member order."))]
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
@@ -83,8 +83,8 @@ pub(super) enum RuntimeStartupError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(super)))]
-pub(super) enum PublishChangesError {
+#[snafu(visibility(pub(crate)), module(publish))]
+pub(crate) enum PublishChangesError {
     #[snafu(display("publish_changes requires at least one row mutation."))]
     EmptyChanges,
     #[snafu(display(
@@ -97,14 +97,14 @@ pub(super) enum PublishChangesError {
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
     #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
-    PublishInvalidPersistedGroup {
+    InvalidPersistedGroup {
         group_id: GroupId,
         source: GroupInstallError,
         #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Replication-store access failed at {location}."))]
-    PublishStoreAccess {
+    StoreAccess {
         source: StoreError,
         #[snafu(implicit)]
         location: Location,
@@ -151,8 +151,8 @@ pub(super) enum PublishChangesError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(super)))]
-pub(super) enum InboundDeliveryError {
+#[snafu(visibility(pub(crate)), module(inbound))]
+pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to decode inbound runtime message."))]
     DecodeMessage { source: RuntimeMessageError },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
@@ -181,14 +181,14 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
     #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
-    InboundInvalidPersistedGroup {
+    InvalidPersistedGroup {
         group_id: GroupId,
         source: GroupInstallError,
         #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display("Replication-store access failed at {location}."))]
-    InboundStoreAccess {
+    StoreAccess {
         source: StoreError,
         #[snafu(implicit)]
         location: Location,
@@ -196,12 +196,12 @@ pub(super) enum InboundDeliveryError {
     #[snafu(display(
         "Failed to load schema for inbound dataset '{dataset_id}' from the replication store."
     ))]
-    InboundLoadDatasetSchema {
+    LoadDatasetSchema {
         dataset_id: DatasetId,
         source: StoreError,
     },
     #[snafu(display("No schema was available for inbound dataset '{dataset_id}'."))]
-    InboundMissingDatasetSchema { dataset_id: DatasetId },
+    MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
         "Inbound update for group {group_id} came from sender {sender}, which is not a group member.",
     ))]

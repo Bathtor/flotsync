@@ -12,24 +12,30 @@ use crate::{
     api::{
         CreateGroupRequest,
         DatasetId,
-        DatasetSnapshotRecord,
-        DatasetSnapshotRowAction,
-        DatasetSnapshotWrite,
+        DatasetRowPatch,
+        DatasetRowSlice,
+        DatasetRowWrite,
         GroupId,
         ListenerError,
+        ListenerExternalSnafu,
         MemberIdentity,
         MemberIndex,
         ReplicationApi,
         ReplicationConfig,
+        ReplicationEvent,
+        ReplicationEventListener,
         ReplicationGroupRecord,
         ReplicationStore,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
         RowChange,
+        RowId,
         RowKey,
+        RowKeyIterator,
         RowMutation,
         SchemaSource,
+        StoreError,
     },
 };
 use flotsync_core::{
@@ -66,7 +72,7 @@ struct StoreStub {
     local_member: MemberIdentity,
     schemas: HashMap<DatasetId, SchemaSource>,
     state: Arc<Mutex<StoreStubState>>,
-    fail_next_apply_dataset_snapshot: Arc<Mutex<Option<DatasetId>>>,
+    fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
 }
 
 impl StoreStub {
@@ -75,7 +81,7 @@ impl StoreStub {
             local_member,
             schemas: HashMap::new(),
             state: Arc::new(Mutex::new(StoreStubState::default())),
-            fail_next_apply_dataset_snapshot: Arc::new(Mutex::new(None)),
+            fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -91,31 +97,29 @@ impl StoreStub {
             .clone()
     }
 
-    fn fail_next_apply_dataset_snapshot(&self, dataset_id: DatasetId) {
+    fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
         *self
-            .fail_next_apply_dataset_snapshot
+            .fail_next_apply_dataset_row_patch
             .lock()
             .expect("store stub failure mutex must not be poisoned") = Some(dataset_id);
     }
 }
 
-impl crate::api::ReplicationStore for StoreStub {
-    fn local_member_identity(
-        &self,
-    ) -> BoxFuture<'_, Result<MemberIdentity, crate::api::StoreError>> {
+impl ReplicationStore for StoreStub {
+    fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>> {
         future::ok(self.local_member.clone()).boxed()
     }
 
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<SchemaSource>, crate::api::StoreError>> {
+    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
         future::ok(self.schemas.get(dataset_id).cloned()).boxed()
     }
 
     fn begin_transaction(
         &self,
-    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, crate::api::StoreError>> {
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let state = self
             .state
             .lock()
@@ -123,8 +127,7 @@ impl crate::api::ReplicationStore for StoreStub {
             .clone();
         let transaction = StoreStubTransaction {
             shared_state: self.state.clone(),
-            schemas: self.schemas.clone(),
-            fail_next_apply_dataset_snapshot: self.fail_next_apply_dataset_snapshot.clone(),
+            fail_next_apply_dataset_row_patch: self.fail_next_apply_dataset_row_patch.clone(),
             working_state: state,
             closed: false,
         };
@@ -142,8 +145,7 @@ struct StoreStubState {
 
 struct StoreStubTransaction {
     shared_state: Arc<Mutex<StoreStubState>>,
-    schemas: HashMap<DatasetId, SchemaSource>,
-    fail_next_apply_dataset_snapshot: Arc<Mutex<Option<DatasetId>>>,
+    fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
     working_state: StoreStubState,
     closed: bool,
 }
@@ -161,14 +163,14 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
         self.assert_open();
         future::ok(self.working_state.groups.get(group_id).cloned()).boxed()
     }
 
     fn load_replication_groups<'a>(
         &'a mut self,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         self.assert_open();
         let groups = self.working_state.groups.values().cloned().collect();
         future::ok(groups).boxed()
@@ -177,7 +179,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
     fn insert_replication_group<'a>(
         &'a mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.assert_open();
         if self
             .working_state
@@ -185,7 +187,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
             .insert(group.group_id, group)
             .is_some()
         {
-            return future::err(crate::api::StoreError::StoreExternal {
+            return future::err(StoreError::StoreExternal {
                 source: Box::new(std::io::Error::other(
                     "store stub does not allow duplicate group inserts",
                 )),
@@ -199,10 +201,10 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         version_vector: VersionVector,
-    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.assert_open();
         let Some(group) = self.working_state.groups.get_mut(group_id) else {
-            return future::err(crate::api::StoreError::StoreExternal {
+            return future::err(StoreError::StoreExternal {
                 source: Box::new(std::io::Error::other(format!(
                     "store stub could not find group '{group_id}'"
                 ))),
@@ -213,82 +215,90 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         future::ok(()).boxed()
     }
 
-    fn load_dataset_snapshot<'a>(
+    fn load_dataset_rows<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
-    ) -> BoxFuture<'a, Result<Option<DatasetSnapshotRecord>, crate::api::StoreError>> {
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
         self.assert_open();
-        if !self
+        let row_keys: Vec<_> = row_keys.copied().collect();
+        let dataset_exists = self
             .working_state
             .datasets
-            .contains(&(*group_id, dataset_id.clone()))
-        {
-            return future::ok(None).boxed();
-        }
-        let Some(schema) = self.schemas.get(dataset_id).cloned() else {
-            return future::ok(None).boxed();
-        };
-        let mut rows: Vec<_> = self
-            .working_state
-            .dataset_rows
+            .contains(&(*group_id, dataset_id.clone()));
+        let rows = row_keys
             .iter()
-            .filter(|((stored_group_id, stored_dataset_id, _), _)| {
-                *stored_group_id == *group_id && *stored_dataset_id == *dataset_id
+            .copied()
+            .map(|row_key| {
+                (
+                    row_key,
+                    self.working_state
+                        .dataset_rows
+                        .get(&(*group_id, dataset_id.clone(), row_key))
+                        .cloned(),
+                )
             })
-            .map(|((_, _, row_key), row)| (*row_key, row.clone()))
             .collect();
-        rows.sort_by_key(|(row_key, _)| *row_key);
-        let data = flotsync_messages::InMemoryData::with_owned_schema_and_row_snapshots(
-            schema.as_schema().clone(),
-            rows.into_iter().map(|(row_key, row)| (row_key.0, row)),
-        )
-        .expect("store stub row snapshot should always materialise");
-        future::ok(Some(DatasetSnapshotRecord {
+        future::ok(DatasetRowSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
-            data,
-        }))
+            dataset_exists,
+            rows,
+        })
         .boxed()
     }
 
-    fn apply_dataset_snapshot<'a>(
+    fn apply_dataset_row_patch<'a>(
         &'a mut self,
-        snapshot: DatasetSnapshotWrite,
-    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+        patch: DatasetRowPatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.assert_open();
         let mut failure = self
-            .fail_next_apply_dataset_snapshot
+            .fail_next_apply_dataset_row_patch
             .lock()
             .expect("store stub failure mutex must not be poisoned");
-        if failure.as_ref() == Some(&snapshot.dataset_id) {
+        if failure.as_ref() == Some(&patch.dataset_id) {
             *failure = None;
-            return future::err(crate::api::StoreError::StoreExternal {
+            return future::err(StoreError::StoreExternal {
                 source: Box::new(std::io::Error::other(format!(
-                    "store stub intentionally failed dataset snapshot apply for '{}'",
-                    snapshot.dataset_id
+                    "store stub intentionally failed dataset row patch apply for '{}'",
+                    patch.dataset_id
                 ))),
             })
             .boxed();
         }
-        self.working_state
-            .datasets
-            .insert((snapshot.group_id, snapshot.dataset_id.clone()));
-        for action in snapshot.row_actions {
+        if patch
+            .actions
+            .iter()
+            .any(|action| matches!(action, DatasetRowWrite::Put { .. }))
+        {
+            self.working_state
+                .datasets
+                .insert((patch.group_id, patch.dataset_id.clone()));
+        }
+        for action in patch.actions {
             match action {
-                DatasetSnapshotRowAction::Insert { row_key, row }
-                | DatasetSnapshotRowAction::Update { row_key, row } => {
-                    self.working_state.dataset_rows.insert(
-                        (snapshot.group_id, snapshot.dataset_id.clone(), row_key),
-                        row,
-                    );
+                DatasetRowWrite::Put { row_key, row } => {
+                    self.working_state
+                        .dataset_rows
+                        .insert((patch.group_id, patch.dataset_id.clone(), row_key), row);
                 }
-                DatasetSnapshotRowAction::Delete { row_key } => {
-                    self.working_state.dataset_rows.remove(&(
-                        snapshot.group_id,
-                        snapshot.dataset_id.clone(),
+                DatasetRowWrite::Delete { row_key } => {
+                    let removed = self.working_state.dataset_rows.remove(&(
+                        patch.group_id,
+                        patch.dataset_id.clone(),
                         row_key,
                     ));
+                    if removed.is_none() {
+                        return future::err(StoreError::StoreExternal {
+                            source: Box::new(std::io::Error::other(format!(
+                                "store stub could not find row '{}/{}/{}'",
+                                patch.group_id, patch.dataset_id, row_key
+                            ))),
+                        })
+                        .boxed();
+                    }
                 }
             }
         }
@@ -299,7 +309,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
         self.assert_open();
         let update = self
             .working_state
@@ -313,7 +323,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
         self.assert_open();
         let updates = self
             .working_state
@@ -333,7 +343,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
     fn append_replication_update<'a>(
         &'a mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.assert_open();
         if self
             .working_state
@@ -341,7 +351,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
             .insert((update.group_id, update.update_id), update)
             .is_some()
         {
-            return future::err(crate::api::StoreError::StoreExternal {
+            return future::err(StoreError::StoreExternal {
                 source: Box::new(std::io::Error::other(
                     "store stub does not allow duplicate update inserts",
                 )),
@@ -355,7 +365,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
         self.assert_open();
         if let Some(update) = self.working_state.updates.get_mut(&(*group_id, update_id)) {
             update.applied_locally = true;
@@ -363,7 +373,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         future::ok(()).boxed()
     }
 
-    fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), crate::api::StoreError>> {
+    fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         self.assert_open();
         self.closed = true;
         let working_state = self.working_state;
@@ -377,7 +387,7 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         .boxed()
     }
 
-    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), crate::api::StoreError>> {
+    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         self.assert_open();
         self.closed = true;
         future::ok(()).boxed()
@@ -391,13 +401,8 @@ struct CapturedDataChange {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CapturedRowChange {
-    Upsert {
-        row_id: crate::api::RowId,
-        title: String,
-    },
-    Delete {
-        row_id: crate::api::RowId,
-    },
+    Upsert { row_id: RowId, title: String },
+    Delete { row_id: RowId },
 }
 
 impl CapturedRowChange {
@@ -407,7 +412,7 @@ impl CapturedRowChange {
                 let title = row
                     .get_field_value::<str>("title")
                     .boxed()
-                    .context(crate::ListenerExternalSnafu)?
+                    .context(ListenerExternalSnafu)?
                     .into_owned();
                 Ok(Self::Upsert { row_id, title })
             }
@@ -486,21 +491,18 @@ impl ListenerStub {
     }
 }
 
-impl crate::api::ReplicationEventListener for ListenerStub {
-    fn on_event(
-        &self,
-        event: crate::api::ReplicationEvent,
-    ) -> BoxFuture<'_, Result<(), ListenerError>> {
+impl ReplicationEventListener for ListenerStub {
+    fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
         Box::pin(async move {
             match event {
-                crate::api::ReplicationEvent::DataChanged { mut rows } => {
+                ReplicationEvent::DataChanged { mut rows } => {
                     let mut captured_rows = Vec::new();
                     loop {
                         let batch = rows
                             .next_batch()
                             .await
                             .boxed()
-                            .context(crate::ListenerExternalSnafu)?;
+                            .context(ListenerExternalSnafu)?;
                         if batch.is_empty() {
                             break;
                         }
@@ -514,7 +516,7 @@ impl crate::api::ReplicationEventListener for ListenerStub {
                         })
                         .expect("listener event channel must remain open while tests are running");
                 }
-                crate::api::ReplicationEvent::GroupInvitation { .. } => {}
+                ReplicationEvent::GroupInvitation { .. } => {}
             }
             Ok(())
         })
@@ -549,11 +551,11 @@ fn title_schema() -> Arc<Schema> {
     Arc::new(Schema::from_fields([Field::linear_string("title")]))
 }
 
-fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> crate::api::RowId {
-    crate::api::RowId {
+fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
+    RowId {
         group_id,
         dataset_id,
-        row_key: crate::api::RowKey(Uuid::from_u128(raw)),
+        row_key: RowKey(Uuid::from_u128(raw)),
     }
 }
 
@@ -624,7 +626,7 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
 fn delivery_runtime_host_updates_shared_group_memberships() {
     let local_member = Identifier::from_array(ALICE_MEMBER_SEGMENTS);
     let mut host = start_host(local_member.clone());
-    let group_id = crate::api::GroupId(Uuid::from_u128(1));
+    let group_id = GroupId(Uuid::from_u128(1));
     let memberships = GroupMemberships::from_groups([(
         group_id,
         GroupMembers::singleton(local_member).expect("group should build"),
@@ -962,7 +964,8 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         },
     )
     .expect("first operation should build")
-    .expect("first operation should apply");
+    .expect("first operation should apply")
+    .encoded_operation;
     let second_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
@@ -973,7 +976,8 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         },
     )
     .expect("second operation should build")
-    .expect("second operation should apply");
+    .expect("second operation should apply")
+    .encoded_operation;
 
     let member_count = NonZeroUsize::new(2).expect("group has two members");
     let first_message = UpdateBatchMessage {
@@ -1067,7 +1071,8 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
         },
     )
     .expect("first operation should build")
-    .expect("first operation should apply");
+    .expect("first operation should apply")
+    .encoded_operation;
     let second_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
@@ -1078,7 +1083,8 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
         },
     )
     .expect("second operation should build")
-    .expect("second operation should apply");
+    .expect("second operation should apply")
+    .encoded_operation;
     let member_count = NonZeroUsize::new(2).expect("group has two members");
     let first_message = UpdateBatchMessage {
         group_id,
@@ -1198,7 +1204,8 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
         },
     )
     .expect("first operation should build")
-    .expect("first operation should apply");
+    .expect("first operation should apply")
+    .encoded_operation;
     let second_operation = apply_local_upsert(
         &mut source_dataset,
         &row_id,
@@ -1209,7 +1216,8 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
         },
     )
     .expect("second operation should build")
-    .expect("second operation should apply");
+    .expect("second operation should apply")
+    .encoded_operation;
     let member_count = NonZeroUsize::new(2).expect("group has two members");
     let first_message = UpdateBatchMessage {
         group_id,
@@ -1241,14 +1249,11 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     runtime
         .apply_update_batch_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should persist pending state");
-    store.fail_next_apply_dataset_snapshot(dataset_id.clone());
+    store.fail_next_apply_dataset_row_patch(dataset_id.clone());
     let error = runtime
         .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
         .expect_err("store write failure should abort the whole ready chain");
-    assert!(matches!(
-        error,
-        InboundDeliveryError::InboundStoreAccess { .. }
-    ));
+    assert!(matches!(error, InboundDeliveryError::StoreAccess { .. }));
     assert!(listener.captured_data_changes().is_empty());
 
     let persisted_state = store.snapshot_state();
@@ -1332,7 +1337,8 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         },
     )
     .expect("first operation should build")
-    .expect("first operation should apply");
+    .expect("first operation should apply")
+    .encoded_operation;
 
     let mut conflicting_source_dataset = LocalDataset::new(schema);
     let conflicting_operation = apply_local_upsert(
@@ -1345,7 +1351,8 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         },
     )
     .expect("conflicting operation should build")
-    .expect("conflicting operation should apply");
+    .expect("conflicting operation should apply")
+    .encoded_operation;
 
     let buffered_message = UpdateBatchMessage {
         group_id,

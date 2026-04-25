@@ -1,5 +1,5 @@
 use crate::{
-    api::{DatasetId, GroupId, MemberIdentity},
+    api::{DatasetId, DatasetIdError, GroupId, MemberIdentity},
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -56,7 +56,7 @@ pub(crate) enum RuntimeMessageError {
     #[snafu(display("Update batch dataset id '{value}' was invalid: {source}"))]
     InvalidDatasetId {
         value: String,
-        source: crate::api::DatasetIdError,
+        source: DatasetIdError,
     },
 }
 

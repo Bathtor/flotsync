@@ -1,10 +1,12 @@
-use super::errors::*;
+use super::errors::{inbound, publish, *};
 use crate::{
     GroupMembers,
     api::{
         DatasetId,
-        DatasetSnapshotRowAction,
-        DatasetSnapshotWrite,
+        DatasetRowPatch,
+        DatasetRowSlice,
+        DatasetRowWrite,
+        DatasetUpdateRecord,
         GroupId,
         MemberIdentity,
         MemberIndex,
@@ -15,6 +17,7 @@ use crate::{
         RowId,
         RowKey,
         RowMutation,
+        SchemaSource,
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
@@ -25,7 +28,7 @@ use flotsync_data_types::{
     RowRead,
     Schema,
     TableOperations,
-    schema::datamodel::RowSnapshot,
+    schema::datamodel::{RowOperation, RowSnapshot},
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use snafu::prelude::*;
@@ -192,16 +195,29 @@ pub(super) struct PendingApplyPlan {
 }
 
 /// One local dataset together with its current replicated in-memory contents.
-#[derive(Clone)]
 pub(super) struct LocalDataset {
     pub(super) data: flotsync_messages::InMemoryData,
 }
 
 impl LocalDataset {
-    pub(super) fn new(schema: Arc<Schema>) -> Self {
+    #[cfg(test)]
+    pub(super) fn new(schema: impl AsRef<Schema>) -> Self {
         Self {
             data: flotsync_messages::InMemoryData::with_owned_schema(schema.as_ref().clone()),
         }
+    }
+
+    /// Rebuild one ephemeral in-memory dataset slice from store-loaded rows.
+    pub(super) fn from_row_slice(schema: &Schema, slice: DatasetRowSlice) -> Self {
+        let data = flotsync_messages::InMemoryData::with_owned_schema_and_row_snapshots(
+            schema.clone(),
+            slice
+                .rows
+                .into_iter()
+                .filter_map(|(row_key, row)| row.map(|row| (row_key.0, row))),
+        )
+        .expect("store-loaded dataset slice must not contain duplicate row keys");
+        Self { data }
     }
 
     fn clone_row(&self, row_key: RowKey) -> Option<flotsync_data_types::OwnedRow<UpdateId>> {
@@ -216,25 +232,18 @@ impl LocalDataset {
         Some(flotsync_data_types::OwnedRow::new(fields))
     }
 
-    /// Materialise the active row set as deterministic owned snapshots.
-    fn active_row_snapshots(&self) -> BTreeMap<RowKey, RowSnapshot<'static, UpdateId>> {
-        let mut rows = BTreeMap::new();
-        for row_id in self.data.active_row_ids() {
-            let row = self
-                .data
-                .get_row(row_id)
-                .expect("active row ids must resolve against the same dataset");
-            let mut fields = Vec::with_capacity(self.data.num_fields());
-            for field_name in self.data.field_names() {
-                let value = row
-                    .get_field(field_name)
-                    .expect("field iteration must resolve against the same row")
-                    .clone();
-                fields.push((field_name.to_owned(), value));
-            }
-            rows.insert(RowKey(*row_id), RowSnapshot::from_owned_fields(fields));
+    /// Snapshot the current row image for explicit durable row writes.
+    fn snapshot_row(&self, row_key: RowKey) -> Option<RowSnapshot<'static, UpdateId>> {
+        let row = self.data.get_row(&row_key.0)?;
+        let mut fields = Vec::with_capacity(self.data.num_fields());
+        for field_name in self.data.field_names() {
+            let value = row
+                .get_field(field_name)
+                .expect("field iteration must resolve against the same row")
+                .clone();
+            fields.push((field_name.to_owned(), value));
         }
-        rows
+        Some(RowSnapshot::from_owned_fields(fields))
     }
 }
 
@@ -246,23 +255,19 @@ impl MutableRow {
     ) -> Result<Vec<InitialFieldValue<'schema>>, PublishChangesError> {
         let mut initial_values = Vec::with_capacity(self.fields.len());
         for (field_name, value) in self.fields {
-            let field =
-                schema
-                    .columns
-                    .get(field_name.as_str())
-                    .context(UnknownSchemaFieldSnafu {
-                        row_id: row_id.clone(),
-                        dataset_id: row_id.dataset_id.clone(),
-                        field_name,
-                    })?;
-            let initial_value =
-                field
-                    .initial(value)
-                    .map_err(Box::new)
-                    .context(InvalidFieldValueSnafu {
-                        row_id: row_id.clone(),
-                        dataset_id: row_id.dataset_id.clone(),
-                    })?;
+            let field = schema.columns.get(field_name.as_str()).with_context(|| {
+                publish::UnknownSchemaFieldSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                    field_name,
+                }
+            })?;
+            let initial_value = field.initial(value).map_err(Box::new).with_context(|_| {
+                publish::InvalidFieldValueSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                }
+            })?;
             initial_values.push(initial_value);
         }
         Ok(initial_values)
@@ -275,51 +280,94 @@ impl MutableRow {
     ) -> Result<Vec<PendingFieldUpdate<'schema>>, PublishChangesError> {
         let mut pending_updates = Vec::with_capacity(self.fields.len());
         for (field_name, value) in self.fields {
-            let field =
-                schema
-                    .columns
-                    .get(field_name.as_str())
-                    .context(UnknownSchemaFieldSnafu {
-                        row_id: row_id.clone(),
-                        dataset_id: row_id.dataset_id.clone(),
-                        field_name,
-                    })?;
-            let pending_update =
-                field
-                    .set(value)
-                    .map_err(Box::new)
-                    .context(InvalidFieldValueSnafu {
-                        row_id: row_id.clone(),
-                        dataset_id: row_id.dataset_id.clone(),
-                    })?;
+            let field = schema.columns.get(field_name.as_str()).with_context(|| {
+                publish::UnknownSchemaFieldSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                    field_name,
+                }
+            })?;
+            let pending_update = field.set(value).map_err(Box::new).with_context(|_| {
+                publish::InvalidFieldValueSnafu {
+                    row_id: row_id.clone(),
+                    dataset_id: row_id.dataset_id.clone(),
+                }
+            })?;
             pending_updates.push(pending_update);
         }
         Ok(pending_updates)
     }
 }
 
+/// One publish batch scoped to a single group and the touched rows per dataset.
+pub(super) struct TouchedGroupRows {
+    pub(super) group_id: GroupId,
+    pub(super) dataset_rows: HashMap<DatasetId, HashSet<RowKey>>,
+}
+
 /// Validate that one publish call targets exactly one group and collect the
-/// touched datasets without imposing any semantic ordering on them.
-pub(super) fn collect_group_dataset_scope(
+/// touched row keys for each dataset without imposing semantic ordering on the
+/// original mutation list.
+pub(super) fn collect_group_row_scope(
     changes: &[RowMutation],
-) -> Result<(GroupId, HashSet<DatasetId>), PublishChangesError> {
+) -> Result<TouchedGroupRows, PublishChangesError> {
     let Some(first_change) = changes.first() else {
-        return EmptyChangesSnafu.fail();
+        return publish::EmptyChangesSnafu.fail();
     };
     let group_id = first_change.row_id().group_id;
-    let mut dataset_ids = HashSet::new();
+    let mut dataset_rows: HashMap<DatasetId, HashSet<RowKey>> = HashMap::new();
     for change in changes {
         let row_id = change.row_id();
         ensure!(
             row_id.group_id == group_id,
-            MixedGroupsSnafu {
+            publish::MixedGroupsSnafu {
                 first_group_id: group_id,
                 other_group_id: row_id.group_id,
             }
         );
-        dataset_ids.insert(row_id.dataset_id.clone());
+        dataset_rows
+            .entry(row_id.dataset_id.clone())
+            .or_default()
+            .insert(row_id.row_key);
     }
-    Ok((group_id, dataset_ids))
+    Ok(TouchedGroupRows {
+        group_id,
+        dataset_rows,
+    })
+}
+
+/// Collect the row keys touched by the given persisted updates.
+///
+/// Schemas are required because stored update records carry encoded schema
+/// operations rather than decoded row operations.
+pub(super) fn collect_record_row_scope(
+    updates: &[ReplicationUpdateRecord],
+    schemas: &HashMap<DatasetId, SchemaSource>,
+) -> Result<HashMap<DatasetId, HashSet<RowKey>>, InboundDeliveryError> {
+    let mut dataset_rows: HashMap<DatasetId, HashSet<RowKey>> = HashMap::new();
+    for update in updates {
+        for dataset_update in &update.dataset_updates {
+            let schema = schemas
+                .get(&dataset_update.dataset_id)
+                .expect("touched inbound dataset schemas must be pre-loaded");
+            for operation in &dataset_update.operations {
+                let operation = decode_schema_operation(operation.clone(), schema.as_schema())
+                    .context(inbound::DecodeSchemaOperationSnafu {
+                        dataset_id: dataset_update.dataset_id.clone(),
+                    })?;
+                let row_key = match operation.operation {
+                    RowOperation::Insert { row_id, .. }
+                    | RowOperation::Update { row_id, .. }
+                    | RowOperation::Delete { row_id } => RowKey(row_id),
+                };
+                dataset_rows
+                    .entry(dataset_update.dataset_id.clone())
+                    .or_default()
+                    .insert(row_key);
+            }
+        }
+    }
+    Ok(dataset_rows)
 }
 
 /// Returns the mutable working dataset image used for one outbound publish batch.
@@ -349,6 +397,30 @@ fn working_dataset_for_inbound<'a>(
         .expect("touched inbound dataset must be pre-loaded before apply"))
 }
 
+/// One prepared local publish batch together with the corresponding durable
+/// row patches.
+pub(super) struct PreparedLocalChanges {
+    pub(super) dataset_updates: Vec<DatasetUpdateRecord>,
+    pub(super) row_patches: Vec<DatasetRowPatch>,
+}
+
+/// One applied inbound batch together with the corresponding durable row patches.
+pub(super) struct AppliedInboundBatch {
+    pub(super) row_changes: Vec<RowChange>,
+    pub(super) row_patches: Vec<DatasetRowPatch>,
+}
+
+/// One staged local mutation together with its explicit durable row write.
+pub(super) struct AppliedLocalOperation {
+    pub(super) encoded_operation: flotsync_messages::datamodel::SchemaOperation,
+    pub(super) row_write: DatasetRowWrite,
+}
+
+struct AppliedRemoteOperation {
+    row_change: RowChange,
+    row_write: DatasetRowWrite,
+}
+
 /// Applies one causally-ready inbound batch against one local group state.
 ///
 /// All touched datasets are first materialised into working copies so the batch
@@ -358,15 +430,17 @@ pub(super) fn apply_one_update_batch(
     group: &mut LoadedGroupMeta,
     working_datasets: &mut HashMap<DatasetId, LocalDataset>,
     update: &ReplicationUpdateRecord,
-) -> Result<Vec<RowChange>, InboundDeliveryError> {
+) -> Result<AppliedInboundBatch, InboundDeliveryError> {
     let mut row_changes = Vec::new();
+    let mut row_patches = Vec::new();
     for dataset_update in &update.dataset_updates {
         let working_dataset =
             working_dataset_for_inbound(working_datasets, &dataset_update.dataset_id)?;
+        let mut row_writes = Vec::new();
         for operation in &dataset_update.operations {
             let schema = working_dataset.data.schema().clone();
             let operation = decode_schema_operation(operation.clone(), &schema).context(
-                DecodeSchemaOperationSnafu {
+                inbound::DecodeSchemaOperationSnafu {
                     dataset_id: dataset_update.dataset_id.clone(),
                 },
             )?;
@@ -375,62 +449,27 @@ pub(super) fn apply_one_update_batch(
                 "decoded inbound operation for dataset '{}' carried change id {}, expected {}",
                 dataset_update.dataset_id, operation.change_id, update.update_id,
             );
-            let row_change = apply_remote_operation(
+            let applied_operation = apply_remote_operation(
                 working_dataset,
                 update.group_id,
                 &dataset_update.dataset_id,
                 operation,
             )?;
-            row_changes.push(row_change);
+            row_changes.push(applied_operation.row_change);
+            row_writes.push(applied_operation.row_write);
+        }
+        if !row_writes.is_empty() {
+            row_patches.push(DatasetRowPatch {
+                group_id: update.group_id,
+                dataset_id: dataset_update.dataset_id.clone(),
+                actions: row_writes,
+            });
         }
     }
     group.mark_applied(update.update_id);
-    Ok(row_changes)
-}
-
-/// Compute the minimal durable row-action set that turns `before` into `after`.
-pub(super) fn build_dataset_snapshot_write(
-    group_id: GroupId,
-    dataset_id: DatasetId,
-    before: Option<&LocalDataset>,
-    after: &LocalDataset,
-) -> Option<DatasetSnapshotWrite> {
-    let before_rows = before
-        .map(LocalDataset::active_row_snapshots)
-        .unwrap_or_default();
-    let after_rows = after.active_row_snapshots();
-    let mut row_actions = Vec::new();
-
-    for (row_key, row) in &after_rows {
-        match before_rows.get(row_key) {
-            None => row_actions.push(DatasetSnapshotRowAction::Insert {
-                row_key: *row_key,
-                row: row.clone(),
-            }),
-            Some(existing_row) if existing_row != row => {
-                row_actions.push(DatasetSnapshotRowAction::Update {
-                    row_key: *row_key,
-                    row: row.clone(),
-                });
-            }
-            Some(_) => {}
-        }
-    }
-
-    for row_key in before_rows.keys() {
-        if !after_rows.contains_key(row_key) {
-            row_actions.push(DatasetSnapshotRowAction::Delete { row_key: *row_key });
-        }
-    }
-
-    if row_actions.is_empty() {
-        return None;
-    }
-
-    Some(DatasetSnapshotWrite {
-        group_id,
-        dataset_id,
-        row_actions,
+    Ok(AppliedInboundBatch {
+        row_changes,
+        row_patches,
     })
 }
 
@@ -440,17 +479,17 @@ pub(super) fn build_dataset_snapshot_write(
 /// image is identical to what is already stored locally.
 pub(super) fn apply_local_upsert(
     dataset: &mut LocalDataset,
-    row_id: &crate::api::RowId,
+    row_id: &RowId,
     row: MutableRow,
     update_id: UpdateId,
-) -> Result<Option<flotsync_messages::datamodel::SchemaOperation>, PublishChangesError> {
+) -> Result<Option<AppliedLocalOperation>, PublishChangesError> {
     let schema = dataset.data.schema().clone();
     let operation = if dataset.data.get_row(&row_id.row_key.0).is_some() {
         let pending_updates = row.into_pending_updates(&schema, row_id)?;
         match dataset
             .data
             .modify_row(update_id, row_id.row_key.0, pending_updates)
-            .context(ApplyLocalMutationSnafu {
+            .context(publish::ApplyLocalMutationSnafu {
                 row_id: row_id.clone(),
             })? {
             OperationOutcome::Applied(operation) => Some(operation),
@@ -461,7 +500,7 @@ pub(super) fn apply_local_upsert(
         let operation = dataset
             .data
             .insert_row(update_id, row_id.row_key.0, initial_values)
-            .context(ApplyLocalMutationSnafu {
+            .context(publish::ApplyLocalMutationSnafu {
                 row_id: row_id.clone(),
             })?;
         Some(operation)
@@ -471,30 +510,44 @@ pub(super) fn apply_local_upsert(
         return Ok(None);
     };
     let encoded_operation =
-        encode_schema_operation(&operation, &schema).context(EncodeOperationSnafu {
+        encode_schema_operation(&operation, &schema).context(publish::EncodeOperationSnafu {
             dataset_id: row_id.dataset_id.clone(),
         })?;
-    Ok(Some(encoded_operation))
+    let row_snapshot = dataset
+        .snapshot_row(row_id.row_key)
+        .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
+    Ok(Some(AppliedLocalOperation {
+        encoded_operation,
+        row_write: DatasetRowWrite::Put {
+            row_key: row_id.row_key,
+            row: row_snapshot,
+        },
+    }))
 }
 
 /// Applies one local delete and encodes the resulting schema operation for transport.
 pub(super) fn apply_local_delete(
     dataset: &mut LocalDataset,
-    row_id: &crate::api::RowId,
+    row_id: &RowId,
     update_id: UpdateId,
-) -> Result<flotsync_messages::datamodel::SchemaOperation, PublishChangesError> {
+) -> Result<AppliedLocalOperation, PublishChangesError> {
     let schema = dataset.data.schema().clone();
     let operation = dataset
         .data
         .delete_row(update_id, row_id.row_key.0)
-        .context(ApplyLocalMutationSnafu {
+        .context(publish::ApplyLocalMutationSnafu {
             row_id: row_id.clone(),
         })?;
     let encoded_operation =
-        encode_schema_operation(&operation, &schema).context(EncodeOperationSnafu {
+        encode_schema_operation(&operation, &schema).context(publish::EncodeOperationSnafu {
             dataset_id: row_id.dataset_id.clone(),
         })?;
-    Ok(encoded_operation)
+    Ok(AppliedLocalOperation {
+        encoded_operation,
+        row_write: DatasetRowWrite::Delete {
+            row_key: row_id.row_key,
+        },
+    })
 }
 
 fn apply_remote_operation(
@@ -502,16 +555,14 @@ fn apply_remote_operation(
     group_id: GroupId,
     dataset_id: &DatasetId,
     operation: flotsync_messages::SchemaOperation<'_>,
-) -> Result<RowChange, InboundDeliveryError> {
-    use flotsync_data_types::schema::datamodel::RowOperation;
-
+) -> Result<AppliedRemoteOperation, InboundDeliveryError> {
     let api_row_id = match &operation.operation {
         RowOperation::Insert { row_id, .. }
         | RowOperation::Update { row_id, .. }
-        | RowOperation::Delete { row_id } => crate::api::RowId {
+        | RowOperation::Delete { row_id } => RowId {
             group_id,
             dataset_id: dataset_id.clone(),
-            row_key: crate::api::RowKey(*row_id),
+            row_key: RowKey(*row_id),
         },
     };
     let change_kind = match &operation.operation {
@@ -526,19 +577,35 @@ fn apply_remote_operation(
         .data
         .clone()
         .apply_schema_operation(operation)
-        .context(ApplyInboundMutationSnafu {
+        .context(inbound::ApplyInboundMutationSnafu {
             row_id: api_row_id.clone(),
         })?;
 
     match change_kind {
-        AppliedChangeKind::Delete => Ok(RowChange::Delete { row_id: api_row_id }),
+        AppliedChangeKind::Delete => Ok(AppliedRemoteOperation {
+            row_change: RowChange::Delete {
+                row_id: api_row_id.clone(),
+            },
+            row_write: DatasetRowWrite::Delete {
+                row_key: api_row_id.row_key,
+            },
+        }),
         AppliedChangeKind::Upsert => {
             let row = dataset.clone_row(api_row_id.row_key).unwrap_or_else(|| {
                 panic!("applied inbound upsert must leave row {api_row_id} readable")
             });
-            Ok(RowChange::Upsert {
-                row_id: api_row_id,
-                row: Arc::new(row),
+            let row_snapshot = dataset.snapshot_row(api_row_id.row_key).unwrap_or_else(|| {
+                panic!("applied inbound upsert must leave row {api_row_id} snapshotable")
+            });
+            Ok(AppliedRemoteOperation {
+                row_change: RowChange::Upsert {
+                    row_id: api_row_id.clone(),
+                    row: Arc::new(row),
+                },
+                row_write: DatasetRowWrite::Put {
+                    row_key: api_row_id.row_key,
+                    row: row_snapshot,
+                },
             })
         }
     }

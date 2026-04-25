@@ -373,65 +373,51 @@ impl std::fmt::Debug for ReplicationGroupRecord {
     }
 }
 
-/// One persisted in-memory dataset view inside a replication group.
+/// One row-granular dataset view loaded for a single transaction.
 ///
-/// `InMemoryData` here is just the materialised dataset state involved in the
-/// current store operation. Backends may persist that state as one blob or
-/// reconstruct it from more granular internal storage, and callers must not
-/// assume that the value represents every row that exists in the dataset.
-#[derive(Clone)]
-pub struct DatasetSnapshotRecord {
-    /// Replication group that owns this dataset image.
-    pub group_id: GroupId,
-    /// Dataset identifier within the replication group.
-    pub dataset_id: DatasetId,
-    /// In-memory dataset state materialised for this durable store operation.
-    pub data: flotsync_messages::InMemoryData,
-}
-
-impl std::fmt::Debug for DatasetSnapshotRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DatasetSnapshotRecord")
-            .field("group_id", &self.group_id)
-            .field("dataset_id", &self.dataset_id)
-            .field("schema", self.data.schema())
-            .finish_non_exhaustive()
-    }
-}
-
-/// One explicit storage write batch for one dataset image.
-///
-/// The actions describe the intended persistence operation for each provided
-/// row key so store implementations do not have to infer insert/update/delete
-/// semantics from the shape of an `InMemoryData` value. The row payload itself
-/// is still a schema-level snapshot, so backends remain free to encode it in a
-/// storage-specific form.
+/// If `dataset_exists` is `true`, the dataset entry already exists for
+/// `(group_id, dataset_id)`, even when every requested row key maps to
+/// `None`. If `dataset_exists` is `false`, the dataset itself has not been
+/// initialised in the group yet, so every requested key is absent because the
+/// dataset is absent. Callers can then decide whether to seed an empty
+/// in-memory working set from the application schema.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DatasetSnapshotWrite {
-    /// Replication group that owns this dataset image.
+pub struct DatasetRowSlice {
+    /// Replication group that owns this dataset slice.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
     pub dataset_id: DatasetId,
-    /// Explicit persistence action for each touched row.
-    pub row_actions: Vec<DatasetSnapshotRowAction>,
+    /// Whether this dataset already exists durably for `group_id`.
+    pub dataset_exists: bool,
+    /// Durable state for each requested row key.
+    pub rows: HashMap<RowKey, Option<RowSnapshot<'static, UpdateId>>>,
+}
+
+/// One explicit transactional row patch for a dataset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowPatch {
+    /// Replication group that owns this dataset patch.
+    pub group_id: GroupId,
+    /// Dataset identifier within the replication group.
+    pub dataset_id: DatasetId,
+    /// Ordered row-level writes to apply transactionally.
+    pub actions: Vec<DatasetRowWrite>,
 }
 
 /// One explicit storage action for a persisted dataset row.
 #[derive(Clone, Debug, PartialEq)]
-pub enum DatasetSnapshotRowAction {
-    /// Insert a new persisted row snapshot.
-    Insert {
+pub enum DatasetRowWrite {
+    /// Ensure that `row_key` exists with the provided snapshot after commit.
+    Put {
         row_key: RowKey,
         row: RowSnapshot<'static, UpdateId>,
     },
-    /// Replace the persisted row snapshot for an existing row.
-    Update {
-        row_key: RowKey,
-        row: RowSnapshot<'static, UpdateId>,
-    },
-    /// Remove one persisted row entirely.
+    /// Remove `row_key` from durable storage.
     Delete { row_key: RowKey },
 }
+
+/// Iterator used to stream requested row keys into one store transaction.
+pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
 
 /// One dataset-scoped batch inside a persisted replication update.
 #[derive(Clone, Debug, PartialEq)]
@@ -511,17 +497,21 @@ pub trait ReplicationStoreTransaction: Send {
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Load the durable dataset snapshot for one `(group_id, dataset_id)` pair.
-    fn load_dataset_snapshot<'a>(
+    /// Load the durable state for the requested dataset row keys.
+    ///
+    /// Implementations must include every iterated `row_key` exactly once in
+    /// `DatasetRowSlice.rows`.
+    fn load_dataset_rows<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
-    ) -> BoxFuture<'a, Result<Option<DatasetSnapshotRecord>, StoreError>>;
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
 
     /// Apply one explicit set of durable row-level dataset storage actions.
-    fn apply_dataset_snapshot<'a>(
+    fn apply_dataset_row_patch<'a>(
         &'a mut self,
-        snapshot: DatasetSnapshotWrite,
+        patch: DatasetRowPatch,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
     /// Load one persisted replication update by `(group_id, update_id)`.

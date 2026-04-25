@@ -1,9 +1,9 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetSnapshotRecord,
-        DatasetSnapshotRowAction,
-        DatasetSnapshotWrite,
+        DatasetRowPatch,
+        DatasetRowSlice,
+        DatasetRowWrite,
         DatasetUpdateRecord,
         GroupId,
         MemberIdentity,
@@ -14,6 +14,7 @@ use crate::{
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
         RowKey,
+        RowKeyIterator,
         SchemaSource,
         StoreError,
     },
@@ -44,6 +45,7 @@ use kompact::prelude::block_on;
 use log::warn;
 use snafu::prelude::*;
 use sqlx::{
+    QueryBuilder,
     Row,
     Sqlite,
     SqlitePool,
@@ -239,34 +241,36 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_dataset_snapshot<'a>(
+    fn load_dataset_rows<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
-    ) -> BoxFuture<'a, Result<Option<DatasetSnapshotRecord>, StoreError>> {
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
-            load_dataset_snapshot(
+            load_dataset_rows(
                 self.assert_open_connection(),
                 schema_sources.as_ref(),
                 group_id,
                 dataset_id,
+                row_keys,
             )
             .await
         }
         .boxed()
     }
 
-    fn apply_dataset_snapshot<'a>(
+    fn apply_dataset_row_patch<'a>(
         &'a mut self,
-        snapshot: DatasetSnapshotWrite,
+        patch: DatasetRowPatch,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
-            apply_dataset_snapshot(
+            apply_dataset_row_patch(
                 self.assert_open_connection(),
                 schema_sources.as_ref(),
-                &snapshot,
+                &patch,
             )
             .await
         }
@@ -546,27 +550,33 @@ WHERE group_id = ?1
     Ok(())
 }
 
-async fn load_dataset_snapshot(
+async fn load_dataset_rows(
     connection: &mut SqliteStoreConnection,
     schema_sources: &HashMap<DatasetId, SchemaSource>,
     group_id: &GroupId,
     dataset_id: &DatasetId,
-) -> Result<Option<DatasetSnapshotRecord>, StoreError> {
-    let dataset_exists = sqlx::query_scalar::<_, i64>(
-        "
-SELECT 1
-FROM datasets
-WHERE group_id = ?1 AND dataset_id = ?2
-",
-    )
-    .bind(group_id.to_string())
-    .bind(dataset_id.as_str())
-    .fetch_optional(&mut **connection)
-    .await
-    .context(SqlxSnafu)?
-    .is_some();
+    row_keys: &mut RowKeyIterator<'_>,
+) -> Result<DatasetRowSlice, StoreError> {
+    let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
+    let mut row_keys = row_keys.peekable();
+    if row_keys.peek().is_none() {
+        return Ok(DatasetRowSlice {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            dataset_exists,
+            rows: HashMap::new(),
+        });
+    }
+    let mut rows = row_keys
+        .map(|row_key| (*row_key, None))
+        .collect::<HashMap<_, _>>();
     if !dataset_exists {
-        return Ok(None);
+        return Ok(DatasetRowSlice {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            dataset_exists,
+            rows,
+        });
     }
 
     let schema = schema_sources
@@ -575,86 +585,103 @@ WHERE group_id = ?1 AND dataset_id = ?2
         .context(MissingSchemaSnafu {
             dataset_id: dataset_id.clone(),
         })?;
-    let rows = load_dataset_rows(connection, group_id, dataset_id, schema.as_schema()).await?;
-    let data = flotsync_messages::InMemoryData::with_owned_schema_and_row_snapshots(
-        schema.as_schema().clone(),
-        rows.into_iter().map(|(row_key, row)| (row_key.0, row)),
-    )
-    .map_err(|source| invalid_stored_object("dataset row", source))?;
-    Ok(Some(DatasetSnapshotRecord {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT row_key, row_snapshot
+FROM dataset_rows
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    query_builder.push(" AND dataset_id = ");
+    query_builder.push_bind(dataset_id.as_str());
+    query_builder.push(" AND row_key IN (");
+    {
+        let mut separated = query_builder.separated(", ");
+        for row_key in rows.keys() {
+            separated.push_bind(row_key.to_string());
+        }
+    }
+    query_builder.push(")");
+    let stored_rows = query_builder
+        .build()
+        .fetch_all(&mut **connection)
+        .await
+        .context(SqlxSnafu)?;
+    for row in stored_rows {
+        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
+        let row_snapshot = decode_dataset_row_snapshot(
+            schema.as_schema(),
+            &row.get::<Vec<u8>, _>("row_snapshot"),
+        )?;
+        rows.insert(row_key, Some(row_snapshot));
+    }
+    Ok(DatasetRowSlice {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
-        data,
-    }))
+        dataset_exists,
+        rows,
+    })
 }
 
-async fn apply_dataset_snapshot(
+async fn apply_dataset_row_patch(
     connection: &mut SqliteStoreConnection,
     schema_sources: &HashMap<DatasetId, SchemaSource>,
-    snapshot: &DatasetSnapshotWrite,
+    patch: &DatasetRowPatch,
 ) -> Result<(), StoreError> {
-    let schema = schema_sources
-        .get(&snapshot.dataset_id)
-        .cloned()
-        .context(MissingSchemaSnafu {
-            dataset_id: snapshot.dataset_id.clone(),
-        })?;
+    if patch.actions.is_empty() {
+        return Ok(());
+    }
 
-    ensure_dataset_exists(connection, &snapshot.group_id, &snapshot.dataset_id).await?;
+    let schema = if patch
+        .actions
+        .iter()
+        .any(|action| matches!(action, DatasetRowWrite::Put { .. }))
+    {
+        let schema =
+            schema_sources
+                .get(&patch.dataset_id)
+                .cloned()
+                .context(MissingSchemaSnafu {
+                    dataset_id: patch.dataset_id.clone(),
+                })?;
+        ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
+        Some(schema)
+    } else {
+        None
+    };
 
-    for action in &snapshot.row_actions {
+    for action in &patch.actions {
         match action {
-            DatasetSnapshotRowAction::Insert { row_key, row } => {
+            DatasetRowWrite::Put { row_key, row } => {
+                let schema = schema
+                    .as_ref()
+                    .expect("put actions require a schema-loaded dataset patch");
                 let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), row)?;
                 sqlx::query(
                     "
 INSERT INTO dataset_rows (group_id, dataset_id, row_key, row_snapshot)
 VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(group_id, dataset_id, row_key) DO UPDATE
+SET row_snapshot = excluded.row_snapshot
 ",
                 )
-                .bind(snapshot.group_id.to_string())
-                .bind(snapshot.dataset_id.as_str())
+                .bind(patch.group_id.to_string())
+                .bind(patch.dataset_id.as_str())
                 .bind(row_key.to_string())
                 .bind(row_snapshot)
                 .execute(&mut **connection)
                 .await
                 .context(SqlxSnafu)?;
             }
-            DatasetSnapshotRowAction::Update { row_key, row } => {
-                let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), row)?;
-                let rows_affected = sqlx::query(
-                    "
-UPDATE dataset_rows
-SET row_snapshot = ?4
-WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
-",
-                )
-                .bind(snapshot.group_id.to_string())
-                .bind(snapshot.dataset_id.as_str())
-                .bind(row_key.to_string())
-                .bind(row_snapshot)
-                .execute(&mut **connection)
-                .await
-                .context(SqlxSnafu)?
-                .rows_affected();
-                ensure!(
-                    rows_affected == 1,
-                    MissingStoredDatasetRowSnafu {
-                        group_id: snapshot.group_id,
-                        dataset_id: snapshot.dataset_id.clone(),
-                        row_key: *row_key,
-                    }
-                );
-            }
-            DatasetSnapshotRowAction::Delete { row_key } => {
+            DatasetRowWrite::Delete { row_key } => {
                 let rows_affected = sqlx::query(
                     "
 DELETE FROM dataset_rows
 WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
 ",
                 )
-                .bind(snapshot.group_id.to_string())
-                .bind(snapshot.dataset_id.as_str())
+                .bind(patch.group_id.to_string())
+                .bind(patch.dataset_id.as_str())
                 .bind(row_key.to_string())
                 .execute(&mut **connection)
                 .await
@@ -663,8 +690,8 @@ WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
                 ensure!(
                     rows_affected == 1,
                     MissingStoredDatasetRowSnafu {
-                        group_id: snapshot.group_id,
-                        dataset_id: snapshot.dataset_id.clone(),
+                        group_id: patch.group_id,
+                        dataset_id: patch.dataset_id.clone(),
                         row_key: *row_key,
                     }
                 );
@@ -881,33 +908,25 @@ WHERE group_id = ?1
     decode_non_zero_member_count(member_count)
 }
 
-async fn load_dataset_rows(
+async fn dataset_exists_in_group(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
     dataset_id: &DatasetId,
-    schema: &flotsync_data_types::schema::Schema,
-) -> Result<Vec<(RowKey, RowSnapshot<'static, UpdateId>)>, StoreError> {
-    let rows = sqlx::query(
+) -> Result<bool, StoreError> {
+    let exists = sqlx::query_scalar::<_, i64>(
         "
-SELECT row_key, row_snapshot
-FROM dataset_rows
+SELECT 1
+FROM datasets
 WHERE group_id = ?1 AND dataset_id = ?2
-ORDER BY row_key
 ",
     )
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
-    .fetch_all(&mut **connection)
+    .fetch_optional(&mut **connection)
     .await
-    .context(SqlxSnafu)?;
-    let mut dataset_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
-        let row_snapshot =
-            decode_dataset_row_snapshot(schema, &row.get::<Vec<u8>, _>("row_snapshot"))?;
-        dataset_rows.push((row_key, row_snapshot));
-    }
-    Ok(dataset_rows)
+    .context(SqlxSnafu)?
+    .is_some();
+    Ok(exists)
 }
 
 async fn ensure_dataset_exists(
@@ -1216,7 +1235,7 @@ impl From<SqliteStoreError> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{DatasetSnapshotRowAction, ReplicationUpdateFilter};
+    use crate::api::{DatasetRowPatch, DatasetRowWrite, ReplicationUpdateFilter};
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
@@ -1263,29 +1282,23 @@ mod tests {
         }
     }
 
-    fn insert_row_action(
+    fn insert_row_patch(
+        group_id: GroupId,
+        dataset_id: &DatasetId,
         row_key: RowKey,
         operation: &flotsync_messages::SchemaOperation<'_>,
-    ) -> DatasetSnapshotRowAction {
+    ) -> DatasetRowPatch {
         let RowOperation::Insert { snapshot, .. } = &operation.operation else {
             panic!("expected insert operation");
         };
-        DatasetSnapshotRowAction::Insert {
-            row_key,
-            row: snapshot.clone().into_owned(),
+        DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowWrite::Put {
+                row_key,
+                row: snapshot.clone().into_owned(),
+            }],
         }
-    }
-
-    fn encode_materialised_snapshot(data: &flotsync_messages::InMemoryData) -> Vec<u8> {
-        let mut encoder =
-            flotsync_messages::snapshots::datamodel::ProtoDataSnapshotEncoder::new(data.schema());
-        data.encode_data_snapshots(&mut encoder)
-            .expect("snapshot encoding should succeed");
-        encoder
-            .into_snapshot()
-            .expect("snapshot should finalise")
-            .encode_to_bytes()
-            .to_vec()
     }
 
     #[test]
@@ -1323,10 +1336,10 @@ mod tests {
             .expect("row insert should succeed");
         let encoded_operation =
             encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
-        let snapshot = DatasetSnapshotWrite {
-            group_id,
-            dataset_id: dataset_id.clone(),
-            row_actions: vec![insert_row_action(row_key, &operation)],
+        let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
+        let expected_row = match &row_patch.actions[0] {
+            DatasetRowWrite::Put { row, .. } => row.clone(),
+            DatasetRowWrite::Delete { .. } => panic!("expected row put patch"),
         };
         let update = ReplicationUpdateRecord {
             group_id,
@@ -1352,8 +1365,8 @@ mod tests {
                 .update_replication_group_version_vector(&group_id, updated_version_vector.clone()),
         )
         .expect("group version vector should update");
-        wait_for_store_future(transaction.apply_dataset_snapshot(snapshot))
-            .expect("snapshot should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(row_patch))
+            .expect("row patch should store");
         wait_for_store_future(transaction.append_replication_update(update.clone()))
             .expect("update should store");
         wait_for_store_future(transaction.commit()).expect("commit should succeed");
@@ -1370,14 +1383,22 @@ mod tests {
             updated_version_vector.iter().collect::<Vec<_>>()
         );
 
-        let loaded_snapshot =
-            wait_for_store_future(transaction.load_dataset_snapshot(&group_id, &dataset_id))
-                .expect("snapshot should load")
-                .expect("snapshot should exist");
+        let missing_row_key = RowKey(Uuid::from_u128(203));
+        let requested_row_keys = [row_key, missing_row_key];
+        let mut requested_row_keys = requested_row_keys.iter();
+        let loaded_snapshot = wait_for_store_future(transaction.load_dataset_rows(
+            &group_id,
+            &dataset_id,
+            &mut requested_row_keys,
+        ))
+        .expect("row slice should load");
+        assert!(loaded_snapshot.dataset_exists);
+        assert_eq!(loaded_snapshot.rows.len(), 2);
         assert_eq!(
-            encode_materialised_snapshot(&loaded_snapshot.data),
-            encode_materialised_snapshot(&source_data)
+            loaded_snapshot.rows.get(&row_key).cloned().flatten(),
+            Some(expected_row)
         );
+        assert_eq!(loaded_snapshot.rows.get(&missing_row_key), Some(&None));
 
         let loaded_update =
             wait_for_store_future(transaction.load_replication_update(&group_id, update.update_id))

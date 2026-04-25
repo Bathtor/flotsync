@@ -1,14 +1,16 @@
 use super::{
-    errors::*,
+    errors::{inbound, publish, *},
     in_memory::{
         LoadedGroupMeta,
         LocalDataset,
         PendingUpdateSet,
+        PreparedLocalChanges,
+        TouchedGroupRows,
         apply_local_delete,
         apply_local_upsert,
         apply_one_update_batch,
-        build_dataset_snapshot_write,
-        collect_group_dataset_scope,
+        collect_group_row_scope,
+        collect_record_row_scope,
         working_dataset_for_publish,
     },
     messages::{
@@ -30,6 +32,9 @@ use crate::{
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DatasetId,
+        DatasetRowPatch,
+        DatasetRowWrite,
+        DatasetUpdateRecord,
         GroupId,
         GroupMigration,
         MemberIdentity,
@@ -39,8 +44,13 @@ use crate::{
         ReplicationEventListener,
         ReplicationGroupRecord,
         ReplicationStore,
+        ReplicationStoreTransaction,
+        ReplicationUpdateFilter,
+        ReplicationUpdateRecord,
         RowChange,
+        RowKey,
         RowMutation,
+        SchemaSource,
         StoreError,
         providers::VecRowProvider,
     },
@@ -76,7 +86,6 @@ use crate::{
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::Schema;
 use flotsync_messages::buffa::Message as BuffaMessage;
 use kompact::prelude::*;
 use snafu::prelude::*;
@@ -114,17 +123,6 @@ enum DatasetSchemaLoadError {
     Missing {
         dataset_id: DatasetId,
     },
-}
-
-/// One transaction-scoped dataset load result for the currently touched ids.
-///
-/// `datasets` contains fully materialised working copies for dataset ids that
-/// already had durable snapshot state. `missing_dataset_ids` tracks datasets
-/// that do not yet exist in durable storage and therefore still need to be
-/// seeded from the application schema catalogue.
-struct MaterialisedDatasets {
-    datasets: HashMap<DatasetId, LocalDataset>,
-    missing_dataset_ids: HashSet<DatasetId>,
 }
 
 /// Local-actor messages understood by [`ReplicationRuntimeComponent`].
@@ -256,12 +254,15 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    async fn load_dataset_schemas(
+    async fn load_dataset_schemas<I>(
         store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: HashSet<DatasetId>,
-    ) -> Result<HashMap<DatasetId, Arc<Schema>>, DatasetSchemaLoadError> {
-        let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
-        for dataset_id in missing_dataset_ids {
+        dataset_ids: I,
+    ) -> Result<HashMap<DatasetId, SchemaSource>, DatasetSchemaLoadError>
+    where
+        I: IntoIterator<Item = DatasetId>,
+    {
+        let mut loaded_schemas = HashMap::new();
+        for dataset_id in dataset_ids {
             let schema = store
                 .load_dataset_schema(&dataset_id)
                 .await
@@ -272,88 +273,43 @@ impl ReplicationRuntimeComponent {
             let schema = schema.ok_or_else(|| DatasetSchemaLoadError::Missing {
                 dataset_id: dataset_id.clone(),
             })?;
-            loaded_schemas.insert(dataset_id, schema.into_shared());
+            loaded_schemas.insert(dataset_id, schema);
         }
         Ok(loaded_schemas)
     }
 
-    /// Materialise the committed state for every touched dataset id.
-    ///
-    /// This currently loads full dataset images into memory because the store
-    /// boundary only exposes whole-dataset snapshots. `flotsync-i5b` tracks the
-    /// planned follow-up to reduce this to row-granular transactional loading.
+    /// Materialise one ephemeral in-memory dataset slice for each touched
+    /// dataset using only the requested row keys.
     async fn materialise_touched_datasets(
-        transaction: &mut dyn crate::api::ReplicationStoreTransaction,
+        transaction: &mut dyn ReplicationStoreTransaction,
+        schemas: &HashMap<DatasetId, SchemaSource>,
         group_id: GroupId,
-        dataset_ids: &HashSet<DatasetId>,
-    ) -> Result<MaterialisedDatasets, StoreError> {
-        let mut datasets = HashMap::with_capacity(dataset_ids.len());
-        let mut missing_dataset_ids = HashSet::new();
-        for dataset_id in dataset_ids {
-            let snapshot = transaction
-                .load_dataset_snapshot(&group_id, dataset_id)
+        dataset_rows: &HashMap<DatasetId, HashSet<RowKey>>,
+    ) -> Result<HashMap<DatasetId, LocalDataset>, StoreError> {
+        let mut datasets = HashMap::with_capacity(dataset_rows.len());
+        for (dataset_id, row_keys) in dataset_rows {
+            let mut row_keys = row_keys.iter();
+            let row_slice = transaction
+                .load_dataset_rows(&group_id, dataset_id, &mut row_keys)
                 .await?;
-            if let Some(snapshot) = snapshot {
-                datasets.insert(
-                    dataset_id.clone(),
-                    LocalDataset {
-                        data: snapshot.data,
-                    },
-                );
-            } else {
-                missing_dataset_ids.insert(dataset_id.clone());
-            }
+            let schema = schemas
+                .get(dataset_id)
+                .expect("touched dataset schemas must be pre-loaded");
+            datasets.insert(
+                dataset_id.clone(),
+                LocalDataset::from_row_slice(schema.as_schema(), row_slice),
+            );
         }
-        Ok(MaterialisedDatasets {
-            datasets,
-            missing_dataset_ids,
-        })
+        Ok(datasets)
     }
 
-    /// Seed empty working datasets from application schemas for dataset ids
-    /// that were not yet present in durable storage.
-    ///
-    /// This stays in the runtime for now because the current store boundary
-    /// does not carry schema-backed empty datasets when no snapshot rows exist.
-    async fn seed_missing_datasets(
-        store: Arc<dyn ReplicationStore>,
-        datasets: &mut HashMap<DatasetId, LocalDataset>,
-        missing_dataset_ids: HashSet<DatasetId>,
-    ) -> Result<(), DatasetSchemaLoadError> {
-        let loaded_schemas = Self::load_dataset_schemas(store, missing_dataset_ids).await?;
-        for (dataset_id, schema) in loaded_schemas {
-            datasets.insert(dataset_id, LocalDataset::new(schema));
-        }
-        Ok(())
-    }
-
-    /// Persist the transactional dataset diff back into durable snapshot rows.
-    async fn persist_dataset_changes(
-        transaction: &mut dyn crate::api::ReplicationStoreTransaction,
-        group_id: GroupId,
-        original_datasets: &HashMap<DatasetId, LocalDataset>,
-        working_datasets: &HashMap<DatasetId, LocalDataset>,
+    /// Persist one set of explicit row patches back into durable storage.
+    async fn apply_dataset_row_patches(
+        transaction: &mut dyn ReplicationStoreTransaction,
+        patches: Vec<DatasetRowPatch>,
     ) -> Result<(), StoreError> {
-        let dataset_ids: HashSet<_> = original_datasets
-            .keys()
-            .chain(working_datasets.keys())
-            .cloned()
-            .collect();
-        for dataset_id in dataset_ids {
-            let snapshot_write = working_datasets
-                .get(&dataset_id)
-                .and_then(|working_dataset| {
-                    build_dataset_snapshot_write(
-                        group_id,
-                        dataset_id.clone(),
-                        original_datasets.get(&dataset_id),
-                        working_dataset,
-                    )
-                });
-            let Some(snapshot_write) = snapshot_write else {
-                continue;
-            };
-            transaction.apply_dataset_snapshot(snapshot_write).await?;
+        for patch in patches {
+            transaction.apply_dataset_row_patch(patch).await?;
         }
         Ok(())
     }
@@ -566,7 +522,7 @@ impl ReplicationRuntimeComponent {
         let next_local_version = local_group
             .applied_version(local_group.local_member_index)
             .checked_add(1)
-            .context(ExhaustedUpdateIdsSnafu { group_id })?;
+            .context(publish::ExhaustedUpdateIdsSnafu { group_id })?;
         Ok(UpdateId {
             version: next_local_version,
             node_index: local_group.local_member_index.as_u32(),
@@ -578,18 +534,19 @@ impl ReplicationRuntimeComponent {
         working_datasets: &mut HashMap<DatasetId, LocalDataset>,
         changes: Vec<RowMutation>,
         update_id: UpdateId,
-    ) -> Result<Vec<crate::api::DatasetUpdateRecord>, PublishChangesError> {
+    ) -> Result<PreparedLocalChanges, PublishChangesError> {
         let mut encoded_operations: HashMap<
             DatasetId,
             Vec<flotsync_messages::datamodel::SchemaOperation>,
         > = HashMap::new();
+        let mut row_writes: HashMap<DatasetId, Vec<DatasetRowWrite>> = HashMap::new();
 
         'changes: for mutation in changes {
             let row_id = mutation.row_id().clone();
             let working_dataset =
                 working_dataset_for_publish(working_datasets, &row_id.dataset_id)?;
 
-            let encoded_operation = match mutation {
+            let applied_operation = match mutation {
                 RowMutation::Upsert { row, .. } => {
                     apply_local_upsert(working_dataset, &row_id, row, update_id)?
                 }
@@ -597,26 +554,42 @@ impl ReplicationRuntimeComponent {
                     Some(apply_local_delete(working_dataset, &row_id, update_id)?)
                 }
             };
-            let Some(encoded_operation) = encoded_operation else {
+            let Some(applied_operation) = applied_operation else {
                 continue 'changes;
             };
             encoded_operations
                 .entry(row_id.dataset_id.clone())
                 .or_default()
-                .push(encoded_operation);
+                .push(applied_operation.encoded_operation);
+            row_writes
+                .entry(row_id.dataset_id.clone())
+                .or_default()
+                .push(applied_operation.row_write);
         }
 
         ensure!(
             !encoded_operations.is_empty(),
-            NoEffectiveChangesSnafu { group_id }
+            publish::NoEffectiveChangesSnafu { group_id }
         );
-        Ok(encoded_operations
+        let dataset_updates = encoded_operations
             .into_iter()
-            .map(|(dataset_id, operations)| crate::api::DatasetUpdateRecord {
+            .map(|(dataset_id, operations)| DatasetUpdateRecord {
                 dataset_id,
                 operations,
             })
-            .collect())
+            .collect();
+        let row_patches = row_writes
+            .into_iter()
+            .map(|(dataset_id, actions)| DatasetRowPatch {
+                group_id,
+                dataset_id,
+                actions,
+            })
+            .collect();
+        Ok(PreparedLocalChanges {
+            dataset_updates,
+            row_patches,
+        })
     }
 
     /// Convert one runtime update message into the durable update-record shape.
@@ -624,8 +597,8 @@ impl ReplicationRuntimeComponent {
         sender: MemberIdentity,
         message: UpdateBatchMessage,
         applied_locally: bool,
-    ) -> crate::api::ReplicationUpdateRecord {
-        crate::api::ReplicationUpdateRecord {
+    ) -> ReplicationUpdateRecord {
+        ReplicationUpdateRecord {
             group_id: message.group_id,
             update_id: message.update_id,
             sender,
@@ -633,7 +606,7 @@ impl ReplicationRuntimeComponent {
             dataset_updates: message
                 .dataset_updates
                 .into_iter()
-                .map(|dataset_update| crate::api::DatasetUpdateRecord {
+                .map(|dataset_update| DatasetUpdateRecord {
                     dataset_id: dataset_update.dataset_id,
                     operations: dataset_update.operations,
                 })
@@ -642,101 +615,84 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Collect the dataset ids touched by persisted update records.
-    fn collect_record_dataset_ids(
-        updates: &[crate::api::ReplicationUpdateRecord],
-    ) -> HashSet<DatasetId> {
-        updates
-            .iter()
-            .flat_map(|update| update.dataset_updates.iter())
-            .map(|dataset_update| dataset_update.dataset_id.clone())
-            .collect()
-    }
-
     /// Publish one local change batch through one durable store transaction.
     async fn publish_changes_transactionally(
         &mut self,
         changes: Vec<RowMutation>,
     ) -> Result<PreparedLocalPublish, PublishChangesError> {
-        let (group_id, dataset_ids) = collect_group_dataset_scope(&changes)?;
+        let TouchedGroupRows {
+            group_id,
+            dataset_rows,
+        } = collect_group_row_scope(&changes)?;
+        let loaded_schemas =
+            Self::load_dataset_schemas(self.store.clone(), dataset_rows.keys().cloned())
+                .await
+                .map_err(|error| match error {
+                    DatasetSchemaLoadError::Load { dataset_id, source } => {
+                        PublishChangesError::LoadDatasetSchema { dataset_id, source }
+                    }
+                    DatasetSchemaLoadError::Missing { dataset_id } => {
+                        PublishChangesError::MissingDatasetSchema { dataset_id }
+                    }
+                })?;
         let mut transaction = self
             .store
             .begin_transaction()
             .await
-            .context(PublishStoreAccessSnafu)?;
+            .context(publish::StoreAccessSnafu)?;
         let persisted_group = transaction
             .load_replication_group(&group_id)
             .await
-            .context(PublishStoreAccessSnafu)?;
-        let persisted_group = persisted_group.context(UnknownGroupSnafu { group_id })?;
+            .context(publish::StoreAccessSnafu)?;
+        let persisted_group = persisted_group.context(publish::UnknownGroupSnafu { group_id })?;
         let mut local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
-                .context(PublishInvalidPersistedGroupSnafu { group_id })?;
-        let materialised_datasets =
-            Self::materialise_touched_datasets(transaction.as_mut(), group_id, &dataset_ids)
-                .await
-                .context(PublishStoreAccessSnafu)?;
-        let mut working_datasets = materialised_datasets.datasets;
-        Self::seed_missing_datasets(
-            self.store.clone(),
-            &mut working_datasets,
-            materialised_datasets.missing_dataset_ids,
+                .context(publish::InvalidPersistedGroupSnafu { group_id })?;
+        let mut working_datasets = Self::materialise_touched_datasets(
+            transaction.as_mut(),
+            &loaded_schemas,
+            group_id,
+            &dataset_rows,
         )
         .await
-        .map_err(|error| match error {
-            DatasetSchemaLoadError::Load { dataset_id, source } => {
-                PublishChangesError::LoadDatasetSchema { dataset_id, source }
-            }
-            DatasetSchemaLoadError::Missing { dataset_id } => {
-                PublishChangesError::MissingDatasetSchema { dataset_id }
-            }
-        })?;
-
-        // Current snapshot diffing keeps both the committed and working dataset
-        // images in memory. `flotsync-i5b` tracks the planned row-granular
-        // redesign that should remove this full-copy comparison.
-        let original_datasets = working_datasets.clone();
+        .context(publish::StoreAccessSnafu)?;
         let read_versions = local_group.version_vector.clone();
         let update_id = Self::next_local_update_id(&local_group, group_id)?;
-        let dataset_updates =
+        let prepared_local_changes =
             Self::build_local_dataset_updates(group_id, &mut working_datasets, changes, update_id)?;
         local_group.mark_applied(update_id);
 
-        let persisted_update = crate::api::ReplicationUpdateRecord {
+        let persisted_update = ReplicationUpdateRecord {
             group_id,
             update_id,
             sender: self.local_member.clone(),
             read_versions: read_versions.clone(),
-            dataset_updates: dataset_updates.clone(),
+            dataset_updates: prepared_local_changes.dataset_updates.clone(),
             applied_locally: true,
         };
+        Self::apply_dataset_row_patches(transaction.as_mut(), prepared_local_changes.row_patches)
+            .await
+            .context(publish::StoreAccessSnafu)?;
         transaction
             .append_replication_update(persisted_update)
             .await
-            .context(PublishStoreAccessSnafu)?;
-        Self::persist_dataset_changes(
-            transaction.as_mut(),
-            group_id,
-            &original_datasets,
-            &working_datasets,
-        )
-        .await
-        .context(PublishStoreAccessSnafu)?;
+            .context(publish::StoreAccessSnafu)?;
         transaction
             .update_replication_group_version_vector(&group_id, local_group.version_vector)
             .await
-            .context(PublishStoreAccessSnafu)?;
+            .context(publish::StoreAccessSnafu)?;
         transaction
             .commit()
             .await
-            .context(PublishStoreAccessSnafu)?;
+            .context(publish::StoreAccessSnafu)?;
 
         let payload =
             Self::encode_runtime_payload(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
                 group_id,
                 update_id,
                 read_versions,
-                dataset_updates: dataset_updates
+                dataset_updates: prepared_local_changes
+                    .dataset_updates
                     .into_iter()
                     .map(|dataset_update| DatasetUpdateMessage {
                         dataset_id: dataset_update.dataset_id,
@@ -756,15 +712,15 @@ impl ReplicationRuntimeComponent {
         deliver: ReliableDeliveryDeliver,
     ) -> Result<Handled, InboundDeliveryError> {
         let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-            .context(DecodeMessageSnafu)?;
+            .context(inbound::DecodeMessageSnafu)?;
         match message {
             WireRuntimeMessage::BootstrapGroup(message) => {
                 let group_id = message.group_id;
                 let members = GroupMembers::from_ordered_members(message.members)
-                    .context(InvalidBootstrapMembersSnafu)?;
+                    .context(inbound::InvalidBootstrapMembersSnafu)?;
                 ensure!(
                     members.contains(&self.local_member),
-                    BootstrapMissingLocalMemberSnafu {
+                    inbound::BootstrapMissingLocalMemberSnafu {
                         group_id,
                         local_member: self.local_member.clone(),
                     }
@@ -775,10 +731,10 @@ impl ReplicationRuntimeComponent {
                         let persisted_group = async_self
                             .store_new_replication_group(record)
                             .await
-                            .context(InstallBootstrapGroupSnafu { group_id })?;
+                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
                         async_self
                             .install_group_membership_view(persisted_group)
-                            .context(InstallBootstrapGroupSnafu { group_id })?;
+                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
                         // Dropping `deliver` without completing `processed`
                         // intentionally withholds the recipient acknowledgement
                         // from reliable delivery. Sender-side timeout/retry
@@ -786,7 +742,7 @@ impl ReplicationRuntimeComponent {
                         deliver
                             .processed
                             .complete()
-                            .context(CompleteProcessedPromiseSnafu { group_id })?;
+                            .context(inbound::CompleteProcessedPromiseSnafu { group_id })?;
                         Ok::<(), InboundDeliveryError>(())
                     }
                     .await;
@@ -795,7 +751,7 @@ impl ReplicationRuntimeComponent {
                     }
                 }))
             }
-            WireRuntimeMessage::UpdateBatch(_) => UnexpectedReliableMessageSnafu.fail(),
+            WireRuntimeMessage::UpdateBatch(_) => inbound::UnexpectedReliableMessageSnafu.fail(),
         }
     }
 
@@ -805,9 +761,9 @@ impl ReplicationRuntimeComponent {
     ) -> Result<Handled, InboundDeliveryError> {
         let sender = deliver.envelope.header.sender.clone();
         let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-            .context(DecodeMessageSnafu)?;
+            .context(inbound::DecodeMessageSnafu)?;
         match message {
-            WireRuntimeMessage::BootstrapGroup(_) => UnexpectedGroupMessageSnafu.fail(),
+            WireRuntimeMessage::BootstrapGroup(_) => inbound::UnexpectedGroupMessageSnafu.fail(),
             WireRuntimeMessage::UpdateBatch(message) => {
                 Ok(self.handle_update_batch(sender, message))
             }
@@ -826,29 +782,28 @@ impl ReplicationRuntimeComponent {
             .store
             .begin_transaction()
             .await
-            .context(InboundStoreAccessSnafu)?;
+            .context(inbound::StoreAccessSnafu)?;
         let persisted_group = transaction
             .load_replication_group(&group_id)
             .await
-            .context(InboundStoreAccessSnafu)?;
-        let persisted_group = persisted_group.context(UnknownHostedGroupSnafu { group_id })?;
+            .context(inbound::StoreAccessSnafu)?;
+        let persisted_group =
+            persisted_group.context(inbound::UnknownHostedGroupSnafu { group_id })?;
         let local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
-                .context(InboundInvalidPersistedGroupSnafu { group_id })?;
+                .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
         let message = message
             .into_runtime(local_group.member_count())
-            .context(DecodeReadVersionsSnafu { group_id })?;
-        let expected_sender_index =
-            local_group
-                .members
-                .member_index(&sender)
-                .context(UpdateSenderNotInGroupSnafu {
-                    group_id,
-                    sender: sender.clone(),
-                })?;
+            .context(inbound::DecodeReadVersionsSnafu { group_id })?;
+        let expected_sender_index = local_group.members.member_index(&sender).context(
+            inbound::UpdateSenderNotInGroupSnafu {
+                group_id,
+                sender: sender.clone(),
+            },
+        )?;
         ensure!(
             expected_sender_index.as_u32() == message.update_id.node_index,
-            UpdateSenderIndexMismatchSnafu {
+            inbound::UpdateSenderIndexMismatchSnafu {
                 group_id,
                 sender: sender.clone(),
                 expected_index: expected_sender_index,
@@ -859,7 +814,7 @@ impl ReplicationRuntimeComponent {
             transaction
                 .commit()
                 .await
-                .context(InboundStoreAccessSnafu)?;
+                .context(inbound::StoreAccessSnafu)?;
             return Ok(Vec::new());
         }
 
@@ -867,11 +822,11 @@ impl ReplicationRuntimeComponent {
         if let Some(existing_update) = transaction
             .load_replication_update(&group_id, inbound_update.update_id)
             .await
-            .context(InboundStoreAccessSnafu)?
+            .context(inbound::StoreAccessSnafu)?
         {
             ensure!(
                 existing_update == inbound_update,
-                ConflictingPersistedUpdateSnafu {
+                inbound::ConflictingPersistedUpdateSnafu {
                     group_id,
                     update_id: inbound_update.update_id,
                 }
@@ -880,13 +835,13 @@ impl ReplicationRuntimeComponent {
             transaction
                 .append_replication_update(inbound_update.clone())
                 .await
-                .context(InboundStoreAccessSnafu)?;
+                .context(inbound::StoreAccessSnafu)?;
         }
 
         let pending_updates = transaction
-            .load_replication_updates(&group_id, crate::api::ReplicationUpdateFilter::PendingApply)
+            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply)
             .await
-            .context(InboundStoreAccessSnafu)?;
+            .context(inbound::StoreAccessSnafu)?;
         let mut pending_updates = PendingUpdateSet::from_updates(pending_updates);
         let mut local_group = local_group;
         let apply_plan = pending_updates.plan_apply_chain(&local_group);
@@ -894,71 +849,65 @@ impl ReplicationRuntimeComponent {
             transaction
                 .mark_replication_update_applied(&group_id, *applied_update_id)
                 .await
-                .context(InboundStoreAccessSnafu)?;
+                .context(inbound::StoreAccessSnafu)?;
         }
         if apply_plan.ready_chain.is_empty() {
             transaction
                 .commit()
                 .await
-                .context(InboundStoreAccessSnafu)?;
+                .context(inbound::StoreAccessSnafu)?;
             return Ok(Vec::new());
         }
 
-        let touched_dataset_ids = Self::collect_record_dataset_ids(&apply_plan.ready_chain);
-        let materialised_datasets = Self::materialise_touched_datasets(
+        let touched_dataset_ids = apply_plan
+            .ready_chain
+            .iter()
+            .flat_map(|update| update.dataset_updates.iter())
+            .map(|dataset_update| dataset_update.dataset_id.clone())
+            .collect::<HashSet<_>>();
+        let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), touched_dataset_ids)
+            .await
+            .map_err(|error| match error {
+                DatasetSchemaLoadError::Load { dataset_id, source } => {
+                    InboundDeliveryError::LoadDatasetSchema { dataset_id, source }
+                }
+                DatasetSchemaLoadError::Missing { dataset_id } => {
+                    InboundDeliveryError::MissingDatasetSchema { dataset_id }
+                }
+            })?;
+        let touched_dataset_rows =
+            collect_record_row_scope(&apply_plan.ready_chain, &loaded_schemas)?;
+        let mut working_datasets = Self::materialise_touched_datasets(
             transaction.as_mut(),
+            &loaded_schemas,
             group_id,
-            &touched_dataset_ids,
+            &touched_dataset_rows,
         )
         .await
-        .context(InboundStoreAccessSnafu)?;
-        let mut working_datasets = materialised_datasets.datasets;
-        Self::seed_missing_datasets(
-            self.store.clone(),
-            &mut working_datasets,
-            materialised_datasets.missing_dataset_ids,
-        )
-        .await
-        .map_err(|error| match error {
-            DatasetSchemaLoadError::Load { dataset_id, source } => {
-                InboundDeliveryError::InboundLoadDatasetSchema { dataset_id, source }
-            }
-            DatasetSchemaLoadError::Missing { dataset_id } => {
-                InboundDeliveryError::InboundMissingDatasetSchema { dataset_id }
-            }
-        })?;
-        // Current snapshot diffing keeps both the committed and working dataset
-        // images in memory. `flotsync-i5b` tracks the planned row-granular
-        // redesign that should remove this full-copy comparison.
-        let original_datasets = working_datasets.clone();
+        .context(inbound::StoreAccessSnafu)?;
         let mut event_batches = Vec::new();
         for ready_update in &apply_plan.ready_chain {
-            let row_changes =
+            let applied_batch =
                 apply_one_update_batch(&mut local_group, &mut working_datasets, ready_update)?;
-            if !row_changes.is_empty() {
-                event_batches.push(row_changes);
+            if !applied_batch.row_changes.is_empty() {
+                event_batches.push(applied_batch.row_changes);
             }
+            Self::apply_dataset_row_patches(transaction.as_mut(), applied_batch.row_patches)
+                .await
+                .context(inbound::StoreAccessSnafu)?;
             transaction
                 .mark_replication_update_applied(&group_id, ready_update.update_id)
                 .await
-                .context(InboundStoreAccessSnafu)?;
+                .context(inbound::StoreAccessSnafu)?;
         }
-        Self::persist_dataset_changes(
-            transaction.as_mut(),
-            group_id,
-            &original_datasets,
-            &working_datasets,
-        )
-        .await
-        .context(InboundStoreAccessSnafu)?;
         transaction
             .update_replication_group_version_vector(&group_id, local_group.version_vector)
             .await
-            .context(InboundStoreAccessSnafu)?;
+            .context(inbound::StoreAccessSnafu)?;
         transaction
             .commit()
             .await
-            .context(InboundStoreAccessSnafu)?;
+            .context(inbound::StoreAccessSnafu)?;
         Ok(event_batches)
     }
 

@@ -4,6 +4,7 @@ use crate::api::{
     ApiResult,
     ChangeGroupMembershipRequest,
     CreateGroupRequest,
+    GroupId,
     GroupMigration,
     LoadError,
     PublishReceipt,
@@ -27,7 +28,7 @@ use super::{
     messages::UpdateBatchMessage,
 };
 #[cfg(test)]
-use crate::{GroupId, GroupMembers, api::MemberIdentity};
+use crate::{GroupMembers, api::MemberIdentity};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -141,7 +142,7 @@ impl ReplicationApi for ReplicationRuntime {
         })
     }
 
-    fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, crate::api::GroupId> {
+    fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, GroupId> {
         self.ask(move |promise| ReplicationRuntimeMessage::CreateGroup(Ask::new(promise, req)))
     }
 
