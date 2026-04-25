@@ -1,12 +1,16 @@
-use super::{component::BufferedInboundUpdate, errors::*, messages::UpdateBatchMessage};
+use super::errors::*;
 use crate::{
     GroupMembers,
     api::{
         DatasetId,
+        DatasetSnapshotRowAction,
+        DatasetSnapshotWrite,
         GroupId,
         MemberIdentity,
         MemberIndex,
         MutableRow,
+        ReplicationGroupRecord,
+        ReplicationUpdateRecord,
         RowChange,
         RowId,
         RowKey,
@@ -21,39 +25,34 @@ use flotsync_data_types::{
     RowRead,
     Schema,
     TableOperations,
+    schema::datamodel::RowSnapshot,
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use snafu::prelude::*;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
 };
 
-/// In-memory read model for the current replication runtime.
+/// One fixed-membership replication group loaded for one store transaction.
 ///
-/// The authoritative group registry now lives in `ReplicationStore`. This
-/// structure only caches the currently loaded group views plus transient
-/// runtime-only buffers.
-#[derive(Default)]
-pub(super) struct LocalRuntimeState {
-    pub(super) groups: HashMap<GroupId, LocalGroupState>,
-}
-
-/// One fixed-membership replication group currently hosted locally.
-pub(super) struct LocalGroupState {
+/// The runtime no longer keeps this state resident between messages. Instead,
+/// each publish or inbound-apply flow loads the persisted group metadata, uses
+/// it to drive one isolated transaction-scoped working set, and then writes the
+/// updated durable state back through `ReplicationStore`.
+#[derive(Clone)]
+pub(super) struct LoadedGroupMeta {
     pub(super) members: GroupMembers,
     pub(super) local_member_index: MemberIndex,
     pub(super) version_vector: VersionVector,
-    pub(super) datasets: HashMap<DatasetId, LocalDataset>,
-    pub(super) pending_updates: BTreeMap<UpdateId, BufferedInboundUpdate>,
 }
 
-impl LocalGroupState {
-    /// Rebuild one local read model from a persisted group record.
+impl LoadedGroupMeta {
+    /// Rebuild one transaction-scoped group view from a persisted group record.
     pub(super) fn from_replication_group_record(
         local_member: &MemberIdentity,
-        group: crate::api::ReplicationGroupRecord,
+        group: ReplicationGroupRecord,
     ) -> Result<Self, GroupInstallError> {
         let group_id = group.group_id;
         let members = GroupMembers::from_ordered_members(group.members)
@@ -89,29 +88,15 @@ impl LocalGroupState {
             members,
             local_member_index,
             version_vector: group.version_vector,
-            datasets: HashMap::new(),
-            pending_updates: BTreeMap::new(),
         })
     }
 
-    /// Return the subset of `dataset_ids` that is not hosted locally yet.
-    pub(super) fn missing_dataset_ids(
-        &self,
-        dataset_ids: &HashSet<DatasetId>,
-    ) -> HashSet<DatasetId> {
-        dataset_ids
-            .iter()
-            .filter(|dataset_id| !self.datasets.contains_key(*dataset_id))
-            .cloned()
-            .collect()
-    }
-
-    /// Return the fixed member count for this hosted group.
+    /// Return the fixed member count for this transaction-scoped group view.
     pub(super) fn member_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.members.len()).expect("hosted group must be non-empty")
+        NonZeroUsize::new(self.members.len()).expect("loaded group must be non-empty")
     }
 
-    /// Return the locally applied version for the given member index.
+    /// Return the durably applied version for the given member index.
     pub(super) fn applied_version(&self, member_index: MemberIndex) -> u64 {
         self.version_vector
             .version_at(member_index.as_u32() as usize)
@@ -124,66 +109,86 @@ impl LocalGroupState {
             .expect("member version counter must not overflow")
     }
 
-    /// Return `true` when `update_id` is already reflected in the local VV.
+    /// Return `true` when `update_id` is already reflected in the durable VV.
     pub(super) fn has_applied(&self, update_id: UpdateId) -> bool {
         self.applied_version(MemberIndex::new(update_id.node_index)) >= update_id.version
     }
 
-    /// Return `true` when `message` is causally ready and is the next version
+    /// Return `true` when `update` is causally ready and is the next version
     /// expected from its producer.
-    pub(super) fn can_apply(&self, message: &UpdateBatchMessage) -> bool {
-        let producer_index = MemberIndex::new(message.update_id.node_index);
-        (self.version_vector >= message.read_versions)
-            && self.expected_next_version(producer_index) == message.update_id.version
+    pub(super) fn can_apply(&self, update: &ReplicationUpdateRecord) -> bool {
+        let producer_index = MemberIndex::new(update.update_id.node_index);
+        (self.version_vector >= update.read_versions)
+            && self.expected_next_version(producer_index) == update.update_id.version
     }
 
-    /// Buffer one inbound update until its causal dependencies become ready.
-    pub(super) fn buffer_update(
-        &mut self,
-        pending_update: BufferedInboundUpdate,
-    ) -> Result<(), InboundDeliveryError> {
-        let update_id = pending_update.message.update_id;
-        match self.pending_updates.entry(update_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(pending_update);
-                Ok(())
-            }
-            Entry::Occupied(entry) => {
-                if entry.get().message == pending_update.message {
-                    Ok(())
-                } else {
-                    ConflictingBufferedUpdateSnafu {
-                        group_id: pending_update.message.group_id,
-                        update_id,
-                    }
-                    .fail()
-                }
-            }
-        }
+    /// Advance the durable VV to reflect one update that has now applied.
+    pub(super) fn mark_applied(&mut self, update_id: UpdateId) {
+        self.version_vector
+            .increment_at(update_id.node_index as usize);
     }
+}
 
-    /// Drop already-applied duplicates, then return one causally-ready pending
-    /// update when any exist.
-    pub(super) fn take_next_actionable_pending_update(&mut self) -> Option<BufferedInboundUpdate> {
-        let duplicate_keys: Vec<_> = self
-            .pending_updates
-            .keys()
-            .copied()
-            .filter(|update_id| self.has_applied(*update_id))
+/// Persisted-but-not-yet-applied updates loaded for one transactional
+/// causality check.
+pub(super) struct PendingUpdateSet {
+    updates: BTreeMap<UpdateId, ReplicationUpdateRecord>,
+}
+
+impl PendingUpdateSet {
+    /// Materialise one deterministic pending-update index from store records.
+    pub(super) fn from_updates(updates: Vec<ReplicationUpdateRecord>) -> Self {
+        let updates = updates
+            .into_iter()
+            .map(|update| (update.update_id, update))
             .collect();
-        for update_id in duplicate_keys {
-            self.pending_updates.remove(&update_id);
+        Self { updates }
+    }
+
+    /// Determine which pending updates are already reflected in durable state
+    /// and which additional updates can now apply in causal order.
+    pub(super) fn plan_apply_chain(&mut self, group: &LoadedGroupMeta) -> PendingApplyPlan {
+        let mut already_applied = Vec::new();
+        let mut ready_chain = Vec::new();
+        let mut simulated_group = group.clone();
+
+        'drain: loop {
+            let stale_ids: Vec<_> = self
+                .updates
+                .keys()
+                .copied()
+                .filter(|update_id| simulated_group.has_applied(*update_id))
+                .collect();
+            for update_id in stale_ids {
+                self.updates.remove(&update_id);
+                already_applied.push(update_id);
+            }
+
+            let ready_update_id = self.updates.iter().find_map(|(update_id, update)| {
+                simulated_group.can_apply(update).then_some(*update_id)
+            });
+            let Some(ready_update_id) = ready_update_id else {
+                break 'drain;
+            };
+            let ready_update = self
+                .updates
+                .remove(&ready_update_id)
+                .expect("pending update must still exist while draining");
+            simulated_group.mark_applied(ready_update_id);
+            ready_chain.push(ready_update);
         }
 
-        let ready_key = self
-            .pending_updates
-            .iter()
-            .find_map(|(update_id, pending_update)| {
-                self.can_apply(&pending_update.message)
-                    .then_some(*update_id)
-            });
-        ready_key.and_then(|update_id| self.pending_updates.remove(&update_id))
+        PendingApplyPlan {
+            already_applied,
+            ready_chain,
+        }
     }
+}
+
+/// One transaction-local decision about pending persisted updates.
+pub(super) struct PendingApplyPlan {
+    pub(super) already_applied: Vec<UpdateId>,
+    pub(super) ready_chain: Vec<ReplicationUpdateRecord>,
 }
 
 /// One local dataset together with its current replicated in-memory contents.
@@ -209,6 +214,27 @@ impl LocalDataset {
             fields.insert(field_name.to_owned(), value.clone());
         }
         Some(flotsync_data_types::OwnedRow::new(fields))
+    }
+
+    /// Materialise the active row set as deterministic owned snapshots.
+    fn active_row_snapshots(&self) -> BTreeMap<RowKey, RowSnapshot<'static, UpdateId>> {
+        let mut rows = BTreeMap::new();
+        for row_id in self.data.active_row_ids() {
+            let row = self
+                .data
+                .get_row(row_id)
+                .expect("active row ids must resolve against the same dataset");
+            let mut fields = Vec::with_capacity(self.data.num_fields());
+            for field_name in self.data.field_names() {
+                let value = row
+                    .get_field(field_name)
+                    .expect("field iteration must resolve against the same row")
+                    .clone();
+                fields.push((field_name.to_owned(), value));
+            }
+            rows.insert(RowKey(*row_id), RowSnapshot::from_owned_fields(fields));
+        }
+        rows
     }
 }
 
@@ -298,66 +324,29 @@ pub(super) fn collect_group_dataset_scope(
 
 /// Returns the mutable working dataset image used for one outbound publish batch.
 ///
-/// The batch may touch a mix of already-hosted datasets and newly-loaded schema
-/// definitions, so this helper either clones the current local dataset image or
-/// seeds one from a freshly loaded schema.
+/// Callers are expected to pre-load every touched dataset before publish
+/// staging starts, so reaching a missing dataset here is a runtime bug rather
+/// than a schema-loading decision.
 pub(super) fn working_dataset_for_publish<'a>(
     working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
-    local_group: &LocalGroupState,
-    loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
 ) -> Result<&'a mut LocalDataset, PublishChangesError> {
-    if !working_datasets.contains_key(dataset_id) {
-        let working_dataset = local_group
-            .datasets
-            .get(dataset_id)
-            .cloned()
-            .or_else(|| {
-                loaded_schemas
-                    .get(dataset_id)
-                    .cloned()
-                    .map(LocalDataset::new)
-            })
-            .context(MissingDatasetSchemaSnafu {
-                dataset_id: dataset_id.clone(),
-            })?;
-        working_datasets.insert(dataset_id.clone(), working_dataset);
-    }
     Ok(working_datasets
         .get_mut(dataset_id)
-        .expect("working publish dataset must exist after insertion"))
+        .expect("touched publish dataset must be pre-loaded before staging"))
 }
 
 /// Returns the mutable working dataset image used for one inbound apply batch.
 ///
-/// The caller passes already-loaded schemas for datasets that were not hosted
-/// locally yet, while existing datasets are cloned so the whole batch can apply
-/// against one isolated working set before committing back into local state.
+/// Callers are expected to pre-load every dataset touched by the causal apply
+/// chain before the first operation is decoded.
 fn working_dataset_for_inbound<'a>(
     working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
-    local_group: &LocalGroupState,
-    loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
     dataset_id: &DatasetId,
 ) -> Result<&'a mut LocalDataset, InboundDeliveryError> {
-    if !working_datasets.contains_key(dataset_id) {
-        let working_dataset = local_group
-            .datasets
-            .get(dataset_id)
-            .cloned()
-            .or_else(|| {
-                loaded_schemas
-                    .get(dataset_id)
-                    .cloned()
-                    .map(LocalDataset::new)
-            })
-            .context(InboundMissingDatasetSchemaSnafu {
-                dataset_id: dataset_id.clone(),
-            })?;
-        working_datasets.insert(dataset_id.clone(), working_dataset);
-    }
     Ok(working_datasets
         .get_mut(dataset_id)
-        .expect("working inbound dataset must exist after insertion"))
+        .expect("touched inbound dataset must be pre-loaded before apply"))
 }
 
 /// Applies one causally-ready inbound batch against one local group state.
@@ -366,48 +355,83 @@ fn working_dataset_for_inbound<'a>(
 /// either commits atomically into local state or returns an error without
 /// partially replacing dataset maps.
 pub(super) fn apply_one_update_batch(
-    local_group: &mut LocalGroupState,
-    message: UpdateBatchMessage,
-    loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
+    group: &mut LoadedGroupMeta,
+    working_datasets: &mut HashMap<DatasetId, LocalDataset>,
+    update: &ReplicationUpdateRecord,
 ) -> Result<Vec<RowChange>, InboundDeliveryError> {
-    let mut working_datasets = HashMap::<DatasetId, LocalDataset>::new();
     let mut row_changes = Vec::new();
-    for dataset_update in message.dataset_updates {
-        let working_dataset = working_dataset_for_inbound(
-            &mut working_datasets,
-            local_group,
-            loaded_schemas,
-            &dataset_update.dataset_id,
-        )?;
-        for operation in dataset_update.operations {
+    for dataset_update in &update.dataset_updates {
+        let working_dataset =
+            working_dataset_for_inbound(working_datasets, &dataset_update.dataset_id)?;
+        for operation in &dataset_update.operations {
             let schema = working_dataset.data.schema().clone();
-            let operation = decode_schema_operation(operation, &schema).context(
+            let operation = decode_schema_operation(operation.clone(), &schema).context(
                 DecodeSchemaOperationSnafu {
                     dataset_id: dataset_update.dataset_id.clone(),
                 },
             )?;
             assert_eq!(
-                operation.change_id, message.update_id,
+                operation.change_id, update.update_id,
                 "decoded inbound operation for dataset '{}' carried change id {}, expected {}",
-                dataset_update.dataset_id, operation.change_id, message.update_id,
+                dataset_update.dataset_id, operation.change_id, update.update_id,
             );
             let row_change = apply_remote_operation(
                 working_dataset,
-                message.group_id,
+                update.group_id,
                 &dataset_update.dataset_id,
                 operation,
             )?;
             row_changes.push(row_change);
         }
     }
-
-    for (dataset_id, working_dataset) in working_datasets {
-        local_group.datasets.insert(dataset_id, working_dataset);
-    }
-    local_group
-        .version_vector
-        .increment_at(message.update_id.node_index as usize);
+    group.mark_applied(update.update_id);
     Ok(row_changes)
+}
+
+/// Compute the minimal durable row-action set that turns `before` into `after`.
+pub(super) fn build_dataset_snapshot_write(
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    before: Option<&LocalDataset>,
+    after: &LocalDataset,
+) -> Option<DatasetSnapshotWrite> {
+    let before_rows = before
+        .map(LocalDataset::active_row_snapshots)
+        .unwrap_or_default();
+    let after_rows = after.active_row_snapshots();
+    let mut row_actions = Vec::new();
+
+    for (row_key, row) in &after_rows {
+        match before_rows.get(row_key) {
+            None => row_actions.push(DatasetSnapshotRowAction::Insert {
+                row_key: *row_key,
+                row: row.clone(),
+            }),
+            Some(existing_row) if existing_row != row => {
+                row_actions.push(DatasetSnapshotRowAction::Update {
+                    row_key: *row_key,
+                    row: row.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    for row_key in before_rows.keys() {
+        if !after_rows.contains_key(row_key) {
+            row_actions.push(DatasetSnapshotRowAction::Delete { row_key: *row_key });
+        }
+    }
+
+    if row_actions.is_empty() {
+        return None;
+    }
+
+    Some(DatasetSnapshotWrite {
+        group_id,
+        dataset_id,
+        row_actions,
+    })
 }
 
 /// Applies one local upsert and returns the encoded schema operation, if any.

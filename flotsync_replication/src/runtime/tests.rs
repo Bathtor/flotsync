@@ -66,6 +66,7 @@ struct StoreStub {
     local_member: MemberIdentity,
     schemas: HashMap<DatasetId, SchemaSource>,
     state: Arc<Mutex<StoreStubState>>,
+    fail_next_apply_dataset_snapshot: Arc<Mutex<Option<DatasetId>>>,
 }
 
 impl StoreStub {
@@ -74,12 +75,27 @@ impl StoreStub {
             local_member,
             schemas: HashMap::new(),
             state: Arc::new(Mutex::new(StoreStubState::default())),
+            fail_next_apply_dataset_snapshot: Arc::new(Mutex::new(None)),
         }
     }
 
     fn with_schema(mut self, dataset_id: DatasetId, schema: Arc<Schema>) -> Self {
         self.schemas.insert(dataset_id, SchemaSource::from(schema));
         self
+    }
+
+    fn snapshot_state(&self) -> StoreStubState {
+        self.state
+            .lock()
+            .expect("store stub state mutex must not be poisoned")
+            .clone()
+    }
+
+    fn fail_next_apply_dataset_snapshot(&self, dataset_id: DatasetId) {
+        *self
+            .fail_next_apply_dataset_snapshot
+            .lock()
+            .expect("store stub failure mutex must not be poisoned") = Some(dataset_id);
     }
 }
 
@@ -108,6 +124,7 @@ impl crate::api::ReplicationStore for StoreStub {
         let transaction = StoreStubTransaction {
             shared_state: self.state.clone(),
             schemas: self.schemas.clone(),
+            fail_next_apply_dataset_snapshot: self.fail_next_apply_dataset_snapshot.clone(),
             working_state: state,
             closed: false,
         };
@@ -126,6 +143,7 @@ struct StoreStubState {
 struct StoreStubTransaction {
     shared_state: Arc<Mutex<StoreStubState>>,
     schemas: HashMap<DatasetId, SchemaSource>,
+    fail_next_apply_dataset_snapshot: Arc<Mutex<Option<DatasetId>>>,
     working_state: StoreStubState,
     closed: bool,
 }
@@ -239,6 +257,20 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         snapshot: DatasetSnapshotWrite,
     ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
         self.assert_open();
+        let mut failure = self
+            .fail_next_apply_dataset_snapshot
+            .lock()
+            .expect("store stub failure mutex must not be poisoned");
+        if failure.as_ref() == Some(&snapshot.dataset_id) {
+            *failure = None;
+            return future::err(crate::api::StoreError::StoreExternal {
+                source: Box::new(std::io::Error::other(format!(
+                    "store stub intentionally failed dataset snapshot apply for '{}'",
+                    snapshot.dataset_id
+                ))),
+            })
+            .boxed();
+        }
         self.working_state
             .datasets
             .insert((snapshot.group_id, snapshot.dataset_id.clone()));
@@ -303,9 +335,19 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         update: ReplicationUpdateRecord,
     ) -> BoxFuture<'a, Result<(), crate::api::StoreError>> {
         self.assert_open();
-        self.working_state
+        if self
+            .working_state
             .updates
-            .insert((update.group_id, update.update_id), update);
+            .insert((update.group_id, update.update_id), update)
+            .is_some()
+        {
+            return future::err(crate::api::StoreError::StoreExternal {
+                source: Box::new(std::io::Error::other(
+                    "store stub does not allow duplicate update inserts",
+                )),
+            })
+            .boxed();
+        }
         future::ok(()).boxed()
     }
 
@@ -697,6 +739,48 @@ fn create_group_persists_membership_across_runtime_restart() {
 }
 
 #[test]
+fn publish_changes_persists_applied_update_and_snapshot_state() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store =
+        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+    let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let row_id = test_row_id(group_id, dataset_id.clone(), 34);
+
+    let receipt = wait_for_test_reply(runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id: row_id.clone(),
+        row: crate::row_values! {
+            "title" => "durable publish",
+        },
+    }]))
+    .expect("publish_changes should succeed");
+
+    let persisted_state = store.snapshot_state();
+    let persisted_group = persisted_state
+        .groups
+        .get(&group_id)
+        .expect("group should persist");
+    assert_eq!(persisted_group.version_vector.version_at(0), 1);
+    let persisted_update = persisted_state
+        .updates
+        .get(&(group_id, receipt.update_id))
+        .expect("published update should persist");
+    assert!(persisted_update.applied_locally);
+    assert!(
+        persisted_state
+            .dataset_rows
+            .contains_key(&(group_id, dataset_id, row_id.row_key))
+    );
+}
+
+#[test]
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -952,6 +1036,264 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
 }
 
 #[test]
+fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = Arc::new(
+        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    );
+    let first_listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), first_listener);
+    let group_id = GroupId(Uuid::from_u128(35));
+    runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 36);
+    let mut source_dataset = LocalDataset::new(schema);
+    let first_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "first" },
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+    )
+    .expect("first operation should build")
+    .expect("first operation should apply");
+    let second_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "second" },
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+    )
+    .expect("second operation should build")
+    .expect("second operation should apply");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let first_message = UpdateBatchMessage {
+        group_id,
+        update_id: UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        read_versions: VersionVector::initial(member_count),
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: dataset_id.clone(),
+            operations: vec![first_operation],
+        }],
+    };
+    let mut second_read_versions = VersionVector::initial(member_count);
+    second_read_versions.increment_at(0);
+    let second_message = UpdateBatchMessage {
+        group_id,
+        update_id: UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+        read_versions: second_read_versions,
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: dataset_id.clone(),
+            operations: vec![second_operation],
+        }],
+    };
+
+    runtime
+        .apply_update_batch_for_test(alice_member.clone(), second_message)
+        .expect("out-of-order update should persist pending state");
+    drop(runtime);
+
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime =
+        load_runtime_with_parts(app_bob_id(), store.clone(), restarted_listener.clone());
+    restarted_runtime
+        .apply_update_batch_for_test(alice_member, first_message)
+        .expect("missing predecessor should apply and drain the persisted successor");
+    restarted_listener.wait_for_data_change_count(2);
+    assert_eq!(
+        restarted_listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: row_id.clone(),
+                    title: "first".to_owned(),
+                }],
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "second".to_owned(),
+                }],
+            },
+        ]
+    );
+
+    let persisted_state = store.snapshot_state();
+    assert!(
+        persisted_state
+            .updates
+            .get(&(
+                group_id,
+                UpdateId {
+                    version: 1,
+                    node_index: 0,
+                },
+            ))
+            .expect("first update should persist")
+            .applied_locally
+    );
+    assert!(
+        persisted_state
+            .updates
+            .get(&(
+                group_id,
+                UpdateId {
+                    version: 2,
+                    node_index: 0,
+                },
+            ))
+            .expect("second update should persist")
+            .applied_locally
+    );
+}
+
+#[test]
+fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema();
+    let store = Arc::new(
+        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), listener.clone());
+    let group_id = GroupId(Uuid::from_u128(37));
+    runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 38);
+    let mut source_dataset = LocalDataset::new(schema);
+    let first_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "first" },
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+    )
+    .expect("first operation should build")
+    .expect("first operation should apply");
+    let second_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "second" },
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+    )
+    .expect("second operation should build")
+    .expect("second operation should apply");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let first_message = UpdateBatchMessage {
+        group_id,
+        update_id: UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        read_versions: VersionVector::initial(member_count),
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: dataset_id.clone(),
+            operations: vec![first_operation],
+        }],
+    };
+    let mut second_read_versions = VersionVector::initial(member_count);
+    second_read_versions.increment_at(0);
+    let second_message = UpdateBatchMessage {
+        group_id,
+        update_id: UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+        read_versions: second_read_versions,
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: dataset_id.clone(),
+            operations: vec![second_operation],
+        }],
+    };
+
+    runtime
+        .apply_update_batch_for_test(alice_member.clone(), second_message)
+        .expect("out-of-order update should persist pending state");
+    store.fail_next_apply_dataset_snapshot(dataset_id.clone());
+    let error = runtime
+        .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
+        .expect_err("store write failure should abort the whole ready chain");
+    assert!(matches!(
+        error,
+        InboundDeliveryError::InboundStoreAccess { .. }
+    ));
+    assert!(listener.captured_data_changes().is_empty());
+
+    let persisted_state = store.snapshot_state();
+    assert!(
+        !persisted_state.updates.contains_key(&(
+            group_id,
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+        )),
+        "the newly ready predecessor must roll back with the failed transaction"
+    );
+    assert!(
+        !persisted_state
+            .updates
+            .get(&(
+                group_id,
+                UpdateId {
+                    version: 2,
+                    node_index: 0,
+                },
+            ))
+            .expect("pending successor should still exist")
+            .applied_locally,
+        "the previously buffered successor must stay pending after rollback"
+    );
+    assert!(persisted_state.dataset_rows.is_empty());
+    assert_eq!(
+        persisted_state
+            .groups
+            .get(&group_id)
+            .expect("group should still exist")
+            .version_vector
+            .version_at(0),
+        0
+    );
+
+    runtime
+        .apply_update_batch_for_test(alice_member, first_message)
+        .expect("retry after rollback should succeed");
+    listener.wait_for_data_change_count(2);
+}
+
+#[test]
 fn buffered_updates_reject_conflicting_duplicate_payloads() {
     // Conflicting duplicate protection:
     // 1. buffer one out-of-order update on Bob,
@@ -1045,7 +1387,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         .apply_update_batch_for_test(alice_member, conflicting_message)
         .expect_err("conflicting duplicate payload should fail");
     match error {
-        InboundDeliveryError::ConflictingBufferedUpdate {
+        InboundDeliveryError::ConflictingPersistedUpdate {
             group_id: actual_group_id,
             update_id,
         } => {

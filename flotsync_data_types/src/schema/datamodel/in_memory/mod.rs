@@ -163,6 +163,17 @@ where
         self.rows.iter().filter(|row| !row.deleted).count()
     }
 
+    /// Iterate the ids of rows that are not currently tombstoned.
+    pub fn active_row_ids(&self) -> impl Iterator<Item = &RowId> {
+        self.row_id_map.iter().filter_map(|(row_id, row_index)| {
+            let row = self
+                .rows
+                .get(*row_index)
+                .expect("row_id_map and rows must stay in sync");
+            (!row.deleted).then_some(row_id)
+        })
+    }
+
     /// Validate and append one row represented by positional field values.
     ///
     /// Returns the inserted row index on success.

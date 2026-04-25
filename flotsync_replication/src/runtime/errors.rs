@@ -96,6 +96,19 @@ pub(super) enum PublishChangesError {
     },
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    PublishInvalidPersistedGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replication-store access failed at {location}."))]
+    PublishStoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Failed to load schema for dataset '{dataset_id}' from the replication store."
     ))]
@@ -167,6 +180,19 @@ pub(super) enum InboundDeliveryError {
     },
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    InboundInvalidPersistedGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replication-store access failed at {location}."))]
+    InboundStoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Failed to load schema for inbound dataset '{dataset_id}' from the replication store."
     ))]
@@ -198,9 +224,9 @@ pub(super) enum InboundDeliveryError {
         source: RuntimeMessageError,
     },
     #[snafu(display(
-        "Buffered inbound update collision in group {group_id}: update id {update_id} arrived with a different payload than the one already buffered.",
+        "Persisted inbound update collision in group {group_id}: update id {update_id} already exists with a different payload.",
     ))]
-    ConflictingBufferedUpdate {
+    ConflictingPersistedUpdate {
         group_id: GroupId,
         update_id: UpdateId,
     },
