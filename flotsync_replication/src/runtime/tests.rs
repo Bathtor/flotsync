@@ -680,7 +680,7 @@ fn create_group_persists_membership_across_runtime_restart() {
     let dataset_id = docs_dataset_id();
     let store = sqlite_store_with_schemas(
         alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
+        [(dataset_id.clone(), title_schema_static())],
     );
     let first_listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener);
@@ -905,7 +905,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_shared();
+    let schema = title_schema_static();
     let bob_fixture = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
@@ -1013,9 +1013,8 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_shared();
-    let store =
-        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema.clone())]);
+    let schema = title_schema_static();
+    let store = sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema)]);
     let first_listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), first_listener);
     let group_id = GroupId(Uuid::from_u128(35));
@@ -1142,9 +1141,9 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_shared();
+    let schema = title_schema_static();
     let sqlite_store =
-        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema.clone())]);
+        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema)]);
     let store = Arc::new(FailingStore::new(sqlite_store.clone()));
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), listener.clone());
@@ -1276,7 +1275,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema_shared();
+    let schema = title_schema_static();
     let bob_runtime = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
@@ -1295,7 +1294,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let row_id = test_row_id(group_id, dataset_id.clone(), 25);
     let member_count = NonZeroUsize::new(2).expect("group has two members");
 
-    let mut first_source_dataset = LocalDataset::new(schema.clone());
+    let mut first_source_dataset = LocalDataset::new(schema);
     let first_operation = apply_local_upsert(
         &mut first_source_dataset,
         &row_id,

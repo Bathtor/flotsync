@@ -1,8 +1,5 @@
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::schema::{
-    Schema,
-    datamodel::{NullableBasicValue, RowSnapshot},
-};
+use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -18,6 +15,7 @@ pub use flotsync_data_types::{
     InMemoryFieldValue,
     RowOperations,
     RowRead,
+    schema::datamodel::SchemaSource,
 };
 pub use ids::*;
 
@@ -274,58 +272,6 @@ pub trait ReplicationApi: Send + Sync {
         &self,
         req: ChangeGroupMembershipRequest,
     ) -> BoxFuture<'_, Result<GroupMigration, ApiError>>;
-}
-
-/// Schema source returned by [`ReplicationStore`].
-///
-/// Applications that hardcode most of their schemas can return a static schema
-/// reference without paying for additional reference counting, while dynamic
-/// schema providers can still use shared `Arc` ownership.
-#[derive(Clone)]
-pub enum SchemaSource {
-    /// One dynamically owned schema shared through reference counting.
-    Shared(Arc<Schema>),
-    /// One process-static schema baked into the application binary.
-    Static(&'static Schema),
-}
-
-impl SchemaSource {
-    /// Borrow the schema regardless of how it is stored.
-    pub fn as_schema(&self) -> &Schema {
-        match self {
-            Self::Shared(schema) => schema.as_ref(),
-            Self::Static(schema) => schema,
-        }
-    }
-
-    /// Convert the schema source into shared `Arc` ownership.
-    ///
-    /// Static schemas are cloned once into owned form when callers require an
-    /// `Arc<Schema>` specifically.
-    pub fn into_shared(self) -> Arc<Schema> {
-        match self {
-            Self::Shared(schema) => schema,
-            Self::Static(schema) => Arc::new(schema.clone()),
-        }
-    }
-}
-
-impl AsRef<Schema> for SchemaSource {
-    fn as_ref(&self) -> &Schema {
-        self.as_schema()
-    }
-}
-
-impl From<Arc<Schema>> for SchemaSource {
-    fn from(value: Arc<Schema>) -> Self {
-        Self::Shared(value)
-    }
-}
-
-impl From<&'static Schema> for SchemaSource {
-    fn from(value: &'static Schema) -> Self {
-        Self::Static(value)
-    }
 }
 
 /// One persisted replication group together with its local progress.

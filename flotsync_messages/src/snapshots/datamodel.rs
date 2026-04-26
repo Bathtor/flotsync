@@ -1165,7 +1165,7 @@ mod tests {
         },
         text::LinearString,
     };
-    use std::{assert_matches, borrow::Cow, sync::LazyLock};
+    use std::{assert_matches, sync::LazyLock};
 
     fn update_id(version: u64, node_index: u32) -> UpdateId {
         UpdateId {
@@ -1228,7 +1228,7 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data: InMemoryData<(), UpdateId> = InMemoryData::with_owned_schema(schema.clone());
+        let mut data: InMemoryData<(), UpdateId> = InMemoryData::with_static_schema(schema);
         data.push_row_from_named_fields([
             (
                 "latest",
@@ -1260,8 +1260,7 @@ mod tests {
         let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
         let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
-        let roundtrip =
-            InMemoryData::decode_data_snapshots(Cow::Borrowed(schema), &mut decoder).unwrap();
+        let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
         assert_eq!(roundtrip, data);
     }
 

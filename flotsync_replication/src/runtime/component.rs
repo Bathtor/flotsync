@@ -304,7 +304,7 @@ impl ReplicationRuntimeComponent {
                 .expect("touched dataset schemas must be pre-loaded");
             datasets.insert(
                 dataset_id.clone(),
-                LocalDataset::from_row_slice(schema.as_schema(), row_slice),
+                LocalDataset::from_row_slice(schema.clone(), row_slice),
             );
         }
         Ok(datasets)

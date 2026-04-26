@@ -19,7 +19,7 @@ use crate::{
 };
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
-use std::{borrow::Cow, collections::HashMap, fmt, hash::Hash, marker::PhantomData};
+use std::{collections::HashMap, fmt, hash::Hash, marker::PhantomData};
 
 mod decode;
 #[allow(
@@ -37,7 +37,7 @@ pub struct InMemoryData<RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
-    schema: Cow<'static, Schema>,
+    schema: SchemaSource,
     field_names: Vec<String>,
     field_index_by_name: HashMap<String, usize>,
     row_id_map: HashMap<RowId, usize>,
@@ -48,11 +48,13 @@ where
     RowId: PartialEq + Eq + Hash,
 {
     /// Create an empty in-memory dataset for `schema`.
-    pub fn new(schema: Cow<'static, Schema>) -> Self {
-        let mut field_names = Vec::with_capacity(schema.columns.len());
-        let mut field_index_by_name = HashMap::with_capacity(schema.columns.len());
+    pub fn new(schema: impl Into<SchemaSource>) -> Self {
+        let schema = schema.into();
+        let schema_ref = schema.as_schema();
+        let mut field_names = Vec::with_capacity(schema_ref.columns.len());
+        let mut field_index_by_name = HashMap::with_capacity(schema_ref.columns.len());
 
-        for field_name in schema.columns.keys() {
+        for field_name in schema_ref.columns.keys() {
             let index = field_names.len();
             let field_name = field_name.to_owned();
             field_index_by_name.insert(field_name.clone(), index);
@@ -70,12 +72,12 @@ where
 
     /// Create an empty in-memory dataset borrowing a `'static` schema.
     pub fn with_static_schema(schema: &'static Schema) -> Self {
-        Self::new(Cow::Borrowed(schema))
+        Self::new(schema)
     }
 
     /// Create an empty in-memory dataset owning `schema`.
     pub fn with_owned_schema(schema: Schema) -> Self {
-        Self::new(Cow::Owned(schema))
+        Self::new(schema)
     }
 
     /// Create one in-memory dataset from complete row snapshots and a `'static` schema.
@@ -88,7 +90,7 @@ where
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
-        Self::from_row_snapshots(Cow::Borrowed(schema), rows)
+        Self::from_row_snapshots(schema, rows)
     }
 
     /// Create one in-memory dataset from complete row snapshots and an owned schema.
@@ -101,14 +103,14 @@ where
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
-        Self::from_row_snapshots(Cow::Owned(schema), rows)
+        Self::from_row_snapshots(schema, rows)
     }
 
     /// Create one in-memory dataset from complete row snapshots.
     ///
     /// Each snapshot must contain the full row state for the associated schema.
     pub fn from_row_snapshots<'snapshot, I>(
-        schema: Cow<'static, Schema>,
+        schema: impl Into<SchemaSource>,
         rows: I,
     ) -> Result<Self, InMemoryDataError>
     where
@@ -125,7 +127,7 @@ where
 
     /// Get the immutable schema associated with this dataset.
     pub fn schema(&self) -> &Schema {
-        self.schema.as_ref()
+        self.schema.as_schema()
     }
 
     /// Return the number of fields expected in every row.
@@ -310,7 +312,7 @@ where
     /// Each row is decoded lazily field-by-field and history-backed fields are reconstructed via
     /// each CRDT's `from_snapshot_nodes` API.
     pub fn decode_data_snapshots<D>(
-        schema: Cow<'static, Schema>,
+        schema: impl Into<SchemaSource>,
         decoder: &mut D,
     ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
     where
@@ -356,7 +358,7 @@ where
         for (field_index, value) in row.fields.iter().enumerate() {
             let field_name = self.field_names[field_index].as_str();
             let schema_field = self
-                .schema
+                .schema()
                 .columns
                 .get(field_name)
                 .expect("field index map and schema are in sync");
@@ -397,7 +399,7 @@ where
             }
 
             let schema_field = self
-                .schema
+                .schema()
                 .columns
                 .get(field_name)
                 .expect("field index map and schema are in sync");
@@ -454,7 +456,7 @@ where
             }
 
             let schema_field = self
-                .schema
+                .schema()
                 .columns
                 .get(field_name.as_str())
                 .expect("field_names and schema are in sync");
@@ -477,7 +479,7 @@ where
 
             let field_name = self.field_names[field_index].as_str();
             let schema_field = self
-                .schema
+                .schema()
                 .columns
                 .get(field_name)
                 .expect("field_names and schema are in sync");
@@ -608,7 +610,7 @@ where
         Self: 'a;
 
     fn schema(&self) -> &Schema {
-        self.schema.as_ref()
+        self.schema.as_schema()
     }
 
     fn get_row(&self, row_id: &RowId) -> Option<Self::Row<'_>> {
@@ -643,7 +645,7 @@ where
         let mut fields = Vec::with_capacity(self.field_names.len());
         for field_name in &self.field_names {
             let schema_field = self
-                .schema
+                .schema()
                 .columns
                 .get(field_name.as_str())
                 .expect("field_names and schema are in sync");

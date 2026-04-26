@@ -10,12 +10,16 @@ use flotsync_data_types::{
         Direction,
         Field,
         PrimitiveType,
-        datamodel::{InMemoryData, OperationValue, RowOperation, SchemaValueError},
+        datamodel::{InMemoryData, OperationValue, RowOperation, SchemaSource, SchemaValueError},
         values::PrimitiveValueArray,
     },
     update_values,
 };
-use std::{assert_matches, borrow::Cow, sync::LazyLock};
+use std::{
+    assert_matches,
+    borrow::Cow,
+    sync::{Arc, LazyLock},
+};
 
 static TEST_SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
     Schema::from_fields([
@@ -34,6 +38,22 @@ fn expect_applied<T>(outcome: OperationOutcome<T>) -> T {
         OperationOutcome::Applied(operation) => operation,
         OperationOutcome::NoChanges => panic!("expected an applied operation"),
     }
+}
+
+#[test]
+fn in_memory_data_preserves_static_schema_reference() {
+    let schema = &*TEST_SCHEMA;
+    let data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+
+    assert!(std::ptr::eq(data.schema(), schema));
+}
+
+#[test]
+fn in_memory_data_preserves_shared_schema_reference() {
+    let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
+    let data: InMemoryData<RowId, OperationId> = InMemoryData::new(schema.clone());
+
+    assert!(std::ptr::eq(data.schema(), schema.as_ref()));
 }
 
 #[test]
@@ -237,7 +257,7 @@ fn insert_row_requires_explicit_values_for_all_fields() {
 
 #[test]
 fn insert_row_uses_schema_defaults_for_omitted_fields() {
-    let schema = Schema::from_fields([
+    let schema = SchemaSource::from(Schema::from_fields([
         Field::linear_string("title")
             .with_default("untitled")
             .unwrap(),
@@ -250,9 +270,8 @@ fn insert_row_uses_schema_defaults_for_omitted_fields() {
         Field::total_order_register("priority", PrimitiveType::UInt, Direction::Ascending)
             .with_default(11u64)
             .unwrap(),
-    ]);
-    let mut data: InMemoryData<RowId, OperationId> =
-        InMemoryData::with_owned_schema(schema.clone());
+    ]));
+    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::new(schema.clone());
 
     let operation = data
         .insert_row(
@@ -283,8 +302,8 @@ fn insert_row_uses_schema_defaults_for_omitted_fields() {
 
 #[test]
 fn apply_insert_materializes_defaults_for_missing_fields() {
-    let old_schema = Schema::from_fields([Field::linear_string("title")]);
-    let new_schema = Schema::from_fields([
+    let old_schema = SchemaSource::from(Schema::from_fields([Field::linear_string("title")]));
+    let new_schema = SchemaSource::from(Schema::from_fields([
         Field::linear_string("title"),
         Field::linear_string("subtitle")
             .with_default("default subtitle")
@@ -292,10 +311,9 @@ fn apply_insert_materializes_defaults_for_missing_fields() {
         Field::linear_list("numbers", PrimitiveType::Int)
             .with_default(vec![3i64, 4])
             .unwrap(),
-    ]);
+    ]));
 
-    let mut source: InMemoryData<RowId, OperationId> =
-        InMemoryData::with_owned_schema(old_schema.clone());
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::new(old_schema.clone());
     let insert = source
         .insert_row(
             300,
@@ -307,7 +325,7 @@ fn apply_insert_materializes_defaults_for_missing_fields() {
         .unwrap()
         .into_owned();
 
-    let target = InMemoryData::with_owned_schema(new_schema.clone())
+    let target = InMemoryData::new(new_schema.clone())
         .apply_schema_operation(insert)
         .unwrap();
 

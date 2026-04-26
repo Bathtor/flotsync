@@ -201,16 +201,16 @@ pub(super) struct LocalDataset {
 
 impl LocalDataset {
     #[cfg(test)]
-    pub(super) fn new(schema: impl AsRef<Schema>) -> Self {
+    pub(super) fn new(schema: impl Into<SchemaSource>) -> Self {
         Self {
-            data: flotsync_messages::InMemoryData::with_owned_schema(schema.as_ref().clone()),
+            data: flotsync_messages::InMemoryData::new(schema),
         }
     }
 
     /// Rebuild one ephemeral in-memory dataset slice from store-loaded rows.
-    pub(super) fn from_row_slice(schema: &Schema, slice: DatasetRowSlice) -> Self {
-        let data = flotsync_messages::InMemoryData::with_owned_schema_and_row_snapshots(
-            schema.clone(),
+    pub(super) fn from_row_slice(schema: SchemaSource, slice: DatasetRowSlice) -> Self {
+        let data = flotsync_messages::InMemoryData::from_row_snapshots(
+            schema,
             slice
                 .rows
                 .into_iter()

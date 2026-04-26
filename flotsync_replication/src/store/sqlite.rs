@@ -1315,8 +1315,7 @@ mod tests {
         let group = sample_group(group_id);
         let mut updated_version_vector = group.version_vector.clone();
         updated_version_vector.increment_at(1);
-        let mut source_data =
-            flotsync_messages::InMemoryData::with_owned_schema(schema.as_ref().clone());
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -1451,8 +1450,7 @@ mod tests {
         .expect("store should build");
         let group_id = GroupId(Uuid::from_u128(404));
         let group = sample_group(group_id);
-        let mut source_data =
-            flotsync_messages::InMemoryData::with_owned_schema(schema.as_ref().clone());
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {

@@ -829,7 +829,7 @@ mod tests {
     };
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use chrono::Datelike;
-    use std::{borrow::Cow, collections::HashMap, sync::LazyLock};
+    use std::{collections::HashMap, sync::LazyLock};
 
     const TAG_NULL: u8 = 0;
     const TAG_BASIC_PRIMITIVE: u8 = 1;
@@ -2460,7 +2460,7 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data: InMemoryData<(), u32> = InMemoryData::with_owned_schema(schema.clone());
+        let mut data: InMemoryData<(), u32> = InMemoryData::with_static_schema(schema);
         data.push_row_from_named_fields([
             (
                 "latest",
@@ -2490,8 +2490,7 @@ mod tests {
         let bytes = encoder.result();
 
         let mut decoder = BytesDataSnapshotDecoder::try_from_bytes(bytes).unwrap();
-        let roundtrip =
-            InMemoryData::decode_data_snapshots(Cow::Borrowed(schema), &mut decoder).unwrap();
+        let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
         assert_eq!(roundtrip, data);
     }
 }
