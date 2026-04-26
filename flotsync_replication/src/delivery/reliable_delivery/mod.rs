@@ -1073,7 +1073,13 @@ mod tests {
     impl FullStackHarness {
         fn new(local_member: MemberIdentity) -> Self {
             let system = build_delivery_test_system();
-            let core = TransportHarnessCore::new(system, default_udpour_config());
+            let core = TransportHarnessCore::with_socket_budgets(
+                system,
+                default_udpour_config(),
+                true,
+                &[],
+                0,
+            );
             let manager_ref = core.manager_ref();
             let ingress = core.system().create(|| {
                 DeliveryIngressComponent::new(DeliveryInterestConfig {

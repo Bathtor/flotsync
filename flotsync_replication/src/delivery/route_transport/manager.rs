@@ -11,6 +11,8 @@
 
 use super::*;
 use crate::delivery::shared::RouteSendId;
+#[cfg(test)]
+use crate::delivery::test_support::ManagerOwnedUdpBindBudget;
 use bytes::Bytes;
 use flotsync_io::prelude::{
     IoBridgeHandle,
@@ -37,6 +39,8 @@ use flotsync_udpour::{
     UDPourSubmitResult,
 };
 use kompact::{Never, config::UsizeValue, kompact_config, prelude::*};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -87,6 +91,9 @@ pub struct RouteTransportManager {
     tcp_routes: HashMap<TcpRouteKey, LiveTcpRouteHandle>,
     /// Logical sends that are still waiting for one route-transport outcome.
     pending_sends: HashMap<RouteSendId, PendingRouteSend>,
+    /// Test-only declared budget for manager-owned lazy UDP binds.
+    #[cfg(test)]
+    test_manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
 }
 
 impl RouteTransportManager {
@@ -111,7 +118,23 @@ impl RouteTransportManager {
             udp_sockets: HashMap::new(),
             tcp_routes: HashMap::new(),
             pending_sends: HashMap::new(),
+            #[cfg(test)]
+            test_manager_owned_udp_bind_budget: None,
         }
+    }
+
+    /// Creates one manager with one explicit test-only budget for lazy
+    /// manager-owned UDP binds.
+    #[cfg(test)]
+    pub(crate) fn new_with_test_manager_owned_udp_bind_budget(
+        system: KompactSystem,
+        bridge: IoBridgeHandle,
+        udpour_config: UDPourConfig,
+        test_manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
+    ) -> Self {
+        let mut manager = Self::new(system, bridge, udpour_config);
+        manager.test_manager_owned_udp_bind_budget = test_manager_owned_udp_bind_budget;
+        manager
     }
 
     fn load_udp_activation_policy(&self) -> UdpActivationPolicy {
@@ -145,6 +168,122 @@ impl RouteTransportManager {
             }
         }
     }
+
+    #[cfg(test)]
+    fn test_manager_owned_udp_bind_policy(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        socket_key: UdpSocketKey,
+        requested_bind: UdpLocalBind,
+    ) -> UdpLocalBind {
+        let requested_local_addr = requested_bind.resolve_local_addr();
+        let system_label = self
+            .ctx
+            .config()
+            .read_or_default(&kompact::config_keys::system::LABEL)
+            .unwrap_or_else(|_| String::from("<unlabelled-route-transport-test-system>"));
+        if requested_local_addr != socket_key.local_addr {
+            panic!(
+                "route-transport test system '{system_label}' saw inconsistent manager-owned UDP bind state for {socket_key:?}; requested_bind resolved to {requested_local_addr}"
+            );
+        }
+        if requested_local_addr.port() != 0 {
+            panic!(
+                "route-transport test system '{system_label}' attempted manager-owned exact UDP bind for {socket_key:?}; the test bind budget only supports port-zero manager-owned binds"
+            );
+        }
+        let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
+        else {
+            panic!(
+                "route-transport test system '{system_label}' attempted undeclared manager-owned UDP bind for {socket_key:?}; declare manager_owned_udp_sockets up front in the harness"
+            );
+        };
+        let reserved_bind_addr = test_manager_owned_udp_bind_budget
+            .lock()
+            .expect("manager-owned UDP bind budget lock")
+            .begin_bind(request_id, requested_local_addr);
+        match reserved_bind_addr {
+            Ok(reserved_bind_addr) => UdpLocalBind::Exact(reserved_bind_addr),
+            Err(error) => panic!(
+                "route-transport test system '{system_label}' exhausted declared manager-owned UDP bind budget for {socket_key:?}: {error}"
+            ),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn test_manager_owned_udp_bind_policy(
+        &mut self,
+        _request_id: UdpOpenRequestId,
+        _socket_key: UdpSocketKey,
+        requested_bind: UdpLocalBind,
+    ) -> UdpLocalBind {
+        requested_bind
+    }
+
+    #[cfg(test)]
+    fn complete_test_manager_owned_udp_bind(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) {
+        let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
+        else {
+            return;
+        };
+        let complete_result = test_manager_owned_udp_bind_budget
+            .lock()
+            .expect("manager-owned UDP bind budget lock")
+            .complete_bind(request_id, socket_id, local_addr);
+        if let Err(error) = complete_result {
+            panic!("complete manager-owned UDP bind budget accounting: {error}");
+        }
+    }
+
+    #[cfg(not(test))]
+    fn complete_test_manager_owned_udp_bind(
+        &mut self,
+        _request_id: UdpOpenRequestId,
+        _socket_id: SocketId,
+        _local_addr: SocketAddr,
+    ) {
+    }
+
+    #[cfg(test)]
+    fn fail_test_manager_owned_udp_bind(&mut self, request_id: UdpOpenRequestId) {
+        let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
+        else {
+            return;
+        };
+        let fail_result = test_manager_owned_udp_bind_budget
+            .lock()
+            .expect("manager-owned UDP bind budget lock")
+            .fail_bind(request_id);
+        if let Err(error) = fail_result {
+            panic!("restore failed manager-owned UDP bind budget slot: {error}");
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_test_manager_owned_udp_bind(&mut self, _request_id: UdpOpenRequestId) {}
+
+    #[cfg(test)]
+    fn release_test_manager_owned_udp_bind(&mut self, socket_id: SocketId) {
+        let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
+        else {
+            return;
+        };
+        let release_result = test_manager_owned_udp_bind_budget
+            .lock()
+            .expect("manager-owned UDP bind budget lock")
+            .release_live(socket_id);
+        if let Err(error) = release_result {
+            panic!("restore closed manager-owned UDP bind budget slot: {error}");
+        }
+    }
+
+    #[cfg(not(test))]
+    fn release_test_manager_owned_udp_bind(&mut self, _socket_id: SocketId) {}
 
     fn handle_submit(
         &mut self,
@@ -203,7 +342,11 @@ impl RouteTransportManager {
         }
 
         let request_id = UdpOpenRequestId::default();
-        let bind = socket_key.bind_policy();
+        let bind = self.test_manager_owned_udp_bind_policy(
+            request_id,
+            socket_key,
+            socket_key.bind_policy(),
+        );
         self.udp_open_sockets.insert(
             socket_key,
             PendingUdpSocketOpen {
@@ -225,6 +368,7 @@ impl RouteTransportManager {
             self.handle_external_udp_bound(socket_id, local_addr);
             return;
         };
+        self.complete_test_manager_owned_udp_bind(request_id, socket_id, local_addr);
         let Some(open) = self.udp_open_sockets.remove(&socket_key) else {
             return;
         };
@@ -297,6 +441,7 @@ impl RouteTransportManager {
         let Some(socket_key) = self.udp_open_requests.remove(&request_id) else {
             return;
         };
+        self.fail_test_manager_owned_udp_bind(request_id);
         let Some(open) = self.udp_open_sockets.remove(&socket_key) else {
             return;
         };
@@ -664,6 +809,7 @@ impl RouteTransportManager {
 
     fn handle_udp_closed(&mut self, socket_id: SocketId, reason: UdpCloseReason) {
         self.udp_broadcast_configurations.remove(&socket_id);
+        self.release_test_manager_owned_udp_bind(socket_id);
         let Some(socket_key) = self.udp_socket_ids.remove(&socket_id) else {
             return;
         };
@@ -736,7 +882,8 @@ impl RouteTransportManager {
     ) {
         match origin {
             UdpSocketStartOrigin::ManagerOwned => {
-                self.udp_socket_ids.remove(&socket_id);
+                self.udp_bridge_port
+                    .trigger(UdpRequest::Close { socket_id });
             }
             UdpSocketStartOrigin::ExternalDormant => {
                 self.udp_socket_ids.insert(socket_id, socket_key);
@@ -1135,7 +1282,7 @@ fn classify_udp_connect_failure_for_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delivery::test_support::TransportHarnessCore;
+    use crate::delivery::test_support::{BoundReservedUdpSocket, TransportHarnessCore};
     use bytes::Bytes;
     use flotsync_io::{
         pool::PayloadWriter,
@@ -1143,13 +1290,12 @@ mod tests {
         test_support::{
             ReservedSocketKind,
             WAIT_TIMEOUT,
-            bind_reserved_udp_socket,
             build_test_kompact_system_with,
             enable_bind_reuse_address,
             eventually_component_state,
             eventually_value,
             localhost,
-            reserve_sockets,
+            set_test_system_label,
         },
     };
     use flotsync_udpour::{
@@ -1238,20 +1384,50 @@ mod tests {
 
     impl UdpManagerHarness {
         fn new() -> Self {
-            Self::with_config(
+            Self::with_socket_budgets(
+                0,
+                0,
                 UdpActivationPolicy::OnBind,
                 TestSendRateControl::default(),
                 udpour_config(),
             )
         }
 
-        fn with_config(
+        fn with_socket_budgets(
+            extra_reserved_udp_sockets: usize,
+            manager_owned_udp_sockets: usize,
+            activation_policy: UdpActivationPolicy,
+            send_rate_control: TestSendRateControl,
+            udpour_config: UDPourConfig,
+        ) -> Self {
+            let extra_socket_kinds =
+                vec![ReservedSocketKind::UdpSocket; extra_reserved_udp_sockets];
+            Self::with_reserved_socket_kinds_and_manager_budget(
+                false,
+                &extra_socket_kinds,
+                manager_owned_udp_sockets,
+                activation_policy,
+                send_rate_control,
+                udpour_config,
+            )
+        }
+
+        fn with_reserved_socket_kinds_and_manager_budget(
+            reserve_external_udp_socket: bool,
+            extra_socket_kinds: &[ReservedSocketKind],
+            manager_owned_udp_sockets: usize,
             activation_policy: UdpActivationPolicy,
             send_rate_control: TestSendRateControl,
             udpour_config: UDPourConfig,
         ) -> Self {
             let system = build_manager_test_kompact_system(activation_policy, send_rate_control);
-            let core = TransportHarnessCore::new(system, udpour_config);
+            let core = TransportHarnessCore::with_socket_budgets(
+                system,
+                udpour_config,
+                reserve_external_udp_socket,
+                extra_socket_kinds,
+                manager_owned_udp_sockets,
+            );
             let manager = Arc::clone(core.manager());
             let manager_ref = core.manager_ref();
             core.start();
@@ -1261,6 +1437,29 @@ mod tests {
                 manager,
                 manager_ref,
             }
+        }
+
+        fn with_config(
+            activation_policy: UdpActivationPolicy,
+            send_rate_control: TestSendRateControl,
+            udpour_config: UDPourConfig,
+        ) -> Self {
+            Self::with_socket_budgets(0, 0, activation_policy, send_rate_control, udpour_config)
+        }
+
+        fn with_external_socket(
+            activation_policy: UdpActivationPolicy,
+            send_rate_control: TestSendRateControl,
+            udpour_config: UDPourConfig,
+        ) -> Self {
+            Self::with_reserved_socket_kinds_and_manager_budget(
+                true,
+                &[],
+                0,
+                activation_policy,
+                send_rate_control,
+                udpour_config,
+            )
         }
 
         fn send(&self, send: TransportRouteTransportSend) -> TransportRouteTransportSubmitResult {
@@ -1406,6 +1605,10 @@ mod tests {
             self.core.bind_external_socket(bind, WAIT_TIMEOUT)
         }
 
+        fn bind_reserved_udp_socket(&self, reservation_index: usize) -> BoundReservedUdpSocket {
+            self.core.bind_reserved_udp_socket(reservation_index)
+        }
+
         fn wait_for_new_bound_socket(&self) -> (SocketId, SocketAddr) {
             self.core.wait_for_new_bound_socket(WAIT_TIMEOUT)
         }
@@ -1491,11 +1694,14 @@ mod tests {
 
     #[test]
     fn udp_manager_sends_payload_over_real_socket() {
-        let harness = UdpManagerHarness::new();
-        let mut receiver_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
-        let receiver =
-            bind_reserved_udp_socket(&receiver_lease, 0).expect("bind reserved raw UDP receiver");
-        receiver_lease.release_binding(0);
+        let harness = UdpManagerHarness::with_socket_budgets(
+            1,
+            1,
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config(),
+        );
+        let receiver = harness.bind_reserved_udp_socket(0);
         receiver
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set UDP read timeout");
@@ -1520,22 +1726,19 @@ mod tests {
             .recv_from(&mut buffer)
             .expect("receive UDP datagram from managed sender");
         assert!(buffer[..len].ends_with(b"hello route transport"));
-        receiver_lease
-            .rebind_binding(0)
-            .expect("rebind reserved raw UDP receiver");
     }
 
     #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
-        let harness = UdpManagerHarness::new();
-        let mut receiver_lease =
-            reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-        let receiver1 = bind_reserved_udp_socket(&receiver_lease, 0)
-            .expect("bind first reserved raw UDP receiver");
-        let receiver2 = bind_reserved_udp_socket(&receiver_lease, 1)
-            .expect("bind second reserved raw UDP receiver");
-        receiver_lease.release_binding(0);
-        receiver_lease.release_binding(1);
+        let harness = UdpManagerHarness::with_socket_budgets(
+            2,
+            1,
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config(),
+        );
+        let receiver1 = harness.bind_reserved_udp_socket(0);
+        let receiver2 = harness.bind_reserved_udp_socket(1);
         receiver1
             .set_read_timeout(Some(WAIT_TIMEOUT))
             .expect("set first UDP read timeout");
@@ -1581,12 +1784,6 @@ mod tests {
         assert!(buffer1[..len1].ends_with(b"first target"));
         assert!(buffer2[..len2].ends_with(b"second target"));
         assert_eq!(source1, source2);
-        receiver_lease
-            .rebind_binding(0)
-            .expect("rebind first reserved raw UDP receiver");
-        receiver_lease
-            .rebind_binding(1)
-            .expect("rebind second reserved raw UDP receiver");
     }
 
     #[test]
@@ -1641,7 +1838,7 @@ mod tests {
 
     #[test]
     fn udp_manager_starts_dormant_socket_on_first_inbound_udpour_message() {
-        let receiver_harness = UdpManagerHarness::with_config(
+        let receiver_harness = UdpManagerHarness::with_external_socket(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
             udpour_config_with_part_size(64),
@@ -1655,7 +1852,9 @@ mod tests {
         assert_eq!(receiver_harness.dormant_udp_socket_count(), 1);
         assert_eq!(receiver_harness.live_udp_socket_count(), 0);
 
-        let sender_harness = UdpManagerHarness::with_config(
+        let sender_harness = UdpManagerHarness::with_socket_budgets(
+            0,
+            1,
             UdpActivationPolicy::OnBind,
             TestSendRateControl {
                 send_delay: Duration::from_millis(10),
@@ -1772,6 +1971,7 @@ mod tests {
         send_rate_control: TestSendRateControl,
     ) -> KompactSystem {
         build_test_kompact_system_with(|config| {
+            set_test_system_label(config, "route-transport-manager-test-system");
             enable_bind_reuse_address(config);
             let activation_policy_value = match activation_policy {
                 UdpActivationPolicy::OnBind => 0usize,

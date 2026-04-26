@@ -148,12 +148,19 @@ pub enum ReplicationRuntimeMessage {
     reason = "test-only ask plumbing reuses internal error types"
 )]
 pub enum ReplicationRuntimeTestMessage {
+    /// Confirm that the runtime component is alive and able to process one
+    /// mailbox turn after startup.
+    Ping(Ask<(), ()>),
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
     ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
 }
 
 #[cfg(test)]
 impl ReplicationRuntimeMessage {
+    pub(super) fn test_ping(promise: KPromise<()>) -> Self {
+        Self::Test(ReplicationRuntimeTestMessage::Ping(Ask::new(promise, ())))
+    }
+
     pub(super) fn test_install_group(
         promise: KPromise<Result<(), GroupInstallError>>,
         group_id: GroupId,
@@ -1030,6 +1037,13 @@ impl ReplicationRuntimeComponent {
     }
 
     #[cfg(test)]
+    fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> Handled {
+        let (promise, ()) = ask.take();
+        let _ = promise.fulfil(());
+        Handled::Ok
+    }
+
+    #[cfg(test)]
     fn handle_test_apply_update_batch(
         &mut self,
         ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
@@ -1116,6 +1130,10 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
                 self.handle_change_group_membership(ask)
+            }
+            #[cfg(test)]
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::Ping(ask)) => {
+                self.handle_test_ping(ask)
             }
             #[cfg(test)]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {

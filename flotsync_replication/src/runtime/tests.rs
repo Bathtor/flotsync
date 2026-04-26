@@ -9,12 +9,12 @@ use super::{
 use crate::{
     GroupMembers,
     GroupMemberships,
+    SqliteReplicationStore,
     api::{
         CreateGroupRequest,
         DatasetId,
         DatasetRowPatch,
         DatasetRowSlice,
-        DatasetRowWrite,
         GroupId,
         ListenerError,
         ListenerExternalSnafu,
@@ -42,15 +42,14 @@ use flotsync_core::{
     member::Identifier,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::{Field, RowOperations, Schema, schema::datamodel::RowSnapshot};
+use flotsync_data_types::{Field, RowOperations, Schema};
 use flotsync_io::test_support::eventually;
 use flotsync_utils::BoxFuture;
-use futures_util::{FutureExt, future};
+use futures_util::FutureExt;
 use snafu::ResultExt;
 use std::{
-    collections::{HashMap, HashSet},
     num::NonZeroUsize,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, LazyLock, Mutex, mpsc},
     time::Duration,
 };
 use uuid::Uuid;
@@ -63,138 +62,102 @@ const APP_ALICE_SEGMENTS: [&str; 2] = ["app", "alice"];
 const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
 const APP_PROBE_SEGMENTS: [&str; 2] = ["app", "probe"];
 
-struct RuntimeFixture {
+static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
+    LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
+
+struct RuntimeFixture<S> {
     runtime: Arc<ReplicationRuntime>,
     listener: Arc<ListenerStub>,
+    store: Arc<S>,
 }
 
-struct StoreStub {
-    local_member: MemberIdentity,
-    schemas: HashMap<DatasetId, SchemaSource>,
-    state: Arc<Mutex<StoreStubState>>,
+/// Test-only store wrapper that can fail one future row-patch write while
+/// delegating all durable state to the wrapped SQLite store.
+struct FailingStore<S> {
+    inner: Arc<S>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
 }
 
-impl StoreStub {
-    fn new(local_member: MemberIdentity) -> Self {
+impl<S> FailingStore<S> {
+    fn new(inner: Arc<S>) -> Self {
         Self {
-            local_member,
-            schemas: HashMap::new(),
-            state: Arc::new(Mutex::new(StoreStubState::default())),
+            inner,
             fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
         }
-    }
-
-    fn with_schema(mut self, dataset_id: DatasetId, schema: Arc<Schema>) -> Self {
-        self.schemas.insert(dataset_id, SchemaSource::from(schema));
-        self
-    }
-
-    fn snapshot_state(&self) -> StoreStubState {
-        self.state
-            .lock()
-            .expect("store stub state mutex must not be poisoned")
-            .clone()
     }
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
         *self
             .fail_next_apply_dataset_row_patch
             .lock()
-            .expect("store stub failure mutex must not be poisoned") = Some(dataset_id);
+            .expect("failing store mutex must not be poisoned") = Some(dataset_id);
     }
 }
 
-impl ReplicationStore for StoreStub {
+impl<S> ReplicationStore for FailingStore<S>
+where
+    S: ReplicationStore + 'static,
+{
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>> {
-        future::ok(self.local_member.clone()).boxed()
+        self.inner.local_member_identity()
     }
 
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
     ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>> {
-        future::ok(self.schemas.get(dataset_id).cloned()).boxed()
+        self.inner.load_dataset_schema(dataset_id)
     }
 
     fn begin_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
-        let state = self
-            .state
-            .lock()
-            .expect("store stub state mutex must not be poisoned")
-            .clone();
-        let transaction = StoreStubTransaction {
-            shared_state: self.state.clone(),
-            fail_next_apply_dataset_row_patch: self.fail_next_apply_dataset_row_patch.clone(),
-            working_state: state,
-            closed: false,
-        };
-        future::ok(Box::new(transaction) as Box<dyn ReplicationStoreTransaction>).boxed()
+        let inner = self.inner.clone();
+        let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
+        async move {
+            let inner = inner.begin_transaction().await?;
+            Ok(Box::new(FailingStoreTransaction {
+                inner: Some(inner),
+                fail_next_apply_dataset_row_patch,
+            }) as Box<dyn ReplicationStoreTransaction>)
+        }
+        .boxed()
     }
 }
 
-#[derive(Clone, Default)]
-struct StoreStubState {
-    groups: HashMap<GroupId, ReplicationGroupRecord>,
-    datasets: HashSet<(GroupId, DatasetId)>,
-    dataset_rows: HashMap<(GroupId, DatasetId, RowKey), RowSnapshot<'static, UpdateId>>,
-    updates: HashMap<(GroupId, UpdateId), ReplicationUpdateRecord>,
-}
-
-struct StoreStubTransaction {
-    shared_state: Arc<Mutex<StoreStubState>>,
+struct FailingStoreTransaction {
+    inner: Option<Box<dyn ReplicationStoreTransaction>>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
-    working_state: StoreStubState,
-    closed: bool,
 }
 
-impl StoreStubTransaction {
-    fn assert_open(&self) {
-        assert!(
-            !self.closed,
-            "store stub transaction must not be used after commit or rollback"
-        );
-    }
-}
-
-impl ReplicationStoreTransaction for StoreStubTransaction {
+impl ReplicationStoreTransaction for FailingStoreTransaction {
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
     ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
-        self.assert_open();
-        future::ok(self.working_state.groups.get(group_id).cloned()).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_group(group_id)
     }
 
     fn load_replication_groups<'a>(
         &'a mut self,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        self.assert_open();
-        let groups = self.working_state.groups.values().cloned().collect();
-        future::ok(groups).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_groups()
     }
 
     fn insert_replication_group<'a>(
         &'a mut self,
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.assert_open();
-        if self
-            .working_state
-            .groups
-            .insert(group.group_id, group)
-            .is_some()
-        {
-            return future::err(StoreError::StoreExternal {
-                source: Box::new(std::io::Error::other(
-                    "store stub does not allow duplicate group inserts",
-                )),
-            })
-            .boxed();
-        }
-        future::ok(()).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .insert_replication_group(group)
     }
 
     fn update_replication_group_version_vector<'a>(
@@ -202,17 +165,10 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         group_id: &'a GroupId,
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.assert_open();
-        let Some(group) = self.working_state.groups.get_mut(group_id) else {
-            return future::err(StoreError::StoreExternal {
-                source: Box::new(std::io::Error::other(format!(
-                    "store stub could not find group '{group_id}'"
-                ))),
-            })
-            .boxed();
-        };
-        group.version_vector = version_vector;
-        future::ok(()).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .update_replication_group_version_vector(group_id, version_vector)
     }
 
     fn load_dataset_rows<'a>(
@@ -221,88 +177,49 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
     ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
-        self.assert_open();
-        let row_keys: Vec<_> = row_keys.copied().collect();
-        let dataset_exists = self
-            .working_state
-            .datasets
-            .contains(&(*group_id, dataset_id.clone()));
-        let rows = row_keys
-            .iter()
-            .copied()
-            .map(|row_key| {
-                (
-                    row_key,
-                    self.working_state
-                        .dataset_rows
-                        .get(&(*group_id, dataset_id.clone(), row_key))
-                        .cloned(),
-                )
-            })
-            .collect();
-        future::ok(DatasetRowSlice {
-            group_id: *group_id,
-            dataset_id: dataset_id.clone(),
-            dataset_exists,
-            rows,
-        })
-        .boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_dataset_rows(group_id, dataset_id, row_keys)
     }
 
     fn apply_dataset_row_patch<'a>(
         &'a mut self,
         patch: DatasetRowPatch,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.assert_open();
-        let mut failure = self
-            .fail_next_apply_dataset_row_patch
-            .lock()
-            .expect("store stub failure mutex must not be poisoned");
-        if failure.as_ref() == Some(&patch.dataset_id) {
-            *failure = None;
-            return future::err(StoreError::StoreExternal {
-                source: Box::new(std::io::Error::other(format!(
-                    "store stub intentionally failed dataset row patch apply for '{}'",
-                    patch.dataset_id
-                ))),
-            })
-            .boxed();
-        }
-        if patch
-            .actions
-            .iter()
-            .any(|action| matches!(action, DatasetRowWrite::Put { .. }))
-        {
-            self.working_state
-                .datasets
-                .insert((patch.group_id, patch.dataset_id.clone()));
-        }
-        for action in patch.actions {
-            match action {
-                DatasetRowWrite::Put { row_key, row } => {
-                    self.working_state
-                        .dataset_rows
-                        .insert((patch.group_id, patch.dataset_id.clone(), row_key), row);
+        let failure = self.fail_next_apply_dataset_row_patch.clone();
+        async move {
+            let should_fail = {
+                let mut failure = failure
+                    .lock()
+                    .expect("failing store mutex must not be poisoned");
+                if failure.as_ref() == Some(&patch.dataset_id) {
+                    *failure = None;
+                    true
+                } else {
+                    false
                 }
-                DatasetRowWrite::Delete { row_key } => {
-                    let removed = self.working_state.dataset_rows.remove(&(
-                        patch.group_id,
-                        patch.dataset_id.clone(),
-                        row_key,
-                    ));
-                    if removed.is_none() {
-                        return future::err(StoreError::StoreExternal {
-                            source: Box::new(std::io::Error::other(format!(
-                                "store stub could not find row '{}/{}/{}'",
-                                patch.group_id, patch.dataset_id, row_key
-                            ))),
-                        })
-                        .boxed();
-                    }
-                }
+            };
+            if should_fail {
+                self.inner
+                    .take()
+                    .expect("failing store transaction must remain open during rollback")
+                    .rollback()
+                    .await?;
+                return Err(StoreError::StoreExternal {
+                    source: Box::new(std::io::Error::other(format!(
+                        "failing store intentionally failed dataset row patch apply for '{}'",
+                        patch.dataset_id
+                    ))),
+                });
             }
+            self.inner
+                .as_mut()
+                .expect("failing store transaction must remain open during delegated writes")
+                .apply_dataset_row_patch(patch)
+                .await
         }
-        future::ok(()).boxed()
+        .boxed()
     }
 
     fn load_replication_update<'a>(
@@ -310,13 +227,10 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         group_id: &'a GroupId,
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        self.assert_open();
-        let update = self
-            .working_state
-            .updates
-            .get(&(*group_id, update_id))
-            .cloned();
-        future::ok(update).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update(group_id, update_id)
     }
 
     fn load_replication_updates<'a>(
@@ -324,41 +238,20 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
     ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        self.assert_open();
-        let updates = self
-            .working_state
-            .updates
-            .values()
-            .filter(|update| update.group_id == *group_id)
-            .filter(|update| match filter {
-                ReplicationUpdateFilter::All => true,
-                ReplicationUpdateFilter::PendingApply => !update.applied_locally,
-                ReplicationUpdateFilter::Applied => update.applied_locally,
-            })
-            .cloned()
-            .collect();
-        future::ok(updates).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_updates(group_id, filter)
     }
 
     fn append_replication_update<'a>(
         &'a mut self,
         update: ReplicationUpdateRecord,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.assert_open();
-        if self
-            .working_state
-            .updates
-            .insert((update.group_id, update.update_id), update)
-            .is_some()
-        {
-            return future::err(StoreError::StoreExternal {
-                source: Box::new(std::io::Error::other(
-                    "store stub does not allow duplicate update inserts",
-                )),
-            })
-            .boxed();
-        }
-        future::ok(()).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .append_replication_update(update)
     }
 
     fn mark_replication_update_applied<'a>(
@@ -366,31 +259,24 @@ impl ReplicationStoreTransaction for StoreStubTransaction {
         group_id: &'a GroupId,
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<(), StoreError>> {
-        self.assert_open();
-        if let Some(update) = self.working_state.updates.get_mut(&(*group_id, update_id)) {
-            update.applied_locally = true;
-        }
-        future::ok(()).boxed()
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .mark_replication_update_applied(group_id, update_id)
     }
 
-    fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
-        self.assert_open();
-        self.closed = true;
-        let working_state = self.working_state;
-        let shared_state = self.shared_state;
-        async move {
-            *shared_state
-                .lock()
-                .expect("store stub state mutex must not be poisoned") = working_state;
-            Ok(())
-        }
-        .boxed()
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        let Self { inner, .. } = *self;
+        inner
+            .expect("failing store transaction must remain open until commit")
+            .commit()
     }
 
-    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
-        self.assert_open();
-        self.closed = true;
-        future::ok(()).boxed()
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        let Self { inner, .. } = *self;
+        inner
+            .expect("failing store transaction must remain open until rollback")
+            .rollback()
     }
 }
 
@@ -547,8 +433,12 @@ fn app_probe_id() -> Identifier {
     Identifier::from_array(APP_PROBE_SEGMENTS)
 }
 
-fn title_schema() -> Arc<Schema> {
-    Arc::new(Schema::from_fields([Field::linear_string("title")]))
+fn title_schema_shared() -> Arc<Schema> {
+    Arc::new(STATIC_TITLE_SCHEMA.clone())
+}
+
+fn title_schema_static() -> &'static Schema {
+    &STATIC_TITLE_SCHEMA
 }
 
 fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
@@ -563,36 +453,64 @@ fn load_runtime(
     application_id: Identifier,
     local_member: MemberIdentity,
 ) -> Arc<ReplicationRuntime> {
-    let store = Arc::new(StoreStub::new(local_member));
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(local_member).expect("store should build"));
     let listener = Arc::new(ListenerStub::default());
     load_runtime_with_parts(application_id, store, listener)
 }
 
-fn load_runtime_fixture(
+fn sqlite_store_with_schemas<I, S>(
+    local_member: MemberIdentity,
+    schemas: I,
+) -> Arc<SqliteReplicationStore>
+where
+    I: IntoIterator<Item = (DatasetId, S)>,
+    S: Into<SchemaSource>,
+{
+    Arc::new(
+        SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
+            .expect("store should build"),
+    )
+}
+
+fn load_runtime_fixture<I, S>(
     application_id: Identifier,
     local_member: MemberIdentity,
-    schemas: impl IntoIterator<Item = (DatasetId, Arc<Schema>)>,
-) -> RuntimeFixture {
+    schemas: I,
+) -> RuntimeFixture<SqliteReplicationStore>
+where
+    I: IntoIterator<Item = (DatasetId, S)>,
+    S: Into<SchemaSource>,
+{
     let listener = Arc::new(ListenerStub::default());
-    let mut store = StoreStub::new(local_member);
-    for (dataset_id, schema) in schemas {
-        store = store.with_schema(dataset_id, schema);
+    let store = sqlite_store_with_schemas(local_member, schemas);
+    let runtime = load_runtime_with_parts(application_id, store.clone(), listener.clone());
+    RuntimeFixture {
+        runtime,
+        listener,
+        store,
     }
-    let runtime = load_runtime_with_parts(application_id, Arc::new(store), listener.clone());
-    RuntimeFixture { runtime, listener }
 }
 
 fn start_host(local_member: MemberIdentity) -> DeliveryRuntimeHost {
-    let store = Arc::new(StoreStub::new(local_member.clone()));
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
+    );
     let listener = Arc::new(ListenerStub::default());
-    DeliveryRuntimeHost::start(local_member, store, listener).expect("host should start")
+    let host =
+        DeliveryRuntimeHost::start(local_member, store, listener).expect("host should start");
+    host.wait_for_runtime_startup();
+    host
 }
 
-fn load_runtime_with_parts(
+fn load_runtime_with_parts<S>(
     application_id: Identifier,
-    store: Arc<StoreStub>,
+    store: Arc<S>,
     listener: Arc<ListenerStub>,
-) -> Arc<ReplicationRuntime> {
+) -> Arc<ReplicationRuntime>
+where
+    S: ReplicationStore + 'static,
+{
     wait_for_test_reply(load_replication_runtime_typed(
         application_id,
         store,
@@ -602,11 +520,66 @@ fn load_runtime_with_parts(
     .expect("runtime should load")
 }
 
-fn persist_group_in_store(store: &StoreStub, group: ReplicationGroupRecord) {
+fn persist_group_in_store<S>(store: &S, group: ReplicationGroupRecord)
+where
+    S: ReplicationStore + ?Sized,
+{
     let mut transaction =
         wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
     wait_for_test_reply(transaction.insert_replication_group(group)).expect("group should persist");
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+}
+
+fn load_persisted_group<S>(store: &S, group_id: GroupId) -> ReplicationGroupRecord
+where
+    S: ReplicationStore + ?Sized,
+{
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let group = wait_for_test_reply(transaction.load_replication_group(&group_id))
+        .expect("group should load")
+        .expect("group should exist");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    group
+}
+
+fn load_persisted_update<S>(
+    store: &S,
+    group_id: GroupId,
+    update_id: UpdateId,
+) -> Option<ReplicationUpdateRecord>
+where
+    S: ReplicationStore + ?Sized,
+{
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let update = wait_for_test_reply(transaction.load_replication_update(&group_id, update_id))
+        .expect("update should load");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    update
+}
+
+fn load_persisted_row_slice<S>(
+    store: &S,
+    group_id: GroupId,
+    dataset_id: &DatasetId,
+    row_keys: impl IntoIterator<Item = RowKey>,
+) -> DatasetRowSlice
+where
+    S: ReplicationStore + ?Sized,
+{
+    let requested_row_keys: Vec<_> = row_keys.into_iter().collect();
+    let mut requested_row_keys = requested_row_keys.iter();
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let row_slice = wait_for_test_reply(transaction.load_dataset_rows(
+        &group_id,
+        dataset_id,
+        &mut requested_row_keys,
+    ))
+    .expect("row slice should load");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    row_slice
 }
 
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
@@ -641,7 +614,8 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 #[test]
 fn load_replication_runtime_returns_concrete_runtime() {
     let application_id = app_probe_id();
-    let store = Arc::new(StoreStub::new(alice_member()));
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
     let listener = Arc::new(ListenerStub::default());
 
     let runtime = wait_for_test_reply(load_replication_runtime(
@@ -668,9 +642,10 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store =
-        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
     let group_id = GroupId(Uuid::from_u128(31));
     let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member()])
         .expect("group should build");
@@ -689,12 +664,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
     let row_id = test_row_id(group_id, dataset_id, 32);
 
-    assert!(
-        runtime
-            .host()
-            .membership_snapshot()
-            .contains_group(&group_id)
-    );
+    wait_for_group_install(&runtime, group_id);
     wait_for_test_reply(runtime.publish_changes(vec![RowMutation::Upsert {
         row_id,
         row: crate::row_values! {
@@ -708,9 +678,10 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
 fn create_group_persists_membership_across_runtime_restart() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store =
-        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
     let first_listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener);
     let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
@@ -724,13 +695,7 @@ fn create_group_persists_membership_across_runtime_restart() {
     let restarted_runtime = load_runtime_with_parts(app_alice_id(), store, restarted_listener);
     let row_id = test_row_id(group_id, dataset_id, 33);
 
-    assert!(
-        restarted_runtime
-            .host()
-            .membership_snapshot()
-            .contains_group(&group_id),
-        "restarted runtime should hydrate the persisted group"
-    );
+    wait_for_group_install(&restarted_runtime, group_id);
     wait_for_test_reply(restarted_runtime.publish_changes(vec![RowMutation::Upsert {
         row_id,
         row: crate::row_values! {
@@ -744,19 +709,19 @@ fn create_group_persists_membership_across_runtime_restart() {
 fn publish_changes_persists_applied_update_and_snapshot_state() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store =
-        Arc::new(StoreStub::new(alice_member.clone()).with_schema(dataset_id.clone(), schema));
-    let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
-    let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         initial_state: None,
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 34);
 
-    let receipt = wait_for_test_reply(runtime.publish_changes(vec![RowMutation::Upsert {
+    let receipt = wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
         row_id: row_id.clone(),
         row: crate::row_values! {
             "title" => "durable publish",
@@ -764,21 +729,26 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     }]))
     .expect("publish_changes should succeed");
 
-    let persisted_state = store.snapshot_state();
-    let persisted_group = persisted_state
-        .groups
-        .get(&group_id)
-        .expect("group should persist");
+    let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
     assert_eq!(persisted_group.version_vector.version_at(0), 1);
-    let persisted_update = persisted_state
-        .updates
-        .get(&(group_id, receipt.update_id))
-        .expect("published update should persist");
+    let persisted_update =
+        load_persisted_update(fixture.store.as_ref(), group_id, receipt.update_id)
+            .expect("published update should persist");
     assert!(persisted_update.applied_locally);
+    let row_slice = load_persisted_row_slice(
+        fixture.store.as_ref(),
+        group_id,
+        &dataset_id,
+        [row_id.row_key],
+    );
+    assert!(row_slice.dataset_exists);
     assert!(
-        persisted_state
-            .dataset_rows
-            .contains_key(&(group_id, dataset_id, row_id.row_key))
+        row_slice
+            .rows
+            .get(&row_id.row_key)
+            .cloned()
+            .flatten()
+            .is_some()
     );
 }
 
@@ -858,16 +828,15 @@ fn publish_changes_delivers_remote_data_changed_event() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
     let alice_fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(dataset_id.clone(), schema.clone())],
+        [(dataset_id.clone(), title_schema_shared())],
     );
     let bob_fixture = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
-        [(dataset_id.clone(), schema.clone())],
+        [(dataset_id.clone(), title_schema_static())],
     );
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
@@ -936,11 +905,11 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
+    let schema = title_schema_shared();
     let bob_fixture = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
-        [(dataset_id.clone(), schema.clone())],
+        [(dataset_id.clone(), title_schema_static())],
     );
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(22));
@@ -1044,10 +1013,9 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store = Arc::new(
-        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
-    );
+    let schema = title_schema_shared();
+    let store =
+        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema.clone())]);
     let first_listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), first_listener);
     let group_id = GroupId(Uuid::from_u128(35));
@@ -1143,32 +1111,29 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
         ]
     );
 
-    let persisted_state = store.snapshot_state();
     assert!(
-        persisted_state
-            .updates
-            .get(&(
-                group_id,
-                UpdateId {
-                    version: 1,
-                    node_index: 0,
-                },
-            ))
-            .expect("first update should persist")
-            .applied_locally
+        load_persisted_update(
+            store.as_ref(),
+            group_id,
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+        )
+        .expect("first update should persist")
+        .applied_locally
     );
     assert!(
-        persisted_state
-            .updates
-            .get(&(
-                group_id,
-                UpdateId {
-                    version: 2,
-                    node_index: 0,
-                },
-            ))
-            .expect("second update should persist")
-            .applied_locally
+        load_persisted_update(
+            store.as_ref(),
+            group_id,
+            UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+        )
+        .expect("second update should persist")
+        .applied_locally
     );
 }
 
@@ -1177,10 +1142,10 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
-    let store = Arc::new(
-        StoreStub::new(bob_member.clone()).with_schema(dataset_id.clone(), schema.clone()),
-    );
+    let schema = title_schema_shared();
+    let sqlite_store =
+        sqlite_store_with_schemas(bob_member.clone(), [(dataset_id.clone(), schema.clone())]);
+    let store = Arc::new(FailingStore::new(sqlite_store.clone()));
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_bob_id(), store.clone(), listener.clone());
     let group_id = GroupId(Uuid::from_u128(37));
@@ -1256,37 +1221,41 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     assert!(matches!(error, InboundDeliveryError::StoreAccess { .. }));
     assert!(listener.captured_data_changes().is_empty());
 
-    let persisted_state = store.snapshot_state();
     assert!(
-        !persisted_state.updates.contains_key(&(
+        load_persisted_update(
+            sqlite_store.as_ref(),
             group_id,
             UpdateId {
                 version: 1,
                 node_index: 0,
             },
-        )),
+        )
+        .is_none(),
         "the newly ready predecessor must roll back with the failed transaction"
     );
     assert!(
-        !persisted_state
-            .updates
-            .get(&(
-                group_id,
-                UpdateId {
-                    version: 2,
-                    node_index: 0,
-                },
-            ))
-            .expect("pending successor should still exist")
-            .applied_locally,
+        !load_persisted_update(
+            sqlite_store.as_ref(),
+            group_id,
+            UpdateId {
+                version: 2,
+                node_index: 0,
+            },
+        )
+        .expect("pending successor should still exist")
+        .applied_locally,
         "the previously buffered successor must stay pending after rollback"
     );
-    assert!(persisted_state.dataset_rows.is_empty());
+    let row_slice = load_persisted_row_slice(
+        sqlite_store.as_ref(),
+        group_id,
+        &dataset_id,
+        [row_id.row_key],
+    );
+    assert!(!row_slice.dataset_exists);
+    assert_eq!(row_slice.rows.get(&row_id.row_key), Some(&None));
     assert_eq!(
-        persisted_state
-            .groups
-            .get(&group_id)
-            .expect("group should still exist")
+        load_persisted_group(sqlite_store.as_ref(), group_id)
             .version_vector
             .version_at(0),
         0
@@ -1307,11 +1276,11 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let schema = title_schema();
+    let schema = title_schema_shared();
     let bob_runtime = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
-        [(dataset_id.clone(), schema.clone())],
+        [(dataset_id.clone(), title_schema_static())],
     );
     let bob_runtime = bob_runtime.runtime;
     let group_id = GroupId(Uuid::from_u128(24));
