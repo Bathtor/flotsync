@@ -1,5 +1,5 @@
-use flotsync_core::versions::UpdateId;
-use flotsync_data_types::schema::{Schema, datamodel::NullableBasicValue};
+use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -15,6 +15,7 @@ pub use flotsync_data_types::{
     InMemoryFieldValue,
     RowOperations,
     RowRead,
+    schema::datamodel::SchemaSource,
 };
 pub use ids::*;
 
@@ -273,6 +274,233 @@ pub trait ReplicationApi: Send + Sync {
     ) -> BoxFuture<'_, Result<GroupMigration, ApiError>>;
 }
 
+/// One persisted replication group together with its local progress.
+///
+/// This is the group-level record that anchors dataset snapshots and persisted
+/// replication updates in the store. The canonical member order is significant
+/// because it defines the stable `MemberIndex` values used in version vectors
+/// and `UpdateId.node_index`.
+#[derive(Clone)]
+pub struct ReplicationGroupRecord {
+    /// Stable replication-group identifier.
+    pub group_id: GroupId,
+    /// Canonical member order for the group.
+    pub members: Vec<MemberIdentity>,
+    /// Position of the local member within `members`.
+    pub local_member_index: MemberIndex,
+    /// Last locally durable version vector for this group.
+    pub version_vector: VersionVector,
+}
+
+impl ReplicationGroupRecord {
+    /// Return the number of members encoded in this record.
+    pub fn member_count(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.members.len())
+            .expect("replication group records must not contain an empty member set")
+    }
+
+    /// Return the local member identity referenced by `local_member_index`.
+    ///
+    /// Store implementations must preserve the invariant that
+    /// `local_member_index < members.len()`.
+    pub fn local_member(&self) -> &MemberIdentity {
+        &self.members[self.local_member_index.as_u32() as usize]
+    }
+}
+
+impl std::fmt::Debug for ReplicationGroupRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationGroupRecord")
+            .field("group_id", &self.group_id)
+            .field("members", &self.members)
+            .field("local_member_index", &self.local_member_index)
+            .field("version_vector", &self.version_vector)
+            .finish()
+    }
+}
+
+/// One row-granular dataset view loaded for a single transaction.
+///
+/// If `dataset_exists` is `true`, the dataset entry already exists for
+/// `(group_id, dataset_id)`, even when every requested row key maps to
+/// `None`. If `dataset_exists` is `false`, the dataset itself has not been
+/// initialised in the group yet, so every requested key is absent because the
+/// dataset is absent. Callers can then decide whether to seed an empty
+/// in-memory working set from the application schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowSlice {
+    /// Replication group that owns this dataset slice.
+    pub group_id: GroupId,
+    /// Dataset identifier within the replication group.
+    pub dataset_id: DatasetId,
+    /// Whether this dataset already exists durably for `group_id`.
+    pub dataset_exists: bool,
+    /// Durable state for each requested row key.
+    pub rows: HashMap<RowKey, Option<RowSnapshot<'static, UpdateId>>>,
+}
+
+/// One explicit transactional row patch for a dataset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowPatch {
+    /// Replication group that owns this dataset patch.
+    pub group_id: GroupId,
+    /// Dataset identifier within the replication group.
+    pub dataset_id: DatasetId,
+    /// Ordered row-level writes to apply transactionally.
+    pub actions: Vec<DatasetRowWrite>,
+}
+
+/// One explicit storage action for a persisted dataset row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DatasetRowWrite {
+    /// Ensure that `row_key` exists with the provided snapshot after commit.
+    Put {
+        row_key: RowKey,
+        row: RowSnapshot<'static, UpdateId>,
+    },
+    /// Remove `row_key` from durable storage.
+    Delete { row_key: RowKey },
+}
+
+/// Iterator used to stream requested row keys into one store transaction.
+pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
+
+/// One dataset-scoped batch inside a persisted replication update.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetUpdateRecord {
+    /// Dataset targeted by this batch of schema operations.
+    pub dataset_id: DatasetId,
+    /// Ordered schema operations for `dataset_id` within one replication update.
+    pub operations: Vec<flotsync_messages::datamodel::SchemaOperation>,
+}
+
+/// One persisted replication update recorded by the runtime.
+///
+/// Stores must preserve at most one durable record for each
+/// `(group_id, update_id)` pair. The `applied_locally` flag distinguishes
+/// updates that are already reflected in durable dataset snapshots from updates
+/// that are still only present in the append-only update log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplicationUpdateRecord {
+    /// Group that this update belongs to.
+    pub group_id: GroupId,
+    /// Stable replication update identifier within `group_id`.
+    pub update_id: UpdateId,
+    /// Logical sender of the update.
+    pub sender: MemberIdentity,
+    /// Sender read-version snapshot carried with this update.
+    pub read_versions: VersionVector,
+    /// Per-dataset schema operations in transport order.
+    pub dataset_updates: Vec<DatasetUpdateRecord>,
+    /// Whether this update is already reflected in durable local dataset state.
+    pub applied_locally: bool,
+}
+
+/// Which replication updates should be returned by one transaction query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReplicationUpdateFilter {
+    /// Return every persisted update for the group.
+    All,
+    /// Return only updates that are not yet reflected in durable local state.
+    PendingApply,
+    /// Return only updates that are already reflected in durable local state.
+    Applied,
+}
+
+/// Mutable transaction over one replication store implementation.
+///
+/// Implementations must provide read-your-own-writes semantics within the same
+/// transaction object so the runtime can interleave async validation and
+/// mutation steps without reconstructing temporary whole-runtime state.
+///
+/// Transactions are rollback-by-default. Dropping an uncommitted transaction
+/// must discard all uncommitted writes as if `rollback` had been called.
+/// `rollback` remains part of the API so callers can release store resources
+/// early and observe rollback failures explicitly when the backend can report
+/// them.
+pub trait ReplicationStoreTransaction: Send {
+    /// Load one persisted replication group by id.
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load all persisted replication groups currently known to the store.
+    fn load_replication_groups<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
+    /// Insert one new persisted replication group.
+    fn insert_replication_group<'a>(
+        &'a mut self,
+        group: ReplicationGroupRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Advance the durable version vector for one existing replication group.
+    fn update_replication_group_version_vector<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Load the durable state for the requested dataset row keys.
+    ///
+    /// Implementations must include every iterated `row_key` exactly once in
+    /// `DatasetRowSlice.rows`.
+    fn load_dataset_rows<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
+
+    /// Apply one explicit set of durable row-level dataset storage actions.
+    fn apply_dataset_row_patch<'a>(
+        &'a mut self,
+        patch: DatasetRowPatch,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Load one persisted replication update by `(group_id, update_id)`.
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
+
+    /// Load persisted replication updates for one group using the given filter.
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
+
+    /// Append one new persisted replication update record.
+    ///
+    /// Implementations must preserve the uniqueness of `(group_id, update_id)`
+    /// and reject attempts to overwrite an existing durable update blob.
+    fn append_replication_update<'a>(
+        &'a mut self,
+        update: ReplicationUpdateRecord,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Mark one persisted replication update as already applied locally.
+    fn mark_replication_update_applied<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// Durably commit all writes performed in this transaction.
+    fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
+
+    /// Explicitly roll back all writes performed in this transaction.
+    ///
+    /// Callers may skip this and simply drop the transaction instead, but an
+    /// explicit rollback allows store implementations to release resources
+    /// promptly and surface rollback failures directly.
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
+}
+
 /// Persistence extension point.
 pub trait ReplicationStore: Send + Sync {
     /// Return the member identity hosted by this replication runtime instance.
@@ -282,5 +510,10 @@ pub trait ReplicationStore: Send + Sync {
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
-    ) -> BoxFuture<'_, Result<Option<Arc<Schema>>, StoreError>>;
+    ) -> BoxFuture<'_, Result<Option<SchemaSource>, StoreError>>;
+
+    /// Begin one mutable transaction over the replication state store.
+    fn begin_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>>;
 }

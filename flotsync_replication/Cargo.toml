@@ -14,6 +14,8 @@ flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 futures-util = "0.3"
 kompact = { workspace = true }
+log = { workspace = true }
 smallvec = "1"
 snafu = { workspace = true }
+sqlx = { workspace = true }
 uuid = { workspace = true }

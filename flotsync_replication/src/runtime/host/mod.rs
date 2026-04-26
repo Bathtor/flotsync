@@ -1,4 +1,6 @@
 use super::ReplicationRuntimeComponent;
+#[cfg(test)]
+use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
     GroupMemberships,
     SharedGroupMemberships,
@@ -17,7 +19,19 @@ use crate::{
         },
     },
 };
-use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
+#[cfg(test)]
+use flotsync_io::test_support::{
+    ReservedSocketKind,
+    ReservedSocketLease,
+    build_test_kompact_system_with,
+    enable_bind_reuse_address,
+    reserve_sockets,
+    set_test_system_label,
+};
+use flotsync_io::{
+    kompact::shutdown_system_bounded,
+    prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent},
+};
 use flotsync_udpour::UDPourConfig;
 use kompact::{KompactLogger, prelude::*};
 use snafu::prelude::*;
@@ -76,6 +90,11 @@ pub(crate) enum RuntimeHostError {
     InvalidConfig { key: &'static str, message: String },
     #[snafu(display("Failed to start runtime component '{component}': {message}"))]
     StartComponent {
+        component: &'static str,
+        message: String,
+    },
+    #[snafu(display("Failed to stop runtime component '{component}': {message}"))]
+    StopComponent {
         component: &'static str,
         message: String,
     },
@@ -142,6 +161,8 @@ pub(crate) struct DeliveryRuntimeHost {
     control_timeout: Duration,
     #[cfg_attr(not(test), allow(dead_code))]
     external_udp_addr: SocketAddr,
+    #[cfg(test)]
+    local_endpoint_lease: ReservedSocketLease,
 }
 
 struct RuntimeTopology {
@@ -155,6 +176,12 @@ struct RuntimeTopology {
     discovery_source_ref: ActorRefStrong<RuntimeDiscoverySourceMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
     runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
+}
+
+struct BuiltRuntimeSystem {
+    system: KompactSystem,
+    #[cfg(test)]
+    local_endpoint_lease: ReservedSocketLease,
 }
 
 impl RuntimeTopology {
@@ -319,16 +346,46 @@ impl RuntimeTopology {
         Ok(())
     }
 
-    fn stop_all(&self, system: &KompactSystem, control_timeout: Duration) {
-        self.stop_component(system, &self.runtime_component, control_timeout);
-        self.stop_component(system, &self.reliable_delivery, control_timeout);
-        self.stop_component(system, &self.group_broadcast, control_timeout);
-        self.stop_component(system, &self.ingress, control_timeout);
-        self.stop_component(system, &self.discovery_source, control_timeout);
-        self.stop_component(system, &self.local_endpoint_manager, control_timeout);
-        self.stop_component(system, &self.manager, control_timeout);
-        self.stop_component(system, &self.bridge, control_timeout);
-        self.stop_component(system, &self.driver, control_timeout);
+    fn stop_all(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        self.stop_component(
+            system,
+            &self.runtime_component,
+            "replication_runtime",
+            control_timeout,
+        )?;
+        self.stop_component(
+            system,
+            &self.reliable_delivery,
+            "reliable_delivery",
+            control_timeout,
+        )?;
+        self.stop_component(
+            system,
+            &self.group_broadcast,
+            "group_broadcast",
+            control_timeout,
+        )?;
+        self.stop_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
+        self.stop_component(
+            system,
+            &self.discovery_source,
+            "runtime_discovery_source",
+            control_timeout,
+        )?;
+        self.stop_component(
+            system,
+            &self.local_endpoint_manager,
+            "local_endpoint_manager",
+            control_timeout,
+        )?;
+        self.stop_component(system, &self.manager, "route_transport", control_timeout)?;
+        self.stop_component(system, &self.bridge, "io_bridge", control_timeout)?;
+        self.stop_component(system, &self.driver, "io_driver", control_timeout)?;
+        Ok(())
     }
 
     fn connect_components<P, C1, C2>(
@@ -374,13 +431,19 @@ impl RuntimeTopology {
         &self,
         system: &KompactSystem,
         component: &Arc<Component<C>>,
+        name: &'static str,
         control_timeout: Duration,
-    ) where
+    ) -> Result<(), RuntimeHostError>
+    where
         C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
     {
-        let _ = system
-            .kill_notify(component.clone())
-            .wait_timeout(control_timeout);
+        system
+            .stop_notify(component)
+            .wait_timeout(control_timeout)
+            .map_err(|error| RuntimeHostError::StopComponent {
+                component: name,
+                message: format!("{error:?}"),
+            })
     }
 }
 
@@ -391,6 +454,7 @@ impl DeliveryRuntimeHost {
         group_memberships: SharedGroupMemberships,
         control_timeout: Duration,
         external_udp_addr: SocketAddr,
+        #[cfg(test)] local_endpoint_lease: ReservedSocketLease,
     ) -> Self {
         Self {
             system: Some(system),
@@ -398,6 +462,8 @@ impl DeliveryRuntimeHost {
             group_memberships,
             control_timeout,
             external_udp_addr,
+            #[cfg(test)]
+            local_endpoint_lease,
         }
     }
 
@@ -424,9 +490,10 @@ impl DeliveryRuntimeHost {
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
     ) -> Result<Self, RuntimeHostError> {
-        let system = build_runtime_system()?;
+        let built_system = build_runtime_system()?;
+        let system = built_system.system.clone();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
-        let group_memberships = SharedGroupMemberships::default();
+        let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
         let topology = RuntimeTopology::build(
             &system,
             &group_memberships,
@@ -440,6 +507,16 @@ impl DeliveryRuntimeHost {
         let local_endpoint = ensure_local_endpoint_bound(
             &topology.local_endpoint_manager,
             host_config.control_timeout,
+        )
+        .map_err(|error| {
+            annotate_local_endpoint_bind_error(&system, host_config.local_endpoint_bind_addr, error)
+        })?;
+        #[cfg(test)]
+        let mut local_endpoint_lease = built_system.local_endpoint_lease;
+        #[cfg(test)]
+        release_reserved_runtime_local_endpoint_binding(
+            &mut local_endpoint_lease,
+            local_endpoint.local_addr,
         )?;
 
         Ok(Self::new(
@@ -448,6 +525,8 @@ impl DeliveryRuntimeHost {
             group_memberships,
             host_config.control_timeout,
             local_endpoint.local_addr,
+            #[cfg(test)]
+            local_endpoint_lease,
         ))
     }
 
@@ -458,9 +537,17 @@ impl DeliveryRuntimeHost {
         let Some(system) = self.system.take() else {
             return;
         };
-        topology.stop_all(&system, self.control_timeout);
+        let stop_result = topology.stop_all(&system, self.control_timeout);
         drop(topology);
-        let _ = system.kill_system();
+        if let Err(error) = stop_result {
+            shutdown_system_bounded(system, self.control_timeout, true);
+            #[cfg(test)]
+            rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
+            panic!("failed to stop delivery runtime host cleanly: {error}");
+        }
+        shutdown_system_bounded(system, self.control_timeout, false);
+        #[cfg(test)]
+        rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }
 
     /// Replace the authoritative shared group-membership snapshot.
@@ -503,25 +590,99 @@ impl Drop for DeliveryRuntimeHost {
         let Some(system) = self.system.take() else {
             return;
         };
+        let stop_result = topology.stop_all(&system, self.control_timeout);
         drop(topology);
-        let _ = system.kill_system();
+        if let Err(error) = stop_result {
+            log::error!("delivery runtime host drop stop_all failed before forced kill: {error}");
+        }
+        shutdown_system_bounded(system, self.control_timeout, true);
+        #[cfg(test)]
+        rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }
 }
 
-fn build_runtime_system() -> Result<KompactSystem, RuntimeHostError> {
+#[cfg(test)]
+fn build_runtime_system() -> Result<BuiltRuntimeSystem, RuntimeHostError> {
+    let local_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let local_endpoint_bind_addr = local_endpoint_lease.addr(0).to_string();
+    let system = build_test_kompact_system_with(|config| {
+        set_test_system_label(config, "replication-runtime-host-test-system");
+        enable_bind_reuse_address(config);
+        config.set_config_value(
+            &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
+            local_endpoint_bind_addr,
+        );
+        configure_replication_runtime(config);
+    });
+    Ok(BuiltRuntimeSystem {
+        system,
+        local_endpoint_lease,
+    })
+}
+
+#[cfg(not(test))]
+fn build_runtime_system() -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let mut config = KompactConfig::default();
     configure_replication_runtime(&mut config);
-    config
+    let system = config
         .build()
         .map_err(|error| RuntimeHostError::BuildSystem {
             message: error.to_string(),
-        })
+        })?;
+    Ok(BuiltRuntimeSystem { system })
+}
+
+#[cfg(test)]
+fn release_reserved_runtime_local_endpoint_binding(
+    local_endpoint_lease: &mut ReservedSocketLease,
+    local_addr: SocketAddr,
+) -> Result<(), RuntimeHostError> {
+    let reserved_addr = local_endpoint_lease.addr(0);
+    if reserved_addr != local_addr {
+        return Err(RuntimeHostError::BindLocalEndpoint {
+            message: format!(
+                "runtime host bound local endpoint at {local_addr}, but the reserved test socket expected {reserved_addr}"
+            ),
+        });
+    }
+    local_endpoint_lease.activate_live_binding(0);
+    Ok(())
+}
+
+#[cfg(test)]
+fn rebind_reserved_runtime_local_endpoint_binding(local_endpoint_lease: &mut ReservedSocketLease) {
+    let rebind_result = local_endpoint_lease.rebind_binding(0);
+    if let Err(error) = rebind_result
+        && !std::thread::panicking()
+    {
+        panic!("rebind reserved runtime-host local endpoint socket: {error}");
+    }
+}
+
+fn annotate_local_endpoint_bind_error(
+    system: &KompactSystem,
+    configured_bind_addr: SocketAddr,
+    error: RuntimeHostError,
+) -> RuntimeHostError {
+    let RuntimeHostError::BindLocalEndpoint { message } = error else {
+        return error;
+    };
+    let system_label = system
+        .config()
+        .read_or_default(&kompact::config_keys::system::LABEL)
+        .unwrap_or_else(|_| String::from("<unlabelled-runtime-host-system>"));
+    RuntimeHostError::BindLocalEndpoint {
+        message: format!(
+            "{message}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
+        ),
+    }
 }
 
 #[cfg(test)]
 pub(crate) trait DeliveryRuntimeHostTestExt {
     fn advertised_loopback_udp_addr(&self) -> SocketAddr;
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
+    fn wait_for_runtime_startup(&self);
 }
 
 #[cfg(test)]
@@ -557,6 +718,19 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             routes: vec![route],
         });
         wait_for_direct_peer_route(self.topology(), &peer);
+    }
+
+    fn wait_for_runtime_startup(&self) {
+        let future = self
+            .runtime_component()
+            .actor_ref()
+            .ask_with(ReplicationRuntimeMessage::test_ping);
+        match wait_for_test_reply(future) {
+            Ok(()) => {}
+            Err(_) => panic!(
+                "replication runtime component became unavailable during test startup barrier"
+            ),
+        }
     }
 }
 

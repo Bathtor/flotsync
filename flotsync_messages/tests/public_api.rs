@@ -14,7 +14,12 @@ use flotsync_data_types::{
         NullableBasicDataType,
         PrimitiveType,
         Schema,
-        datamodel::{InMemoryFieldValue, LinearLatestValueWinsValue, LinearListValue},
+        datamodel::{
+            InMemoryFieldValue,
+            LinearLatestValueWinsValue,
+            LinearListValue,
+            SchemaSource,
+        },
         values::{NullablePrimitiveValue, PrimitiveValue},
     },
     test_support::schema_operations::{
@@ -105,7 +110,7 @@ fn public_snapshot_transport_roundtrips_dataset() {
     let priority = PrimitiveValue::UInt(7);
     let status = NullablePrimitiveValue::Null;
 
-    let mut data = InMemoryData::with_owned_schema(schema.clone());
+    let mut data = InMemoryData::with_static_schema(schema);
     data.push_row_from_named_fields([
         (
             "latest",
@@ -135,8 +140,7 @@ fn public_snapshot_transport_roundtrips_dataset() {
     let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
     let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
-    let roundtrip =
-        InMemoryData::decode_data_snapshots(Cow::Borrowed(schema), &mut decoder).unwrap();
+    let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
 
     assert_eq!(roundtrip, data);
 }
@@ -186,8 +190,8 @@ fn public_schema_transport_roundtrips_field_defaults() {
 
 #[test]
 fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
-    let old_schema = Schema::from_fields([Field::linear_string("title")]);
-    let new_schema = Schema::from_fields([
+    let old_schema = SchemaSource::from(Schema::from_fields([Field::linear_string("title")]));
+    let new_schema = SchemaSource::from(Schema::from_fields([
         Field::linear_string("title"),
         Field::linear_string("subtitle")
             .with_default("generated subtitle")
@@ -195,10 +199,10 @@ fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
         Field::linear_list("numbers", PrimitiveType::Int)
             .with_default(vec![4i64, 5])
             .unwrap(),
-    ]);
+    ]));
     let row_id = row_id(7777);
 
-    let mut source = InMemoryData::with_owned_schema(old_schema.clone());
+    let mut source = InMemoryData::new(old_schema.clone());
     let insert = source
         .insert_row(
             update_id(700, 1),
@@ -213,7 +217,7 @@ fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
     let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_operation(encoded, &new_schema).unwrap();
 
-    let target = InMemoryData::with_owned_schema(new_schema.clone())
+    let target = InMemoryData::new(new_schema.clone())
         .apply_schema_operation(decoded)
         .unwrap();
     let row = target
@@ -259,7 +263,7 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
     let schema = &*PUBLIC_TEST_SCHEMA;
     let row_id = row_id(4242);
 
-    let mut source = InMemoryData::with_owned_schema(schema.clone());
+    let mut source = InMemoryData::with_static_schema(schema);
     let decoded_insert = {
         let insert = source
             .insert_row(
@@ -306,7 +310,7 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
         decode_schema_operation(encoded, schema).unwrap()
     };
 
-    let target = InMemoryData::with_owned_schema(schema.clone())
+    let target = InMemoryData::with_static_schema(schema)
         .apply_schema_operation(decoded_insert)
         .unwrap()
         .apply_schema_operation(decoded_delete)

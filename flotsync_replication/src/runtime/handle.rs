@@ -4,6 +4,7 @@ use crate::api::{
     ApiResult,
     ChangeGroupMembershipRequest,
     CreateGroupRequest,
+    GroupId,
     GroupMigration,
     LoadError,
     PublishReceipt,
@@ -27,14 +28,14 @@ use super::{
     messages::UpdateBatchMessage,
 };
 #[cfg(test)]
-use crate::{
-    GroupMembers,
-    api::{GroupId, MemberIdentity},
-};
+use crate::{GroupMembers, api::MemberIdentity};
 #[cfg(test)]
-use std::future::Future;
+use std::time::Duration;
 
 type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
+
+#[cfg(test)]
+const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create one concrete replication runtime for the given application identity.
 ///
@@ -141,7 +142,7 @@ impl ReplicationApi for ReplicationRuntime {
         })
     }
 
-    fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, crate::api::GroupId> {
+    fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, GroupId> {
         self.ask(move |promise| ReplicationRuntimeMessage::CreateGroup(Ask::new(promise, req)))
     }
 
@@ -158,10 +159,10 @@ impl ReplicationApi for ReplicationRuntime {
 #[cfg(test)]
 pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
-    F: Future,
+    F: std::future::Future,
 {
     flotsync_io::test_support::wait_for_future(
-        std::time::Duration::from_secs(5),
+        TEST_REPLY_TIMEOUT,
         future,
         "timed out waiting for test future to resolve",
     )

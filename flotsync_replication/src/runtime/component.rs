@@ -1,13 +1,16 @@
 use super::{
-    errors::*,
+    errors::{inbound, publish, *},
     in_memory::{
+        LoadedGroupMeta,
         LocalDataset,
-        LocalGroupState,
-        LocalRuntimeState,
+        PendingUpdateSet,
+        PreparedLocalChanges,
+        TouchedGroupRows,
         apply_local_delete,
         apply_local_upsert,
         apply_one_update_batch,
-        collect_group_dataset_scope,
+        collect_group_row_scope,
+        collect_record_row_scope,
         working_dataset_for_publish,
     },
     messages::{
@@ -21,6 +24,7 @@ use super::{
 };
 use crate::{
     GroupMembers,
+    GroupMemberships,
     SharedGroupMemberships,
     api::{
         ApiError,
@@ -28,6 +32,9 @@ use crate::{
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DatasetId,
+        DatasetRowPatch,
+        DatasetRowWrite,
+        DatasetUpdateRecord,
         GroupId,
         GroupMigration,
         MemberIdentity,
@@ -35,9 +42,15 @@ use crate::{
         PublishReceipt,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupRecord,
         ReplicationStore,
+        ReplicationStoreTransaction,
+        ReplicationUpdateFilter,
+        ReplicationUpdateRecord,
         RowChange,
+        RowKey,
         RowMutation,
+        SchemaSource,
         StoreError,
         providers::VecRowProvider,
     },
@@ -73,12 +86,12 @@ use crate::{
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::Schema;
 use flotsync_messages::buffa::Message as BuffaMessage;
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::Arc,
 };
 use uuid::Uuid;
@@ -100,18 +113,6 @@ struct PreparedLocalPublish {
     group_id: GroupId,
     update_id: UpdateId,
     payload: bytes::Bytes,
-}
-
-/// One inbound update batch buffered until its causal dependencies are met.
-pub(super) struct BufferedInboundUpdate {
-    pub(super) message: UpdateBatchMessage,
-    pub(super) loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
-}
-
-/// Prepared local dataset changes for one outbound publish.
-struct PreparedDatasetUpdates {
-    dataset_updates: Vec<DatasetUpdateMessage>,
-    working_datasets: HashMap<DatasetId, LocalDataset>,
 }
 
 enum DatasetSchemaLoadError {
@@ -147,12 +148,19 @@ pub enum ReplicationRuntimeMessage {
     reason = "test-only ask plumbing reuses internal error types"
 )]
 pub enum ReplicationRuntimeTestMessage {
+    /// Confirm that the runtime component is alive and able to process one
+    /// mailbox turn after startup.
+    Ping(Ask<(), ()>),
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
     ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
 }
 
 #[cfg(test)]
 impl ReplicationRuntimeMessage {
+    pub(super) fn test_ping(promise: KPromise<()>) -> Self {
+        Self::Test(ReplicationRuntimeTestMessage::Ping(Ask::new(promise, ())))
+    }
+
     pub(super) fn test_install_group(
         promise: KPromise<Result<(), GroupInstallError>>,
         group_id: GroupId,
@@ -176,11 +184,11 @@ impl ReplicationRuntimeMessage {
     }
 }
 
-/// Stateful Kompact component that hosts one in-memory replication runtime.
+/// Stateful Kompact component that hosts one replication runtime.
 ///
-/// It owns the local replicated group state, speaks to the delivery-layer
-/// components through required ports, and translates the public replication
-/// API into deterministic local state transitions plus outbound delivery work.
+/// Durable replication state now lives entirely in `ReplicationStore`. This
+/// component only owns membership-routing snapshots plus the imperative bridge
+/// from public API calls and delivery events into transactional store work.
 #[derive(ComponentDefinition)]
 pub struct ReplicationRuntimeComponent {
     ctx: ComponentContext<Self>,
@@ -190,7 +198,6 @@ pub struct ReplicationRuntimeComponent {
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     group_memberships: SharedGroupMemberships,
-    state: LocalRuntimeState,
     terminal_fault: Option<TerminalRuntimeFault>,
 }
 
@@ -210,7 +217,6 @@ impl ReplicationRuntimeComponent {
             store,
             listener,
             group_memberships,
-            state: LocalRuntimeState::default(),
             terminal_fault: None,
         }
     }
@@ -224,17 +230,22 @@ impl ReplicationRuntimeComponent {
         Ok(())
     }
 
-    fn record_terminal_fault(&mut self, operation: &'static str, error: &InboundDeliveryError) {
+    fn install_terminal_fault(&mut self, operation: &'static str, message: String) {
         if self.terminal_fault.is_some() {
             return;
         }
-        let fault = TerminalRuntimeFault {
-            operation,
-            message: error.to_string(),
-        };
+        let fault = TerminalRuntimeFault { operation, message };
         error!(self.log(), "terminal runtime failure: {}", fault);
         self.terminal_fault = Some(fault);
+    }
+
+    fn record_terminal_fault(&mut self, operation: &'static str, error: &InboundDeliveryError) {
+        self.install_terminal_fault(operation, error.to_string());
         self.ctx.suicide();
+    }
+
+    fn record_startup_fault(&mut self, operation: &'static str, error: &RuntimeStartupError) {
+        self.install_terminal_fault(operation, error.to_string());
     }
 
     fn reply_api<T>(
@@ -250,28 +261,15 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Validate one publish request locally and return the missing dataset
-    /// schemas that must be loaded before local staging can proceed.
-    fn preflight_publish(&self, changes: &[RowMutation]) -> Result<HashSet<DatasetId>, ApiError> {
-        let (group_id, dataset_ids) = collect_group_dataset_scope(changes)
-            .boxed()
-            .context(ApiExternalSnafu)?;
-        let local_group = self
-            .state
-            .groups
-            .get(&group_id)
-            .context(UnknownGroupSnafu { group_id })
-            .boxed()
-            .context(ApiExternalSnafu)?;
-        Ok(local_group.missing_dataset_ids(&dataset_ids))
-    }
-
-    async fn load_dataset_schemas(
+    async fn load_dataset_schemas<I>(
         store: Arc<dyn ReplicationStore>,
-        missing_dataset_ids: HashSet<DatasetId>,
-    ) -> Result<HashMap<DatasetId, Arc<Schema>>, DatasetSchemaLoadError> {
-        let mut loaded_schemas = HashMap::with_capacity(missing_dataset_ids.len());
-        for dataset_id in missing_dataset_ids {
+        dataset_ids: I,
+    ) -> Result<HashMap<DatasetId, SchemaSource>, DatasetSchemaLoadError>
+    where
+        I: IntoIterator<Item = DatasetId>,
+    {
+        let mut loaded_schemas = HashMap::new();
+        for dataset_id in dataset_ids {
             let schema = store
                 .load_dataset_schema(&dataset_id)
                 .await
@@ -285,6 +283,159 @@ impl ReplicationRuntimeComponent {
             loaded_schemas.insert(dataset_id, schema);
         }
         Ok(loaded_schemas)
+    }
+
+    /// Materialise one ephemeral in-memory dataset slice for each touched
+    /// dataset using only the requested row keys.
+    async fn materialise_touched_datasets(
+        transaction: &mut dyn ReplicationStoreTransaction,
+        schemas: &HashMap<DatasetId, SchemaSource>,
+        group_id: GroupId,
+        dataset_rows: &HashMap<DatasetId, HashSet<RowKey>>,
+    ) -> Result<HashMap<DatasetId, LocalDataset>, StoreError> {
+        let mut datasets = HashMap::with_capacity(dataset_rows.len());
+        for (dataset_id, row_keys) in dataset_rows {
+            let mut row_keys = row_keys.iter();
+            let row_slice = transaction
+                .load_dataset_rows(&group_id, dataset_id, &mut row_keys)
+                .await?;
+            let schema = schemas
+                .get(dataset_id)
+                .expect("touched dataset schemas must be pre-loaded");
+            datasets.insert(
+                dataset_id.clone(),
+                LocalDataset::from_row_slice(schema.clone(), row_slice),
+            );
+        }
+        Ok(datasets)
+    }
+
+    /// Persist one set of explicit row patches back into durable storage.
+    async fn apply_dataset_row_patches(
+        transaction: &mut dyn ReplicationStoreTransaction,
+        patches: Vec<DatasetRowPatch>,
+    ) -> Result<(), StoreError> {
+        for patch in patches {
+            transaction.apply_dataset_row_patch(patch).await?;
+        }
+        Ok(())
+    }
+
+    /// Build the canonical persisted record for one group definition that has
+    /// already passed local membership validation.
+    fn build_replication_group_record(
+        &self,
+        group_id: GroupId,
+        members: &GroupMembers,
+    ) -> ReplicationGroupRecord {
+        let member_count = NonZeroUsize::new(members.len())
+            .expect("group installation must keep members non-empty");
+        let local_member_index = members
+            .member_index(&self.local_member)
+            .expect("group installation validates the local member before persistence");
+        ReplicationGroupRecord {
+            group_id,
+            members: members.ordered_members(),
+            local_member_index,
+            version_vector: VersionVector::initial(member_count),
+        }
+    }
+
+    /// Persist one newly observed group definition.
+    ///
+    /// If the same group already exists with the same canonical membership
+    /// definition, this returns the stored record without mutating it.
+    async fn store_new_replication_group(
+        &mut self,
+        record: ReplicationGroupRecord,
+    ) -> Result<ReplicationGroupRecord, GroupInstallError> {
+        let group_id = record.group_id;
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        let existing = transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        if let Some(existing) = existing {
+            transaction
+                .commit()
+                .await
+                .context(StoreGroupSnafu { group_id })?;
+            ensure!(
+                existing.members == record.members
+                    && existing.local_member_index == record.local_member_index,
+                ConflictingExistingGroupSnafu { group_id }
+            );
+            return Ok(existing);
+        }
+
+        transaction
+            .insert_replication_group(record.clone())
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        transaction
+            .commit()
+            .await
+            .context(StoreGroupSnafu { group_id })?;
+        Ok(record)
+    }
+
+    /// Install one validated group view into the shared delivery-membership
+    /// snapshot.
+    fn install_group_membership_view(
+        &mut self,
+        group: ReplicationGroupRecord,
+    ) -> Result<(), GroupInstallError> {
+        let group_id = group.group_id;
+        let local_group =
+            LoadedGroupMeta::from_replication_group_record(&self.local_member, group)?;
+
+        let mut memberships = self.group_memberships.snapshot().as_ref().clone();
+        let existing_members = memberships.insert(group_id, local_group.members.clone());
+        if let Some(existing_members) = existing_members {
+            ensure!(
+                existing_members == local_group.members,
+                ConflictingExistingGroupSnafu { group_id }
+            );
+            return Ok(());
+        }
+        self.group_memberships.replace(memberships);
+        Ok(())
+    }
+
+    /// Load the persisted group registry into the shared membership snapshot during
+    /// component startup.
+    async fn load_hydrated_runtime_memberships(
+        &mut self,
+    ) -> Result<GroupMemberships, RuntimeStartupError> {
+        let initial_memberships = self.group_memberships.snapshot().as_ref().clone();
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(StoreStartupSnafu)?;
+        let persisted_groups = transaction
+            .load_replication_groups()
+            .await
+            .context(StoreStartupSnafu)?;
+        transaction.commit().await.context(StoreStartupSnafu)?;
+
+        let mut memberships = initial_memberships;
+        for persisted_group in persisted_groups {
+            let group_id = persisted_group.group_id;
+            let local_group =
+                LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
+                    .context(InvalidGroupSnafu { group_id })?;
+            let existing_members = memberships.insert(group_id, local_group.members.clone());
+            if existing_members.is_some() {
+                return DuplicateGroupSnafu { group_id }.fail();
+            }
+        }
+
+        Ok(memberships)
     }
 
     /// Submit one encoded live update to the group-broadcast layer.
@@ -347,14 +498,12 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    fn collect_dataset_ids(dataset_updates: &[DatasetUpdateMessage]) -> HashSet<DatasetId> {
-        dataset_updates
-            .iter()
-            .map(|dataset_update| dataset_update.dataset_id.clone())
-            .collect()
-    }
-
-    fn create_group(&mut self, req: CreateGroupRequest) -> Result<GroupId, CreateGroupError> {
+    /// Validate one create-group request and derive the canonical persisted
+    /// group record that should be written if the request succeeds.
+    fn prepare_created_group(
+        &self,
+        req: CreateGroupRequest,
+    ) -> Result<(GroupId, GroupMembers, ReplicationGroupRecord), CreateGroupError> {
         if req.initial_state.is_some() {
             return InitialStateUnsupportedSnafu.fail();
         }
@@ -369,77 +518,18 @@ impl ReplicationRuntimeComponent {
         );
 
         let group_id = GroupId(Uuid::new_v4());
-        self.install_group(group_id, members.clone())
-            .context(InstallGroupSnafu)?;
-        self.submit_group_bootstrap(group_id, &members);
-        Ok(group_id)
-    }
-
-    fn prepare_local_publish(
-        &mut self,
-        changes: Vec<RowMutation>,
-        loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
-    ) -> Result<PreparedLocalPublish, PublishChangesError> {
-        let (group_id, _) = collect_group_dataset_scope(&changes)?;
-        let local_group = self
-            .state
-            .groups
-            .get_mut(&group_id)
-            .context(UnknownGroupSnafu { group_id })?;
-
-        let read_versions = local_group.version_vector.clone();
-        let update_id = Self::next_local_update_id(local_group, group_id)?;
-        let prepared_datasets = Self::build_local_dataset_updates(
-            group_id,
-            local_group,
-            loaded_schemas,
-            changes,
-            update_id,
-        )?;
-        let payload = Self::finalise_local_publish(
-            local_group,
-            group_id,
-            update_id,
-            read_versions,
-            prepared_datasets,
-        );
-        Ok(PreparedLocalPublish {
-            group_id,
-            update_id,
-            payload,
-        })
-    }
-
-    fn finalise_local_publish(
-        local_group: &mut LocalGroupState,
-        group_id: GroupId,
-        update_id: UpdateId,
-        read_versions: VersionVector,
-        prepared_datasets: PreparedDatasetUpdates,
-    ) -> bytes::Bytes {
-        for (dataset_id, working_dataset) in prepared_datasets.working_datasets {
-            local_group.datasets.insert(dataset_id, working_dataset);
-        }
-        local_group
-            .version_vector
-            .increment_at(local_group.local_member_index.as_u32() as usize);
-
-        Self::encode_runtime_payload(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
-            group_id,
-            update_id,
-            read_versions,
-            dataset_updates: prepared_datasets.dataset_updates,
-        }))
+        let record = self.build_replication_group_record(group_id, &members);
+        Ok((group_id, members, record))
     }
 
     fn next_local_update_id(
-        local_group: &LocalGroupState,
+        local_group: &LoadedGroupMeta,
         group_id: GroupId,
     ) -> Result<UpdateId, PublishChangesError> {
         let next_local_version = local_group
             .applied_version(local_group.local_member_index)
             .checked_add(1)
-            .context(ExhaustedUpdateIdsSnafu { group_id })?;
+            .context(publish::ExhaustedUpdateIdsSnafu { group_id })?;
         Ok(UpdateId {
             version: next_local_version,
             node_index: local_group.local_member_index.as_u32(),
@@ -448,27 +538,22 @@ impl ReplicationRuntimeComponent {
 
     fn build_local_dataset_updates(
         group_id: GroupId,
-        local_group: &LocalGroupState,
-        loaded_schemas: &HashMap<DatasetId, Arc<Schema>>,
+        working_datasets: &mut HashMap<DatasetId, LocalDataset>,
         changes: Vec<RowMutation>,
         update_id: UpdateId,
-    ) -> Result<PreparedDatasetUpdates, PublishChangesError> {
-        let mut working_datasets = HashMap::<DatasetId, LocalDataset>::new();
+    ) -> Result<PreparedLocalChanges, PublishChangesError> {
         let mut encoded_operations: HashMap<
             DatasetId,
             Vec<flotsync_messages::datamodel::SchemaOperation>,
         > = HashMap::new();
+        let mut row_writes: HashMap<DatasetId, Vec<DatasetRowWrite>> = HashMap::new();
 
         'changes: for mutation in changes {
             let row_id = mutation.row_id().clone();
-            let working_dataset = working_dataset_for_publish(
-                &mut working_datasets,
-                local_group,
-                loaded_schemas,
-                &row_id.dataset_id,
-            )?;
+            let working_dataset =
+                working_dataset_for_publish(working_datasets, &row_id.dataset_id)?;
 
-            let encoded_operation = match mutation {
+            let applied_operation = match mutation {
                 RowMutation::Upsert { row, .. } => {
                     apply_local_upsert(working_dataset, &row_id, row, update_id)?
                 }
@@ -476,61 +561,204 @@ impl ReplicationRuntimeComponent {
                     Some(apply_local_delete(working_dataset, &row_id, update_id)?)
                 }
             };
-            let Some(encoded_operation) = encoded_operation else {
+            let Some(applied_operation) = applied_operation else {
                 continue 'changes;
             };
             encoded_operations
                 .entry(row_id.dataset_id.clone())
                 .or_default()
-                .push(encoded_operation);
+                .push(applied_operation.encoded_operation);
+            row_writes
+                .entry(row_id.dataset_id.clone())
+                .or_default()
+                .push(applied_operation.row_write);
         }
 
         ensure!(
             !encoded_operations.is_empty(),
-            NoEffectiveChangesSnafu { group_id }
+            publish::NoEffectiveChangesSnafu { group_id }
         );
         let dataset_updates = encoded_operations
             .into_iter()
-            .map(|(dataset_id, operations)| DatasetUpdateMessage {
+            .map(|(dataset_id, operations)| DatasetUpdateRecord {
                 dataset_id,
                 operations,
             })
             .collect();
-        Ok(PreparedDatasetUpdates {
+        let row_patches = row_writes
+            .into_iter()
+            .map(|(dataset_id, actions)| DatasetRowPatch {
+                group_id,
+                dataset_id,
+                actions,
+            })
+            .collect();
+        Ok(PreparedLocalChanges {
             dataset_updates,
-            working_datasets,
+            row_patches,
+        })
+    }
+
+    /// Convert one runtime update message into the durable update-record shape.
+    fn build_replication_update_record(
+        sender: MemberIdentity,
+        message: UpdateBatchMessage,
+        applied_locally: bool,
+    ) -> ReplicationUpdateRecord {
+        ReplicationUpdateRecord {
+            group_id: message.group_id,
+            update_id: message.update_id,
+            sender,
+            read_versions: message.read_versions,
+            dataset_updates: message
+                .dataset_updates
+                .into_iter()
+                .map(|dataset_update| DatasetUpdateRecord {
+                    dataset_id: dataset_update.dataset_id,
+                    operations: dataset_update.operations,
+                })
+                .collect(),
+            applied_locally,
+        }
+    }
+
+    /// Publish one local change batch through one durable store transaction.
+    async fn publish_changes_transactionally(
+        &mut self,
+        changes: Vec<RowMutation>,
+    ) -> Result<PreparedLocalPublish, PublishChangesError> {
+        let TouchedGroupRows {
+            group_id,
+            dataset_rows,
+        } = collect_group_row_scope(&changes)?;
+        let loaded_schemas =
+            Self::load_dataset_schemas(self.store.clone(), dataset_rows.keys().cloned())
+                .await
+                .map_err(|error| match error {
+                    DatasetSchemaLoadError::Load { dataset_id, source } => {
+                        PublishChangesError::LoadDatasetSchema { dataset_id, source }
+                    }
+                    DatasetSchemaLoadError::Missing { dataset_id } => {
+                        PublishChangesError::MissingDatasetSchema { dataset_id }
+                    }
+                })?;
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        let persisted_group = transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        let persisted_group = persisted_group.context(publish::UnknownGroupSnafu { group_id })?;
+        let mut local_group =
+            LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
+                .context(publish::InvalidPersistedGroupSnafu { group_id })?;
+        let mut working_datasets = Self::materialise_touched_datasets(
+            transaction.as_mut(),
+            &loaded_schemas,
+            group_id,
+            &dataset_rows,
+        )
+        .await
+        .context(publish::StoreAccessSnafu)?;
+        let read_versions = local_group.version_vector.clone();
+        let update_id = Self::next_local_update_id(&local_group, group_id)?;
+        let prepared_local_changes =
+            Self::build_local_dataset_updates(group_id, &mut working_datasets, changes, update_id)?;
+        local_group.mark_applied(update_id);
+
+        let persisted_update = ReplicationUpdateRecord {
+            group_id,
+            update_id,
+            sender: self.local_member.clone(),
+            read_versions: read_versions.clone(),
+            dataset_updates: prepared_local_changes.dataset_updates.clone(),
+            applied_locally: true,
+        };
+        Self::apply_dataset_row_patches(transaction.as_mut(), prepared_local_changes.row_patches)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        transaction
+            .append_replication_update(persisted_update)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        transaction
+            .update_replication_group_version_vector(&group_id, local_group.version_vector)
+            .await
+            .context(publish::StoreAccessSnafu)?;
+        transaction
+            .commit()
+            .await
+            .context(publish::StoreAccessSnafu)?;
+
+        let payload =
+            Self::encode_runtime_payload(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+                group_id,
+                update_id,
+                read_versions,
+                dataset_updates: prepared_local_changes
+                    .dataset_updates
+                    .into_iter()
+                    .map(|dataset_update| DatasetUpdateMessage {
+                        dataset_id: dataset_update.dataset_id,
+                        operations: dataset_update.operations,
+                    })
+                    .collect(),
+            }));
+        Ok(PreparedLocalPublish {
+            group_id,
+            update_id,
+            payload,
         })
     }
 
     fn handle_reliable_delivery(
         &mut self,
         deliver: ReliableDeliveryDeliver,
-    ) -> Result<(), InboundDeliveryError> {
+    ) -> Result<Handled, InboundDeliveryError> {
         let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-            .context(DecodeMessageSnafu)?;
+            .context(inbound::DecodeMessageSnafu)?;
         match message {
             WireRuntimeMessage::BootstrapGroup(message) => {
                 let group_id = message.group_id;
                 let members = GroupMembers::from_ordered_members(message.members)
-                    .context(InvalidBootstrapMembersSnafu)?;
+                    .context(inbound::InvalidBootstrapMembersSnafu)?;
                 ensure!(
                     members.contains(&self.local_member),
-                    BootstrapMissingLocalMemberSnafu {
+                    inbound::BootstrapMissingLocalMemberSnafu {
                         group_id,
                         local_member: self.local_member.clone(),
                     }
                 );
-                self.install_group(group_id, members)
-                    .context(InstallBootstrapGroupSnafu { group_id })?;
-                // Dropping `deliver` without completing `processed` intentionally
-                // withholds the recipient acknowledgement from reliable delivery.
-                // Sender-side timeout/retry semantics are tracked in flotsync-46r.
-                deliver.processed.complete().map_err(|source| {
-                    InboundDeliveryError::CompleteProcessedPromise { group_id, source }
-                })?;
-                Ok(())
+                let record = self.build_replication_group_record(group_id, &members);
+                Ok(Handled::block_on(self, async move |mut async_self| {
+                    let reply = async {
+                        let persisted_group = async_self
+                            .store_new_replication_group(record)
+                            .await
+                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
+                        async_self
+                            .install_group_membership_view(persisted_group)
+                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
+                        // Dropping `deliver` without completing `processed`
+                        // intentionally withholds the recipient acknowledgement
+                        // from reliable delivery. Sender-side timeout/retry
+                        // semantics are tracked in flotsync-46r.
+                        deliver
+                            .processed
+                            .complete()
+                            .context(inbound::CompleteProcessedPromiseSnafu { group_id })?;
+                        Ok::<(), InboundDeliveryError>(())
+                    }
+                    .await;
+                    if let Err(error) = reply {
+                        async_self.record_terminal_fault("reliable delivery", &error);
+                    }
+                }))
             }
-            WireRuntimeMessage::UpdateBatch(_) => UnexpectedReliableMessageSnafu.fail(),
+            WireRuntimeMessage::UpdateBatch(_) => inbound::UnexpectedReliableMessageSnafu.fail(),
         }
     }
 
@@ -540,32 +768,154 @@ impl ReplicationRuntimeComponent {
     ) -> Result<Handled, InboundDeliveryError> {
         let sender = deliver.envelope.header.sender.clone();
         let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-            .context(DecodeMessageSnafu)?;
+            .context(inbound::DecodeMessageSnafu)?;
         match message {
-            WireRuntimeMessage::BootstrapGroup(_) => UnexpectedGroupMessageSnafu.fail(),
+            WireRuntimeMessage::BootstrapGroup(_) => inbound::UnexpectedGroupMessageSnafu.fail(),
             WireRuntimeMessage::UpdateBatch(message) => {
                 Ok(self.handle_update_batch(sender, message))
             }
         }
     }
 
-    async fn load_and_apply_update_batch(
+    /// Persist one inbound update and apply every newly-ready successor inside
+    /// the same store transaction.
+    async fn persist_and_apply_update_batch(
         &mut self,
         sender: MemberIdentity,
         message: WireUpdateBatchMessage,
-        missing_dataset_ids: HashSet<DatasetId>,
     ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
-        let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), missing_dataset_ids)
+        let group_id = message.group_id;
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let persisted_group = transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let persisted_group =
+            persisted_group.context(inbound::UnknownHostedGroupSnafu { group_id })?;
+        let local_group =
+            LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
+                .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+        let message = message
+            .into_runtime(local_group.member_count())
+            .context(inbound::DecodeReadVersionsSnafu { group_id })?;
+        let expected_sender_index = local_group.members.member_index(&sender).context(
+            inbound::UpdateSenderNotInGroupSnafu {
+                group_id,
+                sender: sender.clone(),
+            },
+        )?;
+        ensure!(
+            expected_sender_index.as_u32() == message.update_id.node_index,
+            inbound::UpdateSenderIndexMismatchSnafu {
+                group_id,
+                sender: sender.clone(),
+                expected_index: expected_sender_index,
+                actual_index: MemberIndex::new(message.update_id.node_index),
+            }
+        );
+        if local_group.has_applied(message.update_id) {
+            transaction
+                .commit()
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+            return Ok(Vec::new());
+        }
+
+        let inbound_update = Self::build_replication_update_record(sender, message, false);
+        if let Some(existing_update) = transaction
+            .load_replication_update(&group_id, inbound_update.update_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?
+        {
+            ensure!(
+                existing_update == inbound_update,
+                inbound::ConflictingPersistedUpdateSnafu {
+                    group_id,
+                    update_id: inbound_update.update_id,
+                }
+            );
+        } else {
+            transaction
+                .append_replication_update(inbound_update.clone())
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+        }
+
+        let pending_updates = transaction
+            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let mut pending_updates = PendingUpdateSet::from_updates(pending_updates);
+        let mut local_group = local_group;
+        let apply_plan = pending_updates.plan_apply_chain(&local_group);
+        for applied_update_id in &apply_plan.already_applied {
+            transaction
+                .mark_replication_update_applied(&group_id, *applied_update_id)
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+        }
+        if apply_plan.ready_chain.is_empty() {
+            transaction
+                .commit()
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+            return Ok(Vec::new());
+        }
+
+        let touched_dataset_ids = apply_plan
+            .ready_chain
+            .iter()
+            .flat_map(|update| update.dataset_updates.iter())
+            .map(|dataset_update| dataset_update.dataset_id.clone())
+            .collect::<HashSet<_>>();
+        let loaded_schemas = Self::load_dataset_schemas(self.store.clone(), touched_dataset_ids)
             .await
             .map_err(|error| match error {
                 DatasetSchemaLoadError::Load { dataset_id, source } => {
-                    InboundDeliveryError::InboundLoadDatasetSchema { dataset_id, source }
+                    InboundDeliveryError::LoadDatasetSchema { dataset_id, source }
                 }
                 DatasetSchemaLoadError::Missing { dataset_id } => {
-                    InboundDeliveryError::InboundMissingDatasetSchema { dataset_id }
+                    InboundDeliveryError::MissingDatasetSchema { dataset_id }
                 }
             })?;
-        self.apply_wire_update_batch_loaded(sender, message, loaded_schemas)
+        let touched_dataset_rows =
+            collect_record_row_scope(&apply_plan.ready_chain, &loaded_schemas)?;
+        let mut working_datasets = Self::materialise_touched_datasets(
+            transaction.as_mut(),
+            &loaded_schemas,
+            group_id,
+            &touched_dataset_rows,
+        )
+        .await
+        .context(inbound::StoreAccessSnafu)?;
+        let mut event_batches = Vec::new();
+        for ready_update in &apply_plan.ready_chain {
+            let applied_batch =
+                apply_one_update_batch(&mut local_group, &mut working_datasets, ready_update)?;
+            if !applied_batch.row_changes.is_empty() {
+                event_batches.push(applied_batch.row_changes);
+            }
+            Self::apply_dataset_row_patches(transaction.as_mut(), applied_batch.row_patches)
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+            transaction
+                .mark_replication_update_applied(&group_id, ready_update.update_id)
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+        }
+        transaction
+            .update_replication_group_version_vector(&group_id, local_group.version_vector)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .commit()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        Ok(event_batches)
     }
 
     fn handle_update_batch(
@@ -573,21 +923,9 @@ impl ReplicationRuntimeComponent {
         sender: MemberIdentity,
         message: WireUpdateBatchMessage,
     ) -> Handled {
-        let dataset_ids = Self::collect_dataset_ids(&message.dataset_updates);
-        let missing_dataset_ids =
-            if let Some(local_group) = self.state.groups.get(&message.group_id) {
-                local_group.missing_dataset_ids(&dataset_ids)
-            } else {
-                let error = UnknownHostedGroupSnafu {
-                    group_id: message.group_id,
-                }
-                .build();
-                self.record_terminal_fault("group delivery", &error);
-                return Handled::Ok;
-            };
         Handled::block_on(self, async move |mut async_self| {
             let reply = async_self
-                .load_and_apply_update_batch(sender, message, missing_dataset_ids)
+                .persist_and_apply_update_batch(sender, message)
                 .await;
             if let Ok(event_batches) = reply {
                 if let Err(error) =
@@ -605,153 +943,26 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    fn apply_wire_update_batch_loaded(
-        &mut self,
-        sender: MemberIdentity,
-        message: WireUpdateBatchMessage,
-        loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
-    ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
-        let group_id = message.group_id;
-        let member_count = self
-            .state
-            .groups
-            .get(&group_id)
-            .context(UnknownHostedGroupSnafu { group_id })?
-            .member_count();
-        let message = message
-            .into_runtime(member_count)
-            .context(DecodeReadVersionsSnafu { group_id })?;
-        self.apply_update_batch_loaded(sender, message, loaded_schemas)
-    }
-
-    fn apply_update_batch_loaded(
-        &mut self,
-        sender: MemberIdentity,
-        message: UpdateBatchMessage,
-        loaded_schemas: HashMap<DatasetId, Arc<Schema>>,
-    ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
-        let local_group =
-            self.state
-                .groups
-                .get_mut(&message.group_id)
-                .context(UnknownHostedGroupSnafu {
-                    group_id: message.group_id,
-                })?;
-        let expected_sender_index =
-            local_group
-                .members
-                .member_index(&sender)
-                .context(UpdateSenderNotInGroupSnafu {
-                    group_id: message.group_id,
-                    sender: sender.clone(),
-                })?;
-        ensure!(
-            expected_sender_index.as_u32() == message.update_id.node_index,
-            UpdateSenderIndexMismatchSnafu {
-                group_id: message.group_id,
-                sender: sender.clone(),
-                expected_index: expected_sender_index,
-                actual_index: MemberIndex::new(message.update_id.node_index),
-            }
-        );
-        if local_group.has_applied(message.update_id) {
-            return Ok(Vec::new());
-        }
-        if !local_group.can_apply(&message) {
-            local_group.buffer_update(BufferedInboundUpdate {
-                message,
-                loaded_schemas,
-            })?;
-            return Ok(Vec::new());
-        }
-
-        // Listener notifications are emitted only after the whole drain
-        // succeeds. If one later buffered batch fails after an earlier batch
-        // already committed locally, the listener can temporarily lag the
-        // runtime state. Tracked in flotsync-46i.
-        let mut event_batches = Vec::new();
-        let row_changes = apply_one_update_batch(local_group, message, &loaded_schemas)?;
-        if !row_changes.is_empty() {
-            event_batches.push(row_changes);
-        }
-        while let Some(pending_update) = local_group.take_next_actionable_pending_update() {
-            let row_changes = apply_one_update_batch(
-                local_group,
-                pending_update.message,
-                &pending_update.loaded_schemas,
-            )?;
-            if !row_changes.is_empty() {
-                event_batches.push(row_changes);
-            }
-        }
-
-        Ok(event_batches)
-    }
-
-    fn install_group(
-        &mut self,
-        group_id: GroupId,
-        members: GroupMembers,
-    ) -> Result<(), GroupInstallError> {
-        if let Some(existing_group) = self.state.groups.get(&group_id) {
-            if existing_group.members == members {
-                return Ok(());
-            }
-            return ConflictingExistingGroupSnafu { group_id }.fail();
-        }
-
-        let local_group = LocalGroupState::new(&self.local_member, members)?;
-        self.state.groups.insert(group_id, local_group);
-        self.group_memberships
-            .replace(self.state.membership_snapshot());
-        Ok(())
-    }
-
     fn handle_publish_changes(
         &mut self,
         ask: Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>,
     ) -> Handled {
         let (promise, changes) = ask.take();
-        let missing_dataset_ids = match self
-            .ensure_running()
-            .and_then(|()| self.preflight_publish(&changes))
-        {
-            Ok(missing_dataset_ids) => missing_dataset_ids,
-            Err(error) => {
-                self.reply_api(promise, "publish_changes", Err(error));
-                return Handled::Ok;
-            }
-        };
+        if let Err(error) = self.ensure_running() {
+            self.reply_api(promise, "publish_changes", Err(error));
+            return Handled::Ok;
+        }
         Handled::block_on(self, async move |mut async_self| {
-            let reply =
-                match Self::load_dataset_schemas(async_self.store.clone(), missing_dataset_ids)
-                    .await
-                    .map_err(|error| match error {
-                        DatasetSchemaLoadError::Load { dataset_id, source } => {
-                            PublishChangesError::LoadDatasetSchema { dataset_id, source }
-                        }
-                        DatasetSchemaLoadError::Missing { dataset_id } => {
-                            PublishChangesError::MissingDatasetSchema { dataset_id }
-                        }
-                    }) {
-                    Ok(loaded_schemas) => {
-                        let prepared_publish = async_self
-                            .prepare_local_publish(changes, &loaded_schemas)
-                            .boxed()
-                            .context(ApiExternalSnafu);
-                        match prepared_publish {
-                            Ok(prepared_publish) => {
-                                let update_id = prepared_publish.update_id;
-                                async_self.submit_group_update(prepared_publish);
-                                Ok(PublishReceipt { update_id })
-                            }
-                            Err(error) => Err(error),
-                        }
-                    }
-                    Err(error) => Err(ApiError::ApiExternal {
-                        source: Box::new(error),
-                    }),
-                };
+            let reply = match async_self.publish_changes_transactionally(changes).await {
+                Ok(prepared_publish) => {
+                    let update_id = prepared_publish.update_id;
+                    async_self.submit_group_update(prepared_publish);
+                    Ok(PublishReceipt { update_id })
+                }
+                Err(error) => Err(ApiError::ApiExternal {
+                    source: Box::new(error),
+                }),
+            };
             async_self.reply_api(promise, "publish_changes", reply);
         })
     }
@@ -761,11 +972,38 @@ impl ReplicationRuntimeComponent {
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
     ) -> Handled {
         let (promise, req) = ask.take();
-        let reply = self
-            .ensure_running()
-            .and_then(|()| self.create_group(req).boxed().context(ApiExternalSnafu));
-        self.reply_api(promise, "create_group", reply);
-        Handled::Ok
+        if let Err(error) = self.ensure_running() {
+            self.reply_api(promise, "create_group", Err(error));
+            return Handled::Ok;
+        }
+        let created_group = self.prepare_created_group(req);
+        let (group_id, members, record) = match created_group {
+            Ok(created_group) => created_group,
+            Err(error) => {
+                let reply = Err(ApiError::ApiExternal {
+                    source: Box::new(error),
+                });
+                self.reply_api(promise, "create_group", reply);
+                return Handled::Ok;
+            }
+        };
+        Handled::block_on(self, async move |mut async_self| {
+            let persisted_group = async_self.store_new_replication_group(record).await;
+            let reply = match persisted_group {
+                Ok(persisted_group) => {
+                    let install_result = async_self.install_group_membership_view(persisted_group);
+                    let reply = install_result.map(|()| {
+                        async_self.submit_group_bootstrap(group_id, &members);
+                        group_id
+                    });
+                    reply.boxed().context(ApiExternalSnafu)
+                }
+                Err(error) => Err(ApiError::ApiExternal {
+                    source: Box::new(error),
+                }),
+            };
+            async_self.reply_api(promise, "create_group", reply);
+        })
     }
 
     fn handle_change_group_membership(
@@ -787,8 +1025,21 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
     ) -> Handled {
         let (promise, (group_id, members)) = ask.take();
-        let reply = self.install_group(group_id, members);
-        let _ = promise.fulfil(reply);
+        let record = self.build_replication_group_record(group_id, &members);
+        Handled::block_on(self, async move |mut async_self| {
+            let persisted_group = async_self.store_new_replication_group(record).await;
+            let reply = match persisted_group {
+                Ok(persisted_group) => async_self.install_group_membership_view(persisted_group),
+                Err(error) => Err(error),
+            };
+            let _ = promise.fulfil(reply);
+        })
+    }
+
+    #[cfg(test)]
+    fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> Handled {
+        let (promise, ()) = ask.take();
+        let _ = promise.fulfil(());
         Handled::Ok
     }
 
@@ -798,25 +1049,9 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
     ) -> Handled {
         let (promise, (sender, message)) = ask.take();
-        let dataset_ids = Self::collect_dataset_ids(&message.dataset_updates);
-        let missing_dataset_ids =
-            if let Some(local_group) = self.state.groups.get(&message.group_id) {
-                local_group.missing_dataset_ids(&dataset_ids)
-            } else {
-                let error = UnknownHostedGroupSnafu {
-                    group_id: message.group_id,
-                }
-                .build();
-                let _ = promise.fulfil(Err(error));
-                return Handled::Ok;
-            };
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self
-                .load_and_apply_update_batch(
-                    sender,
-                    WireUpdateBatchMessage::from(message),
-                    missing_dataset_ids,
-                )
+                .persist_and_apply_update_batch(sender, WireUpdateBatchMessage::from(message))
                 .await
             {
                 Ok(event_batches) => {
@@ -829,7 +1064,30 @@ impl ReplicationRuntimeComponent {
     }
 }
 
-ignore_lifecycle!(ReplicationRuntimeComponent);
+impl ComponentLifecycle for ReplicationRuntimeComponent {
+    fn on_start(&mut self) -> Handled {
+        Handled::block_on(self, async move |mut async_self| {
+            let hydrated_memberships = async_self.load_hydrated_runtime_memberships().await;
+            match hydrated_memberships {
+                Ok(hydrated_memberships) => {
+                    async_self.group_memberships.replace(hydrated_memberships);
+                }
+                Err(error) => {
+                    async_self.record_startup_fault("runtime startup", &error);
+                    async_self.ctx.suicide();
+                }
+            }
+        })
+    }
+
+    fn on_stop(&mut self) -> Handled {
+        Handled::Ok
+    }
+
+    fn on_kill(&mut self) -> Handled {
+        Handled::Ok
+    }
+}
 
 impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
     fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
@@ -837,10 +1095,13 @@ impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
             return Handled::Ok;
         }
         let ReliableDeliveryPortIndication::Deliver(deliver) = indication;
-        if let Err(error) = self.handle_reliable_delivery(deliver) {
-            self.record_terminal_fault("reliable delivery", &error);
+        match self.handle_reliable_delivery(deliver) {
+            Ok(handled) => handled,
+            Err(error) => {
+                self.record_terminal_fault("reliable delivery", &error);
+                Handled::DieNow
+            }
         }
-        Handled::Ok
     }
 }
 
@@ -869,6 +1130,10 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
                 self.handle_change_group_membership(ask)
+            }
+            #[cfg(test)]
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::Ping(ask)) => {
+                self.handle_test_ping(ask)
             }
             #[cfg(test)]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {

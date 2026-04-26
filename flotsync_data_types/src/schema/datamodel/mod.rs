@@ -27,6 +27,7 @@ use super::{
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
 use snafu::prelude::*;
+use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 mod in_memory;
 mod operations;
@@ -36,6 +37,81 @@ pub mod validation;
 pub use in_memory::*;
 pub use operations::*;
 pub use snapshots::*;
+
+/// Source of a schema used by in-memory and durable datamodel state.
+///
+/// Applications that hardcode most of their schemas can pass a static schema
+/// reference without paying for additional reference counting, while dynamic
+/// schema providers can still use shared `Arc` ownership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaSource {
+    /// One dynamically owned schema shared through reference counting.
+    Shared(Arc<Schema>),
+    /// One process-static schema baked into the application binary.
+    Static(&'static Schema),
+}
+
+impl SchemaSource {
+    /// Borrow the schema regardless of how it is stored.
+    pub fn as_schema(&self) -> &Schema {
+        match self {
+            Self::Shared(schema) => schema.as_ref(),
+            Self::Static(schema) => schema,
+        }
+    }
+
+    /// Convert the schema source into shared `Arc` ownership.
+    ///
+    /// Static schemas are cloned once into owned form when callers require an
+    /// `Arc<Schema>` specifically.
+    pub fn into_shared(self) -> Arc<Schema> {
+        match self {
+            Self::Shared(schema) => schema,
+            Self::Static(schema) => Arc::new(schema.clone()),
+        }
+    }
+}
+
+impl AsRef<Schema> for SchemaSource {
+    fn as_ref(&self) -> &Schema {
+        self.as_schema()
+    }
+}
+
+impl Deref for SchemaSource {
+    type Target = Schema;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_schema()
+    }
+}
+
+impl From<Arc<Schema>> for SchemaSource {
+    fn from(value: Arc<Schema>) -> Self {
+        Self::Shared(value)
+    }
+}
+
+impl From<Schema> for SchemaSource {
+    fn from(value: Schema) -> Self {
+        Self::Shared(Arc::new(value))
+    }
+}
+
+impl From<&'static Schema> for SchemaSource {
+    fn from(value: &'static Schema) -> Self {
+        Self::Static(value)
+    }
+}
+
+impl From<Cow<'static, Schema>> for SchemaSource {
+    fn from(value: Cow<'static, Schema>) -> Self {
+        match value {
+            Cow::Borrowed(schema) => Self::Static(schema),
+            Cow::Owned(schema) => Self::from(schema),
+        }
+    }
+}
 
 /// A borrowed array of primitive values, flattened by primitive type.
 #[derive(Clone, Debug, PartialEq, Eq)]

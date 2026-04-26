@@ -13,6 +13,7 @@ use super::route_transport::{
 use crate::api::MemberIdentity;
 use flotsync_core::member::IdentifierBuf;
 use flotsync_io::{
+    kompact::shutdown_system_bounded,
     prelude::{
         DriverConfig,
         IoBridge,
@@ -30,17 +31,21 @@ use flotsync_io::{
         ReservedSocketLease,
         UdpObserver,
         WAIT_TIMEOUT,
+        bind_reserved_udp_socket,
         build_test_kompact_system_with,
         enable_bind_reuse_address,
         eventually_component_state,
         reserve_sockets,
+        set_test_system_label,
         start_component,
     },
 };
 use flotsync_udpour::UDPourConfig;
 use kompact::prelude::*;
 use std::{
+    collections::HashMap,
     net::SocketAddr,
+    ops::{Deref, DerefMut},
     sync::{
         Arc,
         Mutex,
@@ -93,9 +98,141 @@ impl Actor for DiscoveryRouteSource {
 ///
 /// This owns the driver, bridge, manager, and observer stack. Semantic-owner
 /// harnesses layer ingress, probes, and route-discovery fixtures on top.
+pub(crate) struct ManagerOwnedUdpBindBudget {
+    lease: ReservedSocketLease,
+    available_slots: Vec<usize>,
+    pending_slots: HashMap<UdpOpenRequestId, ClaimedManagerOwnedUdpBind>,
+    live_slots: HashMap<SocketId, ClaimedManagerOwnedUdpBind>,
+}
+
+impl ManagerOwnedUdpBindBudget {
+    /// Reserve one fixed amount of manager-owned UDP bind capacity for one
+    /// test harness.
+    pub(crate) fn new(slot_count: usize) -> Option<Arc<Mutex<Self>>> {
+        if slot_count == 0 {
+            return None;
+        }
+
+        let lease = reserve_sockets(&vec![ReservedSocketKind::UdpSocket; slot_count]);
+        let available_slots = (0..slot_count).rev().collect();
+        Some(Arc::new(Mutex::new(Self {
+            lease,
+            available_slots,
+            pending_slots: HashMap::new(),
+            live_slots: HashMap::new(),
+        })))
+    }
+
+    /// Claim one reservation slot for one manager-owned bind request before
+    /// the real bridge bind is issued.
+    pub(crate) fn begin_bind(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        requested_local_addr: SocketAddr,
+    ) -> Result<SocketAddr, String> {
+        let Some(slot_index) = self.available_slots.pop() else {
+            return Err(format!(
+                "no declared manager-owned UDP bind budget remained for local_addr={requested_local_addr}; declared_slots={}, pending_binds={}, live_binds={}",
+                self.lease.len(),
+                self.pending_slots.len(),
+                self.live_slots.len(),
+            ));
+        };
+        let reserved_bind_addr = self.lease.addr(slot_index);
+        self.lease.begin_live_binding(slot_index);
+        let previous = self.pending_slots.insert(
+            request_id,
+            ClaimedManagerOwnedUdpBind {
+                slot_index,
+                requested_local_addr,
+                reserved_bind_addr,
+            },
+        );
+        debug_assert!(
+            previous.is_none(),
+            "manager-owned UDP bind request ids must be unique in tests"
+        );
+        Ok(reserved_bind_addr)
+    }
+
+    /// Promote one pending bind reservation into one live manager-owned UDP
+    /// socket.
+    pub(crate) fn complete_bind(
+        &mut self,
+        request_id: UdpOpenRequestId,
+        socket_id: SocketId,
+        actual_local_addr: SocketAddr,
+    ) -> Result<(), String> {
+        let claimed = self.pending_slots.remove(&request_id).ok_or_else(|| {
+            format!("manager-owned UDP bind budget lost pending request_id={request_id:?}")
+        })?;
+        if actual_local_addr != claimed.reserved_bind_addr {
+            let message = format!(
+                "manager-owned UDP bind request_id={request_id:?} bound at {actual_local_addr}, but reserved slot {} expected {}; requested_local_addr={}",
+                claimed.slot_index, claimed.reserved_bind_addr, claimed.requested_local_addr,
+            );
+            let restore_result = self.restore_slot(claimed);
+            return match restore_result {
+                Ok(()) => Err(message),
+                Err(error) => Err(format!(
+                    "{message}; additionally failed to restore slot: {error}"
+                )),
+            };
+        }
+        self.lease.complete_live_binding(claimed.slot_index);
+        let previous = self.live_slots.insert(socket_id, claimed);
+        debug_assert!(
+            previous.is_none(),
+            "manager-owned UDP bind socket ids must be unique in tests"
+        );
+        Ok(())
+    }
+
+    /// Restore one failed pending manager-owned bind request back into the
+    /// available budget.
+    pub(crate) fn fail_bind(&mut self, request_id: UdpOpenRequestId) -> Result<(), String> {
+        let claimed = self.pending_slots.remove(&request_id).ok_or_else(|| {
+            format!("manager-owned UDP bind budget lost failed request_id={request_id:?}")
+        })?;
+        self.restore_slot(claimed)
+    }
+
+    /// Restore one closed live manager-owned UDP socket back into the
+    /// available budget.
+    pub(crate) fn release_live(&mut self, socket_id: SocketId) -> Result<bool, String> {
+        let Some(claimed) = self.live_slots.remove(&socket_id) else {
+            return Ok(false);
+        };
+        self.restore_slot(claimed)?;
+        Ok(true)
+    }
+
+    fn restore_slot(&mut self, claimed: ClaimedManagerOwnedUdpBind) -> Result<(), String> {
+        self.lease
+            .rebind_binding(claimed.slot_index)
+            .map_err(|error| {
+                format!(
+                    "rebind manager-owned UDP bind budget slot {} for local_addr={}: {error}",
+                    claimed.slot_index, claimed.requested_local_addr
+                )
+            })?;
+        self.available_slots.push(claimed.slot_index);
+        Ok(())
+    }
+}
+
+struct ClaimedManagerOwnedUdpBind {
+    slot_index: usize,
+    requested_local_addr: SocketAddr,
+    reserved_bind_addr: SocketAddr,
+}
+
 pub(crate) struct TransportHarnessCore {
     system: KompactSystem,
-    external_socket_lease: Mutex<ReservedSocketLease>,
+    reserved_socket_lease: Option<Arc<Mutex<ReservedSocketLease>>>,
+    _manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
+    extra_reserved_socket_slots: usize,
+    extra_reserved_socket_slot_offset: usize,
     external_socket_binding_released: AtomicBool,
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
@@ -106,19 +243,43 @@ pub(crate) struct TransportHarnessCore {
 }
 
 impl TransportHarnessCore {
-    /// Create one transport-only harness core inside the provided test system.
-    ///
-    /// The caller is responsible for connecting any semantic-owner ports before
-    /// calling [`start`](Self::start).
-    pub(crate) fn new(system: KompactSystem, udpour_config: UDPourConfig) -> Self {
-        let external_socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    /// Create one transport-only harness core with explicit budgets for both
+    /// pre-bound raw test sockets and lazy manager-owned UDP sockets.
+    pub(crate) fn with_socket_budgets(
+        system: KompactSystem,
+        udpour_config: UDPourConfig,
+        reserve_external_udp_socket: bool,
+        extra_socket_kinds: &[ReservedSocketKind],
+        manager_owned_udp_sockets: usize,
+    ) -> Self {
+        let mut reserved_socket_kinds =
+            Vec::with_capacity(extra_socket_kinds.len() + usize::from(reserve_external_udp_socket));
+        if reserve_external_udp_socket {
+            reserved_socket_kinds.push(ReservedSocketKind::UdpSocket);
+        }
+        reserved_socket_kinds.extend_from_slice(extra_socket_kinds);
+        let reserved_socket_lease = if reserved_socket_kinds.is_empty() {
+            None
+        } else {
+            Some(Arc::new(Mutex::new(reserve_sockets(
+                &reserved_socket_kinds,
+            ))))
+        };
+        let manager_owned_udp_bind_budget =
+            ManagerOwnedUdpBindBudget::new(manager_owned_udp_sockets);
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
         let driver_for_bridge = driver.clone();
         let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
         let bridge_handle = IoBridgeHandle::from_component(&bridge);
         let manager_system = system.clone();
+        let manager_owned_udp_bind_budget_for_manager = manager_owned_udp_bind_budget.clone();
         let manager = system.create(move || {
-            RouteTransportManager::new(manager_system, bridge_handle, udpour_config)
+            RouteTransportManager::new_with_test_manager_owned_udp_bind_budget(
+                manager_system,
+                bridge_handle,
+                udpour_config,
+                manager_owned_udp_bind_budget_for_manager,
+            )
         });
         let manager_ref = manager
             .actor_ref()
@@ -129,7 +290,10 @@ impl TransportHarnessCore {
 
         Self {
             system,
-            external_socket_lease: Mutex::new(external_socket_lease),
+            reserved_socket_lease,
+            _manager_owned_udp_bind_budget: manager_owned_udp_bind_budget,
+            extra_reserved_socket_slots: extra_socket_kinds.len(),
+            extra_reserved_socket_slot_offset: usize::from(reserve_external_udp_socket),
             external_socket_binding_released: AtomicBool::new(false),
             driver,
             bridge,
@@ -178,9 +342,13 @@ impl TransportHarnessCore {
         bind: UdpLocalBind,
         timeout: Duration,
     ) -> (SocketId, SocketAddr) {
+        let reserved_socket_lease = self
+            .reserved_socket_lease
+            .as_ref()
+            .expect("external socket bind requires one declared reserved socket lease");
         let bind = match bind {
             UdpLocalBind::Exact(addr) if addr.port() == 0 => UdpLocalBind::Exact(
-                self.external_socket_lease
+                reserved_socket_lease
                     .lock()
                     .expect("external socket lease lock")
                     .addr(0),
@@ -226,6 +394,43 @@ impl TransportHarnessCore {
         }
     }
 
+    /// Bind one pre-reserved raw UDP socket owned directly by the test.
+    ///
+    /// `reservation_index` addresses the extra reservation slots that were
+    /// requested via [`with_reserved_socket_kinds`](Self::with_reserved_socket_kinds).
+    /// The externally managed route-transport socket always occupies slot `0`
+    /// internally and is therefore not visible through this helper.
+    pub(crate) fn bind_reserved_udp_socket(
+        &self,
+        reservation_index: usize,
+    ) -> BoundReservedUdpSocket {
+        assert!(
+            reservation_index < self.extra_reserved_socket_slots,
+            "reserved UDP socket index {reservation_index} is out of range for {} extra slots",
+            self.extra_reserved_socket_slots,
+        );
+        let lease_index = reservation_index + self.extra_reserved_socket_slot_offset;
+        let reserved_socket_lease = self
+            .reserved_socket_lease
+            .as_ref()
+            .expect("reserved raw UDP socket bind requires one declared reserved socket lease");
+        let socket = {
+            let mut reserved_socket_lease = reserved_socket_lease
+                .lock()
+                .expect("reserved socket lease lock");
+            let socket = bind_reserved_udp_socket(&reserved_socket_lease, lease_index)
+                .expect("bind reserved raw UDP socket");
+            reserved_socket_lease.activate_live_binding(lease_index);
+            socket
+        };
+
+        BoundReservedUdpSocket {
+            socket: Some(socket),
+            reserved_socket_lease: Arc::clone(reserved_socket_lease),
+            lease_index,
+        }
+    }
+
     fn release_external_socket_binding(&self, local_addr: SocketAddr) {
         if self
             .external_socket_binding_released
@@ -233,14 +438,16 @@ impl TransportHarnessCore {
         {
             return;
         }
-        let mut external_socket_lease = self
-            .external_socket_lease
+        let Some(reserved_socket_lease) = self.reserved_socket_lease.as_ref() else {
+            panic!("external socket binding release requires one declared reserved socket lease");
+        };
+        let mut reserved_socket_lease = reserved_socket_lease
             .lock()
             .expect("external socket lease lock");
-        if external_socket_lease.addr(0) != local_addr {
+        if reserved_socket_lease.addr(0) != local_addr {
             return;
         }
-        external_socket_lease.release_binding(0);
+        reserved_socket_lease.activate_live_binding(0);
         self.external_socket_binding_released
             .store(true, Ordering::Relaxed);
     }
@@ -252,7 +459,9 @@ impl TransportHarnessCore {
         {
             return;
         }
-        self.external_socket_lease
+        self.reserved_socket_lease
+            .as_ref()
+            .expect("external socket binding rebind requires one declared reserved socket lease")
             .lock()
             .expect("external socket lease lock")
             .rebind_binding(0)
@@ -311,9 +520,55 @@ impl TransportHarnessCore {
     }
 }
 
+/// One raw UDP socket bound against one reserved test-harness lease slot.
+///
+/// Dropping this wrapper closes the live socket and re-binds the hidden
+/// reservation so later teardown steps keep ownership of the port.
+pub(crate) struct BoundReservedUdpSocket {
+    socket: Option<std::net::UdpSocket>,
+    reserved_socket_lease: Arc<Mutex<ReservedSocketLease>>,
+    lease_index: usize,
+}
+
+impl Deref for BoundReservedUdpSocket {
+    type Target = std::net::UdpSocket;
+
+    fn deref(&self) -> &Self::Target {
+        self.socket
+            .as_ref()
+            .expect("reserved UDP socket must remain available while borrowed")
+    }
+}
+
+impl DerefMut for BoundReservedUdpSocket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.socket
+            .as_mut()
+            .expect("reserved UDP socket must remain available while borrowed")
+    }
+}
+
+impl Drop for BoundReservedUdpSocket {
+    fn drop(&mut self) {
+        drop(self.socket.take());
+        let rebind_result = self
+            .reserved_socket_lease
+            .lock()
+            .expect("reserved socket lease lock")
+            .rebind_binding(self.lease_index);
+        if let Err(error) = rebind_result
+            && !std::thread::panicking()
+        {
+            panic!(
+                "rebind reserved raw UDP socket at slot {}: {error}",
+                self.lease_index
+            );
+        }
+    }
+}
+
 impl Drop for TransportHarnessCore {
     fn drop(&mut self) {
-        self.rebind_external_socket_binding();
         let _ = self
             .system
             .kill_notify(self.observer.clone())
@@ -330,12 +585,15 @@ impl Drop for TransportHarnessCore {
             .system
             .kill_notify(self.driver.clone())
             .wait_timeout(WAIT_TIMEOUT);
+        shutdown_system_bounded(self.system.clone(), WAIT_TIMEOUT, true);
+        self.rebind_external_socket_binding();
     }
 }
 
 /// Build a Kompact system for the semantic delivery full-stack tests.
 pub(crate) fn build_delivery_test_system() -> KompactSystem {
     build_test_kompact_system_with(|config| {
+        set_test_system_label(config, "replication-delivery-test-system");
         enable_bind_reuse_address(config);
         configure_replication_runtime(config);
     })

@@ -486,7 +486,14 @@ mod tests {
             bind_external_socket: bool,
         ) -> Self {
             let system = build_delivery_test_system();
-            let core = TransportHarnessCore::new(system, default_udpour_config());
+            let manager_owned_udp_sockets = if bind_external_socket { 0 } else { 1 };
+            let core = TransportHarnessCore::with_socket_budgets(
+                system,
+                default_udpour_config(),
+                bind_external_socket,
+                &[],
+                manager_owned_udp_sockets,
+            );
             let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
             let manager_ref = core.manager_ref();
             let ingress_group_memberships = shared_group_memberships.clone();

@@ -7,7 +7,7 @@ use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
 use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;
-use snafu::prelude::*;
+use snafu::{Location, prelude::*};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
@@ -18,22 +18,73 @@ pub(super) enum CreateGroupError {
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group member list is invalid."))]
     InvalidMembers { source: GroupMembersError },
-    #[snafu(display("Failed to install the created group locally."))]
-    InstallGroup { source: GroupInstallError },
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(super)))]
-pub(super) enum GroupInstallError {
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different canonical member order."))]
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
     InstallMissingLocalMember { local_member: MemberIdentity },
+    #[snafu(display("Persisted group {group_id} carried an invalid canonical member set."))]
+    InvalidPersistedMembers {
+        group_id: GroupId,
+        source: GroupMembersError,
+    },
+    #[snafu(display(
+        "Persisted group {group_id} stored local member {local_member} at index {persisted_local_member_index}, but the canonical member order resolves it to {actual_local_member_index}.",
+    ))]
+    PersistedLocalMemberIndexMismatch {
+        group_id: GroupId,
+        local_member: MemberIdentity,
+        persisted_local_member_index: MemberIndex,
+        actual_local_member_index: MemberIndex,
+    },
+    #[snafu(display(
+        "Persisted group {group_id} stored {persisted_member_count} version-vector members, but the canonical member set has {actual_member_count}.",
+    ))]
+    PersistedVersionVectorMemberCountMismatch {
+        group_id: GroupId,
+        persisted_member_count: usize,
+        actual_member_count: usize,
+    },
+    #[snafu(display(
+        "Replication-store access failed while installing group {group_id} at {location}."
+    ))]
+    StoreGroup {
+        group_id: GroupId,
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
-pub(super) enum PublishChangesError {
+pub(super) enum RuntimeStartupError {
+    #[snafu(display(
+        "Replication-store access failed while hydrating runtime state at {location}."
+    ))]
+    StoreStartup {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Persisted replication runtime state contained duplicate group {group_id}."))]
+    DuplicateGroup { group_id: GroupId },
+    #[snafu(display(
+        "Persisted replication group {group_id} could not be rebuilt into the runtime read model."
+    ))]
+    InvalidGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(publish))]
+pub(crate) enum PublishChangesError {
     #[snafu(display("publish_changes requires at least one row mutation."))]
     EmptyChanges,
     #[snafu(display(
@@ -45,6 +96,19 @@ pub(super) enum PublishChangesError {
     },
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    InvalidPersistedGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replication-store access failed at {location}."))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Failed to load schema for dataset '{dataset_id}' from the replication store."
     ))]
@@ -87,8 +151,8 @@ pub(super) enum PublishChangesError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(visibility(pub(super)))]
-pub(super) enum InboundDeliveryError {
+#[snafu(visibility(pub(crate)), module(inbound))]
+pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to decode inbound runtime message."))]
     DecodeMessage { source: RuntimeMessageError },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
@@ -116,15 +180,28 @@ pub(super) enum InboundDeliveryError {
     },
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    InvalidPersistedGroup {
+        group_id: GroupId,
+        source: GroupInstallError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replication-store access failed at {location}."))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     #[snafu(display(
         "Failed to load schema for inbound dataset '{dataset_id}' from the replication store."
     ))]
-    InboundLoadDatasetSchema {
+    LoadDatasetSchema {
         dataset_id: DatasetId,
         source: StoreError,
     },
     #[snafu(display("No schema was available for inbound dataset '{dataset_id}'."))]
-    InboundMissingDatasetSchema { dataset_id: DatasetId },
+    MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display(
         "Inbound update for group {group_id} came from sender {sender}, which is not a group member.",
     ))]
@@ -147,9 +224,9 @@ pub(super) enum InboundDeliveryError {
         source: RuntimeMessageError,
     },
     #[snafu(display(
-        "Buffered inbound update collision in group {group_id}: update id {update_id} arrived with a different payload than the one already buffered.",
+        "Persisted inbound update collision in group {group_id}: update id {update_id} already exists with a different payload.",
     ))]
-    ConflictingBufferedUpdate {
+    ConflictingPersistedUpdate {
         group_id: GroupId,
         update_id: UpdateId,
     },
