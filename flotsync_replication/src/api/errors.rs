@@ -44,8 +44,6 @@ pub enum ListenerError {
 pub enum ApiError {
     #[snafu(display("Replication API operation failed: {source}"))]
     ApiExternal { source: BoxError },
-    #[snafu(display("Replication runtime terminated after inbound delivery failure: {fault}"))]
-    RuntimeTerminated { fault: String },
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
     #[snafu(display("Replication runtime operation '{operation}' is not implemented yet."))]

@@ -243,3 +243,38 @@ pub(crate) enum InboundDeliveryError {
     #[snafu(display("Listener rejected one inbound data-change event."))]
     NotifyListener { source: ListenerError },
 }
+
+impl InboundDeliveryError {
+    pub(crate) fn failure_action(&self) -> InboundFailureAction {
+        match self {
+            Self::StoreAccess { .. }
+            | Self::LoadDatasetSchema { .. }
+            | Self::InvalidPersistedGroup { .. }
+            | Self::InstallBootstrapGroup { .. }
+            | Self::CompleteProcessedPromise { .. }
+            | Self::NotifyListener { .. } => InboundFailureAction::Fatal,
+            Self::DecodeMessage { .. }
+            | Self::UnexpectedReliableMessage
+            | Self::UnexpectedGroupMessage
+            | Self::InvalidBootstrapMembers { .. }
+            | Self::BootstrapMissingLocalMember { .. }
+            | Self::UnknownHostedGroup { .. }
+            | Self::MissingDatasetSchema { .. }
+            | Self::UpdateSenderNotInGroup { .. }
+            | Self::UpdateSenderIndexMismatch { .. }
+            | Self::DecodeReadVersions { .. }
+            | Self::ConflictingPersistedUpdate { .. }
+            | Self::DecodeSchemaOperation { .. }
+            | Self::ApplyInboundMutation { .. } => InboundFailureAction::Drop,
+        }
+    }
+}
+
+/// Runtime action selected after classifying an inbound delivery failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InboundFailureAction {
+    /// Ignore the offending delivery without applying it.
+    Drop,
+    /// Treat the failure as a component fault and let Kompact supervision handle it.
+    Fatal,
+}
