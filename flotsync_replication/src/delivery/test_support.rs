@@ -592,10 +592,18 @@ impl Drop for TransportHarnessCore {
 
 /// Build a Kompact system for the semantic delivery full-stack tests.
 pub(crate) fn build_delivery_test_system() -> KompactSystem {
+    build_delivery_test_system_with(|_| {})
+}
+
+/// Build a Kompact system for semantic delivery tests with extra config.
+pub(crate) fn build_delivery_test_system_with(
+    configure: impl FnOnce(&mut KompactConfig),
+) -> KompactSystem {
     build_test_kompact_system_with(|config| {
         set_test_system_label(config, "replication-delivery-test-system");
         enable_bind_reuse_address(config);
         configure_replication_runtime(config);
+        configure(config);
     })
 }
 

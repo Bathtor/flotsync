@@ -807,10 +807,11 @@ impl ReplicationRuntimeComponent {
                         async_self
                             .install_group_membership_view(persisted_group)
                             .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-                        // Dropping `deliver` without completing `processed`
-                        // intentionally withholds the recipient acknowledgement
-                        // from reliable delivery. Sender-side timeout/retry
-                        // semantics are tracked in flotsync-46r.
+                        // Complete `processed` only after the bootstrap group
+                        // is durably installed locally. Failure paths
+                        // intentionally withhold this completion, so the
+                        // sender-side recipient-ack timeout can redeliver the
+                        // same reliable message later.
                         deliver
                             .processed
                             .complete()
