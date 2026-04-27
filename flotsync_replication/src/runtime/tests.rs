@@ -1,7 +1,12 @@
 use super::{
     errors::InboundDeliveryError,
-    handle::{ReplicationRuntime, load_replication_runtime_typed, wait_for_test_reply},
-    host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt},
+    handle::{
+        ReplicationRuntime,
+        load_replication_runtime_typed,
+        load_replication_runtime_typed_with_runtime_config_toml,
+        wait_for_test_reply,
+    },
+    host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt, PreconfiguredPeerRoutesPublishMode},
     in_memory::{LocalDataset, apply_local_upsert},
     load_replication_runtime,
     messages::{DatasetUpdateMessage, UpdateBatchMessage},
@@ -43,11 +48,12 @@ use flotsync_core::{
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, Schema};
-use flotsync_io::test_support::eventually;
+use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
 use std::{
+    net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, LazyLock, Mutex, mpsc},
     time::Duration,
@@ -520,6 +526,39 @@ where
     .expect("runtime should load")
 }
 
+fn load_runtime_with_parts_and_runtime_config_toml<S>(
+    application_id: Identifier,
+    store: Arc<S>,
+    listener: Arc<ListenerStub>,
+    runtime_config_toml: &str,
+) -> Arc<ReplicationRuntime>
+where
+    S: ReplicationStore + 'static,
+{
+    wait_for_test_reply(load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        ReplicationConfig::default(),
+        Some(runtime_config_toml),
+    ))
+    .expect("runtime should load")
+}
+
+fn static_peer_route_toml(peer: &MemberIdentity, remote_addr: SocketAddr) -> String {
+    format!(
+        r#"
+        [[flotsync.replication.runtime.static-peer-routes]]
+        name = "{peer}"
+        protocol = "udp"
+        ip = "{ip}"
+        port = {port}
+        "#,
+        ip = remote_addr.ip(),
+        port = remote_addr.port(),
+    )
+}
+
 fn persist_group_in_store<S>(store: &S, group: ReplicationGroupRecord)
 where
     S: ReplicationStore + ?Sized,
@@ -635,6 +674,51 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
     let mut host = start_host(Identifier::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
+    host.shutdown();
+}
+
+#[test]
+fn runtime_host_publishes_static_peer_routes_after_local_endpoint_bind() {
+    let remote_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let remote_addr = remote_endpoint_lease.addr(0);
+    let bob_member = bob_member();
+    let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts_and_runtime_config_toml(
+        app_alice_id(),
+        store,
+        listener,
+        runtime_config_toml.as_str(),
+    );
+
+    runtime.host().wait_for_direct_peer_route(&bob_member);
+}
+
+#[test]
+fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
+    let remote_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let remote_addr = remote_endpoint_lease.addr(0);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let mut host = DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
+        alice_member,
+        store,
+        listener,
+        Some(runtime_config_toml.as_str()),
+        PreconfiguredPeerRoutesPublishMode::ManualForTest,
+    )
+    .expect("host should start");
+    host.wait_for_runtime_startup();
+
+    host.publish_preconfigured_peer_routes();
+    host.wait_for_direct_peer_route(&bob_member);
     host.shutdown();
 }
 

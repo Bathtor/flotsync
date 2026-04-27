@@ -10,7 +10,7 @@ pub mod runtime;
 pub mod store;
 
 pub use api::*;
-pub use runtime::load_replication_runtime;
+pub use runtime::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
 pub use store::SqliteReplicationStore;
 
 /// Immutable snapshot of the groups currently hosted locally and their

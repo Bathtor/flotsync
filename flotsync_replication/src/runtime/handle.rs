@@ -52,15 +52,63 @@ pub async fn load_replication_runtime(
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
-    let runtime = load_replication_runtime_typed(application_id, store, listener, config).await?;
+    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        None,
+    )
+    .await?;
     Ok(runtime)
 }
 
+/// Create one concrete replication runtime with an additional in-memory TOML
+/// config fragment merged into the internal Kompact runtime config.
+///
+/// The TOML string only needs to live until this function returns; Kompact
+/// copies it into its config builder before the runtime system is built.
+pub async fn load_replication_runtime_with_runtime_config_toml(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    runtime_config_toml: &str,
+) -> Result<Arc<dyn ReplicationApi>, LoadError> {
+    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        Some(runtime_config_toml),
+    )
+    .await?;
+    Ok(runtime)
+}
+
+#[cfg(test)]
 pub(super) async fn load_replication_runtime_typed(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     let local_member = store
         .local_member_identity()
@@ -69,11 +117,16 @@ pub(super) async fn load_replication_runtime_typed(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let host = DeliveryRuntimeHost::start(local_member, store, listener)
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let host = DeliveryRuntimeHost::start_with_runtime_config_toml(
+        local_member,
+        store,
+        listener,
+        runtime_config_toml,
+    )
+    .boxed()
+    .context(RuntimeSnafu {
+        application_id: application_id.clone(),
+    })?;
     let runtime_component = host.runtime_component().clone();
     let runtime_ref = runtime_component
         .actor_ref()
