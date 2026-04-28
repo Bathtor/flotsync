@@ -443,6 +443,7 @@ fn working_dataset_for_inbound<'a>(
 pub(super) struct PreparedLocalChanges {
     pub(super) dataset_updates: Vec<DatasetUpdateRecord>,
     pub(super) row_patches: Vec<DatasetRowPatch>,
+    pub(super) row_changes: Vec<RowChange>,
 }
 
 /// One applied inbound batch together with the corresponding durable row patches.
@@ -454,6 +455,7 @@ pub(super) struct AppliedInboundBatch {
 /// One staged local mutation together with its explicit durable row write.
 pub(super) struct AppliedLocalOperation {
     pub(super) encoded_operation: flotsync_messages::datamodel::SchemaOperation,
+    pub(super) row_change: RowChange,
     pub(super) row_write: DatasetRowWrite,
 }
 
@@ -572,8 +574,15 @@ pub(super) fn apply_local_upsert(
     let row_snapshot = dataset
         .snapshot_row(row_id.row_key)
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
+    let row = dataset
+        .clone_row(row_id.row_key)
+        .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
     Ok(Some(AppliedLocalOperation {
         encoded_operation,
+        row_change: RowChange::Upsert {
+            row_id: row_id.clone(),
+            row: Arc::new(row),
+        },
         row_write: DatasetRowWrite::Put {
             row_key: row_id.row_key,
             row: row_snapshot,
@@ -600,6 +609,9 @@ pub(super) fn apply_local_delete(
         })?;
     Ok(AppliedLocalOperation {
         encoded_operation,
+        row_change: RowChange::Delete {
+            row_id: row_id.clone(),
+        },
         row_write: DatasetRowWrite::Delete {
             row_key: row_id.row_key,
         },

@@ -843,6 +843,41 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
 }
 
 #[test]
+fn publish_changes_emits_local_data_changed_event_before_reply() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let row_id = test_row_id(group_id, dataset_id, 39);
+
+    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id: row_id.clone(),
+        row: crate::row_values! {
+            "title" => "local event",
+        },
+    }]))
+    .expect("publish_changes should succeed");
+
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id,
+                title: "local event".to_owned(),
+            }],
+        }]
+    );
+}
+
+#[test]
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();

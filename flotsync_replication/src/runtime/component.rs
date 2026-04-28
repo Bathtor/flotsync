@@ -103,6 +103,7 @@ struct PreparedLocalPublish {
     group_id: GroupId,
     update_id: UpdateId,
     payload: bytes::Bytes,
+    row_changes: Vec<RowChange>,
 }
 
 enum DatasetSchemaLoadError {
@@ -494,7 +495,7 @@ impl ReplicationRuntimeComponent {
     }
 
     /// Submit one encoded live update to the group-broadcast layer.
-    fn submit_group_update(&mut self, prepared_publish: PreparedLocalPublish) {
+    fn submit_group_update(&mut self, prepared_publish: &PreparedLocalPublish) {
         let local_member = self.local_member.clone();
         self.group_broadcast
             .trigger(GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
@@ -506,7 +507,7 @@ impl ReplicationRuntimeComponent {
                         message_id: MessageId(Uuid::new_v4()),
                     },
                     payload: EncryptedPayload {
-                        ciphertext: prepared_publish.payload,
+                        ciphertext: prepared_publish.payload.clone(),
                     },
                     footer: placeholder_signed_footer(),
                 },
@@ -610,6 +611,7 @@ impl ReplicationRuntimeComponent {
             Vec<flotsync_messages::datamodel::SchemaOperation>,
         > = HashMap::new();
         let mut row_writes: HashMap<DatasetId, Vec<DatasetRowWrite>> = HashMap::new();
+        let mut row_changes = Vec::new();
 
         'changes: for mutation in changes {
             let row_id = mutation.row_id().clone();
@@ -631,6 +633,7 @@ impl ReplicationRuntimeComponent {
                 .entry(row_id.dataset_id.clone())
                 .or_default()
                 .push(applied_operation.encoded_operation);
+            row_changes.push(applied_operation.row_change);
             row_writes
                 .entry(row_id.dataset_id.clone())
                 .or_default()
@@ -659,6 +662,7 @@ impl ReplicationRuntimeComponent {
         Ok(PreparedLocalChanges {
             dataset_updates,
             row_patches,
+            row_changes,
         })
     }
 
@@ -774,6 +778,7 @@ impl ReplicationRuntimeComponent {
             group_id,
             update_id,
             payload,
+            row_changes: prepared_local_changes.row_changes,
         })
     }
 
@@ -1061,8 +1066,18 @@ impl ReplicationRuntimeComponent {
             let reply = match async_self.publish_changes_transactionally(changes).await {
                 Ok(prepared_publish) => {
                     let update_id = prepared_publish.update_id;
-                    async_self.submit_group_update(prepared_publish);
-                    Ok(PublishReceipt { update_id })
+                    async_self.submit_group_update(&prepared_publish);
+                    match notify_listener_batches(
+                        async_self.listener.clone(),
+                        vec![prepared_publish.row_changes],
+                    )
+                    .await
+                    {
+                        Ok(()) => Ok(PublishReceipt { update_id }),
+                        Err(error) => Err(ApiError::ApiExternal {
+                            source: Box::new(error),
+                        }),
+                    }
                 }
                 Err(error) => Err(ApiError::ApiExternal {
                     source: Box::new(error),

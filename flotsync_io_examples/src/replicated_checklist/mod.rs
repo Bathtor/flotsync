@@ -6,14 +6,26 @@
 
 use clap::{CommandFactory, Parser, Subcommand};
 use flotsync_data_types::{
+    Decode,
+    DecodeValueError,
     Field,
     PrimitiveType,
+    RowOperations,
+    RowRead,
     Schema,
-    schema::{BasicDataType, NullableBasicDataType},
+    schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
-use flotsync_replication::{DatasetId, RowKey};
-use snafu::Snafu;
-use std::{num::NonZeroUsize, str::FromStr};
+use flotsync_replication::{DatasetId, GroupId, MutableRow, RowChange, RowId, RowKey, RowMutation};
+use snafu::{Snafu, ensure};
+use std::{
+    borrow::Cow,
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    fmt,
+    hash::Hash,
+    num::NonZeroUsize,
+    str::FromStr,
+    time::SystemTime,
+};
 use uuid::Uuid;
 
 /// Logical dataset id segments for the checklist example.
@@ -78,6 +90,23 @@ impl ChecklistStatus {
             Self::Open => Self::OPEN,
             Self::InProgress => Self::IN_PROGRESS,
             Self::Done => Self::DONE,
+        }
+    }
+
+    pub fn from_schema_value(value: &str) -> Option<Self> {
+        match value {
+            Self::OPEN => Some(Self::Open),
+            Self::IN_PROGRESS => Some(Self::InProgress),
+            Self::DONE => Some(Self::Done),
+            _ => None,
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Open => 0,
+            Self::InProgress => 1,
+            Self::Done => 2,
         }
     }
 }
@@ -218,6 +247,568 @@ pub fn parse_item_selector(value: &str) -> Result<ItemSelector, ChecklistCommand
 
 pub fn checklist_help() -> String {
     ChecklistLine::command().render_long_help().to_string()
+}
+
+/// Checklist row state decoded into example-specific Rust values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChecklistItem {
+    /// User-facing checklist text.
+    pub text: String,
+    /// Longer free-form note text edited separately from the title.
+    pub note: String,
+    /// Tags are stored as a set locally so display order converges before sync.
+    pub tags: BTreeSet<String>,
+    /// Monotonic checklist workflow state.
+    pub status: ChecklistStatus,
+    /// User-selected priority, stored as a byte in the replicated row.
+    pub priority: u8,
+    /// Local edit counter used by the example to make edits visible in the row.
+    pub edit_count: u64,
+}
+
+impl ChecklistItem {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            note: String::new(),
+            tags: BTreeSet::new(),
+            status: ChecklistStatus::Open,
+            priority: 0,
+            edit_count: 1,
+        }
+    }
+
+    fn from_row<OperationId>(
+        row_key: RowKey,
+        row: &(dyn RowRead<OperationId> + Send + Sync),
+    ) -> Result<Self, ChecklistWorkingCopyError>
+    where
+        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        let text = decode_row_field::<_, String>(row_key, row, FIELD_TEXT)?.into_owned();
+        let note = decode_row_field::<_, String>(row_key, row, FIELD_NOTE)?.into_owned();
+        let tags = decode_row_field::<_, Vec<String>>(row_key, row, FIELD_TAGS)?
+            .iter()
+            .cloned()
+            .collect();
+        let status = decode_row_field::<_, String>(row_key, row, FIELD_STATUS)?;
+        let status = ChecklistStatus::from_schema_value(status.as_ref()).ok_or_else(|| {
+            ChecklistWorkingCopyError::InvalidStatus {
+                row_key,
+                value: status.into_owned(),
+            }
+        })?;
+        let priority = decode_row_field::<_, u8>(row_key, row, FIELD_PRIORITY)?.into_owned();
+        let edit_count = decode_row_field::<_, u64>(row_key, row, FIELD_EDIT_COUNT)?.into_owned();
+
+        Ok(Self {
+            text,
+            note,
+            tags,
+            status,
+            priority,
+            edit_count,
+        })
+    }
+
+    fn to_mutable_row(&self) -> MutableRow {
+        let mut fields = HashMap::new();
+        insert_field(&mut fields, FIELD_TEXT, self.text.clone());
+        insert_field(&mut fields, FIELD_NOTE, self.note.clone());
+        insert_field(
+            &mut fields,
+            FIELD_TAGS,
+            self.tags.iter().cloned().collect::<Vec<_>>(),
+        );
+        insert_field(&mut fields, FIELD_STATUS, self.status.as_str().to_owned());
+        insert_field(&mut fields, FIELD_PRIORITY, self.priority);
+        insert_field(&mut fields, FIELD_EDIT_COUNT, self.edit_count);
+        MutableRow::new(fields)
+    }
+
+    fn increment_edit_count(&mut self) {
+        self.edit_count = self
+            .edit_count
+            .checked_add(1)
+            .expect("checklist edit_count must not overflow during an example run");
+    }
+}
+
+/// Checklist-specific row change buffered from the replication listener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChecklistRowChange {
+    /// A listener-visible full-row upsert for this checklist dataset.
+    Upsert {
+        row_key: RowKey,
+        item: ChecklistItem,
+    },
+    /// A listener-visible row deletion for this checklist dataset.
+    Delete { row_key: RowKey },
+}
+
+/// One queued listener batch in checklist terms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChecklistEvent {
+    /// Local receive timestamp for display in the example event log.
+    pub timestamp: SystemTime,
+    /// Decoded checklist changes carried by one listener batch.
+    pub changes: Vec<ChecklistRowChange>,
+}
+
+/// Mutations prepared from dirty rows for one explicit sync command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChecklistSyncPlan {
+    row_keys: HashSet<RowKey>,
+    /// Full-row mutations to pass to `publish_changes`.
+    pub mutations: Vec<RowMutation>,
+}
+
+impl ChecklistSyncPlan {
+    pub fn row_keys(&self) -> impl Iterator<Item = RowKey> + '_ {
+        self.row_keys.iter().copied()
+    }
+}
+
+/// Checklist item paired with its transient one-based display index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedChecklistItem<'a> {
+    /// One-based list position accepted by REPL commands.
+    pub index: NonZeroUsize,
+    /// Stable replicated row key for this item.
+    pub row_key: RowKey,
+    /// Checklist item currently visible in the working copy.
+    pub item: &'a ChecklistItem,
+}
+
+/// Errors raised while decoding rows or mutating the checklist working copy.
+#[derive(Debug, Snafu)]
+pub enum ChecklistWorkingCopyError {
+    #[snafu(display("Checklist item reference {selector:?} does not resolve to a visible row."))]
+    UnknownItem { selector: ItemSelector },
+    #[snafu(display(
+        "Replicated row {row_id} does not belong to checklist group {group_id} dataset {dataset_id}."
+    ))]
+    UnexpectedRowScope {
+        row_id: RowId,
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
+    #[snafu(display("Failed to decode field {field} from checklist row {row_key}: {source}"))]
+    DecodeRowField {
+        row_key: RowKey,
+        field: &'static str,
+        source: DecodeValueError,
+    },
+    #[snafu(display("Checklist row {row_key} has unsupported status value {value:?}."))]
+    InvalidStatus { row_key: RowKey, value: String },
+    #[snafu(display("Dirty checklist row {row_key} is missing from the working copy."))]
+    MissingDirtyRow { row_key: RowKey },
+}
+
+/// In-memory REPL view of checklist rows between explicit `sync` commands.
+///
+/// Local commands update this working copy and mark full rows dirty. Listener
+/// changes are queued here and only applied when `sync` drains the queue after
+/// any local dirty rows have been published.
+pub struct ChecklistWorkingCopy {
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    rows: HashMap<RowKey, ChecklistItem>,
+    display_order: Vec<RowKey>,
+    dirty_rows: HashMap<RowKey, DirtyRowKind>,
+    queued_events: VecDeque<ChecklistEvent>,
+    event_history: Vec<ChecklistEvent>,
+}
+
+impl ChecklistWorkingCopy {
+    pub fn new(group_id: GroupId) -> Self {
+        Self {
+            group_id,
+            dataset_id: checklist_dataset_id(),
+            rows: HashMap::new(),
+            display_order: Vec::new(),
+            dirty_rows: HashMap::new(),
+            queued_events: VecDeque::new(),
+            event_history: Vec::new(),
+        }
+    }
+
+    pub fn group_id(&self) -> GroupId {
+        self.group_id
+    }
+
+    pub fn dataset_id(&self) -> &DatasetId {
+        &self.dataset_id
+    }
+
+    pub fn item(&self, row_key: RowKey) -> Option<&ChecklistItem> {
+        self.rows.get(&row_key)
+    }
+
+    pub fn dirty_row_count(&self) -> usize {
+        self.dirty_rows.len()
+    }
+
+    pub fn queued_event_count(&self) -> usize {
+        self.queued_events.len()
+    }
+
+    pub fn events(&self) -> &[ChecklistEvent] {
+        &self.event_history
+    }
+
+    pub fn listed_items(&self) -> Vec<ListedChecklistItem<'_>> {
+        self.display_order
+            .iter()
+            .filter_map(|row_key| self.rows.get(row_key).map(|item| (*row_key, item)))
+            .enumerate()
+            .map(|(index, (row_key, item))| ListedChecklistItem {
+                index: NonZeroUsize::new(index + 1)
+                    .expect("enumerated list positions start at one"),
+                row_key,
+                item,
+            })
+            .collect()
+    }
+
+    pub fn add_item(&mut self, text: impl Into<String>) -> RowKey {
+        let row_key = RowKey(Uuid::new_v4());
+        self.add_item_with_key(row_key, text);
+        row_key
+    }
+
+    pub fn add_item_with_key(&mut self, row_key: RowKey, text: impl Into<String>) {
+        self.rows.insert(row_key, ChecklistItem::new(text));
+        push_display_row(&mut self.display_order, row_key);
+        self.dirty_rows.insert(row_key, DirtyRowKind::Insert);
+    }
+
+    pub fn rename_item(
+        &mut self,
+        selector: ItemSelector,
+        text: impl Into<String>,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        let text = text.into();
+        self.modify_item(selector, |item| {
+            if item.text == text {
+                return false;
+            }
+            item.text = text;
+            item.increment_edit_count();
+            true
+        })
+    }
+
+    pub fn edit_note(
+        &mut self,
+        selector: ItemSelector,
+        note: impl Into<String>,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        let note = note.into();
+        self.modify_item(selector, |item| {
+            if item.note == note {
+                return false;
+            }
+            item.note = note;
+            item.increment_edit_count();
+            true
+        })
+    }
+
+    pub fn add_tag(
+        &mut self,
+        selector: ItemSelector,
+        tag: impl Into<String>,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        let tag = tag.into();
+        self.modify_item(selector, |item| {
+            if item.tags.insert(tag) {
+                item.increment_edit_count();
+                return true;
+            }
+            false
+        })
+    }
+
+    pub fn remove_tag(
+        &mut self,
+        selector: ItemSelector,
+        tag: &str,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        self.modify_item(selector, |item| {
+            if item.tags.remove(tag) {
+                item.increment_edit_count();
+                return true;
+            }
+            false
+        })
+    }
+
+    pub fn claim_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingCopyError> {
+        self.advance_status(selector, ChecklistStatus::InProgress)
+    }
+
+    pub fn complete_item(
+        &mut self,
+        selector: ItemSelector,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        self.advance_status(selector, ChecklistStatus::Done)
+    }
+
+    pub fn set_priority(
+        &mut self,
+        selector: ItemSelector,
+        priority: u8,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        self.modify_item(selector, |item| {
+            if item.priority == priority {
+                return false;
+            }
+            item.priority = priority;
+            item.increment_edit_count();
+            true
+        })
+    }
+
+    pub fn delete_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingCopyError> {
+        let row_key = self.resolve_selector(selector)?;
+        self.rows.remove(&row_key);
+        self.display_order.retain(|candidate| *candidate != row_key);
+        match self.dirty_rows.remove(&row_key) {
+            Some(DirtyRowKind::Insert) => {}
+            _ => {
+                self.dirty_rows.insert(row_key, DirtyRowKind::Delete);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn enqueue_row_changes(
+        &mut self,
+        changes: Vec<RowChange>,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        let mut checklist_changes = Vec::with_capacity(changes.len());
+        for change in changes {
+            checklist_changes.push(self.checklist_change_from_row_change(change)?);
+        }
+        self.enqueue_checklist_changes(checklist_changes);
+        Ok(())
+    }
+
+    pub fn enqueue_checklist_changes(&mut self, changes: Vec<ChecklistRowChange>) {
+        if changes.is_empty() {
+            return;
+        }
+        let event = ChecklistEvent {
+            timestamp: SystemTime::now(),
+            changes,
+        };
+        self.event_history.push(event.clone());
+        self.queued_events.push_back(event);
+    }
+
+    pub fn prepare_sync(&self) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingCopyError> {
+        if self.dirty_rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut row_keys = HashSet::with_capacity(self.dirty_rows.len());
+        let mut mutations = Vec::with_capacity(self.dirty_rows.len());
+        for (&row_key, &kind) in &self.dirty_rows {
+            row_keys.insert(row_key);
+            match kind {
+                DirtyRowKind::Insert | DirtyRowKind::Update => {
+                    let item = self
+                        .rows
+                        .get(&row_key)
+                        .ok_or(ChecklistWorkingCopyError::MissingDirtyRow { row_key })?;
+                    mutations.push(RowMutation::Upsert {
+                        row_id: self.row_id(row_key),
+                        row: item.to_mutable_row(),
+                    });
+                }
+                DirtyRowKind::Delete => {
+                    mutations.push(RowMutation::Delete {
+                        row_id: self.row_id(row_key),
+                    });
+                }
+            }
+        }
+
+        Ok(Some(ChecklistSyncPlan {
+            row_keys,
+            mutations,
+        }))
+    }
+
+    pub fn finish_successful_sync(&mut self, plan: Option<ChecklistSyncPlan>) -> usize {
+        if let Some(plan) = plan {
+            for row_key in plan.row_keys {
+                self.dirty_rows.remove(&row_key);
+            }
+        }
+        self.drain_queued_events()
+    }
+
+    pub fn drain_queued_events(&mut self) -> usize {
+        let mut applied_events = 0;
+        while let Some(event) = self.queued_events.pop_front() {
+            for change in event.changes {
+                self.apply_checklist_change(change);
+            }
+            applied_events += 1;
+        }
+        applied_events
+    }
+
+    fn advance_status(
+        &mut self,
+        selector: ItemSelector,
+        target: ChecklistStatus,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        self.modify_item(selector, |item| {
+            if item.status.rank() >= target.rank() {
+                return false;
+            }
+            item.status = target;
+            item.increment_edit_count();
+            true
+        })
+    }
+
+    fn modify_item(
+        &mut self,
+        selector: ItemSelector,
+        update: impl FnOnce(&mut ChecklistItem) -> bool,
+    ) -> Result<(), ChecklistWorkingCopyError> {
+        let row_key = self.resolve_selector(selector)?;
+        let item = self
+            .rows
+            .get_mut(&row_key)
+            .expect("resolved selector must point to a visible row");
+        if update(item) {
+            self.mark_dirty(row_key);
+        }
+        Ok(())
+    }
+
+    fn mark_dirty(&mut self, row_key: RowKey) {
+        if self.dirty_rows.get(&row_key) == Some(&DirtyRowKind::Insert) {
+            return;
+        }
+        self.dirty_rows.insert(row_key, DirtyRowKind::Update);
+    }
+
+    fn resolve_selector(
+        &self,
+        selector: ItemSelector,
+    ) -> Result<RowKey, ChecklistWorkingCopyError> {
+        match selector {
+            ItemSelector::RowKey(row_key) if self.rows.contains_key(&row_key) => Ok(row_key),
+            ItemSelector::RowKey(_) => Err(ChecklistWorkingCopyError::UnknownItem { selector }),
+            ItemSelector::ListIndex(index) => self
+                .listed_items()
+                .get(index.get() - 1)
+                .map(|listed| listed.row_key)
+                .ok_or(ChecklistWorkingCopyError::UnknownItem { selector }),
+        }
+    }
+
+    fn row_id(&self, row_key: RowKey) -> RowId {
+        RowId {
+            group_id: self.group_id,
+            dataset_id: self.dataset_id.clone(),
+            row_key,
+        }
+    }
+
+    fn checklist_change_from_row_change(
+        &self,
+        change: RowChange,
+    ) -> Result<ChecklistRowChange, ChecklistWorkingCopyError> {
+        match change {
+            RowChange::Upsert { row_id, row } => {
+                self.validate_row_scope(&row_id)?;
+                let row_key = row_id.row_key;
+                let item = ChecklistItem::from_row(row_key, row.as_ref())?;
+                Ok(ChecklistRowChange::Upsert { row_key, item })
+            }
+            RowChange::Delete { row_id } => {
+                self.validate_row_scope(&row_id)?;
+                Ok(ChecklistRowChange::Delete {
+                    row_key: row_id.row_key,
+                })
+            }
+        }
+    }
+
+    fn validate_row_scope(&self, row_id: &RowId) -> Result<(), ChecklistWorkingCopyError> {
+        ensure!(
+            row_id.group_id == self.group_id && row_id.dataset_id == self.dataset_id,
+            UnexpectedRowScopeSnafu {
+                row_id: row_id.clone(),
+                group_id: self.group_id,
+                dataset_id: self.dataset_id.clone(),
+            }
+        );
+        Ok(())
+    }
+
+    fn apply_checklist_change(&mut self, change: ChecklistRowChange) {
+        match change {
+            ChecklistRowChange::Upsert { row_key, item } => {
+                self.rows.insert(row_key, item);
+                push_display_row(&mut self.display_order, row_key);
+            }
+            ChecklistRowChange::Delete { row_key } => {
+                self.rows.remove(&row_key);
+                self.display_order.retain(|candidate| *candidate != row_key);
+            }
+        }
+    }
+}
+
+/// Dirty state for a row in the local working copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyRowKind {
+    /// Row was created locally and has not been published yet.
+    Insert,
+    /// Existing row was modified locally and needs a full-row upsert.
+    Update,
+    /// Existing row was deleted locally and needs a delete mutation.
+    Delete,
+}
+
+fn insert_field(
+    fields: &mut HashMap<String, NullableBasicValue>,
+    name: &'static str,
+    value: impl Into<NullableBasicValue>,
+) {
+    fields.insert(name.to_owned(), value.into());
+}
+
+fn push_display_row(display_order: &mut Vec<RowKey>, row_key: RowKey) {
+    if display_order.iter().all(|candidate| *candidate != row_key) {
+        display_order.push(row_key);
+    }
+}
+
+fn decode_row_field<'a, OperationId, Value>(
+    row_key: RowKey,
+    row: &'a (dyn RowRead<OperationId> + Send + Sync),
+    field: &'static str,
+) -> Result<Cow<'a, Value>, ChecklistWorkingCopyError>
+where
+    Value: ?Sized + Decode<OperationId>,
+    OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    row.get_field_value::<Value>(field).map_err(|source| {
+        ChecklistWorkingCopyError::DecodeRowField {
+            row_key,
+            field,
+            source,
+        }
+    })
 }
 
 #[derive(Debug, Parser)]
@@ -463,6 +1054,205 @@ mod tests {
         }
     }
 
+    #[test]
+    fn working_copy_local_edits_mark_full_rows_dirty_without_queueing_events() {
+        let row_key = RowKey(Uuid::from_u128(1));
+        let mut checklist = test_working_copy();
+
+        checklist.add_item_with_key(row_key, "buy milk");
+        checklist
+            .rename_item(ItemSelector::RowKey(row_key), "buy oat milk")
+            .expect("rename should apply");
+        checklist
+            .add_tag(ItemSelector::RowKey(row_key), "errand")
+            .expect("tag should apply");
+        checklist
+            .claim_item(ItemSelector::RowKey(row_key))
+            .expect("claim should apply");
+
+        assert_eq!(checklist.dirty_row_count(), 1);
+        assert_eq!(checklist.queued_event_count(), 0);
+        assert_eq!(
+            checklist
+                .item(row_key)
+                .expect("row should exist")
+                .edit_count,
+            4
+        );
+
+        let plan = checklist
+            .prepare_sync()
+            .expect("plan should build")
+            .expect("dirty row should produce a sync plan");
+        assert_eq!(plan.mutations.len(), 1);
+        assert_eq!(plan.row_keys().count(), 1);
+        assert!(
+            plan.row_keys()
+                .any(|dirty_row_key| dirty_row_key == row_key)
+        );
+        assert!(matches!(
+            &plan.mutations[0],
+            RowMutation::Upsert { row_id, .. }
+                if row_id.group_id == checklist.group_id()
+                    && row_id.dataset_id == *checklist.dataset_id()
+                    && row_id.row_key == row_key
+        ));
+    }
+
+    #[test]
+    fn working_copy_listener_events_queue_until_explicit_drain() {
+        let row_key = RowKey(Uuid::from_u128(2));
+        let mut checklist = test_working_copy();
+
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("remote item", 7),
+        }]);
+
+        assert!(checklist.item(row_key).is_none());
+        assert_eq!(checklist.queued_event_count(), 1);
+        assert_eq!(checklist.events().len(), 1);
+
+        assert_eq!(checklist.drain_queued_events(), 1);
+        assert_eq!(
+            checklist.item(row_key).expect("row should apply").text,
+            "remote item"
+        );
+        assert_eq!(checklist.queued_event_count(), 0);
+    }
+
+    #[test]
+    fn working_copy_tags_have_deterministic_display_order() {
+        let row_key = RowKey(Uuid::from_u128(6));
+        let mut checklist = test_working_copy();
+
+        checklist.add_item_with_key(row_key, "tagged");
+        checklist
+            .add_tag(ItemSelector::RowKey(row_key), "zeta")
+            .expect("tag should apply");
+        checklist
+            .add_tag(ItemSelector::RowKey(row_key), "alpha")
+            .expect("tag should apply");
+        checklist
+            .add_tag(ItemSelector::RowKey(row_key), "zeta")
+            .expect("duplicate tag should be a no-op");
+
+        let item = checklist.item(row_key).expect("row should exist");
+        assert_eq!(
+            item.tags.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+        assert_eq!(item.edit_count, 3);
+    }
+
+    #[test]
+    fn successful_sync_clears_dirty_rows_then_applies_queued_events_in_order() {
+        let row_key = RowKey(Uuid::from_u128(3));
+        let mut checklist = test_working_copy();
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("base", 1),
+        }]);
+        checklist.drain_queued_events();
+        checklist
+            .rename_item(ItemSelector::RowKey(row_key), "local")
+            .expect("local rename should apply");
+
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("remote before sync", 2),
+        }]);
+        let plan = checklist
+            .prepare_sync()
+            .expect("plan should build")
+            .expect("dirty row should produce a sync plan");
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("local", 3),
+        }]);
+
+        assert_eq!(checklist.finish_successful_sync(Some(plan)), 2);
+
+        let item = checklist.item(row_key).expect("row should remain visible");
+        assert_eq!(item.text, "local");
+        assert_eq!(item.edit_count, 3);
+        assert_eq!(checklist.dirty_row_count(), 0);
+        assert_eq!(checklist.queued_event_count(), 0);
+    }
+
+    #[test]
+    fn failed_sync_can_leave_dirty_rows_and_queued_events_untouched() {
+        let row_key = RowKey(Uuid::from_u128(4));
+        let mut checklist = test_working_copy();
+        checklist.add_item_with_key(row_key, "local");
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("remote", 1),
+        }]);
+
+        let plan = checklist
+            .prepare_sync()
+            .expect("plan should build")
+            .expect("dirty row should produce a sync plan");
+
+        assert_eq!(plan.mutations.len(), 1);
+        assert_eq!(checklist.dirty_row_count(), 1);
+        assert_eq!(checklist.queued_event_count(), 1);
+        assert_eq!(
+            checklist.item(row_key).expect("row should exist").text,
+            "local"
+        );
+    }
+
+    #[test]
+    fn deleting_new_dirty_row_suppresses_publish() {
+        let row_key = RowKey(Uuid::from_u128(5));
+        let mut checklist = test_working_copy();
+
+        checklist.add_item_with_key(row_key, "transient");
+        checklist
+            .delete_item(ItemSelector::RowKey(row_key))
+            .expect("delete should apply");
+
+        assert!(checklist.item(row_key).is_none());
+        assert_eq!(checklist.dirty_row_count(), 0);
+        assert!(
+            checklist
+                .prepare_sync()
+                .expect("plan should build")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleting_existing_row_prepares_delete_mutation() {
+        let row_key = RowKey(Uuid::from_u128(7));
+        let mut checklist = test_working_copy();
+
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: test_item("remote", 1),
+        }]);
+        checklist.drain_queued_events();
+        checklist
+            .delete_item(ItemSelector::RowKey(row_key))
+            .expect("delete should apply");
+
+        let plan = checklist
+            .prepare_sync()
+            .expect("plan should build")
+            .expect("dirty delete should produce a sync plan");
+
+        assert_eq!(plan.mutations.len(), 1);
+        assert!(matches!(
+            &plan.mutations[0],
+            RowMutation::Delete { row_id }
+                if row_id.group_id == checklist.group_id()
+                    && row_id.dataset_id == *checklist.dataset_id()
+                    && row_id.row_key == row_key
+        ));
+    }
+
     fn assert_command_error_contains(line: &str, expected: &str) {
         let error = parse_checklist_command(line).expect_err("command should fail");
         let message = error.to_string();
@@ -474,5 +1264,20 @@ mod tests {
 
     fn words<const N: usize>(values: [&str; N]) -> Vec<String> {
         values.into_iter().map(str::to_owned).collect()
+    }
+
+    fn test_working_copy() -> ChecklistWorkingCopy {
+        ChecklistWorkingCopy::new(GroupId(Uuid::from_u128(10)))
+    }
+
+    fn test_item(text: &str, edit_count: u64) -> ChecklistItem {
+        ChecklistItem {
+            text: text.to_owned(),
+            note: String::new(),
+            tags: BTreeSet::new(),
+            status: ChecklistStatus::Open,
+            priority: 0,
+            edit_count,
+        }
     }
 }
