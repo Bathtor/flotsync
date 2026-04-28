@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
+flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_io = { path = "../flotsync_io" }
+flotsync_replication = { path = "../flotsync_replication" }
 http = "1"
 httparse = "1"
 itoa = "1"
@@ -17,6 +19,7 @@ slog-scope = "4"
 slog-stdlog = "4"
 slog-term = "2"
 snafu = { workspace = true }
+uuid = { workspace = true }
 
 [[bin]]
 name = "netcat"

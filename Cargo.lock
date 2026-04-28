@@ -1208,7 +1208,9 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "clap",
+ "flotsync_data_types",
  "flotsync_io",
+ "flotsync_replication",
  "http",
  "httparse",
  "itoa",
@@ -1219,6 +1221,7 @@ dependencies = [
  "slog-stdlog",
  "slog-term",
  "snafu",
+ "uuid",
 ]
 
 [[package]]
