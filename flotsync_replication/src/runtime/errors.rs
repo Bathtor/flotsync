@@ -224,11 +224,28 @@ pub(crate) enum InboundDeliveryError {
         source: RuntimeMessageError,
     },
     #[snafu(display(
+        "Inbound update {update_id} for group {group_id} carried read versions that already include producer version {producer_read_version}.",
+    ))]
+    SelfDependentReadVersions {
+        group_id: GroupId,
+        update_id: UpdateId,
+        producer_read_version: u64,
+    },
+    #[snafu(display(
         "Persisted inbound update collision in group {group_id}: update id {update_id} already exists with a different payload.",
     ))]
     ConflictingPersistedUpdate {
         group_id: GroupId,
         update_id: UpdateId,
+    },
+    #[snafu(display(
+        "Inbound update {update_id} for group {group_id} carried a schema operation for dataset '{dataset_id}' with change id {operation_change_id}.",
+    ))]
+    UpdateOperationIdMismatch {
+        group_id: GroupId,
+        update_id: UpdateId,
+        dataset_id: DatasetId,
+        operation_change_id: UpdateId,
     },
     #[snafu(display("Failed to decode inbound schema operation for dataset '{dataset_id}'."))]
     DecodeSchemaOperation {
@@ -263,7 +280,9 @@ impl InboundDeliveryError {
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
             | Self::DecodeReadVersions { .. }
+            | Self::SelfDependentReadVersions { .. }
             | Self::ConflictingPersistedUpdate { .. }
+            | Self::UpdateOperationIdMismatch { .. }
             | Self::DecodeSchemaOperation { .. }
             | Self::ApplyInboundMutation { .. } => InboundFailureAction::Drop,
         }

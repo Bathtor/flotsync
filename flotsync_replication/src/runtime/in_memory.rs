@@ -132,6 +132,23 @@ impl LoadedGroupMeta {
     }
 }
 
+pub(super) fn validate_inbound_update_read_versions(
+    update: &ReplicationUpdateRecord,
+) -> Result<(), InboundDeliveryError> {
+    let producer_read_version = update
+        .read_versions
+        .version_at(update.update_id.node_index as usize);
+    ensure!(
+        producer_read_version < update.update_id.version,
+        inbound::SelfDependentReadVersionsSnafu {
+            group_id: update.group_id,
+            update_id: update.update_id,
+            producer_read_version,
+        }
+    );
+    Ok(())
+}
+
 /// Persisted-but-not-yet-applied updates loaded for one transactional
 /// causality check.
 pub(super) struct PendingUpdateSet {
@@ -351,10 +368,12 @@ pub(super) fn collect_record_row_scope(
                 .get(&dataset_update.dataset_id)
                 .expect("touched inbound dataset schemas must be pre-loaded");
             for operation in &dataset_update.operations {
-                let operation = decode_schema_operation(operation.clone(), schema.as_schema())
-                    .context(inbound::DecodeSchemaOperationSnafu {
-                        dataset_id: dataset_update.dataset_id.clone(),
-                    })?;
+                let operation = decode_update_schema_operation(
+                    update,
+                    dataset_update,
+                    operation.clone(),
+                    schema.as_schema(),
+                )?;
                 let row_key = match operation.operation {
                     RowOperation::Insert { row_id, .. }
                     | RowOperation::Update { row_id, .. }
@@ -368,6 +387,28 @@ pub(super) fn collect_record_row_scope(
         }
     }
     Ok(dataset_rows)
+}
+
+/// Validate that every schema operation embedded in one replication update is
+/// decodable for the local schema and bound to the update's `UpdateId`.
+pub(super) fn validate_update_mapping(
+    update: &ReplicationUpdateRecord,
+    schemas: &HashMap<DatasetId, SchemaSource>,
+) -> Result<(), InboundDeliveryError> {
+    for dataset_update in &update.dataset_updates {
+        let schema = schemas
+            .get(&dataset_update.dataset_id)
+            .expect("inbound update schemas must be pre-loaded before validation");
+        for operation in &dataset_update.operations {
+            decode_update_schema_operation(
+                update,
+                dataset_update,
+                operation.clone(),
+                schema.as_schema(),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Returns the mutable working dataset image used for one outbound publish batch.
@@ -439,16 +480,8 @@ pub(super) fn apply_one_update_batch(
         let mut row_writes = Vec::new();
         for operation in &dataset_update.operations {
             let schema = working_dataset.data.schema().clone();
-            let operation = decode_schema_operation(operation.clone(), &schema).context(
-                inbound::DecodeSchemaOperationSnafu {
-                    dataset_id: dataset_update.dataset_id.clone(),
-                },
-            )?;
-            assert_eq!(
-                operation.change_id, update.update_id,
-                "decoded inbound operation for dataset '{}' carried change id {}, expected {}",
-                dataset_update.dataset_id, operation.change_id, update.update_id,
-            );
+            let operation =
+                decode_update_schema_operation(update, dataset_update, operation.clone(), &schema)?;
             let applied_operation = apply_remote_operation(
                 working_dataset,
                 update.group_id,
@@ -471,6 +504,29 @@ pub(super) fn apply_one_update_batch(
         row_changes,
         row_patches,
     })
+}
+
+fn decode_update_schema_operation<'schema>(
+    update: &ReplicationUpdateRecord,
+    dataset_update: &DatasetUpdateRecord,
+    operation: flotsync_messages::datamodel::SchemaOperation,
+    schema: &'schema Schema,
+) -> Result<flotsync_messages::SchemaOperation<'schema>, InboundDeliveryError> {
+    let operation = decode_schema_operation(operation, schema).context(
+        inbound::DecodeSchemaOperationSnafu {
+            dataset_id: dataset_update.dataset_id.clone(),
+        },
+    )?;
+    ensure!(
+        operation.change_id == update.update_id,
+        inbound::UpdateOperationIdMismatchSnafu {
+            group_id: update.group_id,
+            update_id: update.update_id,
+            dataset_id: dataset_update.dataset_id.clone(),
+            operation_change_id: operation.change_id,
+        }
+    );
+    Ok(operation)
 }
 
 /// Applies one local upsert and returns the encoded schema operation, if any.

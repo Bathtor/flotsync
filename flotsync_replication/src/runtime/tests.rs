@@ -7,7 +7,12 @@ use super::{
         wait_for_test_reply,
     },
     host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt, PreconfiguredPeerRoutesPublishMode},
-    in_memory::{LocalDataset, apply_local_upsert},
+    in_memory::{
+        LocalDataset,
+        apply_local_upsert,
+        validate_inbound_update_read_versions,
+        validate_update_mapping,
+    },
     load_replication_runtime,
     messages::{DatasetUpdateMessage, UpdateBatchMessage},
 };
@@ -20,6 +25,7 @@ use crate::{
         DatasetId,
         DatasetRowPatch,
         DatasetRowSlice,
+        DatasetUpdateRecord,
         GroupId,
         ListenerError,
         ListenerExternalSnafu,
@@ -1093,6 +1099,106 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
 }
 
 #[test]
+fn inbound_update_rejects_operation_change_id_mismatch_before_persisting() {
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema_static();
+    let group_id = GroupId(Uuid::from_u128(26));
+    let row_id = test_row_id(group_id, dataset_id.clone(), 27);
+    let batch_update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    let operation_change_id = UpdateId {
+        version: 2,
+        node_index: 0,
+    };
+    let mut source_dataset = LocalDataset::new(schema);
+    let encoded_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "wrong change id" },
+        operation_change_id,
+    )
+    .expect("operation should build")
+    .expect("operation should apply")
+    .encoded_operation;
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let update = ReplicationUpdateRecord {
+        group_id,
+        update_id: batch_update_id,
+        sender: alice_member(),
+        read_versions: VersionVector::initial(member_count),
+        dataset_updates: vec![DatasetUpdateRecord {
+            dataset_id: dataset_id.clone(),
+            operations: vec![encoded_operation],
+        }],
+        applied_locally: false,
+    };
+    let schemas = std::collections::HashMap::from([(
+        dataset_id.clone(),
+        SchemaSource::from(title_schema_static()),
+    )]);
+
+    let error =
+        validate_update_mapping(&update, &schemas).expect_err("change-id mismatch should reject");
+
+    match error {
+        InboundDeliveryError::UpdateOperationIdMismatch {
+            group_id: actual_group_id,
+            update_id,
+            dataset_id: actual_dataset_id,
+            operation_change_id: actual_operation_change_id,
+        } => {
+            assert_eq!(actual_group_id, group_id);
+            assert_eq!(update_id, batch_update_id);
+            assert_eq!(actual_dataset_id, dataset_id);
+            assert_eq!(actual_operation_change_id, operation_change_id);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn inbound_update_rejects_self_dependent_read_versions_before_persisting() {
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(28));
+    let update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let mut read_versions = VersionVector::initial(member_count);
+    read_versions.increment_at(0);
+    let update = ReplicationUpdateRecord {
+        group_id,
+        update_id,
+        sender: alice_member(),
+        read_versions,
+        dataset_updates: vec![DatasetUpdateRecord {
+            dataset_id,
+            operations: Vec::new(),
+        }],
+        applied_locally: false,
+    };
+
+    let error = validate_inbound_update_read_versions(&update)
+        .expect_err("self-dependent read versions should be rejected");
+
+    match error {
+        InboundDeliveryError::SelfDependentReadVersions {
+            group_id: actual_group_id,
+            update_id: actual_update_id,
+            producer_read_version,
+        } => {
+            assert_eq!(actual_group_id, group_id);
+            assert_eq!(actual_update_id, update_id);
+            assert_eq!(producer_read_version, 1);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -1384,7 +1490,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         &row_id,
         crate::row_values! { "title" => "first" },
         UpdateId {
-            version: 1,
+            version: 2,
             node_index: 0,
         },
     )
@@ -1398,7 +1504,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         &row_id,
         crate::row_values! { "title" => "conflict" },
         UpdateId {
-            version: 1,
+            version: 2,
             node_index: 0,
         },
     )

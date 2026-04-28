@@ -11,6 +11,8 @@ use super::{
         apply_one_update_batch,
         collect_group_row_scope,
         collect_record_row_scope,
+        validate_inbound_update_read_versions,
+        validate_update_mapping,
         working_dataset_for_publish,
     },
     messages::{
@@ -589,6 +591,14 @@ impl ReplicationRuntimeComponent {
         })
     }
 
+    /// Stage local row mutations as schema operations for one replication update.
+    ///
+    /// This is the local `SchemaOperation -> Update(ReadVV)` boundary: the
+    /// caller supplies the freshly allocated `UpdateId`, and every effective
+    /// schema operation produced for the publish batch is encoded with exactly
+    /// that change id. The surrounding publish transaction captures `ReadVV`
+    /// before applying the mutations, persists the same `UpdateId` and `ReadVV`,
+    /// and sends both values in the outbound `UpdateBatch`.
     fn build_local_dataset_updates(
         group_id: GroupId,
         working_datasets: &mut HashMap<DatasetId, LocalDataset>,
@@ -897,7 +907,9 @@ impl ReplicationRuntimeComponent {
                 actual_index: MemberIndex::new(message.update_id.node_index),
             }
         );
-        if local_group.has_applied(message.update_id) {
+        let inbound_update = Self::build_replication_update_record(sender, message, false);
+        validate_inbound_update_read_versions(&inbound_update)?;
+        if local_group.has_applied(inbound_update.update_id) {
             transaction
                 .commit()
                 .await
@@ -905,7 +917,6 @@ impl ReplicationRuntimeComponent {
             return Ok(Vec::new());
         }
 
-        let inbound_update = Self::build_replication_update_record(sender, message, false);
         if let Some(existing_update) = transaction
             .load_replication_update(&group_id, inbound_update.update_id)
             .await
@@ -919,6 +930,23 @@ impl ReplicationRuntimeComponent {
                 }
             );
         } else {
+            let touched_dataset_ids = inbound_update
+                .dataset_updates
+                .iter()
+                .map(|dataset_update| dataset_update.dataset_id.clone())
+                .collect::<HashSet<_>>();
+            let loaded_schemas =
+                Self::load_dataset_schemas(self.store.clone(), touched_dataset_ids)
+                    .await
+                    .map_err(|error| match error {
+                        DatasetSchemaLoadError::Load { dataset_id, source } => {
+                            InboundDeliveryError::LoadDatasetSchema { dataset_id, source }
+                        }
+                        DatasetSchemaLoadError::Missing { dataset_id } => {
+                            InboundDeliveryError::MissingDatasetSchema { dataset_id }
+                        }
+                    })?;
+            validate_update_mapping(&inbound_update, &loaded_schemas)?;
             transaction
                 .append_replication_update(inbound_update.clone())
                 .await
