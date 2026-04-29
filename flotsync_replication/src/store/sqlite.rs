@@ -56,6 +56,7 @@ use std::{
     collections::HashMap,
     error::Error as StdError,
     num::NonZeroUsize,
+    path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -89,6 +90,15 @@ impl SqliteReplicationStore {
         )
     }
 
+    /// Open one disk-backed SQLite store for `local_member`.
+    pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::file_with_schema_sources(
+            local_member,
+            path,
+            std::iter::empty::<(DatasetId, SchemaSource)>(),
+        )
+    }
+
     /// Create one in-memory store with the provided application schema sources.
     pub fn in_memory_with_schema_sources<I, S>(
         local_member: MemberIdentity,
@@ -108,6 +118,36 @@ impl SqliteReplicationStore {
             })?
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(local_member, schema_sources, connect_options)
+    }
+
+    /// Open one disk-backed SQLite store with the provided application schema sources.
+    pub fn file_with_schema_sources<I, S>(
+        local_member: MemberIdentity,
+        path: impl AsRef<Path>,
+        schema_sources: I,
+    ) -> Result<Self, StoreError>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        let connect_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(local_member, schema_sources, connect_options)
+    }
+
+    fn from_connect_options<I, S>(
+        local_member: MemberIdentity,
+        schema_sources: I,
+        connect_options: SqliteConnectOptions,
+    ) -> Result<Self, StoreError>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
         let pool = block_on(
             SqlitePoolOptions::new()
                 .min_connections(1)

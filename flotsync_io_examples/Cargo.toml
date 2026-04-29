@@ -6,11 +6,15 @@ edition = "2024"
 [dependencies]
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
+flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_replication = { path = "../flotsync_replication" }
+chrono = { workspace = true }
+futures-util = { workspace = true }
 http = "1"
 httparse = "1"
+itertools = { workspace = true }
 itoa = "1"
 kompact = { workspace = true }
 log = "0.4"
@@ -28,3 +32,7 @@ path = "src/bin/netcat.rs"
 [[bin]]
 name = "http_server"
 path = "src/bin/http_server.rs"
+
+[[bin]]
+name = "replicated_checklist"
+path = "src/bin/replicated_checklist.rs"

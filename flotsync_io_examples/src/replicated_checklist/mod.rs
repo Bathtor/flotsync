@@ -4,6 +4,12 @@
 //! item addressing, and the checklist schema. The runnable process and runtime
 //! wiring live in the example CLI task.
 
+mod config;
+mod runner;
+
+pub use config::ChecklistConfigError;
+pub use runner::{ReplicatedChecklistArgs, ReplicatedChecklistError, run};
+
 use clap::{CommandFactory, Parser, Subcommand};
 use flotsync_data_types::{
     Decode,
@@ -16,7 +22,8 @@ use flotsync_data_types::{
     schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
 use flotsync_replication::{DatasetId, GroupId, MutableRow, RowChange, RowId, RowKey, RowMutation};
-use snafu::{Snafu, ensure};
+use itertools::Itertools;
+use snafu::prelude::*;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
@@ -24,6 +31,7 @@ use std::{
     hash::Hash,
     num::NonZeroUsize,
     str::FromStr,
+    sync::LazyLock,
     time::SystemTime,
 };
 use uuid::Uuid;
@@ -41,13 +49,14 @@ pub const FIELD_TAGS: &str = "tags";
 pub const FIELD_STATUS: &str = "status";
 pub const FIELD_PRIORITY: &str = "priority";
 pub const FIELD_EDIT_COUNT: &str = "edit_count";
+pub static CHECKLIST_SCHEMA: LazyLock<Schema> = LazyLock::new(build_checklist_schema);
 
 pub fn checklist_dataset_id() -> DatasetId {
     DatasetId::try_new(CHECKLIST_DATASET_ID)
         .expect("checklist dataset id must be a valid dataset identifier")
 }
 
-pub fn checklist_schema() -> Schema {
+fn build_checklist_schema() -> Schema {
     Schema::from_fields([
         Field::linear_string(FIELD_TEXT)
             .with_default("")
@@ -278,10 +287,17 @@ impl ChecklistItem {
         }
     }
 
+    pub fn formatted_tags(&self) -> String {
+        self.tags
+            .iter()
+            .format_with(" ", |tag, formatter| formatter(&format_args!("#{tag}")))
+            .to_string()
+    }
+
     fn from_row<OperationId>(
         row_key: RowKey,
         row: &(dyn RowRead<OperationId> + Send + Sync),
-    ) -> Result<Self, ChecklistWorkingCopyError>
+    ) -> Result<Self, ChecklistWorkingSetError>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     {
@@ -293,7 +309,7 @@ impl ChecklistItem {
             .collect();
         let status = decode_row_field::<_, String>(row_key, row, FIELD_STATUS)?;
         let status = ChecklistStatus::from_schema_value(status.as_ref()).ok_or_else(|| {
-            ChecklistWorkingCopyError::InvalidStatus {
+            ChecklistWorkingSetError::InvalidStatus {
                 row_key,
                 value: status.into_owned(),
             }
@@ -376,13 +392,13 @@ pub struct ListedChecklistItem<'a> {
     pub index: NonZeroUsize,
     /// Stable replicated row key for this item.
     pub row_key: RowKey,
-    /// Checklist item currently visible in the working copy.
+    /// Checklist item currently visible in the working set.
     pub item: &'a ChecklistItem,
 }
 
-/// Errors raised while decoding rows or mutating the checklist working copy.
+/// Errors raised while decoding rows or mutating the checklist working set.
 #[derive(Debug, Snafu)]
-pub enum ChecklistWorkingCopyError {
+pub enum ChecklistWorkingSetError {
     #[snafu(display("Checklist item reference {selector:?} does not resolve to a visible row."))]
     UnknownItem { selector: ItemSelector },
     #[snafu(display(
@@ -401,16 +417,16 @@ pub enum ChecklistWorkingCopyError {
     },
     #[snafu(display("Checklist row {row_key} has unsupported status value {value:?}."))]
     InvalidStatus { row_key: RowKey, value: String },
-    #[snafu(display("Dirty checklist row {row_key} is missing from the working copy."))]
+    #[snafu(display("Dirty checklist row {row_key} is missing from the working set."))]
     MissingDirtyRow { row_key: RowKey },
 }
 
 /// In-memory REPL view of checklist rows between explicit `sync` commands.
 ///
-/// Local commands update this working copy and mark full rows dirty. Listener
+/// Local commands update this working set and mark full rows dirty. Listener
 /// changes are queued here and only applied when `sync` drains the queue after
 /// any local dirty rows have been published.
-pub struct ChecklistWorkingCopy {
+pub struct ChecklistWorkingSet {
     group_id: GroupId,
     dataset_id: DatasetId,
     rows: HashMap<RowKey, ChecklistItem>,
@@ -420,7 +436,7 @@ pub struct ChecklistWorkingCopy {
     event_history: Vec<ChecklistEvent>,
 }
 
-impl ChecklistWorkingCopy {
+impl ChecklistWorkingSet {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
@@ -443,6 +459,17 @@ impl ChecklistWorkingCopy {
 
     pub fn item(&self, row_key: RowKey) -> Option<&ChecklistItem> {
         self.rows.get(&row_key)
+    }
+
+    pub fn selected_item(
+        &self,
+        selector: ItemSelector,
+    ) -> Result<ListedChecklistItem<'_>, ChecklistWorkingSetError> {
+        let row_key = self.resolve_selector(selector)?;
+        self.listed_items()
+            .into_iter()
+            .find(|listed| listed.row_key == row_key)
+            .ok_or(ChecklistWorkingSetError::UnknownItem { selector })
     }
 
     pub fn dirty_row_count(&self) -> usize {
@@ -487,7 +514,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         text: impl Into<String>,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         let text = text.into();
         self.modify_item(selector, |item| {
             if item.text == text {
@@ -503,7 +530,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         note: impl Into<String>,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         let note = note.into();
         self.modify_item(selector, |item| {
             if item.note == note {
@@ -519,7 +546,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         tag: impl Into<String>,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         let tag = tag.into();
         self.modify_item(selector, |item| {
             if item.tags.insert(tag) {
@@ -534,7 +561,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         tag: &str,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         self.modify_item(selector, |item| {
             if item.tags.remove(tag) {
                 item.increment_edit_count();
@@ -544,14 +571,14 @@ impl ChecklistWorkingCopy {
         })
     }
 
-    pub fn claim_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingCopyError> {
+    pub fn claim_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
         self.advance_status(selector, ChecklistStatus::InProgress)
     }
 
     pub fn complete_item(
         &mut self,
         selector: ItemSelector,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         self.advance_status(selector, ChecklistStatus::Done)
     }
 
@@ -559,7 +586,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         priority: u8,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         self.modify_item(selector, |item| {
             if item.priority == priority {
                 return false;
@@ -570,7 +597,7 @@ impl ChecklistWorkingCopy {
         })
     }
 
-    pub fn delete_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingCopyError> {
+    pub fn delete_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
         let row_key = self.resolve_selector(selector)?;
         self.rows.remove(&row_key);
         self.display_order.retain(|candidate| *candidate != row_key);
@@ -586,7 +613,7 @@ impl ChecklistWorkingCopy {
     pub fn enqueue_row_changes(
         &mut self,
         changes: Vec<RowChange>,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         let mut checklist_changes = Vec::with_capacity(changes.len());
         for change in changes {
             checklist_changes.push(self.checklist_change_from_row_change(change)?);
@@ -607,7 +634,7 @@ impl ChecklistWorkingCopy {
         self.queued_events.push_back(event);
     }
 
-    pub fn prepare_sync(&self) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingCopyError> {
+    pub fn prepare_sync(&self) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingSetError> {
         if self.dirty_rows.is_empty() {
             return Ok(None);
         }
@@ -621,7 +648,7 @@ impl ChecklistWorkingCopy {
                     let item = self
                         .rows
                         .get(&row_key)
-                        .ok_or(ChecklistWorkingCopyError::MissingDirtyRow { row_key })?;
+                        .ok_or(ChecklistWorkingSetError::MissingDirtyRow { row_key })?;
                     mutations.push(RowMutation::Upsert {
                         row_id: self.row_id(row_key),
                         row: item.to_mutable_row(),
@@ -665,7 +692,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         target: ChecklistStatus,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         self.modify_item(selector, |item| {
             if item.status.rank() >= target.rank() {
                 return false;
@@ -680,7 +707,7 @@ impl ChecklistWorkingCopy {
         &mut self,
         selector: ItemSelector,
         update: impl FnOnce(&mut ChecklistItem) -> bool,
-    ) -> Result<(), ChecklistWorkingCopyError> {
+    ) -> Result<(), ChecklistWorkingSetError> {
         let row_key = self.resolve_selector(selector)?;
         let item = self
             .rows
@@ -699,18 +726,15 @@ impl ChecklistWorkingCopy {
         self.dirty_rows.insert(row_key, DirtyRowKind::Update);
     }
 
-    fn resolve_selector(
-        &self,
-        selector: ItemSelector,
-    ) -> Result<RowKey, ChecklistWorkingCopyError> {
+    fn resolve_selector(&self, selector: ItemSelector) -> Result<RowKey, ChecklistWorkingSetError> {
         match selector {
             ItemSelector::RowKey(row_key) if self.rows.contains_key(&row_key) => Ok(row_key),
-            ItemSelector::RowKey(_) => Err(ChecklistWorkingCopyError::UnknownItem { selector }),
+            ItemSelector::RowKey(_) => Err(ChecklistWorkingSetError::UnknownItem { selector }),
             ItemSelector::ListIndex(index) => self
                 .listed_items()
                 .get(index.get() - 1)
                 .map(|listed| listed.row_key)
-                .ok_or(ChecklistWorkingCopyError::UnknownItem { selector }),
+                .ok_or(ChecklistWorkingSetError::UnknownItem { selector }),
         }
     }
 
@@ -725,7 +749,7 @@ impl ChecklistWorkingCopy {
     fn checklist_change_from_row_change(
         &self,
         change: RowChange,
-    ) -> Result<ChecklistRowChange, ChecklistWorkingCopyError> {
+    ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         match change {
             RowChange::Upsert { row_id, row } => {
                 self.validate_row_scope(&row_id)?;
@@ -742,7 +766,7 @@ impl ChecklistWorkingCopy {
         }
     }
 
-    fn validate_row_scope(&self, row_id: &RowId) -> Result<(), ChecklistWorkingCopyError> {
+    fn validate_row_scope(&self, row_id: &RowId) -> Result<(), ChecklistWorkingSetError> {
         ensure!(
             row_id.group_id == self.group_id && row_id.dataset_id == self.dataset_id,
             UnexpectedRowScopeSnafu {
@@ -768,7 +792,7 @@ impl ChecklistWorkingCopy {
     }
 }
 
-/// Dirty state for a row in the local working copy.
+/// Dirty state for a row in the local working set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirtyRowKind {
     /// Row was created locally and has not been published yet.
@@ -797,18 +821,13 @@ fn decode_row_field<'a, OperationId, Value>(
     row_key: RowKey,
     row: &'a (dyn RowRead<OperationId> + Send + Sync),
     field: &'static str,
-) -> Result<Cow<'a, Value>, ChecklistWorkingCopyError>
+) -> Result<Cow<'a, Value>, ChecklistWorkingSetError>
 where
     Value: ?Sized + Decode<OperationId>,
     OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
-    row.get_field_value::<Value>(field).map_err(|source| {
-        ChecklistWorkingCopyError::DecodeRowField {
-            row_key,
-            field,
-            source,
-        }
-    })
+    row.get_field_value::<Value>(field)
+        .context(DecodeRowFieldSnafu { row_key, field })
 }
 
 #[derive(Debug, Parser)]
@@ -833,7 +852,7 @@ mod tests {
 
     #[test]
     fn checklist_schema_uses_agreed_replication_semantics() {
-        let schema = checklist_schema();
+        let schema = &*CHECKLIST_SCHEMA;
         let expected_status =
             Field::finite_state_register(FIELD_STATUS, ChecklistStatus::SCHEMA_STATES)
                 .expect("test status field should build")
@@ -1055,9 +1074,9 @@ mod tests {
     }
 
     #[test]
-    fn working_copy_local_edits_mark_full_rows_dirty_without_queueing_events() {
+    fn working_set_local_edits_mark_full_rows_dirty_without_queueing_events() {
         let row_key = RowKey(Uuid::from_u128(1));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
 
         checklist.add_item_with_key(row_key, "buy milk");
         checklist
@@ -1100,9 +1119,9 @@ mod tests {
     }
 
     #[test]
-    fn working_copy_listener_events_queue_until_explicit_drain() {
+    fn working_set_listener_events_queue_until_explicit_drain() {
         let row_key = RowKey(Uuid::from_u128(2));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
 
         checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
             row_key,
@@ -1122,9 +1141,9 @@ mod tests {
     }
 
     #[test]
-    fn working_copy_tags_have_deterministic_display_order() {
+    fn working_set_tags_have_deterministic_display_order() {
         let row_key = RowKey(Uuid::from_u128(6));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
 
         checklist.add_item_with_key(row_key, "tagged");
         checklist
@@ -1148,7 +1167,7 @@ mod tests {
     #[test]
     fn successful_sync_clears_dirty_rows_then_applies_queued_events_in_order() {
         let row_key = RowKey(Uuid::from_u128(3));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
         checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
             row_key,
             item: test_item("base", 1),
@@ -1183,7 +1202,7 @@ mod tests {
     #[test]
     fn failed_sync_can_leave_dirty_rows_and_queued_events_untouched() {
         let row_key = RowKey(Uuid::from_u128(4));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
         checklist.add_item_with_key(row_key, "local");
         checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
             row_key,
@@ -1207,7 +1226,7 @@ mod tests {
     #[test]
     fn deleting_new_dirty_row_suppresses_publish() {
         let row_key = RowKey(Uuid::from_u128(5));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
 
         checklist.add_item_with_key(row_key, "transient");
         checklist
@@ -1227,7 +1246,7 @@ mod tests {
     #[test]
     fn deleting_existing_row_prepares_delete_mutation() {
         let row_key = RowKey(Uuid::from_u128(7));
-        let mut checklist = test_working_copy();
+        let mut checklist = test_working_set();
 
         checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
             row_key,
@@ -1266,8 +1285,8 @@ mod tests {
         values.into_iter().map(str::to_owned).collect()
     }
 
-    fn test_working_copy() -> ChecklistWorkingCopy {
-        ChecklistWorkingCopy::new(GroupId(Uuid::from_u128(10)))
+    fn test_working_set() -> ChecklistWorkingSet {
+        ChecklistWorkingSet::new(GroupId(Uuid::from_u128(10)))
     }
 
     fn test_item(text: &str, edit_count: u64) -> ChecklistItem {

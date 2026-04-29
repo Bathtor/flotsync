@@ -39,6 +39,12 @@ pub enum ListenerError {
     ListenerExternal { source: BoxError },
 }
 
+impl From<BoxError> for ListenerError {
+    fn from(source: BoxError) -> Self {
+        Self::ListenerExternal { source }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum ApiError {
