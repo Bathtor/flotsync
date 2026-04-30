@@ -230,7 +230,7 @@ impl LocalDataset {
     pub(super) fn from_row_slice(schema: SchemaSource, slice: DatasetRowSlice) -> Self {
         let data = flotsync_messages::InMemoryData::from_row_snapshots_with_tombstones(
             schema,
-            slice.rows.into_iter().filter_map(|(_, row)| {
+            slice.rows.into_values().filter_map(|row| {
                 row.map(|row| RowRecord {
                     row_id: row.row_id.0,
                     snapshot: row.snapshot,
