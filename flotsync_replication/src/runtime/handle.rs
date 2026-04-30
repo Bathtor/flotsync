@@ -146,9 +146,10 @@ fn start_delivery_runtime_host(
     runtime_config_toml: Option<&str>,
 ) -> Result<DeliveryRuntimeHost, RuntimeHostError> {
     let runtime_config_toml = runtime_config_toml.map(str::to_owned);
+    // Temporary workaround for https://github.com/kompics/kompact/issues/223:
     // Kompact startup currently enters a futures-executor LocalPool internally.
-    // Run it outside the caller's async executor so CLI block_on callers do not
-    // trip futures-executor's nested-enter guard.
+    // Run it outside the caller's async executor until Kompact has an
+    // async-friendly startup path or clearer non-panicking failure mode.
     let start_thread = thread::Builder::new()
         .name("flotsync-runtime-start".to_owned())
         .spawn(move || {
