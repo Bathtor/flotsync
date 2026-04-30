@@ -128,47 +128,73 @@ impl std::fmt::Display for ChecklistStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum ChecklistCommand {
+    /// Add one new checklist item.
     Add {
+        /// Item text.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Replace an item's text.
     Rename {
+        /// Item list index or row UUID.
         item: ItemSelector,
+        /// Replacement item text.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Edit longer item fields.
     Edit {
         #[command(subcommand)]
         command: EditCommand,
     },
+    /// Add or remove item tags.
     Tag {
         #[command(subcommand)]
         command: TagCommand,
     },
+    /// Mark an item as in progress.
     Claim {
+        /// Item list index or row UUID.
         item: ItemSelector,
     },
+    /// Mark an item as done.
     Complete {
+        /// Item list index or row UUID.
         item: ItemSelector,
     },
+    /// Set an item's priority.
     Priority {
+        /// Item list index or row UUID.
         item: ItemSelector,
+        /// Priority value to store on the item.
         priority: u8,
     },
+    /// Delete an item.
     Delete {
+        /// Item list index or row UUID.
         item: ItemSelector,
     },
+    /// Print visible checklist items.
     List,
+    /// Print all fields for one item.
     Show {
+        /// Item list index or row UUID.
         item: ItemSelector,
     },
+    /// Print queued replication events.
     Events {
+        /// Maximum number of latest events to print.
         limit: Option<usize>,
     },
+    /// Publish local changes and apply received updates.
     Sync,
+    /// Print configured group members.
     Members,
+    /// Print local member and store details.
     Me,
+    /// Print command help.
     Help,
+    /// Exit the REPL.
     #[command(alias = "exit")]
     Quit,
 }
@@ -185,13 +211,29 @@ impl ChecklistCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum EditCommand {
-    Note { item: ItemSelector },
+    /// Replace an item's note text.
+    Note {
+        /// Item list index or row UUID.
+        item: ItemSelector,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum TagCommand {
-    Add { item: ItemSelector, tag: String },
-    Rm { item: ItemSelector, tag: String },
+    /// Add one tag to an item.
+    Add {
+        /// Item list index or row UUID.
+        item: ItemSelector,
+        /// Tag text to add.
+        tag: String,
+    },
+    /// Remove one tag from an item.
+    Rm {
+        /// Item list index or row UUID.
+        item: ItemSelector,
+        /// Tag text to remove.
+        tag: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1063,8 +1105,26 @@ mod tests {
         let help = checklist_help();
 
         for command in [
-            "add", "rename", "edit", "tag", "claim", "complete", "priority", "delete", "list",
-            "show", "events", "sync", "members", "me", "help", "quit",
+            "add",
+            "rename",
+            "edit",
+            "tag",
+            "claim",
+            "complete",
+            "priority",
+            "delete",
+            "list",
+            "show",
+            "events",
+            "sync",
+            "members",
+            "me",
+            "help",
+            "quit",
+            "Add one new checklist item",
+            "Publish local changes and apply received updates",
+            "Print configured group members",
+            "Exit the REPL",
         ] {
             assert!(
                 help.contains(command),
