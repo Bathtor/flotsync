@@ -125,6 +125,24 @@ where
         Ok(data)
     }
 
+    /// Create one in-memory dataset from complete row snapshots and retained
+    /// row tombstone flags.
+    pub fn from_row_snapshots_with_tombstones<'snapshot, I>(
+        schema: impl Into<SchemaSource>,
+        rows: I,
+    ) -> Result<Self, InMemoryDataError>
+    where
+        I: IntoIterator<Item = RowRecord<'snapshot, RowId, OperationId>>,
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        let mut data = Self::new(schema);
+        for record in rows {
+            data.push_row_record(record)?;
+        }
+        Ok(data)
+    }
+
     /// Get the immutable schema associated with this dataset.
     pub fn schema(&self) -> &Schema {
         self.schema.as_schema()
@@ -176,6 +194,12 @@ where
         })
     }
 
+    /// Return whether an addressable row is currently tombstoned.
+    pub fn row_is_tombstoned(&self, row_id: &RowId) -> Option<bool> {
+        let row_index = self.row_id_map.get(row_id)?;
+        Some(self.rows[*row_index].deleted)
+    }
+
     /// Validate and append one row represented by positional field values.
     ///
     /// Returns the inserted row index on success.
@@ -216,13 +240,35 @@ where
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
+        self.push_row_record(RowRecord {
+            row_id,
+            snapshot,
+            tombstoned: false,
+        })
+    }
+
+    /// Validate and append one retained row record.
+    pub fn push_row_record<'snapshot>(
+        &mut self,
+        record: RowRecord<'snapshot, RowId, OperationId>,
+    ) -> Result<usize, InMemoryDataError>
+    where
+        RowId: fmt::Display,
+        OperationId: Clone + 'snapshot,
+    {
+        let RowRecord {
+            row_id,
+            snapshot,
+            tombstoned,
+        } = record;
         if self.row_id_map.contains_key(&row_id) {
             return Err(InMemoryDataError::DuplicateRowId {
                 row_id: row_id.to_string(),
             });
         }
 
-        let row = self.row_from_named_fields(snapshot.into_owned_fields())?;
+        let mut row = self.row_from_named_fields(snapshot.into_owned_fields())?;
+        row.deleted = tombstoned;
         self.rows.push(row);
         let index = self.rows.len() - 1;
         self.row_id_map.insert(row_id, index);
@@ -2236,6 +2282,24 @@ where
             data: self.data,
             row_index: self.row_index,
         }
+    }
+}
+impl<'a, RowId, OperationId> InMemoryDataRow<'a, RowId, OperationId>
+where
+    RowId: PartialEq + Eq + Hash,
+{
+    /// Materialise this row into a complete owned snapshot.
+    pub fn snapshot(&self) -> RowSnapshot<'static, OperationId>
+    where
+        OperationId: Clone,
+    {
+        RowSnapshot::borrowed_in_memory(&self.data.field_names, &self.data.rows[self.row_index])
+            .into_owned()
+    }
+
+    /// Return whether this retained row is currently tombstoned.
+    pub fn is_tombstoned(&self) -> bool {
+        self.data.rows[self.row_index].deleted
     }
 }
 impl<'a, RowId, OperationId> RowRead<OperationId> for InMemoryDataRow<'a, RowId, OperationId>

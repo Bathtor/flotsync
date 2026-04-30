@@ -10,7 +10,14 @@ use flotsync_data_types::{
         Direction,
         Field,
         PrimitiveType,
-        datamodel::{InMemoryData, OperationValue, RowOperation, SchemaSource, SchemaValueError},
+        datamodel::{
+            InMemoryData,
+            OperationValue,
+            RowOperation,
+            RowRecord,
+            SchemaSource,
+            SchemaValueError,
+        },
         values::PrimitiveValueArray,
     },
     update_values,
@@ -519,6 +526,60 @@ fn apply_schema_operation_update_on_deleted_row_applies_and_repeated_delete_is_o
     let before_repeat_delete = target.clone();
     let after_repeat_delete = target.apply_schema_operation(delete).unwrap();
     assert_eq!(after_repeat_delete, before_repeat_delete);
+}
+
+#[test]
+fn in_memory_data_rehydrates_tombstoned_row_snapshots() {
+    let schema = &*TEST_SCHEMA;
+    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let insert = source
+        .insert_row(
+            230,
+            10,
+            initial_values! {
+                schema["title"] => "deleted",
+                schema["numbers"] => vec![1i64],
+                schema["counter"] => 0u64,
+                schema["priority"] => 1u64,
+            },
+        )
+        .unwrap()
+        .into_owned();
+    let RowOperation::Insert { snapshot, .. } = insert.operation else {
+        panic!("expected insert operation");
+    };
+    let update_operation = expect_applied(
+        source
+            .modify_row(
+                231,
+                10,
+                update_values! {
+                    schema["priority"] => 2u64,
+                },
+            )
+            .unwrap(),
+    )
+    .into_owned();
+
+    let target = InMemoryData::from_row_snapshots_with_tombstones(
+        schema,
+        [RowRecord {
+            row_id: 10,
+            snapshot: snapshot.into_owned(),
+            tombstoned: true,
+        }],
+    )
+    .expect("tombstoned snapshot should rehydrate");
+
+    assert_eq!(target.len(), 1);
+    assert_eq!(target.num_active_rows(), 0);
+    assert_eq!(target.row_is_tombstoned(&10), Some(true));
+    assert!(target.get_row(&10).is_some());
+    let update = target
+        .clone()
+        .apply_schema_operation(update_operation)
+        .expect("updates against tombstoned rows should apply");
+    assert_eq!(update.num_active_rows(), 0);
 }
 
 #[test]

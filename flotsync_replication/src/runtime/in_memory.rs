@@ -12,6 +12,8 @@ use crate::{
         MemberIndex,
         MutableRow,
         ReplicationGroupRecord,
+        ReplicationRowRecord,
+        ReplicationRowSnapshot,
         ReplicationUpdateRecord,
         RowChange,
         RowId,
@@ -28,7 +30,7 @@ use flotsync_data_types::{
     RowRead,
     Schema,
     TableOperations,
-    schema::datamodel::{RowOperation, RowSnapshot},
+    schema::datamodel::{RowOperation, RowRecord},
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
 use snafu::prelude::*;
@@ -226,15 +228,31 @@ impl LocalDataset {
 
     /// Rebuild one ephemeral in-memory dataset slice from store-loaded rows.
     pub(super) fn from_row_slice(schema: SchemaSource, slice: DatasetRowSlice) -> Self {
-        let data = flotsync_messages::InMemoryData::from_row_snapshots(
+        let data = flotsync_messages::InMemoryData::from_row_snapshots_with_tombstones(
             schema,
-            slice
-                .rows
-                .into_iter()
-                .filter_map(|(row_key, row)| row.map(|row| (row_key.0, row))),
+            slice.rows.into_iter().filter_map(|(_, row)| {
+                row.map(|row| RowRecord {
+                    row_id: row.row_id.0,
+                    snapshot: row.snapshot,
+                    tombstoned: row.tombstoned,
+                })
+            }),
         )
         .expect("store-loaded dataset slice must not contain duplicate row keys");
         Self { data }
+    }
+
+    fn stored_row(&self, row_key: RowKey) -> Option<ReplicationRowRecord> {
+        let row = self.data.get_row(&row_key.0)?;
+        Some(ReplicationRowRecord {
+            row_id: row_key,
+            snapshot: row.snapshot(),
+            tombstoned: row.is_tombstoned(),
+        })
+    }
+
+    fn row_is_tombstoned(&self, row_key: RowKey) -> Option<bool> {
+        self.data.row_is_tombstoned(&row_key.0)
     }
 
     fn clone_row(&self, row_key: RowKey) -> Option<flotsync_data_types::OwnedRow<UpdateId>> {
@@ -250,17 +268,8 @@ impl LocalDataset {
     }
 
     /// Snapshot the current row image for explicit durable row writes.
-    fn snapshot_row(&self, row_key: RowKey) -> Option<RowSnapshot<'static, UpdateId>> {
-        let row = self.data.get_row(&row_key.0)?;
-        let mut fields = Vec::with_capacity(self.data.num_fields());
-        for field_name in self.data.field_names() {
-            let value = row
-                .get_field(field_name)
-                .expect("field iteration must resolve against the same row")
-                .clone();
-            fields.push((field_name.to_owned(), value));
-        }
-        Some(RowSnapshot::from_owned_fields(fields))
+    fn snapshot_row(&self, row_key: RowKey) -> Option<ReplicationRowSnapshot> {
+        self.data.get_row(&row_key.0).map(|row| row.snapshot())
     }
 }
 
@@ -460,7 +469,12 @@ pub(super) struct AppliedLocalOperation {
 }
 
 struct AppliedRemoteOperation {
-    row_change: RowChange,
+    /// Listener-visible change for this operation.
+    ///
+    /// `None` means the durable tombstone image changed, but the row was
+    /// already deleted from the application's visible set and should not emit a
+    /// second delete or a resurrection upsert.
+    row_change: Option<RowChange>,
     row_write: DatasetRowWrite,
 }
 
@@ -490,7 +504,9 @@ pub(super) fn apply_one_update_batch(
                 &dataset_update.dataset_id,
                 operation,
             )?;
-            row_changes.push(applied_operation.row_change);
+            if let Some(row_change) = applied_operation.row_change {
+                row_changes.push(row_change);
+            }
             row_writes.push(applied_operation.row_write);
         }
         if !row_writes.is_empty() {
@@ -583,9 +599,9 @@ pub(super) fn apply_local_upsert(
             row_id: row_id.clone(),
             row: Arc::new(row),
         },
-        row_write: DatasetRowWrite::Put {
+        row_write: DatasetRowWrite::UpsertActive {
             row_key: row_id.row_key,
-            row: row_snapshot,
+            snapshot: row_snapshot,
         },
     }))
 }
@@ -607,13 +623,18 @@ pub(super) fn apply_local_delete(
         encode_schema_operation(&operation, &schema).context(publish::EncodeOperationSnafu {
             dataset_id: row_id.dataset_id.clone(),
         })?;
+    let row = dataset
+        .stored_row(row_id.row_key)
+        .unwrap_or_else(|| panic!("applied local delete must leave row {row_id} snapshotable"));
+    debug_assert!(row.tombstoned);
     Ok(AppliedLocalOperation {
         encoded_operation,
         row_change: RowChange::Delete {
             row_id: row_id.clone(),
         },
-        row_write: DatasetRowWrite::Delete {
+        row_write: DatasetRowWrite::UpsertTombstone {
             row_key: row_id.row_key,
+            snapshot: row.snapshot,
         },
     })
 }
@@ -633,10 +654,9 @@ fn apply_remote_operation(
             row_key: RowKey(*row_id),
         },
     };
-    let change_kind = match &operation.operation {
-        RowOperation::Delete { .. } => AppliedChangeKind::Delete,
-        RowOperation::Insert { .. } | RowOperation::Update { .. } => AppliedChangeKind::Upsert,
-    };
+    let was_tombstoned = dataset
+        .row_is_tombstoned(api_row_id.row_key)
+        .unwrap_or(false);
 
     // flotsync_messages::InMemoryData currently consumes `self` when applying
     // one schema operation, so the runtime must clone the current dataset image
@@ -649,38 +669,40 @@ fn apply_remote_operation(
             row_id: api_row_id.clone(),
         })?;
 
-    match change_kind {
-        AppliedChangeKind::Delete => Ok(AppliedRemoteOperation {
-            row_change: RowChange::Delete {
+    let stored_row = dataset.stored_row(api_row_id.row_key).unwrap_or_else(|| {
+        panic!("applied inbound operation must leave row {api_row_id} snapshotable")
+    });
+    let row_change = if stored_row.tombstoned {
+        if was_tombstoned {
+            None
+        } else {
+            Some(RowChange::Delete {
                 row_id: api_row_id.clone(),
-            },
-            row_write: DatasetRowWrite::Delete {
-                row_key: api_row_id.row_key,
-            },
-        }),
-        AppliedChangeKind::Upsert => {
+            })
+        }
+    } else {
+        Some({
             let row = dataset.clone_row(api_row_id.row_key).unwrap_or_else(|| {
                 panic!("applied inbound upsert must leave row {api_row_id} readable")
             });
-            let row_snapshot = dataset.snapshot_row(api_row_id.row_key).unwrap_or_else(|| {
-                panic!("applied inbound upsert must leave row {api_row_id} snapshotable")
-            });
-            Ok(AppliedRemoteOperation {
-                row_change: RowChange::Upsert {
-                    row_id: api_row_id.clone(),
-                    row: Arc::new(row),
-                },
-                row_write: DatasetRowWrite::Put {
-                    row_key: api_row_id.row_key,
-                    row: row_snapshot,
-                },
-            })
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum AppliedChangeKind {
-    Upsert,
-    Delete,
+            RowChange::Upsert {
+                row_id: api_row_id.clone(),
+                row: Arc::new(row),
+            }
+        })
+    };
+    Ok(AppliedRemoteOperation {
+        row_change,
+        row_write: if stored_row.tombstoned {
+            DatasetRowWrite::UpsertTombstone {
+                row_key: api_row_id.row_key,
+                snapshot: stored_row.snapshot,
+            }
+        } else {
+            DatasetRowWrite::UpsertActive {
+                row_key: api_row_id.row_key,
+                snapshot: stored_row.snapshot,
+            }
+        },
+    })
 }

@@ -227,6 +227,22 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 }
 
+/// One retained row image together with its addressability state.
+///
+/// A [`RowRecord`] is a storage and rehydration shape, not a replicated row
+/// operation. `snapshot` contains the complete row value image, while
+/// `tombstoned` records whether that image is retained only so later CRDT
+/// operations can still address the row after a delete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowRecord<'a, RowId, ChangeId> {
+    /// Stable row identifier in the dataset that owns this record.
+    pub row_id: RowId,
+    /// Complete value snapshot for the row.
+    pub snapshot: RowSnapshot<'a, ChangeId>,
+    /// Whether the row is deleted but still retained for causal updates.
+    pub tombstoned: bool,
+}
+
 #[derive(Debug, Snafu)]
 pub enum RowSnapshotEncodeError<E>
 where

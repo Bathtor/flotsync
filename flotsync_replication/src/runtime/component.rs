@@ -1293,6 +1293,9 @@ async fn notify_listener_batches(
     event_batches: Vec<Vec<RowChange>>,
 ) -> Result<(), InboundDeliveryError> {
     for row_changes in event_batches {
+        if row_changes.is_empty() {
+            continue;
+        }
         listener
             .on_event(ReplicationEvent::DataChanged {
                 rows: Box::new(VecRowProvider::new(row_changes)),

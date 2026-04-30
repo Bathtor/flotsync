@@ -1,5 +1,5 @@
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
+use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowRecord, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
@@ -336,8 +336,19 @@ pub struct DatasetRowSlice {
     /// Whether this dataset already exists durably for `group_id`.
     pub dataset_exists: bool,
     /// Durable state for each requested row key.
-    pub rows: HashMap<RowKey, Option<RowSnapshot<'static, UpdateId>>>,
+    ///
+    /// `None` means the requested row is absent. A present
+    /// [`ReplicationRowRecord`] with `tombstoned = true` means the row is
+    /// deleted for application visibility but retained so causally later CRDT
+    /// operations can still target the row.
+    pub rows: HashMap<RowKey, Option<ReplicationRowRecord>>,
 }
+
+/// Complete row snapshot used by replication storage.
+pub type ReplicationRowSnapshot = RowSnapshot<'static, UpdateId>;
+
+/// Durable row image loaded from or written to replication storage.
+pub type ReplicationRowRecord = RowRecord<'static, RowKey, UpdateId>;
 
 /// One explicit transactional row patch for a dataset.
 #[derive(Clone, Debug, PartialEq)]
@@ -353,13 +364,16 @@ pub struct DatasetRowPatch {
 /// One explicit storage action for a persisted dataset row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DatasetRowWrite {
-    /// Ensure that `row_key` exists with the provided snapshot after commit.
-    Put {
+    /// Ensure that `row_key` exists as an active application-visible row.
+    UpsertActive {
         row_key: RowKey,
-        row: RowSnapshot<'static, UpdateId>,
+        snapshot: ReplicationRowSnapshot,
     },
-    /// Remove `row_key` from durable storage.
-    Delete { row_key: RowKey },
+    /// Ensure that `row_key` exists as a retained delete tombstone.
+    UpsertTombstone {
+        row_key: RowKey,
+        snapshot: ReplicationRowSnapshot,
+    },
 }
 
 /// Iterator used to stream requested row keys into one store transaction.

@@ -9,6 +9,8 @@ use crate::{
         MemberIdentity,
         MemberIndex,
         ReplicationGroupRecord,
+        ReplicationRowRecord,
+        ReplicationRowSnapshot,
         ReplicationStore,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
@@ -31,7 +33,6 @@ use flotsync_core::{
     member::IdentifierParseError,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::schema::datamodel::RowSnapshot;
 use flotsync_messages::{
     buffa::Message as _,
     codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
@@ -440,6 +441,7 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     dataset_id TEXT NOT NULL,
     row_key TEXT NOT NULL,
     row_snapshot BLOB NOT NULL,
+    row_tombstoned INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (group_id, dataset_id, row_key),
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );
@@ -627,7 +629,7 @@ async fn load_dataset_rows(
         })?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
-SELECT row_key, row_snapshot
+SELECT row_key, row_snapshot, row_tombstoned
 FROM dataset_rows
 WHERE group_id = ",
     );
@@ -653,7 +655,14 @@ WHERE group_id = ",
             schema.as_schema(),
             &row.get::<Vec<u8>, _>("row_snapshot"),
         )?;
-        rows.insert(row_key, Some(row_snapshot));
+        rows.insert(
+            row_key,
+            Some(ReplicationRowRecord {
+                row_id: row_key,
+                snapshot: row_snapshot,
+                tombstoned: row.get::<bool, _>("row_tombstoned"),
+            }),
+        );
     }
     Ok(DatasetRowSlice {
         group_id: *group_id,
@@ -672,73 +681,91 @@ async fn apply_dataset_row_patch(
         return Ok(());
     }
 
-    let schema = if patch
-        .actions
-        .iter()
-        .any(|action| matches!(action, DatasetRowWrite::Put { .. }))
-    {
-        let schema =
-            schema_sources
-                .get(&patch.dataset_id)
-                .cloned()
-                .context(MissingSchemaSnafu {
-                    dataset_id: patch.dataset_id.clone(),
-                })?;
-        ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
-        Some(schema)
-    } else {
-        None
-    };
+    let schema = schema_sources
+        .get(&patch.dataset_id)
+        .cloned()
+        .context(MissingSchemaSnafu {
+            dataset_id: patch.dataset_id.clone(),
+        })?;
+    ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
 
     for action in &patch.actions {
-        match action {
-            DatasetRowWrite::Put { row_key, row } => {
-                let schema = schema
-                    .as_ref()
-                    .expect("put actions require a schema-loaded dataset patch");
-                let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), row)?;
-                sqlx::query(
-                    "
-INSERT INTO dataset_rows (group_id, dataset_id, row_key, row_snapshot)
-VALUES (?1, ?2, ?3, ?4)
+        let (row_key, snapshot, tombstoned) = match action {
+            DatasetRowWrite::UpsertActive { row_key, snapshot } => {
+                ensure_dataset_row_upsert_active_is_valid(
+                    connection,
+                    &patch.group_id,
+                    &patch.dataset_id,
+                    row_key,
+                )
+                .await?;
+                (row_key, snapshot, false)
+            }
+            DatasetRowWrite::UpsertTombstone { row_key, snapshot } => (row_key, snapshot, true),
+        };
+        let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
+        sqlx::query(
+            "
+INSERT INTO dataset_rows (group_id, dataset_id, row_key, row_snapshot, row_tombstoned)
+VALUES (?1, ?2, ?3, ?4, ?5)
 ON CONFLICT(group_id, dataset_id, row_key) DO UPDATE
-SET row_snapshot = excluded.row_snapshot
+SET row_snapshot = excluded.row_snapshot,
+    row_tombstoned = excluded.row_tombstoned
 ",
-                )
-                .bind(patch.group_id.to_string())
-                .bind(patch.dataset_id.as_str())
-                .bind(row_key.to_string())
-                .bind(row_snapshot)
-                .execute(&mut **connection)
-                .await
-                .context(SqlxSnafu)?;
-            }
-            DatasetRowWrite::Delete { row_key } => {
-                let rows_affected = sqlx::query(
-                    "
-DELETE FROM dataset_rows
-WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
-",
-                )
-                .bind(patch.group_id.to_string())
-                .bind(patch.dataset_id.as_str())
-                .bind(row_key.to_string())
-                .execute(&mut **connection)
-                .await
-                .context(SqlxSnafu)?
-                .rows_affected();
-                ensure!(
-                    rows_affected == 1,
-                    MissingStoredDatasetRowSnafu {
-                        group_id: patch.group_id,
-                        dataset_id: patch.dataset_id.clone(),
-                        row_key: *row_key,
-                    }
-                );
-            }
-        }
+        )
+        .bind(patch.group_id.to_string())
+        .bind(patch.dataset_id.as_str())
+        .bind(row_key.to_string())
+        .bind(row_snapshot)
+        .bind(tombstoned)
+        .execute(&mut **connection)
+        .await
+        .context(SqlxSnafu)?;
     }
     Ok(())
+}
+
+async fn ensure_dataset_row_upsert_active_is_valid(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    row_key: &RowKey,
+) -> Result<(), StoreError> {
+    let existing_tombstoned =
+        load_dataset_row_tombstoned(connection, group_id, dataset_id, row_key).await?;
+    ensure!(
+        existing_tombstoned != Some(true),
+        InvalidDatasetRowStateTransitionSnafu {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            row_key: *row_key,
+            from: "tombstone",
+            to: "active",
+        }
+    );
+    Ok(())
+}
+
+async fn load_dataset_row_tombstoned(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    row_key: &RowKey,
+) -> Result<Option<bool>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT row_tombstoned
+FROM dataset_rows
+WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
+",
+    )
+    .bind(group_id.to_string())
+    .bind(dataset_id.as_str())
+    .bind(row_key.to_string())
+    .fetch_optional(&mut **connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(row.map(|row| row.get::<bool, _>("row_tombstoned")))
 }
 
 async fn load_replication_update(
@@ -992,7 +1019,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
 
 fn encode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
-    row: &RowSnapshot<'static, UpdateId>,
+    row: &ReplicationRowSnapshot,
 ) -> Result<Vec<u8>, StoreError> {
     let row = encode_row_snapshot(row, schema)
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
@@ -1002,7 +1029,7 @@ fn encode_dataset_row_snapshot(
 fn decode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
     bytes: &[u8],
-) -> Result<RowSnapshot<'static, UpdateId>, StoreError> {
+) -> Result<ReplicationRowSnapshot, StoreError> {
     let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
         SqliteStoreError::DecodeStoredProto {
             object: "dataset row snapshot",
@@ -1250,12 +1277,14 @@ enum SqliteStoreError {
     #[snafu(display("Stored group '{group_id}' was missing."))]
     MissingStoredGroup { group_id: GroupId },
     #[snafu(display(
-        "Stored dataset row '{group_id}/{dataset_id}/{row_key}' was missing for the requested action."
+        "Stored dataset row '{group_id}/{dataset_id}/{row_key}' cannot transition from {from} to {to}."
     ))]
-    MissingStoredDatasetRow {
+    InvalidDatasetRowStateTransition {
         group_id: GroupId,
         dataset_id: DatasetId,
         row_key: RowKey,
+        from: &'static str,
+        to: &'static str,
     },
     #[snafu(display("Stored update '{group_id}/{update_id:?}' was missing."))]
     MissingStoredUpdate {
@@ -1275,7 +1304,12 @@ impl From<SqliteStoreError> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{DatasetRowPatch, DatasetRowWrite, ReplicationUpdateFilter};
+    use crate::api::{
+        DatasetRowPatch,
+        DatasetRowWrite,
+        ReplicationRowRecord,
+        ReplicationUpdateFilter,
+    };
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
@@ -1334,11 +1368,40 @@ mod tests {
         DatasetRowPatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::Put {
+            actions: vec![DatasetRowWrite::UpsertActive {
                 row_key,
-                row: snapshot.clone().into_owned(),
+                snapshot: snapshot.clone().into_owned(),
             }],
         }
+    }
+
+    fn title_snapshot(
+        schema: &Arc<Schema>,
+        row_key: RowKey,
+        title: &str,
+    ) -> ReplicationRowSnapshot {
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let operation = source_data
+            .insert_row(
+                UpdateId {
+                    node_index: 0,
+                    version: 1,
+                },
+                row_key.0,
+                vec![
+                    schema
+                        .columns
+                        .get("title")
+                        .expect("title field should exist")
+                        .initial(title)
+                        .expect("field value should build"),
+                ],
+            )
+            .expect("row insert should succeed");
+        let RowOperation::Insert { snapshot, .. } = operation.operation else {
+            panic!("expected insert operation");
+        };
+        snapshot.into_owned()
     }
 
     #[test]
@@ -1377,8 +1440,12 @@ mod tests {
             encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
         let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
         let expected_row = match &row_patch.actions[0] {
-            DatasetRowWrite::Put { row, .. } => row.clone(),
-            DatasetRowWrite::Delete { .. } => panic!("expected row put patch"),
+            DatasetRowWrite::UpsertActive { row_key, snapshot } => ReplicationRowRecord {
+                row_id: *row_key,
+                snapshot: snapshot.clone(),
+                tombstoned: false,
+            },
+            DatasetRowWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
         };
         let update = ReplicationUpdateRecord {
             group_id,
@@ -1451,6 +1518,123 @@ mod tests {
             .expect("updates should load")
             .as_slice(),
             [only] if only == &update
+        ));
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(104));
+        let row_key = RowKey(Uuid::from_u128(204));
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let operation = source_data
+            .insert_row(
+                UpdateId {
+                    node_index: 0,
+                    version: 1,
+                },
+                row_key.0,
+                vec![
+                    schema
+                        .columns
+                        .get("title")
+                        .expect("title field should exist")
+                        .initial("deleted")
+                        .expect("field value should build"),
+                ],
+            )
+            .expect("row insert should succeed");
+        let RowOperation::Insert { snapshot, .. } = &operation.operation else {
+            panic!("expected insert operation");
+        };
+        let stored_row = ReplicationRowRecord {
+            row_id: row_key,
+            snapshot: snapshot.clone().into_owned(),
+            tombstoned: true,
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowWrite::UpsertTombstone {
+                row_key,
+                snapshot: stored_row.snapshot.clone(),
+            }],
+        }))
+        .expect("row patch should store");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        let requested_row_keys = [row_key];
+        let mut requested_row_keys = requested_row_keys.iter();
+        let loaded_rows = wait_for_store_future(transaction.load_dataset_rows(
+            &group_id,
+            &dataset_id,
+            &mut requested_row_keys,
+        ))
+        .expect("row slice should load");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        assert_eq!(
+            loaded_rows.rows.get(&row_key).cloned().flatten(),
+            Some(stored_row)
+        );
+    }
+
+    #[test]
+    fn sqlite_store_rejects_tombstone_to_active_row_transition() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(105));
+        let row_key = RowKey(Uuid::from_u128(205));
+        let tombstone_snapshot = title_snapshot(&schema, row_key, "deleted");
+        let active_snapshot = title_snapshot(&schema, row_key, "resurrected");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowWrite::UpsertTombstone {
+                row_key,
+                snapshot: tombstone_snapshot,
+            }],
+        }))
+        .expect("missing-to-tombstone upsert should store");
+
+        let error = wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id,
+            actions: vec![DatasetRowWrite::UpsertActive {
+                row_key,
+                snapshot: active_snapshot,
+            }],
+        }))
+        .expect_err("tombstone-to-active upsert should fail");
+        wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
+
+        assert!(matches!(
+            error,
+            StoreError::StoreExternal { ref source }
+                if source.to_string().contains("cannot transition from tombstone to active")
         ));
     }
 

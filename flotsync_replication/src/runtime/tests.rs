@@ -9,6 +9,7 @@ use super::{
     host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt, PreconfiguredPeerRoutesPublishMode},
     in_memory::{
         LocalDataset,
+        apply_local_delete,
         apply_local_upsert,
         validate_inbound_update_read_versions,
         validate_update_mapping,
@@ -53,7 +54,7 @@ use flotsync_core::{
     member::Identifier,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::{Field, RowOperations, Schema};
+use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
@@ -1131,6 +1132,194 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         .apply_update_batch_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
+}
+
+#[test]
+fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema_static();
+    let RuntimeFixture {
+        runtime: bob_runtime,
+        listener: bob_listener,
+        store: bob_store,
+    } = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), schema)],
+    );
+    let group_id = GroupId(Uuid::from_u128(24));
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 25);
+    let mut source_dataset = LocalDataset::new(schema);
+    let first_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "first" },
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+    )
+    .expect("first operation should build")
+    .expect("first operation should apply")
+    .encoded_operation;
+    let edit_operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "second" },
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+    )
+    .expect("edit operation should build")
+    .expect("edit operation should apply")
+    .encoded_operation;
+    let delete_operation = apply_local_delete(
+        &mut source_dataset,
+        &row_id,
+        UpdateId {
+            version: 3,
+            node_index: 0,
+        },
+    )
+    .expect("delete operation should build")
+    .encoded_operation;
+
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    bob_runtime
+        .apply_update_batch_for_test(
+            alice_member.clone(),
+            UpdateBatchMessage {
+                group_id,
+                update_id: UpdateId {
+                    version: 1,
+                    node_index: 0,
+                },
+                read_versions: VersionVector::initial(member_count),
+                dataset_updates: vec![DatasetUpdateMessage {
+                    dataset_id: dataset_id.clone(),
+                    operations: vec![first_operation],
+                }],
+            },
+        )
+        .expect("first update should apply");
+    bob_listener.wait_for_data_change_count(1);
+    assert_eq!(
+        bob_listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: row_id.clone(),
+                title: "first".to_owned(),
+            }],
+        }]
+    );
+
+    wait_for_test_reply(bob_runtime.publish_changes(vec![RowMutation::Delete {
+        row_id: row_id.clone(),
+    }]))
+    .expect("local delete should publish");
+    bob_listener.wait_for_data_change_count(2);
+    assert_eq!(
+        bob_listener.captured_data_changes()[1],
+        CapturedDataChange {
+            rows: vec![CapturedRowChange::Delete {
+                row_id: row_id.clone(),
+            }],
+        }
+    );
+    let deleted_row =
+        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key])
+            .rows
+            .get(&row_id.row_key)
+            .cloned()
+            .flatten()
+            .expect("deleted row should persist as a tombstone");
+    assert!(deleted_row.tombstoned);
+    drop(bob_runtime);
+
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime =
+        load_runtime_with_parts(app_bob_id(), bob_store.clone(), restarted_listener.clone());
+    wait_for_group_install(&restarted_runtime, group_id);
+    let mut edit_read_versions = VersionVector::initial(member_count);
+    edit_read_versions.increment_at(0);
+    restarted_runtime
+        .apply_update_batch_for_test(
+            alice_member.clone(),
+            UpdateBatchMessage {
+                group_id,
+                update_id: UpdateId {
+                    version: 2,
+                    node_index: 0,
+                },
+                read_versions: edit_read_versions,
+                dataset_updates: vec![DatasetUpdateMessage {
+                    dataset_id: dataset_id.clone(),
+                    operations: vec![edit_operation],
+                }],
+            },
+        )
+        .expect("concurrent edit after local delete should apply to the tombstone");
+    assert!(restarted_listener.captured_data_changes().is_empty());
+
+    let edited_tombstone =
+        load_persisted_row_slice(bob_store.as_ref(), group_id, &dataset_id, [row_id.row_key])
+            .rows
+            .get(&row_id.row_key)
+            .cloned()
+            .flatten()
+            .expect("edited tombstone should persist");
+    assert!(edited_tombstone.tombstoned);
+    let materialised_tombstone =
+        flotsync_messages::InMemoryData::from_row_snapshots_with_tombstones(
+            schema,
+            [flotsync_data_types::schema::datamodel::RowRecord {
+                row_id: row_id.row_key.0,
+                snapshot: edited_tombstone.snapshot,
+                tombstoned: edited_tombstone.tombstoned,
+            }],
+        )
+        .expect("tombstone should rehydrate");
+    assert_eq!(materialised_tombstone.num_active_rows(), 0);
+    let materialised_row = materialised_tombstone
+        .get_row(&row_id.row_key.0)
+        .expect("tombstoned row should remain addressable");
+    let title = materialised_row
+        .get_field_value::<str>("title")
+        .expect("title should decode");
+    assert_eq!(title.as_ref(), "second");
+
+    let mut delete_read_versions = VersionVector::initial(member_count);
+    delete_read_versions.increment_at(0);
+    delete_read_versions.increment_at(0);
+    restarted_runtime
+        .apply_update_batch_for_test(
+            alice_member,
+            UpdateBatchMessage {
+                group_id,
+                update_id: UpdateId {
+                    version: 3,
+                    node_index: 0,
+                },
+                read_versions: delete_read_versions,
+                dataset_updates: vec![DatasetUpdateMessage {
+                    dataset_id,
+                    operations: vec![delete_operation],
+                }],
+            },
+        )
+        .expect("delete against an existing tombstone should be idempotent");
+    assert!(restarted_listener.captured_data_changes().is_empty());
 }
 
 #[test]
