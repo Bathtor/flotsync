@@ -1,0 +1,14 @@
+[flotsync.examples.replicated-checklist]
+local-member = "current-system"
+store-path = "stores/current-system.sqlite"
+group-id = 17872
+ordered-members = ["current-system", "raspberrypi"]
+
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "0.0.0.0:45100"
+
+[[flotsync.replication.runtime.static-peer-routes]]
+name = "raspberrypi"
+protocol = "udp"
+ip = "192.168.178.72"
+port = 45101
