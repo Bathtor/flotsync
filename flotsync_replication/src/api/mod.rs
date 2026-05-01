@@ -20,6 +20,10 @@ pub use flotsync_data_types::{
 pub use ids::*;
 
 /// Write-only row payload submitted by applications.
+///
+/// For a new row this must contain the initial values required by the dataset
+/// schema. For an existing row this is a sparse field patch: fields omitted from
+/// `fields` are intentionally left unchanged by `publish_changes`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MutableRow {
     /// Desired nullable field values keyed by field name.
@@ -50,7 +54,9 @@ macro_rules! row_values {
 /// A row-level mutation submitted by an application.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowMutation {
+    /// Insert a new row or update the provided fields of an existing row.
     Upsert { row_id: RowId, row: MutableRow },
+    /// Tombstone an existing row.
     Delete { row_id: RowId },
 }
 

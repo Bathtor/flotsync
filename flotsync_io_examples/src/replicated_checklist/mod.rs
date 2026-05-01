@@ -384,6 +384,33 @@ impl ChecklistItem {
         MutableRow::new(fields)
     }
 
+    fn changed_fields_since(&self, original: &Self) -> MutableRow {
+        let mut fields = HashMap::new();
+        if self.text != original.text {
+            insert_field(&mut fields, FIELD_TEXT, self.text.clone());
+        }
+        if self.note != original.note {
+            insert_field(&mut fields, FIELD_NOTE, self.note.clone());
+        }
+        if self.tags != original.tags {
+            insert_field(
+                &mut fields,
+                FIELD_TAGS,
+                self.tags.iter().cloned().collect::<Vec<_>>(),
+            );
+        }
+        if self.status != original.status {
+            insert_field(&mut fields, FIELD_STATUS, self.status.as_str().to_owned());
+        }
+        if self.priority != original.priority {
+            insert_field(&mut fields, FIELD_PRIORITY, self.priority);
+        }
+        if self.edit_count != original.edit_count {
+            insert_field(&mut fields, FIELD_EDIT_COUNT, self.edit_count);
+        }
+        MutableRow::new(fields)
+    }
+
     fn increment_edit_count(&mut self) {
         self.edit_count = self
             .edit_count
@@ -417,7 +444,7 @@ pub struct ChecklistEvent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChecklistSyncPlan {
     row_keys: HashSet<RowKey>,
-    /// Full-row mutations to pass to `publish_changes`.
+    /// Row mutations to pass to `publish_changes`.
     pub mutations: Vec<RowMutation>,
 }
 
@@ -465,9 +492,9 @@ pub enum ChecklistWorkingSetError {
 
 /// In-memory REPL view of checklist rows between explicit `sync` commands.
 ///
-/// Local commands update this working set and mark full rows dirty. Listener
-/// changes are queued here and only applied when `sync` drains the queue after
-/// any local dirty rows have been published.
+/// Local commands update this working set and remember the original row state
+/// for dirty rows. Listener changes are queued here and only applied when
+/// `sync` drains the queue after any local dirty rows have been published.
 pub struct ChecklistWorkingSet {
     group_id: GroupId,
     dataset_id: DatasetId,
@@ -683,10 +710,10 @@ impl ChecklistWorkingSet {
 
         let mut row_keys = HashSet::with_capacity(self.dirty_rows.len());
         let mut mutations = Vec::with_capacity(self.dirty_rows.len());
-        for (&row_key, &kind) in &self.dirty_rows {
+        for (&row_key, dirty_row) in &self.dirty_rows {
             row_keys.insert(row_key);
-            match kind {
-                DirtyRowKind::Insert | DirtyRowKind::Update => {
+            match dirty_row {
+                DirtyRowKind::Insert => {
                     let item = self
                         .rows
                         .get(&row_key)
@@ -694,6 +721,16 @@ impl ChecklistWorkingSet {
                     mutations.push(RowMutation::Upsert {
                         row_id: self.row_id(row_key),
                         row: item.to_mutable_row(),
+                    });
+                }
+                DirtyRowKind::Update { original } => {
+                    let item = self
+                        .rows
+                        .get(&row_key)
+                        .ok_or(ChecklistWorkingSetError::MissingDirtyRow { row_key })?;
+                    mutations.push(RowMutation::Upsert {
+                        row_id: self.row_id(row_key),
+                        row: item.changed_fields_since(original),
                     });
                 }
                 DirtyRowKind::Delete => {
@@ -751,21 +788,25 @@ impl ChecklistWorkingSet {
         update: impl FnOnce(&mut ChecklistItem) -> bool,
     ) -> Result<(), ChecklistWorkingSetError> {
         let row_key = self.resolve_selector(selector)?;
+        let original = self
+            .rows
+            .get(&row_key)
+            .expect("resolved selector must point to a visible row")
+            .clone();
         let item = self
             .rows
             .get_mut(&row_key)
             .expect("resolved selector must point to a visible row");
         if update(item) {
-            self.mark_dirty(row_key);
+            self.mark_dirty(row_key, original);
         }
         Ok(())
     }
 
-    fn mark_dirty(&mut self, row_key: RowKey) {
-        if self.dirty_rows.get(&row_key) == Some(&DirtyRowKind::Insert) {
-            return;
-        }
-        self.dirty_rows.insert(row_key, DirtyRowKind::Update);
+    fn mark_dirty(&mut self, row_key: RowKey, original: ChecklistItem) {
+        self.dirty_rows
+            .entry(row_key)
+            .or_insert(DirtyRowKind::Update { original });
     }
 
     fn resolve_selector(&self, selector: ItemSelector) -> Result<RowKey, ChecklistWorkingSetError> {
@@ -835,12 +876,13 @@ impl ChecklistWorkingSet {
 }
 
 /// Dirty state for a row in the local working set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum DirtyRowKind {
     /// Row was created locally and has not been published yet.
     Insert,
-    /// Existing row was modified locally and needs a full-row upsert.
-    Update,
+    /// Existing row was modified locally; `original` is the snapshot visible
+    /// before the first unsynchronised local edit.
+    Update { original: ChecklistItem },
     /// Existing row was deleted locally and needs a delete mutation.
     Delete,
 }
@@ -1134,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn working_set_local_edits_mark_full_rows_dirty_without_queueing_events() {
+    fn working_set_local_insert_edits_prepare_one_mutation_without_queueing_events() {
         let row_key = RowKey(Uuid::from_u128(1));
         let mut checklist = test_working_set();
 
@@ -1222,6 +1264,60 @@ mod tests {
             vec!["alpha", "zeta"]
         );
         assert_eq!(item.edit_count, 3);
+    }
+
+    #[test]
+    fn dirty_update_publishes_only_local_field_diff_so_remote_fields_survive_sync() {
+        let row_key = RowKey(Uuid::from_u128(8));
+        let mut checklist = test_working_set();
+        let base = test_item("base", 1);
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: base.clone(),
+        }]);
+        checklist.drain_queued_events();
+
+        checklist
+            .set_priority(ItemSelector::RowKey(row_key), 7)
+            .expect("priority edit should apply");
+
+        let plan = checklist
+            .prepare_sync()
+            .expect("plan should build")
+            .expect("dirty update should produce a sync plan");
+        assert_eq!(plan.mutations.len(), 1);
+        let RowMutation::Upsert { row, .. } = &plan.mutations[0] else {
+            panic!("dirty update should publish an upsert");
+        };
+        let changed_fields = row
+            .fields
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            changed_fields,
+            HashSet::from([FIELD_PRIORITY, FIELD_EDIT_COUNT])
+        );
+
+        let mut remote = base;
+        remote.text = "remote title".to_owned();
+        remote.increment_edit_count();
+        let mut merged = remote.clone();
+        merged.priority = 7;
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: remote,
+        }]);
+        checklist.enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+            row_key,
+            item: merged,
+        }]);
+
+        assert_eq!(checklist.finish_successful_sync(Some(plan)), 2);
+        let item = checklist.item(row_key).expect("row should remain visible");
+        assert_eq!(item.text, "remote title");
+        assert_eq!(item.priority, 7);
+        assert_eq!(checklist.dirty_row_count(), 0);
     }
 
     #[test]
