@@ -1,7 +1,7 @@
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowRecord, RowSnapshot};
 use flotsync_utils::BoxFuture;
-use smallvec::SmallVec;
+use smallvec::{Array, SmallVec};
 use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
@@ -98,17 +98,90 @@ impl RowChange {
     }
 }
 
-/// Batch of row changes emitted by a [`RowProvider`].
+/// One owned batch emitted by a [`BatchProvider`].
+pub trait ProviderBatch: Send + 'static {
+    /// Remove previously emitted rows before reusing this allocation.
+    fn clear(&mut self);
+    /// Return whether the batch currently contains no rows.
+    fn is_empty(&self) -> bool;
+}
+
+impl<T> ProviderBatch for Vec<T>
+where
+    T: Send + 'static,
+{
+    fn clear(&mut self) {
+        Vec::clear(self);
+    }
+
+    fn is_empty(&self) -> bool {
+        Vec::is_empty(self)
+    }
+}
+
+impl<A> ProviderBatch for SmallVec<A>
+where
+    A: Array + Send + 'static,
+    A::Item: Send + 'static,
+{
+    fn clear(&mut self) {
+        SmallVec::clear(self);
+    }
+
+    fn is_empty(&self) -> bool {
+        SmallVec::is_empty(self)
+    }
+}
+
+/// Source for owned batches with explicit end-of-stream signalling.
 ///
-/// An empty batch marks end-of-stream.
+/// `Some(batch)` means at least one row was emitted. `None` means the provider
+/// is exhausted. `fill_batch` accepts the previous batch by value so
+/// implementations may reuse, move, or hand the allocation to another thread
+/// while preparing the next batch.
+pub trait BatchProvider: Send {
+    type Batch: ProviderBatch;
+
+    /// Allocate a fresh empty batch using this provider's batching policy.
+    fn new_batch(&self) -> Self::Batch;
+
+    fn fill_batch<'a>(
+        &'a mut self,
+        reuse: Self::Batch,
+    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>>;
+
+    fn next_batch<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
+        let reuse = self.new_batch();
+        self.fill_batch(reuse)
+    }
+}
+
+/// Process all batches from `provider`, reusing each emitted batch allocation.
+///
+/// `process` receives the batch mutably so it can use concrete batch APIs such
+/// as `drain` before the allocation is handed back to the provider.
+pub async fn process_batches<B>(
+    provider: &mut dyn BatchProvider<Batch = B>,
+    mut process: impl FnMut(&mut B) -> Result<(), RowProviderError>,
+) -> Result<(), RowProviderError>
+where
+    B: ProviderBatch,
+{
+    let mut batch = provider.new_batch();
+    while let Some(mut filled_batch) = provider.fill_batch(batch).await? {
+        process(&mut filled_batch)?;
+        batch = filled_batch;
+    }
+    Ok(())
+}
+
+/// Batch of row changes emitted by a [`RowProvider`].
 pub type RowChangeBatch = SmallVec<[RowChange; 4]>;
 
 /// Source for batched row-level changes carried in `ReplicationEvent::DataChanged`.
-///
-/// Returning an empty batch signals end-of-stream.
-pub trait RowProvider: Send {
-    fn next_batch<'a>(&'a mut self) -> BoxFuture<'a, Result<RowChangeBatch, RowProviderError>>;
-}
+pub type RowProvider = dyn BatchProvider<Batch = RowChangeBatch>;
 
 /// Request a full snapshot of all rows in the latest state of the replication
 /// group with `group_id` for the given `datasets`.
@@ -131,7 +204,7 @@ pub struct SnapshotRowsRequest {
 /// Row snapshot stream returned by [`ReplicationApi::snapshot_rows`].
 pub struct SnapshotRows {
     pub group_id: GroupId,
-    pub rows: Box<dyn SnapshotRowProvider>,
+    pub rows: Box<SnapshotRowProvider>,
 }
 
 impl std::fmt::Debug for SnapshotRows {
@@ -156,13 +229,9 @@ pub type SnapshotRowBatch = SmallVec<[SnapshotRow; 16]>;
 
 /// Source for batched snapshot rows.
 ///
-/// Returning `None` signals end-of-stream. Providers may hold a store read
-/// transaction internally, so callers should drain or drop them promptly.
-pub trait SnapshotRowProvider: Send {
-    fn next_batch<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Option<SnapshotRowBatch>, RowProviderError>>;
-}
+/// Snapshot providers may hold a store read transaction internally, so callers
+/// should drain or drop them promptly.
+pub type SnapshotRowProvider = dyn BatchProvider<Batch = SnapshotRowBatch>;
 
 /// One row entry in an initial dataset state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,26 +241,15 @@ pub struct InitialRowState {
 }
 
 /// Batch type used by [`InitialRowProvider`].
-///
-/// An empty batch marks end-of-stream.
 pub type InitialRowBatch = Vec<InitialRowState>;
 
 /// Source for one dataset's initial rows in `InitialGroupState`.
-///
-/// `reuse` is owned and returned so callers can keep allocation capacity across calls.
-/// Returning an empty batch signals end-of-stream.
-pub trait InitialRowProvider: Send {
-    fn next_batch<'a>(
-        &'a mut self,
-        reuse: InitialRowBatch,
-        max_rows: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<InitialRowBatch, RowProviderError>>;
-}
+pub type InitialRowProvider = dyn BatchProvider<Batch = InitialRowBatch>;
 
 /// Initial state rows for one dataset.
 pub struct InitialDatasetState {
     pub dataset_id: DatasetId,
-    pub rows: Box<dyn InitialRowProvider>,
+    pub rows: Box<InitialRowProvider>,
 }
 
 /// Initial group state grouped by dataset.
@@ -288,7 +346,7 @@ pub struct GroupInvitation {
 /// Listener-visible replication events.
 pub enum ReplicationEvent {
     DataChanged {
-        rows: Box<dyn RowProvider>,
+        rows: Box<RowProvider>,
     },
     GroupInvitation {
         invitation: GroupInvitation,

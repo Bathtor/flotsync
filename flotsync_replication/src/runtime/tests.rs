@@ -32,6 +32,7 @@ use crate::{
         ListenerExternalSnafu,
         MemberIdentity,
         MemberIndex,
+        ProviderExternalSnafu,
         ReplicationApi,
         ReplicationConfig,
         ReplicationEvent,
@@ -43,6 +44,7 @@ use crate::{
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
         RowChange,
+        RowChangeBatch,
         RowId,
         RowKey,
         RowKeyIterator,
@@ -51,6 +53,7 @@ use crate::{
         SnapshotRow,
         SnapshotRowsRequest,
         StoreError,
+        process_batches,
     },
 };
 use flotsync_core::{
@@ -422,19 +425,18 @@ impl ReplicationEventListener for ListenerStub {
             match event {
                 ReplicationEvent::DataChanged { mut rows } => {
                     let mut captured_rows = Vec::new();
-                    loop {
-                        let batch = rows
-                            .next_batch()
-                            .await
-                            .boxed()
-                            .context(ListenerExternalSnafu)?;
-                        if batch.is_empty() {
-                            break;
+                    process_batches::<RowChangeBatch>(rows.as_mut(), |batch| {
+                        for change in batch.drain(..) {
+                            let captured = CapturedRowChange::capture(change)
+                                .boxed()
+                                .context(ProviderExternalSnafu)?;
+                            captured_rows.push(captured);
                         }
-                        for change in batch {
-                            captured_rows.push(CapturedRowChange::capture(change)?);
-                        }
-                    }
+                        Ok(())
+                    })
+                    .await
+                    .boxed()
+                    .context(ListenerExternalSnafu)?;
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,

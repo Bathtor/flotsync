@@ -190,11 +190,7 @@ impl ReplicationEventListener for ChecklistListener {
         async move {
             match event {
                 ReplicationEvent::DataChanged { mut rows } => {
-                    loop {
-                        let batch = rows.next_batch().await.boxed()?;
-                        if batch.is_empty() {
-                            break;
-                        }
+                    while let Some(batch) = rows.next_batch().await.boxed()? {
                         sender.send(batch.into_iter().collect()).map_err(|_| {
                             ListenerError::Rejected {
                                 message: "checklist listener queue is closed".to_owned(),

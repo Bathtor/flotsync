@@ -31,6 +31,7 @@ use crate::{
     api::{
         ApiError,
         ApiExternalSnafu,
+        BatchProvider,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DatasetId,
@@ -60,7 +61,6 @@ use crate::{
         SchemaSource,
         SnapshotRow,
         SnapshotRowBatch,
-        SnapshotRowProvider,
         SnapshotRows,
         SnapshotRowsRequest,
         StoreError,
@@ -270,13 +270,20 @@ impl StoreSnapshotRowProvider {
     }
 }
 
-impl SnapshotRowProvider for StoreSnapshotRowProvider {
-    fn next_batch<'a>(
+impl BatchProvider for StoreSnapshotRowProvider {
+    type Batch = SnapshotRowBatch;
+
+    fn new_batch(&self) -> Self::Batch {
+        SnapshotRowBatch::with_capacity(self.max_rows_per_batch.get())
+    }
+
+    fn fill_batch<'a>(
         &'a mut self,
-    ) -> BoxFuture<'a, Result<Option<SnapshotRowBatch>, RowProviderError>> {
+        mut reuse: Self::Batch,
+    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
         async move {
-            let mut snapshot_rows = SnapshotRowBatch::new();
-            'fill_batch: while snapshot_rows.is_empty() {
+            reuse.clear();
+            'fill_batch: while reuse.is_empty() {
                 let Some(dataset_id) = self.select_dataset() else {
                     self.release_transaction().await?;
                     return Ok(None);
@@ -297,7 +304,7 @@ impl SnapshotRowProvider for StoreSnapshotRowProvider {
                     if record.tombstoned && !self.include_tombstones {
                         continue 'rows;
                     }
-                    snapshot_rows.push(Self::snapshot_row_from_record(
+                    reuse.push(Self::snapshot_row_from_record(
                         self.group_id,
                         dataset_id.clone(),
                         record,
@@ -309,12 +316,12 @@ impl SnapshotRowProvider for StoreSnapshotRowProvider {
                 } else {
                     self.finish_current_dataset();
                 }
-                if snapshot_rows.is_empty() {
+                if reuse.is_empty() {
                     continue 'fill_batch;
                 }
             }
 
-            Ok(Some(snapshot_rows))
+            Ok(Some(reuse))
         }
         .boxed()
     }
