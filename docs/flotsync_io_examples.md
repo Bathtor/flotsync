@@ -192,3 +192,6 @@ cargo run -p flotsync_io_examples --bin replicated_checklist -- bob.toml
 
 Local edit commands update the in-process working set. Run `sync` when you want that peer to
 publish dirty rows and then apply queued incoming events.
+
+Concrete Alice/Bob manual acceptance flows for the replicated checklist are documented in
+[`replicated_checklist_scenarios.md`](replicated_checklist_scenarios.md).
