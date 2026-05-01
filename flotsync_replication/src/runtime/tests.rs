@@ -879,6 +879,52 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
 }
 
 #[test]
+fn publish_changes_error_display_includes_local_operation_source() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(
+            dataset_id.clone(),
+            Arc::new(Schema::from_fields([
+                Field::linear_string("title"),
+                Field::monotonic_counter("edit_count"),
+            ])),
+        )],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let row_id = test_row_id(group_id, dataset_id, 40);
+
+    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id: row_id.clone(),
+        row: crate::row_values! {
+            "title" => "counted row",
+            "edit_count" => 5_u64,
+        },
+    }]))
+    .expect("initial publish should succeed");
+
+    let error = wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
+        row_id,
+        row: crate::row_values! {
+            "edit_count" => 4_u64,
+        },
+    }]))
+    .expect_err("counter decrease should fail publish");
+    let message = error.to_string();
+
+    assert!(
+        message.contains("monotonic and cannot decrease from 5 to 4"),
+        "{message}"
+    );
+}
+
+#[test]
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();

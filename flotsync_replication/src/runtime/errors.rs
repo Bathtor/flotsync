@@ -16,7 +16,7 @@ pub(super) enum CreateGroupError {
     InitialStateUnsupported,
     #[snafu(display("Group members must include the local member {local_member}."))]
     LocalMemberMissing { local_member: MemberIdentity },
-    #[snafu(display("Group member list is invalid."))]
+    #[snafu(display("Group member list is invalid: {source}"))]
     InvalidMembers { source: GroupMembersError },
 }
 
@@ -27,7 +27,9 @@ pub(crate) enum GroupInstallError {
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
     InstallMissingLocalMember { local_member: MemberIdentity },
-    #[snafu(display("Persisted group {group_id} carried an invalid canonical member set."))]
+    #[snafu(display(
+        "Persisted group {group_id} carried an invalid canonical member set: {source}"
+    ))]
     InvalidPersistedMembers {
         group_id: GroupId,
         source: GroupMembersError,
@@ -50,7 +52,7 @@ pub(crate) enum GroupInstallError {
         actual_member_count: usize,
     },
     #[snafu(display(
-        "Replication-store access failed while installing group {group_id} at {location}."
+        "Replication-store access failed while installing group {group_id} at {location}: {source}"
     ))]
     StoreGroup {
         group_id: GroupId,
@@ -64,7 +66,7 @@ pub(crate) enum GroupInstallError {
 #[snafu(visibility(pub(super)))]
 pub(super) enum RuntimeStartupError {
     #[snafu(display(
-        "Replication-store access failed while hydrating runtime state at {location}."
+        "Replication-store access failed while hydrating runtime state at {location}: {source}"
     ))]
     StoreStartup {
         source: StoreError,
@@ -74,7 +76,7 @@ pub(super) enum RuntimeStartupError {
     #[snafu(display("Persisted replication runtime state contained duplicate group {group_id}."))]
     DuplicateGroup { group_id: GroupId },
     #[snafu(display(
-        "Persisted replication group {group_id} could not be rebuilt into the runtime read model."
+        "Persisted replication group {group_id} could not be rebuilt into the runtime read model: {source}"
     ))]
     InvalidGroup {
         group_id: GroupId,
@@ -96,21 +98,21 @@ pub(crate) enum PublishChangesError {
     },
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
-    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
         source: GroupInstallError,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Replication-store access failed at {location}."))]
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
     StoreAccess {
         source: StoreError,
         #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display(
-        "Failed to load schema for dataset '{dataset_id}' from the replication store."
+        "Failed to load schema for dataset '{dataset_id}' from the replication store: {source}"
     ))]
     LoadDatasetSchema {
         dataset_id: DatasetId,
@@ -126,18 +128,20 @@ pub(crate) enum PublishChangesError {
         dataset_id: DatasetId,
         field_name: String,
     },
-    #[snafu(display("Row {row_id} carried a value incompatible with dataset '{dataset_id}'.",))]
+    #[snafu(display(
+        "Row {row_id} carried a value incompatible with dataset '{dataset_id}': {source}",
+    ))]
     InvalidFieldValue {
         row_id: RowId,
         dataset_id: DatasetId,
         source: Box<FieldValueBuildError>,
     },
-    #[snafu(display("Applying local mutation for row {row_id} failed."))]
+    #[snafu(display("Applying local mutation for row {row_id} failed: {source}"))]
     ApplyLocalMutation {
         row_id: RowId,
         source: OperationError,
     },
-    #[snafu(display("Encoding dataset '{dataset_id}' update for transport failed."))]
+    #[snafu(display("Encoding dataset '{dataset_id}' update for transport failed: {source}"))]
     EncodeOperation {
         dataset_id: DatasetId,
         source: OperationCodecError,
@@ -153,13 +157,13 @@ pub(crate) enum PublishChangesError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(inbound))]
 pub(crate) enum InboundDeliveryError {
-    #[snafu(display("Failed to decode inbound runtime message."))]
+    #[snafu(display("Failed to decode inbound runtime message: {source}"))]
     DecodeMessage { source: RuntimeMessageError },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
     UnexpectedReliableMessage,
     #[snafu(display("Group broadcast unexpectedly carried a reliable bootstrap message."))]
     UnexpectedGroupMessage,
-    #[snafu(display("Inbound bootstrap message carried an invalid group member set."))]
+    #[snafu(display("Inbound bootstrap message carried an invalid group member set: {source}"))]
     InvalidBootstrapMembers { source: GroupMembersError },
     #[snafu(display(
         "Inbound bootstrap for group {group_id} did not include the local member {local_member}.",
@@ -168,33 +172,33 @@ pub(crate) enum InboundDeliveryError {
         group_id: GroupId,
         local_member: MemberIdentity,
     },
-    #[snafu(display("Failed to install inbound bootstrap group {group_id} locally."))]
+    #[snafu(display("Failed to install inbound bootstrap group {group_id} locally: {source}"))]
     InstallBootstrapGroup {
         group_id: GroupId,
         source: GroupInstallError,
     },
-    #[snafu(display("Failed to complete the processed promise for group {group_id}."))]
+    #[snafu(display("Failed to complete the processed promise for group {group_id}: {source}"))]
     CompleteProcessedPromise {
         group_id: GroupId,
         source: PromiseErr,
     },
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
-    #[snafu(display("Persisted group {group_id} was invalid at {location}."))]
+    #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
         source: GroupInstallError,
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Replication-store access failed at {location}."))]
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
     StoreAccess {
         source: StoreError,
         #[snafu(implicit)]
         location: Location,
     },
     #[snafu(display(
-        "Failed to load schema for inbound dataset '{dataset_id}' from the replication store."
+        "Failed to load schema for inbound dataset '{dataset_id}' from the replication store: {source}"
     ))]
     LoadDatasetSchema {
         dataset_id: DatasetId,
@@ -218,7 +222,9 @@ pub(crate) enum InboundDeliveryError {
         expected_index: MemberIndex,
         actual_index: MemberIndex,
     },
-    #[snafu(display("Inbound update for group {group_id} carried invalid read versions.",))]
+    #[snafu(display(
+        "Inbound update for group {group_id} carried invalid read versions: {source}",
+    ))]
     DecodeReadVersions {
         group_id: GroupId,
         source: RuntimeMessageError,
@@ -247,17 +253,19 @@ pub(crate) enum InboundDeliveryError {
         dataset_id: DatasetId,
         operation_change_id: UpdateId,
     },
-    #[snafu(display("Failed to decode inbound schema operation for dataset '{dataset_id}'."))]
+    #[snafu(display(
+        "Failed to decode inbound schema operation for dataset '{dataset_id}': {source}"
+    ))]
     DecodeSchemaOperation {
         dataset_id: DatasetId,
         source: OperationCodecError,
     },
-    #[snafu(display("Applying inbound mutation for row {row_id} failed."))]
+    #[snafu(display("Applying inbound mutation for row {row_id} failed: {source}"))]
     ApplyInboundMutation {
         row_id: RowId,
         source: OperationError,
     },
-    #[snafu(display("Listener rejected one inbound data-change event."))]
+    #[snafu(display("Listener rejected one inbound data-change event: {source}"))]
     NotifyListener { source: ListenerError },
 }
 

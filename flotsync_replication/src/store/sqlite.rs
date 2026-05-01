@@ -49,8 +49,8 @@ use sqlx::{
     QueryBuilder,
     Row,
     Sqlite,
+    SqliteConnection,
     SqlitePool,
-    pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
@@ -193,9 +193,8 @@ impl ReplicationStore for SqliteReplicationStore {
         let pool = self.pool.clone();
         let schema_sources = self.schema_sources.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
+            let connection = pool
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context(SqlxSnafu)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
@@ -207,19 +206,19 @@ impl ReplicationStore for SqliteReplicationStore {
     }
 }
 
-/// One open store transaction backed by a dedicated pooled SQLite connection.
+/// One open store transaction backed by SQLx's transaction guard.
 ///
 /// `connection` becomes `None` after explicit commit or rollback. Dropping an
-/// open transaction returns the connection to the pool while SQLite rolls the
-/// uncommitted transaction back implicitly.
+/// open transaction lets SQLx queue a rollback before returning the connection
+/// to the pool.
 struct SqliteReplicationStoreTransaction {
-    connection: Option<SqliteStoreConnection>,
+    connection: Option<SqliteStoreTransaction>,
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
 }
 
 impl SqliteReplicationStoreTransaction {
     fn new(
-        connection: SqliteStoreConnection,
+        connection: SqliteStoreTransaction,
         schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     ) -> Self {
         Self {
@@ -228,7 +227,7 @@ impl SqliteReplicationStoreTransaction {
         }
     }
 
-    fn assert_open_connection(&mut self) -> &mut SqliteStoreConnection {
+    fn assert_open_connection(&mut self) -> &mut SqliteStoreTransaction {
         self.connection
             .as_mut()
             .expect("sqlite replication transaction must not be used after commit or rollback")
@@ -239,7 +238,7 @@ impl Drop for SqliteReplicationStoreTransaction {
     fn drop(&mut self) {
         if self.connection.is_some() {
             warn!(
-                "dropping sqlite replication transaction with uncommitted work; returning connection to the pool so SQLite can roll the transaction back"
+                "dropping sqlite replication transaction with uncommitted work; SQLx will roll it back before returning the connection to the pool"
             );
         }
     }
@@ -362,43 +361,31 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
-            let mut connection = self
+            let connection = self
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not commit twice");
-            let commit_result = sqlx::query("COMMIT")
-                .execute(&mut *connection)
-                .await
-                .context(SqlxSnafu)
-                .map(|_| ())
-                .map_err(StoreError::from);
-            if commit_result.is_err()
-                && let Err(rollback_error) = sqlx::query("ROLLBACK").execute(&mut *connection).await
-            {
-                warn!("sqlite rollback after failed commit also failed: {rollback_error}");
-            }
-            commit_result
+            connection.commit().await.context(SqlxSnafu)?;
+            Ok(())
         }
         .boxed()
     }
 
     fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
-            let mut connection = self
+            let connection = self
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not roll back twice");
-            sqlx::query("ROLLBACK")
-                .execute(&mut *connection)
-                .await
-                .context(SqlxSnafu)?;
+            connection.rollback().await.context(SqlxSnafu)?;
             Ok(())
         }
         .boxed()
     }
 }
 
-type SqliteStoreConnection = PoolConnection<Sqlite>;
+type SqliteStoreConnection = SqliteConnection;
+type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 
 /// SQLite compares BLOBs lexicographically. Fixed-width big-endian encodings
 /// therefore preserve the natural ordering of `u64` values across the full
@@ -461,7 +448,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     ];
     for statement in schema_statements {
         sqlx::query(statement)
-            .execute(&mut **connection)
+            .execute(&mut *connection)
             .await
             .context(SqlxSnafu)?;
     }
@@ -480,7 +467,7 @@ WHERE group_id = ?1
 ",
     )
     .bind(group_id.to_string())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(row) = row else {
@@ -512,7 +499,7 @@ FROM replication_groups
 ORDER BY group_id
 ",
     )
-    .fetch_all(&mut **connection)
+    .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let mut groups = Vec::with_capacity(group_ids.len());
@@ -543,7 +530,7 @@ VALUES (?1, ?2, ?3, ?4)
     .bind(i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?)
     .bind(i64::from(group.local_member_index.as_u32()))
     .bind(version_vector)
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
 
@@ -558,7 +545,7 @@ VALUES (?1, ?2, ?3)
         .bind(group.group_id.to_string())
         .bind(member_index)
         .bind(member.to_string())
-        .execute(&mut **connection)
+        .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
     }
@@ -579,7 +566,7 @@ WHERE group_id = ?1
     )
     .bind(group_id.to_string())
     .bind(encode_stored_version_vector(version_vector))
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .rows_affected();
@@ -646,7 +633,7 @@ WHERE group_id = ",
     query_builder.push(")");
     let stored_rows = query_builder
         .build()
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
     for row in stored_rows {
@@ -718,7 +705,7 @@ SET row_snapshot = excluded.row_snapshot,
         .bind(row_key.to_string())
         .bind(row_snapshot)
         .bind(tombstoned)
-        .execute(&mut **connection)
+        .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
     }
@@ -762,7 +749,7 @@ WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
     .bind(row_key.to_string())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     Ok(row.map(|row| row.get::<bool, _>("row_tombstoned")))
@@ -786,7 +773,7 @@ WHERE group_id = ?1
     .bind(group_id.to_string())
     .bind(i64::from(update_id.node_index))
     .bind(encode_update_version_sort_key_vec(update_id.version))
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(row) = row else {
@@ -836,7 +823,7 @@ ORDER BY update_version, update_node_index
     let member_count = load_group_member_count(connection, group_id).await?;
     let rows = sqlx::query(sql)
         .bind(group_id.to_string())
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
 
@@ -880,7 +867,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     .bind(update.sender.to_string())
     .bind(update.applied_locally)
     .bind(update_batch)
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     Ok(())
@@ -903,7 +890,7 @@ WHERE group_id = ?1
     .bind(group_id.to_string())
     .bind(i64::from(update_id.node_index))
     .bind(encode_update_version_sort_key_vec(update_id.version))
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .rows_affected();
@@ -931,7 +918,7 @@ ORDER BY member_index
 ",
     )
     .bind(group_id.to_string())
-    .fetch_all(&mut **connection)
+    .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     ensure!(
@@ -962,7 +949,7 @@ WHERE group_id = ?1
 ",
     )
     .bind(group_id.to_string())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(member_count) = member_count else {
@@ -989,7 +976,7 @@ WHERE group_id = ?1 AND dataset_id = ?2
     )
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .is_some();
@@ -1011,7 +998,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
     )
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     Ok(())
@@ -1209,27 +1196,27 @@ fn invalid_stored_object(
 
 #[derive(Debug, Snafu)]
 enum SqliteStoreError {
-    #[snafu(display("SQLite operation failed."))]
+    #[snafu(display("SQLite operation failed: {source}"))]
     Sqlx { source: sqlx::Error },
-    #[snafu(display("SQLite connection URL '{database_url}' was invalid."))]
+    #[snafu(display("SQLite connection URL '{database_url}' was invalid: {source}"))]
     ParseSqliteUrl {
         database_url: String,
         source: sqlx::Error,
     },
-    #[snafu(display("Stored group id was not a valid UUID."))]
+    #[snafu(display("Stored group id was not a valid UUID: {source}"))]
     InvalidGroupId { source: uuid::Error },
-    #[snafu(display("Stored row key was not a valid UUID."))]
+    #[snafu(display("Stored row key was not a valid UUID: {source}"))]
     InvalidRowKey { source: uuid::Error },
-    #[snafu(display("Stored member identity '{raw}' was invalid."))]
+    #[snafu(display("Stored member identity '{raw}' was invalid: {source}"))]
     InvalidMemberIdentity {
         raw: String,
         source: IdentifierParseError,
     },
     #[snafu(display("Stored group had no members."))]
     EmptyGroupMembers,
-    #[snafu(display("Stored member count overflowed the supported range."))]
+    #[snafu(display("Stored member count overflowed the supported range: {source}"))]
     MemberCountOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Stored member index overflowed the supported range."))]
+    #[snafu(display("Stored member index overflowed the supported range: {source}"))]
     MemberIndexOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
         "Stored local member index {local_member_index} is out of bounds for {member_count} members."
@@ -1248,12 +1235,12 @@ enum SqliteStoreError {
     },
     #[snafu(display("Stored schema source for dataset '{dataset_id}' was missing."))]
     MissingSchema { dataset_id: DatasetId },
-    #[snafu(display("Stored {object} blob could not be decoded."))]
+    #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
     DecodeStoredProto {
         object: &'static str,
         source: flotsync_messages::buffa::DecodeError,
     },
-    #[snafu(display("Stored {object} was invalid."))]
+    #[snafu(display("Stored {object} was invalid: {source}"))]
     InvalidStoredObject {
         object: &'static str,
         source: Box<dyn StdError + Send + Sync>,
@@ -1402,6 +1389,30 @@ mod tests {
             panic!("expected insert operation");
         };
         snapshot.into_owned()
+    }
+
+    #[test]
+    fn dropping_open_sqlite_transaction_releases_store() {
+        let store = Arc::new(SqliteReplicationStore::in_memory(local_member()).unwrap());
+        let transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        drop(transaction);
+
+        let (probe_result_tx, probe_result_rx) = std::sync::mpsc::channel();
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let probe_result =
+                wait_for_store_future(store.begin_transaction()).map(|transaction| {
+                    wait_for_store_future(transaction.rollback())
+                        .expect("probe transaction should roll back");
+                });
+            let _ = probe_result_tx.send(probe_result);
+        });
+
+        let probe_result = probe_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping an open transaction should release the SQLite store promptly");
+        probe_result.expect("dropped transaction should leave the SQLite store usable");
     }
 
     #[test]
