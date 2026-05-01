@@ -2,7 +2,11 @@ use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowRecord, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::SmallVec;
-use std::{collections::HashMap, num::NonZeroUsize, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+    sync::Arc,
+};
 
 mod errors;
 mod ids;
@@ -104,6 +108,60 @@ pub type RowChangeBatch = SmallVec<[RowChange; 4]>;
 /// Returning an empty batch signals end-of-stream.
 pub trait RowProvider: Send {
     fn next_batch<'a>(&'a mut self) -> BoxFuture<'a, Result<RowChangeBatch, RowProviderError>>;
+}
+
+/// Request a full snapshot of all rows in the latest state of the replication
+/// group with `group_id` for the given `datasets`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRowsRequest {
+    /// Id of the replication group this request targets.
+    pub group_id: GroupId,
+    /// Application datasets to include in the snapshot.
+    pub datasets: HashSet<DatasetId>,
+    /// Maximum number of stored rows the provider should read in one batch.
+    pub max_rows_per_batch: NonZeroUsize,
+    /// Whether retained delete tombstones should be emitted with
+    /// [`SnapshotRow::deleted`] set.
+    ///
+    /// Application reload paths normally leave this disabled so they only
+    /// rebuild visible rows.
+    pub include_tombstones: bool,
+}
+
+/// Row snapshot stream returned by [`ReplicationApi::snapshot_rows`].
+pub struct SnapshotRows {
+    pub group_id: GroupId,
+    pub rows: Box<dyn SnapshotRowProvider>,
+}
+
+impl std::fmt::Debug for SnapshotRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotRows")
+            .field("group_id", &self.group_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One row in a snapshot stream.
+pub struct SnapshotRow {
+    pub row_id: RowId,
+    pub row: Arc<dyn RowRead<UpdateId> + Send + Sync>,
+    /// Whether this row is a retained delete tombstone instead of an
+    /// application-visible row.
+    pub deleted: bool,
+}
+
+/// Batch of rows emitted by a [`SnapshotRowProvider`].
+pub type SnapshotRowBatch = SmallVec<[SnapshotRow; 16]>;
+
+/// Source for batched snapshot rows.
+///
+/// Returning `None` signals end-of-stream. Providers may hold a store read
+/// transaction internally, so callers should drain or drop them promptly.
+pub trait SnapshotRowProvider: Send {
+    fn next_batch<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Option<SnapshotRowBatch>, RowProviderError>>;
 }
 
 /// One row entry in an initial dataset state.
@@ -272,6 +330,11 @@ pub trait ReplicationApi: Send + Sync {
         changes: Vec<RowMutation>,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
+    fn snapshot_rows(
+        &self,
+        request: SnapshotRowsRequest,
+    ) -> BoxFuture<'_, Result<SnapshotRows, ApiError>>;
+
     fn create_group(&self, req: CreateGroupRequest) -> BoxFuture<'_, Result<GroupId, ApiError>>;
 
     fn change_group_membership(
@@ -350,6 +413,25 @@ pub struct DatasetRowSlice {
     pub rows: HashMap<RowKey, Option<ReplicationRowRecord>>,
 }
 
+/// Storage-extension result for one ordered batch of rows scanned from a dataset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetRowsBatch {
+    /// Replication group that owns this batch.
+    pub group_id: GroupId,
+    /// Dataset identifier within the replication group.
+    pub dataset_id: DatasetId,
+    /// Whether this dataset already exists for `group_id`.
+    pub dataset_exists: bool,
+    /// Row records ordered by row key.
+    pub rows: Vec<ReplicationRowRecord>,
+    /// Row key to use as the exclusive lower bound for the next batch.
+    ///
+    /// `None` means the scan is exhausted. `Some` means callers should issue a
+    /// follow-up scan when they need more rows; that follow-up may still return
+    /// an empty batch if this batch ended exactly at the stored row count.
+    pub next_after: Option<RowKey>,
+}
+
 /// Complete row snapshot used by replication storage.
 pub type ReplicationRowSnapshot = RowSnapshot<'static, UpdateId>;
 
@@ -384,6 +466,41 @@ pub enum DatasetRowWrite {
 
 /// Iterator used to stream requested row keys into one store transaction.
 pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
+
+/// Read-only transaction over one replication store implementation.
+///
+/// Read transactions are rollback-by-default. They are intended for consistent
+/// snapshot streams and may be held by a provider across multiple `next_batch`
+/// calls, so callers should drain or drop the provider promptly.
+pub trait ReplicationStoreReadTransaction: Send {
+    /// Load one persisted replication group by id.
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
+
+    /// Scan one ordered batch of stored dataset rows.
+    ///
+    /// `after` is an exclusive lower bound over row keys. `None` starts before
+    /// the first row. Implementations must return at most `limit` rows ordered
+    /// by row key. `next_after` is the last emitted row key when another scan
+    /// may be needed, and `None` when this dataset scan is known to be
+    /// exhausted.
+    fn scan_dataset_row_batch<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>>;
+
+    /// Explicitly release the read transaction.
+    ///
+    /// Callers may skip this and simply drop the transaction instead, but an
+    /// explicit rollback allows store implementations to release resources
+    /// promptly and surface rollback failures directly.
+    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
+}
 
 /// One dataset-scoped batch inside a persisted replication update.
 #[derive(Clone, Debug, PartialEq)]
@@ -536,4 +653,9 @@ pub trait ReplicationStore: Send + Sync {
     fn begin_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>>;
+
+    /// Begin one read-only transaction over the replication state store.
+    fn begin_read_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>>;
 }

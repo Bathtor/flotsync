@@ -21,6 +21,21 @@ pub(super) enum CreateGroupError {
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(snapshot))]
+pub(super) enum SnapshotRowsError {
+    #[snafu(display("snapshot_rows requires at least one dataset."))]
+    EmptyDatasets,
+    #[snafu(display("Group {group_id} is not hosted by this runtime."))]
+    UnknownGroup { group_id: GroupId },
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+#[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub(crate) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different canonical member order."))]

@@ -32,6 +32,8 @@ use flotsync_replication::{
     ReplicationGroupRecord,
     ReplicationStore,
     RowChange,
+    RowProviderError,
+    SnapshotRowsRequest,
     SqliteReplicationStore,
     StoreError,
     load_replication_runtime_with_runtime_config_toml,
@@ -40,6 +42,7 @@ use futures_util::FutureExt;
 use kompact::prelude::block_on;
 use snafu::prelude::*;
 use std::{
+    collections::HashSet,
     fs,
     future::Future,
     io::{self, Write},
@@ -52,6 +55,8 @@ use std::{
     },
     time::SystemTime,
 };
+
+const CHECKLIST_SNAPSHOT_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 
 /// Command-line arguments for the replicated checklist example.
 #[derive(Clone, Debug, Parser)]
@@ -87,7 +92,8 @@ pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError
     ))
     .context(repl_error::LoadRuntimeSnafu)?;
 
-    let mut repl = ChecklistRepl::new(config, replication, listener_receiver);
+    let working_set = load_checklist_working_set(replication.as_ref(), config.group_id)?;
+    let mut repl = ChecklistRepl::new(config, replication, listener_receiver, working_set);
     repl.run()
 }
 
@@ -107,6 +113,8 @@ pub enum ReplicatedChecklistError {
     LoadRuntime { source: LoadError },
     #[snafu(display("Replication API call failed: {source}"))]
     Replication { source: ApiError },
+    #[snafu(display("Failed to load checklist snapshot from replication store: {source}"))]
+    SnapshotRows { source: RowProviderError },
     #[snafu(display("{source}"))]
     WorkingSet { source: ChecklistWorkingSetError },
     #[snafu(display("I/O failed while {action}: {source}"))]
@@ -220,8 +228,8 @@ impl ChecklistRepl {
         config: ChecklistAppConfig,
         replication: Arc<dyn ReplicationApi>,
         listener_receiver: Receiver<Vec<RowChange>>,
+        working_set: ChecklistWorkingSet,
     ) -> Self {
-        let working_set = ChecklistWorkingSet::new(config.group_id);
         Self {
             config,
             replication,
@@ -485,6 +493,36 @@ impl ChecklistRepl {
         print_row(&selected);
         Ok(())
     }
+}
+
+fn load_checklist_working_set(
+    replication: &dyn ReplicationApi,
+    group_id: GroupId,
+) -> Result<ChecklistWorkingSet, ReplicatedChecklistError> {
+    let mut working_set = ChecklistWorkingSet::new(group_id);
+    block_on(async {
+        let mut snapshot = replication
+            .snapshot_rows(SnapshotRowsRequest {
+                group_id,
+                datasets: HashSet::from([checklist_dataset_id()]),
+                max_rows_per_batch: CHECKLIST_SNAPSHOT_BATCH_SIZE,
+                include_tombstones: false,
+            })
+            .await
+            .context(repl_error::ReplicationSnafu)?;
+        while let Some(batch) = snapshot
+            .rows
+            .next_batch()
+            .await
+            .context(repl_error::SnapshotRowsSnafu)?
+        {
+            working_set
+                .apply_snapshot_rows(batch)
+                .context(repl_error::WorkingSetSnafu)?;
+        }
+        Ok::<(), ReplicatedChecklistError>(())
+    })?;
+    Ok(working_set)
 }
 
 /// Ensure the store contains either no group or exactly the configured static group.

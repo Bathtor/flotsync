@@ -21,7 +21,16 @@ use flotsync_data_types::{
     Schema,
     schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
-use flotsync_replication::{DatasetId, GroupId, MutableRow, RowChange, RowId, RowKey, RowMutation};
+use flotsync_replication::{
+    DatasetId,
+    GroupId,
+    MutableRow,
+    RowChange,
+    RowId,
+    RowKey,
+    RowMutation,
+    SnapshotRow,
+};
 use itertools::Itertools;
 use snafu::prelude::*;
 use std::{
@@ -486,6 +495,10 @@ pub enum ChecklistWorkingSetError {
     },
     #[snafu(display("Checklist row {row_key} has unsupported status value {value:?}."))]
     InvalidStatus { row_key: RowKey, value: String },
+    #[snafu(display(
+        "Checklist snapshot unexpectedly included deleted row {row_id}; startup only requests visible rows."
+    ))]
+    UnexpectedDeletedSnapshotRow { row_id: RowId },
     #[snafu(display("Dirty checklist row {row_key} is missing from the working set."))]
     MissingDirtyRow { row_key: RowKey },
 }
@@ -703,6 +716,17 @@ impl ChecklistWorkingSet {
         self.queued_events.push_back(event);
     }
 
+    pub fn apply_snapshot_rows<I>(&mut self, rows: I) -> Result<(), ChecklistWorkingSetError>
+    where
+        I: IntoIterator<Item = SnapshotRow>,
+    {
+        for row in rows {
+            let change = self.checklist_change_from_snapshot_row(row)?;
+            self.apply_checklist_change(change);
+        }
+        Ok(())
+    }
+
     pub fn prepare_sync(&self) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingSetError> {
         if self.dirty_rows.is_empty() {
             return Ok(None);
@@ -835,10 +859,7 @@ impl ChecklistWorkingSet {
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         match change {
             RowChange::Upsert { row_id, row } => {
-                self.validate_row_scope(&row_id)?;
-                let row_key = row_id.row_key;
-                let item = ChecklistItem::from_row(row_key, row.as_ref())?;
-                Ok(ChecklistRowChange::Upsert { row_key, item })
+                self.checklist_upsert_change_from_row(row_id, row.as_ref())
             }
             RowChange::Delete { row_id } => {
                 self.validate_row_scope(&row_id)?;
@@ -847,6 +868,36 @@ impl ChecklistWorkingSet {
                 })
             }
         }
+    }
+
+    fn checklist_change_from_snapshot_row(
+        &self,
+        row: SnapshotRow,
+    ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
+        let SnapshotRow {
+            row_id,
+            row,
+            deleted,
+        } = row;
+        if deleted {
+            self.validate_row_scope(&row_id)?;
+            return Err(ChecklistWorkingSetError::UnexpectedDeletedSnapshotRow { row_id });
+        }
+        self.checklist_upsert_change_from_row(row_id, row.as_ref())
+    }
+
+    fn checklist_upsert_change_from_row<OperationId>(
+        &self,
+        row_id: RowId,
+        row: &(dyn RowRead<OperationId> + Send + Sync),
+    ) -> Result<ChecklistRowChange, ChecklistWorkingSetError>
+    where
+        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        self.validate_row_scope(&row_id)?;
+        let row_key = row_id.row_key;
+        let item = ChecklistItem::from_row(row_key, row)?;
+        Ok(ChecklistRowChange::Upsert { row_key, item })
     }
 
     fn validate_row_scope(&self, row_id: &RowId) -> Result<(), ChecklistWorkingSetError> {
@@ -932,7 +983,16 @@ fn split_repl_args(line: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_data_types::ReplicatedDataType;
+    use flotsync_core::versions::UpdateId;
+    use flotsync_data_types::{InMemoryFieldValue, ReplicatedDataType};
+
+    struct EmptySnapshotRow;
+
+    impl RowRead<UpdateId> for EmptySnapshotRow {
+        fn get_field(&self, _field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>> {
+            None
+        }
+    }
 
     #[test]
     fn checklist_schema_uses_agreed_replication_semantics() {
@@ -1173,6 +1233,24 @@ mod tests {
                 "generated help should contain {command:?}: {help}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_reload_rejects_unrequested_deleted_rows() {
+        let mut checklist = test_working_set();
+        let row_id = checklist.row_id(RowKey(Uuid::from_u128(61)));
+
+        let result = checklist.apply_snapshot_rows([SnapshotRow {
+            row_id: row_id.clone(),
+            row: std::sync::Arc::new(EmptySnapshotRow),
+            deleted: true,
+        }]);
+
+        assert!(matches!(
+            result,
+            Err(ChecklistWorkingSetError::UnexpectedDeletedSnapshotRow { row_id: actual })
+                if actual == row_id
+        ));
     }
 
     #[test]

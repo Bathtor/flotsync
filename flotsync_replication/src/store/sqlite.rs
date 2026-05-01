@@ -4,6 +4,7 @@ use crate::{
         DatasetRowPatch,
         DatasetRowSlice,
         DatasetRowWrite,
+        DatasetRowsBatch,
         DatasetUpdateRecord,
         GroupId,
         MemberIdentity,
@@ -12,6 +13,7 @@ use crate::{
         ReplicationRowRecord,
         ReplicationRowSnapshot,
         ReplicationStore,
+        ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
@@ -204,6 +206,21 @@ impl ReplicationStore for SqliteReplicationStore {
         }
         .boxed()
     }
+
+    fn begin_read_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
+        let pool = self.pool.clone();
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            let connection = pool.begin_with("BEGIN").await.context(SqlxSnafu)?;
+            Ok(Box::new(SqliteReplicationStoreTransaction::new(
+                connection,
+                schema_sources,
+            )) as Box<dyn ReplicationStoreReadTransaction>)
+        }
+        .boxed()
+    }
 }
 
 /// One open store transaction backed by SQLx's transaction guard.
@@ -238,9 +255,52 @@ impl Drop for SqliteReplicationStoreTransaction {
     fn drop(&mut self) {
         if self.connection.is_some() {
             warn!(
-                "dropping sqlite replication transaction with uncommitted work; SQLx will roll it back before returning the connection to the pool"
+                "dropping open sqlite replication transaction; SQLx will roll it back before returning the connection to the pool"
             );
         }
+    }
+}
+
+impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
+    }
+
+    fn scan_dataset_row_batch<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            scan_dataset_row_batch(
+                self.assert_open_connection(),
+                schema_sources.as_ref(),
+                group_id,
+                dataset_id,
+                after,
+                limit,
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        async move {
+            let connection = self
+                .connection
+                .take()
+                .expect("sqlite replication transaction must not roll back twice");
+            connection.rollback().await.context(SqlxSnafu)?;
+            Ok(())
+        }
+        .boxed()
     }
 }
 
@@ -656,6 +716,84 @@ WHERE group_id = ",
         dataset_id: dataset_id.clone(),
         dataset_exists,
         rows,
+    })
+}
+
+/// Scan rows in lexicographic row-key order.
+///
+/// `after` is an exclusive lower bound. When the result contains exactly
+/// `limit` rows, `next_after` is set to the last returned row key so callers can
+/// continue with `row_key > next_after`.
+async fn scan_dataset_row_batch(
+    connection: &mut SqliteStoreConnection,
+    schema_sources: &HashMap<DatasetId, SchemaSource>,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    after: Option<RowKey>,
+    limit: NonZeroUsize,
+) -> Result<DatasetRowsBatch, StoreError> {
+    let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
+    if !dataset_exists {
+        return Ok(DatasetRowsBatch {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            dataset_exists,
+            rows: Vec::new(),
+            next_after: None,
+        });
+    }
+
+    let schema = schema_sources
+        .get(dataset_id)
+        .cloned()
+        .context(MissingSchemaSnafu {
+            dataset_id: dataset_id.clone(),
+        })?;
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT row_key, row_snapshot, row_tombstoned
+FROM dataset_rows
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    query_builder.push(" AND dataset_id = ");
+    query_builder.push_bind(dataset_id.as_str());
+    if let Some(after) = after {
+        query_builder.push(" AND row_key > ");
+        query_builder.push_bind(after.to_string());
+    }
+    query_builder.push(" ORDER BY row_key LIMIT ");
+    query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+
+    let stored_rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    let mut rows = Vec::with_capacity(stored_rows.len());
+    for row in stored_rows {
+        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
+        let row_snapshot = decode_dataset_row_snapshot(
+            schema.as_schema(),
+            &row.get::<Vec<u8>, _>("row_snapshot"),
+        )?;
+        rows.push(ReplicationRowRecord {
+            row_id: row_key,
+            snapshot: row_snapshot,
+            tombstoned: row.get::<bool, _>("row_tombstoned"),
+        });
+    }
+    let next_after = if rows.len() == limit.get() {
+        rows.last().map(|row| row.row_id)
+    } else {
+        None
+    };
+    Ok(DatasetRowsBatch {
+        group_id: *group_id,
+        dataset_id: dataset_id.clone(),
+        dataset_exists,
+        rows,
+        next_after,
     })
 }
 
@@ -1218,6 +1356,8 @@ enum SqliteStoreError {
     MemberCountOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Stored member index overflowed the supported range: {source}"))]
     MemberIndexOverflow { source: std::num::TryFromIntError },
+    #[snafu(display("Dataset row scan limit overflowed the supported range: {source}"))]
+    RowLimitOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
         "Stored local member index {local_member_index} is out of bounds for {member_count} members."
     ))]
@@ -1601,6 +1741,64 @@ mod tests {
             loaded_rows.rows.get(&row_key).cloned().flatten(),
             Some(stored_row)
         );
+    }
+
+    #[test]
+    fn sqlite_store_scans_dataset_rows_in_key_order() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(106));
+        let first_row_key = RowKey(Uuid::from_u128(206));
+        let second_row_key = RowKey(Uuid::from_u128(207));
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![
+                DatasetRowWrite::UpsertActive {
+                    row_key: second_row_key,
+                    snapshot: title_snapshot(&schema, second_row_key, "second"),
+                },
+                DatasetRowWrite::UpsertActive {
+                    row_key: first_row_key,
+                    snapshot: title_snapshot(&schema, first_row_key, "first"),
+                },
+            ],
+        }))
+        .expect("rows should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let first_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
+            &group_id,
+            &dataset_id,
+            None,
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        ))
+        .expect("first batch should scan");
+        let second_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
+            &group_id,
+            &dataset_id,
+            first_batch.next_after,
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        ))
+        .expect("second batch should scan");
+        wait_for_store_future(transaction.rollback()).expect("read should roll back");
+
+        assert_eq!(first_batch.rows[0].row_id, first_row_key);
+        assert_eq!(first_batch.next_after, Some(first_row_key));
+        assert_eq!(second_batch.rows[0].row_id, second_row_key);
+        assert_eq!(second_batch.next_after, Some(second_row_key));
     }
 
     #[test]

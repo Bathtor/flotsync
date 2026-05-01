@@ -38,6 +38,7 @@ use crate::{
         ReplicationEventListener,
         ReplicationGroupRecord,
         ReplicationStore,
+        ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
@@ -47,6 +48,8 @@ use crate::{
         RowKeyIterator,
         RowMutation,
         SchemaSource,
+        SnapshotRow,
+        SnapshotRowsRequest,
         StoreError,
     },
 };
@@ -60,6 +63,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, LazyLock, Mutex, mpsc},
@@ -135,6 +139,12 @@ where
             }) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
+    }
+
+    fn begin_read_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
+        self.inner.begin_read_transaction()
     }
 }
 
@@ -317,6 +327,22 @@ impl CapturedRowChange {
             }
             RowChange::Delete { row_id } => Ok(Self::Delete { row_id }),
         }
+    }
+
+    fn capture_snapshot(row: SnapshotRow) -> Result<Self, ListenerError> {
+        if row.deleted {
+            return Ok(Self::Delete { row_id: row.row_id });
+        }
+        let title = row
+            .row
+            .get_field_value::<str>("title")
+            .boxed()
+            .context(ListenerExternalSnafu)?
+            .into_owned();
+        Ok(Self::Upsert {
+            row_id: row.row_id,
+            title,
+        })
     }
 }
 
@@ -628,6 +654,33 @@ where
     row_slice
 }
 
+fn drain_snapshot_rows(
+    runtime: &dyn ReplicationApi,
+    request: SnapshotRowsRequest,
+) -> Vec<CapturedRowChange> {
+    let mut snapshot =
+        wait_for_test_reply(runtime.snapshot_rows(request)).expect("snapshot should start");
+    let mut rows = Vec::new();
+    while let Some(batch) =
+        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
+    {
+        for row in batch {
+            rows.push(
+                CapturedRowChange::capture_snapshot(row).expect("snapshot row should decode"),
+            );
+        }
+    }
+    rows
+}
+
+fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
+    rows.sort_by_key(|row| match row {
+        CapturedRowChange::Upsert { row_id, .. } | CapturedRowChange::Delete { row_id } => {
+            row_id.to_string()
+        }
+    });
+}
+
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
     eventually(
         TEST_WAIT_TIMEOUT,
@@ -840,6 +893,87 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
             .cloned()
             .flatten()
             .is_some()
+    );
+}
+
+#[test]
+fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let active_row_id = test_row_id(group_id, dataset_id.clone(), 35);
+    let deleted_row_id = test_row_id(group_id, dataset_id.clone(), 36);
+
+    wait_for_test_reply(fixture.runtime.publish_changes(vec![
+        RowMutation::Upsert {
+            row_id: active_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "still visible",
+            },
+        },
+        RowMutation::Upsert {
+            row_id: deleted_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "now deleted",
+            },
+        },
+    ]))
+    .expect("initial rows should publish");
+    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Delete {
+        row_id: deleted_row_id.clone(),
+    }]))
+    .expect("delete should publish");
+
+    let mut visible_rows = drain_snapshot_rows(
+        fixture.runtime.as_ref(),
+        SnapshotRowsRequest {
+            group_id,
+            datasets: HashSet::from([dataset_id.clone()]),
+            max_rows_per_batch: NonZeroUsize::new(1).expect("batch size should be non-zero"),
+            include_tombstones: false,
+        },
+    );
+    sort_captured_rows(&mut visible_rows);
+
+    assert_eq!(
+        visible_rows,
+        vec![CapturedRowChange::Upsert {
+            row_id: active_row_id.clone(),
+            title: "still visible".to_owned(),
+        }]
+    );
+
+    let mut all_rows = drain_snapshot_rows(
+        fixture.runtime.as_ref(),
+        SnapshotRowsRequest {
+            group_id,
+            datasets: HashSet::from([dataset_id]),
+            max_rows_per_batch: NonZeroUsize::new(1).expect("batch size should be non-zero"),
+            include_tombstones: true,
+        },
+    );
+    sort_captured_rows(&mut all_rows);
+
+    assert_eq!(
+        all_rows,
+        vec![
+            CapturedRowChange::Upsert {
+                row_id: active_row_id,
+                title: "still visible".to_owned(),
+            },
+            CapturedRowChange::Delete {
+                row_id: deleted_row_id,
+            },
+        ]
     );
 }
 

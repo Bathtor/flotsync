@@ -17,6 +17,8 @@ use crate::api::{
     ReplicationStore,
     RowMutation,
     RuntimeSnafu,
+    SnapshotRows,
+    SnapshotRowsRequest,
 };
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
@@ -236,6 +238,10 @@ impl ReplicationApi for ReplicationRuntime {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, changes))
         })
+    }
+
+    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotRows> {
+        self.ask(move |promise| ReplicationRuntimeMessage::SnapshotRows(Ask::new(promise, request)))
     }
 
     fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, GroupId> {

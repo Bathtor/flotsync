@@ -41,18 +41,28 @@ use crate::{
         GroupMigration,
         MemberIdentity,
         MemberIndex,
+        ProviderExternalSnafu,
         PublishReceipt,
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
+        ReplicationRowRecord,
         ReplicationStore,
+        ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
         RowChange,
+        RowId,
         RowKey,
         RowMutation,
+        RowProviderError,
         SchemaSource,
+        SnapshotRow,
+        SnapshotRowBatch,
+        SnapshotRowProvider,
+        SnapshotRows,
+        SnapshotRowsRequest,
         StoreError,
         providers::VecRowProvider,
     },
@@ -88,7 +98,10 @@ use crate::{
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_data_types::OwnedRow;
 use flotsync_messages::buffa::Message as BuffaMessage;
+use flotsync_utils::BoxFuture;
+use futures_util::FutureExt;
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
@@ -189,6 +202,124 @@ impl InboundDeliveryFailure {
     }
 }
 
+/// Snapshot provider backed by one store read transaction.
+///
+/// The transaction pins a consistent store view while the provider batches rows
+/// from requested datasets. Dropping the provider releases the transaction
+/// through the store implementation's rollback-on-drop path.
+struct StoreSnapshotRowProvider {
+    transaction: Option<Box<dyn ReplicationStoreReadTransaction>>,
+    group_id: GroupId,
+    datasets: HashSet<DatasetId>,
+    current_dataset: Option<DatasetId>,
+    /// Exclusive lower bound for the current dataset scan.
+    ///
+    /// `None` starts before the first row. `Some(row_key)` means the next store
+    /// scan requests rows with `row_key > after_row_key`.
+    after_row_key: Option<RowKey>,
+    max_rows_per_batch: NonZeroUsize,
+    include_tombstones: bool,
+}
+
+impl StoreSnapshotRowProvider {
+    async fn release_transaction(&mut self) -> Result<(), RowProviderError> {
+        let Some(transaction) = self.transaction.take() else {
+            return Ok(());
+        };
+        transaction
+            .rollback()
+            .await
+            .boxed()
+            .context(ProviderExternalSnafu)
+    }
+
+    fn select_dataset(&mut self) -> Option<DatasetId> {
+        if self.current_dataset.is_none() {
+            self.current_dataset = self.datasets.iter().next().cloned();
+        }
+        self.current_dataset.clone()
+    }
+
+    fn finish_current_dataset(&mut self) {
+        if let Some(dataset_id) = self.current_dataset.take() {
+            self.datasets.remove(&dataset_id);
+        }
+        self.after_row_key = None;
+    }
+
+    fn snapshot_row_from_record(
+        group_id: GroupId,
+        dataset_id: DatasetId,
+        record: ReplicationRowRecord,
+    ) -> SnapshotRow {
+        let row_id = RowId {
+            group_id,
+            dataset_id,
+            row_key: record.row_id,
+        };
+        let fields = record
+            .snapshot
+            .into_owned_fields()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        SnapshotRow {
+            row_id,
+            row: Arc::new(OwnedRow::new(fields)),
+            deleted: record.tombstoned,
+        }
+    }
+}
+
+impl SnapshotRowProvider for StoreSnapshotRowProvider {
+    fn next_batch<'a>(
+        &'a mut self,
+    ) -> BoxFuture<'a, Result<Option<SnapshotRowBatch>, RowProviderError>> {
+        async move {
+            let mut snapshot_rows = SnapshotRowBatch::new();
+            'fill_batch: while snapshot_rows.is_empty() {
+                let Some(dataset_id) = self.select_dataset() else {
+                    self.release_transaction().await?;
+                    return Ok(None);
+                };
+                let group_id = self.group_id;
+                let after = self.after_row_key;
+                let max_rows_per_batch = self.max_rows_per_batch;
+                let Some(transaction) = self.transaction.as_mut() else {
+                    return Ok(None);
+                };
+                let batch = transaction
+                    .scan_dataset_row_batch(&group_id, &dataset_id, after, max_rows_per_batch)
+                    .await
+                    .boxed()
+                    .context(ProviderExternalSnafu)?;
+
+                'rows: for record in batch.rows {
+                    if record.tombstoned && !self.include_tombstones {
+                        continue 'rows;
+                    }
+                    snapshot_rows.push(Self::snapshot_row_from_record(
+                        self.group_id,
+                        dataset_id.clone(),
+                        record,
+                    ));
+                }
+
+                if let Some(next_after) = batch.next_after {
+                    self.after_row_key = Some(next_after);
+                } else {
+                    self.finish_current_dataset();
+                }
+                if snapshot_rows.is_empty() {
+                    continue 'fill_batch;
+                }
+            }
+
+            Ok(Some(snapshot_rows))
+        }
+        .boxed()
+    }
+}
+
 /// Local-actor messages understood by [`ReplicationRuntimeComponent`].
 ///
 /// This is the imperative bridge surface between the public async runtime
@@ -197,6 +328,8 @@ impl InboundDeliveryFailure {
 pub enum ReplicationRuntimeMessage {
     /// Submit one local publish request through the component interface.
     PublishChanges(Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>),
+    /// Request a local snapshot stream through the component interface.
+    SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>),
     /// Create one new fixed-membership group through the component interface.
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     /// Request one group-membership change through the component interface.
@@ -339,6 +472,40 @@ impl ReplicationRuntimeComponent {
             loaded_schemas.insert(dataset_id, schema);
         }
         Ok(loaded_schemas)
+    }
+
+    async fn snapshot_rows_from_store(
+        &mut self,
+        request: SnapshotRowsRequest,
+    ) -> Result<SnapshotRows, SnapshotRowsError> {
+        ensure!(!request.datasets.is_empty(), snapshot::EmptyDatasetsSnafu);
+
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(snapshot::StoreAccessSnafu)?;
+        let group = transaction
+            .load_replication_group(&request.group_id)
+            .await
+            .context(snapshot::StoreAccessSnafu)?;
+        group.context(snapshot::UnknownGroupSnafu {
+            group_id: request.group_id,
+        })?;
+
+        let provider = StoreSnapshotRowProvider {
+            transaction: Some(transaction),
+            group_id: request.group_id,
+            datasets: request.datasets,
+            current_dataset: None,
+            after_row_key: None,
+            max_rows_per_batch: request.max_rows_per_batch,
+            include_tombstones: request.include_tombstones,
+        };
+        Ok(SnapshotRows {
+            group_id: request.group_id,
+            rows: Box::new(provider),
+        })
     }
 
     /// Materialise one ephemeral in-memory dataset slice for each touched
@@ -1087,6 +1254,21 @@ impl ReplicationRuntimeComponent {
         })
     }
 
+    fn handle_snapshot_rows(
+        &mut self,
+        ask: Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>,
+    ) -> Handled {
+        let (promise, request) = ask.take();
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = async_self
+                .snapshot_rows_from_store(request)
+                .await
+                .boxed()
+                .context(ApiExternalSnafu);
+            async_self.reply_api(promise, "snapshot_rows", reply);
+        })
+    }
+
     fn handle_create_group(
         &mut self,
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
@@ -1238,6 +1420,7 @@ impl Actor for ReplicationRuntimeComponent {
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
+            ReplicationRuntimeMessage::SnapshotRows(ask) => self.handle_snapshot_rows(ask),
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
                 self.handle_change_group_membership(ask)
