@@ -383,18 +383,82 @@ pub trait ReplicationEventListener: Send + Sync {
 
 /// Application-facing replication control surface.
 pub trait ReplicationApi: Send + Sync {
+    /// Publish one local set of row mutations to the configured replication group.
+    ///
+    /// `changes` is interpreted as a sparse field patch for each [`RowMutation::Upsert`]:
+    /// fields omitted from the submitted [`MutableRow`] are intentionally left
+    /// unchanged in the current local state. [`RowMutation::Delete`] records a
+    /// replicated row tombstone rather than physically removing the row from the
+    /// store.
+    ///
+    /// On success, the runtime has applied the mutations transactionally to the
+    /// local store, persisted the corresponding replication update, notified the
+    /// local [`ReplicationEventListener`] with the locally applied row changes,
+    /// and submitted a best-effort live update broadcast to currently configured
+    /// peers. The returned [`PublishReceipt`] identifies the local update that
+    /// was durably recorded.
+    ///
+    /// The method returns [`ApiError`] if validation, local apply, durable store
+    /// access, listener notification, or runtime availability fails. Failed calls
+    /// must not be treated as partially published by applications; callers should
+    /// keep their own pending changes until a receipt is returned.
     fn publish_changes(
         &self,
         changes: Vec<RowMutation>,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
+    /// Open a batched stream over the latest locally durable rows for selected datasets.
+    ///
+    /// The request is scoped to one replication group and an explicit set of
+    /// application datasets. The stream reflects the latest state known to the
+    /// local store when the snapshot is opened; it does not wait for remote peers
+    /// and it does not perform catch-up. When `include_tombstones` is false, the
+    /// provider should emit only application-visible rows. When it is true,
+    /// retained delete tombstones are emitted as [`SnapshotRow`] values with
+    /// [`SnapshotRow::deleted`] set.
+    ///
+    /// The returned [`SnapshotRows`] provider may hold a store read transaction
+    /// while it is alive, so callers should drain or drop it promptly. Batches
+    /// are bounded by [`SnapshotRowsRequest::max_rows_per_batch`] and are emitted
+    /// through the same [`BatchProvider`] end-of-stream contract as listener row
+    /// providers.
+    ///
+    /// The method returns [`ApiError`] when the group is unknown, the request is
+    /// invalid, the runtime is unavailable, or the store cannot open the
+    /// snapshot.
     fn snapshot_rows(
         &self,
         request: SnapshotRowsRequest,
     ) -> BoxFuture<'_, Result<SnapshotRows, ApiError>>;
 
+    /// Create one new fixed-membership replication group rooted at this member.
+    ///
+    /// `req.members` defines the canonical member order for the new group and
+    /// must include the local member. On success, the runtime durably stores the
+    /// group record, installs it in the live runtime view, broadcasts bootstrap
+    /// messages to the configured remote members, and returns the newly allocated
+    /// [`GroupId`].
+    ///
+    /// Initial dataset state in [`CreateGroupRequest::initial_state`] is part of
+    /// the public request shape but is not implemented in the current manual
+    /// replication slice; requests that include it fail with [`ApiError`].
+    ///
+    /// The method returns [`ApiError`] when membership validation fails, the
+    /// runtime is unavailable, durable group storage fails, or unsupported
+    /// request features are used.
     fn create_group(&self, req: CreateGroupRequest) -> BoxFuture<'_, Result<GroupId, ApiError>>;
 
+    /// Request a membership migration for an existing replication group.
+    ///
+    /// The intended contract is to propose adding and removing members for
+    /// `req.group_id`, persist the accepted migration, and surface any
+    /// application-mediated invitations through [`ReplicationEvent::GroupInvitation`].
+    /// Ordering and compatibility rules are governed by [`ReplicationConfig`]
+    /// and [`GroupMigrationPolicy`].
+    ///
+    /// Membership migration is not implemented in the current manual replication
+    /// slice. Current implementations return [`ApiError::UnsupportedOperation`]
+    /// without mutating group state.
     fn change_group_membership(
         &self,
         req: ChangeGroupMembershipRequest,
