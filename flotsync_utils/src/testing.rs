@@ -45,6 +45,7 @@ pub struct SmallVec<T, const N: usize> {
 }
 
 impl<T: Copy, const N: usize> SmallVec<T, N> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             data: [None; N],
@@ -102,9 +103,7 @@ impl<T: Copy, const N: usize> FromIterator<T> for SmallVec<T, N> {
         let mut i = 0;
 
         for v in iter {
-            if i >= N {
-                panic!("SmallVec capacity exceeded");
-            }
+            assert!(i < N, "SmallVec capacity exceeded");
             out.data[i] = Some(v);
             i += 1;
         }

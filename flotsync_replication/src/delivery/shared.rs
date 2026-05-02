@@ -85,12 +85,14 @@ pub struct LogicalRouteId {
 }
 
 impl LogicalRouteId {
+    #[must_use]
     pub fn peer(peer: MemberIdentity) -> Self {
         Self {
             endpoint: RouteEndpoint::Peer(peer),
         }
     }
 
+    #[must_use]
     pub fn relay(relay: RelayIdentity) -> Self {
         Self {
             endpoint: RouteEndpoint::Relay(relay),

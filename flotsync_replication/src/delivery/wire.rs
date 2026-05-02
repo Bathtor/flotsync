@@ -599,7 +599,7 @@ fn member_identity_from_wire_view(
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
     let mut buffer = IdentifierBuf::new();
-    for segment in identifier.segments.iter() {
+    for segment in &identifier.segments {
         let segment = segment.to_owned();
         buffer
             .push_checked(segment.to_owned())

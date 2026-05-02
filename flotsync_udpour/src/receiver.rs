@@ -3,7 +3,21 @@
 //! This module owns `(source, message_id)` reassembly state, repair polling,
 //! whole-message checksum validation, and purge behavior.
 
-use crate::{codec::fit_one_need_parts_frame, types::*};
+use crate::{
+    codec::fit_one_need_parts_frame,
+    types::{
+        AckFrame,
+        Checksum,
+        FrameType,
+        MessageId,
+        NeedPartsFrame,
+        NoLongerAvailableFrame,
+        PartCount,
+        PayloadFrame,
+        UDPourHeader,
+        io_payload_eq,
+    },
+};
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
@@ -235,7 +249,7 @@ impl ReceiverMachine {
     /// header from `source`.
     ///
     /// This lets runtime tests distinguish "the bridge observer saw the frame"
-    /// from "the receiving UDPour state machine already consumed the frame and
+    /// from "the receiving `UDPour` state machine already consumed the frame and
     /// reset any dependent repair deadlines".
     pub(crate) fn has_reflected_payload(&self, source: SocketAddr, header: UDPourHeader) -> bool {
         let key = ReceiverTransferKey {

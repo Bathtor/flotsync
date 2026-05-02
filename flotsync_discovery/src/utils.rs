@@ -1,11 +1,12 @@
 use base64::engine::{GeneralPurpose, general_purpose::URL_SAFE_NO_PAD};
 use std::fmt;
 
-/// Shorthand for [[base64::display::Base64Display]] with fixed engine.
+/// Shorthand for [[`base64::display::Base64Display`]] with fixed engine.
 pub struct Base64Display<'a> {
     inner: base64::display::Base64Display<'a, 'static, GeneralPurpose>,
 }
 impl<'a> Base64Display<'a> {
+    #[must_use]
     pub fn new(bytes: &'a [u8]) -> Self {
         Self {
             inner: base64::display::Base64Display::new(bytes, &URL_SAFE_NO_PAD),
@@ -34,6 +35,7 @@ pub mod shutdown {
         Panic,
     }
 
+    #[must_use]
     pub fn watcher() -> (ShutdownHandle, ShutdownWatch) {
         let flag = Arc::new(AtomicBool::new(false));
         (
@@ -50,6 +52,7 @@ pub mod shutdown {
     }
 
     impl ShutdownHandle {
+        #[must_use]
         pub fn with_thread<T>(
             self,
             join_handle: std::thread::JoinHandle<T>,
@@ -71,6 +74,7 @@ pub mod shutdown {
     }
 
     impl ShutdownWatch {
+        #[must_use]
         pub fn should_shutdown(&self) -> bool {
             self.flag.load(Ordering::Acquire)
         }

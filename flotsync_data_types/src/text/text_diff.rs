@@ -26,14 +26,14 @@ pub struct TextChangePrettyPrint<'a, 'b> {
     pub from: &'a str,
     pub changes: &'b [TextChange],
 }
-impl<'a, 'b> fmt::Display for TextChangePrettyPrint<'a, 'b> {
+impl fmt::Display for TextChangePrettyPrint<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut from_cursor = GraphemeCursor::new(self.from);
-        for entry in self.changes.iter() {
+        for entry in self.changes {
             match entry {
                 TextChange::Insert { at, value } => {
                     from_cursor.write_to_until(f, *at)?;
-                    write!(f, "\x1b[32m{}\x1b[0m", value)?;
+                    write!(f, "\x1b[32m{value}\x1b[0m")?;
                 }
                 TextChange::Delete { at, len } => {
                     from_cursor.write_to_until(f, *at)?;
@@ -57,7 +57,7 @@ pub fn diff(from: &str, to: &str) -> Vec<TextChange> {
     let changes: Vec<TextChange> = {
         let mut builder = Vec::with_capacity(ops.len());
         let mut copy_to_index = 0usize;
-        for change in ops.iter() {
+        for change in ops {
             match change {
                 similar::DiffOp::Equal { old_index, len, .. } => {
                     copy_to_index = old_index + len;
@@ -107,7 +107,7 @@ pub fn diff(from: &str, to: &str) -> Vec<TextChange> {
 
         // Before we return this, let's double check it really satisfied our requirements.
         let mut last_pos = 0usize;
-        for change in builder.iter() {
+        for change in &builder {
             match change {
                 TextChange::Insert { at, .. } => {
                     assert!(last_pos <= *at, "The list of changes was misordered.");
@@ -192,15 +192,15 @@ impl<'s> GraphemeCursor<'s> {
 
     pub fn copy_to_until(&mut self, target: &mut String, until_pos: usize) {
         self.write_to_until(target, until_pos)
-            .expect("Writing in to String failed.")
+            .expect("Writing in to String failed.");
     }
 
     pub fn write_to_until<W: fmt::Write>(&mut self, out: &mut W, until_pos: usize) -> fmt::Result {
         while self
             .iter
             .peek()
-            .filter(|(index, _)| *index < until_pos)
-            .is_some()
+            .as_ref()
+            .is_some_and(|(index, _)| *index < until_pos)
         {
             let (_, next_grapheme) = self.iter.next().expect("Copied beyond end of cursor");
             out.write_str(next_grapheme)?;
@@ -210,7 +210,7 @@ impl<'s> GraphemeCursor<'s> {
 
     #[allow(unused, reason = "Used in tests")]
     pub fn copy_to(self, target: &mut String) {
-        self.write_to(target).expect("Writing in to String failed.")
+        self.write_to(target).expect("Writing in to String failed.");
     }
 
     pub fn write_to<W: fmt::Write>(self, out: &mut W) -> fmt::Result {
@@ -311,7 +311,7 @@ pub(crate) mod tests {
         }
     }
 
-    pub const TEXT_A: &str = r#"
+    pub const TEXT_A: &str = r"
 # Harbor Log — Entry Ⅰ
 
 The **ancient** harbor lay silent beneath the pale morning light.
@@ -327,9 +327,9 @@ A thin mist clung to the worn stone pier, wrapping everything in a cold embrace.
 Somewhere in the distance, a *bell* tolled with a hollow, metallic ring 🔔.
 No ships had docked here in years, yet the smell of salt and tar lingered stubbornly.
 It felt as though the sea itself refused to forget. 🌊⚓
-"#;
+";
 
-    pub const TEXT_B: &str = r#"
+    pub const TEXT_B: &str = r"
 # Harbour Log — Entry II
 
 The **old** harbour stood quiet under the dim morning glow.
@@ -345,7 +345,7 @@ A light fog clung to the cracked stone jetty, coating everything in a damp shrou
 Far in the distance, a *bell* chimed with a hollow, echoing tone 🔔.
 No boats had berthed here in ages, yet the scent of salt 🧂 and pitch persisted defiantly.
 It seemed as though the ocean itself refused to let go. 🌊⚓🪝
-"#;
+";
     #[test]
     fn diff_and_apply_larger_changes() {
         check_diff_and_apply(
@@ -376,7 +376,7 @@ It seemed as though the ocean itself refused to let go. 🌊⚓🪝
 
 #[allow(unused)]
 mod debug_helpers {
-    use super::*;
+    use super::{GraphemeCursor, TextDiff};
     use similar::DiffOp;
 
     #[allow(clippy::print_stderr, reason = "This is designed for debug printing.")]
@@ -402,7 +402,7 @@ mod debug_helpers {
     pub fn print_ops_changes(from: &str, to: &str, ops: &[DiffOp]) {
         let mut diff_str = String::new();
         // eprintln!("diff:\n----");
-        for entry in ops.iter() {
+        for entry in ops {
             match entry {
                 similar::DiffOp::Equal {
                     old_index,

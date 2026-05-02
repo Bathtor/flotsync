@@ -140,6 +140,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         }
     }
 
+    #[must_use]
     pub fn from_owned_fields(fields: Vec<(String, InMemoryFieldValue<ChangeId>)>) -> Self {
         Self {
             repr: RowSnapshotRepr::Owned { fields },
@@ -147,6 +148,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 
     /// Materialize this snapshot into an owned `'static` representation.
+    #[must_use]
     pub fn into_owned(self) -> RowSnapshot<'static, ChangeId>
     where
         ChangeId: Clone,
@@ -155,6 +157,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 
     /// Materialize this snapshot as owned `(field_name, value)` pairs.
+    #[must_use]
     pub fn into_owned_fields(self) -> Vec<(String, InMemoryFieldValue<ChangeId>)>
     where
         ChangeId: Clone,

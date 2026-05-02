@@ -3,7 +3,16 @@
 use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
-    route_transport::*,
+    route_transport::{
+        FlotsyncSerializable,
+        RouteDiscoveryPort,
+        RouteSharingKind,
+        RouteTransportActorMessage,
+        RouteTransportSend,
+        RouteTransportSubmitResult,
+        SendRouteCandidate,
+        TransportRouteKey,
+    },
     shared::{DeliveryClass, EncryptedPayload, MessageId, RouteSendId, SignedEnvelopeFooter},
 };
 use crate::{
@@ -112,6 +121,7 @@ pub struct GroupBroadcastComponent {
 impl GroupBroadcastComponent {
     /// Create one new group-broadcast component around the shared
     /// group-membership view and route-transport actor.
+    #[must_use]
     pub fn new(
         group_memberships: SharedGroupMemberships,
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,

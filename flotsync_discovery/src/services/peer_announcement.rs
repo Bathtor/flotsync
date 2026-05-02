@@ -1,4 +1,4 @@
-use super::*;
+use super::Snafu;
 use crate::{SocketPort, kompact::prelude::*};
 use flotsync_io::prelude::{
     ConfigureFailureReason,
@@ -38,7 +38,7 @@ pub struct Options {
 
 impl Options {
     pub const DEFAULT: Self = Self {
-        bind_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         bind_port: SocketPort(0),
         port: SocketPort(52156),
         announcement_interval: Duration::from_secs(5),
@@ -145,10 +145,12 @@ pub enum PeerAnnouncementMessage {
 }
 
 impl PeerAnnouncementComponent {
+    #[must_use]
     pub fn with_options(options: Options) -> Self {
         Self::with_optional_startup_promise(options, None)
     }
 
+    #[must_use]
     pub fn with_options_and_startup_promise(
         options: Options,
         startup_promise: KPromise<PeerAnnouncementStartupResult>,
@@ -669,7 +671,7 @@ mod tests {
             .with_instance_id(
                 Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("valid UUID"),
             )
-            .with_announcement_interval(Duration::from_secs(60));
+            .with_announcement_interval(Duration::from_mins(1));
         let expected_instance_id = options.instance_id;
 
         let system = build_test_kompact_system();

@@ -92,12 +92,12 @@ where
 
     /// Get the node ids between head and its successor.
     ///
-    /// As opposed to [[ids_at_pos]], this always exists.
+    /// As opposed to [[`ids_at_pos`]], this always exists.
     fn ids_after_head(&self) -> LinkIds<Self::Id>;
 
     /// Get the node ids between the end and its predecessor.
     ///
-    /// As opposed to [[ids_at_pos]], this always exists.
+    /// As opposed to [[`ids_at_pos`]], this always exists.
     fn ids_before_end(&self) -> LinkIds<Self::Id>;
 
     /// Get the ids of the nodes at, before, and after `position`.
@@ -274,7 +274,7 @@ where
 
     /// Get the size of the current value, if any.
     pub fn get_len(&self) -> Option<usize> {
-        self.get_current_value().map(|v| v.len())
+        self.get_current_value().map(coalesced::Composite::len)
     }
 
     /// Gets the size of the node's value.

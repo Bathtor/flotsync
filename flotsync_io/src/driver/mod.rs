@@ -289,21 +289,25 @@ impl IoDriver {
     }
 
     /// Returns the runtime configuration used by this driver instance.
+    #[must_use]
     pub fn config(&self) -> &DriverConfig {
         &self.config
     }
 
     /// Returns the shared ingress and egress pool handles owned by this driver instance.
+    #[must_use]
     pub fn buffers(&self) -> &IoBufferPools {
         &self.buffers
     }
 
     /// Returns the shared ingress pool handle owned by this driver instance.
+    #[must_use]
     pub fn ingress_pool(&self) -> IngressPool {
         self.buffers.ingress()
     }
 
     /// Returns the shared egress pool handle owned by this driver instance.
+    #[must_use]
     pub fn egress_pool(&self) -> EgressPool {
         self.buffers.egress()
     }
@@ -524,9 +528,10 @@ pub(super) fn wait_for_request<T>(mut request: DriverRequest<T>) -> Result<T> {
             return Ok(reply);
         }
 
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out waiting for flotsync_io driver request reply");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for flotsync_io driver request reply"
+        );
 
         std::thread::sleep(Duration::from_millis(1));
     }

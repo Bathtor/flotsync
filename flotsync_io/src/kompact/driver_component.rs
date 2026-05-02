@@ -244,6 +244,7 @@ impl IoDriverComponent {
     ///
     /// A typical Kompact system creates exactly one instance and then passes it to one or more
     /// [`IoBridge`](super::IoBridge) components.
+    #[must_use]
     pub fn new(config: DriverConfig) -> Self {
         Self::try_new(config).expect("IoDriverComponent buffer configuration must be valid")
     }

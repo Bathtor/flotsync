@@ -578,28 +578,28 @@ fn encode_primitive_array(value: &PrimitiveValueArray) -> proto::PrimitiveArrayV
     let encoded_value = match value {
         PrimitiveValueArray::String(values) => {
             let message = proto::StringArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::StringArrayValue::default()
             };
             proto::primitive_array_value::Value::String(Box::new(message))
         }
         PrimitiveValueArray::UInt(values) => {
             let message = proto::UIntArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::UIntArrayValue::default()
             };
             proto::primitive_array_value::Value::Uint(Box::new(message))
         }
         PrimitiveValueArray::Int(values) => {
             let message = proto::IntArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::IntArrayValue::default()
             };
             proto::primitive_array_value::Value::Int(Box::new(message))
         }
         PrimitiveValueArray::Byte(values) => {
             let message = proto::ByteArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::ByteArrayValue::default()
             };
             proto::primitive_array_value::Value::Byte(Box::new(message))
@@ -613,14 +613,14 @@ fn encode_primitive_array(value: &PrimitiveValueArray) -> proto::PrimitiveArrayV
         }
         PrimitiveValueArray::Boolean(values) => {
             let message = proto::BooleanArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::BooleanArrayValue::default()
             };
             proto::primitive_array_value::Value::Boolean(Box::new(message))
         }
         PrimitiveValueArray::Binary(values) => {
             let message = proto::BinaryArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::BinaryArrayValue::default()
             };
             proto::primitive_array_value::Value::Binary(Box::new(message))
@@ -634,7 +634,7 @@ fn encode_primitive_array(value: &PrimitiveValueArray) -> proto::PrimitiveArrayV
         }
         PrimitiveValueArray::Timestamp(values) => {
             let message = proto::TimestampArrayValue {
-                values: values.to_vec(),
+                values: values.clone(),
                 ..proto::TimestampArrayValue::default()
             };
             proto::primitive_array_value::Value::Timestamp(Box::new(message))

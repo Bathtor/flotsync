@@ -75,21 +75,25 @@ impl ExampleRuntime {
     }
 
     /// Returns the shared Kompact system.
+    #[must_use]
     pub fn system(&self) -> &KompactSystem {
         &self.system
     }
 
     /// Returns the shared bridge component.
+    #[must_use]
     pub fn bridge_component(&self) -> &Arc<Component<IoBridge>> {
         &self.bridge_component
     }
 
     /// Returns the shared driver component.
+    #[must_use]
     pub fn driver_component(&self) -> &Arc<Component<IoDriverComponent>> {
         &self._driver_component
     }
 
     /// Returns the control handle for the shared bridge.
+    #[must_use]
     pub fn bridge_handle(&self) -> &IoBridgeHandle {
         &self.bridge_handle
     }

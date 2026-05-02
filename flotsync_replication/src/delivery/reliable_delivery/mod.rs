@@ -9,8 +9,33 @@ use super::{
         ReliableDeliveryPortRequest,
     },
     ingress::InboundDeliveryMeta,
-    route_transport::*,
-    shared::*,
+    route_transport::{
+        FlotsyncSerializable,
+        RouteDiscoveryPort,
+        RouteSharingKind,
+        RouteTransportActorMessage,
+        RouteTransportNackReason,
+        RouteTransportSend,
+        RouteTransportSubmitResult,
+        SendRouteCandidate,
+        TransportRouteKey,
+    },
+    shared::{
+        ActiveRouteRecord,
+        DetachedSignature,
+        EncryptedPayload,
+        LogicalRouteId,
+        MailboxItemId,
+        MessageId,
+        PendingRouteReason,
+        RelayIdentity,
+        RouteActiveState,
+        RouteSendId,
+        SignatureScheme,
+        SignedEnvelopeFooter,
+        StableRouteKey,
+        WorkScopeKey,
+    },
 };
 use crate::api::MemberIdentity;
 use bytes::Bytes;
@@ -207,6 +232,7 @@ pub struct ReliableDeliveryComponent {
 impl ReliableDeliveryComponent {
     /// Create one new reliable-delivery component around the shared
     /// route-transport actor.
+    #[must_use]
     pub fn new(
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
     ) -> Self {
@@ -473,7 +499,7 @@ impl ReliableDeliveryComponent {
                 "Reliable delivery ignored recipient ack for unknown message_id={}", message_id
             );
             return Handled::Ok;
-        };
+        }
         self.cancel_retry(RetryKey::Sender(message_id));
         debug!(
             self.log(),
@@ -506,7 +532,7 @@ impl ReliableDeliveryComponent {
                     self.log(),
                     "Reliable delivery observed processed completion for {message_id}"
                 );
-                self.finish_processed_delivery(message_id).await
+                self.finish_processed_delivery(message_id).await;
             }
             Err(_error) => {
                 // If every clone of the processed handle disappears before one
@@ -971,7 +997,7 @@ type TransportRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
 type TransportDiscoveryRouteUpdate = super::contracts::DiscoveryRouteUpdate<TransportRouteKey>;
 
 mod config_keys {
-    use super::*;
+    use super::{DEFAULT_RECIPIENT_ACK_TIMEOUT, Duration, kompact_config};
     use kompact::config::DurationValue;
 
     kompact_config! {
@@ -994,7 +1020,7 @@ mod config_keys {
 }
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(30);
-const DEFAULT_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Receiver-side state for one inbound reliable-delivery envelope after it was

@@ -827,9 +827,9 @@ pub trait ReplicationStoreTransaction: Send {
     ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
 
     /// Load all persisted replication groups currently known to the store.
-    fn load_replication_groups<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
     /// Load persisted replication groups whose ids are included in `group_ids`.
     ///
@@ -841,10 +841,10 @@ pub trait ReplicationStoreTransaction: Send {
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
     /// Insert one new persisted replication group.
-    fn insert_replication_group<'a>(
-        &'a mut self,
+    fn insert_replication_group(
+        &mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Advance the durable version vector for one existing replication group.
     fn update_replication_group_version_vector<'a>(
@@ -865,10 +865,10 @@ pub trait ReplicationStoreTransaction: Send {
     ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
 
     /// Apply one explicit set of durable row-level dataset storage actions.
-    fn apply_dataset_row_patch<'a>(
-        &'a mut self,
+    fn apply_dataset_row_patch(
+        &mut self,
         patch: DatasetRowPatch,
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Load one persisted replication update by `(group_id, update_id)`.
     fn load_replication_update<'a>(
@@ -888,10 +888,10 @@ pub trait ReplicationStoreTransaction: Send {
     ///
     /// Implementations must preserve the uniqueness of `(group_id, update_id)`
     /// and reject attempts to overwrite an existing durable update blob.
-    fn append_replication_update<'a>(
-        &'a mut self,
+    fn append_replication_update(
+        &mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>>;
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Mark one persisted replication update as already applied locally.
     fn mark_replication_update_applied<'a>(

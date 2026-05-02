@@ -658,7 +658,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
                 ));
             }
             other => {
-                log::debug!("ignoring unrelated TCP session event in test: {:?}", other);
+                log::debug!("ignoring unrelated TCP session event in test: {other:?}");
             }
         }
     }

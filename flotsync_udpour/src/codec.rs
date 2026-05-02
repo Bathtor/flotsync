@@ -1,6 +1,18 @@
 use crate::{
     roaring_helpers::{MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError, select_bitmap_chunk},
-    types::*,
+    types::{
+        AckFrame,
+        Checksum,
+        FrameType,
+        MessageId,
+        NeedPartsFrame,
+        NoLongerAvailableFrame,
+        PartCount,
+        PayloadFrame,
+        UDPourFrame,
+        UDPourHeader,
+        UDPourTypeError,
+    },
     wire::{DecodeFromBuf, EncodeToBufMut},
 };
 #[cfg(test)]
@@ -190,6 +202,7 @@ fn encode_header(header: UDPourHeader) -> BytesMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{PROTOCOL_VERSION, PartNumber};
     use bytes::Bytes;
 
     fn raw_frame(bytes: Vec<u8>) -> IoPayload {

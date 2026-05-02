@@ -71,11 +71,13 @@ where
     }
 
     /// Create an empty in-memory dataset borrowing a `'static` schema.
+    #[must_use]
     pub fn with_static_schema(schema: &'static Schema) -> Self {
         Self::new(schema)
     }
 
     /// Create an empty in-memory dataset owning `schema`.
+    #[must_use]
     pub fn with_owned_schema(schema: Schema) -> Self {
         Self::new(schema)
     }
@@ -144,11 +146,13 @@ where
     }
 
     /// Get the immutable schema associated with this dataset.
+    #[must_use]
     pub fn schema(&self) -> &Schema {
         self.schema.as_schema()
     }
 
     /// Return the number of fields expected in every row.
+    #[must_use]
     pub fn num_fields(&self) -> usize {
         self.field_names.len()
     }
@@ -169,16 +173,19 @@ where
     }
 
     /// Return the number of stored rows.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
     /// Return `true` when no rows are stored.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Return the number of rows that are not tombstoned.
+    #[must_use]
     pub fn num_active_rows(&self) -> usize {
         self.rows.iter().filter(|row| !row.deleted).count()
     }
@@ -2220,10 +2227,10 @@ where
         ) => {
             match (current, delta) {
                 (CounterValue::Byte(current), CounterValue::Byte(delta)) => {
-                    *current = current.saturating_add(delta)
+                    *current = current.saturating_add(delta);
                 }
                 (CounterValue::UInt(current), CounterValue::UInt(delta)) => {
-                    *current = current.saturating_add(delta)
+                    *current = current.saturating_add(delta);
                 }
                 _ => {
                     return crate::InternalOperationSnafu {
@@ -2273,7 +2280,7 @@ where
     data: &'a InMemoryData<RowId, OperationId>,
     row_index: usize,
 }
-impl<'a, RowId, OperationId> Clone for InMemoryDataRow<'a, RowId, OperationId>
+impl<RowId, OperationId> Clone for InMemoryDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -2284,11 +2291,12 @@ where
         }
     }
 }
-impl<'a, RowId, OperationId> InMemoryDataRow<'a, RowId, OperationId>
+impl<RowId, OperationId> InMemoryDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
     /// Materialise this row into a complete owned snapshot.
+    #[must_use]
     pub fn snapshot(&self) -> RowSnapshot<'static, OperationId>
     where
         OperationId: Clone,
@@ -2298,11 +2306,12 @@ where
     }
 
     /// Return whether this retained row is currently tombstoned.
+    #[must_use]
     pub fn is_tombstoned(&self) -> bool {
         self.data.rows[self.row_index].deleted
     }
 }
-impl<'a, RowId, OperationId> RowRead<OperationId> for InMemoryDataRow<'a, RowId, OperationId>
+impl<RowId, OperationId> RowRead<OperationId> for InMemoryDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -2517,6 +2526,7 @@ pub enum LinearLatestValueWinsValue<OperationId> {
     ),
 }
 impl<OperationId> LinearLatestValueWinsValue<OperationId> {
+    #[must_use]
     pub fn matches_type(&self, expected: &NullableBasicDataType) -> bool {
         match (self, expected) {
             (
@@ -3090,6 +3100,7 @@ pub enum LinearListValue<OperationId> {
     Timestamp(LinearList<OperationId, UnixTimestamp>),
 }
 impl<OperationId> LinearListValue<OperationId> {
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::String(_) => PrimitiveType::String,

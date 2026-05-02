@@ -93,7 +93,7 @@ impl SqliteReplicationStore {
         )
     }
 
-    /// Open one disk-backed SQLite store for `local_member`.
+    /// Open one disk-backed `SQLite` store for `local_member`.
     pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::file_with_schema_sources(
             local_member,
@@ -124,7 +124,7 @@ impl SqliteReplicationStore {
         Self::from_connect_options(local_member, schema_sources, connect_options)
     }
 
-    /// Open one disk-backed SQLite store with the provided application schema sources.
+    /// Open one disk-backed `SQLite` store with the provided application schema sources.
     pub fn file_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         path: impl AsRef<Path>,
@@ -223,10 +223,10 @@ impl ReplicationStore for SqliteReplicationStore {
     }
 }
 
-/// One open store transaction backed by SQLx's transaction guard.
+/// One open store transaction backed by `SQLx`'s transaction guard.
 ///
 /// `connection` becomes `None` after explicit commit or rollback. Dropping an
-/// open transaction lets SQLx queue a rollback before returning the connection
+/// open transaction lets `SQLx` queue a rollback before returning the connection
 /// to the pool.
 struct SqliteReplicationStoreTransaction {
     connection: Option<SqliteStoreTransaction>,
@@ -320,9 +320,9 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
-    fn load_replication_groups<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
     }
 
@@ -334,10 +334,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn insert_replication_group<'a>(
-        &'a mut self,
+    fn insert_replication_group(
+        &mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
     }
 
@@ -377,10 +377,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn apply_dataset_row_patch<'a>(
-        &'a mut self,
+    fn apply_dataset_row_patch(
+        &mut self,
         patch: DatasetRowPatch,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             apply_dataset_row_patch(
@@ -415,10 +415,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn append_replication_update<'a>(
-        &'a mut self,
+    fn append_replication_update(
+        &mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { append_replication_update(self.assert_open_connection(), &update).await }
             .boxed()
     }
@@ -463,7 +463,7 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 type SqliteStoreConnection = SqliteConnection;
 type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 
-/// SQLite compares BLOBs lexicographically. Fixed-width big-endian encodings
+/// `SQLite` compares BLOBs lexicographically. Fixed-width big-endian encodings
 /// therefore preserve the natural ordering of `u64` values across the full
 /// range, so `ORDER BY update_version` remains numerically correct even above
 /// `i64::MAX`.

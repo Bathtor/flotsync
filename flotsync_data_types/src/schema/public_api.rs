@@ -92,6 +92,7 @@ impl Field {
         Ok(self)
     }
 
+    #[must_use]
     pub fn without_default(mut self) -> Self {
         self.default_value = None;
         self
@@ -107,7 +108,7 @@ impl Field {
         Ok(Some(target_value))
     }
 
-    pub fn initial<'a, V>(&'a self, value: V) -> Result<InitialFieldValue<'a>, FieldValueBuildError>
+    pub fn initial<V>(&self, value: V) -> Result<InitialFieldValue<'_>, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,
     {
@@ -118,7 +119,7 @@ impl Field {
         })
     }
 
-    pub fn set<'a, V>(&'a self, value: V) -> Result<PendingFieldUpdate<'a>, FieldValueBuildError>
+    pub fn set<V>(&self, value: V) -> Result<PendingFieldUpdate<'_>, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,
     {

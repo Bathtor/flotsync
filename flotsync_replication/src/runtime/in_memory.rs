@@ -1,4 +1,14 @@
-use super::errors::{inbound, publish, *};
+use super::errors::{
+    GroupInstallError,
+    InboundDeliveryError,
+    InstallMissingLocalMemberSnafu,
+    InvalidPersistedMembersSnafu,
+    PersistedLocalMemberIndexMismatchSnafu,
+    PersistedVersionVectorMemberCountMismatchSnafu,
+    PublishChangesError,
+    inbound,
+    publish,
+};
 use crate::{
     GroupMembers,
     api::{

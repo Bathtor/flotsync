@@ -10,7 +10,7 @@ use crate::delivery::wire::{
     signature_to_wire_format,
 };
 
-use super::*;
+use super::{EncryptedPayload, GroupMessageEnvelope, GroupMessageHeader};
 use flotsync_messages::{buffa::MessageField, delivery as delivery_proto};
 use snafu::prelude::*;
 

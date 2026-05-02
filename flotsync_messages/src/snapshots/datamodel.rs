@@ -107,6 +107,7 @@ pub struct ProtoSchemaSnapshotEncoder<'schema> {
 
 impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
     /// Create an empty row encoder bound to `schema`.
+    #[must_use]
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
@@ -434,8 +435,8 @@ pub struct LatestValueWinsHistoryFieldSink<'schema, 'row> {
     value_type: &'schema NullableBasicDataType,
 }
 
-impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRef<'value>>
-    for LatestValueWinsHistoryFieldSink<'schema, 'row>
+impl<'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRef<'value>>
+    for LatestValueWinsHistoryFieldSink<'_, '_>
 {
     type Error = SnapshotAdapterError;
 
@@ -471,9 +472,7 @@ pub struct LinearStringHistoryFieldSink<'schema, 'row> {
     state: Option<HistoryFieldEncoderState<'schema, 'row, SnapshotNode<UpdateIdWithIndex, String>>>,
 }
 
-impl<'schema, 'row> SnapshotSink<UpdateIdWithIndex, str>
-    for LinearStringHistoryFieldSink<'schema, 'row>
-{
+impl SnapshotSink<UpdateIdWithIndex, str> for LinearStringHistoryFieldSink<'_, '_> {
     type Error = SnapshotAdapterError;
 
     fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error> {
@@ -514,8 +513,8 @@ pub struct LinearListHistoryFieldSink<'schema, 'row> {
     value_type: PrimitiveType,
 }
 
-impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayRef<'value>>
-    for LinearListHistoryFieldSink<'schema, 'row>
+impl SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>
+    for LinearListHistoryFieldSink<'_, '_>
 {
     type Error = SnapshotAdapterError;
 
@@ -853,7 +852,7 @@ pub struct ProtoDataSnapshotRowEncoder<'schema, 'row> {
     inner: &'row mut ProtoSchemaSnapshotEncoder<'schema>,
 }
 
-impl<'schema, 'row> SchemaSnapshotEncoder<UpdateId> for ProtoDataSnapshotRowEncoder<'schema, 'row> {
+impl<'schema> SchemaSnapshotEncoder<UpdateId> for ProtoDataSnapshotRowEncoder<'schema, '_> {
     type Error = SnapshotAdapterError;
 
     type LatestValueWinsFieldSink<'a>
@@ -926,6 +925,7 @@ pub struct ProtoDataSnapshotEncoder<'schema> {
 
 impl<'schema> ProtoDataSnapshotEncoder<'schema> {
     /// Create an empty dataset encoder bound to `schema`.
+    #[must_use]
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
@@ -979,7 +979,7 @@ impl<'schema> flotsync_data_types::schema::datamodel::DataSnapshotEncoder<Update
         Ok(())
     }
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowEncoder<'a>, Self::Error> {
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowEncoder<'_>, Self::Error> {
         let row_count = self.expected_row_count.context(BeginRequiredSnafu {
             target: "data snapshot encoder",
         })?;
@@ -1057,7 +1057,7 @@ impl flotsync_data_types::schema::datamodel::DataSnapshotDecoder<UpdateId>
         Ok(self.rows.len())
     }
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowDecoder<'a>, Self::Error> {
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowDecoder<'_>, Self::Error> {
         ensure!(
             self.began,
             BeginRequiredSnafu {

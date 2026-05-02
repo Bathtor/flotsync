@@ -10,10 +10,12 @@ pub type MemberIdentity = Identifier;
 pub struct MemberIndex(u32);
 
 impl MemberIndex {
+    #[must_use]
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
+    #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
@@ -83,10 +85,12 @@ impl DatasetId {
         Ok(Self(value))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
+    #[must_use]
     pub fn into_string(self) -> String {
         self.0
     }

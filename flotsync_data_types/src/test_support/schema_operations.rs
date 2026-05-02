@@ -59,6 +59,7 @@ pub enum ExampleBuildError {
 }
 
 /// Build a schema that covers every supported CRDT/data-type combination in the operations model.
+#[must_use]
 pub fn exhaustive_schema() -> Schema {
     let mut columns = HashMap::with_capacity(EXHAUSTIVE_SCHEMA_FIELD_COUNT);
 
@@ -1097,12 +1098,15 @@ mod tests {
                     }
                 }
             }
-            (ReplicatedDataType::LatestValueWins { .. }, _)
-            | (ReplicatedDataType::LinearString, _)
-            | (ReplicatedDataType::LinearList { .. }, _)
-            | (ReplicatedDataType::MonotonicCounter { .. }, _)
-            | (ReplicatedDataType::TotalOrderRegister { .. }, _)
-            | (ReplicatedDataType::TotalOrderFiniteStateRegister { .. }, _) => {
+            (
+                ReplicatedDataType::LatestValueWins { .. }
+                | ReplicatedDataType::LinearString
+                | ReplicatedDataType::LinearList { .. }
+                | ReplicatedDataType::MonotonicCounter { .. }
+                | ReplicatedDataType::TotalOrderRegister { .. }
+                | ReplicatedDataType::TotalOrderFiniteStateRegister { .. },
+                _,
+            ) => {
                 panic!("operation does not match schema data type")
             }
         }

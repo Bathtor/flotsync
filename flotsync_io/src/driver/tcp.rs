@@ -1030,17 +1030,16 @@ impl TcpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         loop {
-            let mut ingress_buffer = match ingress_pool.try_acquire()? {
-                Some(buffer) => buffer,
-                None => {
-                    let suspended = self.suspend_read(connection_id, registry)?;
-                    if suspended {
-                        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadSuspended {
-                            connection_id,
-                        }))?;
-                    }
-                    return Ok(None);
+            let mut ingress_buffer = if let Some(buffer) = ingress_pool.try_acquire()? {
+                buffer
+            } else {
+                let suspended = self.suspend_read(connection_id, registry)?;
+                if suspended {
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadSuspended {
+                        connection_id,
+                    }))?;
                 }
+                return Ok(None);
             };
 
             let read_result = {
@@ -1354,9 +1353,10 @@ mod tests {
                 return event;
             }
 
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for flotsync_io driver event");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for flotsync_io driver event"
+            );
 
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1415,8 +1415,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP listen failure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP listen failure: {other:?}"
                     );
                 }
             }
@@ -1479,8 +1478,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP listening event: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP listening event: {other:?}"
                     );
                 }
             }
@@ -1499,8 +1497,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP accepted event: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP accepted event: {other:?}"
                     );
                 }
             }
@@ -1528,8 +1525,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for adopted TCP payload: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for adopted TCP payload: {other:?}"
                     );
                 }
             }
@@ -1652,8 +1648,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP connect: {other:?}"
                     );
                 }
             }
@@ -1685,7 +1680,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated TCP event: {:?}", other);
+                    log::debug!("ignoring unrelated TCP event: {other:?}");
                 }
             }
         }
@@ -1731,8 +1726,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP connect failure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP connect failure: {other:?}"
                     );
                 }
             }
@@ -1814,8 +1808,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP write suspension/backpressure nack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP write suspension/backpressure nack: {other:?}"
                     );
                 }
             }
@@ -1891,8 +1884,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP WriteSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP WriteSuspended: {other:?}"
                     );
                 }
             }
@@ -1917,8 +1909,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP SendAck/WriteResumed: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP SendAck/WriteResumed: {other:?}"
                     );
                 }
             }
@@ -2004,8 +1995,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP graceful close: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP graceful close: {other:?}"
                     );
                 }
             }
@@ -2089,8 +2079,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP send-and-close: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP send-and-close: {other:?}"
                     );
                 }
             }
@@ -2165,8 +2154,7 @@ mod tests {
                 }) if received_id == connection_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for first TCP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for first TCP receive: {other:?}"
                     );
                 }
             }
@@ -2179,8 +2167,7 @@ mod tests {
                 }) if received_id == connection_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for second TCP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for second TCP receive: {other:?}"
                     );
                 }
             }
@@ -2195,8 +2182,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP ReadSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP ReadSuspended: {other:?}"
                     );
                 }
             }
@@ -2222,8 +2208,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP ReadResumed/Received: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP ReadResumed/Received: {other:?}"
                     );
                 }
             }

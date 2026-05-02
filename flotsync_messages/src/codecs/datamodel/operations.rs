@@ -110,10 +110,10 @@ pub fn encode_schema_operation(
 }
 
 /// Decode a schema operation from protobuf, validating it against the provided schema.
-pub fn decode_schema_operation<'schema>(
+pub fn decode_schema_operation(
     mut operation: proto::SchemaOperation,
-    schema: &'schema Schema,
-) -> OperationResult<model::SchemaOperation<'schema, Uuid, UpdateId>> {
+    schema: &Schema,
+) -> OperationResult<model::SchemaOperation<'_, Uuid, UpdateId>> {
     let change_id = operation
         .change_id
         .take_required("SchemaOperation", "change_id")
@@ -221,10 +221,10 @@ fn decode_insert_row_operation(
     Ok(RowOperation::Insert { row_id, snapshot })
 }
 
-fn decode_update_row_operation<'schema>(
+fn decode_update_row_operation(
     operation: proto::UpdateRowOperation,
-    schema: &'schema Schema,
-) -> OperationResult<RowOperation<'schema, Uuid, UpdateId>> {
+    schema: &Schema,
+) -> OperationResult<RowOperation<'_, Uuid, UpdateId>> {
     let row_id = decode_row_id(operation.row_id)?;
     let fields = operation
         .fields
@@ -282,10 +282,10 @@ pub fn encode_operation_field(
     })
 }
 
-fn decode_operation_field<'schema>(
+fn decode_operation_field(
     mut field: proto::OperationField,
-    schema: &'schema Schema,
-) -> OperationResult<model::OperationFieldValue<'schema, UpdateId>> {
+    schema: &Schema,
+) -> OperationResult<model::OperationFieldValue<'_, UpdateId>> {
     let field_name = field.field_name.as_str();
     let Some((field_name, _)) = schema.columns.get_key_value(field_name) else {
         return Err(OperationCodecError::InvalidSchemaOperation {
@@ -422,13 +422,13 @@ fn encode_linear_string_action(
         } => {
             encoded.value = Some(proto::linear_string_action::Value::Insert(Box::new(
                 encode_linear_string_insert_operation(id, pred, succ, value),
-            )))
+            )));
         }
         DataOperation::Delete { start, end } => {
             let encoded_op = encode_linear_delete_operation(start, end.as_ref())?;
             encoded.value = Some(proto::linear_string_action::Value::Delete(Box::new(
                 encoded_op,
-            )))
+            )));
         }
     }
     Ok(encoded)
@@ -527,12 +527,12 @@ fn encode_linear_list_action(
         } => {
             encoded.value = Some(proto::linear_list_action::Value::Insert(Box::new(
                 encode_linear_list_insert_operation(id, pred, succ, value),
-            )))
+            )));
         }
         DataOperation::Delete { start, end } => {
             encoded.value = Some(proto::linear_list_action::Value::Delete(Box::new(
                 encode_linear_delete_operation(start, end.as_ref())?,
-            )))
+            )));
         }
     }
     Ok(encoded)

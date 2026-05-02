@@ -19,6 +19,7 @@ pub struct VecRowProvider {
 }
 
 impl VecRowProvider {
+    #[must_use]
     pub fn new(rows: Vec<RowChange>) -> Self {
         Self { rows }
     }
@@ -31,10 +32,10 @@ impl BatchProvider for VecRowProvider {
         RowChangeBatch::new()
     }
 
-    fn fill_batch<'a>(
-        &'a mut self,
+    fn fill_batch(
+        &mut self,
         mut reuse: Self::Batch,
-    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
+    ) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>> {
         async move {
             reuse.clear();
             reuse.extend(std::mem::take(&mut self.rows));
@@ -55,10 +56,12 @@ pub struct VecInitialRowProvider {
 }
 
 impl VecInitialRowProvider {
+    #[must_use]
     pub fn new(rows: Vec<InitialRowState>) -> Self {
         Self::with_max_rows_per_batch(rows, DEFAULT_INITIAL_ROW_BATCH_SIZE)
     }
 
+    #[must_use]
     pub fn with_max_rows_per_batch(
         rows: Vec<InitialRowState>,
         max_rows_per_batch: NonZeroUsize,
@@ -83,10 +86,10 @@ impl BatchProvider for VecInitialRowProvider {
         Vec::with_capacity(self.max_rows_per_batch.get())
     }
 
-    fn fill_batch<'a>(
-        &'a mut self,
+    fn fill_batch(
+        &mut self,
         mut reuse: Self::Batch,
-    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
+    ) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>> {
         async move {
             reuse.clear();
             while reuse.len() < self.max_rows_per_batch.get() {

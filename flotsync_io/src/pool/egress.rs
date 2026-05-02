@@ -91,11 +91,13 @@ impl EgressPool {
     }
 
     /// Returns the configuration used by this pool.
+    #[must_use]
     pub fn config(&self) -> IoPoolConfig {
         self.config.clone()
     }
 
     /// Creates one growable async writer over this pool.
+    #[must_use]
     pub fn writer(&self, hint_bytes: Option<usize>) -> EgressAsyncWriter {
         let chunk_size = self.config.chunk_size;
         let total_capacity = self.config.total_capacity_bytes();
@@ -519,6 +521,7 @@ impl EgressReservation {
     }
 
     /// Returns the reserved payload budget in bytes.
+    #[must_use]
     pub fn reserved_bytes(&self) -> usize {
         self.reserved_bytes
     }
@@ -829,6 +832,7 @@ impl<'a> EgressReservedWriter<'a> {
     }
 
     /// Returns how many bytes may still be written through this bounded proxy.
+    #[must_use]
     pub fn reserved_remaining(&self) -> usize {
         self.reserved_remaining
     }

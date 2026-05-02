@@ -21,6 +21,7 @@ pub fn configure_bind_reuse(socket: &Socket) -> io::Result<()> {
 }
 
 /// Returns the socket domain that matches the supplied address family.
+#[must_use]
 pub fn socket_domain(addr: SocketAddr) -> Domain {
     match addr {
         SocketAddr::V4(_) => Domain::IPV4,

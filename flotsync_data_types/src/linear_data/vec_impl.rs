@@ -1,4 +1,22 @@
-use super::*;
+use super::{
+    Composite,
+    DataOperation,
+    IntegrityError,
+    InvalidNodeSnafu,
+    LinearData,
+    LinkIds,
+    MissingBeginningBoundarySnafu,
+    MissingEndBoundarySnafu,
+    Node,
+    NodeIds,
+    Operation,
+    VisibleLengthMismatchSnafu,
+    assert_matches,
+    ensure,
+    fmt,
+    option_when,
+    vec,
+};
 use crate::snapshot::{
     SnapshotHeader,
     SnapshotNode,
@@ -8,7 +26,7 @@ use crate::snapshot::{
 };
 use std::{collections::HashMap, hash::Hash};
 
-/// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
+/// An implementation of [[`LinearData`]] using a [[Vec]] to track the individual operation nodes.
 ///
 /// # Note
 /// While the natural representation of this data structure is linked nodes,

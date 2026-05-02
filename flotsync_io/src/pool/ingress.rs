@@ -54,6 +54,7 @@ impl IngressPool {
     }
 
     /// Returns the configuration used by this pool.
+    #[must_use]
     pub fn config(&self) -> IoPoolConfig {
         self.config.clone()
     }
@@ -131,7 +132,7 @@ impl IngressPoolState {
                     "ingress pool state is poisoned; dropping returned chunks"
                 );
             }
-        };
+        }
     }
 
     pub(super) fn release_live_chunks_from_weak(
@@ -174,6 +175,7 @@ impl IngressBuffer {
     }
 
     /// Returns the chunk capacity in bytes.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.chunk
             .as_deref()

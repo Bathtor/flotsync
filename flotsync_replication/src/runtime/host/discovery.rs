@@ -365,7 +365,7 @@ fn read_route_port(
         .get("port")
         .as_i64()
         .map_err(|error| invalid_static_routes_config(format!("route[{index}].port: {error}")))?;
-    if !(1..=u16::MAX as i64).contains(&port) {
+    if !(1..=i64::from(u16::MAX)).contains(&port) {
         return Err(invalid_static_routes_config(format!(
             "route[{index}].port must be between 1 and {}, got {port}",
             u16::MAX

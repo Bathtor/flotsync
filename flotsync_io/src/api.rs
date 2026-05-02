@@ -103,6 +103,7 @@ impl IoPayload {
     }
 
     /// Creates a payload from a static byte slice.
+    #[must_use]
     pub fn from_static(bytes: &'static [u8]) -> Self {
         Self::Bytes(Bytes::from_static(bytes))
     }
@@ -487,6 +488,7 @@ impl UdpLocalBind {
     /// The resolution is platform-sensitive. In particular, loopback peers resolve to loopback
     /// ephemeral local addresses, while other peers resolve to wildcard ephemeral local addresses
     /// in the same address family.
+    #[must_use]
     pub fn resolve_local_addr(self) -> SocketAddr {
         match self {
             Self::Exact(local_addr) => local_addr,

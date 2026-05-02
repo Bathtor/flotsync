@@ -21,7 +21,7 @@ use std::{borrow::Cow, fmt, hash::Hash};
 ///
 /// - **Write:** publishing a new value `T` creates a new version node.
 /// - **Visible value:** the register evaluates the set of version nodes and returns the
-///   value of the single node that is considered *current* under the ReplaceManager rule.
+///   value of the single node that is considered *current* under the `ReplaceManager` rule.
 /// - **Concurrency:** if multiple writes are concurrent, all replicas still choose the same
 ///   current node deterministically (no reliance on wall-clock time), if they have seen the same
 ///   set of published values (in any order).
@@ -62,6 +62,7 @@ where
     }
 
     /// Returns the current value of this CRDT.
+    #[must_use]
     pub fn content(&self) -> &T {
         self.data
             .iter_values()
@@ -397,8 +398,7 @@ mod tests {
             if let Some(ref prev) = previous_result {
                 assert_eq!(
                     prev, &reg,
-                    "Result did not match for schedule: {:?}",
-                    schedule_trace
+                    "Result did not match for schedule: {schedule_trace:?}"
                 );
             }
             previous_result = Some(reg);

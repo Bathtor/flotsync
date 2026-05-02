@@ -1301,7 +1301,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
         // of the way, otherwise `NeedParts` retransmissions can overlap with
         // the paced sends and stop testing the behaviour we actually care about.
         ReceiverConfig {
-            repair_interval: Duration::from_secs(60),
+            repair_interval: Duration::from_mins(1),
             ..DEFAULT_RECEIVER_CONFIG
         },
         TestSendRateControl {

@@ -234,6 +234,7 @@ pub struct UdpOpenRequestId(pub Uuid);
 
 impl UdpOpenRequestId {
     /// Allocates one fresh UDP open-request correlation id.
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -311,6 +312,7 @@ impl TcpListenerRef {
     }
 
     /// Returns a narrowed recipient for this listener.
+    #[must_use]
     pub fn recipient(&self) -> Recipient<TcpListenerRequest> {
         self.actor.recipient()
     }
@@ -434,6 +436,7 @@ impl TcpSessionEventTarget {
     }
 
     /// Builds one event target from a plain Kompact recipient.
+    #[must_use]
     pub fn from_recipient(recipient: Recipient<TcpSessionEvent>) -> Self {
         Self::new(RecipientTcpSessionEventTarget { recipient })
     }
@@ -598,6 +601,7 @@ impl TcpSessionRef {
     }
 
     /// Returns the shared egress pool owned by the underlying raw driver instance.
+    #[must_use]
     pub fn egress_pool(&self) -> &EgressPool {
         &self.egress_pool
     }
@@ -679,6 +683,7 @@ impl TcpSessionRef {
     ///
     /// This is provided for integration points that specifically require a `Recipient`, but it
     /// pays the normal Kompact recipient adapter overhead on each use.
+    #[must_use]
     pub fn recipient(&self) -> Recipient<TcpSessionRequest> {
         self.actor.recipient()
     }

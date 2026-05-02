@@ -1,6 +1,6 @@
 use std::cmp;
 
-use super::*;
+use super::{Composite, Graphemes, Hash, UnicodeSegmentation, fmt};
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct GraphemeString {

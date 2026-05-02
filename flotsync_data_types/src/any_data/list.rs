@@ -31,23 +31,26 @@ pub enum DiffError {
     Internal { source: InternalError },
 }
 
-/// A set of list changes that can be applied to a [[LinearList]].
+/// A set of list changes that can be applied to a [[`LinearList`]].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearListDiff<Id, T> {
     operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
 }
 impl<Id, T> LinearListDiff<Id, T> {
     /// Returns `true` iff this diff is empty, i.e. a no-op.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 
     /// Returns how many individual operations there are in this diff.
+    #[must_use]
     pub fn num_operations(&self) -> usize {
         self.operations.len()
     }
 
     /// Returns how many operations in this diff are inserts.
+    #[must_use]
     pub fn num_insert_operations(&self) -> usize {
         self.operations
             .iter()
@@ -56,6 +59,7 @@ impl<Id, T> LinearListDiff<Id, T> {
     }
 
     /// Returns how many operations in this diff are deletes.
+    #[must_use]
     pub fn num_delete_operations(&self) -> usize {
         self.operations
             .iter()
@@ -171,7 +175,11 @@ where
                 range.start, range.end
             ),
         })?;
-    operations.extend(range_ids.delete_operations().map(|op| op.into_operation()));
+    operations.extend(
+        range_ids
+            .delete_operations()
+            .map(ListOperation::into_operation),
+    );
     Ok(())
 }
 
@@ -299,7 +307,7 @@ impl<T> Composite for ListChunk<T> {
     }
 }
 
-/// A convergent linear list CRDT backed by [[VecCoalescedLinearData]].
+/// A convergent linear list CRDT backed by [[`VecCoalescedLinearData`]].
 ///
 /// `LinearList` models an ordered sequence of values `T`. Inserts can add one item or a chunk
 /// of items in one operation. Concurrent inserts at the same position are resolved
@@ -335,7 +343,7 @@ where
 
     /// Create a list initialized with `initial_values`.
     ///
-    /// If `initial_values` is empty this is equivalent to [[LinearList::new]].
+    /// If `initial_values` is empty this is equivalent to [[`LinearList::new`]].
     ///
     /// # Example
     ///
@@ -357,16 +365,19 @@ where
     }
 
     /// Number of visible elements in the list.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Whether the list contains no visible elements.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     /// Iterate over visible values in list order.
+    #[must_use]
     pub fn iter(&self) -> LinearListIter<'_, Id, T> {
         LinearListIter {
             underlying: self.data.iter_values(),
@@ -518,7 +529,7 @@ where
 
     /// Return ids covering a contiguous visible range.
     ///
-    /// The returned wrapper can be applied directly via [[NodeIdRangeList::delete]]
+    /// The returned wrapper can be applied directly via [[`NodeIdRangeList::delete`]]
     /// or converted into replayable operations.
     pub fn ids_in_range<R>(&self, range: R) -> Option<NodeIdRangeList<Id>>
     where
@@ -528,6 +539,7 @@ where
     }
 
     /// Resolve the concrete ids at the given visible position.
+    #[must_use]
     pub fn ids_at_pos(&self, position: usize) -> Option<NodeIds<IdWithIndex<Id>>> {
         self.data.ids_at_pos(position)
     }
@@ -632,6 +644,7 @@ where
     /// Build a delete operation for the value at `position`.
     ///
     /// Returns `None` if the position is out of bounds.
+    #[must_use]
     pub fn delete_operation_at(&self, position: usize) -> Option<ListOperation<Id, T>> {
         let node_ids = self.data.ids_at_pos(position)?;
         Some(ListOperation {
@@ -716,9 +729,9 @@ where
     }
 }
 
-/// A replication operation for [[LinearList]].
+/// A replication operation for [[`LinearList`]].
 ///
-/// This wraps a low-level [[DataOperation]] and keeps list payloads as `Vec<T>`.
+/// This wraps a low-level [[`DataOperation`]] and keeps list payloads as `Vec<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListOperation<Id, T> {
     op: DataOperation<IdWithIndex<Id>, Vec<T>>,
@@ -733,7 +746,7 @@ impl<Id, T> ListOperation<Id, T> {
     }
 }
 
-/// Convenience wrapper around [[NodeIdRange]] when using it with [[LinearList]].
+/// Convenience wrapper around [[`NodeIdRange`]] when using it with [[`LinearList`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeIdRangeList<Id>(NodeIdRange<Id>);
 impl<Id> NodeIdRangeList<Id>
@@ -814,7 +827,7 @@ mod tests {
         assert_eq!(diff.num_delete_operations(), 1);
         assert_eq!(
             diff.values_inserted()
-                .map(|chunk| chunk.to_vec())
+                .map(<[i32]>::to_vec)
                 .collect::<Vec<_>>(),
             vec![vec![9]]
         );
@@ -901,7 +914,7 @@ mod tests {
         let mut a = base.clone();
         let mut b = base;
 
-        let mut op_id_generator = TestIdGenerator::without_ids(a.iter_ids().cloned());
+        let mut op_id_generator = TestIdGenerator::without_ids(a.iter_ids().copied());
         let op = a
             .insert_operation_at(1, op_id_generator.next_with_zero_index().unwrap(), [9, 8])
             .unwrap()
@@ -1084,13 +1097,11 @@ mod tests {
                 assert_eq!(
                     previous.iter().copied().collect::<Vec<_>>(),
                     list.iter().copied().collect::<Vec<_>>(),
-                    "Result content did not match for schedule: {:?}",
-                    schedule_trace
+                    "Result content did not match for schedule: {schedule_trace:?}"
                 );
                 assert_eq!(
                     previous, &list,
-                    "Result structure did not match for schedule: {:?}",
-                    schedule_trace
+                    "Result structure did not match for schedule: {schedule_trace:?}"
                 );
             }
             previous_result = Some(list);

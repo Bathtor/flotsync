@@ -52,7 +52,7 @@ pub const RESERVED_SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Maximum time one test will wait for its full reserved-socket request before
 /// failing.
-pub const RESERVED_SOCKET_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(180);
+pub const RESERVED_SOCKET_ACQUIRE_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// Maximum attempts to acquire one hidden reservation socket directly from the
 /// OS while still validating that the broker never tracks the same
@@ -81,21 +81,25 @@ pub struct ReservedSocketLease {
 
 impl ReservedSocketLease {
     /// Returns the reserved socket address at `index`.
+    #[must_use]
     pub fn addr(&self, index: usize) -> SocketAddr {
         self.reserved[index].addr
     }
 
     /// Returns the reserved socket kind at `index`.
+    #[must_use]
     pub fn kind(&self, index: usize) -> ReservedSocketKind {
         self.reserved[index].kind
     }
 
     /// Returns how many reserved sockets this lease holds.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.reserved.len()
     }
 
     /// Returns whether this lease holds no reserved sockets.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.reserved.is_empty()
     }
@@ -164,12 +168,11 @@ impl Drop for ReservedSocketLease {
             }
         }
         RESERVED_SOCKET_BROKER.release(rebound);
-        if !failed_rebinds.is_empty() && !std::thread::panicking() {
-            panic!(
-                "failed to rebind reserved test sockets before returning them to the broker: {}",
-                failed_rebinds.join("; ")
-            );
-        }
+        assert!(
+            !(!failed_rebinds.is_empty() && !std::thread::panicking()),
+            "failed to rebind reserved test sockets before returning them to the broker: {}",
+            failed_rebinds.join("; ")
+        );
     }
 }
 
@@ -256,6 +259,7 @@ pub fn init_test_logger() {
 }
 
 /// Builds a Kompact system whose logs follow libtest output capture.
+#[must_use]
 pub fn build_test_kompact_system() -> KompactSystem {
     build_test_kompact_system_with(|_| {})
 }
@@ -536,15 +540,12 @@ impl ReservedSocketBroker {
 
         let diagnostics_rendered = diagnostics.render();
         let has_socket_accounting_mismatch = diagnostics.has_socket_accounting_mismatch();
-        if has_socket_accounting_mismatch {
-            panic!(
-                "reserved-socket broker detected a socket-accounting mismatch while reserving {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {}",
-                diagnostics_rendered,
-            );
-        }
+        assert!(
+            !has_socket_accounting_mismatch,
+            "reserved-socket broker detected a socket-accounting mismatch while reserving {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {diagnostics_rendered}",
+        );
         panic!(
-            "timed out waiting to reserve {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {}",
-            diagnostics_rendered,
+            "timed out waiting to reserve {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {diagnostics_rendered}",
         );
     }
 
@@ -857,8 +858,7 @@ impl ReservationCounters {
     fn render(&self, trace: &ReservationTrace) -> String {
         let next_kind = self
             .next_kind
-            .map(|kind| format!("{kind:?}"))
-            .unwrap_or_else(|| String::from("<complete>"));
+            .map_or_else(|| String::from("<complete>"), |kind| format!("{kind:?}"));
         format!(
             "request_id={}, owner={}, requested_tcp={}, requested_udp={}, acquired_tcp={}, acquired_udp={}, next_kind={}, waiting_tcp={}, waiting_udp={}, idle_tcp={}, idle_udp={}",
             trace.request_id,
@@ -888,8 +888,7 @@ impl ReservationFailureContext {
     fn render(&self, trace: &ReservationTrace) -> String {
         let next_kind_idle_available = self
             .next_kind_idle_available
-            .map(|available| available.to_string())
-            .unwrap_or_else(|| String::from("<n/a>"));
+            .map_or_else(|| String::from("<n/a>"), |available| available.to_string());
         format!(
             "{}, next_kind_idle_available={}, leased_tcp={}, leased_udp={}, expected_live_tcp={}, expected_live_udp={}",
             self.counters.render(trace),
@@ -1107,15 +1106,13 @@ impl ReservedSocket {
                         io::Error::new(
                             error.kind(),
                             format!(
-                                "read assigned local address for reserved {:?} socket: {error}",
-                                kind
+                                "read assigned local address for reserved {kind:?} socket: {error}"
                             ),
                         )
                     })?;
                     let addr = addr.as_socket().ok_or_else(|| {
                         io::Error::other(format!(
-                            "reserved {:?} socket was assigned a non-IP local address",
-                            kind
+                            "reserved {kind:?} socket was assigned a non-IP local address"
                         ))
                     })?;
                     return Ok(Self {
@@ -1160,16 +1157,13 @@ impl ReservedSocket {
         configure_bind_reuse(&socket).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!(
-                    "configure bind reuse for reserved {:?} socket at {addr}: {error}",
-                    kind
-                ),
+                format!("configure bind reuse for reserved {kind:?} socket at {addr}: {error}"),
             )
         })?;
         socket.bind(&SockAddr::from(addr)).map_err(|error| {
             io::Error::new(
                 error.kind(),
-                format!("bind reserved {:?} socket at {addr}: {error}", kind),
+                format!("bind reserved {kind:?} socket at {addr}: {error}"),
             )
         })?;
         if matches!(kind, ReservedSocketKind::TcpListener) {
@@ -1228,6 +1222,7 @@ impl ReservedSocket {
 }
 
 /// Returns the loopback address for the supplied port.
+#[must_use]
 pub fn localhost(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
 }
@@ -1261,9 +1256,7 @@ where
         }
 
         let now = Instant::now();
-        if now >= deadline {
-            panic!("{failure_message}");
-        }
+        assert!(now < deadline, "{failure_message}");
 
         thread::sleep(deadline.saturating_duration_since(now).min(poll_interval));
     }
@@ -1312,9 +1305,7 @@ where
 {
     let deadline = Instant::now() + duration;
     loop {
-        if predicate() {
-            panic!("{failure_message}");
-        }
+        assert!(!predicate(), "{failure_message}");
 
         let now = Instant::now();
         if now >= deadline {
@@ -1330,6 +1321,7 @@ where
 }
 
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].
+#[must_use]
 pub fn wait_for_driver_request<T>(mut request: DriverRequest<T>) -> T {
     eventually_value(
         WAIT_TIMEOUT,
@@ -1353,8 +1345,7 @@ pub fn wait_for_driver_event(
             Ok(Some(event)) if predicate(&event) => Some(event),
             Ok(Some(other)) => {
                 log::debug!(
-                    "ignoring unrelated driver event while waiting in integration test: {:?}",
-                    other
+                    "ignoring unrelated driver event while waiting in integration test: {other:?}"
                 );
                 None
             }
@@ -1425,6 +1416,7 @@ pub struct BufferedReceiver<T> {
 
 impl<T> BufferedReceiver<T> {
     /// Wraps one plain channel receiver with deferred-match support.
+    #[must_use]
     pub fn new(receiver: mpsc::Receiver<T>) -> Self {
         Self {
             receiver,
@@ -1558,9 +1550,10 @@ impl<T> BufferedReceiver<T> {
                     panic!("buffered test event sender disconnected during negative assertion")
                 }
             };
-            if predicate(&event) {
-                panic!("unexpected test event matched negative assertion: {event:?}");
-            }
+            assert!(
+                !predicate(&event),
+                "unexpected test event matched negative assertion: {event:?}"
+            );
             self.deferred.borrow_mut().push_back(event);
         }
     }
@@ -1585,6 +1578,7 @@ pub enum UdpObserverMessage {
 
 impl UdpObserver {
     /// Creates a new UDP observer.
+    #[must_use]
     pub fn new(indications: mpsc::Sender<UdpIndication>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -1627,6 +1621,7 @@ pub struct UdpSendResultProbe {
 
 impl UdpSendResultProbe {
     /// Creates a new UDP send-result probe.
+    #[must_use]
     pub fn new(results: mpsc::Sender<UdpSendResult>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -1657,6 +1652,7 @@ pub struct TcpSessionEventProbe {
 
 impl TcpSessionEventProbe {
     /// Creates a new TCP session-event probe.
+    #[must_use]
     pub fn new(events: mpsc::Sender<TcpSessionEvent>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -1687,6 +1683,7 @@ pub struct TcpListenerEventProbe {
 
 impl TcpListenerEventProbe {
     /// Creates a new TCP listener-event probe.
+    #[must_use]
     pub fn new(events: mpsc::Sender<TcpListenerEvent>) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),

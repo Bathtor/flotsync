@@ -8,7 +8,7 @@ pub type UnixTimestamp = i64;
 
 /// Arrays over primitive values.
 ///
-/// Corresponds to the [[super::PrimitiveType]].
+/// Corresponds to the [[`super::PrimitiveType`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrimitiveValueArray {
     String(Vec<String>),
@@ -22,6 +22,7 @@ pub enum PrimitiveValueArray {
     Timestamp(Vec<UnixTimestamp>),
 }
 impl PrimitiveValueArray {
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Self::String(values) => values.len(),
@@ -36,6 +37,7 @@ impl PrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -70,7 +72,7 @@ impl_primitive_value_array_from_vec!(f64, Float, |values: Vec<f64>| values
     .collect());
 impl_primitive_value_array_from_vec!(f32, Float, |values: Vec<f32>| values
     .into_iter()
-    .map(|value| OrderedFloat(value as f64))
+    .map(|value| OrderedFloat(f64::from(value)))
     .collect());
 impl_primitive_value_array_from_vec!(bool, Boolean, |values: Vec<bool>| values);
 impl_primitive_value_array_from_vec!(Vec<u8>, Binary, |values: Vec<Vec<u8>>| values);
@@ -78,7 +80,7 @@ impl_primitive_value_array_from_vec!(NaiveDate, Date, |values: Vec<NaiveDate>| v
 
 /// Primitive values.
 ///
-/// Corresponds to the [[super::PrimitiveType]].
+/// Corresponds to the [[`super::PrimitiveType`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrimitiveValue {
     String(String),
@@ -92,6 +94,7 @@ pub enum PrimitiveValue {
     Timestamp(UnixTimestamp),
 }
 impl PrimitiveValue {
+    #[must_use]
     pub fn as_ref(&self) -> PrimitiveValueRef<'_> {
         match self {
             Self::String(value) => PrimitiveValueRef::String(value.as_str()),
@@ -106,10 +109,12 @@ impl PrimitiveValue {
         }
     }
 
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         self.as_ref().primitive_type()
     }
 
+    #[must_use]
     pub fn value_type(&self) -> PrimitiveType {
         self.primitive_type()
     }
@@ -174,7 +179,7 @@ impl From<f64> for PrimitiveValue {
 
 impl From<f32> for PrimitiveValue {
     fn from(value: f32) -> Self {
-        Self::Float(OrderedFloat(value as f64))
+        Self::Float(OrderedFloat(f64::from(value)))
     }
 }
 
@@ -204,6 +209,7 @@ pub enum PrimitiveValueRef<'a> {
     Timestamp(UnixTimestamp),
 }
 impl PrimitiveValueRef<'_> {
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::String(_) => PrimitiveType::String,
@@ -218,10 +224,12 @@ impl PrimitiveValueRef<'_> {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self) -> PrimitiveType {
         self.primitive_type()
     }
 
+    #[must_use]
     pub fn to_owned(&self) -> PrimitiveValue {
         match self {
             Self::String(value) => PrimitiveValue::String((*value).to_owned()),
@@ -244,6 +252,7 @@ pub enum NullablePrimitiveValue {
     Value(PrimitiveValue),
 }
 impl NullablePrimitiveValue {
+    #[must_use]
     pub fn as_ref(&self) -> NullablePrimitiveValueRef<'_> {
         match self {
             Self::Null => NullablePrimitiveValueRef::Null,
@@ -251,6 +260,7 @@ impl NullablePrimitiveValue {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self, value_type: NullablePrimitiveType) -> NullablePrimitiveType {
         match self {
             Self::Null => value_type,
@@ -273,6 +283,7 @@ pub enum NullablePrimitiveValueRef<'a> {
     Value(PrimitiveValueRef<'a>),
 }
 impl NullablePrimitiveValueRef<'_> {
+    #[must_use]
     pub fn to_owned(&self) -> NullablePrimitiveValue {
         match self {
             Self::Null => NullablePrimitiveValue::Null,
@@ -365,7 +376,7 @@ impl From<f64> for OrderedValue {
 
 impl From<f32> for OrderedValue {
     fn from(value: f32) -> Self {
-        Self::Value(PrimitiveValue::Float(OrderedFloat(value as f64)))
+        Self::Value(PrimitiveValue::Float(OrderedFloat(f64::from(value))))
     }
 }
 
@@ -483,6 +494,7 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self) -> NullablePrimitiveType {
         match self {
             Self::NonNull(values) => NullablePrimitiveType::NonNull(values.primitive_type()),
@@ -492,6 +504,7 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::NonNull(values) => values.primitive_type(),
@@ -499,10 +512,12 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_nullable(&self) -> bool {
         matches!(self, Self::Nullable { .. })
     }
 
+    #[must_use]
     pub fn value_count(&self) -> usize {
         match self {
             Self::NonNull(values) => values.len(),
@@ -510,10 +525,12 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn state_count(&self) -> usize {
         self.value_count() + usize::from(self.is_nullable())
     }
 
+    #[must_use]
     pub fn null_index(&self) -> Option<usize> {
         match self {
             Self::NonNull(_) => None,
@@ -521,6 +538,7 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         match self {
             Self::NonNull(_) => true,

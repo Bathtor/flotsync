@@ -500,17 +500,16 @@ impl UdpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ReleasedUdpSocket>> {
         loop {
-            let mut ingress_buffer = match ingress_pool.try_acquire()? {
-                Some(buffer) => buffer,
-                None => {
-                    let suspended = self.suspend_read(socket_id, registry);
-                    if suspended {
-                        event_sink.publish(super::DriverEvent::Udp(UdpEvent::ReadSuspended {
-                            socket_id,
-                        }))?;
-                    }
-                    return Ok(None);
+            let mut ingress_buffer = if let Some(buffer) = ingress_pool.try_acquire()? {
+                buffer
+            } else {
+                let suspended = self.suspend_read(socket_id, registry);
+                if suspended {
+                    event_sink.publish(super::DriverEvent::Udp(UdpEvent::ReadSuspended {
+                        socket_id,
+                    }))?;
                 }
+                return Ok(None);
             };
 
             let recv_result = {
@@ -957,9 +956,10 @@ mod tests {
                 return event;
             }
 
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for flotsync_io driver event");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for flotsync_io driver event"
+            );
 
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -993,10 +993,7 @@ mod tests {
                     local_addr,
                 }) if bound_socket_id == socket_id => return local_addr,
                 other => {
-                    log::debug!(
-                        "ignoring unrelated event while waiting for bind: {:?}",
-                        other
-                    );
+                    log::debug!("ignoring unrelated event while waiting for bind: {other:?}");
                 }
             }
         }
@@ -1076,7 +1073,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                    log::debug!("ignoring unrelated UDP event: {other:?}");
                 }
             }
         }
@@ -1124,8 +1121,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP connect: {other:?}"
                     );
                 }
             }
@@ -1160,7 +1156,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                    log::debug!("ignoring unrelated UDP event: {other:?}");
                 }
             }
         }
@@ -1205,8 +1201,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP SendNack: {other:?}"
                     );
                 }
             }
@@ -1247,8 +1242,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP connect: {other:?}"
                     );
                 }
             }
@@ -1279,8 +1273,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP SendNack: {other:?}"
                     );
                 }
             }
@@ -1321,8 +1314,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP configure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP configure: {other:?}"
                     );
                 }
             }
@@ -1383,8 +1375,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP multicast join: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP multicast join: {other:?}"
                     );
                 }
             }
@@ -1412,8 +1403,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP multicast leave: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP multicast leave: {other:?}"
                     );
                 }
             }
@@ -1468,8 +1458,7 @@ mod tests {
                 }) if socket_id == receiver_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for first UDP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for first UDP receive: {other:?}"
                     );
                 }
             }
@@ -1493,8 +1482,7 @@ mod tests {
                 }) if socket_id == receiver_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for second UDP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for second UDP receive: {other:?}"
                     );
                 }
             }
@@ -1518,8 +1506,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for ReadSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for ReadSuspended: {other:?}"
                     );
                 }
             }
@@ -1544,8 +1531,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for ReadResumed/Received: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for ReadResumed/Received: {other:?}"
                     );
                 }
             }

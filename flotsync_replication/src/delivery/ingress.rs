@@ -83,6 +83,7 @@ pub enum DeliveryTargetHint {
 impl DeliveryTargetHint {
     /// Return the delivery-domain message id when this target corresponds to
     /// one concrete message.
+    #[must_use]
     pub fn delivery_message_id(&self) -> Option<MessageId> {
         match self {
             Self::GroupBroadcast {
@@ -141,6 +142,7 @@ pub struct DeliveryIngressComponent {
 impl DeliveryIngressComponent {
     /// Creates one new delivery-ingress adapter with the current local-interest
     /// snapshot handles.
+    #[must_use]
     pub fn new(interest: DeliveryInterestConfig) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),

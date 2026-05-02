@@ -61,6 +61,7 @@ pub const FIELD_PRIORITY: &str = "priority";
 pub const FIELD_EDIT_COUNT: &str = "edit_count";
 pub static CHECKLIST_SCHEMA: LazyLock<Schema> = LazyLock::new(build_checklist_schema);
 
+#[must_use]
 pub fn checklist_dataset_id() -> DatasetId {
     DatasetId::try_new(CHECKLIST_DATASET_ID)
         .expect("checklist dataset id must be a valid dataset identifier")
@@ -104,6 +105,7 @@ impl ChecklistStatus {
     pub const DONE: &'static str = "done";
     pub const SCHEMA_STATES: [&'static str; 3] = [Self::OPEN, Self::IN_PROGRESS, Self::DONE];
 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Open => Self::OPEN,
@@ -112,6 +114,7 @@ impl ChecklistStatus {
         }
     }
 
+    #[must_use]
     pub fn from_schema_value(value: &str) -> Option<Self> {
         match value {
             Self::OPEN => Some(Self::Open),
@@ -210,6 +213,7 @@ pub enum ChecklistCommand {
 }
 
 impl ChecklistCommand {
+    #[must_use]
     pub const fn status_target(&self) -> Option<ChecklistStatus> {
         match self {
             Self::Claim { .. } => Some(ChecklistStatus::InProgress),
@@ -306,6 +310,7 @@ pub fn parse_item_selector(value: &str) -> Result<ItemSelector, ChecklistCommand
     Ok(ItemSelector::RowKey(RowKey(row_key)))
 }
 
+#[must_use]
 pub fn checklist_help() -> String {
     ChecklistLine::command().render_long_help().to_string()
 }
@@ -339,6 +344,7 @@ impl ChecklistItem {
         }
     }
 
+    #[must_use]
     pub fn formatted_tags(&self) -> String {
         self.tags
             .iter()
@@ -523,6 +529,7 @@ pub struct ChecklistWorkingSet {
 }
 
 impl ChecklistWorkingSet {
+    #[must_use]
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
@@ -536,14 +543,17 @@ impl ChecklistWorkingSet {
         }
     }
 
+    #[must_use]
     pub fn group_id(&self) -> GroupId {
         self.group_id
     }
 
+    #[must_use]
     pub fn dataset_id(&self) -> &DatasetId {
         &self.dataset_id
     }
 
+    #[must_use]
     pub fn item(&self, row_key: RowKey) -> Option<&ChecklistItem> {
         self.rows.get(&row_key)
     }
@@ -559,14 +569,17 @@ impl ChecklistWorkingSet {
             .ok_or(ChecklistWorkingSetError::UnknownItem { selector })
     }
 
+    #[must_use]
     pub fn dirty_row_count(&self) -> usize {
         self.dirty_rows.len()
     }
 
+    #[must_use]
     pub fn queued_event_count(&self) -> usize {
         self.queued_events.len()
     }
 
+    #[must_use]
     pub fn events(&self) -> &[ChecklistEvent] {
         &self.event_history
     }
@@ -589,6 +602,7 @@ impl ChecklistWorkingSet {
         }
     }
 
+    #[must_use]
     pub fn listed_items(&self) -> Vec<ListedChecklistItem<'_>> {
         self.display_order
             .iter()

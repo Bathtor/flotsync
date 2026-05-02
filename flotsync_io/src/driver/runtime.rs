@@ -168,10 +168,10 @@ impl DriverRuntimeState {
 
         match key {
             ResourceKey::Listener(listener_id) => {
-                self.tcp.record_listener_readiness_hit(listener_id)
+                self.tcp.record_listener_readiness_hit(listener_id);
             }
             ResourceKey::Connection(connection_id) => {
-                self.tcp.record_connection_readiness_hit(connection_id)
+                self.tcp.record_connection_readiness_hit(connection_id);
             }
             ResourceKey::Socket(socket_id) => self.udp.record_socket_readiness_hit(socket_id),
         }

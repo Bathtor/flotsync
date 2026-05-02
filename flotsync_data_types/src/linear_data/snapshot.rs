@@ -1,6 +1,6 @@
 //! Format-agnostic snapshot streaming API.
 //!
-//! Serializers can consume snapshot nodes in canonical order via [[SnapshotSink]]
+//! Serializers can consume snapshot nodes in canonical order via [[`SnapshotSink`]]
 //! without depending on internal storage types.
 
 use snafu::prelude::*;

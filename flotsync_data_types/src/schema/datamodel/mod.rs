@@ -1,11 +1,11 @@
 //! Schema-aware value model for snapshots and operations.
 //!
 //! This module describes the concrete *value shapes* that a transport/library must
-//! serialize and deserialize for each [[super::ReplicatedDataType]].
+//! serialize and deserialize for each [[`super::ReplicatedDataType`]].
 //!
 //! For history-based CRDTs (`LatestValueWins`, `LinearString`, `LinearList`), value encoding
 //! is intended to be used together with the visitor/lazy-node snapshot interfaces in
-//! [[crate::snapshot]].
+//! [[`crate::snapshot`]].
 
 use super::{
     BasicDataType,
@@ -53,6 +53,7 @@ pub enum SchemaSource {
 
 impl SchemaSource {
     /// Borrow the schema regardless of how it is stored.
+    #[must_use]
     pub fn as_schema(&self) -> &Schema {
         match self {
             Self::Shared(schema) => schema.as_ref(),
@@ -64,6 +65,7 @@ impl SchemaSource {
     ///
     /// Static schemas are cloned once into owned form when callers require an
     /// `Arc<Schema>` specifically.
+    #[must_use]
     pub fn into_shared(self) -> Arc<Schema> {
         match self {
             Self::Shared(schema) => schema,
@@ -127,6 +129,7 @@ pub enum PrimitiveValueArrayRef<'a> {
     Timestamp(&'a [UnixTimestamp]),
 }
 impl PrimitiveValueArrayRef<'_> {
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::String(_) => PrimitiveType::String,
@@ -141,6 +144,7 @@ impl PrimitiveValueArrayRef<'_> {
         }
     }
 
+    #[must_use]
     pub fn into_owned(self) -> PrimitiveValueArray {
         match self {
             Self::String(values) => PrimitiveValueArray::String(values.to_vec()),
@@ -157,6 +161,7 @@ impl PrimitiveValueArrayRef<'_> {
 }
 
 impl PrimitiveValueArray {
+    #[must_use]
     pub fn as_ref(&self) -> PrimitiveValueArrayRef<'_> {
         match self {
             Self::String(values) => PrimitiveValueArrayRef::String(values.as_slice()),
@@ -171,6 +176,7 @@ impl PrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         self.as_ref().primitive_type()
     }
@@ -183,6 +189,7 @@ pub enum BasicValue {
     Array(PrimitiveValueArray),
 }
 impl BasicValue {
+    #[must_use]
     pub fn as_ref(&self) -> BasicValueRef<'_> {
         match self {
             Self::Primitive(value) => BasicValueRef::Primitive(value.as_ref()),
@@ -190,6 +197,7 @@ impl BasicValue {
         }
     }
 
+    #[must_use]
     pub fn matches_type(&self, expected: &BasicDataType) -> bool {
         self.as_ref().matches_type(expected)
     }
@@ -229,6 +237,7 @@ pub enum NullableBasicValue {
     Value(BasicValue),
 }
 impl NullableBasicValue {
+    #[must_use]
     pub fn as_ref(&self) -> NullableBasicValueRef<'_> {
         match self {
             Self::Null => NullableBasicValueRef::Null,
@@ -236,6 +245,7 @@ impl NullableBasicValue {
         }
     }
 
+    #[must_use]
     pub fn matches_type(&self, expected: &NullableBasicDataType) -> bool {
         self.as_ref().matches_type(expected)
     }
@@ -269,6 +279,7 @@ pub enum BasicValueRef<'a> {
     Array(PrimitiveValueArrayRef<'a>),
 }
 impl BasicValueRef<'_> {
+    #[must_use]
     pub fn into_owned(self) -> BasicValue {
         match self {
             Self::Primitive(value) => BasicValue::Primitive(value.to_owned()),
@@ -276,6 +287,7 @@ impl BasicValueRef<'_> {
         }
     }
 
+    #[must_use]
     pub fn matches_type(&self, expected: &BasicDataType) -> bool {
         match (self, expected) {
             (Self::Primitive(value), BasicDataType::Primitive(expected_primitive)) => {
@@ -296,6 +308,7 @@ pub enum NullableBasicValueRef<'a> {
     Value(BasicValueRef<'a>),
 }
 impl NullableBasicValueRef<'_> {
+    #[must_use]
     pub fn into_owned(self) -> NullableBasicValue {
         match self {
             Self::Null => NullableBasicValue::Null,
@@ -303,6 +316,7 @@ impl NullableBasicValueRef<'_> {
         }
     }
 
+    #[must_use]
     pub fn matches_type(&self, expected: &NullableBasicDataType) -> bool {
         match (self, expected) {
             (Self::Null, NullableBasicDataType::Nullable(_)) => true,
@@ -319,6 +333,7 @@ pub enum CounterValue {
     UInt(u64),
 }
 impl CounterValue {
+    #[must_use]
     pub fn as_ref(&self) -> CounterValueRef {
         match self {
             Self::Byte(value) => CounterValueRef::Byte(*value),
@@ -326,6 +341,7 @@ impl CounterValue {
         }
     }
 
+    #[must_use]
     pub fn matches_type(&self, small_range: bool) -> bool {
         self.as_ref().matches_type(small_range)
     }
@@ -338,6 +354,7 @@ pub enum CounterValueRef {
     UInt(u64),
 }
 impl CounterValueRef {
+    #[must_use]
     pub fn into_owned(self) -> CounterValue {
         match self {
             Self::Byte(value) => CounterValue::Byte(value),
@@ -345,6 +362,7 @@ impl CounterValueRef {
         }
     }
 
+    #[must_use]
     pub fn matches_type(self, small_range: bool) -> bool {
         if small_range {
             matches!(self, Self::Byte(_))

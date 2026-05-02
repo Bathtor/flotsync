@@ -103,23 +103,22 @@ enum ColumnarValueBufferKind {
 
 impl ColumnarValueBuffer {
     fn new(data_type: &ReplicatedDataType) -> ColumnarResult<Self> {
-        let values = match data_type {
-            ReplicatedDataType::LinearString => ColumnarValueBufferKind::String(String::new()),
-            _ => {
-                let primitive_type = history_primitive_type(data_type)?;
-                let primitive_empty_value = match primitive_type {
-                    PrimitiveType::String => ModelPrimitiveValueArray::String(Vec::new()),
-                    PrimitiveType::UInt => ModelPrimitiveValueArray::UInt(Vec::new()),
-                    PrimitiveType::Int => ModelPrimitiveValueArray::Int(Vec::new()),
-                    PrimitiveType::Byte => ModelPrimitiveValueArray::Byte(Vec::new()),
-                    PrimitiveType::Float => ModelPrimitiveValueArray::Float(Vec::new()),
-                    PrimitiveType::Boolean => ModelPrimitiveValueArray::Boolean(Vec::new()),
-                    PrimitiveType::Binary => ModelPrimitiveValueArray::Binary(Vec::new()),
-                    PrimitiveType::Date => ModelPrimitiveValueArray::Date(Vec::new()),
-                    PrimitiveType::Timestamp => ModelPrimitiveValueArray::Timestamp(Vec::new()),
-                };
-                ColumnarValueBufferKind::Primitive(primitive_empty_value)
-            }
+        let values = if data_type == &ReplicatedDataType::LinearString {
+            ColumnarValueBufferKind::String(String::new())
+        } else {
+            let primitive_type = history_primitive_type(data_type)?;
+            let primitive_empty_value = match primitive_type {
+                PrimitiveType::String => ModelPrimitiveValueArray::String(Vec::new()),
+                PrimitiveType::UInt => ModelPrimitiveValueArray::UInt(Vec::new()),
+                PrimitiveType::Int => ModelPrimitiveValueArray::Int(Vec::new()),
+                PrimitiveType::Byte => ModelPrimitiveValueArray::Byte(Vec::new()),
+                PrimitiveType::Float => ModelPrimitiveValueArray::Float(Vec::new()),
+                PrimitiveType::Boolean => ModelPrimitiveValueArray::Boolean(Vec::new()),
+                PrimitiveType::Binary => ModelPrimitiveValueArray::Binary(Vec::new()),
+                PrimitiveType::Date => ModelPrimitiveValueArray::Date(Vec::new()),
+                PrimitiveType::Timestamp => ModelPrimitiveValueArray::Timestamp(Vec::new()),
+            };
+            ColumnarValueBufferKind::Primitive(primitive_empty_value)
         };
         Ok(Self { values })
     }
@@ -153,28 +152,28 @@ impl ColumnarValueBuffer {
         };
         match (values, value) {
             (ModelPrimitiveValueArray::String(values), ModelPrimitiveValueRef::String(value)) => {
-                values.push(value.to_owned())
+                values.push(value.to_owned());
             }
             (ModelPrimitiveValueArray::UInt(values), ModelPrimitiveValueRef::UInt(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (ModelPrimitiveValueArray::Int(values), ModelPrimitiveValueRef::Int(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (ModelPrimitiveValueArray::Byte(values), ModelPrimitiveValueRef::Byte(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (ModelPrimitiveValueArray::Float(values), ModelPrimitiveValueRef::Float(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (ModelPrimitiveValueArray::Boolean(values), ModelPrimitiveValueRef::Boolean(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (ModelPrimitiveValueArray::Binary(values), ModelPrimitiveValueRef::Binary(value)) => {
-                values.push(value.to_vec())
+                values.push(value.to_vec());
             }
             (ModelPrimitiveValueArray::Date(values), ModelPrimitiveValueRef::Date(value)) => {
-                values.push(value)
+                values.push(value);
             }
             (
                 ModelPrimitiveValueArray::Timestamp(values),
@@ -211,13 +210,13 @@ impl ColumnarValueBuffer {
                 ModelPrimitiveValueArrayRef::String(value),
             ) => values.extend_from_slice(value),
             (ModelPrimitiveValueArray::UInt(values), ModelPrimitiveValueArrayRef::UInt(value)) => {
-                values.extend_from_slice(value)
+                values.extend_from_slice(value);
             }
             (ModelPrimitiveValueArray::Int(values), ModelPrimitiveValueArrayRef::Int(value)) => {
-                values.extend_from_slice(value)
+                values.extend_from_slice(value);
             }
             (ModelPrimitiveValueArray::Byte(values), ModelPrimitiveValueArrayRef::Byte(value)) => {
-                values.extend_from_slice(value)
+                values.extend_from_slice(value);
             }
             (
                 ModelPrimitiveValueArray::Float(values),
@@ -232,7 +231,7 @@ impl ColumnarValueBuffer {
                 ModelPrimitiveValueArrayRef::Binary(value),
             ) => values.extend_from_slice(value),
             (ModelPrimitiveValueArray::Date(values), ModelPrimitiveValueArrayRef::Date(value)) => {
-                values.extend_from_slice(value)
+                values.extend_from_slice(value);
             }
             (
                 ModelPrimitiveValueArray::Timestamp(values),
@@ -305,7 +304,7 @@ impl ColumnarValueBuffer {
     }
 }
 
-/// Encode a columnar history snapshot for a LatestValueWins field.
+/// Encode a columnar history snapshot for a `LatestValueWins` field.
 pub fn encode_columnar_latest_value_wins_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, ModelNullableBasicValue>],
     value_type: &NullableBasicDataType,
@@ -329,7 +328,7 @@ pub fn encode_columnar_latest_value_wins_history_snapshot(
     encode_columnar_history_snapshot(&data_type, records)
 }
 
-/// Decode a columnar history snapshot for a LatestValueWins field.
+/// Decode a columnar history snapshot for a `LatestValueWins` field.
 pub fn decode_columnar_latest_value_wins_history_snapshot(
     snapshot: proto::HistorySnapshot,
     value_type: NullableBasicDataType,
@@ -360,7 +359,7 @@ pub fn decode_columnar_latest_value_wins_history_snapshot(
         .collect()
 }
 
-/// Encode a columnar history snapshot for a LinearString field.
+/// Encode a columnar history snapshot for a `LinearString` field.
 pub fn encode_columnar_linear_string_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, String>],
 ) -> ColumnarResult<proto::HistorySnapshot> {
@@ -381,7 +380,7 @@ pub fn encode_columnar_linear_string_history_snapshot(
     encode_columnar_history_snapshot(&data_type, records)
 }
 
-/// Decode a columnar history snapshot for a LinearString field.
+/// Decode a columnar history snapshot for a `LinearString` field.
 pub fn decode_columnar_linear_string_history_snapshot(
     snapshot: proto::HistorySnapshot,
 ) -> ColumnarResult<Vec<SnapshotNode<UpdateIdWithIndex, String>>> {
@@ -411,7 +410,7 @@ pub fn decode_columnar_linear_string_history_snapshot(
         .collect()
 }
 
-/// Encode a columnar history snapshot for a LinearList field.
+/// Encode a columnar history snapshot for a `LinearList` field.
 pub fn encode_columnar_linear_list_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, ModelPrimitiveValueArray>],
     value_type: PrimitiveType,
@@ -433,7 +432,7 @@ pub fn encode_columnar_linear_list_history_snapshot(
     encode_columnar_history_snapshot(&data_type, records)
 }
 
-/// Decode a columnar history snapshot for a LinearList field.
+/// Decode a columnar history snapshot for a `LinearList` field.
 pub fn decode_columnar_linear_list_history_snapshot(
     snapshot: proto::HistorySnapshot,
     value_type: PrimitiveType,

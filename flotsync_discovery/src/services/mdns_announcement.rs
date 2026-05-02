@@ -74,7 +74,7 @@ impl ServiceConfig {
 
 #[cfg(feature = "zeroconf-via-kompact")]
 mod kompact_implementation {
-    use super::*;
+    use super::{Options, ServiceConfig, build_mdns_service};
     use crate::{
         kompact::prelude::*,
         kompact_fsm::{State, StateHandled, StateUpdate},
@@ -87,8 +87,8 @@ mod kompact_implementation {
     /// Default options for the mDNS service.
     ///
     /// - port: 52156,
-    /// - instance_id: Uuid::nil(),
-    /// - service_provider_name: "flotsync_discovery",
+    /// - `instance_id`: `Uuid::nil()`,
+    /// - `service_provider_name`: "`flotsync_discovery`",
     pub const MDNS_ANNOUNCEMENT_SERVICE_DEFAULT_OPTIONS: Options = Options::DEFAULT;
 
     #[derive(ComponentDefinition)]
@@ -116,6 +116,7 @@ mod kompact_implementation {
         },
     }
     impl MdnsAnnouncementComponent {
+        #[must_use]
         pub fn with_options(options: Options) -> Self {
             Self {
                 ctx: ComponentContext::uninitialised(),
@@ -123,6 +124,7 @@ mod kompact_implementation {
             }
         }
 
+        #[must_use]
         pub fn new() -> Self {
             Self {
                 ctx: ComponentContext::uninitialised(),
@@ -230,14 +232,15 @@ mod kompact_implementation {
         }
         fn on_stop(&mut self) -> Handled {
             transform_state_match!(self, state, {
-                old_state @ ComponentState::Uninitialised | old_state@ComponentState::Initialised { .. } => StateUpdate::ok(old_state),
-                ComponentState::Running {
-                    config,
-                    shutdown_handle, ..
-                } | ComponentState::Starting { config, shutdown_handle } => {
-                    self.stop_service(config, shutdown_handle)
-                }
-            })
+                            old_state @
+            (ComponentState::Uninitialised | ComponentState::Initialised { .. }) => StateUpdate::ok(old_state),
+                            ComponentState::Running {
+                                config,
+                                shutdown_handle, ..
+                            } | ComponentState::Starting { config, shutdown_handle } => {
+                                self.stop_service(config, shutdown_handle)
+                            }
+                        })
         }
         fn on_kill(&mut self) -> Handled {
             transform_state_match!(self, state, {
@@ -333,24 +336,26 @@ fn build_mdns_service(
     use crate::zeroconf::prelude::*;
 
     let mut service = crate::zeroconf::MdnsService::new(service_type, port);
-    let host_name = hostname::get()
-        .map(|s| {
-            s.into_string()
-                .map(|mut s| {
+    let host_name = hostname::get().map_or_else(
+        |e| {
+            log::warn!("Could not get hostname: {e}");
+            FALLBACK_HOST_NAME.to_string()
+        },
+        |s| {
+            s.into_string().map_or_else(
+                |s| {
+                    log::warn!("Could not turn hostname '{s:?}' into Rust String");
+                    FALLBACK_HOST_NAME.to_string()
+                },
+                |mut s| {
                     if s.ends_with(".local") {
                         let _ = s.split_off(s.len() - 6);
                     }
                     s
-                })
-                .unwrap_or_else(|s| {
-                    log::warn!("Could not turn hostname '{s:?}' into Rust String");
-                    FALLBACK_HOST_NAME.to_string()
-                })
-        })
-        .unwrap_or_else(|e| {
-            log::warn!("Could not get hostname: {e}");
-            FALLBACK_HOST_NAME.to_string()
-        });
+                },
+            )
+        },
+    );
     let service_name = format!("{service_provider_name}@{host_name}:{port:04X}");
     service.set_name(&service_name);
     service.set_txt_record(txt_record);

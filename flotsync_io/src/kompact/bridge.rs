@@ -250,11 +250,13 @@ impl IoBridgeHandle {
     }
 
     /// Returns the shared egress pool used by the underlying raw driver instance.
+    #[must_use]
     pub fn egress_pool(&self) -> &EgressPool {
         &self.egress_pool
     }
 
     /// Returns a clone of the bridge's shared UDP provided-port reference.
+    #[must_use]
     pub fn udp_port_ref(&self) -> ProvidedRef<UdpPort> {
         self.udp.clone()
     }

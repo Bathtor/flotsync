@@ -1,8 +1,29 @@
 #[cfg(test)]
 use super::validation::{ensure_nullable_basic_type, ensure_primitive_array_type};
+#[cfg(test)]
+use super::{BasicValue, BasicValueRef, DecodeError};
 use super::{
+    CounterValue,
+    CounterValueRef,
+    DataModelValueError,
+    NullableBasicDataType,
+    NullableBasicValue,
+    NullableBasicValueRef,
+    NullablePrimitiveType,
+    NullablePrimitiveValue,
+    NullablePrimitiveValueArray,
+    NullablePrimitiveValueRef,
+    PrimitiveType,
+    PrimitiveValue,
+    PrimitiveValueArray,
+    PrimitiveValueArrayRef,
+    PrimitiveValueRef,
+    ReplicatedDataType,
+    Schema,
+    SchemaValueError,
+    SchemaVisitError,
+    VisitError,
     validation::{ensure_counter_type, ensure_finite_state_value, ensure_primitive_type},
-    *,
 };
 use crate::{
     IdWithIndex,
@@ -46,6 +67,7 @@ pub enum SnapshotStateValue {
     TotalOrderFiniteStateRegister(NullablePrimitiveValue),
 }
 impl SnapshotStateValue {
+    #[must_use]
     pub fn as_ref(&self) -> SnapshotStateValueRef<'_> {
         match self {
             Self::MonotonicCounter(value) => {
@@ -69,6 +91,7 @@ pub enum SnapshotStateValueRef<'a> {
     TotalOrderFiniteStateRegister(NullablePrimitiveValueRef<'a>),
 }
 impl SnapshotStateValueRef<'_> {
+    #[must_use]
     pub fn into_owned(self) -> SnapshotStateValue {
         match self {
             Self::MonotonicCounter(value) => {
@@ -192,7 +215,7 @@ where
     seen_fields: HashSet<String>,
     _id_marker: PhantomData<Id>,
 }
-impl<'a, Id, V> SchemaSnapshotEncodingWriter<'a, Id, V>
+impl<Id, V> SchemaSnapshotEncodingWriter<'_, Id, V>
 where
     V: SchemaSnapshotEncoder<Id>,
 {
@@ -488,7 +511,7 @@ pub trait DataSnapshotEncoder<Id> {
 
     fn begin(&mut self, row_count: usize) -> Result<(), Self::Error>;
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowEncoder<'a>, Self::Error>;
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowEncoder<'_>, Self::Error>;
 
     fn end_row(&mut self, row_index: usize) -> Result<(), Self::Error>;
 
@@ -512,7 +535,7 @@ pub trait DataSnapshotDecoder<Id> {
 
     fn begin(&mut self) -> Result<usize, Self::Error>;
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowDecoder<'a>, Self::Error>;
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowDecoder<'_>, Self::Error>;
 
     fn end_row(&mut self, row_index: usize) -> Result<(), Self::Error>;
 
@@ -823,12 +846,23 @@ mod tests {
         IdWithIndex,
         any_data::{LinearLatestValueWins, list::LinearList},
         linear_data::snapshot::bytes_testkit as snapshot_bytes,
-        schema::{Direction, Field},
+        schema::{
+            BasicDataType,
+            Direction,
+            Field,
+            datamodel::{
+                InMemoryData,
+                InMemoryFieldValue,
+                LinearLatestValueWinsValue,
+                LinearListValue,
+            },
+        },
         snapshot::{SnapshotHeader, SnapshotNodeRef, SnapshotSink},
         text::LinearString,
     };
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use chrono::Datelike;
+    use snafu::Snafu;
     use std::{collections::HashMap, sync::LazyLock};
 
     const TAG_NULL: u8 = 0;
@@ -1544,8 +1578,8 @@ mod tests {
                 .ok_or_else(|| "field sink already closed".to_owned())
         }
     }
-    impl<'a, 'value> SnapshotSink<IdWithIndex<u32>, NullableBasicValueRef<'value>>
-        for LatestValueWinsHistoryBytesSink<'a>
+    impl<'value> SnapshotSink<IdWithIndex<u32>, NullableBasicValueRef<'value>>
+        for LatestValueWinsHistoryBytesSink<'_>
     {
         type Error = TestError;
 
@@ -1612,7 +1646,7 @@ mod tests {
                 .ok_or_else(|| "field sink already closed".to_owned())
         }
     }
-    impl<'a> SnapshotSink<IdWithIndex<u32>, str> for LinearStringHistoryBytesSink<'a> {
+    impl SnapshotSink<IdWithIndex<u32>, str> for LinearStringHistoryBytesSink<'_> {
         type Error = TestError;
 
         fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error> {
@@ -1682,8 +1716,8 @@ mod tests {
                 .ok_or_else(|| "field sink already closed".to_owned())
         }
     }
-    impl<'a, 'value> SnapshotSink<IdWithIndex<u32>, PrimitiveValueArrayRef<'value>>
-        for LinearListHistoryBytesSink<'a>
+    impl<'value> SnapshotSink<IdWithIndex<u32>, PrimitiveValueArrayRef<'value>>
+        for LinearListHistoryBytesSink<'_>
     {
         type Error = TestError;
 
@@ -1828,7 +1862,7 @@ mod tests {
     struct BytesDataSnapshotRowEncoder<'schema, 'row> {
         inner: &'row mut BytesSchemaSnapshotEncoder<'schema>,
     }
-    impl<'schema, 'row> SchemaSnapshotEncoder<u32> for BytesDataSnapshotRowEncoder<'schema, 'row> {
+    impl<'schema> SchemaSnapshotEncoder<u32> for BytesDataSnapshotRowEncoder<'schema, '_> {
         type Error = TestError;
 
         type LatestValueWinsFieldSink<'a>
@@ -1946,10 +1980,7 @@ mod tests {
             Ok(())
         }
 
-        fn begin_row<'a>(
-            &'a mut self,
-            row_index: usize,
-        ) -> Result<Self::RowEncoder<'a>, Self::Error> {
+        fn begin_row(&mut self, row_index: usize) -> Result<Self::RowEncoder<'_>, Self::Error> {
             if self.current_row.is_some() {
                 return Err("previous row encoder was not closed".to_owned().into());
             }
@@ -2217,10 +2248,7 @@ mod tests {
             Ok(self.row_state_fields.len())
         }
 
-        fn begin_row<'a>(
-            &'a mut self,
-            row_index: usize,
-        ) -> Result<Self::RowDecoder<'a>, Self::Error> {
+        fn begin_row(&mut self, row_index: usize) -> Result<Self::RowDecoder<'_>, Self::Error> {
             if !self.began {
                 return Err("begin must be called first".to_owned().into());
             }

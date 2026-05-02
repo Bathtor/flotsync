@@ -98,6 +98,7 @@ impl IoPoolConfig {
     }
 
     /// Returns the maximum number of bytes that can be backed by this pool at once.
+    #[must_use]
     pub fn total_capacity_bytes(&self) -> usize {
         self.chunk_size * self.max_chunk_count
     }
@@ -178,16 +179,19 @@ impl IoBufferPools {
     }
 
     /// Returns the pool configuration used by these shared pools.
+    #[must_use]
     pub fn config(&self) -> &IoBufferConfig {
         &self.config
     }
 
     /// Returns the shared ingress pool handle.
+    #[must_use]
     pub fn ingress(&self) -> IngressPool {
         self.ingress.clone()
     }
 
     /// Returns the shared egress pool handle.
+    #[must_use]
     pub fn egress(&self) -> EgressPool {
         self.egress.clone()
     }
@@ -302,11 +306,13 @@ impl IoLease {
     }
 
     /// Returns the total readable payload length in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Returns whether the payload is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -315,6 +321,7 @@ impl IoLease {
     ///
     /// Each cursor advances independently, so the same payload can be read many times before the
     /// shared memory is finally released.
+    #[must_use]
     pub fn cursor(&self) -> IoCursor {
         let mut cursor = PooledCursor::new(Arc::clone(&self.payload));
         if self.offset > 0 {
@@ -327,6 +334,7 @@ impl IoLease {
     }
 
     /// Returns one sliced view over the readable payload bytes.
+    #[must_use]
     pub fn try_slice(self, range: Range<usize>) -> Option<Self> {
         if range.start > range.end || range.end > self.len {
             return None;
@@ -342,6 +350,7 @@ impl IoLease {
     ///
     /// This borrows directly from the underlying storage and therefore performs no allocation.
     /// It returns `None` when the visible range spans more than one pooled segment.
+    #[must_use]
     pub fn try_as_contiguous_slice(&self) -> Option<&[u8]> {
         if self.is_empty() {
             return Some(&[]);
@@ -351,11 +360,13 @@ impl IoLease {
     }
 
     /// Creates a byte-clone of the full readable payload contents.
+    #[must_use]
     pub fn create_byte_clone(&self) -> Bytes {
         Bytes::from(self.to_vec())
     }
 
     /// Copies the full readable payload contents into one owned `Vec<u8>`.
+    #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
         if self.is_empty() {
             return Vec::new();
@@ -688,9 +699,10 @@ pub(super) fn wait_for_request<T>(mut request: PoolRequest<T>) -> Result<T> {
             return Ok(reply);
         }
 
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out waiting for flotsync_io pool request reply");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for flotsync_io pool request reply"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -722,9 +734,10 @@ where
             return output;
         }
 
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out waiting for flotsync_io future completion");
-        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for flotsync_io future completion"
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(1));
     }

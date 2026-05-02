@@ -64,6 +64,7 @@ pub enum StateSnapshotWireValue {
     TotalOrderFiniteStateRegister(proto::NullablePrimitiveValue),
 }
 
+#[must_use]
 pub fn encode_update_id(id: UpdateId) -> proto::HistoryId {
     proto::HistoryId {
         version: id.version,
@@ -80,6 +81,7 @@ pub fn decode_update_id(id: proto::HistoryId) -> Result<UpdateId, CodecError> {
     })
 }
 
+#[must_use]
 pub fn encode_indexed_update_id(id: &UpdateIdWithIndex) -> proto::HistoryId {
     proto::HistoryId {
         version: id.id.version,
@@ -99,6 +101,7 @@ pub fn decode_indexed_update_id(id: proto::HistoryId) -> Result<UpdateIdWithInde
     })
 }
 
+#[must_use]
 pub fn encode_primitive_value(value: ModelPrimitiveValueRef<'_>) -> proto::PrimitiveValue {
     let mut encoded = proto::PrimitiveValue::default();
     let value_enum = match value {
@@ -265,6 +268,7 @@ pub fn decode_primitive_array(
     }
 }
 
+#[must_use]
 pub fn encode_basic_value(value: ModelBasicValueRef<'_>) -> proto::BasicValue {
     let mut encoded = proto::BasicValue::default();
     match value {
@@ -296,6 +300,7 @@ pub fn decode_basic_value(mut value: proto::BasicValue) -> Result<ModelBasicValu
     }
 }
 
+#[must_use]
 pub fn encode_nullable_basic_value(
     value: ModelNullableBasicValueRef<'_>,
 ) -> proto::NullableBasicValue {
@@ -332,6 +337,7 @@ pub fn decode_nullable_basic_value(
     }
 }
 
+#[must_use]
 pub fn encode_nullable_primitive_value(
     value: ModelNullablePrimitiveValueRef<'_>,
 ) -> proto::NullablePrimitiveValue {
@@ -364,10 +370,11 @@ pub fn decode_nullable_primitive_value(
     }
 }
 
+#[must_use]
 pub fn encode_counter_value(value: ModelCounterValueRef) -> proto::CounterValue {
     let mut encoded = proto::CounterValue::default();
     let value_enum = match value {
-        ModelCounterValueRef::Byte(value) => proto::counter_value::Value::Byte(value as u32),
+        ModelCounterValueRef::Byte(value) => proto::counter_value::Value::Byte(u32::from(value)),
         ModelCounterValueRef::UInt(value) => proto::counter_value::Value::Uint(value),
     };
     encoded.value = Some(value_enum);

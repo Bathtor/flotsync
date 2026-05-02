@@ -115,11 +115,13 @@ pub struct RoutePreferenceRank(u8);
 impl RoutePreferenceRank {
     pub const UNRANKED: Self = Self(0);
 
+    #[must_use]
     pub fn new(value: u8) -> Self {
         Self(value)
     }
 
     /// No specific preference was provided.
+    #[must_use]
     pub fn is_unranked(self) -> bool {
         self.0 == 0
     }

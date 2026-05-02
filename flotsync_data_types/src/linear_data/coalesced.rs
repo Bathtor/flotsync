@@ -9,7 +9,7 @@ pub trait Composite: Sized {
     /// E.g. `u8` for a `Vec<u8>`.
     type Element: ?Sized;
 
-    /// The element iterator type return by [[Composite::iter]].
+    /// The element iterator type return by [[`Composite::iter`]].
     type Iter<'a>: Iterator<Item = &'a Self::Element>
     where
         Self: 'a;
@@ -45,7 +45,7 @@ pub enum DeleteError {
     NotFound,
 }
 
-/// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
+/// An implementation of [[`LinearData`]] using a [[Vec]] to track the individual operation nodes.
 ///
 /// # Coalescing
 /// Sequences with identical metadata are coalesced into a single node to save space.
@@ -54,7 +54,7 @@ pub enum DeleteError {
 ///
 /// This requires Values to implement the [[Composite]] trait, to facilitate coalescing and splitting.
 ///
-/// Otherwise the same properties as the [[VecLinearData]] apply.
+/// Otherwise the same properties as the [[`VecLinearData`]] apply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VecCoalescedLinearData<Id, Value> {
     /// The number of values in Insert nodes in `base`.
@@ -79,7 +79,7 @@ where
     }
 
     pub(crate) fn from_base_snapshot(base: VecLinearData<IdWithIndex<BaseId>, Value>) -> Self {
-        let len = base.iter_values().map(|value| value.len()).sum();
+        let len = base.iter_values().map(Composite::len).sum();
         Self { len, base }
     }
 
@@ -151,7 +151,7 @@ where
         }
     }
 
-    /// The number of elements, i.e. [[Composite::Element]] that are not deleted.
+    /// The number of elements, i.e. [[`Composite::Element`]] that are not deleted.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -397,10 +397,9 @@ where
                             if *position == next_position {
                                 // This is fine.
                                 break;
-                            } else {
-                                // The range's end does not occur in the collection.
-                                return None;
                             }
+                            // The range's end does not occur in the collection.
+                            return None;
                         }
                         std::ops::Bound::Unbounded => {
                             // Very well, we reached the end.
@@ -477,11 +476,10 @@ where
                 // The position is somewhere within this node's value.
                 node_index_at_position_opt = Some(node_index);
                 break;
-            } else {
-                assert!(position > current_node_start_position);
-                // We are looking for a later node.
-                current_node_start_position += node_value_len;
             }
+            assert!(position > current_node_start_position);
+            // We are looking for a later node.
+            current_node_start_position += node_value_len;
         }
         node_index_at_position_opt.map(|node_index| NodePosition {
             node_index,
@@ -661,7 +659,7 @@ where
             .base
             .nodes
             .iter()
-            .flat_map(|n| match n.operation {
+            .filter_map(|n| match n.operation {
                 Operation::Insert { ref value } => Some(value.len()),
                 _ => None,
             })
@@ -1102,7 +1100,7 @@ where
 
 /// Just a newtype to wrap the slice for debug printing.
 struct DebugSlice<'a, BaseId, Value>(&'a [Node<IdWithIndex<BaseId>, Value>]);
-impl<'a, BaseId, Value> DebugFormatting for DebugSlice<'a, BaseId, Value>
+impl<BaseId, Value> DebugFormatting for DebugSlice<'_, BaseId, Value>
 where
     BaseId: fmt::Display + 'static,
     Value: Composite + fmt::Display + 'static,
@@ -1111,8 +1109,8 @@ where
         write!(f, "{{ ")?;
         for (index, node) in self.0.iter().enumerate() {
             let content = match node.operation {
-                Operation::Insert { ref value } => format!("'{}'", value),
-                Operation::Delete { ref value } => format!("[^'{}']", value),
+                Operation::Insert { ref value } => format!("'{value}'"),
+                Operation::Delete { ref value } => format!("[^'{value}']"),
                 Operation::Beginning => "$".to_owned(),
                 Operation::End => "X".to_owned(),
                 Operation::Invalid => "?!?".to_owned(),
@@ -1183,9 +1181,8 @@ where
         if let Some(ref mut node_iter) = self.current_node_iter {
             if let Some(next) = node_iter.next() {
                 return Some(next);
-            } else {
-                self.current_node_iter = None;
             }
+            self.current_node_iter = None;
         }
         self.next_from_underlying()
     }
@@ -1213,7 +1210,7 @@ where
         Self { underlying: iter }
     }
 }
-impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
+impl<I> Iterator for IdGeneratorWithZeroIndex<'_, I>
 where
     I: Iterator,
 {
@@ -1239,7 +1236,7 @@ impl<Id> IdWithIndex<Id>
 where
     Id: Clone,
 {
-    /// The maximum length of a single [[Composite]] addressed by an [[IdWithIndex]] starting
+    /// The maximum length of a single [[Composite]] addressed by an [[`IdWithIndex`]] starting
     /// at index 0.
     pub const MAX_LENGTH: usize = u32::MAX as usize;
 
@@ -1312,8 +1309,7 @@ where
             && self
                 .index
                 .checked_add(1)
-                .map(|next_index| next_index == other.index)
-                .unwrap_or(false)
+                .is_some_and(|next_index| next_index == other.index)
     }
 
     fn index_diff(&self, other: &IdWithIndex<Id>) -> u32
@@ -1388,7 +1384,7 @@ where
 
 /// A range of indices identifying a particular contiguous range of ids.
 ///
-/// This range is inclusive: [id:start_index, id:end_index]
+/// This range is inclusive: [`id:start_index`, `id:end_index`]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdWithIndexRange<Id> {
     pub id: Id,
@@ -1454,7 +1450,7 @@ where
     where
         Value: Composite + fmt::Debug + 'static,
     {
-        for id_range in self.contained.iter() {
+        for id_range in &self.contained {
             let start = id_range.first();
             let end = id_range.last();
             let op = DataOperation::Delete {

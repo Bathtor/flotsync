@@ -37,7 +37,7 @@ where
     Internal { source: InternalError },
 }
 
-/// A set of changes that can be applied to a [[LinearString]].
+/// A set of changes that can be applied to a [[`LinearString`]].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearStringDiff<Id> {
     operations: Vec<DataOperation<IdWithIndex<Id>, String>>,
@@ -70,9 +70,10 @@ where
     }
 
     /// Return all ids that are being newly introduced by applying this diff.
+    #[must_use]
     pub fn new_ids(&self) -> BTreeSet<Id> {
         let mut ids = BTreeSet::new();
-        for op in self.operations.iter() {
+        for op in &self.operations {
             match op {
                 DataOperation::Insert { id, .. } => {
                     ids.insert(id.id.clone());
@@ -84,16 +85,19 @@ where
     }
 
     /// Returns `true` iff this diff is empty, i.e. a no-op.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 
     /// Returns how many individual operations there in this diff.
+    #[must_use]
     pub fn num_operations(&self) -> usize {
         self.operations.len()
     }
 
     /// Returns how many of the operations in this diff are inserts.
+    #[must_use]
     pub fn num_insert_operations(&self) -> usize {
         self.operations
             .iter()
@@ -102,6 +106,7 @@ where
     }
 
     /// Returns how many of the operations in this diff are deletes.
+    #[must_use]
     pub fn num_delete_operations(&self) -> usize {
         self.operations
             .iter()
@@ -111,7 +116,7 @@ where
 
     /// Returns an iterator over the values that are to be inserted.
     pub fn values_inserted(&self) -> impl Iterator<Item = &str> {
-        self.operations.iter().flat_map(|op| match op {
+        self.operations.iter().filter_map(|op| match op {
             DataOperation::Insert { value, .. } => Some(value.as_str()),
             DataOperation::Delete { .. } => None,
         })
@@ -126,7 +131,7 @@ where
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for op in self.operations.iter() {
+        for op in &self.operations {
             match op {
                 DataOperation::Insert {
                     id,
@@ -371,7 +376,7 @@ mod tests {
     }
 
     fn check_diff_and_apply(from: &LinearString<u32>, to: &str, error_context: &str) {
-        let mut id_generator = TestIdGenerator::without_ids(from.iter_ids().cloned());
+        let mut id_generator = TestIdGenerator::without_ids(from.iter_ids().copied());
 
         // println!("Producing diff between\n '{}'\n and\n '{}'", from, to);
         let diff = linear_diff(from, to, &mut id_generator).expect(error_context);
@@ -406,7 +411,7 @@ mod tests {
     fn test_single_step_convergence() {
         // For each group, check that no matter in which order we apply the two diffs,
         // they produce the same result (doesn't matter what it is, as long as its the same).
-        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+        for group in &SMALL_CHANGE_TEST_GROUPS {
             // println!("### \n### Checking Group: {group:?}\n###");
             let mut id_generator = TestIdGenerator::new();
             let base = LinearString::with_value(group[0].to_owned(), id_generator.next().unwrap());
@@ -469,7 +474,7 @@ mod tests {
                 ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
             })
             .collect();
-        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+        for group in &SMALL_CHANGE_TEST_GROUPS {
             for (writer_index, writer) in writers.iter_mut().enumerate() {
                 let op =
                     linear_diff(&writer.linear, group[writer_index], &mut id_generator).unwrap();
@@ -487,7 +492,7 @@ mod tests {
             let mut linear = perm[0].linear.clone();
             //println!("### Base is '{}':\n {}", linear, linear.debug_fmt());
             for writer in &perm[1..] {
-                for op in writer.ops.iter() {
+                for op in &writer.ops {
                     //println!("### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
                     op.clone().apply_to(&mut linear).unwrap();
                     linear.validate_integrity().unwrap();
@@ -498,13 +503,11 @@ mod tests {
                 assert_eq!(
                     last_result.to_string(),
                     linear.to_string(),
-                    "Result strings did not match for permutation: {}",
-                    permutation_str
+                    "Result strings did not match for permutation: {permutation_str}"
                 );
                 assert_eq!(
                     last_result, &linear,
-                    "Results did not match for permutation: {}",
-                    permutation_str
+                    "Results did not match for permutation: {permutation_str}"
                 );
             }
             // permutation_results.push(linear);
@@ -674,7 +677,7 @@ mod tests {
             diffs: &[LinearStringDiff<u32>],
             linear: &mut LinearString<u32>,
         ) -> Result<(), ()> {
-            for op in diffs.iter() {
+            for op in diffs {
                 // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
                 op.clone().apply_to(linear).map_err(|_| ())?;
                 linear.validate_integrity().unwrap();
@@ -683,7 +686,7 @@ mod tests {
             Ok(())
         }
 
-        'scenario_loop: for scenario in SYNC_SCENARIOS.iter() {
+        'scenario_loop: for scenario in &SYNC_SCENARIOS {
             //println!("##########\n### Scenario #{scenario_index} ###\n#########");
             for (group_index, group) in SMALL_CHANGE_TEST_GROUPS.iter().enumerate() {
                 //println!("### Starting write #{group_index} ###");
@@ -766,8 +769,7 @@ mod tests {
                     assert_eq!(
                         last_result.to_string(),
                         linear.to_string(),
-                        "Result strings did not match for permutation: {}",
-                        permutation_str
+                        "Result strings did not match for permutation: {permutation_str}"
                     );
                     // They might structurally differ in delete splits.
                     // assert_eq!(
