@@ -1,104 +1,104 @@
 name: pr-linux
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-  workflow_dispatch:
+    pull_request:
+    push:
+        branches:
+            - main
+    workflow_dispatch:
 
 concurrency:
-  group: pr-linux-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+    group: pr-linux-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
 
 permissions:
-  contents: read
+    contents: read
 
 env:
-  CARGO_TERM_COLOR: always
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  RUST_TEST_TOOLCHAIN: nightly
-  RUST_STYLE_TOOLCHAIN: nightly-2026-04-11
+    CARGO_TERM_COLOR: always
+    CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    RUST_TEST_TOOLCHAIN: nightly
+    RUST_STYLE_TOOLCHAIN: nightly-2026-04-11
 
 jobs:
-  linux-style:
-    name: linux-style
-    runs-on: ubuntu-latest
+    linux-style:
+        name: linux-style
+        runs-on: ubuntu-latest
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+        steps:
+            - name: Check out repository
+              uses: actions/checkout@v4
 
-      - name: Configure GitHub auth for git dependencies
-        run: >
-          git config --global
-          url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf
-          "https://github.com/"
+            - name: Configure GitHub auth for git dependencies
+              run: >
+                  git config --global
+                  url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf
+                  "https://github.com/"
 
-      - name: Install discovery dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libavahi-compat-libdnssd-dev
+            - name: Install discovery dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang libavahi-compat-libdnssd-dev
 
-      - name: Install pinned Rust nightly for formatting and clippy
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_STYLE_TOOLCHAIN }}
-          components: clippy, rustfmt
+            - name: Install pinned Rust nightly for formatting and clippy
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ env.RUST_STYLE_TOOLCHAIN }}
+                  components: clippy, rustfmt
 
-      - name: Install Buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          version: 1.67.0
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Install Buf
+              uses: bufbuild/buf-setup-action@v1
+              with:
+                  version: 1.67.0
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+            - name: Cache Rust build artifacts
+              uses: Swatinem/rust-cache@v2
 
-      - name: Check proto formatting
-        run: buf format --diff --exit-code
+            - name: Check proto formatting
+              run: buf format --diff --exit-code
 
-      - name: Lint proto schema
-        run: buf lint
+            - name: Lint proto schema
+              run: buf lint
 
-      - name: Check formatting
-        run: cargo fmt --all --check
+            - name: Check formatting
+              run: cargo fmt --all --check
 
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
+            - name: Run clippy
+              run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings -W clippy::pedantic
 
-  linux-tests:
-    name: linux-tests
-    runs-on: ubuntu-latest
+    linux-tests:
+        name: linux-tests
+        runs-on: ubuntu-latest
 
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+        steps:
+            - name: Check out repository
+              uses: actions/checkout@v4
 
-      - name: Configure GitHub auth for git dependencies
-        run: >
-          git config --global
-          url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf
-          "https://github.com/"
+            - name: Configure GitHub auth for git dependencies
+              run: >
+                  git config --global
+                  url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf
+                  "https://github.com/"
 
-      - name: Install discovery dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libavahi-compat-libdnssd-dev
+            - name: Install discovery dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y clang libavahi-compat-libdnssd-dev
 
-      - name: Install floating Rust nightly for tests
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.RUST_TEST_TOOLCHAIN }}
+            - name: Install floating Rust nightly for tests
+              uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ env.RUST_TEST_TOOLCHAIN }}
 
-      - name: Install Buf
-        uses: bufbuild/buf-setup-action@v1
-        with:
-          version: 1.67.0
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+            - name: Install Buf
+              uses: bufbuild/buf-setup-action@v1
+              with:
+                  version: 1.67.0
+                  github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
+            - name: Cache Rust build artifacts
+              uses: Swatinem/rust-cache@v2
 
-      - name: Run workspace tests
-        run: cargo test --workspace --locked
+            - name: Run workspace tests
+              run: cargo test --workspace --locked

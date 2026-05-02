@@ -1,4 +1,4 @@
-use super::{HappenedBeforeOrd, HappenedBeforeOrdering};
+use super::{HappenedBeforeOrd, HappenedBeforeOrdering, UpdateId};
 use flotsync_utils::option_when;
 use itertools::Itertools;
 use std::{cmp, fmt, num::NonZeroUsize};
@@ -21,6 +21,7 @@ pub enum VersionVector {
 }
 impl VersionVector {
     /// Construct the initial all-zero version vector for a fixed member set.
+    #[must_use]
     pub const fn initial(num_members: NonZeroUsize) -> Self {
         Self::Synced {
             num_members,
@@ -28,14 +29,16 @@ impl VersionVector {
         }
     }
 
+    #[must_use]
     pub const fn num_members(&self) -> NonZeroUsize {
         match self {
             VersionVector::Full(v) => v.len(),
-            VersionVector::Override { num_members, .. } => *num_members,
-            VersionVector::Synced { num_members, .. } => *num_members,
+            VersionVector::Override { num_members, .. }
+            | VersionVector::Synced { num_members, .. } => *num_members,
         }
     }
 
+    #[must_use]
     pub const fn max_version(&self) -> u64 {
         match self {
             VersionVector::Full(v) => v.max_version(),
@@ -44,12 +47,84 @@ impl VersionVector {
         }
     }
 
+    #[must_use]
     pub fn succ_at(&self, position: usize) -> Self {
         let mut next = self.clone();
         next.increment_at(position);
         next
     }
 
+    /// Return a copy with `position` set to `version`.
+    ///
+    /// The returned vector keeps the most compact representation that can
+    /// encode the resulting member versions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `position` is outside this vector's member range.
+    #[must_use]
+    pub fn with_version_at(&self, position: usize, version: u64) -> Self {
+        assert!(
+            position < self.num_members().get(),
+            "Position {position} is outside of group range (0-{})",
+            self.num_members()
+        );
+        match self {
+            VersionVector::Full(vector) => vector.with_version_at(position, version),
+            VersionVector::Override {
+                num_members,
+                version: override_version,
+            } => override_version.with_version_at(*num_members, position, version),
+            VersionVector::Synced {
+                num_members,
+                version: group_version,
+            } => synced_with_version_at(*num_members, *group_version, position, version),
+        }
+    }
+
+    /// Return a copy with the producer position advanced to `update_id`.
+    ///
+    /// This is the causal frontier represented by an update with the given
+    /// read vector and id.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `update_id.node_index` is outside this vector's member range.
+    #[must_use]
+    pub fn with_update_applied(&self, update_id: UpdateId) -> Self {
+        self.with_version_at(update_id.node_index as usize, update_id.version)
+    }
+
+    /// Return the pointwise maximum of two compatible version vectors.
+    ///
+    /// This is the causal union: what either side has seen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the vectors describe different member sets.
+    #[must_use]
+    pub fn least_upper_bound(&self, other: &Self) -> Self {
+        assert_same_member_count(self, other);
+        self.pointwise_combine(other, cmp::max)
+    }
+
+    /// Return the pointwise minimum of two compatible version vectors.
+    ///
+    /// This is the causal intersection: what both sides have definitely seen.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the vectors describe different member sets.
+    #[must_use]
+    pub fn greatest_lower_bound(&self, other: &Self) -> Self {
+        assert_same_member_count(self, other);
+        self.pointwise_combine(other, cmp::min)
+    }
+
+    /// # Panics
+    ///
+    /// Panics if `position` is outside this vector's member range or if the
+    /// selected member's version counter overflows.
     pub fn increment_at(&mut self, position: usize) {
         assert!(
             position < self.num_members().get(),
@@ -95,11 +170,102 @@ impl VersionVector {
 
     /// Return the version stored at `position`.
     ///
+    /// # Panics
+    ///
     /// Panics when `position` is outside the fixed member range.
+    #[must_use]
     pub fn version_at(&self, position: usize) -> u64 {
         self.iter()
             .nth(position)
             .expect("version-vector position must be within range")
+    }
+
+    /// Build the most compact vector representation for explicit member versions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `versions` is empty.
+    fn from_versions(versions: Vec<u64>) -> Self {
+        let num_members =
+            NonZeroUsize::new(versions.len()).expect("version vectors must not be empty");
+        let first_version = versions[0];
+        if versions.iter().all(|version| *version == first_version) {
+            return Self::Synced {
+                num_members,
+                version: first_version,
+            };
+        }
+
+        if let Some(version) = OverrideVersion::try_from_versions(&versions) {
+            return Self::Override {
+                num_members,
+                version,
+            };
+        }
+
+        Self::Full(PureVersionVector::from(versions))
+    }
+
+    /// Apply one pointwise operation to compatible vectors.
+    ///
+    /// The specialised arms avoid expanding compact representations when the
+    /// result can still be represented as `Synced` or `Override`.
+    fn pointwise_combine(&self, other: &Self, combine: fn(u64, u64) -> u64) -> Self {
+        match (self, other) {
+            (
+                VersionVector::Synced {
+                    num_members,
+                    version: left,
+                },
+                VersionVector::Synced { version: right, .. },
+            ) => VersionVector::Synced {
+                num_members: *num_members,
+                version: combine(*left, *right),
+            },
+            (
+                VersionVector::Synced {
+                    num_members,
+                    version: synced_version,
+                },
+                VersionVector::Override {
+                    version: override_version,
+                    ..
+                },
+            )
+            | (
+                VersionVector::Override {
+                    num_members,
+                    version: override_version,
+                },
+                VersionVector::Synced {
+                    version: synced_version,
+                    ..
+                },
+            ) => compact_group_override(
+                *num_members,
+                override_version.override_position,
+                combine(*synced_version, override_version.group_version),
+                combine(*synced_version, override_version.override_version),
+            ),
+            (
+                VersionVector::Override {
+                    num_members,
+                    version: left,
+                },
+                VersionVector::Override { version: right, .. },
+            ) if left.override_position == right.override_position => compact_group_override(
+                *num_members,
+                left.override_position,
+                combine(left.group_version, right.group_version),
+                combine(left.override_version, right.override_version),
+            ),
+            (VersionVector::Override { .. }, VersionVector::Override { .. }) => {
+                VersionVector::from_versions(pointwise_combine_to_vec(self, other, combine))
+            }
+            (VersionVector::Full(_), _) | (_, VersionVector::Full(_)) => {
+                VersionVector::from_versions(pointwise_combine_to_vec(self, other, combine))
+            }
+        }
     }
 }
 impl fmt::Display for VersionVector {
@@ -401,6 +567,85 @@ fn hb_compare_override_synced(o: &OverrideVersion, synced_version: u64) -> Happe
     }
 }
 
+/// Panic when two version vectors cannot describe the same member set.
+fn assert_same_member_count(left: &VersionVector, right: &VersionVector) {
+    assert_eq!(
+        left.num_members(),
+        right.num_members(),
+        "Version vectors with different member counts cannot be combined"
+    );
+}
+
+/// Apply a single-position write to a synced vector.
+///
+/// This keeps the synced or override representation when possible and expands
+/// only when the selected member moves behind the common group version.
+fn synced_with_version_at(
+    num_members: NonZeroUsize,
+    group_version: u64,
+    position: usize,
+    version: u64,
+) -> VersionVector {
+    if num_members.get() == 1 || version == group_version {
+        return VersionVector::Synced {
+            num_members,
+            version,
+        };
+    }
+
+    if version > group_version {
+        return VersionVector::Override {
+            num_members,
+            version: OverrideVersion::new(group_version, position, version),
+        };
+    }
+
+    let mut versions = vec![group_version; num_members.get()];
+    versions[position] = version;
+    VersionVector::Full(PureVersionVector::from(versions))
+}
+
+/// Build the compact representation for a common group version plus one exception.
+///
+/// The exception can be represented as `Override` only when it is ahead of the
+/// group version. If it falls behind, the vector must be expanded to `Full`.
+fn compact_group_override(
+    num_members: NonZeroUsize,
+    override_position: usize,
+    group_version: u64,
+    override_version: u64,
+) -> VersionVector {
+    if group_version == override_version {
+        return VersionVector::Synced {
+            num_members,
+            version: group_version,
+        };
+    }
+
+    if group_version < override_version {
+        return VersionVector::Override {
+            num_members,
+            version: OverrideVersion::new(group_version, override_position, override_version),
+        };
+    }
+
+    let mut versions = vec![group_version; num_members.get()];
+    versions[override_position] = override_version;
+    VersionVector::Full(PureVersionVector::from(versions))
+}
+
+/// Expand two vectors just long enough to apply one pointwise operation.
+fn pointwise_combine_to_vec(
+    left: &VersionVector,
+    right: &VersionVector,
+    combine: fn(u64, u64) -> u64,
+) -> Vec<u64> {
+    left.iter()
+        .zip(right.iter())
+        .map(|(left, right)| combine(left, right))
+        .collect()
+}
+
 /// The traditiononal array representation of a vector with every position corresponding to that member.
 ///
 /// Note that empty vectors are not supported.
@@ -436,6 +681,12 @@ impl PureVersionVector {
         self.0[position] = self.0[position]
             .checked_add(1)
             .expect("Max version reached");
+    }
+
+    fn with_version_at(&self, position: usize, version: u64) -> VersionVector {
+        let mut versions = self.0.clone().into_vec();
+        versions[position] = version;
+        VersionVector::from_versions(versions)
     }
 
     const fn is_valid(&self) -> bool {
@@ -536,6 +787,52 @@ impl OverrideVersion {
         )
     }
 
+    /// Recognise explicit member versions that can be represented as one higher override.
+    ///
+    /// The scan keeps only the common group-version candidate and a single
+    /// override candidate. A lower second entry means position zero may be the
+    /// override; any later disagreement means the vector needs `Full`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `versions` is empty.
+    fn try_from_versions(versions: &[u64]) -> Option<Self> {
+        let mut group_candidate_version = versions[0];
+        let mut override_candidate_position = None;
+        let mut override_candidate_version = 0;
+
+        for (position, version) in versions.iter().copied().enumerate().skip(1) {
+            if version == group_candidate_version {
+                continue;
+            }
+
+            if override_candidate_position.is_some() {
+                return None;
+            }
+
+            if version > group_candidate_version {
+                override_candidate_position = Some(position);
+                override_candidate_version = version;
+            } else if position == 1 {
+                override_candidate_position = Some(0);
+                override_candidate_version = group_candidate_version;
+                group_candidate_version = version;
+            } else {
+                return None;
+            }
+        }
+
+        let override_position = override_candidate_position?;
+        option_when!(
+            override_candidate_version > group_candidate_version,
+            Self {
+                group_version: group_candidate_version,
+                override_position,
+                override_version: override_candidate_version,
+            }
+        )
+    }
+
     /// Creates a new instance where `override_version = group_version + 1`.
     pub const fn with_next_version(group_version: u64, override_position: usize) -> Self {
         Self {
@@ -559,6 +856,64 @@ impl OverrideVersion {
         let mut entries = vec![self.group_version; num_members.get()];
         entries[self.override_position] = self.override_version;
         PureVersionVector::from(entries)
+    }
+
+    fn with_version_at(
+        &self,
+        num_members: NonZeroUsize,
+        position: usize,
+        version: u64,
+    ) -> VersionVector {
+        if position == self.override_position {
+            if version >= self.group_version {
+                return compact_group_override(
+                    num_members,
+                    self.override_position,
+                    self.group_version,
+                    version,
+                );
+            }
+
+            if num_members.get() == 2 {
+                let other_position = 1 - self.override_position;
+                return VersionVector::Override {
+                    num_members,
+                    version: OverrideVersion::new(version, other_position, self.group_version),
+                };
+            }
+        } else if version == self.group_version {
+            return VersionVector::Override {
+                num_members,
+                version: self.clone(),
+            };
+        } else if num_members.get() == 2 {
+            if version == self.override_version {
+                return VersionVector::Synced {
+                    num_members,
+                    version,
+                };
+            }
+
+            if version < self.override_version {
+                return VersionVector::Override {
+                    num_members,
+                    version: OverrideVersion::new(
+                        version,
+                        self.override_position,
+                        self.override_version,
+                    ),
+                };
+            }
+
+            return VersionVector::Override {
+                num_members,
+                version: OverrideVersion::new(self.override_version, position, version),
+            };
+        }
+
+        let mut versions = self.to_vector(num_members);
+        versions.0[position] = version;
+        VersionVector::Full(versions)
     }
 
     const fn is_valid(&self) -> bool {

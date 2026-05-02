@@ -12,7 +12,6 @@ use crate::{
         MemberIndex,
         MutableRow,
         ReplicationGroupRecord,
-        ReplicationRowRecord,
         ReplicationRowSnapshot,
         ReplicationUpdateRecord,
         RowChange,
@@ -39,6 +38,11 @@ use std::{
     num::NonZeroUsize,
     sync::Arc,
 };
+
+struct LocalStoredRow {
+    snapshot: ReplicationRowSnapshot,
+    tombstoned: bool,
+}
 
 /// One fixed-membership replication group loaded for one store transaction.
 ///
@@ -214,12 +218,12 @@ pub(super) struct PendingApplyPlan {
 }
 
 /// One local dataset together with its current replicated in-memory contents.
+#[derive(Clone)]
 pub(super) struct LocalDataset {
     pub(super) data: flotsync_messages::InMemoryData,
 }
 
 impl LocalDataset {
-    #[cfg(test)]
     pub(super) fn new(schema: impl Into<SchemaSource>) -> Self {
         Self {
             data: flotsync_messages::InMemoryData::new(schema),
@@ -242,10 +246,9 @@ impl LocalDataset {
         Self { data }
     }
 
-    fn stored_row(&self, row_key: RowKey) -> Option<ReplicationRowRecord> {
+    fn stored_row(&self, row_key: RowKey) -> Option<LocalStoredRow> {
         let row = self.data.get_row(&row_key.0)?;
-        Some(ReplicationRowRecord {
-            row_id: row_key,
+        Some(LocalStoredRow {
             snapshot: row.snapshot(),
             tombstoned: row.is_tombstoned(),
         })
@@ -420,31 +423,17 @@ pub(super) fn validate_update_mapping(
     Ok(())
 }
 
-/// Returns the mutable working dataset image used for one outbound publish batch.
-///
-/// Callers are expected to pre-load every touched dataset before publish
-/// staging starts, so reaching a missing dataset here is a runtime bug rather
-/// than a schema-loading decision.
-pub(super) fn working_dataset_for_publish<'a>(
-    working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
-    dataset_id: &DatasetId,
-) -> Result<&'a mut LocalDataset, PublishChangesError> {
-    Ok(working_datasets
-        .get_mut(dataset_id)
-        .expect("touched publish dataset must be pre-loaded before staging"))
-}
-
 /// Returns the mutable working dataset image used for one inbound apply batch.
 ///
 /// Callers are expected to pre-load every dataset touched by the causal apply
 /// chain before the first operation is decoded.
-fn working_dataset_for_inbound<'a>(
-    working_datasets: &'a mut HashMap<DatasetId, LocalDataset>,
+fn working_dataset_for_inbound<'dataset>(
+    working_datasets: &'dataset mut HashMap<DatasetId, LocalDataset>,
     dataset_id: &DatasetId,
-) -> Result<&'a mut LocalDataset, InboundDeliveryError> {
-    Ok(working_datasets
+) -> &'dataset mut LocalDataset {
+    working_datasets
         .get_mut(dataset_id)
-        .expect("touched inbound dataset must be pre-loaded before apply"))
+        .expect("touched inbound dataset must be pre-loaded before apply")
 }
 
 /// One prepared local publish batch together with the corresponding durable
@@ -464,7 +453,7 @@ pub(super) struct AppliedInboundBatch {
 /// One staged local mutation together with its explicit durable row write.
 pub(super) struct AppliedLocalOperation {
     pub(super) encoded_operation: flotsync_messages::datamodel::SchemaOperation,
-    pub(super) row_change: RowChange,
+    pub(super) row_change: Option<RowChange>,
     pub(super) row_write: DatasetRowWrite,
 }
 
@@ -490,9 +479,10 @@ pub(super) fn apply_one_update_batch(
 ) -> Result<AppliedInboundBatch, InboundDeliveryError> {
     let mut row_changes = Vec::new();
     let mut row_patches = Vec::new();
+    let last_changed_versions = update.read_versions.with_update_applied(update.update_id);
     for dataset_update in &update.dataset_updates {
         let working_dataset =
-            working_dataset_for_inbound(working_datasets, &dataset_update.dataset_id)?;
+            working_dataset_for_inbound(working_datasets, &dataset_update.dataset_id);
         let mut row_writes = Vec::new();
         for operation in &dataset_update.operations {
             let schema = working_dataset.data.schema().clone();
@@ -514,6 +504,7 @@ pub(super) fn apply_one_update_batch(
                 group_id: update.group_id,
                 dataset_id: dataset_update.dataset_id.clone(),
                 actions: row_writes,
+                last_changed_versions: last_changed_versions.clone(),
             });
         }
     }
@@ -558,35 +549,12 @@ pub(super) fn apply_local_upsert(
     update_id: UpdateId,
 ) -> Result<Option<AppliedLocalOperation>, PublishChangesError> {
     let schema = dataset.data.schema().clone();
-    let operation = if dataset.data.get_row(&row_id.row_key.0).is_some() {
-        let pending_updates = row.into_pending_updates(&schema, row_id)?;
-        match dataset
-            .data
-            .modify_row(update_id, row_id.row_key.0, pending_updates)
-            .context(publish::ApplyLocalMutationSnafu {
-                row_id: row_id.clone(),
-            })? {
-            OperationOutcome::Applied(operation) => Some(operation),
-            OperationOutcome::NoChanges => None,
-        }
-    } else {
-        let initial_values = row.into_initial_values(&schema, row_id)?;
-        let operation = dataset
-            .data
-            .insert_row(update_id, row_id.row_key.0, initial_values)
-            .context(publish::ApplyLocalMutationSnafu {
-                row_id: row_id.clone(),
-            })?;
-        Some(operation)
+    let encoded_operation = {
+        let Some(operation) = apply_local_upsert_operation(dataset, row_id, row, update_id)? else {
+            return Ok(None);
+        };
+        encode_publish_operation(row_id, &schema, &operation)?
     };
-
-    let Some(operation) = operation else {
-        return Ok(None);
-    };
-    let encoded_operation =
-        encode_schema_operation(&operation, &schema).context(publish::EncodeOperationSnafu {
-            dataset_id: row_id.dataset_id.clone(),
-        })?;
     let row_snapshot = dataset
         .snapshot_row(row_id.row_key)
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
@@ -595,10 +563,10 @@ pub(super) fn apply_local_upsert(
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
     Ok(Some(AppliedLocalOperation {
         encoded_operation,
-        row_change: RowChange::Upsert {
+        row_change: Some(RowChange::Upsert {
             row_id: row_id.clone(),
             row: Arc::new(row),
-        },
+        }),
         row_write: DatasetRowWrite::UpsertActive {
             row_key: row_id.row_key,
             snapshot: row_snapshot,
@@ -613,28 +581,160 @@ pub(super) fn apply_local_delete(
     update_id: UpdateId,
 ) -> Result<AppliedLocalOperation, PublishChangesError> {
     let schema = dataset.data.schema().clone();
-    let operation = dataset
-        .data
-        .delete_row(update_id, row_id.row_key.0)
-        .context(publish::ApplyLocalMutationSnafu {
-            row_id: row_id.clone(),
-        })?;
-    let encoded_operation =
-        encode_schema_operation(&operation, &schema).context(publish::EncodeOperationSnafu {
-            dataset_id: row_id.dataset_id.clone(),
-        })?;
+    let encoded_operation = {
+        let operation = apply_local_delete_operation(dataset, row_id, update_id)?;
+        encode_publish_operation(row_id, &schema, &operation)?
+    };
     let row = dataset
         .stored_row(row_id.row_key)
         .unwrap_or_else(|| panic!("applied local delete must leave row {row_id} snapshotable"));
     debug_assert!(row.tombstoned);
     Ok(AppliedLocalOperation {
         encoded_operation,
-        row_change: RowChange::Delete {
+        row_change: Some(RowChange::Delete {
             row_id: row_id.clone(),
-        },
+        }),
         row_write: DatasetRowWrite::UpsertTombstone {
             row_key: row_id.row_key,
             snapshot: row.snapshot,
+        },
+    })
+}
+
+/// Generate one local upsert operation from `base_dataset`, then apply that
+/// encoded operation to `current_dataset`.
+pub(super) fn apply_rebased_local_upsert(
+    base_dataset: &mut LocalDataset,
+    current_dataset: &mut LocalDataset,
+    row_id: &RowId,
+    row: MutableRow,
+    update_id: UpdateId,
+) -> Result<Option<AppliedLocalOperation>, PublishChangesError> {
+    let schema = base_dataset.data.schema().clone();
+    let Some(operation) = apply_local_upsert_operation(base_dataset, row_id, row, update_id)?
+    else {
+        return Ok(None);
+    };
+    let encoded_operation = encode_publish_operation(row_id, &schema, &operation)?;
+    apply_decoded_publish_operation(current_dataset, row_id, operation, encoded_operation).map(Some)
+}
+
+/// Generate one local delete operation from `base_dataset`, then apply that
+/// encoded operation to `current_dataset`.
+pub(super) fn apply_rebased_local_delete(
+    base_dataset: &mut LocalDataset,
+    current_dataset: &mut LocalDataset,
+    row_id: &RowId,
+    update_id: UpdateId,
+) -> Result<AppliedLocalOperation, PublishChangesError> {
+    let schema = base_dataset.data.schema().clone();
+    let operation = apply_local_delete_operation(base_dataset, row_id, update_id)?;
+    let encoded_operation = encode_publish_operation(row_id, &schema, &operation)?;
+    apply_decoded_publish_operation(current_dataset, row_id, operation, encoded_operation)
+}
+
+fn apply_local_upsert_operation<'dataset>(
+    dataset: &'dataset mut LocalDataset,
+    row_id: &RowId,
+    row: MutableRow,
+    update_id: UpdateId,
+) -> Result<Option<flotsync_messages::SchemaOperation<'dataset>>, PublishChangesError> {
+    let schema = dataset.data.schema().clone();
+    if dataset.data.get_row(&row_id.row_key.0).is_some() {
+        let pending_updates = row.into_pending_updates(&schema, row_id)?;
+        match dataset
+            .data
+            .modify_row(update_id, row_id.row_key.0, pending_updates)
+            .context(publish::ApplyLocalMutationSnafu {
+                row_id: row_id.clone(),
+            })? {
+            OperationOutcome::Applied(operation) => Ok(Some(operation)),
+            OperationOutcome::NoChanges => Ok(None),
+        }
+    } else {
+        let initial_values = row.into_initial_values(&schema, row_id)?;
+        let operation = dataset
+            .data
+            .insert_row(update_id, row_id.row_key.0, initial_values)
+            .context(publish::ApplyLocalMutationSnafu {
+                row_id: row_id.clone(),
+            })?;
+        Ok(Some(operation))
+    }
+}
+
+fn apply_local_delete_operation<'dataset>(
+    dataset: &'dataset mut LocalDataset,
+    row_id: &RowId,
+    update_id: UpdateId,
+) -> Result<flotsync_messages::SchemaOperation<'dataset>, PublishChangesError> {
+    dataset
+        .data
+        .delete_row(update_id, row_id.row_key.0)
+        .context(publish::ApplyLocalMutationSnafu {
+            row_id: row_id.clone(),
+        })
+}
+
+fn encode_publish_operation(
+    row_id: &RowId,
+    schema: &Schema,
+    operation: &flotsync_messages::SchemaOperation<'_>,
+) -> Result<flotsync_messages::datamodel::SchemaOperation, PublishChangesError> {
+    encode_schema_operation(operation, schema).context(publish::EncodeOperationSnafu {
+        dataset_id: row_id.dataset_id.clone(),
+    })
+}
+
+fn apply_decoded_publish_operation(
+    dataset: &mut LocalDataset,
+    row_id: &RowId,
+    operation: flotsync_messages::SchemaOperation<'_>,
+    encoded_operation: flotsync_messages::datamodel::SchemaOperation,
+) -> Result<AppliedLocalOperation, PublishChangesError> {
+    let was_tombstoned = dataset.row_is_tombstoned(row_id.row_key).unwrap_or(false);
+
+    dataset.data = dataset
+        .data
+        .clone()
+        .apply_schema_operation(operation)
+        .context(publish::ApplyLocalMutationSnafu {
+            row_id: row_id.clone(),
+        })?;
+
+    let stored_row = dataset
+        .stored_row(row_id.row_key)
+        .unwrap_or_else(|| panic!("applied local operation must leave row {row_id} snapshotable"));
+    let row_change = if stored_row.tombstoned {
+        if was_tombstoned {
+            None
+        } else {
+            Some(RowChange::Delete {
+                row_id: row_id.clone(),
+            })
+        }
+    } else {
+        let row = dataset
+            .clone_row(row_id.row_key)
+            .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
+        Some(RowChange::Upsert {
+            row_id: row_id.clone(),
+            row: Arc::new(row),
+        })
+    };
+    Ok(AppliedLocalOperation {
+        encoded_operation,
+        row_change,
+        row_write: if stored_row.tombstoned {
+            DatasetRowWrite::UpsertTombstone {
+                row_key: row_id.row_key,
+                snapshot: stored_row.snapshot,
+            }
+        } else {
+            DatasetRowWrite::UpsertActive {
+                row_key: row_id.row_key,
+                snapshot: stored_row.snapshot,
+            }
         },
     })
 }

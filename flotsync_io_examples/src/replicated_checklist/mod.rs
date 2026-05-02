@@ -25,6 +25,7 @@ use flotsync_replication::{
     DatasetId,
     GroupId,
     MutableRow,
+    ReadToken,
     RowChange,
     RowId,
     RowKey,
@@ -501,6 +502,8 @@ pub enum ChecklistWorkingSetError {
     UnexpectedDeletedSnapshotRow { row_id: RowId },
     #[snafu(display("Dirty checklist row {row_key} is missing from the working set."))]
     MissingDirtyRow { row_key: RowKey },
+    #[snafu(display("Checklist working set does not have a replication read token."))]
+    MissingReadToken,
 }
 
 /// In-memory REPL view of checklist rows between explicit `sync` commands.
@@ -516,6 +519,7 @@ pub struct ChecklistWorkingSet {
     dirty_rows: HashMap<RowKey, DirtyRowKind>,
     queued_events: VecDeque<ChecklistEvent>,
     event_history: Vec<ChecklistEvent>,
+    read_token: Option<ReadToken>,
 }
 
 impl ChecklistWorkingSet {
@@ -528,6 +532,7 @@ impl ChecklistWorkingSet {
             dirty_rows: HashMap::new(),
             queued_events: VecDeque::new(),
             event_history: Vec::new(),
+            read_token: None,
         }
     }
 
@@ -564,6 +569,24 @@ impl ChecklistWorkingSet {
 
     pub fn events(&self) -> &[ChecklistEvent] {
         &self.event_history
+    }
+
+    pub fn read_token(&self) -> Result<ReadToken, ChecklistWorkingSetError> {
+        self.read_token
+            .clone()
+            .ok_or(ChecklistWorkingSetError::MissingReadToken)
+    }
+
+    pub fn set_read_token(&mut self, read_token: ReadToken) {
+        self.read_token = Some(read_token);
+    }
+
+    pub fn merge_read_token(&mut self, read_token: ReadToken) {
+        if let Some(existing_token) = &mut self.read_token {
+            existing_token.merge_applied(&read_token);
+        } else {
+            self.read_token = Some(read_token);
+        }
     }
 
     pub fn listed_items(&self) -> Vec<ListedChecklistItem<'_>> {

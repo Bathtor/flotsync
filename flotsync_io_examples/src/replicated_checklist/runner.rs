@@ -24,6 +24,8 @@ use flotsync_replication::{
     LoadError,
     MemberIdentity,
     MemberIndex,
+    PublishChangesRequest,
+    ReadToken,
     RejectionReason,
     ReplicationApi,
     ReplicationConfig,
@@ -170,12 +172,17 @@ pub enum StaticGroupError {
 }
 
 struct ChecklistListener {
-    sender: Sender<Vec<RowChange>>,
+    sender: Sender<ChecklistListenerBatch>,
+}
+
+struct ChecklistListenerBatch {
+    read_token: ReadToken,
+    changes: Vec<RowChange>,
 }
 
 impl ChecklistListener {
     /// Return the listener plus the receiver used by the REPL to drain queued row-change batches.
-    fn pair() -> (Arc<Self>, Receiver<Vec<RowChange>>) {
+    fn pair() -> (Arc<Self>, Receiver<ChecklistListenerBatch>) {
         let (sender, receiver) = mpsc::channel();
         (Arc::new(Self { sender }), receiver)
     }
@@ -189,13 +196,19 @@ impl ReplicationEventListener for ChecklistListener {
         let sender = self.sender.clone();
         async move {
             match event {
-                ReplicationEvent::DataChanged { mut rows } => {
+                ReplicationEvent::DataChanged {
+                    read_token,
+                    mut rows,
+                } => {
                     while let Some(batch) = rows.next_batch().await.boxed()? {
-                        sender.send(batch.into_iter().collect()).map_err(|_| {
-                            ListenerError::Rejected {
+                        sender
+                            .send(ChecklistListenerBatch {
+                                read_token: read_token.clone(),
+                                changes: batch.into_iter().collect(),
+                            })
+                            .map_err(|_| ListenerError::Rejected {
                                 message: "checklist listener queue is closed".to_owned(),
-                            }
-                        })?;
+                            })?;
                     }
                     Ok(())
                 }
@@ -215,7 +228,7 @@ impl ReplicationEventListener for ChecklistListener {
 struct ChecklistRepl {
     config: ChecklistAppConfig,
     replication: Arc<dyn ReplicationApi>,
-    listener_receiver: Receiver<Vec<RowChange>>,
+    listener_receiver: Receiver<ChecklistListenerBatch>,
     working_set: ChecklistWorkingSet,
 }
 
@@ -223,7 +236,7 @@ impl ChecklistRepl {
     fn new(
         config: ChecklistAppConfig,
         replication: Arc<dyn ReplicationApi>,
-        listener_receiver: Receiver<Vec<RowChange>>,
+        listener_receiver: Receiver<ChecklistListenerBatch>,
         working_set: ChecklistWorkingSet,
     ) -> Self {
         Self {
@@ -384,8 +397,20 @@ impl ChecklistRepl {
             .prepare_sync()
             .context(repl_error::WorkingSetSnafu)?;
         if let Some(plan) = &plan {
-            block_on(self.replication.publish_changes(plan.mutations.clone()))
-                .context(repl_error::ReplicationSnafu)?;
+            let read_token = self
+                .working_set
+                .read_token()
+                .context(repl_error::WorkingSetSnafu)?;
+            let receipt = block_on(self.replication.publish_changes(PublishChangesRequest {
+                read_token,
+                changes: plan.mutations.clone(),
+            }))
+            .context(repl_error::ReplicationSnafu)?;
+            // The receipt token is our previous application read position with
+            // this local writer position advanced. Keeping it here makes the
+            // next local sync causally depend on the write we just published
+            // without waiting for the listener echo to be drained first.
+            self.working_set.set_read_token(receipt.read_token);
         }
         let listener_batch_count = self.drain_listener_queue()?;
         let applied_events = self.working_set.finish_successful_sync(plan);
@@ -398,17 +423,23 @@ impl ChecklistRepl {
     /// Drain queued listener batches into the working set and return the number of batches drained.
     fn drain_listener_queue(&mut self) -> Result<usize, ReplicatedChecklistError> {
         let mut drained_batch_count = 0;
-        while let Some(changes) = self.receive_listener_batch()? {
+        while let Some(batch) = self.receive_listener_batch()? {
             self.working_set
-                .enqueue_row_changes(changes)
+                .enqueue_row_changes(batch.changes)
                 .context(repl_error::WorkingSetSnafu)?;
+            // No REPL command can run while sync is draining listener batches,
+            // so it is safe to merge the event token before the queued rows are
+            // applied immediately below by finish_successful_sync.
+            self.working_set.merge_read_token(batch.read_token);
             drained_batch_count += 1;
         }
         Ok(drained_batch_count)
     }
 
     /// Return one queued listener batch, or `None` when the listener queue is currently empty.
-    fn receive_listener_batch(&self) -> Result<Option<Vec<RowChange>>, ReplicatedChecklistError> {
+    fn receive_listener_batch(
+        &self,
+    ) -> Result<Option<ChecklistListenerBatch>, ReplicatedChecklistError> {
         match self.listener_receiver.try_recv() {
             Ok(changes) => Ok(Some(changes)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -495,29 +526,35 @@ fn load_checklist_working_set(
     replication: &dyn ReplicationApi,
     group_id: GroupId,
 ) -> Result<ChecklistWorkingSet, ReplicatedChecklistError> {
+    block_on(load_checklist_working_set_async(replication, group_id))
+}
+
+async fn load_checklist_working_set_async(
+    replication: &dyn ReplicationApi,
+    group_id: GroupId,
+) -> Result<ChecklistWorkingSet, ReplicatedChecklistError> {
     let mut working_set = ChecklistWorkingSet::new(group_id);
-    block_on(async {
-        let mut snapshot = replication
-            .snapshot_rows(SnapshotRowsRequest {
-                group_id,
-                datasets: HashSet::from([checklist_dataset_id()]),
-                max_rows_per_batch: CHECKLIST_SNAPSHOT_BATCH_SIZE,
-                include_tombstones: false,
-            })
-            .await
-            .context(repl_error::ReplicationSnafu)?;
-        while let Some(batch) = snapshot
-            .rows
-            .next_batch()
-            .await
-            .context(repl_error::SnapshotRowsSnafu)?
-        {
-            working_set
-                .apply_snapshot_rows(batch)
-                .context(repl_error::WorkingSetSnafu)?;
-        }
-        Ok::<(), ReplicatedChecklistError>(())
-    })?;
+    let mut snapshot = replication
+        .snapshot_rows(SnapshotRowsRequest {
+            group_id,
+            datasets: HashSet::from([checklist_dataset_id()]),
+            max_rows_per_batch: CHECKLIST_SNAPSHOT_BATCH_SIZE,
+            include_tombstones: false,
+        })
+        .await
+        .context(repl_error::ReplicationSnafu)?;
+    let read_token = snapshot.read_token.clone();
+    while let Some(batch) = snapshot
+        .rows
+        .next_batch()
+        .await
+        .context(repl_error::SnapshotRowsSnafu)?
+    {
+        working_set
+            .apply_snapshot_rows(batch)
+            .context(repl_error::WorkingSetSnafu)?;
+    }
+    working_set.set_read_token(read_token);
     Ok(working_set)
 }
 

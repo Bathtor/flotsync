@@ -1,5 +1,5 @@
 use flotsync_core::versions::{UpdateId, VersionVector};
-use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowRecord, RowSnapshot};
+use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec};
 use std::{
@@ -35,6 +35,7 @@ pub struct MutableRow {
 }
 
 impl MutableRow {
+    #[must_use]
     pub fn new(fields: HashMap<String, NullableBasicValue>) -> Self {
         Self { fields }
     }
@@ -65,11 +66,107 @@ pub enum RowMutation {
 }
 
 impl RowMutation {
+    #[must_use]
     pub fn row_id(&self) -> &RowId {
         match self {
             RowMutation::Upsert { row_id, .. } | RowMutation::Delete { row_id } => row_id,
         }
     }
+}
+
+/// Opaque read-position token returned by the replication runtime.
+///
+/// Applications should store this value alongside their in-memory application
+/// state and pass it back to [`ReplicationApi::publish_changes`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReadToken {
+    // Developer note: the token intentionally hides its group-scoped version
+    // vectors from applications. Runtime internals remain responsible for
+    // validating group compatibility and advancing the right producer position.
+    versions: Arc<ReadTokenVersions>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadTokenVersions {
+    pub(crate) groups: HashMap<GroupId, VersionVector>,
+}
+
+impl ReadToken {
+    pub(crate) fn from_group_versions(groups: HashMap<GroupId, VersionVector>) -> Self {
+        Self {
+            versions: Arc::new(ReadTokenVersions { groups }),
+        }
+    }
+
+    pub(crate) fn group_version(&self, group_id: &GroupId) -> Option<&VersionVector> {
+        self.versions.groups.get(group_id)
+    }
+
+    pub(crate) fn group_count(&self) -> usize {
+        self.versions.groups.len()
+    }
+
+    pub(crate) fn with_group_version(
+        &self,
+        group_id: GroupId,
+        version_vector: VersionVector,
+    ) -> Self {
+        let mut groups = self.versions.groups.clone();
+        groups.insert(group_id, version_vector);
+        Self::from_group_versions(groups)
+    }
+
+    pub(crate) fn with_update_applied(&self, group_id: GroupId, update_id: UpdateId) -> Self {
+        let Some(group_versions) = self.group_version(&group_id) else {
+            return self.clone();
+        };
+        self.with_group_version(group_id, group_versions.with_update_applied(update_id))
+    }
+
+    /// Merge an event or snapshot token into this application read position.
+    ///
+    /// This is safe for applications that publish locally while listener
+    /// events are still queued: the merge keeps the furthest-known version for
+    /// every group instead of replacing newer local progress with an older
+    /// event token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if both tokens contain the same group with incompatible member
+    /// counts.
+    pub fn merge_applied(&mut self, applied: &ReadToken) {
+        let versions = Arc::make_mut(&mut self.versions);
+        for (group_id, applied_versions) in &applied.versions.groups {
+            let merged_versions = match versions.groups.get(group_id) {
+                Some(existing_versions) => existing_versions.least_upper_bound(applied_versions),
+                None => applied_versions.clone(),
+            };
+            versions.groups.insert(*group_id, merged_versions);
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if f.alternate() {
+            return f
+                .debug_struct("ReadToken")
+                .field("groups", &self.versions.groups)
+                .finish();
+        }
+        f.debug_struct("ReadToken")
+            .field("group_count", &self.group_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Request to publish one local set of row mutations from a known read token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishChangesRequest {
+    /// Opaque read position for the application state this change was based on.
+    pub read_token: ReadToken,
+    /// Row mutations to publish.
+    pub changes: Vec<RowMutation>,
 }
 
 /// Row-level change emitted by the framework to an application listener.
@@ -84,12 +181,14 @@ pub enum RowChange {
 }
 
 impl RowChange {
+    #[must_use]
     pub fn row_id(&self) -> &RowId {
         match self {
             RowChange::Upsert { row_id, .. } | RowChange::Delete { row_id } => row_id,
         }
     }
 
+    #[must_use]
     pub fn row(&self) -> Option<&(dyn RowRead<UpdateId> + Send + Sync)> {
         match self {
             RowChange::Upsert { row, .. } => Some(row.as_ref()),
@@ -145,14 +244,12 @@ pub trait BatchProvider: Send {
     /// Allocate a fresh empty batch using this provider's batching policy.
     fn new_batch(&self) -> Self::Batch;
 
-    fn fill_batch<'a>(
-        &'a mut self,
+    fn fill_batch(
+        &mut self,
         reuse: Self::Batch,
-    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>>;
+    ) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>>;
 
-    fn next_batch<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
+    fn next_batch(&mut self) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>> {
         let reuse = self.new_batch();
         self.fill_batch(reuse)
     }
@@ -162,6 +259,11 @@ pub trait BatchProvider: Send {
 ///
 /// `process` receives the batch mutably so it can use concrete batch APIs such
 /// as `drain` before the allocation is handed back to the provider.
+///
+/// # Errors
+///
+/// Returns provider errors from fetching a batch or processing errors returned
+/// by `process`.
 pub async fn process_batches<B>(
     provider: &mut dyn BatchProvider<Batch = B>,
     mut process: impl FnMut(&mut B) -> Result<(), RowProviderError>,
@@ -204,6 +306,7 @@ pub struct SnapshotRowsRequest {
 /// Row snapshot stream returned by [`ReplicationApi::snapshot_rows`].
 pub struct SnapshotRows {
     pub group_id: GroupId,
+    pub read_token: ReadToken,
     pub rows: Box<SnapshotRowProvider>,
 }
 
@@ -211,6 +314,7 @@ impl std::fmt::Debug for SnapshotRows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotRows")
             .field("group_id", &self.group_id)
+            .field("read_token", &self.read_token)
             .finish_non_exhaustive()
     }
 }
@@ -329,9 +433,10 @@ pub struct ChangeGroupMembershipRequest {
 }
 
 /// Receipt returned by `publish_changes`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishReceipt {
     pub update_id: UpdateId,
+    pub read_token: ReadToken,
 }
 
 /// Invitation details surfaced when migration policy requires listener mediation.
@@ -346,6 +451,14 @@ pub struct GroupInvitation {
 /// Listener-visible replication events.
 pub enum ReplicationEvent {
     DataChanged {
+        /// Read position reached by the row changes in this event.
+        ///
+        /// Applications that keep local mutable state should merge this into
+        /// their stored [`ReadToken`] after applying all rows from the event.
+        /// This avoids replacing newer local publish progress with an older
+        /// listener token when local and inbound events are consumed out of
+        /// order.
+        read_token: ReadToken,
         rows: Box<RowProvider>,
     },
     GroupInvitation {
@@ -383,9 +496,11 @@ pub trait ReplicationEventListener: Send + Sync {
 
 /// Application-facing replication control surface.
 pub trait ReplicationApi: Send + Sync {
-    /// Publish one local set of row mutations to the configured replication group.
+    /// Publish one local set of row mutations from a known read token.
     ///
-    /// `changes` is interpreted as a sparse field patch for each [`RowMutation::Upsert`]:
+    /// The request token is the read position of the application state used to
+    /// decide the mutation list. Mutations are interpreted as sparse field
+    /// patches for each [`RowMutation::Upsert`]:
     /// fields omitted from the submitted [`MutableRow`] are intentionally left
     /// unchanged in the current local state. [`RowMutation::Delete`] records a
     /// replicated row tombstone rather than physically removing the row from the
@@ -404,7 +519,7 @@ pub trait ReplicationApi: Send + Sync {
     /// keep their own pending changes until a receipt is returned.
     fn publish_changes(
         &self,
-        changes: Vec<RowMutation>,
+        request: PublishChangesRequest,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
     /// Open a batched stream over the latest locally durable rows for selected datasets.
@@ -485,6 +600,11 @@ pub struct ReplicationGroupRecord {
 
 impl ReplicationGroupRecord {
     /// Return the number of members encoded in this record.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the record contains an empty member set.
+    #[must_use]
     pub fn member_count(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.members.len())
             .expect("replication group records must not contain an empty member set")
@@ -494,6 +614,7 @@ impl ReplicationGroupRecord {
     ///
     /// Store implementations must preserve the invariant that
     /// `local_member_index < members.len()`.
+    #[must_use]
     pub fn local_member(&self) -> &MemberIdentity {
         &self.members[self.local_member_index.as_u32() as usize]
     }
@@ -557,8 +678,18 @@ pub struct DatasetRowsBatch {
 /// Complete row snapshot used by replication storage.
 pub type ReplicationRowSnapshot = RowSnapshot<'static, UpdateId>;
 
-/// Durable row image loaded from or written to replication storage.
-pub type ReplicationRowRecord = RowRecord<'static, RowKey, UpdateId>;
+/// Row image loaded from or written to replication storage.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplicationRowRecord {
+    /// Stable row key in the dataset that owns this record.
+    pub row_id: RowKey,
+    /// Complete value snapshot for the row.
+    pub snapshot: ReplicationRowSnapshot,
+    /// Whether the row is deleted but still retained for causal updates.
+    pub tombstoned: bool,
+    /// Causal version of the last update that changed this row image.
+    pub last_changed_versions: VersionVector,
+}
 
 /// One explicit transactional row patch for a dataset.
 #[derive(Clone, Debug, PartialEq)]
@@ -569,6 +700,8 @@ pub struct DatasetRowPatch {
     pub dataset_id: DatasetId,
     /// Ordered row-level writes to apply transactionally.
     pub actions: Vec<DatasetRowWrite>,
+    /// Causal version to store as the last change for every row in `actions`.
+    pub last_changed_versions: VersionVector,
 }
 
 /// One explicit storage action for a persisted dataset row.
@@ -600,6 +733,15 @@ pub trait ReplicationStoreReadTransaction: Send {
         &'a mut self,
         group_id: &'a GroupId,
     ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load persisted replication groups whose ids are included in `group_ids`.
+    ///
+    /// Missing ids are omitted from the returned vector so callers can decide
+    /// whether absence is expected or an error.
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
     /// Scan one ordered batch of stored dataset rows.
     ///
@@ -687,6 +829,15 @@ pub trait ReplicationStoreTransaction: Send {
     /// Load all persisted replication groups currently known to the store.
     fn load_replication_groups<'a>(
         &'a mut self,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load persisted replication groups whose ids are included in `group_ids`.
+    ///
+    /// Missing ids are omitted from the returned vector so callers can decide
+    /// whether absence is expected or an error.
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
     /// Insert one new persisted replication group.

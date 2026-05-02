@@ -11,6 +11,7 @@ use super::{
         LocalDataset,
         apply_local_delete,
         apply_local_upsert,
+        apply_rebased_local_upsert,
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
@@ -33,6 +34,9 @@ use crate::{
         MemberIdentity,
         MemberIndex,
         ProviderExternalSnafu,
+        PublishChangesRequest,
+        PublishReceipt,
+        ReadToken,
         ReplicationApi,
         ReplicationConfig,
         ReplicationEvent,
@@ -174,6 +178,16 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_groups()
+    }
+
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_groups_for_ids(group_ids)
     }
 
     fn insert_replication_group<'a>(
@@ -351,6 +365,7 @@ impl CapturedRowChange {
 
 struct ListenerStub {
     data_changes: Mutex<Vec<CapturedDataChange>>,
+    data_change_read_tokens: Mutex<Vec<ReadToken>>,
     buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
     buffered_event_tx: mpsc::Sender<CapturedDataChange>,
 }
@@ -360,6 +375,7 @@ impl Default for ListenerStub {
         let (buffered_event_tx, buffered_events) = mpsc::channel();
         Self {
             data_changes: Mutex::new(Vec::new()),
+            data_change_read_tokens: Mutex::new(Vec::new()),
             buffered_events: Mutex::new(buffered_events),
             buffered_event_tx,
         }
@@ -417,13 +433,24 @@ impl ListenerStub {
             .expect("listener capture mutex must not be poisoned")
             .clone()
     }
+
+    fn captured_data_change_read_tokens(&self) -> Vec<ReadToken> {
+        self.drain_buffered_events();
+        self.data_change_read_tokens
+            .lock()
+            .expect("listener read-token capture mutex must not be poisoned")
+            .clone()
+    }
 }
 
 impl ReplicationEventListener for ListenerStub {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
         Box::pin(async move {
             match event {
-                ReplicationEvent::DataChanged { mut rows } => {
+                ReplicationEvent::DataChanged {
+                    read_token,
+                    mut rows,
+                } => {
                     let mut captured_rows = Vec::new();
                     process_batches::<RowChangeBatch>(rows.as_mut(), |batch| {
                         for change in batch.drain(..) {
@@ -437,6 +464,10 @@ impl ReplicationEventListener for ListenerStub {
                     .await
                     .boxed()
                     .context(ListenerExternalSnafu)?;
+                    self.data_change_read_tokens
+                        .lock()
+                        .expect("listener read-token capture mutex must not be poisoned")
+                        .push(read_token);
                     self.buffered_event_tx
                         .send(CapturedDataChange {
                             rows: captured_rows,
@@ -480,6 +511,13 @@ fn title_schema_shared() -> Arc<Schema> {
 
 fn title_schema_static() -> &'static Schema {
     &STATIC_TITLE_SCHEMA
+}
+
+fn title_note_schema_shared() -> Arc<Schema> {
+    Arc::new(Schema::from_fields([
+        Field::linear_string("title"),
+        Field::linear_string("note"),
+    ]))
 }
 
 fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
@@ -675,12 +713,73 @@ fn drain_snapshot_rows(
     rows
 }
 
+fn snapshot_read_token(
+    runtime: &dyn ReplicationApi,
+    group_id: GroupId,
+    dataset_id: DatasetId,
+) -> ReadToken {
+    let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+        group_id,
+        datasets: HashSet::from([dataset_id]),
+        max_rows_per_batch: NonZeroUsize::new(16).unwrap(),
+        include_tombstones: false,
+    }))
+    .expect("snapshot should start");
+    let read_token = snapshot.read_token.clone();
+    while let Some(_batch) =
+        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
+    {}
+    read_token
+}
+
+fn publish_changes(
+    runtime: &dyn ReplicationApi,
+    read_token: ReadToken,
+    changes: Vec<RowMutation>,
+) -> PublishReceipt {
+    wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
+        read_token,
+        changes,
+    }))
+    .expect("publish should succeed")
+}
+
 fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
     rows.sort_by_key(|row| match row {
         CapturedRowChange::Upsert { row_id, .. } | CapturedRowChange::Delete { row_id } => {
             row_id.to_string()
         }
     });
+}
+
+fn snapshot_string_field(
+    runtime: &dyn ReplicationApi,
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    row_id: &RowId,
+    field_name: &str,
+) -> String {
+    let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+        group_id,
+        datasets: HashSet::from([dataset_id]),
+        max_rows_per_batch: NonZeroUsize::new(16).unwrap(),
+        include_tombstones: false,
+    }))
+    .expect("snapshot should start");
+    while let Some(batch) =
+        wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
+    {
+        for row in batch {
+            if row.row_id == *row_id {
+                return row
+                    .row
+                    .get_field_value::<str>(field_name)
+                    .expect("snapshot field should decode")
+                    .into_owned();
+            }
+        }
+    }
+    panic!("snapshot row {row_id} should exist");
 }
 
 fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) {
@@ -811,13 +910,17 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let row_id = test_row_id(group_id, dataset_id, 32);
 
     wait_for_group_install(&runtime, group_id);
-    wait_for_test_reply(runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id,
-        row: crate::row_values! {
-            "title" => "hydrated on startup",
-        },
-    }]))
-    .expect("publish_changes should succeed for the hydrated group");
+    let read_token = snapshot_read_token(runtime.as_ref(), group_id, docs_dataset_id());
+    publish_changes(
+        runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! {
+                "title" => "hydrated on startup",
+            },
+        }],
+    );
 }
 
 #[test]
@@ -842,13 +945,17 @@ fn create_group_persists_membership_across_runtime_restart() {
     let row_id = test_row_id(group_id, dataset_id, 33);
 
     wait_for_group_install(&restarted_runtime, group_id);
-    wait_for_test_reply(restarted_runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id,
-        row: crate::row_values! {
-            "title" => "after restart",
-        },
-    }]))
-    .expect("publish_changes should succeed after restart hydration");
+    let read_token = snapshot_read_token(restarted_runtime.as_ref(), group_id, docs_dataset_id());
+    publish_changes(
+        restarted_runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! {
+                "title" => "after restart",
+            },
+        }],
+    );
 }
 
 #[test]
@@ -867,13 +974,17 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 34);
 
-    let receipt = wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id: row_id.clone(),
-        row: crate::row_values! {
-            "title" => "durable publish",
-        },
-    }]))
-    .expect("publish_changes should succeed");
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "durable publish",
+            },
+        }],
+    );
 
     let persisted_group = load_persisted_group(fixture.store.as_ref(), group_id);
     assert_eq!(persisted_group.version_vector.version_at(0), 1);
@@ -915,25 +1026,32 @@ fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
     let active_row_id = test_row_id(group_id, dataset_id.clone(), 35);
     let deleted_row_id = test_row_id(group_id, dataset_id.clone(), 36);
 
-    wait_for_test_reply(fixture.runtime.publish_changes(vec![
-        RowMutation::Upsert {
-            row_id: active_row_id.clone(),
-            row: crate::row_values! {
-                "title" => "still visible",
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![
+            RowMutation::Upsert {
+                row_id: active_row_id.clone(),
+                row: crate::row_values! {
+                    "title" => "still visible",
+                },
             },
-        },
-        RowMutation::Upsert {
+            RowMutation::Upsert {
+                row_id: deleted_row_id.clone(),
+                row: crate::row_values! {
+                    "title" => "now deleted",
+                },
+            },
+        ],
+    );
+    publish_changes(
+        fixture.runtime.as_ref(),
+        receipt.read_token,
+        vec![RowMutation::Delete {
             row_id: deleted_row_id.clone(),
-            row: crate::row_values! {
-                "title" => "now deleted",
-            },
-        },
-    ]))
-    .expect("initial rows should publish");
-    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Delete {
-        row_id: deleted_row_id.clone(),
-    }]))
-    .expect("delete should publish");
+        }],
+    );
 
     let mut visible_rows = drain_snapshot_rows(
         fixture.runtime.as_ref(),
@@ -995,13 +1113,17 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 39);
 
-    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id: row_id.clone(),
-        row: crate::row_values! {
-            "title" => "local event",
-        },
-    }]))
-    .expect("publish_changes should succeed");
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
+    publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "local event",
+            },
+        }],
+    );
 
     assert_eq!(
         fixture.listener.captured_data_changes(),
@@ -1011,6 +1133,154 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
                 title: "local event".to_owned(),
             }],
         }]
+    );
+}
+
+#[test]
+fn rebased_local_upsert_applies_only_staged_field_to_current_dataset() {
+    let group_id = GroupId(Uuid::from_u128(710));
+    let dataset_id = docs_dataset_id();
+    let row_id = test_row_id(group_id, dataset_id, 42);
+    let mut base_dataset = LocalDataset::new(title_note_schema_shared());
+    let mut current_dataset = LocalDataset::new(title_note_schema_shared());
+
+    let insert_update_id = UpdateId {
+        version: 1,
+        node_index: 0,
+    };
+    for dataset in [&mut base_dataset, &mut current_dataset] {
+        apply_local_upsert(
+            dataset,
+            &row_id,
+            crate::row_values! {
+                "title" => "original title",
+                "note" => "original note",
+            },
+            insert_update_id,
+        )
+        .expect("insert should apply")
+        .expect("insert should produce an operation");
+    }
+    apply_local_upsert(
+        &mut current_dataset,
+        &row_id,
+        crate::row_values! {
+            "note" => "newer note",
+        },
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+    )
+    .expect("note update should apply")
+    .expect("note update should produce an operation");
+
+    apply_rebased_local_upsert(
+        &mut base_dataset,
+        &mut current_dataset,
+        &row_id,
+        crate::row_values! {
+            "title" => "original title updated",
+        },
+        UpdateId {
+            version: 3,
+            node_index: 0,
+        },
+    )
+    .expect("rebased title update should apply")
+    .expect("rebased title update should produce an operation");
+
+    let row = current_dataset
+        .data
+        .get_row(&row_id.row_key.0)
+        .expect("row should exist");
+    assert_eq!(
+        row.get_field_value::<str>("title")
+            .expect("title should decode")
+            .as_ref(),
+        "original title updated"
+    );
+    assert_eq!(
+        row.get_field_value::<str>("note")
+            .expect("note should decode")
+            .as_ref(),
+        "newer note"
+    );
+}
+
+#[test]
+fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_note_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let row_id = test_row_id(group_id, dataset_id.clone(), 41);
+
+    let initial_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let insert_receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        initial_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "original title",
+                "note" => "original note",
+            },
+        }],
+    );
+    let stale_edit_token = insert_receipt.read_token.clone();
+
+    let note_receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        insert_receipt.read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "note" => "newer note",
+            },
+        }],
+    );
+    assert_eq!(note_receipt.update_id.version, 2);
+
+    let title_receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        stale_edit_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "original title updated",
+            },
+        }],
+    );
+    assert_eq!(title_receipt.update_id.version, 3);
+
+    assert_eq!(
+        snapshot_string_field(
+            fixture.runtime.as_ref(),
+            group_id,
+            dataset_id.clone(),
+            &row_id,
+            "title",
+        ),
+        "original title updated"
+    );
+    assert_eq!(
+        snapshot_string_field(
+            fixture.runtime.as_ref(),
+            group_id,
+            dataset_id,
+            &row_id,
+            "note"
+        ),
+        "newer note"
     );
 }
 
@@ -1036,21 +1306,28 @@ fn publish_changes_error_display_includes_local_operation_source() {
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 40);
 
-    wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id: row_id.clone(),
-        row: crate::row_values! {
-            "title" => "counted row",
-            "edit_count" => 5_u64,
-        },
-    }]))
-    .expect("initial publish should succeed");
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "counted row",
+                "edit_count" => 5_u64,
+            },
+        }],
+    );
 
-    let error = wait_for_test_reply(fixture.runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id,
-        row: crate::row_values! {
-            "edit_count" => 4_u64,
-        },
-    }]))
+    let error = wait_for_test_reply(fixture.runtime.publish_changes(PublishChangesRequest {
+        read_token: receipt.read_token,
+        changes: vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! {
+                "edit_count" => 4_u64,
+            },
+        }],
+    }))
     .expect_err("counter decrease should fail publish");
     let message = error.to_string();
 
@@ -1166,13 +1443,17 @@ fn publish_changes_delivers_remote_data_changed_event() {
     wait_for_group_install(bob_runtime, group_id);
     let row_id = test_row_id(group_id, dataset_id.clone(), 11);
 
-    let receipt = wait_for_test_reply(alice_runtime.publish_changes(vec![RowMutation::Upsert {
-        row_id: row_id.clone(),
-        row: crate::row_values! {
-            "title" => "hello from alice",
-        },
-    }]))
-    .expect("publish_changes should succeed");
+    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let receipt = publish_changes(
+        alice_runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "hello from alice",
+            },
+        }],
+    );
 
     assert_eq!(
         receipt.update_id,
@@ -1317,6 +1598,95 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
 }
 
 #[test]
+fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema_static();
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), schema)],
+    );
+    let bob_runtime = &bob_fixture.runtime;
+    let inbound_group_id = GroupId(Uuid::from_u128(23_001));
+    let unrelated_group_id = GroupId(Uuid::from_u128(23_002));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group should build");
+    bob_runtime
+        .install_group_for_test(inbound_group_id, members.clone())
+        .expect("inbound group should install");
+    bob_runtime
+        .install_group_for_test(unrelated_group_id, members)
+        .expect("unrelated group should install");
+
+    let unrelated_row_id = test_row_id(unrelated_group_id, dataset_id.clone(), 23_010);
+    let unrelated_read_token =
+        snapshot_read_token(bob_runtime.as_ref(), unrelated_group_id, dataset_id.clone());
+    publish_changes(
+        bob_runtime.as_ref(),
+        unrelated_read_token,
+        vec![RowMutation::Upsert {
+            row_id: unrelated_row_id,
+            row: crate::row_values! { "title" => "local unrelated progress" },
+        }],
+    );
+    bob_fixture.listener.wait_for_data_change_count(1);
+
+    let inbound_row_id = test_row_id(inbound_group_id, dataset_id.clone(), 23_011);
+    let mut source_dataset = LocalDataset::new(schema);
+    let inbound_operation = apply_local_upsert(
+        &mut source_dataset,
+        &inbound_row_id,
+        crate::row_values! { "title" => "remote inbound progress" },
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+    )
+    .expect("inbound operation should build")
+    .expect("inbound operation should apply")
+    .encoded_operation;
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    bob_runtime
+        .apply_update_batch_for_test(
+            alice_member,
+            UpdateBatchMessage {
+                group_id: inbound_group_id,
+                update_id: UpdateId {
+                    version: 1,
+                    node_index: 0,
+                },
+                read_versions: VersionVector::initial(member_count),
+                dataset_updates: vec![DatasetUpdateMessage {
+                    dataset_id,
+                    operations: vec![inbound_operation],
+                }],
+            },
+        )
+        .expect("inbound update should apply");
+    bob_fixture.listener.wait_for_data_change_count(2);
+
+    let read_tokens = bob_fixture.listener.captured_data_change_read_tokens();
+    let inbound_read_token = read_tokens
+        .last()
+        .expect("inbound event should have a read token");
+    let mut expected_inbound_versions = VersionVector::initial(member_count);
+    expected_inbound_versions.increment_at(0);
+    let mut expected_unrelated_versions = VersionVector::initial(member_count);
+    expected_unrelated_versions.increment_at(1);
+    assert_eq!(
+        inbound_read_token.group_version(&inbound_group_id),
+        Some(&expected_inbound_versions)
+    );
+    assert_eq!(
+        inbound_read_token.group_version(&unrelated_group_id),
+        Some(&expected_unrelated_versions)
+    );
+}
+
+#[test]
 fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -1406,10 +1776,14 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
         }]
     );
 
-    wait_for_test_reply(bob_runtime.publish_changes(vec![RowMutation::Delete {
-        row_id: row_id.clone(),
-    }]))
-    .expect("local delete should publish");
+    let read_token = snapshot_read_token(bob_runtime.as_ref(), group_id, dataset_id.clone());
+    publish_changes(
+        bob_runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Delete {
+            row_id: row_id.clone(),
+        }],
+    );
     bob_listener.wait_for_data_change_count(2);
     assert_eq!(
         bob_listener.captured_data_changes()[1],

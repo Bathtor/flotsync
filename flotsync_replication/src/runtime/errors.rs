@@ -113,6 +113,18 @@ pub(crate) enum PublishChangesError {
     },
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Read token does not contain group {group_id}."))]
+    ReadTokenMissingGroup { group_id: GroupId },
+    #[snafu(display(
+        "Read token for group {group_id} has {read_token_member_count} members, but the persisted group has {persisted_member_count} members.",
+    ))]
+    ReadTokenMemberCountMismatch {
+        group_id: GroupId,
+        read_token_member_count: usize,
+        persisted_member_count: usize,
+    },
+    #[snafu(display("Read token for group {group_id} is ahead of the runtime's durable state."))]
+    ReadTokenAheadOfLocalState { group_id: GroupId },
     #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
@@ -126,6 +138,8 @@ pub(crate) enum PublishChangesError {
         #[snafu(implicit)]
         location: Location,
     },
+    #[snafu(display("Failed to reconstruct row state at read token: {source}"))]
+    Replay { source: ReplayError },
     #[snafu(display(
         "Failed to load schema for dataset '{dataset_id}' from the replication store: {source}"
     ))]
@@ -167,6 +181,25 @@ pub(crate) enum PublishChangesError {
     NoEffectiveChanges { group_id: GroupId },
     #[snafu(display("Group {group_id} exhausted its local update id range."))]
     ExhaustedUpdateIds { group_id: GroupId },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(replay))]
+pub(crate) enum ReplayError {
+    #[snafu(display(
+        "Replay for group {group_id} could not resolve a causal order up to the target read token."
+    ))]
+    Incomplete { group_id: GroupId },
+    #[snafu(display("Decoding replay operation for dataset '{dataset_id}' failed: {source}"))]
+    DecodeOperation {
+        dataset_id: DatasetId,
+        source: OperationCodecError,
+    },
+    #[snafu(display("Applying replay operation for row {row_id} failed: {source}"))]
+    ApplyOperation {
+        row_id: RowId,
+        source: OperationError,
+    },
 }
 
 #[derive(Debug, Snafu)]

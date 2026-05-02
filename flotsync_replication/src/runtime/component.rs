@@ -2,18 +2,14 @@ use super::{
     errors::{inbound, publish, *},
     in_memory::{
         LoadedGroupMeta,
-        LocalDataset,
         PendingUpdateSet,
         PreparedLocalChanges,
         TouchedGroupRows,
-        apply_local_delete,
-        apply_local_upsert,
         apply_one_update_batch,
         collect_group_row_scope,
         collect_record_row_scope,
         validate_inbound_update_read_versions,
         validate_update_mapping,
-        working_dataset_for_publish,
     },
     messages::{
         BootstrapGroupMessage,
@@ -23,6 +19,7 @@ use super::{
         WireRuntimeMessage,
         WireUpdateBatchMessage,
     },
+    replay,
 };
 use crate::{
     GroupMembers,
@@ -43,7 +40,9 @@ use crate::{
         MemberIdentity,
         MemberIndex,
         ProviderExternalSnafu,
+        PublishChangesRequest,
         PublishReceipt,
+        ReadToken,
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
@@ -115,7 +114,14 @@ use uuid::Uuid;
 struct PreparedLocalPublish {
     group_id: GroupId,
     update_id: UpdateId,
+    read_token: ReadToken,
     payload: bytes::Bytes,
+    row_changes: Vec<RowChange>,
+}
+
+/// One listener notification batch paired with the read token reached by that batch.
+struct ListenerDataChanges {
+    read_token: ReadToken,
     row_changes: Vec<RowChange>,
 }
 
@@ -277,13 +283,13 @@ impl BatchProvider for StoreSnapshotRowProvider {
         SnapshotRowBatch::with_capacity(self.max_rows_per_batch.get())
     }
 
-    fn fill_batch<'a>(
-        &'a mut self,
+    fn fill_batch(
+        &mut self,
         mut reuse: Self::Batch,
-    ) -> BoxFuture<'a, Result<Option<Self::Batch>, RowProviderError>> {
+    ) -> BoxFuture<'_, Result<Option<Self::Batch>, RowProviderError>> {
         async move {
             reuse.clear();
-            'fill_batch: while reuse.is_empty() {
+            while reuse.is_empty() {
                 let Some(dataset_id) = self.select_dataset() else {
                     self.release_transaction().await?;
                     return Ok(None);
@@ -316,9 +322,6 @@ impl BatchProvider for StoreSnapshotRowProvider {
                 } else {
                     self.finish_current_dataset();
                 }
-                if reuse.is_empty() {
-                    continue 'fill_batch;
-                }
             }
 
             Ok(Some(reuse))
@@ -334,7 +337,7 @@ impl BatchProvider for StoreSnapshotRowProvider {
 #[derive(Debug)]
 pub enum ReplicationRuntimeMessage {
     /// Submit one local publish request through the component interface.
-    PublishChanges(Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>),
+    PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
     /// Request a local snapshot stream through the component interface.
     SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>),
     /// Create one new fixed-membership group through the component interface.
@@ -486,19 +489,35 @@ impl ReplicationRuntimeComponent {
         request: SnapshotRowsRequest,
     ) -> Result<SnapshotRows, SnapshotRowsError> {
         ensure!(!request.datasets.is_empty(), snapshot::EmptyDatasetsSnafu);
+        let hosted_group_ids = self
+            .group_memberships
+            .snapshot()
+            .group_ids()
+            .copied()
+            .collect::<HashSet<_>>();
+        ensure!(
+            hosted_group_ids.contains(&request.group_id),
+            snapshot::UnknownGroupSnafu {
+                group_id: request.group_id,
+            }
+        );
 
         let mut transaction = self
             .store
             .begin_read_transaction()
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        let group = transaction
-            .load_replication_group(&request.group_id)
+        let groups = transaction
+            .load_replication_groups_for_ids(&hosted_group_ids)
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        group.context(snapshot::UnknownGroupSnafu {
-            group_id: request.group_id,
-        })?;
+        let read_token = Self::read_token_from_groups(groups);
+        ensure!(
+            read_token.group_version(&request.group_id).is_some(),
+            snapshot::UnknownGroupSnafu {
+                group_id: request.group_id,
+            }
+        );
 
         let provider = StoreSnapshotRowProvider {
             transaction: Some(transaction),
@@ -511,33 +530,9 @@ impl ReplicationRuntimeComponent {
         };
         Ok(SnapshotRows {
             group_id: request.group_id,
+            read_token,
             rows: Box::new(provider),
         })
-    }
-
-    /// Materialise one ephemeral in-memory dataset slice for each touched
-    /// dataset using only the requested row keys.
-    async fn materialise_touched_datasets(
-        transaction: &mut dyn ReplicationStoreTransaction,
-        schemas: &HashMap<DatasetId, SchemaSource>,
-        group_id: GroupId,
-        dataset_rows: &HashMap<DatasetId, HashSet<RowKey>>,
-    ) -> Result<HashMap<DatasetId, LocalDataset>, StoreError> {
-        let mut datasets = HashMap::with_capacity(dataset_rows.len());
-        for (dataset_id, row_keys) in dataset_rows {
-            let mut row_keys = row_keys.iter();
-            let row_slice = transaction
-                .load_dataset_rows(&group_id, dataset_id, &mut row_keys)
-                .await?;
-            let schema = schemas
-                .get(dataset_id)
-                .expect("touched dataset schemas must be pre-loaded");
-            datasets.insert(
-                dataset_id.clone(),
-                LocalDataset::from_row_slice(schema.clone(), row_slice),
-            );
-        }
-        Ok(datasets)
     }
 
     /// Persist one set of explicit row patches back into durable storage.
@@ -569,6 +564,17 @@ impl ReplicationRuntimeComponent {
             local_member_index,
             version_vector: VersionVector::initial(member_count),
         }
+    }
+
+    /// Build one opaque application read token from currently stored group progress.
+    fn read_token_from_groups(
+        groups: impl IntoIterator<Item = ReplicationGroupRecord>,
+    ) -> ReadToken {
+        let group_versions = groups
+            .into_iter()
+            .map(|group| (group.group_id, group.version_vector))
+            .collect();
+        ReadToken::from_group_versions(group_versions)
     }
 
     /// Persist one newly observed group definition.
@@ -691,7 +697,7 @@ impl ReplicationRuntimeComponent {
 
     /// Encode one runtime message into the temporary byte payload expected by
     /// the current delivery-envelope boundary.
-    fn encode_runtime_payload(message: RuntimeMessage) -> bytes::Bytes {
+    fn encode_runtime_payload(message: &RuntimeMessage) -> bytes::Bytes {
         // Temporary byte serialisation at the delivery-envelope boundary.
         // See flotsync-ylo for the payload/encryption redesign.
         message.encode_to_proto().encode_to_bytes()
@@ -699,11 +705,11 @@ impl ReplicationRuntimeComponent {
 
     /// Submit the reliable bootstrap fan-out for one newly created group.
     fn submit_group_bootstrap(&mut self, group_id: GroupId, members: &GroupMembers) {
-        let payload =
-            Self::encode_runtime_payload(RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
-                group_id,
-                members: members.ordered_members(),
-            }));
+        let message = RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
+            group_id,
+            members: members.ordered_members(),
+        });
+        let payload = Self::encode_runtime_payload(&message);
         for recipient in members
             .ordered_members()
             .into_iter()
@@ -774,11 +780,15 @@ impl ReplicationRuntimeComponent {
     /// that change id. The surrounding publish transaction captures `ReadVV`
     /// before applying the mutations, persists the same `UpdateId` and `ReadVV`,
     /// and sends both values in the outbound `UpdateBatch`.
+    ///
+    /// `last_changed_versions` is the causal frontier of the new update and is
+    /// stored on every row image affected by the publish.
     fn build_local_dataset_updates(
         group_id: GroupId,
-        working_datasets: &mut HashMap<DatasetId, LocalDataset>,
+        dataset_state: &mut replay::PublishDatasetState,
         changes: Vec<RowMutation>,
         update_id: UpdateId,
+        last_changed_versions: &VersionVector,
     ) -> Result<PreparedLocalChanges, PublishChangesError> {
         let mut encoded_operations: HashMap<
             DatasetId,
@@ -789,16 +799,11 @@ impl ReplicationRuntimeComponent {
 
         'changes: for mutation in changes {
             let row_id = mutation.row_id().clone();
-            let working_dataset =
-                working_dataset_for_publish(working_datasets, &row_id.dataset_id)?;
-
             let applied_operation = match mutation {
                 RowMutation::Upsert { row, .. } => {
-                    apply_local_upsert(working_dataset, &row_id, row, update_id)?
+                    dataset_state.apply_upsert(&row_id, row, update_id)?
                 }
-                RowMutation::Delete { .. } => {
-                    Some(apply_local_delete(working_dataset, &row_id, update_id)?)
-                }
+                RowMutation::Delete { .. } => Some(dataset_state.apply_delete(&row_id, update_id)?),
             };
             let Some(applied_operation) = applied_operation else {
                 continue 'changes;
@@ -807,7 +812,9 @@ impl ReplicationRuntimeComponent {
                 .entry(row_id.dataset_id.clone())
                 .or_default()
                 .push(applied_operation.encoded_operation);
-            row_changes.push(applied_operation.row_change);
+            if let Some(row_change) = applied_operation.row_change {
+                row_changes.push(row_change);
+            }
             row_writes
                 .entry(row_id.dataset_id.clone())
                 .or_default()
@@ -831,6 +838,7 @@ impl ReplicationRuntimeComponent {
                 group_id,
                 dataset_id,
                 actions,
+                last_changed_versions: last_changed_versions.clone(),
             })
             .collect();
         Ok(PreparedLocalChanges {
@@ -866,8 +874,12 @@ impl ReplicationRuntimeComponent {
     /// Publish one local change batch through one durable store transaction.
     async fn publish_changes_transactionally(
         &mut self,
-        changes: Vec<RowMutation>,
+        request: PublishChangesRequest,
     ) -> Result<PreparedLocalPublish, PublishChangesError> {
+        let PublishChangesRequest {
+            read_token,
+            changes,
+        } = request;
         let TouchedGroupRows {
             group_id,
             dataset_rows,
@@ -896,18 +908,40 @@ impl ReplicationRuntimeComponent {
         let mut local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
                 .context(publish::InvalidPersistedGroupSnafu { group_id })?;
-        let mut working_datasets = Self::materialise_touched_datasets(
+        let read_versions = read_token
+            .group_version(&group_id)
+            .cloned()
+            .context(publish::ReadTokenMissingGroupSnafu { group_id })?;
+        ensure!(
+            read_versions.num_members() == local_group.member_count(),
+            publish::ReadTokenMemberCountMismatchSnafu {
+                group_id,
+                read_token_member_count: read_versions.num_members().get(),
+                persisted_member_count: local_group.member_count().get(),
+            }
+        );
+        ensure!(
+            local_group.version_vector >= read_versions,
+            publish::ReadTokenAheadOfLocalStateSnafu { group_id }
+        );
+        let mut dataset_state = replay::load_publish_dataset_state(
             transaction.as_mut(),
             &loaded_schemas,
             group_id,
-            &dataset_rows,
+            local_group.member_count(),
+            dataset_rows,
+            &read_versions,
         )
-        .await
-        .context(publish::StoreAccessSnafu)?;
-        let read_versions = local_group.version_vector.clone();
+        .await?;
         let update_id = Self::next_local_update_id(&local_group, group_id)?;
-        let prepared_local_changes =
-            Self::build_local_dataset_updates(group_id, &mut working_datasets, changes, update_id)?;
+        let last_changed_versions = read_versions.with_update_applied(update_id);
+        let prepared_local_changes = Self::build_local_dataset_updates(
+            group_id,
+            &mut dataset_state,
+            changes,
+            update_id,
+            &last_changed_versions,
+        )?;
         local_group.mark_applied(update_id);
 
         let persisted_update = ReplicationUpdateRecord {
@@ -929,28 +963,30 @@ impl ReplicationRuntimeComponent {
             .update_replication_group_version_vector(&group_id, local_group.version_vector)
             .await
             .context(publish::StoreAccessSnafu)?;
+        let read_token = read_token.with_update_applied(group_id, update_id);
         transaction
             .commit()
             .await
             .context(publish::StoreAccessSnafu)?;
 
-        let payload =
-            Self::encode_runtime_payload(RuntimeMessage::UpdateBatch(UpdateBatchMessage {
-                group_id,
-                update_id,
-                read_versions,
-                dataset_updates: prepared_local_changes
-                    .dataset_updates
-                    .into_iter()
-                    .map(|dataset_update| DatasetUpdateMessage {
-                        dataset_id: dataset_update.dataset_id,
-                        operations: dataset_update.operations,
-                    })
-                    .collect(),
-            }));
+        let message = RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+            group_id,
+            update_id,
+            read_versions,
+            dataset_updates: prepared_local_changes
+                .dataset_updates
+                .into_iter()
+                .map(|dataset_update| DatasetUpdateMessage {
+                    dataset_id: dataset_update.dataset_id,
+                    operations: dataset_update.operations,
+                })
+                .collect(),
+        });
+        let payload = Self::encode_runtime_payload(&message);
         Ok(PreparedLocalPublish {
             group_id,
             update_id,
+            read_token,
             payload,
             row_changes: prepared_local_changes.row_changes,
         })
@@ -1024,7 +1060,7 @@ impl ReplicationRuntimeComponent {
 
     fn handle_group_delivery(
         &mut self,
-        deliver: GroupBroadcastDeliver,
+        deliver: &GroupBroadcastDeliver,
     ) -> Result<Handled, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::group(&deliver.envelope.header);
         let sender = deliver.envelope.header.sender.clone();
@@ -1052,7 +1088,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         sender: MemberIdentity,
         message: WireUpdateBatchMessage,
-    ) -> Result<Vec<Vec<RowChange>>, InboundDeliveryError> {
+    ) -> Result<Vec<ListenerDataChanges>, InboundDeliveryError> {
         let group_id = message.group_id;
         let mut transaction = self
             .store
@@ -1171,20 +1207,41 @@ impl ReplicationRuntimeComponent {
             })?;
         let touched_dataset_rows =
             collect_record_row_scope(&apply_plan.ready_chain, &loaded_schemas)?;
-        let mut working_datasets = Self::materialise_touched_datasets(
+        let touched_dataset_slices = replay::load_touched_dataset_slices(
             transaction.as_mut(),
-            &loaded_schemas,
             group_id,
             &touched_dataset_rows,
         )
         .await
         .context(inbound::StoreAccessSnafu)?;
+        let mut working_datasets =
+            replay::materialise_dataset_slices(&loaded_schemas, touched_dataset_slices);
+        let hosted_group_ids = self
+            .group_memberships
+            .snapshot()
+            .group_ids()
+            .copied()
+            .collect::<HashSet<_>>();
+        let hosted_groups = transaction
+            .load_replication_groups_for_ids(&hosted_group_ids)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let mut listener_read_token = Self::read_token_from_groups(hosted_groups);
+        if listener_read_token.group_version(&group_id).is_none() {
+            listener_read_token = listener_read_token
+                .with_group_version(group_id, local_group.version_vector.clone());
+        }
         let mut event_batches = Vec::new();
         for ready_update in &apply_plan.ready_chain {
             let applied_batch =
                 apply_one_update_batch(&mut local_group, &mut working_datasets, ready_update)?;
+            listener_read_token = listener_read_token
+                .with_group_version(group_id, local_group.version_vector.clone());
             if !applied_batch.row_changes.is_empty() {
-                event_batches.push(applied_batch.row_changes);
+                event_batches.push(ListenerDataChanges {
+                    read_token: listener_read_token.clone(),
+                    row_changes: applied_batch.row_changes,
+                });
             }
             Self::apply_dataset_row_patches(transaction.as_mut(), applied_batch.row_patches)
                 .await
@@ -1233,29 +1290,32 @@ impl ReplicationRuntimeComponent {
 
     fn handle_publish_changes(
         &mut self,
-        ask: Ask<Vec<RowMutation>, Result<PublishReceipt, ApiError>>,
+        ask: Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>,
     ) -> Handled {
-        let (promise, changes) = ask.take();
+        let (promise, request) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
-            let reply = match async_self.publish_changes_transactionally(changes).await {
+            let reply = match async_self.publish_changes_transactionally(request).await {
                 Ok(prepared_publish) => {
                     let update_id = prepared_publish.update_id;
+                    let read_token = prepared_publish.read_token.clone();
                     async_self.submit_group_update(&prepared_publish);
                     match notify_listener_batches(
                         async_self.listener.clone(),
-                        vec![prepared_publish.row_changes],
+                        vec![ListenerDataChanges {
+                            read_token: read_token.clone(),
+                            row_changes: prepared_publish.row_changes,
+                        }],
                     )
                     .await
                     {
-                        Ok(()) => Ok(PublishReceipt { update_id }),
-                        Err(error) => Err(ApiError::ApiExternal {
-                            source: Box::new(error),
+                        Ok(()) => Ok(PublishReceipt {
+                            update_id,
+                            read_token,
                         }),
+                        Err(error) => Err(error).boxed().context(ApiExternalSnafu),
                     }
                 }
-                Err(error) => Err(ApiError::ApiExternal {
-                    source: Box::new(error),
-                }),
+                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
             };
             async_self.reply_api(promise, "publish_changes", reply);
         })
@@ -1285,9 +1345,7 @@ impl ReplicationRuntimeComponent {
         let (group_id, members, record) = match created_group {
             Ok(created_group) => created_group,
             Err(error) => {
-                let reply = Err(ApiError::ApiExternal {
-                    source: Box::new(error),
-                });
+                let reply = Err(error).boxed().context(ApiExternalSnafu);
                 self.reply_api(promise, "create_group", reply);
                 return Handled::Ok;
             }
@@ -1303,9 +1361,7 @@ impl ReplicationRuntimeComponent {
                     });
                     reply.boxed().context(ApiExternalSnafu)
                 }
-                Err(error) => Err(ApiError::ApiExternal {
-                    source: Box::new(error),
-                }),
+                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
             };
             async_self.reply_api(promise, "create_group", reply);
         })
@@ -1411,7 +1467,7 @@ impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
 impl Require<GroupBroadcastPort> for ReplicationRuntimeComponent {
     fn handle(&mut self, indication: GroupBroadcastPortIndication) -> Handled {
         let GroupBroadcastPortIndication::Deliver(deliver) = indication;
-        match self.handle_group_delivery(deliver) {
+        match self.handle_group_delivery(&deliver) {
             Ok(handled) => handled,
             Err(failure) => {
                 let action = self.record_inbound_failure(&failure);
@@ -1480,18 +1536,19 @@ fn placeholder_signed_footer() -> SignedEnvelopeFooter {
 
 async fn notify_listener_batches(
     listener: Arc<dyn ReplicationEventListener>,
-    event_batches: Vec<Vec<RowChange>>,
+    event_batches: Vec<ListenerDataChanges>,
 ) -> Result<(), InboundDeliveryError> {
-    for row_changes in event_batches {
-        if row_changes.is_empty() {
+    for event_batch in event_batches {
+        if event_batch.row_changes.is_empty() {
             continue;
         }
         listener
             .on_event(ReplicationEvent::DataChanged {
-                rows: Box::new(VecRowProvider::new(row_changes)),
+                read_token: event_batch.read_token,
+                rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
             })
             .await
-            .map_err(|source| InboundDeliveryError::NotifyListener { source })?;
+            .context(inbound::NotifyListenerSnafu)?;
     }
     Ok(())
 }

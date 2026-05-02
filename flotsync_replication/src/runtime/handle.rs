@@ -10,12 +10,12 @@ use crate::api::{
     GroupId,
     GroupMigration,
     LoadError,
+    PublishChangesRequest,
     PublishReceipt,
     ReplicationApi,
     ReplicationConfig,
     ReplicationEventListener,
     ReplicationStore,
-    RowMutation,
     RuntimeSnafu,
     SnapshotRows,
     SnapshotRowsRequest,
@@ -234,9 +234,9 @@ impl Drop for ReplicationRuntime {
 }
 
 impl ReplicationApi for ReplicationRuntime {
-    fn publish_changes(&self, changes: Vec<RowMutation>) -> ApiFuture<'_, PublishReceipt> {
+    fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {
         self.ask(move |promise| {
-            ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, changes))
+            ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, request))
         })
     }
 

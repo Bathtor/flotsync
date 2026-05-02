@@ -96,6 +96,15 @@ pub enum RowOperation<'a, RowId, ChangeId> {
     Delete { row_id: RowId },
 }
 impl<RowId, ChangeId> RowOperation<'_, RowId, ChangeId> {
+    /// Return the row identifier targeted by this operation.
+    pub fn row_id(&self) -> &RowId {
+        match self {
+            RowOperation::Insert { row_id, .. }
+            | RowOperation::Update { row_id, .. }
+            | RowOperation::Delete { row_id } => row_id,
+        }
+    }
+
     pub fn validate_against_schema(&self, schema: &Schema) -> Result<(), SchemaValueError> {
         match self {
             RowOperation::Insert { snapshot, .. } => validate_schema_snapshot(schema, snapshot),

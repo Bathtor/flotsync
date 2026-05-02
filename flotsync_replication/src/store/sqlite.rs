@@ -56,7 +56,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error as StdError,
     num::NonZeroUsize,
     path::Path,
@@ -269,6 +269,14 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
+            .boxed()
+    }
+
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -316,6 +324,14 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         &'a mut self,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
+            .boxed()
     }
 
     fn insert_replication_group<'a>(
@@ -489,6 +505,7 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     row_key TEXT NOT NULL,
     row_snapshot BLOB NOT NULL,
     row_tombstoned INTEGER NOT NULL DEFAULT 0,
+    row_last_changed_versions BLOB NOT NULL,
     PRIMARY KEY (group_id, dataset_id, row_key),
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );
@@ -562,6 +579,43 @@ ORDER BY group_id
     .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
+    let mut groups = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        let group_id = decode_group_id(&group_id)?;
+        if let Some(group) = load_replication_group(connection, &group_id).await? {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
+}
+
+async fn load_replication_groups_for_ids(
+    connection: &mut SqliteStoreConnection,
+    requested_group_ids: &HashSet<GroupId>,
+) -> Result<Vec<ReplicationGroupRecord>, StoreError> {
+    if requested_group_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT group_id
+FROM replication_groups
+WHERE group_id IN (",
+    );
+    {
+        let mut separated = query_builder.separated(", ");
+        for group_id in requested_group_ids {
+            separated.push_bind(group_id.to_string());
+        }
+    }
+    query_builder.push(") ORDER BY group_id");
+
+    let group_ids = query_builder
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
     let mut groups = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
         let group_id = decode_group_id(&group_id)?;
@@ -674,9 +728,10 @@ async fn load_dataset_rows(
         .context(MissingSchemaSnafu {
             dataset_id: dataset_id.clone(),
         })?;
+    let member_count = load_group_member_count(connection, group_id).await?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
-SELECT row_key, row_snapshot, row_tombstoned
+SELECT row_key, row_snapshot, row_tombstoned, row_last_changed_versions
 FROM dataset_rows
 WHERE group_id = ",
     );
@@ -708,6 +763,10 @@ WHERE group_id = ",
                 row_id: row_key,
                 snapshot: row_snapshot,
                 tombstoned: row.get::<bool, _>("row_tombstoned"),
+                last_changed_versions: decode_dataset_row_last_changed_versions(
+                    &row,
+                    member_count,
+                )?,
             }),
         );
     }
@@ -749,9 +808,10 @@ async fn scan_dataset_row_batch(
         .context(MissingSchemaSnafu {
             dataset_id: dataset_id.clone(),
         })?;
+    let member_count = load_group_member_count(connection, group_id).await?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
-SELECT row_key, row_snapshot, row_tombstoned
+SELECT row_key, row_snapshot, row_tombstoned, row_last_changed_versions
 FROM dataset_rows
 WHERE group_id = ",
     );
@@ -781,6 +841,7 @@ WHERE group_id = ",
             row_id: row_key,
             snapshot: row_snapshot,
             tombstoned: row.get::<bool, _>("row_tombstoned"),
+            last_changed_versions: decode_dataset_row_last_changed_versions(&row, member_count)?,
         });
     }
     let next_after = if rows.len() == limit.get() {
@@ -831,11 +892,19 @@ async fn apply_dataset_row_patch(
         let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
         sqlx::query(
             "
-INSERT INTO dataset_rows (group_id, dataset_id, row_key, row_snapshot, row_tombstoned)
-VALUES (?1, ?2, ?3, ?4, ?5)
+INSERT INTO dataset_rows (
+    group_id,
+    dataset_id,
+    row_key,
+    row_snapshot,
+    row_tombstoned,
+    row_last_changed_versions
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ON CONFLICT(group_id, dataset_id, row_key) DO UPDATE
 SET row_snapshot = excluded.row_snapshot,
-    row_tombstoned = excluded.row_tombstoned
+    row_tombstoned = excluded.row_tombstoned,
+    row_last_changed_versions = excluded.row_last_changed_versions
 ",
         )
         .bind(patch.group_id.to_string())
@@ -843,6 +912,7 @@ SET row_snapshot = excluded.row_snapshot,
         .bind(row_key.to_string())
         .bind(row_snapshot)
         .bind(tombstoned)
+        .bind(encode_stored_version_vector(&patch.last_changed_versions))
         .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
@@ -921,7 +991,7 @@ WHERE group_id = ?1
         group_id,
         member_count,
         update_id,
-        row,
+        &row,
     )?))
 }
 
@@ -975,7 +1045,7 @@ ORDER BY update_version, update_node_index
             group_id,
             member_count,
             update_id,
-            row,
+            &row,
         )?);
     }
     Ok(updates)
@@ -1165,6 +1235,16 @@ fn decode_dataset_row_snapshot(
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))
 }
 
+fn decode_dataset_row_last_changed_versions(
+    row: &sqlx::sqlite::SqliteRow,
+    member_count: NonZeroUsize,
+) -> Result<VersionVector, StoreError> {
+    let versions = row
+        .try_get::<Vec<u8>, _>("row_last_changed_versions")
+        .context(SqlxSnafu)?;
+    decode_stored_version_vector(&versions, member_count)
+}
+
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
     encode_version_vector_proto(version_vector)
         .encode_to_bytes()
@@ -1209,7 +1289,7 @@ fn decode_stored_update_row(
     expected_group_id: &GroupId,
     member_count: NonZeroUsize,
     update_id: UpdateId,
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ReplicationUpdateRecord, StoreError> {
     let sender = decode_member_identity(&row.get::<String, _>("sender"))?;
     let applied_locally = row.get::<bool, _>("applied_locally");
@@ -1440,7 +1520,7 @@ mod tests {
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1483,6 +1563,12 @@ mod tests {
         }
     }
 
+    fn sample_last_changed_versions() -> VersionVector {
+        let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
+        version_vector.increment_at(0);
+        version_vector
+    }
+
     fn insert_row_patch(
         group_id: GroupId,
         dataset_id: &DatasetId,
@@ -1499,6 +1585,7 @@ mod tests {
                 row_key,
                 snapshot: snapshot.clone().into_owned(),
             }],
+            last_changed_versions: sample_last_changed_versions(),
         }
     }
 
@@ -1595,6 +1682,7 @@ mod tests {
                 row_id: *row_key,
                 snapshot: snapshot.clone(),
                 tombstoned: false,
+                last_changed_versions: row_patch.last_changed_versions.clone(),
             },
             DatasetRowWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
         };
@@ -1673,6 +1761,55 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_store_loads_replication_groups_by_requested_ids() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let first_group_id = GroupId(Uuid::from_u128(10_001));
+        let second_group_id = GroupId(Uuid::from_u128(10_002));
+        let missing_group_id = GroupId(Uuid::from_u128(10_003));
+        let first_group = sample_group(first_group_id);
+        let second_group = sample_group(second_group_id);
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(first_group))
+            .expect("first group should store");
+        wait_for_store_future(transaction.insert_replication_group(second_group))
+            .expect("second group should store");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let requested_group_ids = HashSet::from([first_group_id, missing_group_id]);
+        let mut write_transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        let loaded_groups = wait_for_store_future(
+            write_transaction.load_replication_groups_for_ids(&requested_group_ids),
+        )
+        .expect("requested groups should load through write transaction");
+        assert_eq!(
+            loaded_groups
+                .iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            vec![first_group_id]
+        );
+        wait_for_store_future(write_transaction.rollback()).expect("rollback should succeed");
+
+        let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
+            .expect("transaction should start");
+        let loaded_groups = wait_for_store_future(
+            read_transaction.load_replication_groups_for_ids(&requested_group_ids),
+        )
+        .expect("requested groups should load through read transaction");
+        assert_eq!(
+            loaded_groups
+                .iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            vec![first_group_id]
+        );
+        wait_for_store_future(read_transaction.rollback()).expect("rollback should succeed");
+    }
+
+    #[test]
     fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
@@ -1708,6 +1845,7 @@ mod tests {
             row_id: row_key,
             snapshot: snapshot.clone().into_owned(),
             tombstoned: true,
+            last_changed_versions: sample_last_changed_versions(),
         };
 
         let mut transaction =
@@ -1721,6 +1859,7 @@ mod tests {
                 row_key,
                 snapshot: stored_row.snapshot.clone(),
             }],
+            last_changed_versions: stored_row.last_changed_versions.clone(),
         }))
         .expect("row patch should store");
         wait_for_store_future(transaction.commit()).expect("commit should succeed");
@@ -1773,6 +1912,7 @@ mod tests {
                     snapshot: title_snapshot(&schema, first_row_key, "first"),
                 },
             ],
+            last_changed_versions: sample_last_changed_versions(),
         }))
         .expect("rows should store");
         wait_for_store_future(transaction.commit()).expect("transaction should commit");
@@ -1826,6 +1966,7 @@ mod tests {
                 row_key,
                 snapshot: tombstone_snapshot,
             }],
+            last_changed_versions: sample_last_changed_versions(),
         }))
         .expect("missing-to-tombstone upsert should store");
 
@@ -1836,6 +1977,7 @@ mod tests {
                 row_key,
                 snapshot: active_snapshot,
             }],
+            last_changed_versions: sample_last_changed_versions(),
         }))
         .expect_err("tombstone-to-active upsert should fail");
         wait_for_store_future(transaction.rollback()).expect("transaction should roll back");

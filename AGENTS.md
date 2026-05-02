@@ -7,7 +7,7 @@
 - Do not run multiple `cargo` instances in parallel! They anyway lock.
 - Inside the sandbox, `cargo test` may run either one explicit test or a broader test selection only when passed `-- --test-threads=1`. Any grouped or repeated multi-threaded `cargo test` run must be executed outside the sandbox.
 - Format Rust code according to `rustfmt.toml`.
-- Keep Rust changes clippy-clean where practical.
+- Keep Rust changes clippy-clean where practical. Use `-W clippy::pedantic` before a change is considered ready for review.
 - Prefer readable control flow over chained iterator side effects.
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - Prefer `context(...)` / `with_context(...)` over manual `map_err(...)` when the target error still wraps the original source. Use `with_context(...)` when building the context captures clones, allocations, or other non-trivial work.

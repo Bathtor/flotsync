@@ -45,6 +45,11 @@ impl GroupMemberships {
         self.groups.get(group_id)
     }
 
+    /// Return the ids of all locally hosted groups in this snapshot.
+    pub fn group_ids(&self) -> impl Iterator<Item = &GroupId> {
+        self.groups.keys()
+    }
+
     /// Replace the membership set for one group inside this snapshot.
     pub fn insert(&mut self, group_id: GroupId, members: GroupMembers) -> Option<GroupMembers> {
         self.groups.insert(group_id, members)

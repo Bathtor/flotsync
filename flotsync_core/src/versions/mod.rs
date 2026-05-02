@@ -291,6 +291,152 @@ mod tests {
     }
 
     #[test]
+    fn with_version_at_preserves_compact_representations_when_possible() {
+        use helpers::*;
+
+        let one_member = NonZeroUsize::new(1).unwrap();
+        let single = VersionVector::Synced {
+            num_members: one_member,
+            version: 4,
+        };
+        assert!(matches!(
+            single.with_version_at(0, 3),
+            VersionVector::Synced { version: 3, .. }
+        ));
+
+        assert!(matches!(
+            sync(4).with_version_at(1, 5),
+            VersionVector::Override { version, .. }
+                if version.group_version() == 4
+                    && version.override_position == 1
+                    && version.override_version() == 5
+        ));
+        assert!(matches!(
+            sync(4).with_version_at(1, 3),
+            VersionVector::Full(PureVersionVector(values)) if values.as_ref() == [4, 3, 4]
+        ));
+
+        assert!(matches!(
+            over(4, (1, 6)).with_version_at(1, 4),
+            VersionVector::Synced { version: 4, .. }
+        ));
+        assert!(matches!(
+            over(4, (1, 6)).with_version_at(2, 4),
+            VersionVector::Override { version, .. }
+                if version.group_version() == 4
+                    && version.override_position == 1
+                    && version.override_version() == 6
+        ));
+        assert!(matches!(
+            over(4, (1, 6)).with_version_at(2, 7),
+            VersionVector::Full(PureVersionVector(values)) if values.as_ref() == [4, 6, 7]
+        ));
+
+        let two_members = NonZeroUsize::new(2).unwrap();
+        let two_member_override = VersionVector::Override {
+            num_members: two_members,
+            version: OverrideVersion::new(4, 0, 6),
+        };
+        assert!(matches!(
+            two_member_override.with_version_at(1, 6),
+            VersionVector::Synced { version: 6, .. }
+        ));
+        assert!(matches!(
+            two_member_override.with_version_at(1, 3),
+            VersionVector::Override { version, .. }
+                if version.group_version() == 3
+                    && version.override_position == 0
+                    && version.override_version() == 6
+        ));
+
+        assert!(matches!(
+            pure([6, 4, 5]).with_version_at(2, 4),
+            VersionVector::Override { version, .. }
+                if version.group_version() == 4
+                    && version.override_position == 0
+                    && version.override_version() == 6
+        ));
+        assert!(matches!(
+            pure([4, 6, 5]).with_version_at(2, 6),
+            VersionVector::Full(PureVersionVector(values)) if values.as_ref() == [4, 6, 6]
+        ));
+    }
+
+    #[test]
+    fn least_upper_bound_and_greatest_lower_bound_use_pointwise_versions() {
+        use helpers::*;
+
+        assert_eq!(sync(2).least_upper_bound(&over(2, (1, 5))), over(2, (1, 5)));
+        assert_eq!(
+            sync(3).greatest_lower_bound(&over(2, (1, 5))),
+            over(2, (1, 3))
+        );
+
+        assert!(matches!(
+            over(1, (0, 3)).least_upper_bound(&over(1, (2, 4))),
+            VersionVector::Full(PureVersionVector(values)) if values.as_ref() == [3, 1, 4]
+        ));
+        assert_eq!(
+            over(1, (0, 3)).greatest_lower_bound(&over(1, (2, 4))),
+            sync(1)
+        );
+
+        assert_eq!(
+            pure([2, 5, 1]).least_upper_bound(&over(3, (2, 4))),
+            pure([3, 5, 4])
+        );
+        assert_eq!(
+            pure([2, 5, 1]).greatest_lower_bound(&over(3, (2, 4))),
+            pure([2, 3, 1])
+        );
+    }
+
+    #[test]
+    fn with_update_applied_sets_the_producer_version() {
+        use helpers::*;
+
+        let update_id = UpdateId {
+            version: 8,
+            node_index: 2,
+        };
+        assert_eq!(sync(4).with_update_applied(update_id), over(4, (2, 8)));
+    }
+
+    #[test]
+    #[should_panic(expected = "different member counts")]
+    fn least_upper_bound_panics_for_incompatible_member_counts() {
+        let two_members = NonZeroUsize::new(2).unwrap();
+        let three_members = NonZeroUsize::new(3).unwrap();
+        let left = VersionVector::Synced {
+            num_members: two_members,
+            version: 1,
+        };
+        let right = VersionVector::Synced {
+            num_members: three_members,
+            version: 1,
+        };
+
+        let _ = left.least_upper_bound(&right);
+    }
+
+    #[test]
+    #[should_panic(expected = "different member counts")]
+    fn greatest_lower_bound_panics_for_incompatible_member_counts() {
+        let two_members = NonZeroUsize::new(2).unwrap();
+        let three_members = NonZeroUsize::new(3).unwrap();
+        let left = VersionVector::Synced {
+            num_members: two_members,
+            version: 1,
+        };
+        let right = VersionVector::Synced {
+            num_members: three_members,
+            version: 1,
+        };
+
+        let _ = left.greatest_lower_bound(&right);
+    }
+
+    #[test]
     fn missing_versions() {
         use helpers::*;
         use maplit::btreemap;
