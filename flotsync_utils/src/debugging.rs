@@ -7,6 +7,10 @@ use std::fmt;
 /// present in the full [[`fmt::Debug`]] format.
 pub trait DebugFormatting {
     /// Same signature and behaviour as [[`std::fmt::Debug::fmt`]];
+    ///
+    /// # Errors
+    ///
+    /// See `fmt::Error` for failure conditions.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error>;
 
     /// Wrap this reference into an instance of [[`DebugFormatter`]],

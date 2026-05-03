@@ -24,7 +24,7 @@ pub mod socket_support;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-/// Common imports for consumers of the flotsync_io API surface.
+/// Common imports for consumers of the `flotsync_io` API surface.
 pub mod prelude {
     pub use crate::{
         api::{

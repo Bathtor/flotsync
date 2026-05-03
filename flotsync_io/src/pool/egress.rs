@@ -62,6 +62,10 @@ impl EgressPool {
     /// Asynchronously reserves enough pooled capacity for a write of `requested_bytes`.
     ///
     /// Requests are granted strictly in FIFO order.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn reserve(&self, requested_bytes: usize) -> Result<PoolRequest<EgressReservation>> {
         if requested_bytes == 0 {
             return Err(Error::InvalidEgressReservationSize { requested_bytes });
@@ -138,6 +142,10 @@ impl EgressPool {
     ///
     /// Non-pooled leases are returned unchanged. Pooled leases must be uniquely owned so the
     /// recycler can be retargeted without affecting other shared readers.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn adopt_lease(&self, mut lease: IoLease) -> Result<IoLease> {
         self.adopt_lease_in_place(&mut lease)?;
         Ok(lease)
@@ -149,6 +157,10 @@ impl EgressPool {
     /// payload slicing as long as each pooled fragment is uniquely owned. Shared pooled fragments
     /// fail with [`Error::SharedIoPayloadOwnership`] unless the payload is already fully owned by
     /// this egress pool, in which case adoption is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn adopt_payload(&self, mut payload: IoPayload) -> Result<IoPayload> {
         self.adopt_payload_in_place(&mut payload)?;
         Ok(payload)
@@ -527,6 +539,14 @@ impl EgressReservation {
     }
 
     /// Convenience helper for copying a byte slice into the reserved pooled memory.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reservation's pooled chunks were already consumed before copying.
     pub fn copy_bytes(mut self, bytes: &[u8]) -> Result<IoLease> {
         if bytes.is_empty() {
             return Err(Error::EmptyIoLease);
@@ -608,6 +628,10 @@ impl EgressAsyncWriter {
     ///
     /// This is intended for serializers that already know an exact size or a hard upper bound and
     /// want to reuse one sync `BufMut` / `Write` implementation without giving up pooled memory.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub async fn write_with_reserved(
         &mut self,
         reserved_bytes: usize,
@@ -638,6 +662,14 @@ impl EgressAsyncWriter {
     ///
     /// This is the only commit point for bytes staged through the writer. Dropping the writer
     /// without calling `finish` discards any unsent staged payload and returns pooled capacity.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if exactly one staged payload part is expected but no part is available.
     pub fn finish(mut self) -> Result<Option<IoPayload>> {
         self.flush_current_part()?;
         Ok(match self.parts.len() {
@@ -670,11 +702,12 @@ impl EgressAsyncWriter {
                 if written == bytes.len() {
                     return Poll::Ready(Ok(written));
                 }
-                continue;
             }
 
             match self.poll_acquire_more(cx) {
-                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Ok(())) => {
+                    // Continue with the newly acquired staged capacity.
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending if written > 0 => return Poll::Ready(Ok(written)),
                 Poll::Pending => return Poll::Pending,
@@ -689,7 +722,9 @@ impl EgressAsyncWriter {
     ) -> Poll<Result<()>> {
         while self.remaining_staged_capacity() < reserved_bytes {
             match self.poll_acquire_more(cx) {
-                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Ok(())) => {
+                    // Continue reserving until the requested synchronous budget is available.
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -754,6 +789,10 @@ impl EgressAsyncWriter {
         }
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "The flush helper shares the Result shape of neighbouring pool operations."
+    )]
     fn flush_current_part(&mut self) -> Result<()> {
         let recycler = LeaseRecycler::Egress(Arc::downgrade(&self.pool.inner));
         if self.written_bytes == 0 {

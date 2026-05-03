@@ -335,11 +335,15 @@ impl UdpRuntimeState {
         clippy::too_many_arguments,
         reason = "driver send handlers take runtime resources explicitly to stay testable"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "UDP send handling validates connection state, target policy, payload size, and event publication together."
+    )]
     pub(super) fn handle_send(
         &mut self,
         socket_id: SocketId,
         transmission_id: TransmissionId,
-        payload: IoPayload,
+        payload: &IoPayload,
         target: Option<SocketAddr>,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
@@ -500,9 +504,7 @@ impl UdpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ReleasedUdpSocket>> {
         loop {
-            let mut ingress_buffer = if let Some(buffer) = ingress_pool.try_acquire()? {
-                buffer
-            } else {
+            let Some(mut ingress_buffer) = ingress_pool.try_acquire()? else {
                 let suspended = self.suspend_read(socket_id, registry);
                 if suspended {
                     event_sink.publish(super::DriverEvent::Udp(UdpEvent::ReadSuspended {
@@ -854,7 +856,7 @@ fn apply_udp_socket_option(socket: &MioUdpSocket, option: UdpSocketOption) -> io
 
 fn send_udp_payload(
     socket: &mut MioUdpSocket,
-    payload: IoPayload,
+    payload: &IoPayload,
     target: UdpSendTarget,
     udp_send_scratch: &mut [u8],
 ) -> io::Result<usize> {
@@ -1413,6 +1415,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "This integration-style test exercises the full suspend/resume UDP read flow."
+    )]
     fn udp_read_suspends_and_resumes_when_ingress_capacity_returns() {
         init_test_logger();
 
@@ -1595,7 +1601,7 @@ mod tests {
             .handle_send(
                 socket_id,
                 transmission_id,
-                IoPayload::Bytes(Bytes::from_static(b"blocked")),
+                &IoPayload::Bytes(Bytes::from_static(b"blocked")),
                 Some(receiver_addr),
                 poll.registry(),
                 &event_sink,
@@ -1631,7 +1637,7 @@ mod tests {
             .handle_send(
                 socket_id,
                 resumed_transmission_id,
-                IoPayload::Bytes(Bytes::from_static(b"resumed")),
+                &IoPayload::Bytes(Bytes::from_static(b"resumed")),
                 Some(receiver_addr),
                 poll.registry(),
                 &event_sink,

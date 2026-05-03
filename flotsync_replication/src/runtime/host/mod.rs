@@ -266,37 +266,37 @@ impl RuntimeTopology {
     }
 
     fn connect_all(&self) -> Result<(), RuntimeHostError> {
-        self.connect_components::<TransportRoutePort, _, _>(
+        Self::connect_components::<TransportRoutePort, _, _>(
             &self.manager,
             &self.ingress,
             "route transport -> ingress",
         )?;
-        self.connect_components::<GroupBroadcastInboundRoutePort, _, _>(
+        Self::connect_components::<GroupBroadcastInboundRoutePort, _, _>(
             &self.ingress,
             &self.group_broadcast,
             "ingress -> group broadcast",
         )?;
-        self.connect_components::<ReliableDeliveryInboundRoutePort, _, _>(
+        Self::connect_components::<ReliableDeliveryInboundRoutePort, _, _>(
             &self.ingress,
             &self.reliable_delivery,
             "ingress -> reliable delivery",
         )?;
-        self.connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+        Self::connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             &self.preconfigured_peer_routes,
             &self.group_broadcast,
             "preconfigured peer routes -> group broadcast",
         )?;
-        self.connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+        Self::connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             &self.preconfigured_peer_routes,
             &self.reliable_delivery,
             "preconfigured peer routes -> reliable delivery",
         )?;
-        self.connect_components::<GroupBroadcastPort, _, _>(
+        Self::connect_components::<GroupBroadcastPort, _, _>(
             &self.group_broadcast,
             &self.runtime_component,
             "group broadcast -> replication runtime",
         )?;
-        self.connect_components::<ReliableDeliveryPort, _, _>(
+        Self::connect_components::<ReliableDeliveryPort, _, _>(
             &self.reliable_delivery,
             &self.runtime_component,
             "reliable delivery -> replication runtime",
@@ -309,8 +309,8 @@ impl RuntimeTopology {
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.start_component(system, &self.driver, "io_driver", control_timeout)?;
-        self.start_component(system, &self.bridge, "io_bridge", control_timeout)?;
+        Self::start_component(system, &self.driver, "io_driver", control_timeout)?;
+        Self::start_component(system, &self.bridge, "io_bridge", control_timeout)?;
         let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
         block_on(udp_connect_handle.connect_udp(&self.manager)).map_err(|error| {
             RuntimeHostError::ConnectUdp {
@@ -327,33 +327,33 @@ impl RuntimeTopology {
                 message: format!("{error:?}"),
             },
         )?;
-        self.start_component(system, &self.manager, "route_transport", control_timeout)?;
-        self.start_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
-        self.start_component(
+        Self::start_component(system, &self.manager, "route_transport", control_timeout)?;
+        Self::start_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
+        Self::start_component(
             system,
             &self.group_broadcast,
             "group_broadcast",
             control_timeout,
         )?;
-        self.start_component(
+        Self::start_component(
             system,
             &self.reliable_delivery,
             "reliable_delivery",
             control_timeout,
         )?;
-        self.start_component(
+        Self::start_component(
             system,
             &self.preconfigured_peer_routes,
             "preconfigured_peer_routes",
             control_timeout,
         )?;
-        self.start_component(
+        Self::start_component(
             system,
             &self.local_endpoint_manager,
             "local_endpoint_manager",
             control_timeout,
         )?;
-        self.start_component(
+        Self::start_component(
             system,
             &self.runtime_component,
             "replication_runtime",
@@ -367,45 +367,44 @@ impl RuntimeTopology {
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.stop_component(
+        Self::stop_component(
             system,
             &self.runtime_component,
             "replication_runtime",
             control_timeout,
         )?;
-        self.stop_component(
+        Self::stop_component(
             system,
             &self.reliable_delivery,
             "reliable_delivery",
             control_timeout,
         )?;
-        self.stop_component(
+        Self::stop_component(
             system,
             &self.group_broadcast,
             "group_broadcast",
             control_timeout,
         )?;
-        self.stop_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
-        self.stop_component(
+        Self::stop_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
+        Self::stop_component(
             system,
             &self.preconfigured_peer_routes,
             "preconfigured_peer_routes",
             control_timeout,
         )?;
-        self.stop_component(
+        Self::stop_component(
             system,
             &self.local_endpoint_manager,
             "local_endpoint_manager",
             control_timeout,
         )?;
-        self.stop_component(system, &self.manager, "route_transport", control_timeout)?;
-        self.stop_component(system, &self.bridge, "io_bridge", control_timeout)?;
-        self.stop_component(system, &self.driver, "io_driver", control_timeout)?;
+        Self::stop_component(system, &self.manager, "route_transport", control_timeout)?;
+        Self::stop_component(system, &self.bridge, "io_bridge", control_timeout)?;
+        Self::stop_component(system, &self.driver, "io_driver", control_timeout)?;
         Ok(())
     }
 
     fn connect_components<P, C1, C2>(
-        &self,
         source: &Arc<Component<C1>>,
         target: &Arc<Component<C2>>,
         link: &'static str,
@@ -425,7 +424,6 @@ impl RuntimeTopology {
     }
 
     fn start_component<C>(
-        &self,
         system: &KompactSystem,
         component: &Arc<Component<C>>,
         name: &'static str,
@@ -444,7 +442,6 @@ impl RuntimeTopology {
     }
 
     fn stop_component<C>(
-        &self,
         system: &KompactSystem,
         component: &Arc<Component<C>>,
         name: &'static str,
@@ -503,7 +500,7 @@ impl DeliveryRuntimeHost {
     /// Start one new delivery runtime host for a single local member.
     #[cfg(test)]
     pub(crate) fn start(
-        local_member: MemberIdentity,
+        local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
     ) -> Result<Self, RuntimeHostError> {
@@ -513,7 +510,7 @@ impl DeliveryRuntimeHost {
     /// Start one new delivery runtime host with an additional in-memory TOML
     /// config fragment merged into the Kompact runtime config.
     pub(crate) fn start_with_runtime_config_toml(
-        local_member: MemberIdentity,
+        local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         runtime_config_toml: Option<&str>,
@@ -528,7 +525,7 @@ impl DeliveryRuntimeHost {
     }
 
     fn start_with_options(
-        local_member: MemberIdentity,
+        local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         runtime_config_toml: Option<&str>,
@@ -543,7 +540,7 @@ impl DeliveryRuntimeHost {
         let topology = RuntimeTopology::build(
             &system,
             &group_memberships,
-            &local_member,
+            local_member,
             store,
             listener,
             host_config.local_endpoint_bind_addr,
@@ -579,7 +576,7 @@ impl DeliveryRuntimeHost {
 
     #[cfg(test)]
     pub(super) fn start_with_route_publish_mode_for_test(
-        local_member: MemberIdentity,
+        local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         runtime_config_toml: Option<&str>,
@@ -676,6 +673,10 @@ impl Drop for DeliveryRuntimeHost {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "The test and production cfg variants share a Result-returning interface."
+)]
 fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
@@ -823,8 +824,8 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             .ask_with(ReplicationRuntimeMessage::test_ping);
         match wait_for_test_reply(future) {
             Ok(()) => {}
-            Err(_) => panic!(
-                "replication runtime component became unavailable during test startup barrier"
+            Err(error) => panic!(
+                "replication runtime component became unavailable during test startup barrier: {error:?}"
             ),
         }
     }

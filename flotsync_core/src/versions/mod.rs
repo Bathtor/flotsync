@@ -1,4 +1,4 @@
-//! The [[VersionVector]] is a variant of a [Version Vector](https://en.wikipedia.org/wiki/Version_vector).
+//! The [[`VersionVector`]] is a variant of a [Version Vector](https://en.wikipedia.org/wiki/Version_vector).
 //! It has entries for the local version at each group member, which may however be collapsed to save space when they are all the same.
 
 mod happened_before;
@@ -46,12 +46,12 @@ mod tests {
             num_members: FOUR_MEMBERS,
             version: 12,
         };
-        assert_eq!(synced_v.to_string(), "〈0-3:12〉".to_string());
+        assert_eq!(synced_v.to_string(), "〈0-3:12〉".to_string());
 
         let override_v_inner = OverrideVersion::with_next_version(12, 2);
         assert_eq!(
             override_v_inner.to_string(),
-            "〈12..., 2:13, 12...〉".to_string()
+            "〈12..., 2:13, 12...〉".to_string()
         );
         let override_v = VersionVector::Override {
             num_members: FOUR_MEMBERS,
@@ -59,13 +59,13 @@ mod tests {
         };
         assert_eq!(
             override_v.to_string(),
-            "〈0-1:12, 2:13, 3-3:12〉".to_string()
+            "〈0-1:12, 2:13, 3-3:12〉".to_string()
         );
 
         let full_v_inner = PureVersionVector::from([12, 13, 12, 11]);
-        assert_eq!(full_v_inner.to_string(), "〈12, 13, 12, 11〉".to_string());
+        assert_eq!(full_v_inner.to_string(), "〈12, 13, 12, 11〉".to_string());
         let full_v = VersionVector::Full(full_v_inner);
-        assert_eq!(full_v.to_string(), "〈12, 13, 12, 11〉".to_string());
+        assert_eq!(full_v.to_string(), "〈12, 13, 12, 11〉".to_string());
     }
 
     #[test]
@@ -89,24 +89,24 @@ mod tests {
         assert_eq!(
             synced_v.to_string(),
             concat!(
-                "〈",
+                "〈",
                 "a.a1 -> 12, ",
                 "b.b2 -> 12, ",
                 "c.c3 -> 12, ",
                 "d.d4 -> 12",
-                "〉"
+                "〉"
             )
             .to_string()
         );
         assert_eq!(
             synced_v.format_line_by_line().to_string(),
             concat!(
-                "〈\n",
+                "〈\n",
                 " a.a1 -> 12,\n",
                 " b.b2 -> 12,\n",
                 " c.c3 -> 12,\n",
                 " d.d4 -> 12\n",
-                "〉"
+                "〉"
             )
             .to_string()
         );
@@ -122,24 +122,24 @@ mod tests {
         assert_eq!(
             override_v.to_string(),
             concat!(
-                "〈",
+                "〈",
                 "a.a1 -> 12, ",
                 "b.b2 -> 12, ",
                 "c.c3 -> 13, ",
                 "d.d4 -> 12",
-                "〉"
+                "〉"
             )
             .to_string()
         );
         assert_eq!(
             override_v.format_line_by_line().to_string(),
             concat!(
-                "〈\n",
+                "〈\n",
                 " a.a1 -> 12,\n",
                 " b.b2 -> 12,\n",
                 " c.c3 -> 13,\n",
                 " d.d4 -> 12\n",
-                "〉"
+                "〉"
             )
             .to_string()
         );
@@ -150,24 +150,24 @@ mod tests {
         assert_eq!(
             full_v.to_string(),
             concat!(
-                "〈",
+                "〈",
                 "a.a1 -> 12, ",
                 "b.b2 -> 13, ",
                 "c.c3 -> 12, ",
                 "d.d4 -> 11",
-                "〉"
+                "〉"
             )
             .to_string()
         );
         assert_eq!(
             full_v.format_line_by_line().to_string(),
             concat!(
-                "〈\n",
+                "〈\n",
                 " a.a1 -> 12,\n",
                 " b.b2 -> 13,\n",
                 " c.c3 -> 12,\n",
                 " d.d4 -> 11\n",
-                "〉"
+                "〉"
             )
             .to_string()
         );
@@ -637,51 +637,51 @@ mod tests {
     proptest! {
         #[test]
         fn version_vector_invariants(v1 in version_vector_strategy(), v2 in version_vector_strategy(), v3 in version_vector_strategy()) {
-            version_vector_invariants_impl(v1, v2, v3)
+            version_vector_invariants_impl(&v1, &v2, &v3);
         }
 
         #[test]
         fn version_vector_equal_size_invariants((v1, v2, v3) in equal_size_version_vector_strategy()) {
-            version_vector_invariants_impl(v1, v2, v3)
+            version_vector_invariants_impl(&v1, &v2, &v3);
         }
     }
-    fn version_vector_invariants_impl(v1: VersionVector, v2: VersionVector, v3: VersionVector) {
-        single_version_vector_invariants_impl(v1.clone());
-        single_version_vector_invariants_impl(v2.clone());
-        single_version_vector_invariants_impl(v3.clone());
-        two_version_vector_invariants_impl(v1.clone(), v2.clone());
-        two_version_vector_invariants_impl(v2.clone(), v3.clone());
-        two_version_vector_invariants_impl(v1.clone(), v3.clone());
+    fn version_vector_invariants_impl(v1: &VersionVector, v2: &VersionVector, v3: &VersionVector) {
+        single_version_vector_invariants_impl(v1);
+        single_version_vector_invariants_impl(v2);
+        single_version_vector_invariants_impl(v3);
+        two_version_vector_invariants_impl(v1, v2);
+        two_version_vector_invariants_impl(v2, v3);
+        two_version_vector_invariants_impl(v1, v3);
 
         // Transitive
         if v1 <= v2 && v2 <= v3 {
             assert!(v1 <= v3);
         }
-        if v1.hb_cmp(&v2) == HappenedBeforeOrdering::Before
-            && v2.hb_cmp(&v3) == HappenedBeforeOrdering::Before
+        if v1.hb_cmp(v2) == HappenedBeforeOrdering::Before
+            && v2.hb_cmp(v3) == HappenedBeforeOrdering::Before
         {
-            assert_eq!(v1.hb_cmp(&v3), HappenedBeforeOrdering::Before);
+            assert_eq!(v1.hb_cmp(v3), HappenedBeforeOrdering::Before);
         }
     }
-    fn single_version_vector_invariants_impl(v: VersionVector) {
+    fn single_version_vector_invariants_impl(v: &VersionVector) {
         // Reflexive
         #[allow(clippy::eq_op)]
         {
             assert_eq!(v, v);
         }
-        assert_eq!(v.hb_cmp(&v), HappenedBeforeOrdering::Equal);
+        assert_eq!(v.hb_cmp(v), HappenedBeforeOrdering::Equal);
 
         // Ensure that we don't overflow, and also we don't run out of memory if we need to expand to a full vector.
         if v.max_version() < u64::MAX - 2 && v.num_members().get() < 100 {
             // Increments
             for pos in 0..v.num_members().get() {
                 let next = v.succ_at(pos);
-                assert!(v < next);
+                assert!(v < &next);
                 assert_eq!(v.hb_cmp(&next), HappenedBeforeOrdering::Before);
-                assert_eq!(next.hb_cmp(&v), HappenedBeforeOrdering::After);
+                assert_eq!(next.hb_cmp(v), HappenedBeforeOrdering::After);
 
                 let next_again = next.succ_at(pos);
-                assert!(v < next_again);
+                assert!(v < &next_again);
                 assert!(next < next_again);
                 assert_eq!(v.hb_cmp(&next_again), HappenedBeforeOrdering::Before);
                 assert_eq!(next.hb_cmp(&next_again), HappenedBeforeOrdering::Before);
@@ -689,14 +689,14 @@ mod tests {
         }
     }
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    fn two_version_vector_invariants_impl(v1: VersionVector, v2: VersionVector) {
+    fn two_version_vector_invariants_impl(v1: &VersionVector, v2: &VersionVector) {
         // v1 == v2 iff v1 =hb= v2
         if v1 == v2 {
-            assert_eq!(v1.hb_cmp(&v2), HappenedBeforeOrdering::Equal);
+            assert_eq!(v1.hb_cmp(v2), HappenedBeforeOrdering::Equal);
         } else {
-            assert_ne!(v1.hb_cmp(&v2), HappenedBeforeOrdering::Equal);
+            assert_ne!(v1.hb_cmp(v2), HappenedBeforeOrdering::Equal);
         }
-        if v1.hb_cmp(&v2) == HappenedBeforeOrdering::Equal {
+        if v1.hb_cmp(v2) == HappenedBeforeOrdering::Equal {
             assert_eq!(v1, v2);
         } else {
             assert_ne!(v1, v2);
@@ -704,35 +704,35 @@ mod tests {
 
         // v1 < v2 iff v1 -> v2
         if v1 < v2 {
-            assert_eq!(v1.hb_cmp(&v2), HappenedBeforeOrdering::Before);
+            assert_eq!(v1.hb_cmp(v2), HappenedBeforeOrdering::Before);
         } else {
-            assert_ne!(v1.hb_cmp(&v2), HappenedBeforeOrdering::Before);
+            assert_ne!(v1.hb_cmp(v2), HappenedBeforeOrdering::Before);
         }
-        if v1.hb_cmp(&v2) == HappenedBeforeOrdering::Before {
+        if v1.hb_cmp(v2) == HappenedBeforeOrdering::Before {
             assert!(v1 < v2);
         } else {
             assert!(!(v1 < v2));
         }
         // v1 > v2 iff v2 -> v1
         if v1 > v2 {
-            assert_eq!(v1.hb_cmp(&v2), HappenedBeforeOrdering::After);
+            assert_eq!(v1.hb_cmp(v2), HappenedBeforeOrdering::After);
         } else {
-            assert_ne!(v1.hb_cmp(&v2), HappenedBeforeOrdering::After);
+            assert_ne!(v1.hb_cmp(v2), HappenedBeforeOrdering::After);
         }
-        if v1.hb_cmp(&v2) == HappenedBeforeOrdering::After {
+        if v1.hb_cmp(v2) == HappenedBeforeOrdering::After {
             assert!(v1 > v2);
         } else {
             assert!(!(v1 > v2));
         }
 
         // Antisymmetry.
-        assert_eq!(v1.hb_cmp(&v2), v2.hb_cmp(&v1).reverse());
+        assert_eq!(v1.hb_cmp(v2), v2.hb_cmp(v1).reverse());
     }
 
     proptest! {
         #[test]
         fn single_override_version_compare(v in 0u64..LARGE_VERSION) {
-            single_override_version_compare_impl(v)
+            single_override_version_compare_impl(v);
         }
     }
     fn single_override_version_compare_impl(v: u64) {
@@ -747,7 +747,7 @@ mod tests {
     proptest! {
         #[test]
         fn two_override_version_compare(v1 in 0u64..u64::MAX, v2 in 0u64..LARGE_VERSION) {
-            two_override_version_compare_impl(v1, v2)
+            two_override_version_compare_impl(v1, v2);
         }
     }
     fn two_override_version_compare_impl(v1: u64, v2: u64) {

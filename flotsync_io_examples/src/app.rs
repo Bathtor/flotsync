@@ -42,7 +42,7 @@ impl RuntimeConfigArgs {
 /// runtime and own the actual UDP/TCP interaction logic.
 pub struct ExampleRuntime {
     system: KompactSystem,
-    _driver_component: Arc<Component<IoDriverComponent>>,
+    driver_component: Arc<Component<IoDriverComponent>>,
     bridge_component: Arc<Component<IoBridge>>,
     bridge_handle: IoBridgeHandle,
 }
@@ -52,6 +52,10 @@ impl ExampleRuntime {
     ///
     /// This only constructs the shared runtime graph. Startup is deferred until the example has
     /// created and wired its transport-specific netcat component.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn setup(runtime_config: &RuntimeConfigArgs) -> Result<Self> {
         init_logging();
 
@@ -68,7 +72,7 @@ impl ExampleRuntime {
 
         Ok(Self {
             system,
-            _driver_component: driver_component,
+            driver_component,
             bridge_component,
             bridge_handle,
         })
@@ -89,7 +93,7 @@ impl ExampleRuntime {
     /// Returns the shared driver component.
     #[must_use]
     pub fn driver_component(&self) -> &Arc<Component<IoDriverComponent>> {
-        &self._driver_component
+        &self.driver_component
     }
 
     /// Returns the control handle for the shared bridge.
@@ -99,16 +103,20 @@ impl ExampleRuntime {
     }
 
     /// Shuts the example runtime down cleanly.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn shutdown(self) -> Result<()> {
         let Self {
             system,
-            _driver_component,
+            driver_component,
             bridge_component,
             bridge_handle,
         } = self;
         drop(bridge_handle);
         drop(bridge_component);
-        drop(_driver_component);
+        drop(driver_component);
 
         match system.shutdown() {
             Ok(()) => Ok(()),

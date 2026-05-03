@@ -1,4 +1,4 @@
-//! UDPour protocol and state machines.
+//! `UDPour` protocol and state machines.
 //!
 //! This crate implements one small multipart protocol for carrying one logical
 //! payload over one UDP route when that payload does not fit into a single

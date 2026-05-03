@@ -891,6 +891,10 @@ impl ReplicationRuntimeComponent {
     }
 
     /// Publish one local change batch through one durable store transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The transactional publish flow is kept together so store writes, listener notifications, and rollback boundaries stay visible."
+    )]
     async fn publish_changes_transactionally(
         &mut self,
         request: PublishChangesRequest,
@@ -1103,6 +1107,10 @@ impl ReplicationRuntimeComponent {
 
     /// Persist one inbound update and apply every newly-ready successor inside
     /// the same store transaction.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The inbound transaction is intentionally linear to keep causality checks and rollback handling auditable."
+    )]
     async fn persist_and_apply_update_batch(
         &mut self,
         sender: MemberIdentity,
@@ -1159,8 +1167,8 @@ impl ReplicationRuntimeComponent {
             ensure!(
                 existing_update == inbound_update,
                 inbound::ConflictingPersistedUpdateSnafu {
-                    group_id,
-                    update_id: inbound_update.update_id,
+                    group: group_id,
+                    update: inbound_update.update_id,
                 }
             );
         } else {
@@ -1415,6 +1423,10 @@ impl ReplicationRuntimeComponent {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::unused_self,
+        reason = "Kompact test messages use the same component method shape as production handlers."
+    )]
     fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> Handled {
         let (promise, ()) = ask.take();
         let _ = promise.fulfil(());
@@ -1595,8 +1607,8 @@ mod tests {
         );
         assert_eq!(
             InboundDeliveryError::ConflictingPersistedUpdate {
-                group_id,
-                update_id,
+                group: group_id,
+                update: update_id,
             }
             .failure_action(),
             InboundFailureAction::Drop

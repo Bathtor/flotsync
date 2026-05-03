@@ -125,6 +125,10 @@ struct ShutdownTimerState {
 }
 
 /// Runs the netcat-style example according to `args`.
+///
+/// # Errors
+///
+/// See `Error` for failure conditions.
 pub fn run(args: NetcatArgs) -> Result<()> {
     let runtime = ExampleRuntime::setup(&args.runtime)?;
     let run_result = match args.mode {

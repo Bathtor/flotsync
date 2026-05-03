@@ -202,9 +202,8 @@ fn modify_row_linear_list_emits_targeted_diff_operations() {
         OperationOutcome::NoChanges => panic!("expected an update operation"),
     };
 
-    let fields = match update.operation {
-        RowOperation::Update { fields, .. } => fields,
-        _ => panic!("expected row update operation"),
+    let RowOperation::Update { fields, .. } = update.operation else {
+        panic!("expected row update operation");
     };
     assert_eq!(fields.len(), 1);
 
@@ -212,9 +211,8 @@ fn modify_row_linear_list_emits_targeted_diff_operations() {
         .iter()
         .find(|field| field.field_name.as_ref() == "numbers")
         .expect("numbers field should be present");
-    let operations = match &numbers_field.value {
-        OperationValue::LinearList(operations) => operations,
-        _ => panic!("numbers field should contain a linear list operation"),
+    let OperationValue::LinearList(operations) = &numbers_field.value else {
+        panic!("numbers field should contain a linear list operation");
     };
 
     assert_eq!(operations.len(), 2);

@@ -69,6 +69,14 @@ pub struct ReplicatedChecklistArgs {
 }
 
 /// Run one configured replicated checklist REPL.
+///
+/// # Errors
+///
+/// See `ReplicatedChecklistError` for failure conditions.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Example entry points consume parsed CLI argument structs."
+)]
 pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError> {
     let config = ChecklistAppConfig::load(&args.config).context(repl_error::ConfigSnafu)?;
     ensure_store_parent_exists(&config.store_path)?;
@@ -247,6 +255,10 @@ impl ChecklistRepl {
         }
     }
 
+    #[allow(
+        clippy::needless_continue,
+        reason = "The REPL loop uses explicit continues to make command-processing outcomes obvious."
+    )]
     fn run(&mut self) -> Result<(), ReplicatedChecklistError> {
         println!("replicated checklist group {}", self.config.group_id);
         println!("type 'help' for commands");
@@ -653,6 +665,10 @@ fn ensure_store_parent_exists(path: &Path) -> Result<(), ReplicatedChecklistErro
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Parsed command words are consumed when building checklist item text."
+)]
 fn join_words(words: Vec<String>) -> String {
     words.join(" ")
 }

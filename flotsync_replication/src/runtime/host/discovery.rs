@@ -21,6 +21,7 @@ use kompact::{
     prelude::*,
 };
 use std::{
+    fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
 };
@@ -223,20 +224,20 @@ impl PreconfiguredPeerRoutesConfig {
             if is_missing_path(&error) {
                 return Ok(Self { routes: Vec::new() });
             }
-            return Err(invalid_static_routes_config(error));
+            return Err(invalid_static_routes_config(&error));
         }
 
         let mut routes = Vec::new();
         // TODO(flotsync-6in): Replace this index probing once Kompact exposes
         // selected config arrays as a slice or iterator.
         for index in 0.. {
-            let route_lookup = routes_lookup.get_index(index);
-            match route_lookup.value() {
+            let route_entry_lookup = routes_lookup.get_index(index);
+            match route_entry_lookup.value() {
                 Ok(_) => {
-                    routes.push(parse_peer_route(route_lookup, index)?);
+                    routes.push(parse_peer_route(route_entry_lookup, index)?);
                 }
                 Err(error) if is_missing_path(&error) => break,
-                Err(error) => return Err(invalid_static_routes_config(error)),
+                Err(error) => return Err(invalid_static_routes_config(&error)),
             }
         }
 
@@ -297,11 +298,11 @@ fn parse_peer_route(
     let ip = read_route_string(route_lookup, index, "ip")?
         .parse::<IpAddr>()
         .map_err(|error| {
-            invalid_static_routes_config(format!("route[{index}].ip is invalid: {error}"))
+            invalid_static_routes_config(&format!("route[{index}].ip is invalid: {error}"))
         })?;
     let port = read_route_port(route_lookup, index)?;
     let peer = MemberIdentity::from_str(&name).map_err(|error| {
-        invalid_static_routes_config(format!("route[{index}].name is invalid: {error}"))
+        invalid_static_routes_config(&format!("route[{index}].name is invalid: {error}"))
     })?;
 
     match protocol {
@@ -324,7 +325,7 @@ impl StaticPeerRouteProtocol {
             .copied()
             .find(|protocol| protocol.as_str() == value)
             .ok_or_else(|| {
-                invalid_static_routes_config(format!(
+                invalid_static_routes_config(&format!(
                     "route[{index}].protocol {value:?} is unsupported; supported protocols are: {}",
                     supported_static_route_protocols()
                 ))
@@ -346,7 +347,7 @@ fn read_route_string(
     route_lookup
         .get(field)
         .as_string()
-        .map_err(|error| invalid_static_routes_config(format!("route[{index}].{field}: {error}")))
+        .map_err(|error| invalid_static_routes_config(&format!("route[{index}].{field}: {error}")))
 }
 
 fn supported_static_route_protocols() -> String {
@@ -364,21 +365,25 @@ fn read_route_port(
     let port = route_lookup
         .get("port")
         .as_i64()
-        .map_err(|error| invalid_static_routes_config(format!("route[{index}].port: {error}")))?;
+        .map_err(|error| invalid_static_routes_config(&format!("route[{index}].port: {error}")))?;
     if !(1..=i64::from(u16::MAX)).contains(&port) {
-        return Err(invalid_static_routes_config(format!(
+        return Err(invalid_static_routes_config(&format!(
             "route[{index}].port must be between 1 and {}, got {port}",
             u16::MAX
         )));
     }
-    Ok(port as u16)
+    u16::try_from(port).map_err(|error| {
+        invalid_static_routes_config(&format!(
+            "route[{index}].port passed range validation but could not be converted: {error}"
+        ))
+    })
 }
 
 fn is_missing_path(error: &ConfigError) -> bool {
     matches!(error, ConfigError::PathError(path) if path.is_missing())
 }
 
-fn invalid_static_routes_config(message: impl ToString) -> RuntimeHostError {
+fn invalid_static_routes_config(message: &dyn fmt::Display) -> RuntimeHostError {
     RuntimeHostError::InvalidConfig {
         key: STATIC_PEER_ROUTES_KEY,
         message: message.to_string(),

@@ -6,7 +6,12 @@ use flotsync_utils::IString;
 use itertools::Itertools;
 use regex::Regex;
 use snafu::prelude::*;
-use std::{fmt, str::FromStr, sync::LazyLock};
+use std::{
+    convert::{AsRef, Into},
+    fmt,
+    str::FromStr,
+    sync::LazyLock,
+};
 use uuid::Uuid;
 
 pub type IdentifierSegment = IString;
@@ -74,20 +79,24 @@ impl Identifier {
         self.segments.iter()
     }
 
+    #[must_use]
     pub(crate) fn from_segments_unchecked(segments: Box<[IdentifierSegment]>) -> Self {
         Self { segments }
     }
 
     /// An identifier with the given `segments` as components, if they are all legal segments.
     ///
+    /// # Errors
+    ///
     /// Otherwise the errors indicate all the segments with illegal characters.
+    /// See `Errors<IdentifierError>` for failure conditions.
     pub fn try_from_array<I, const N: usize>(
         segments: [I; N],
     ) -> Result<Self, Errors<IdentifierError>>
     where
         I: Into<IdentifierSegment>,
     {
-        let id_segments = Box::new(segments.map(|i| i.into()));
+        let id_segments = Box::new(segments.map(Into::into));
         id_segments
             .iter()
             .ensure_for_all(check_that_contains_only_legal_chars)?;
@@ -98,7 +107,10 @@ impl Identifier {
 
     /// An identifier with the given `segments` as components.
     ///
+    /// # Panics
+    ///
     /// Panics if it encounters illegal characters in any segment.
+    #[must_use]
     pub fn from_array<I, const N: usize>(segments: [I; N]) -> Self
     where
         I: Into<IdentifierSegment>,
@@ -119,11 +131,13 @@ impl Identifier {
     /// An identifier with the given `segments` as components.
     ///
     /// Uses the string representation of the [[Uuid]], which is always legal, so this never panics.
+    #[must_use]
     pub fn from_uuid_array<const N: usize>(segments: [Uuid; N]) -> Self {
         Self::from_uuid_array_with_encoding(segments, UuidEncoding::Hyphenated)
     }
 
     /// An identifier with the given `segments` as components encoded using `encoding`.
+    #[must_use]
     pub fn from_uuid_array_with_encoding<const N: usize>(
         segments: [Uuid; N],
         encoding: UuidEncoding,
@@ -136,28 +150,41 @@ impl Identifier {
 
     /// Decode all identifier segments as UUIDs, inferring a single shared encoding from the first
     /// segment's shape.
+    ///
+    /// # Errors
+    ///
+    /// See `IdentifierUuidDecodeError` for failure conditions.
     pub fn decode_uuid_segments(&self) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
-        decode_uuid_segments(self.segments_iter().map(|segment| segment.as_ref()))
+        decode_uuid_segments(self.segments_iter().map(AsRef::as_ref))
     }
 
     /// Decode all identifier segments as UUIDs using the provided encoding.
+    ///
+    /// # Errors
+    ///
+    /// See `IdentifierUuidDecodeError` for failure conditions.
     pub fn decode_uuid_segments_with_encoding(
         &self,
         encoding: UuidEncoding,
     ) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
-        decode_uuid_segments_with_encoding(
-            self.segments_iter().map(|segment| segment.as_ref()),
-            encoding,
-        )
+        decode_uuid_segments_with_encoding(self.segments_iter().map(AsRef::as_ref), encoding)
     }
 
     /// Parse a textual identifier and decode all segments as UUIDs, inferring one shared encoding.
+    ///
+    /// # Errors
+    ///
+    /// See `IdentifierUuidDecodeError` for failure conditions.
     pub fn parse_uuid_segments(input: &str) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
         let segments = split_identifier_text(input)?;
         decode_uuid_segments(segments)
     }
 
     /// Parse a textual identifier and decode all segments as UUIDs using `encoding`.
+    ///
+    /// # Errors
+    ///
+    /// See `IdentifierUuidDecodeError` for failure conditions.
     pub fn parse_uuid_segments_with_encoding(
         input: &str,
         encoding: UuidEncoding,
@@ -167,6 +194,7 @@ impl Identifier {
     }
 
     /// Clone this immutable identifier into a mutable buffer.
+    #[must_use]
     pub fn to_buf(&self) -> IdentifierBuf {
         IdentifierBuf {
             segments: self.segments.to_vec(),
@@ -174,6 +202,7 @@ impl Identifier {
     }
 
     /// Convert this immutable identifier into a mutable buffer.
+    #[must_use]
     pub fn into_buf(self) -> IdentifierBuf {
         IdentifierBuf {
             segments: self.segments.into_vec(),
@@ -217,6 +246,7 @@ pub struct IdentifierBuf {
 }
 
 impl IdentifierBuf {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             segments: Vec::new(),
@@ -228,6 +258,7 @@ impl IdentifierBuf {
         segments: Vec::new(),
     };
 
+    #[must_use]
     pub fn into_identifier(self) -> Identifier {
         Identifier::from_segments_unchecked(self.segments.into_boxed_slice())
     }
@@ -243,14 +274,17 @@ impl IdentifierBuf {
     /// An identifier buffer with the given `segments` as components, if they are all legal
     /// segments.
     ///
+    /// # Errors
+    ///
     /// Otherwise the errors indicate all the segments with illegal characters.
+    /// See `Errors<IdentifierError>` for failure conditions.
     pub fn try_from_array<I, const N: usize>(
         segments: [I; N],
     ) -> Result<Self, Errors<IdentifierError>>
     where
         I: Into<IdentifierSegment>,
     {
-        let id_segments = segments.into_iter().map(|i| i.into()).collect_vec();
+        let id_segments = segments.into_iter().map(Into::into).collect_vec();
         id_segments
             .iter()
             .ensure_for_all(check_that_contains_only_legal_chars)?;
@@ -261,7 +295,10 @@ impl IdentifierBuf {
 
     /// An identifier buffer with the given `segments` as components.
     ///
+    /// # Panics
+    ///
     /// Panics if it encounters illegal characters in any segment.
+    #[must_use]
     pub fn from_array<I, const N: usize>(segments: [I; N]) -> Self
     where
         I: Into<IdentifierSegment>,
@@ -286,11 +323,13 @@ impl IdentifierBuf {
     ///
     /// Uses the string representation of the [[Uuid]], which is always legal, so this never
     /// panics.
+    #[must_use]
     pub fn from_uuid_array<const N: usize>(segments: [Uuid; N]) -> Self {
         Self::from_uuid_array_with_encoding(segments, UuidEncoding::Hyphenated)
     }
 
     /// An identifier buffer with the given `segments` as components encoded using `encoding`.
+    #[must_use]
     pub fn from_uuid_array_with_encoding<const N: usize>(
         segments: [Uuid; N],
         encoding: UuidEncoding,
@@ -305,6 +344,8 @@ impl IdentifierBuf {
     }
 
     /// Extend this identifier buffer by adding a new segment to the end.
+    ///
+    /// # Panics
     ///
     /// Panics if `segment` contains illegal characters.
     pub fn push<I>(&mut self, segment: I)
@@ -322,7 +363,10 @@ impl IdentifierBuf {
     /// Extend this identifier buffer by adding a new `segment` to the end, if it is legal as a
     /// segment.
     ///
+    /// # Errors
+    ///
     /// Otherwise returns the input in the error.
+    /// See `IdentifierError` for failure conditions.
     pub fn push_checked<I>(&mut self, segment: I) -> Result<(), IdentifierError>
     where
         I: Into<IdentifierSegment>,
@@ -363,7 +407,7 @@ where
             );
             s
         });
-        self.segments.extend(id_segments)
+        self.segments.extend(id_segments);
     }
 }
 
@@ -592,18 +636,18 @@ mod tests {
 
     #[test]
     fn segments() {
-        assert_matches!(check_that_contains_only_legal_chars("asimpleid"), Ok(_));
-        assert_matches!(check_that_contains_only_legal_chars("a-simple-id"), Ok(_));
-        assert_matches!(check_that_contains_only_legal_chars("a:simple:id"), Ok(_));
+        assert_matches!(check_that_contains_only_legal_chars("asimpleid"), Ok(()));
+        assert_matches!(check_that_contains_only_legal_chars("a-simple-id"), Ok(()));
+        assert_matches!(check_that_contains_only_legal_chars("a:simple:id"), Ok(()));
 
-        assert_matches!(check_that_contains_only_legal_chars("a0simple1id2"), Ok(_));
+        assert_matches!(check_that_contains_only_legal_chars("a0simple1id2"), Ok(()));
         assert_matches!(
             check_that_contains_only_legal_chars("a-0-simple-1-id-2"),
-            Ok(_)
+            Ok(())
         );
         assert_matches!(
             check_that_contains_only_legal_chars("a:0:simple:1:id:2"),
-            Ok(_)
+            Ok(())
         );
 
         assert_matches!(check_that_contains_only_legal_chars(""), Err(_));
@@ -614,7 +658,7 @@ mod tests {
     proptest! {
         #[test]
         fn legal_segments(segment in "[a-zA-Z0-9:_-]+") {
-            assert_matches!(check_that_contains_only_legal_chars(segment), Ok(_));
+            assert_matches!(check_that_contains_only_legal_chars(segment), Ok(()));
         }
     }
 

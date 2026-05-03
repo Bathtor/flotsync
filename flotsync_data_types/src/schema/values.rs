@@ -23,6 +23,10 @@ pub enum PrimitiveValueArray {
 }
 impl PrimitiveValueArray {
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Each variant wraps a different Vec element type, so the length arms cannot be combined type-safely."
+    )]
     pub fn len(&self) -> usize {
         match self {
             Self::String(values) => values.len(),
@@ -110,6 +114,10 @@ impl PrimitiveValue {
     }
 
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants carry different shapes but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         self.as_ref().primitive_type()
     }
@@ -125,7 +133,7 @@ macro_rules! impl_primitive_value_from_signed {
         $(
             impl From<$ty> for PrimitiveValue {
                 fn from(value: $ty) -> Self {
-                    Self::Int(value as i64)
+                    Self::Int(i64::from(value))
                 }
             }
         )*
@@ -137,7 +145,7 @@ macro_rules! impl_primitive_value_from_unsigned {
         $(
             impl From<$ty> for PrimitiveValue {
                 fn from(value: $ty) -> Self {
-                    Self::UInt(value as u64)
+                    Self::UInt(u64::from(value))
                 }
             }
         )*
@@ -168,8 +176,32 @@ impl From<u8> for PrimitiveValue {
     }
 }
 
-impl_primitive_value_from_unsigned!(u16, u32, u64, usize);
-impl_primitive_value_from_signed!(i8, i16, i32, i64, isize);
+impl_primitive_value_from_unsigned!(u16, u32);
+impl_primitive_value_from_signed!(i8, i16, i32);
+
+impl From<u64> for PrimitiveValue {
+    fn from(value: u64) -> Self {
+        Self::UInt(value)
+    }
+}
+
+impl From<usize> for PrimitiveValue {
+    fn from(value: usize) -> Self {
+        Self::UInt(value as u64)
+    }
+}
+
+impl From<i64> for PrimitiveValue {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<isize> for PrimitiveValue {
+    fn from(value: isize) -> Self {
+        Self::Int(value as i64)
+    }
+}
 
 impl From<f64> for PrimitiveValue {
     fn from(value: f64) -> Self {
@@ -210,6 +242,10 @@ pub enum PrimitiveValueRef<'a> {
 }
 impl PrimitiveValueRef<'_> {
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store values in different fields but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::String(_) => PrimitiveType::String,
@@ -346,7 +382,7 @@ macro_rules! impl_ordered_value_from_signed {
         $(
             impl From<$ty> for OrderedValue {
                 fn from(value: $ty) -> Self {
-                    Self::Value(PrimitiveValue::Int(value as i64))
+                    Self::Value(PrimitiveValue::Int(i64::from(value)))
                 }
             }
         )*
@@ -358,15 +394,39 @@ macro_rules! impl_ordered_value_from_unsigned {
         $(
             impl From<$ty> for OrderedValue {
                 fn from(value: $ty) -> Self {
-                    Self::Value(PrimitiveValue::UInt(value as u64))
+                    Self::Value(PrimitiveValue::UInt(u64::from(value)))
                 }
             }
         )*
     };
 }
 
-impl_ordered_value_from_unsigned!(u16, u32, u64, usize);
-impl_ordered_value_from_signed!(i8, i16, i32, i64, isize);
+impl_ordered_value_from_unsigned!(u16, u32);
+impl_ordered_value_from_signed!(i8, i16, i32);
+
+impl From<u64> for OrderedValue {
+    fn from(value: u64) -> Self {
+        Self::Value(PrimitiveValue::UInt(value))
+    }
+}
+
+impl From<usize> for OrderedValue {
+    fn from(value: usize) -> Self {
+        Self::Value(PrimitiveValue::UInt(value as u64))
+    }
+}
+
+impl From<i64> for OrderedValue {
+    fn from(value: i64) -> Self {
+        Self::Value(PrimitiveValue::Int(value))
+    }
+}
+
+impl From<isize> for OrderedValue {
+    fn from(value: isize) -> Self {
+        Self::Value(PrimitiveValue::Int(value as i64))
+    }
+}
 
 impl From<f64> for OrderedValue {
     fn from(value: f64) -> Self {
@@ -442,6 +502,9 @@ pub enum NullablePrimitiveValueArray {
     },
 }
 impl NullablePrimitiveValueArray {
+    /// # Errors
+    ///
+    /// See `OrderedValueError` for failure conditions.
     pub fn ordered<I, V>(states: I) -> Result<Self, OrderedValueError>
     where
         I: IntoIterator<Item = V>,
@@ -505,6 +568,10 @@ impl NullablePrimitiveValueArray {
     }
 
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store values in different fields but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::NonNull(values) => values.primitive_type(),
@@ -518,6 +585,10 @@ impl NullablePrimitiveValueArray {
     }
 
     #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store their values in different fields but count them identically."
+    )]
     pub fn value_count(&self) -> usize {
         match self {
             Self::NonNull(values) => values.len(),
@@ -710,6 +781,10 @@ fn fmt_primitive_value_from_array(
     }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "Display-compatible variants have distinct payload types, so combining arms would obscure type handling."
+)]
 fn fmt_primitive_value(value: &PrimitiveValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match value {
         PrimitiveValue::String(value) => fmt_single_quoted_string(value, f),

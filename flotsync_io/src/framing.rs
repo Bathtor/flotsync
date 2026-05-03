@@ -63,6 +63,10 @@ impl BoundedCollector {
     /// full buffered frame. This lets callers continue processing trailing bytes from the same
     /// payload without reparsing the frame. The collector does not reset itself automatically
     /// after completion; call [`BoundedCollector::clear`] before reusing it for the next frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
     pub fn push_until<'a>(&'a mut self, chunk: &[u8], delimiter: &[u8]) -> CollectUntil<'a> {
         assert!(
             !delimiter.is_empty(),

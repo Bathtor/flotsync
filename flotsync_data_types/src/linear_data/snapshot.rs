@@ -80,14 +80,23 @@ where
 pub trait SnapshotSink<Id, Value: ?Sized> {
     type Error;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn node(
         &mut self,
         index: usize,
         node: SnapshotNodeRef<'_, Id, Value>,
     ) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -224,6 +233,10 @@ pub(crate) mod bytes_testkit {
         pub nodes: Vec<ParsedNode>,
     }
     #[derive(Debug)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "The test snapshot parser mirrors compact wire flags as independent booleans."
+    )]
     pub struct ParsedNode {
         pub index: usize,
         pub has_left: bool,
@@ -232,7 +245,7 @@ pub(crate) mod bytes_testkit {
         pub deleted: bool,
     }
 
-    pub fn assert_node_invariants(parsed: ParsedSnapshot) {
+    pub fn assert_node_invariants(parsed: &ParsedSnapshot) {
         assert_eq!(parsed.node_count, parsed.nodes.len());
         assert!(
             parsed.node_count >= 2,
@@ -413,7 +426,8 @@ pub(crate) mod bytes_testkit {
 
     pub fn encode_vec_i32(value: &[i32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + value.len() * 4);
-        out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        let value_len = u32::try_from(value.len()).expect("test vector payload too large");
+        out.extend_from_slice(&value_len.to_le_bytes());
         for element in value {
             out.extend_from_slice(&element.to_le_bytes());
         }
@@ -442,6 +456,10 @@ pub(crate) mod bytes_testkit {
         String::from_utf8(bytes.to_vec()).map_err(|_| "invalid utf8 value payload".to_owned())
     }
 
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Snapshot test encoders are passed as `Fn(&Id)` callbacks."
+    )]
     pub fn encode_u32(value: &u32) -> Vec<u8> {
         value.to_le_bytes().to_vec()
     }
@@ -453,6 +471,10 @@ pub(crate) mod bytes_testkit {
         Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Snapshot test encoders are passed as `Fn(&Value)` callbacks."
+    )]
     pub fn encode_u64(value: &u64) -> Vec<u8> {
         value.to_le_bytes().to_vec()
     }
@@ -487,7 +509,7 @@ mod tests {
         let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
         assert!(parsed.nodes.iter().any(|n| n.deleted));
 
-        assert_node_invariants(parsed);
+        assert_node_invariants(&parsed);
     }
 
     #[test]
@@ -502,7 +524,7 @@ mod tests {
         let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
         assert!(parsed.nodes.iter().any(|n| n.deleted));
 
-        assert_node_invariants(parsed);
+        assert_node_invariants(&parsed);
     }
 
     #[test]
@@ -517,7 +539,7 @@ mod tests {
         let parsed = parse_snapshot_shape(sink.into_bytes()).unwrap();
         assert!(parsed.nodes.iter().all(|n| !n.deleted));
 
-        assert_node_invariants(parsed);
+        assert_node_invariants(&parsed);
     }
 
     #[test]

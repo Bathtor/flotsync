@@ -1,6 +1,11 @@
 use crate::{
     buffa::{EnumValue, MessageField},
-    codecs::datamodel::{CodecError, decode_nullable_basic_value, encode_nullable_basic_value},
+    codecs::datamodel::{
+        CodecError,
+        decode_date as decode_datamodel_date,
+        decode_nullable_basic_value,
+        encode_nullable_basic_value,
+    },
     datamodel as proto,
 };
 use flotsync_data_types::{
@@ -117,8 +122,20 @@ pub enum SchemaCodecError {
         source: FieldValueBuildError,
     },
 }
+impl SchemaCodecError {
+    fn from_datamodel_date_error(error: CodecError) -> Self {
+        match error {
+            CodecError::InvalidDate { year, month, day } => Self::InvalidDate { year, month, day },
+            source => Self::Codec { source },
+        }
+    }
+}
 
 /// Encode a `Schema` into its protobuf schema transport form.
+///
+/// # Errors
+///
+/// See `SchemaCodecError` for failure conditions.
 pub fn encode_schema_definition(schema: &Schema) -> SchemaResult<proto::SchemaDefinition> {
     let mut encoded = proto::SchemaDefinition::default();
     let mut fields = schema.columns.values().collect::<Vec<_>>();
@@ -127,11 +144,15 @@ pub fn encode_schema_definition(schema: &Schema) -> SchemaResult<proto::SchemaDe
         .into_iter()
         .map(encode_field_definition)
         .try_collect()?;
-    encoded.metadata = schema.metadata.clone();
+    encoded.metadata.clone_from(&schema.metadata);
     Ok(encoded)
 }
 
 /// Decode a `Schema` from protobuf schema transport form.
+///
+/// # Errors
+///
+/// See `SchemaCodecError` for failure conditions.
 pub fn decode_schema_definition(mut schema: proto::SchemaDefinition) -> SchemaResult<Schema> {
     let mut columns = HashMap::with_capacity(schema.fields.len());
     for field in schema.fields.drain(..) {
@@ -232,7 +253,7 @@ fn encode_replicated_data_type(
             encoded.detail = Some(proto::replicated_data_type::Detail::PrimitiveValueType(
                 encode_primitive_type(*value_type),
             ));
-            encoded.total_order_direction = Some(encode_direction(direction.clone()));
+            encoded.total_order_direction = Some(encode_direction(direction));
         }
         ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states } => {
             validate_finite_state_definition(*value_type, states)?;
@@ -249,6 +270,10 @@ fn encode_replicated_data_type(
     Ok(encoded)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "this decoder is a complete wire-kind decision table and is easier to audit in one place"
+)]
 fn decode_replicated_data_type(
     mut data_type: proto::ReplicatedDataType,
 ) -> SchemaResult<ReplicatedDataType> {
@@ -676,7 +701,7 @@ fn decode_primitive_array(
             Ok(PrimitiveValueArray::Binary(values.values))
         }
         proto::primitive_array_value::Value::Date(values) => {
-            let values = values.values.into_iter().map(decode_date).try_collect()?;
+            let values = values.values.iter().map(decode_date).try_collect()?;
             Ok(PrimitiveValueArray::Date(values))
         }
         proto::primitive_array_value::Value::Timestamp(values) => {
@@ -694,12 +719,8 @@ fn encode_date(value: NaiveDate) -> proto::Date {
     }
 }
 
-fn decode_date(value: proto::Date) -> SchemaResult<NaiveDate> {
-    NaiveDate::from_ymd_opt(value.year, value.month, value.day).context(InvalidDateSnafu {
-        year: value.year,
-        month: value.month,
-        day: value.day,
-    })
+fn decode_date(value: &proto::Date) -> SchemaResult<NaiveDate> {
+    decode_datamodel_date(value).map_err(SchemaCodecError::from_datamodel_date_error)
 }
 
 fn encode_primitive_type(value: PrimitiveType) -> EnumValue<proto::PrimitiveType> {
@@ -737,7 +758,7 @@ fn decode_primitive_type(value: EnumValue<proto::PrimitiveType>) -> SchemaResult
     }
 }
 
-fn encode_direction(value: Direction) -> EnumValue<proto::Direction> {
+fn encode_direction(value: &Direction) -> EnumValue<proto::Direction> {
     let value = match value {
         Direction::Ascending => proto::Direction::DIRECTION_ASCENDING,
         Direction::Descending => proto::Direction::DIRECTION_DESCENDING,

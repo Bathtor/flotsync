@@ -64,6 +64,10 @@ pub struct IoPoolConfig {
 
 impl IoPoolConfig {
     /// Validates the pool configuration.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn validate(&self) -> Result<()> {
         if self.initial_chunk_count > self.max_chunk_count {
             return Err(Error::InvalidIoPoolConfig {
@@ -126,6 +130,10 @@ pub struct IoBufferConfig {
 
 impl IoBufferConfig {
     /// Validates both ingress and egress pool configurations.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn validate(&self) -> Result<()> {
         self.ingress.validate()?;
         self.egress.validate()?;
@@ -144,6 +152,10 @@ pub struct IoBufferPools {
 
 impl IoBufferPools {
     /// Creates the shared ingress and egress pools.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn new(config: IoBufferConfig) -> Result<Self> {
         Self::new_with_logger(config, default_runtime_logger())
     }
@@ -219,6 +231,10 @@ impl<T> PoolRequest<T> {
     }
 
     /// Attempts to retrieve the completed pool reply without blocking.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn try_receive(&mut self) -> Result<Option<T>> {
         match self.receiver.try_recv() {
             Ok(Some(reply)) => reply.map(Some),

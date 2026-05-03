@@ -144,8 +144,14 @@ pub trait SchemaSnapshotEncoder<Id> {
         Self: 'a,
         Id: 'a;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin(&mut self, field_count: usize) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn state_field(
         &mut self,
         field_name: &str,
@@ -155,6 +161,10 @@ pub trait SchemaSnapshotEncoder<Id> {
     /// Prepare a sink for one `LatestValueWins` field.
     ///
     /// The returned sink is fed using `SnapshotSink::begin/node/end`.
+    ///
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_latest_value_wins_field<'a>(
         &'a mut self,
         field_name: &str,
@@ -164,6 +174,10 @@ pub trait SchemaSnapshotEncoder<Id> {
     /// Prepare a sink for one `LinearString` field.
     ///
     /// The returned sink is fed using `SnapshotSink::begin/node/end`.
+    ///
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_linear_string_field<'a>(
         &'a mut self,
         field_name: &str,
@@ -172,12 +186,19 @@ pub trait SchemaSnapshotEncoder<Id> {
     /// Prepare a sink for one `LinearList` field.
     ///
     /// The returned sink is fed using `SnapshotSink::begin/node/end`.
+    ///
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_linear_list_field<'a>(
         &'a mut self,
         field_name: &str,
         value_type: PrimitiveType,
     ) -> Result<Self::LinearListFieldSink<'a>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -404,6 +425,9 @@ where
 pub trait SnapshotNodeSource<Id, Value> {
     type Error;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn next_node(&mut self) -> Result<Option<SnapshotNode<Id, Value>>, Self::Error>;
 }
 
@@ -466,31 +490,49 @@ pub trait SchemaSnapshotDecoder<Id> {
         Self: 'a,
         Id: 'a;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin(&mut self, expected_field_count: usize) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn decode_state_field(
         &mut self,
         field_name: &str,
         data_type: &ReplicatedDataType,
     ) -> Result<SnapshotStateValue, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_latest_value_wins_field<'a>(
         &'a mut self,
         field_name: &str,
         value_type: &NullableBasicDataType,
     ) -> Result<Self::LatestValueWinsFieldSource<'a>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_linear_string_field<'a>(
         &'a mut self,
         field_name: &str,
     ) -> Result<Self::LinearStringFieldSource<'a>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn prepare_linear_list_field<'a>(
         &'a mut self,
         field_name: &str,
         value_type: PrimitiveType,
     ) -> Result<Self::LinearListFieldSource<'a>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -509,12 +551,24 @@ pub trait DataSnapshotEncoder<Id> {
         Self: 'a,
         Id: 'a;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin(&mut self, row_count: usize) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin_row(&mut self, row_index: usize) -> Result<Self::RowEncoder<'_>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end_row(&mut self, row_index: usize) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -533,12 +587,24 @@ pub trait DataSnapshotDecoder<Id> {
         Self: 'a,
         Id: 'a;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin(&mut self) -> Result<usize, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn begin_row(&mut self, row_index: usize) -> Result<Self::RowDecoder<'_>, Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end_row(&mut self, row_index: usize) -> Result<(), Self::Error>;
 
+    /// # Errors
+    ///
+    /// See `Self::Error` for failure conditions.
     fn end(&mut self) -> Result<(), Self::Error>;
 }
 
@@ -950,6 +1016,11 @@ mod tests {
         write_primitive_payload(target, value)
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::match_same_arms,
+        reason = "The primitive value writer consumes the borrowed enum and keeps each wire payload branch explicit."
+    )]
     fn write_primitive_payload(
         target: &mut BytesMut,
         value: PrimitiveValueRef<'_>,
@@ -1064,6 +1135,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "The primitive array writer consumes the borrowed enum while emitting a tagged wire payload."
+    )]
     fn write_primitive_array(
         target: &mut BytesMut,
         values: PrimitiveValueArrayRef<'_>,

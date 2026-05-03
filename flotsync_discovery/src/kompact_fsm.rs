@@ -9,6 +9,9 @@ impl<T> State<T> {
         Self(Some(initial))
     }
 
+    /// # Panics
+    ///
+    /// Panics if the state was already taken.
     pub fn take(&mut self) -> T {
         self.0.take().expect("Illegal take on dangling state.")
     }
@@ -70,6 +73,7 @@ impl<T> StateUpdate<T> {
     /// If this is an Update variant, then replace it with a new Update variant that updates the state to `replacement` instead.
     ///
     /// Otherwise leave this unchanged.
+    #[must_use]
     pub fn replace_new_state(self, replacement: T) -> Self {
         match self {
             StateUpdate::Update { result, .. } => StateUpdate::Update {

@@ -51,6 +51,10 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `listener` receives replication events produced by inbound delivery.
 /// `config` carries public runtime policy knobs; the current runtime only honours
 /// the migration-policy shape while the deeper protocol remains unimplemented.
+///
+/// # Errors
+///
+/// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
@@ -73,6 +77,10 @@ pub async fn load_replication_runtime(
 ///
 /// The TOML string only needs to live until this function returns; Kompact
 /// copies it into its config builder before the runtime system is built.
+///
+/// # Errors
+///
+/// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime_with_runtime_config_toml(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
@@ -156,7 +164,7 @@ fn start_delivery_runtime_host(
         .name("flotsync-runtime-start".to_owned())
         .spawn(move || {
             DeliveryRuntimeHost::start_with_runtime_config_toml(
-                local_member,
+                &local_member,
                 store,
                 listener,
                 runtime_config_toml.as_deref(),
@@ -171,12 +179,12 @@ fn start_delivery_runtime_host(
         .map_err(|payload| RuntimeHostError::BuildSystem {
             message: format!(
                 "runtime startup thread panicked: {}",
-                panic_payload_message(payload)
+                panic_payload_message(payload.as_ref())
             ),
         })?
 }
 
-fn panic_payload_message(payload: Box<dyn Any + Send + 'static>) -> String {
+fn panic_payload_message(payload: &(dyn Any + Send + 'static)) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         (*message).to_owned()
     } else if let Some(message) = payload.downcast_ref::<String>() {
@@ -286,8 +294,10 @@ impl ReplicationRuntime {
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
-            Err(_) => {
-                panic!("replication runtime component became unavailable during test install")
+            Err(error) => {
+                panic!(
+                    "replication runtime component became unavailable during test install: {error:?}"
+                )
             }
         }
     }
@@ -302,9 +312,9 @@ impl ReplicationRuntime {
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
-            Err(_) => {
+            Err(error) => {
                 panic!(
-                    "replication runtime component became unavailable during test apply_update_batch"
+                    "replication runtime component became unavailable during test apply_update_batch: {error:?}"
                 )
             }
         }

@@ -1,8 +1,8 @@
-//! [[TrieMap]] and [[TrieSet]] offer more compressed memory layout for larger groups by re-using parent identifiers,
-//! but they cannot implement [[GroupMembership]] as the full Identifiers cannot be pointed to
+//! [[`TrieMap`]] and [[`TrieSet`]] offer more compressed memory layout for larger groups by re-using parent identifiers,
+//! but they cannot implement [[`GroupMembership`]] as the full identifiers cannot be pointed to
 //! (need to be owned).
 //! They do offer efficient iteration, however.
-use super::*;
+use super::{Identifier, IdentifierSegment};
 use ahash::AHashMap;
 
 #[derive(Clone, Debug)]
@@ -17,6 +17,7 @@ struct TrieNode<V> {
 }
 
 impl<V> TrieMap<V> {
+    #[must_use]
     pub fn new() -> Self {
         TrieMap {
             root: TrieNode {
@@ -26,10 +27,12 @@ impl<V> TrieMap<V> {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.root.children.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.root.count()
     }
@@ -45,6 +48,7 @@ impl<V> TrieMap<V> {
         node.value.replace(value)
     }
 
+    #[must_use]
     pub fn get(&self, key: &Identifier) -> Option<&V> {
         let mut node = &self.root;
         for segment in key.segments_iter() {
@@ -63,6 +67,7 @@ impl<V> TrieMap<V> {
     }
 
     #[allow(dead_code)] // for later
+    #[must_use]
     pub fn get_mut(&mut self, key: &Identifier) -> Option<&mut V> {
         let mut node = &mut self.root;
         for segment in key.segments_iter() {
@@ -71,6 +76,7 @@ impl<V> TrieMap<V> {
         node.value.as_mut()
     }
 
+    #[must_use]
     pub fn iter(&self) -> TrieIter<'_, V> {
         TrieIter {
             stack: vec![(&self.root, self.root.children.iter())],
@@ -80,6 +86,7 @@ impl<V> TrieMap<V> {
         }
     }
 
+    #[must_use]
     pub fn iter_keys(&self) -> TrieIdentifierIter<'_, V> {
         TrieIdentifierIter { inner: self.iter() }
     }
@@ -108,7 +115,7 @@ impl<V> Default for TrieMap<V> {
 
 impl<V> TrieNode<V> {
     fn count(&self) -> usize {
-        let mut total = if self.value.is_some() { 1 } else { 0 };
+        let mut total = usize::from(self.value.is_some());
         for child in self.children.values() {
             total += child.count();
         }
@@ -143,16 +150,18 @@ impl<'a, V> Iterator for TrieIter<'a, V> {
             }
 
             if let Some((node, mut children)) = self.stack.pop() {
-                if let Some((seg, child)) = children.next() {
-                    // Put the updated children back before recursing
-                    self.stack.push((node, children));
-                    self.path.push(seg.clone());
-                    self.current = Some(child);
-                    self.stack.push((child, child.children.iter()));
-                    self.yield_self = true;
-                    continue;
-                } else {
-                    self.path.pop();
+                match children.next() {
+                    Some((seg, child)) => {
+                        // Put the updated children back before recursing
+                        self.stack.push((node, children));
+                        self.path.push(seg.clone());
+                        self.current = Some(child);
+                        self.stack.push((child, child.children.iter()));
+                        self.yield_self = true;
+                    }
+                    None => {
+                        self.path.pop();
+                    }
                 }
             } else {
                 return None;
@@ -164,7 +173,7 @@ impl<'a, V> Iterator for TrieIter<'a, V> {
 pub struct TrieIdentifierIter<'a, V> {
     inner: TrieIter<'a, V>,
 }
-impl<'a, V> Iterator for TrieIdentifierIter<'a, V> {
+impl<V> Iterator for TrieIdentifierIter<'_, V> {
     type Item = Identifier;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -175,14 +184,17 @@ impl<'a, V> Iterator for TrieIdentifierIter<'a, V> {
 #[derive(Clone, Debug)]
 pub struct TrieSet(TrieMap<()>);
 impl TrieSet {
+    #[must_use]
     pub fn new() -> Self {
         Self(TrieMap::new())
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -191,8 +203,14 @@ impl TrieSet {
         self.0.insert(key, ()).is_none()
     }
 
+    #[must_use]
     pub fn contains(&self, key: &Identifier) -> bool {
         self.0.get(key).is_some()
+    }
+
+    #[must_use]
+    pub fn iter(&self) -> TrieIdentifierIter<'_, ()> {
+        self.0.iter_keys()
     }
 }
 
@@ -207,7 +225,16 @@ impl<'a> IntoIterator for &'a TrieSet {
     type IntoIter = TrieIdentifierIter<'a, ()>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter_keys()
+        self.iter()
+    }
+}
+
+impl<'a, V> IntoIterator for &'a TrieMap<V> {
+    type Item = (Identifier, &'a V);
+    type IntoIter = TrieIter<'a, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -271,7 +298,7 @@ mod tests {
     fn test_iter_and_into_iter() {
         let mut trie_map = TrieMap::new();
         let mut trie_set = TrieSet::new();
-        let keys = vec![id(["a"]), id(["a", "b"]), id(["x", "y"])];
+        let keys = [id(["a"]), id(["a", "b"]), id(["x", "y"])];
 
         for (i, k) in keys.iter().enumerate() {
             trie_map.insert(k.clone(), i);

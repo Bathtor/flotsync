@@ -235,6 +235,10 @@ pub struct IoBridgeHandle {
 
 impl IoBridgeHandle {
     /// Creates a control handle for the given live bridge component.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bridge component no longer exposes a live actor reference.
     pub fn from_component(component: &Arc<Component<IoBridge>>) -> Self {
         let actor = component
             .actor_ref()
@@ -270,6 +274,10 @@ impl IoBridgeHandle {
     ///
     /// ## Warning
     /// If `component` is already running when this is called, this function might block.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub async fn connect_udp<C>(&self, component: &Arc<Component<C>>) -> crate::errors::Result<()>
     where
         C: ComponentDefinition + ComponentLifecycle + Require<UdpPort> + RequireRef<UdpPort>,
@@ -504,6 +512,10 @@ impl IoBridge {
         self.driver.dispatch_udp(UdpCommand::Close { socket_id });
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Bridge UDP event handling fan-outs every runtime event to its Kompact port contract."
+    )]
     fn handle_udp_event(&mut self, event: UdpBridgeEvent) {
         match event {
             UdpBridgeEvent::Bound {
@@ -837,10 +849,6 @@ fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
 
 fn open_failure_from_error(error: &Error) -> OpenFailureReason {
     match error {
-        Error::DriverUnavailable
-        | Error::DriverCommandChannelClosed
-        | Error::DriverResponseChannelClosed
-        | Error::DriverEventChannelClosed => OpenFailureReason::DriverUnavailable,
         Error::UnknownConnection { .. }
         | Error::UnknownListener { .. }
         | Error::UnknownSocket { .. } => OpenFailureReason::InvalidHandle,

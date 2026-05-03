@@ -85,6 +85,10 @@ impl ReceiverMachine {
     }
 
     /// Accepts one inbound payload frame from a UDP source.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "receiver API stays fallible to match adjacent state machines and allow future validation errors"
+    )]
     pub fn accept_payload(
         &mut self,
         source: SocketAddr,
@@ -220,6 +224,10 @@ impl ReceiverMachine {
     }
 
     /// Accepts one sender `NoLongerAvailable` control frame.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "control frames are message values at the receiver API boundary"
+    )]
     pub fn accept_no_longer_available(
         &mut self,
         source: SocketAddr,
@@ -528,7 +536,7 @@ impl InboundTransfer {
             part_count,
             checksum,
             parts: vec![None; part_count.get() as usize],
-            missing_parts: RoaringBitmap::from_iter(0..part_count.get()),
+            missing_parts: (0..part_count.get()).collect::<RoaringBitmap>(),
             repair_watermark: None,
             regular_part_size: None,
             give_up_deadline: now + config.give_up_timeout,

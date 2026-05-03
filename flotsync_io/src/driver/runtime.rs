@@ -281,6 +281,10 @@ impl DriverRuntimeState {
     }
 
     /// Returns `true` when command processing requested that the driver thread stop.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Command draining is the central driver dispatch loop and keeps command-to-handler routing visible."
+    )]
     pub(super) fn drain_commands(
         &mut self,
         command_rx: &crossbeam_channel::Receiver<ControlCommand>,
@@ -353,7 +357,7 @@ impl DriverRuntimeState {
                                 let closed_record = self.tcp.handle_send(
                                     connection_id,
                                     transmission_id,
-                                    payload,
+                                    &payload,
                                     registry,
                                     event_sink,
                                 )?;
@@ -369,7 +373,7 @@ impl DriverRuntimeState {
                                 let closed_record = self.tcp.handle_send_and_close(
                                     connection_id,
                                     transmission_id,
-                                    payload,
+                                    &payload,
                                     registry,
                                     event_sink,
                                 )?;
@@ -426,7 +430,7 @@ impl DriverRuntimeState {
                                 self.udp.handle_send(
                                     socket_id,
                                     transmission_id,
-                                    payload,
+                                    &payload,
                                     target,
                                     registry,
                                     event_sink,
@@ -612,12 +616,10 @@ impl From<&DriverCommand> for CommandTrace {
             DriverCommand::Tcp(TcpCommand::RejectAccepted { connection_id }) => {
                 Self::TcpReject(*connection_id)
             }
-            DriverCommand::Tcp(TcpCommand::Send { connection_id, .. }) => {
-                Self::TcpSend(*connection_id)
-            }
-            DriverCommand::Tcp(TcpCommand::SendAndClose { connection_id, .. }) => {
-                Self::TcpSend(*connection_id)
-            }
+            DriverCommand::Tcp(
+                TcpCommand::Send { connection_id, .. }
+                | TcpCommand::SendAndClose { connection_id, .. },
+            ) => Self::TcpSend(*connection_id),
             DriverCommand::Tcp(TcpCommand::CloseListener { listener_id }) => {
                 Self::TcpCloseListener(*listener_id)
             }

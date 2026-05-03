@@ -61,6 +61,9 @@ pub const FIELD_PRIORITY: &str = "priority";
 pub const FIELD_EDIT_COUNT: &str = "edit_count";
 pub static CHECKLIST_SCHEMA: LazyLock<Schema> = LazyLock::new(build_checklist_schema);
 
+/// # Panics
+///
+/// Panics if the static checklist dataset identifier is not a valid [`DatasetId`].
 #[must_use]
 pub fn checklist_dataset_id() -> DatasetId {
     DatasetId::try_new(CHECKLIST_DATASET_ID)
@@ -272,6 +275,9 @@ pub enum ChecklistCommandParseError {
     InvalidItemReference { value: String },
 }
 
+/// # Errors
+///
+/// See `ChecklistCommandParseError` for failure conditions.
 pub fn parse_checklist_command(
     line: &str,
 ) -> Result<Option<ChecklistCommand>, ChecklistCommandParseError> {
@@ -287,6 +293,9 @@ pub fn parse_checklist_command(
     Ok(Some(parsed.command))
 }
 
+/// # Errors
+///
+/// See `ChecklistCommandParseError` for failure conditions.
 pub fn parse_item_selector(value: &str) -> Result<ItemSelector, ChecklistCommandParseError> {
     if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
         let Ok(index) = value.parse::<usize>() else {
@@ -487,12 +496,12 @@ pub enum ChecklistWorkingSetError {
     #[snafu(display("Checklist item reference {selector:?} does not resolve to a visible row."))]
     UnknownItem { selector: ItemSelector },
     #[snafu(display(
-        "Replicated row {row_id} does not belong to checklist group {group_id} dataset {dataset_id}."
+        "Replicated row {row} does not belong to checklist group {group} dataset {dataset}."
     ))]
     UnexpectedRowScope {
-        row_id: RowId,
-        group_id: GroupId,
-        dataset_id: DatasetId,
+        row: RowId,
+        group: GroupId,
+        dataset: DatasetId,
     },
     #[snafu(display("Failed to decode field {field} from checklist row {row_key}: {source}"))]
     DecodeRowField {
@@ -558,6 +567,9 @@ impl ChecklistWorkingSet {
         self.rows.get(&row_key)
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn selected_item(
         &self,
         selector: ItemSelector,
@@ -584,6 +596,9 @@ impl ChecklistWorkingSet {
         &self.event_history
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn read_token(&self) -> Result<ReadToken, ChecklistWorkingSetError> {
         self.read_token
             .clone()
@@ -602,6 +617,9 @@ impl ChecklistWorkingSet {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the one-based display index overflows `usize`.
     #[must_use]
     pub fn listed_items(&self) -> Vec<ListedChecklistItem<'_>> {
         self.display_order
@@ -629,6 +647,9 @@ impl ChecklistWorkingSet {
         self.dirty_rows.insert(row_key, DirtyRowKind::Insert);
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn rename_item(
         &mut self,
         selector: ItemSelector,
@@ -645,6 +666,9 @@ impl ChecklistWorkingSet {
         })
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn edit_note(
         &mut self,
         selector: ItemSelector,
@@ -661,6 +685,9 @@ impl ChecklistWorkingSet {
         })
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn add_tag(
         &mut self,
         selector: ItemSelector,
@@ -676,6 +703,9 @@ impl ChecklistWorkingSet {
         })
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn remove_tag(
         &mut self,
         selector: ItemSelector,
@@ -690,10 +720,16 @@ impl ChecklistWorkingSet {
         })
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn claim_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
         self.advance_status(selector, ChecklistStatus::InProgress)
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn complete_item(
         &mut self,
         selector: ItemSelector,
@@ -701,6 +737,9 @@ impl ChecklistWorkingSet {
         self.advance_status(selector, ChecklistStatus::Done)
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn set_priority(
         &mut self,
         selector: ItemSelector,
@@ -716,6 +755,9 @@ impl ChecklistWorkingSet {
         })
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn delete_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
         let row_key = self.resolve_selector(selector)?;
         self.rows.remove(&row_key);
@@ -729,6 +771,9 @@ impl ChecklistWorkingSet {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn enqueue_row_changes(
         &mut self,
         changes: Vec<RowChange>,
@@ -753,6 +798,9 @@ impl ChecklistWorkingSet {
         self.queued_events.push_back(event);
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn apply_snapshot_rows<I>(&mut self, rows: I) -> Result<(), ChecklistWorkingSetError>
     where
         I: IntoIterator<Item = SnapshotRow>,
@@ -764,6 +812,9 @@ impl ChecklistWorkingSet {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn prepare_sync(&self) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingSetError> {
         if self.dirty_rows.is_empty() {
             return Ok(None);
@@ -896,7 +947,7 @@ impl ChecklistWorkingSet {
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         match change {
             RowChange::Upsert { row_id, row } => {
-                self.checklist_upsert_change_from_row(row_id, row.as_ref())
+                self.checklist_upsert_change_from_row(&row_id, row.as_ref())
             }
             RowChange::Delete { row_id } => {
                 self.validate_row_scope(&row_id)?;
@@ -920,18 +971,18 @@ impl ChecklistWorkingSet {
             self.validate_row_scope(&row_id)?;
             return Err(ChecklistWorkingSetError::UnexpectedDeletedSnapshotRow { row_id });
         }
-        self.checklist_upsert_change_from_row(row_id, row.as_ref())
+        self.checklist_upsert_change_from_row(&row_id, row.as_ref())
     }
 
     fn checklist_upsert_change_from_row<OperationId>(
         &self,
-        row_id: RowId,
+        row_id: &RowId,
         row: &(dyn RowRead<OperationId> + Send + Sync),
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     {
-        self.validate_row_scope(&row_id)?;
+        self.validate_row_scope(row_id)?;
         let row_key = row_id.row_key;
         let item = ChecklistItem::from_row(row_key, row)?;
         Ok(ChecklistRowChange::Upsert { row_key, item })
@@ -941,9 +992,9 @@ impl ChecklistWorkingSet {
         ensure!(
             row_id.group_id == self.group_id && row_id.dataset_id == self.dataset_id,
             UnexpectedRowScopeSnafu {
-                row_id: row_id.clone(),
-                group_id: self.group_id,
-                dataset_id: self.dataset_id.clone(),
+                row: row_id.clone(),
+                group: self.group_id,
+                dataset: self.dataset_id.clone(),
             }
         );
         Ok(())

@@ -249,9 +249,7 @@ impl<Id, Value> Node<Id, Value> {
     pub fn get_current_value(&self) -> Option<&Value> {
         match self.operation {
             Operation::Insert { ref value } => Some(value),
-            Operation::Delete { .. } => None,
-            Operation::Beginning => None,
-            Operation::End => None,
+            Operation::Delete { .. } | Operation::Beginning | Operation::End => None,
             Operation::Invalid => panic!("Node is invalid."),
         }
     }
@@ -282,10 +280,8 @@ where
     /// Zero-sized nodes (e.g. begin/end) return 0.
     pub fn node_len(&self) -> usize {
         match self.operation {
-            Operation::Insert { ref value } => value.len(),
-            Operation::Delete { ref value } => value.len(),
-            Operation::Beginning => 0,
-            Operation::End => 0,
+            Operation::Insert { ref value } | Operation::Delete { ref value } => value.len(),
+            Operation::Beginning | Operation::End => 0,
             Operation::Invalid => panic!("Node is invalid."),
         }
     }
@@ -346,8 +342,7 @@ impl<Value> Operation<Value> {
     // Temporarily replace the operation, so we own the value.
     fn take_value(&mut self) -> Option<Value> {
         match std::mem::replace(self, Operation::Invalid) {
-            Operation::Insert { value } => Some(value),
-            Operation::Delete { value } => Some(value),
+            Operation::Insert { value } | Operation::Delete { value } => Some(value),
             Operation::Beginning | Operation::End | Operation::Invalid => None,
         }
     }
@@ -404,6 +399,52 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::linear_data::IdWithIndex;
+
+    /// Enumerates all schedules that interleave `num_writers` ordered local operation streams.
+    ///
+    /// Each writer appears `per_writer_count` times, and the generated schedules preserve each
+    /// writer's local order while varying only the cross-writer interleaving.
+    pub(crate) fn interleavings_with_local_order(
+        per_writer_count: usize,
+        num_writers: usize,
+    ) -> Vec<Vec<usize>> {
+        fn dfs(
+            per_writer_count: usize,
+            total_steps: usize,
+            current: &mut Vec<usize>,
+            next_for_writer: &mut [usize],
+            out: &mut Vec<Vec<usize>>,
+        ) {
+            if current.len() == total_steps {
+                out.push(current.clone());
+                return;
+            }
+
+            for writer in 0..next_for_writer.len() {
+                if next_for_writer[writer] < per_writer_count {
+                    next_for_writer[writer] += 1;
+                    current.push(writer);
+                    dfs(per_writer_count, total_steps, current, next_for_writer, out);
+                    current.pop();
+                    next_for_writer[writer] -= 1;
+                }
+            }
+        }
+
+        let total_steps = per_writer_count * num_writers;
+        let mut out = Vec::new();
+        let mut current = Vec::with_capacity(total_steps);
+        let mut next_for_writer = vec![0usize; num_writers];
+
+        dfs(
+            per_writer_count,
+            total_steps,
+            &mut current,
+            &mut next_for_writer,
+            &mut out,
+        );
+        out
+    }
 
     pub(crate) struct TestIdGenerator {
         current: Option<u32>,

@@ -851,16 +851,16 @@ impl ReliableDeliveryComponent {
         };
         let delay = next_due_at.saturating_duration_since(now);
         let timer = self.schedule_once(delay, move |component, expected_timer| {
-            component.handle_retry_timeout(expected_timer)
+            component.handle_retry_timeout(&expected_timer)
         });
         self.retry_timer = Some(timer);
     }
 
-    fn handle_retry_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+    fn handle_retry_timeout(&mut self, expected_timer: &ScheduledTimer) -> Handled {
         let Some(active_timer) = self.retry_timer.take() else {
             return Handled::Ok;
         };
-        if active_timer != expected_timer {
+        if &active_timer != expected_timer {
             self.retry_timer = Some(active_timer);
             return Handled::Ok;
         }
@@ -1264,10 +1264,12 @@ mod tests {
                 0,
             );
             let manager_ref = core.manager_ref();
-            let ingress = core.system().create(|| {
+            let local_members: Arc<HashSet<MemberIdentity>> =
+                Arc::new([local_member].into_iter().collect());
+            let ingress = core.system().create(move || {
                 DeliveryIngressComponent::new(DeliveryInterestConfig {
                     group_memberships: SharedGroupMemberships::new(GroupMemberships::new()),
-                    local_members: Arc::new([local_member.clone()].into_iter().collect()),
+                    local_members,
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
@@ -1327,6 +1329,7 @@ mod tests {
                 sharing: RouteSharingKind::Exclusive,
                 preference_rank: RoutePreferenceRank::new(1),
             };
+            let expected_peer = peer.clone();
             self.discovery_source.on_definition(|component| {
                 component
                     .discovery
@@ -1336,6 +1339,12 @@ mod tests {
                         routes: vec![route],
                     });
             });
+            eventually_component_state(
+                WAIT_TIMEOUT,
+                &self.reliable,
+                |component| component.knows_direct_route(&expected_peer),
+                "timed out waiting for reliable-delivery route publication",
+            );
         }
 
         fn submit(&self, submit: ReliableDeliverySubmit) {
@@ -1369,7 +1378,7 @@ mod tests {
             }
         }
 
-        fn inject_recipient_ack(&self, ack: RecipientAck) {
+        fn inject_recipient_ack(&self, ack: &RecipientAck) {
             self.reliable.on_definition(|component| {
                 let frame = ack.to_wire_format();
                 let Some(delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(
@@ -1404,14 +1413,14 @@ mod tests {
             );
         }
 
-        fn wait_for_sender_route_state(&self, message_id: MessageId, expected: RouteActiveState) {
+        fn wait_for_sender_route_state(&self, message_id: MessageId, expected: &RouteActiveState) {
             eventually_component_state(
                 WAIT_TIMEOUT,
                 &self.reliable,
                 |component| {
                     component
                         .sender_work_item(message_id)
-                        .is_some_and(|work_item| work_item.recipient_route.state == expected)
+                        .is_some_and(|work_item| &work_item.recipient_route.state == expected)
                 },
                 format_args!(
                     "timed out waiting for sender-side route state {expected:?} for {message_id:?}"
@@ -1441,7 +1450,7 @@ mod tests {
             );
         }
 
-        fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: Bytes) {
+        fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: &Bytes) {
             eventually_component_state(
                 WAIT_TIMEOUT,
                 &self.reliable,
@@ -1449,7 +1458,8 @@ mod tests {
                     component
                         .sender_work_item(message_id)
                         .is_some_and(|work_item| {
-                            work_item.submit.envelope.payload.ciphertext == expected
+                            work_item.submit.envelope.payload.ciphertext.as_ref()
+                                == expected.as_ref()
                         })
                 },
                 format_args!(
@@ -1547,7 +1557,7 @@ mod tests {
 
         let deliver = receiver.wait_for_delivery();
         assert_eq!(deliver.envelope.header.message_id, message_id);
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AwaitingProcessed);
 
         deliver
@@ -1579,7 +1589,7 @@ mod tests {
 
         let deliver = receiver.wait_for_delivery();
         assert_eq!(deliver.envelope.header.message_id, message_id);
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         drop(deliver);
         receiver.wait_for_inbound_clear(message_id);
 
@@ -1615,7 +1625,7 @@ mod tests {
             .processed
             .complete()
             .expect("processed completion should succeed exactly once");
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         sender.wait_for_sender_ack_observed(message_id);
 
         receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
@@ -1641,7 +1651,7 @@ mod tests {
 
         let deliver = receiver.wait_for_delivery();
         assert_eq!(deliver.envelope.header.message_id, message_id);
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AwaitingProcessed);
 
         receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
@@ -1670,7 +1680,7 @@ mod tests {
         ));
 
         let deliver = receiver.wait_for_delivery();
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         deliver
             .processed
             .complete()
@@ -1698,13 +1708,13 @@ mod tests {
         ));
         sender.wait_for_sender_route_state(
             message_id,
-            RouteActiveState::PendingRoute {
+            &RouteActiveState::PendingRoute {
                 retry_after: None,
                 reason: PendingRouteReason::PeerCurrentlyUnreachable,
             },
         );
 
-        sender.inject_recipient_ack(recipient_ack(alice, bob, message_id));
+        sender.inject_recipient_ack(&recipient_ack(alice, bob, message_id));
         sender.wait_for_sender_ack_observed(message_id);
     }
 
@@ -1758,6 +1768,6 @@ mod tests {
             },
         });
 
-        sender.wait_for_sender_ciphertext(message_id, Bytes::from_static(b"first payload"));
+        sender.wait_for_sender_ciphertext(message_id, &Bytes::from_static(b"first payload"));
     }
 }

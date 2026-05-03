@@ -85,10 +85,14 @@ impl<Id, T> LinearListDiff<Id, T> {
 ///
 /// This uses slice diffing internally and translates those segments into equivalent linear list
 /// operations. All inserts in one diff share `operation_id` and consume consecutive index space.
+///
+/// # Errors
+///
+/// See `DiffError` for failure conditions.
 pub fn linear_diff<Id, T>(
     base: &LinearList<Id, T>,
     changed: &[T],
-    operation_id: Id,
+    operation_id: &Id,
 ) -> Result<LinearListDiff<Id, T>, DiffError>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -120,7 +124,7 @@ where
                     base,
                     old_index,
                     insert_values,
-                    &operation_id,
+                    operation_id,
                     &mut next_insert_index,
                     &mut operations,
                 )?;
@@ -140,7 +144,7 @@ where
                     base,
                     insert_at,
                     insert_values,
-                    &operation_id,
+                    operation_id,
                     &mut next_insert_index,
                     &mut operations,
                 )?;
@@ -385,6 +389,10 @@ where
     }
 
     /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// See `S::Error` for failure conditions.
     pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<IdWithIndex<Id>, [T]>,
@@ -393,6 +401,9 @@ where
             .encode_snapshot(sink, |value| value.values.as_slice())
     }
 
+    /// # Errors
+    ///
+    /// See `SnapshotReadError<E>` for failure conditions.
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
         E: snafu::Error + Send + Sync + 'static,
@@ -416,6 +427,10 @@ where
     ///
     /// This is primarily useful after reconstructing a value from an external snapshot or other
     /// untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// See `IntegrityError` for failure conditions.
     pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
         self.data.validate_integrity()
     }
@@ -430,6 +445,10 @@ where
     /// let mut list = LinearList::new(id_generator.next().unwrap());
     /// list.append(next_id_with_index(), [1, 2, 3]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the appended chunk.
     pub fn append<Values>(&mut self, id: IdWithIndex<Id>, values: Values)
     where
         Values: IntoIterator<Item = T>,
@@ -453,6 +472,10 @@ where
     /// Prepend one chunk of values at the front.
     ///
     /// Empty chunks are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the prepended chunk.
     pub fn prepend<Values>(&mut self, id: IdWithIndex<Id>, values: Values)
     where
         Values: IntoIterator<Item = T>,
@@ -476,7 +499,14 @@ where
     /// Insert a chunk at `position`.
     ///
     /// Inserting at `self.len()` is append-like.
+    ///
+    /// # Errors
+    ///
     /// Returns the original chunk if `position` is out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the inserted chunk.
     pub fn insert_at<Values>(
         &mut self,
         position: usize,
@@ -508,6 +538,14 @@ where
     }
 
     /// Convenience wrapper for inserting a single item at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original value if `position` is out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the failed single-item insert does not return exactly one value.
     pub fn insert_item_at(
         &mut self,
         position: usize,
@@ -557,6 +595,10 @@ where
     /// Build an append operation for replication.
     ///
     /// Returns `None` for empty chunks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the append operation chunk.
     pub fn append_operation<Values>(
         &self,
         id: IdWithIndex<Id>,
@@ -583,6 +625,10 @@ where
     /// Build a prepend operation for replication.
     ///
     /// Returns `None` for empty chunks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the prepend operation chunk.
     pub fn prepend_operation<Values>(
         &self,
         id: IdWithIndex<Id>,
@@ -609,7 +655,16 @@ where
     /// Build an insert operation at `position` for replication.
     ///
     /// Inserting at `self.len()` is append-like.
-    /// Returns `Ok(None)` for empty chunks and `Err(values)` for out-of-bounds positions.
+    ///
+    /// Returns `Ok(None)` for empty chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(values)` for out-of-bounds positions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the insert operation chunk.
     pub fn insert_operation_at<Values>(
         &self,
         position: usize,
@@ -656,6 +711,8 @@ where
     }
 
     /// Apply a replicated operation received from another replica.
+    ///
+    /// # Errors
     ///
     /// The original operation is returned unchanged on failure.
     pub fn apply_operation(
@@ -755,6 +812,8 @@ where
 {
     /// Tries to delete all the nodes contained in the range.
     ///
+    /// # Errors
+    ///
     /// Returns the first failing range if unsuccessful.
     /// In this case the previous deletes will have been applied.
     pub fn delete<'a, T>(
@@ -784,10 +843,23 @@ impl<'a, Id, T> Iterator for LinearListIter<'a, Id, T> {
     }
 }
 
+impl<'a, Id, T> IntoIterator for &'a LinearList<Id, T>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: fmt::Debug + 'static,
+{
+    type IntoIter = LinearListIter<'a, Id, T>;
+    type Item = &'a T;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linear_data::tests::TestIdGenerator;
+    use crate::linear_data::tests::{TestIdGenerator, interleavings_with_local_order};
     use itertools::Itertools;
 
     type Id = u32;
@@ -808,7 +880,7 @@ mod tests {
     #[test]
     fn linear_diff_noop_is_empty() {
         let base = new_list([1, 2, 3]);
-        let diff = linear_diff(&base, &[1, 2, 3], 99).unwrap();
+        let diff = linear_diff(&base, &[1, 2, 3], &99).unwrap();
 
         assert!(diff.is_empty());
         assert_eq!(diff.num_operations(), 0);
@@ -820,7 +892,7 @@ mod tests {
     #[test]
     fn linear_diff_updates_only_changed_middle_segment() {
         let base = new_list([1, 2, 3, 4]);
-        let diff = linear_diff(&base, &[1, 9, 3, 4], 42).unwrap();
+        let diff = linear_diff(&base, &[1, 9, 3, 4], &42).unwrap();
 
         assert_eq!(diff.num_operations(), 2);
         assert_eq!(diff.num_insert_operations(), 1);
@@ -846,7 +918,7 @@ mod tests {
     #[test]
     fn linear_diff_multiple_insert_hunks_allocate_distinct_indices() {
         let base = new_list([1, 2, 3]);
-        let diff = linear_diff(&base, &[0, 1, 2, 3, 4], 17).unwrap();
+        let diff = linear_diff(&base, &[0, 1, 2, 3, 4], &17).unwrap();
 
         let mut insert_indices: Vec<_> = diff
             .into_operations()
@@ -1031,49 +1103,6 @@ mod tests {
 
             vec![op1, op2]
         });
-
-        // Generate all interleavings preserving per-writer causal order.
-        fn interleavings_with_local_order(
-            per_writer_count: usize,
-            num_writers: usize,
-        ) -> Vec<Vec<usize>> {
-            let total_steps = per_writer_count * num_writers;
-            let mut out = Vec::new();
-            let mut current = Vec::with_capacity(total_steps);
-            let mut next_for_writer = vec![0usize; num_writers];
-
-            fn dfs(
-                per_writer_count: usize,
-                total_steps: usize,
-                current: &mut Vec<usize>,
-                next_for_writer: &mut [usize],
-                out: &mut Vec<Vec<usize>>,
-            ) {
-                if current.len() == total_steps {
-                    out.push(current.clone());
-                    return;
-                }
-
-                for writer in 0..next_for_writer.len() {
-                    if next_for_writer[writer] < per_writer_count {
-                        next_for_writer[writer] += 1;
-                        current.push(writer);
-                        dfs(per_writer_count, total_steps, current, next_for_writer, out);
-                        current.pop();
-                        next_for_writer[writer] -= 1;
-                    }
-                }
-            }
-
-            dfs(
-                per_writer_count,
-                total_steps,
-                &mut current,
-                &mut next_for_writer,
-                &mut out,
-            );
-            out
-        }
 
         let schedules = interleavings_with_local_order(2, 3);
         assert_eq!(schedules.len(), 90);

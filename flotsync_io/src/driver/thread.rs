@@ -15,6 +15,10 @@ use slog::{debug, info, warn};
 use snafu::ResultExt;
 use std::sync::Arc;
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The driver thread entry point owns the channel handles and runtime config at the thread boundary."
+)]
 pub(super) fn run_driver_thread(
     config: DriverThreadConfig,
     logger: RuntimeLogger,

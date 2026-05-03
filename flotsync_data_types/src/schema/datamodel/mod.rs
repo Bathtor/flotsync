@@ -396,6 +396,10 @@ pub enum SchemaValueError {
     },
 }
 impl SchemaValueError {
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "This is a convenience constructor for one Err variant."
+    )]
     pub fn unknown_field_err<I>(field_name: I) -> Result<(), Self>
     where
         I: Into<String>,

@@ -565,7 +565,7 @@ mod tests {
             )),
             ..proto::DeliveryBoundaryFrame::default()
         };
-        encode_boundary(boundary)
+        encode_boundary(&boundary)
     }
 
     fn encode_recipient_ack_boundary_frame(
@@ -595,10 +595,10 @@ mod tests {
             )),
             ..proto::DeliveryBoundaryFrame::default()
         };
-        encode_boundary(boundary)
+        encode_boundary(&boundary)
     }
 
-    fn encode_boundary(boundary: proto::DeliveryBoundaryFrame) -> IoPayload {
+    fn encode_boundary(boundary: &proto::DeliveryBoundaryFrame) -> IoPayload {
         IoPayload::from(boundary.encode_to_bytes())
     }
 }

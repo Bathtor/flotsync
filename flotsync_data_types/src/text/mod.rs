@@ -47,6 +47,10 @@ where
     Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Apply all the changes in this diff to `target`.
+    ///
+    /// # Errors
+    ///
+    /// See `ApplyError<Id>` for failure conditions.
     pub fn apply_to(self, target: &mut LinearString<Id>) -> Result<(), ApplyError<Id>> {
         let mut iter = self.operations.into_iter();
 
@@ -169,6 +173,10 @@ pub enum DiffError {
 /// new node ids as required.
 /// Each inserted diff fragment uses a single major id and fails if its addressed indices would
 /// exceed `u32::MAX`.
+///
+/// # Errors
+///
+/// See `DiffError` for failure conditions.
 pub fn linear_diff<Id>(
     base: &LinearString<Id>,
     changed: &str,
@@ -200,21 +208,20 @@ where
                     );
                     base.ids_after_head()
                 } else {
-                    match base.ids_at_pos(at) {
-                        // TextChange always outputs the position where the first inserted character
-                        // should be after the insertion happened.
-                        Some(node_ids) => node_ids.before(),
-                        None => {
-                            // If it wants to insert at the end, it will return the length of the
-                            // string as position (which is consistent with above).
-                            ensure!(
-                                at == base.len(),
-                                InternalSnafu {
-                                    context: format!("Insert position {at} did not exist in base."),
-                                }
-                            );
-                            base.ids_before_end()
-                        }
+                    // TextChange always outputs the position where the first inserted character
+                    // should be after the insertion happened.
+                    if let Some(node_ids) = base.ids_at_pos(at) {
+                        node_ids.before()
+                    } else {
+                        // If it wants to insert at the end, it will return the length of the
+                        // string as position (which is consistent with above).
+                        ensure!(
+                            at == base.len(),
+                            InternalSnafu {
+                                context: format!("Insert position {at} did not exist in base."),
+                            }
+                        );
+                        base.ids_before_end()
                     }
                 };
                 let value_graphemes = GraphemeString::new(value);
@@ -253,6 +260,32 @@ mod tests {
     };
     use flotsync_utils::{debugging::DebugFormatting, option_when, svec16, testing::SVec16};
     use itertools::Itertools;
+
+    struct MultiStepWriter {
+        id: usize,
+        linear: LinearString<u32>,
+        ops: Vec<LinearStringDiff<u32>>,
+    }
+
+    struct SyncWriter {
+        id: usize,
+        linear: LinearString<u32>,
+        ops: Vec<LinearStringDiff<u32>>,
+        next_sync_for: [usize; 3],
+    }
+
+    fn apply_diffs(
+        diffs: &[LinearStringDiff<u32>],
+        linear: &mut LinearString<u32>,
+    ) -> Result<(), ()> {
+        for op in diffs {
+            // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
+            op.clone().apply_to(linear).map_err(|_| ())?;
+            linear.validate_integrity().unwrap();
+            // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_with_empty_string() {
@@ -462,13 +495,8 @@ mod tests {
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
         let shared_base = LinearString::new(id_generator.next().unwrap());
-        struct Writer {
-            id: usize,
-            linear: LinearString<u32>,
-            ops: Vec<LinearStringDiff<u32>>,
-        }
         let mut writers: Vec<_> = (0..3)
-            .map(|id| Writer {
+            .map(|id| MultiStepWriter {
                 id,
                 linear: shared_base.clone(),
                 ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
@@ -660,31 +688,12 @@ mod tests {
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
         let shared_base = LinearString::new(id_generator.next().unwrap());
-        struct Writer {
-            id: usize,
-            linear: LinearString<u32>,
-            ops: Vec<LinearStringDiff<u32>>,
-            next_sync_for: [usize; 3],
-        }
-        let mut writers: [Writer; 3] = std::array::from_fn(|id| Writer {
+        let mut writers: [SyncWriter; 3] = std::array::from_fn(|id| SyncWriter {
             id,
             linear: shared_base.clone(),
             ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
             next_sync_for: [0; 3],
         });
-
-        fn apply_diffs(
-            diffs: &[LinearStringDiff<u32>],
-            linear: &mut LinearString<u32>,
-        ) -> Result<(), ()> {
-            for op in diffs {
-                // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
-                op.clone().apply_to(linear).map_err(|_| ())?;
-                linear.validate_integrity().unwrap();
-                // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
-            }
-            Ok(())
-        }
 
         'scenario_loop: for scenario in &SYNC_SCENARIOS {
             //println!("##########\n### Scenario #{scenario_index} ###\n#########");

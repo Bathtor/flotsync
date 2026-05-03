@@ -130,13 +130,14 @@ fn build_lvw_array_fixture(name: &'static str, updates: usize) -> LvwFixture {
 
     for step in 0..updates {
         let version = (step as u64) + 4;
+        let step_value = usize_to_i64(step);
         let value_update = match step % 3 {
             0 => ModelNullableBasicValue::Null,
             1 => ModelNullableBasicValue::Value(ModelBasicValue::Array(
                 ModelPrimitiveValueArray::Int(Vec::new()),
             )),
             _ => ModelNullableBasicValue::Value(ModelBasicValue::Array(
-                ModelPrimitiveValueArray::Int(vec![step as i64, step as i64 + 1, step as i64 + 2]),
+                ModelPrimitiveValueArray::Int(vec![step_value, step_value + 1, step_value + 2]),
             )),
         };
         value.update(indexed_update_id(version), value_update);
@@ -193,14 +194,12 @@ fn build_linear_list_fixture(
     chunk_size: usize,
     delete_every: usize,
 ) -> LinearListFixture {
-    let initial_values = (0..chunk_size)
-        .map(|value| value as i64)
-        .collect::<Vec<_>>();
+    let initial_values = (0..chunk_size).map(usize_to_i64).collect::<Vec<_>>();
     let mut value = LinearList::with_values(initial_values.clone(), update_id(200));
 
     for chunk_index in 1..chunk_count {
-        let start = (chunk_index * chunk_size) as i64;
-        let chunk = (start..start + chunk_size as i64).collect::<Vec<_>>();
+        let start = usize_to_i64(chunk_index * chunk_size);
+        let chunk = (start..start + usize_to_i64(chunk_size)).collect::<Vec<_>>();
         value.append(indexed_update_id(200 + chunk_index as u64), chunk);
     }
 
@@ -225,6 +224,10 @@ fn build_linear_list_fixture(
         value_type: PrimitiveType::Int,
         nodes: sink.into_nodes(),
     }
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).expect("benchmark fixture sizes fit into i64")
 }
 
 fn lvw_bytes(fixture: &LvwFixture) -> Vec<u8> {
@@ -314,20 +317,20 @@ fn bench_lvw_fixture(c: &mut Criterion, fixture: &LvwFixture) {
     let mut encode_group = c.benchmark_group("history_snapshot/lvw/encode_bytes");
     encode_group.throughput(Throughput::Elements(fixture.nodes.len() as u64));
     encode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(lvw_bytes(black_box(fixture))))
+        b.iter(|| black_box(lvw_bytes(black_box(fixture))));
     });
     encode_group.finish();
 
     let mut decode_group = c.benchmark_group("history_snapshot/lvw/decode_bytes");
     decode_group.throughput(Throughput::Bytes(bytes.len() as u64));
     decode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(decode_lvw(black_box(&bytes), fixture)))
+        b.iter(|| black_box(decode_lvw(black_box(&bytes), fixture)));
     });
     decode_group.finish();
 
     let mut reconstruct_group = c.benchmark_group("history_snapshot/lvw/decode_and_reconstruct");
     reconstruct_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| reconstruct_lvw(decode_lvw(black_box(&bytes), fixture)))
+        b.iter(|| reconstruct_lvw(decode_lvw(black_box(&bytes), fixture)));
     });
     reconstruct_group.finish();
 }
@@ -339,21 +342,21 @@ fn bench_linear_string_fixture(c: &mut Criterion, fixture: &LinearStringFixture)
     let mut encode_group = c.benchmark_group("history_snapshot/linear_string/encode_bytes");
     encode_group.throughput(Throughput::Elements(fixture.nodes.len() as u64));
     encode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(string_bytes(black_box(fixture))))
+        b.iter(|| black_box(string_bytes(black_box(fixture))));
     });
     encode_group.finish();
 
     let mut decode_group = c.benchmark_group("history_snapshot/linear_string/decode_bytes");
     decode_group.throughput(Throughput::Bytes(bytes.len() as u64));
     decode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(decode_string(black_box(&bytes))))
+        b.iter(|| black_box(decode_string(black_box(&bytes))));
     });
     decode_group.finish();
 
     let mut reconstruct_group =
         c.benchmark_group("history_snapshot/linear_string/decode_and_reconstruct");
     reconstruct_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| reconstruct_string(decode_string(black_box(&bytes))))
+        b.iter(|| reconstruct_string(decode_string(black_box(&bytes))));
     });
     reconstruct_group.finish();
 }
@@ -365,21 +368,21 @@ fn bench_linear_list_fixture(c: &mut Criterion, fixture: &LinearListFixture) {
     let mut encode_group = c.benchmark_group("history_snapshot/linear_list/encode_bytes");
     encode_group.throughput(Throughput::Elements(fixture.nodes.len() as u64));
     encode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(list_bytes(black_box(fixture))))
+        b.iter(|| black_box(list_bytes(black_box(fixture))));
     });
     encode_group.finish();
 
     let mut decode_group = c.benchmark_group("history_snapshot/linear_list/decode_bytes");
     decode_group.throughput(Throughput::Bytes(bytes.len() as u64));
     decode_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| black_box(decode_list(black_box(&bytes), fixture)))
+        b.iter(|| black_box(decode_list(black_box(&bytes), fixture)));
     });
     decode_group.finish();
 
     let mut reconstruct_group =
         c.benchmark_group("history_snapshot/linear_list/decode_and_reconstruct");
     reconstruct_group.bench_function(BenchmarkId::new("current", fixture.name), |b| {
-        b.iter(|| reconstruct_list(decode_list(black_box(&bytes), fixture)))
+        b.iter(|| reconstruct_list(decode_list(black_box(&bytes), fixture)));
     });
     reconstruct_group.finish();
 }

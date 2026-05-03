@@ -43,6 +43,7 @@ impl TransmissionId {
     pub const ONE: Self = Self(1);
 
     /// Returns the current identifier and advances the sequence with wrapping arithmetic.
+    #[must_use]
     pub fn take_next(&mut self) -> Self {
         let current = *self;
         self.0 = self.0.wrapping_add(1);
@@ -89,6 +90,7 @@ pub enum IoPayload {
 
 impl IoPayload {
     /// Returns the total readable payload length in bytes.
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Self::Lease(lease) => lease.len(),
@@ -98,6 +100,7 @@ impl IoPayload {
     }
 
     /// Returns whether the payload is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -109,6 +112,10 @@ impl IoPayload {
     }
 
     /// Chains multiple payload fragments into one logical payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the single non-empty fragment vanishes while normalising the chain.
     pub fn chain(parts: impl IntoIterator<Item = IoPayload>) -> Self {
         let mut normalized_parts = Vec::new();
         for part in parts {
@@ -175,6 +182,7 @@ impl IoPayload {
     }
 
     /// Creates a fresh cursor over the full readable payload.
+    #[must_use]
     pub fn cursor(&self) -> IoPayloadCursor {
         IoPayloadCursor::new(self)
     }
@@ -200,6 +208,10 @@ impl IoPayload {
     /// When the payload is already contiguous, this borrows the existing storage directly. When
     /// the payload is fragmented, it is coalesced into one owned `Bytes` value first, and the
     /// payload is rewritten to keep reusing that contiguous representation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the payload cannot expose one contiguous slice after being coalesced.
     pub fn as_contiguous_slice(&mut self) -> &[u8] {
         if self.try_as_contiguous_slice().is_none() {
             let bytes = self.create_byte_clone();

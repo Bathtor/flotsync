@@ -22,6 +22,9 @@ pub struct Schema {
     pub metadata: HashMap<String, String>,
 }
 impl Schema {
+    /// # Panics
+    ///
+    /// Panics if any field has an invalid default value or if two fields share the same name.
     #[must_use]
     pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
         let mut columns = HashMap::with_capacity(N);
@@ -173,6 +176,9 @@ impl Field {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `values::OrderedValueError` for failure conditions.
     pub fn finite_state_register<S, I, V>(
         name: S,
         states: I,
@@ -334,11 +340,11 @@ impl ReplicatedDataType {
     fn is_nullable(&self) -> bool {
         match self {
             Self::LatestValueWins { value_type } => value_type.is_nullable(),
-            Self::LinearString => false,
-            Self::LinearList { .. } => false,
-            Self::MonotonicCounter { .. } => false,
-            Self::TotalOrderRegister { .. } => false,
             Self::TotalOrderFiniteStateRegister { value_type, .. } => value_type.is_nullable(),
+            Self::LinearString
+            | Self::LinearList { .. }
+            | Self::MonotonicCounter { .. }
+            | Self::TotalOrderRegister { .. } => false,
         }
     }
 

@@ -98,6 +98,10 @@ pub mod shutdown {
         }
 
         /// Shutdown and wait for the thread to complete.
+        ///
+        /// # Errors
+        ///
+        /// See `ShutdownError` for failure conditions.
         pub async fn shutdown(self) -> Result<T, ShutdownError> {
             self.shutdown_handle.shutdown();
             blocking::unblock(|| self.join_handle.join().map_err(|_| PanicSnafu.build())).await

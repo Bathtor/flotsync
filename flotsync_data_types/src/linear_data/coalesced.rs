@@ -181,6 +181,10 @@ where
     /// Delete the (sub-range of the) node corresponding to [start, end].
     ///
     /// Returns Err (and deletes nothing) if this range is not part of a single node.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Range deletion has several structurally distinct split cases; keeping them together preserves the invariant checks."
+    )]
     pub fn delete_range(
         &mut self,
         start: &IdWithIndex<BaseId>,
@@ -199,25 +203,6 @@ where
             .enumerate()
             .find(|(_index, node)| node.contains(start))
             .ok_or(DeleteError::NotFound)?;
-
-        enum DeleteMode {
-            Suffix {
-                node_index: usize,
-            },
-            Subrange {
-                node_index: usize,
-            },
-            Full {
-                node_index: usize,
-            },
-            Prefix {
-                node_index: usize,
-            },
-            Skip {
-                #[allow(unused, reason = "Useful for debugging and takes no extra space.")]
-                node_index: usize,
-            },
-        }
 
         let item_from_node = |node_index: usize,
                               node: &Node<IdWithIndex<BaseId>, Value>,
@@ -303,6 +288,10 @@ where
     }
 
     /// Returns the ids that make up insert nodes in the given `range` of element positions.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Inclusive, exclusive, and unbounded ranges need separate boundary resolution for clear error-free ID slicing."
+    )]
     pub fn ids_in_range<R>(&self, range: R) -> Option<NodeIdRange<BaseId>>
     where
         R: RangeBounds<usize>,
@@ -489,6 +478,10 @@ where
 
     /// Splits the node at `node_index` according to `mode` around `split_index` and returns
     /// the node index of the new node with the id that matches `split_index`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Node splitting owns the value during in-place replacement and keeps the index arithmetic in one invariant-preserving block."
+    )]
     fn split_node(&mut self, node_index: usize, split_index: u32, mut mode: SplitMode) -> usize {
         let target_node = &mut self.base.nodes[node_index];
         assert!(
@@ -756,7 +749,7 @@ where
         })
         .map_err(|op| match op {
             DataOperation::Insert { value, .. } => value,
-            _ => {
+            DataOperation::Delete { .. } => {
                 // The apply_operation should not return a different operation type on error.
                 unreachable!();
             }
@@ -808,6 +801,10 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Insert application validates predecessor, successor, duplicate, and sibling-order cases as one CRDT transition."
+    )]
     fn apply_operation(
         &mut self,
         operation: DataOperation<Self::Id, Value>,
@@ -1137,6 +1134,25 @@ where
     }
 }
 
+enum DeleteMode {
+    Suffix {
+        node_index: usize,
+    },
+    Subrange {
+        node_index: usize,
+    },
+    Full {
+        node_index: usize,
+    },
+    Prefix {
+        node_index: usize,
+    },
+    Skip {
+        #[allow(unused, reason = "Useful for debugging and takes no extra space.")]
+        node_index: usize,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SplitMode {
     /// New node starts with target id.
@@ -1240,6 +1256,7 @@ where
     /// at index 0.
     pub const MAX_LENGTH: usize = u32::MAX as usize;
 
+    #[must_use]
     pub fn zero(id: Id) -> Self {
         IdWithIndex { id, index: 0 }
     }
@@ -1248,12 +1265,14 @@ where
     ///
     /// # Panics
     /// - If there are no indices left.
+    #[must_use]
     pub fn increment(&self) -> Self {
         self.checked_increment()
             .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the next sub-id (i.e. the next `index`), if there is one left.
+    #[must_use]
     pub fn checked_increment(&self) -> Option<Self> {
         let mut next = self.clone();
         next.index.checked_add(1u32).map(|next_index| {
@@ -1266,12 +1285,14 @@ where
     ///
     /// # Panics
     /// - If index is 0.
+    #[must_use]
     pub fn decrement(&self) -> Self {
         self.checked_decrement()
             .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the previous sub-id (i.e. the previous `index`), if index is not 0.
+    #[must_use]
     pub fn checked_decrement(&self) -> Option<Self> {
         let mut prev = self.clone();
         prev.index.checked_sub(1u32).map(|prev_index| {
@@ -1283,24 +1304,26 @@ where
     /// Whether we can address all elements in a `num_elements` sized [[Composite]]
     /// if the first element is at `self.index`.
     #[inline]
+    #[must_use]
     pub fn can_address(&self, num_elements: usize) -> bool {
         if num_elements == 0 {
             return true;
         }
-        let last_offset = match u32::try_from(num_elements - 1) {
-            Ok(last_offset) => last_offset,
-            Err(_) => return false,
+        let Ok(last_offset) = u32::try_from(num_elements - 1) else {
+            return false;
         };
         self.index.checked_add(last_offset).is_some()
     }
 
     /// Returns the number of elements in a [[Composite]] that can at most be addressed by this id.
     #[inline]
+    #[must_use]
     pub fn addressable_len(&self) -> usize {
         (Self::MAX_LENGTH.saturating_sub(self.index as usize)).saturating_add(1)
     }
 
     /// Returns `true` iff `other` is the same as what `self.increment()` would return.
+    #[must_use]
     pub fn is_followed_by(&self, other: &Self) -> bool
     where
         Id: PartialEq,
@@ -1322,19 +1345,22 @@ where
             .expect("Index different overflowed")
     }
 
+    #[must_use]
     pub fn checked_next_after(&self, num_elements: usize) -> Option<Self> {
         let offset = u32::try_from(num_elements).ok()?;
         self.checked_add_offset(offset)
     }
 
+    #[must_use]
     pub fn checked_add_offset(&self, rhs: u32) -> Option<Self> {
         let mut next = self.clone();
         next.index = next.index.checked_add(rhs)?;
         Some(next)
     }
 
-    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the largest
+    /// Returns a new id where `id` is the the same as `self.id` and `index` is the largest
     /// possible value.
+    #[must_use]
     pub fn with_max_index(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -1342,8 +1368,9 @@ where
         }
     }
 
-    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the smallest
+    /// Returns a new id where `id` is the the same as `self.id` and `index` is the smallest
     /// possible value (i.e. 0).
+    #[must_use]
     pub fn with_zero_index(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -1407,6 +1434,9 @@ where
         self.start_index == self.end_index
     }
 
+    /// # Panics
+    ///
+    /// Panics if this range's start index is greater than its end index.
     pub fn len(&self) -> u32 {
         assert!(self.start_index <= self.end_index);
         self.end_index - self.start_index

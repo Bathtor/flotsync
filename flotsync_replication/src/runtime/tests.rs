@@ -96,7 +96,7 @@ struct RuntimeFixture<S> {
 }
 
 /// Test-only store wrapper that can fail one future row-patch write while
-/// delegating all durable state to the wrapped SQLite store.
+/// delegating all durable state to the wrapped `SQLite` store.
 struct FailingStore<S> {
     inner: Arc<S>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
@@ -171,9 +171,9 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_replication_group(group_id)
     }
 
-    fn load_replication_groups<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -190,10 +190,10 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_replication_groups_for_ids(group_ids)
     }
 
-    fn insert_replication_group<'a>(
-        &'a mut self,
+    fn insert_replication_group(
+        &mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")
@@ -223,10 +223,10 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_dataset_rows(group_id, dataset_id, row_keys)
     }
 
-    fn apply_dataset_row_patch<'a>(
-        &'a mut self,
+    fn apply_dataset_row_patch(
+        &mut self,
         patch: DatasetRowPatch,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         let failure = self.fail_next_apply_dataset_row_patch.clone();
         async move {
             let should_fail = {
@@ -284,10 +284,10 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_replication_updates(group_id, filter)
     }
 
-    fn append_replication_update<'a>(
-        &'a mut self,
+    fn append_replication_update(
+        &mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")
@@ -571,7 +571,7 @@ where
     }
 }
 
-fn start_host(local_member: MemberIdentity) -> DeliveryRuntimeHost {
+fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
     let store = Arc::new(
         SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
     );
@@ -798,7 +798,7 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
 #[test]
 fn delivery_runtime_host_updates_shared_group_memberships() {
     let local_member = Identifier::from_array(ALICE_MEMBER_SEGMENTS);
-    let mut host = start_host(local_member.clone());
+    let mut host = start_host(&local_member);
     let group_id = GroupId(Uuid::from_u128(1));
     let memberships = GroupMemberships::from_groups([(
         group_id,
@@ -832,7 +832,7 @@ fn load_replication_runtime_returns_concrete_runtime() {
 
 #[test]
 fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
-    let mut host = start_host(Identifier::from_array(PROBE_MEMBER_SEGMENTS));
+    let mut host = start_host(&Identifier::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     host.shutdown();
@@ -869,7 +869,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     );
     let listener = Arc::new(ListenerStub::default());
     let mut host = DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
-        alice_member,
+        &alice_member,
         store,
         listener,
         Some(runtime_config_toml.as_str()),
@@ -1687,6 +1687,10 @@ fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This scenario spells out a full conflict timeline; splitting it would hide the causal setup."
+)]
 fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -1924,10 +1928,10 @@ fn inbound_update_rejects_operation_change_id_mismatch_before_persisting() {
 
     match error {
         InboundDeliveryError::UpdateOperationIdMismatch {
-            group_id: actual_group_id,
-            update_id,
-            dataset_id: actual_dataset_id,
-            operation_change_id: actual_operation_change_id,
+            group: actual_group_id,
+            update: update_id,
+            dataset: actual_dataset_id,
+            operation_change: actual_operation_change_id,
         } => {
             assert_eq!(actual_group_id, group_id);
             assert_eq!(update_id, batch_update_id);
@@ -1979,6 +1983,10 @@ fn inbound_update_rejects_self_dependent_read_versions_before_persisting() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The restart scenario keeps pre- and post-restart assertions together for readability."
+)]
 fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -2107,6 +2115,10 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The rollback scenario needs the complete ready-update chain inline to show the failing write boundary."
+)]
 fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -2333,8 +2345,8 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
         .expect_err("conflicting duplicate payload should fail");
     match error {
         InboundDeliveryError::ConflictingPersistedUpdate {
-            group_id: actual_group_id,
-            update_id,
+            group: actual_group_id,
+            update: update_id,
         } => {
             assert_eq!(actual_group_id, group_id);
             assert_eq!(

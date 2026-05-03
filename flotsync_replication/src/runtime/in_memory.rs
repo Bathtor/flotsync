@@ -539,10 +539,10 @@ fn decode_update_schema_operation<'schema>(
     ensure!(
         operation.change_id == update.update_id,
         inbound::UpdateOperationIdMismatchSnafu {
-            group_id: update.group_id,
-            update_id: update.update_id,
-            dataset_id: dataset_update.dataset_id.clone(),
-            operation_change_id: operation.change_id,
+            group: update.group_id,
+            update: update.update_id,
+            dataset: dataset_update.dataset_id.clone(),
+            operation_change: operation.change_id,
         }
     );
     Ok(operation)

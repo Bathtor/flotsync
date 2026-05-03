@@ -73,6 +73,10 @@ impl<T> RequiredOneofExt<T> for Option<T> {
 }
 
 /// Encode a schema operation into its protobuf transport form.
+///
+/// # Errors
+///
+/// See `OperationCodecError` for failure conditions.
 pub fn encode_schema_operation(
     operation: &model::SchemaOperation<'_, Uuid, UpdateId>,
     schema: &Schema,
@@ -110,6 +114,10 @@ pub fn encode_schema_operation(
 }
 
 /// Decode a schema operation from protobuf, validating it against the provided schema.
+///
+/// # Errors
+///
+/// See `OperationCodecError` for failure conditions.
 pub fn decode_schema_operation(
     mut operation: proto::SchemaOperation,
     schema: &Schema,
@@ -140,7 +148,7 @@ pub fn decode_schema_operation(
             }
         }
         proto::schema_operation::Operation::Delete(delete) => {
-            let operation = decode_delete_row_operation(*delete)?;
+            let operation = decode_delete_row_operation(&delete)?;
             model::SchemaOperation {
                 change_id,
                 operation,
@@ -154,6 +162,10 @@ pub fn decode_schema_operation(
 }
 
 /// Encode one row snapshot into its protobuf transport form.
+///
+/// # Errors
+///
+/// See `OperationCodecError` for failure conditions.
 pub fn encode_row_snapshot(
     snapshot: &model::RowSnapshot<'_, UpdateId>,
     schema: &Schema,
@@ -166,6 +178,10 @@ pub fn encode_row_snapshot(
 }
 
 /// Decode one protobuf row snapshot against `schema`.
+///
+/// # Errors
+///
+/// See `OperationCodecError` for failure conditions.
 pub fn decode_row_snapshot(
     snapshot: proto::RowSnapshot,
     schema: &Schema,
@@ -213,7 +229,7 @@ fn decode_insert_row_operation(
     mut operation: proto::InsertRowOperation,
     schema: &Schema,
 ) -> OperationResult<RowOperation<'static, Uuid, UpdateId>> {
-    let row_id = decode_row_id(operation.row_id)?;
+    let row_id = decode_row_id(&operation.row_id)?;
     let snapshot = operation
         .snapshot
         .take_required("InsertRowOperation", "snapshot")
@@ -225,7 +241,7 @@ fn decode_update_row_operation(
     operation: proto::UpdateRowOperation,
     schema: &Schema,
 ) -> OperationResult<RowOperation<'_, Uuid, UpdateId>> {
-    let row_id = decode_row_id(operation.row_id)?;
+    let row_id = decode_row_id(&operation.row_id)?;
     let fields = operation
         .fields
         .into_iter()
@@ -235,13 +251,17 @@ fn decode_update_row_operation(
 }
 
 fn decode_delete_row_operation(
-    operation: proto::DeleteRowOperation,
+    operation: &proto::DeleteRowOperation,
 ) -> OperationResult<RowOperation<'static, Uuid, UpdateId>> {
-    let row_id = decode_row_id(operation.row_id)?;
+    let row_id = decode_row_id(&operation.row_id)?;
     Ok(RowOperation::Delete { row_id })
 }
 
 /// Encode one schema-bound field operation.
+///
+/// # Errors
+///
+/// See `OperationCodecError` for failure conditions.
 pub fn encode_operation_field(
     field: &model::OperationFieldValue<'_, UpdateId>,
 ) -> OperationResult<proto::OperationField> {
@@ -377,8 +397,8 @@ fn encode_row_id(row_id: Uuid) -> Vec<u8> {
     row_id.as_bytes().to_vec()
 }
 
-fn decode_row_id(bytes: Vec<u8>) -> OperationResult<Uuid> {
-    Uuid::from_slice(&bytes).map_err(|source| OperationCodecError::InvalidRowIdBytes {
+fn decode_row_id(bytes: &[u8]) -> OperationResult<Uuid> {
+    Uuid::from_slice(bytes).map_err(|source| OperationCodecError::InvalidRowIdBytes {
         len: bytes.len(),
         source,
     })
@@ -449,7 +469,6 @@ fn decode_linear_string_action(
     }
 }
 
-#[inline(always)]
 fn encode_linear_string_insert_operation(
     id: &UpdateIdWithIndex,
     pred: &UpdateIdWithIndex,

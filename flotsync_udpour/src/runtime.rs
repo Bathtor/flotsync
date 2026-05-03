@@ -209,6 +209,10 @@ pub struct UDPourConfig {
 
 impl UDPourConfig {
     /// Builds runtime configuration from the sender/receiver state-machine configs.
+    ///
+    /// # Errors
+    ///
+    /// See `UDPourConfigError` for failure conditions.
     pub fn new(
         sender: SenderConfig,
         mut receiver: ReceiverConfig,
@@ -680,6 +684,10 @@ impl UDPourComponent {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact scheduled callbacks deliver timer handles by value"
+    )]
     fn handle_dispatch_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
         let Some(active_timer) = self.dispatcher.dispatch_timer.take() else {
             return Handled::Ok;
@@ -808,6 +816,10 @@ impl UDPourComponent {
         Handled::Ok
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "component messages are consumed at the actor boundary"
+    )]
     fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
         match result {
             UdpSendResult::Ack {
@@ -1059,6 +1071,10 @@ impl UDPourComponent {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact scheduled callbacks deliver timer handles by value"
+    )]
     fn handle_poll_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
         let Some(active_timer) = self.poll_timer.take() else {
             return Handled::Ok;

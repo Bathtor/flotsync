@@ -62,6 +62,11 @@ where
     }
 
     /// Returns the current value of this CRDT.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the register has no value, which violates the construction and operation
+    /// invariants for `LatestValue`.
     #[must_use]
     pub fn content(&self) -> &T {
         self.data
@@ -71,6 +76,11 @@ where
     }
 
     /// Update the current value of this CRDT to `new_value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operation generated from this register cannot be applied back to the same
+    /// register. That indicates corrupted internal link state.
     pub fn update(&mut self, id: Id, new_value: T) {
         let op = self.update_operation(id, new_value);
         self.apply_operation(op)
@@ -81,6 +91,11 @@ where
     /// update the current value of this CRDT to `new_value.`
     /// Depending on concurrent updates, `new_value` may never be the `current` value at some
     /// replicas.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the generated linear insert cannot be represented as a latest-value update.
+    /// That indicates corrupted internal link state.
     pub fn update_operation(&self, id: Id, new_value: T) -> UpdateOperation<Id, T> {
         let ids = self.data.ids_after_head();
         ids.insert_operation(id, new_value)
@@ -89,6 +104,15 @@ where
     }
 
     /// Apply an update operation received from some replica (including ourselves).
+    ///
+    /// # Errors
+    ///
+    /// See `UpdateOperation<Id, T>` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a rejected operation from the underlying linear data cannot be converted back
+    /// into a latest-value update operation. That indicates corrupted internal operation shape.
     pub fn apply_operation(
         &mut self,
         operation: UpdateOperation<Id, T>,
@@ -106,6 +130,10 @@ where
     }
 
     /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// See `S::Error` for failure conditions.
     pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<Id, T>,
@@ -113,6 +141,9 @@ where
         self.data.encode_snapshot(sink, |x| x)
     }
 
+    /// # Errors
+    ///
+    /// See `SnapshotReadError<E>` for failure conditions.
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
         E: snafu::Error + Send + Sync + 'static,
@@ -129,6 +160,10 @@ where
     ///
     /// This is primarily useful after reconstructing a value from an external snapshot or other
     /// untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// See `IntegrityError` for failure conditions.
     pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
         self.data.validate_integrity()
     }
@@ -170,7 +205,7 @@ impl<Id, T> From<UpdateOperation<Id, T>> for DataOperation<Id, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linear_data::tests::TestIdGenerator;
+    use crate::linear_data::tests::{TestIdGenerator, interleavings_with_local_order};
     use itertools::Itertools;
 
     type Id = u32;
@@ -334,48 +369,6 @@ mod tests {
             local.apply_operation(op2.clone()).unwrap();
             vec![op1, op2]
         });
-
-        // Generate all interleavings preserving per-writer causal order.
-        fn interleavings_with_local_order(
-            per_writer_count: usize,
-            num_writers: usize,
-        ) -> Vec<Vec<usize>> {
-            let total_steps = per_writer_count * num_writers;
-            let mut out = Vec::new();
-            let mut current = Vec::with_capacity(total_steps);
-            let mut next_for_writer = vec![0usize; num_writers];
-
-            fn dfs(
-                per_writer_count: usize,
-                total_steps: usize,
-                current: &mut Vec<usize>,
-                next_for_writer: &mut [usize],
-                out: &mut Vec<Vec<usize>>,
-            ) {
-                if current.len() == total_steps {
-                    out.push(current.clone());
-                    return;
-                }
-                for writer in 0..next_for_writer.len() {
-                    if next_for_writer[writer] < per_writer_count {
-                        next_for_writer[writer] += 1;
-                        current.push(writer);
-                        dfs(per_writer_count, total_steps, current, next_for_writer, out);
-                        current.pop();
-                        next_for_writer[writer] -= 1;
-                    }
-                }
-            }
-
-            dfs(
-                per_writer_count,
-                total_steps,
-                &mut current,
-                &mut next_for_writer,
-                &mut out,
-            );
-            out
-        }
 
         let schedules = interleavings_with_local_order(2, 3);
         assert_eq!(schedules.len(), 90);

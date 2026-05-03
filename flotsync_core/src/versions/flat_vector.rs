@@ -259,10 +259,9 @@ impl VersionVector {
                 combine(left.group_version, right.group_version),
                 combine(left.override_version, right.override_version),
             ),
-            (VersionVector::Override { .. }, VersionVector::Override { .. }) => {
-                VersionVector::from_versions(pointwise_combine_to_vec(self, other, combine))
-            }
-            (VersionVector::Full(_), _) | (_, VersionVector::Full(_)) => {
+            (VersionVector::Override { .. }, VersionVector::Override { .. })
+            | (VersionVector::Full(_), _)
+            | (_, VersionVector::Full(_)) => {
                 VersionVector::from_versions(pointwise_combine_to_vec(self, other, combine))
             }
         }
@@ -280,13 +279,13 @@ impl fmt::Display for VersionVector {
                 if version.override_position == 0 {
                     write!(
                         f,
-                        "〈{}, 1-{}:{}〉",
+                        "〈{}, 1-{}:{}〉",
                         version.override_version, last_position, version.group_version
                     )
                 } else if version.override_position == last_position {
                     write!(
                         f,
-                        "〈0-{}:{}, {}〉",
+                        "〈0-{}:{}, {}〉",
                         last_position - 1,
                         version.group_version,
                         version.override_version
@@ -296,7 +295,7 @@ impl fmt::Display for VersionVector {
                     let post_override = version.override_position + 1;
                     write!(
                         f,
-                        "〈0-{}:{}, {}:{}, {}-{}:{}〉",
+                        "〈0-{}:{}, {}:{}, {}-{}:{}〉",
                         pre_override,
                         version.group_version,
                         version.override_position,
@@ -310,7 +309,7 @@ impl fmt::Display for VersionVector {
             VersionVector::Synced {
                 num_members,
                 version,
-            } => write!(f, "〈0-{}:{}〉", num_members.get() - 1, version),
+            } => write!(f, "〈0-{}:{}〉", num_members.get() - 1, version),
         }
     }
 }
@@ -423,7 +422,7 @@ impl<'a> IntoIterator for &'a VersionVector {
 
     fn into_iter(self) -> Self::IntoIter {
         let internal = match self {
-            VersionVector::Full(v) => VersionVectorIterInternal::Full(v.0.iter().cloned()),
+            VersionVector::Full(v) => VersionVectorIterInternal::Full(v.0.iter().copied()),
             VersionVector::Override {
                 num_members,
                 version,
@@ -446,9 +445,9 @@ impl<'a> IntoIterator for &'a VersionVector {
 This is to hide the internals of the iterator implementation from the public API.
 */
 
-/// Use [[VersionVector::iter()]].
+/// Use [[`VersionVector::iter()`]].
 pub struct VersionVectorIter<'a>(VersionVectorIterInternal<'a>);
-impl<'a> Iterator for VersionVectorIter<'a> {
+impl Iterator for VersionVectorIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -457,11 +456,11 @@ impl<'a> Iterator for VersionVectorIter<'a> {
 }
 
 enum VersionVectorIterInternal<'a> {
-    Full(std::iter::Cloned<std::slice::Iter<'a, u64>>),
+    Full(std::iter::Copied<std::slice::Iter<'a, u64>>),
     Override(OverrideIter),
     Synced(std::iter::RepeatN<u64>),
 }
-impl<'a> Iterator for VersionVectorIterInternal<'a> {
+impl Iterator for VersionVectorIterInternal<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -544,7 +543,7 @@ fn hb_compare_full_synced(f: &PureVersionVector, synced_version: u64) -> Happene
     f.assert_valid();
 
     let mut orderings = EncounteredOrderings::none();
-    for value in f.0.iter() {
+    for value in &f.0 {
         orderings.update(value.cmp(&synced_version));
         if orderings.has_less_and_greater() {
             // We can stop checking early in this case.
@@ -558,12 +557,12 @@ fn hb_compare_override_synced(o: &OverrideVersion, synced_version: u64) -> Happe
 
     match o.group_version.cmp(&synced_version) {
         cmp::Ordering::Less => match o.override_version.cmp(&synced_version) {
-            cmp::Ordering::Less => HappenedBeforeOrdering::Before, //  (5, 6) vs. 7
-            cmp::Ordering::Equal => HappenedBeforeOrdering::Before, //  (5, 6) vs. 6
+            // (5, 6) vs. 7; (5, 6) vs. 6.
+            cmp::Ordering::Less | cmp::Ordering::Equal => HappenedBeforeOrdering::Before,
             cmp::Ordering::Greater => HappenedBeforeOrdering::Concurrent, // (5, 7) vs. 6
         },
-        cmp::Ordering::Equal => HappenedBeforeOrdering::After, // (5, 6) vs. 5
-        cmp::Ordering::Greater => HappenedBeforeOrdering::After, // (5, 6) vs. 4
+        // (5, 6) vs. 5; (5, 6) vs. 4.
+        cmp::Ordering::Equal | cmp::Ordering::Greater => HappenedBeforeOrdering::After,
     }
 }
 
@@ -646,18 +645,23 @@ fn pointwise_combine_to_vec(
         .collect()
 }
 
-/// The traditiononal array representation of a vector with every position corresponding to that member.
+/// The traditional array representation of a vector with every position corresponding to that member.
 ///
 /// Note that empty vectors are not supported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PureVersionVector(pub Box<[u64]>);
 impl PureVersionVector {
+    /// # Panics
+    ///
+    /// Panics if this vector was constructed with zero members.
+    #[must_use]
     pub const fn len(&self) -> NonZeroUsize {
         self.assert_valid();
         NonZeroUsize::new(self.0.len())
             .expect("We just checked that the vector's length is non-zero")
     }
 
+    #[must_use]
     pub const fn max_version(&self) -> u64 {
         self.assert_valid();
 
@@ -676,6 +680,9 @@ impl PureVersionVector {
         max
     }
 
+    /// # Panics
+    ///
+    /// Panics if `position` is outside the vector or if that member has already reached `u64::MAX`.
     pub fn increment_at(&mut self, position: usize) {
         // No need to check position, indexed access is anyway checked.
         self.0[position] = self.0[position]
@@ -683,17 +690,18 @@ impl PureVersionVector {
             .expect("Max version reached");
     }
 
+    #[must_use]
     fn with_version_at(&self, position: usize, version: u64) -> VersionVector {
         let mut versions = self.0.clone().into_vec();
         versions[position] = version;
         VersionVector::from_versions(versions)
     }
 
+    #[must_use]
     const fn is_valid(&self) -> bool {
         !self.0.is_empty()
     }
 
-    #[inline(always)]
     const fn assert_valid(&self) {
         debug_assert!(self.is_valid());
     }
@@ -712,7 +720,7 @@ impl From<Vec<u64>> for PureVersionVector {
 }
 impl fmt::Display for PureVersionVector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "〈{}〉", self.0.iter().join(", "))
+        write!(f, "〈{}〉", self.0.iter().join(", "))
     }
 }
 impl HappenedBeforeOrd for PureVersionVector {
@@ -747,21 +755,28 @@ impl PartialOrd for PureVersionVector {
     }
 }
 
-/// A representation of a [[VersionVector]] for when the system is mostly synced up,
+/// A representation of a [[`VersionVector`]] for when the system is mostly synced up,
 /// but a single member is posting a new version.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the domain term is override version, and the accessor intentionally exposes that wording"
+)]
 pub struct OverrideVersion {
-    /// Everyone has this version, except the member with [[override_position]].
+    /// Everyone has this version, except the member with [[`override_position`]].
     group_version: u64,
     /// The position of the member with the newer version in the full vector of members.
     pub override_position: usize,
     /// The new version at this member.
     ///
-    /// This must be > [[group_version]]!
+    /// This must be > [[`group_version`]]!
     override_version: u64,
 }
 impl OverrideVersion {
-    /// Panics if the combination of `group_version` and `override_version` is not legal.
+    /// # Panics
+    ///
+    /// Panics if `override_version` is not greater than `group_version`.
+    #[must_use]
     pub const fn new(group_version: u64, override_position: usize, override_version: u64) -> Self {
         assert!(group_version < override_version);
         Self {
@@ -772,6 +787,7 @@ impl OverrideVersion {
     }
 
     /// Returns `None` if the combination of `group_version` and `override_version` is not legal.
+    #[must_use]
     pub const fn new_opt(
         group_version: u64,
         override_position: usize,
@@ -834,6 +850,11 @@ impl OverrideVersion {
     }
 
     /// Creates a new instance where `override_version = group_version + 1`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `group_version` is already `u64::MAX`.
+    #[must_use]
     pub const fn with_next_version(group_version: u64, override_position: usize) -> Self {
         Self {
             group_version,
@@ -842,16 +863,19 @@ impl OverrideVersion {
         }
     }
 
-    /// Everyone has this version, except the member with [[override_position]].
+    /// Everyone has this version, except the member with [[`override_position`]].
+    #[must_use]
     pub const fn group_version(&self) -> u64 {
         self.group_version
     }
 
-    /// The new version at the member with [[override_position]].
+    /// The new version at the member with [[`override_position`]].
+    #[must_use]
     pub const fn override_version(&self) -> u64 {
         self.override_version
     }
 
+    #[must_use]
     pub fn to_vector(&self, num_members: NonZeroUsize) -> PureVersionVector {
         let mut entries = vec![self.group_version; num_members.get()];
         entries[self.override_position] = self.override_version;
@@ -916,12 +940,12 @@ impl OverrideVersion {
         VersionVector::Full(versions)
     }
 
+    #[must_use]
     const fn is_valid(&self) -> bool {
         self.group_version < self.override_version
     }
 
-    /// Panic if not [[is_valid]].
-    #[inline(always)]
+    /// Panic if not [[`is_valid`]].
     fn assert_valid(&self) {
         // Can be debug assert now, because we are enforcing this during construction.
         debug_assert!(self.is_valid(), "Invalid override version: {self:?}");
@@ -933,30 +957,30 @@ impl HappenedBeforeOrd for OverrideVersion {
         other.assert_valid();
         if self.override_position == other.override_position {
             match self.group_version.cmp(&other.group_version) {
-                cmp::Ordering::Less => {
-                    match self.override_version.cmp(&other.override_version) {
-                        cmp::Ordering::Less => HappenedBeforeOrdering::Before, // (5, 6) vs. (6, 7)
-                        cmp::Ordering::Equal => HappenedBeforeOrdering::Before, // (5, 6) vs (6, 6)
-                        cmp::Ordering::Greater => HappenedBeforeOrdering::Concurrent, // Concurrent, e.g. (5, 8) vs. (6, 7)
-                    }
-                }
+                cmp::Ordering::Less => match self.override_version.cmp(&other.override_version) {
+                    // (5, 6) vs. (6, 7); (5, 6) vs (6, 6).
+                    cmp::Ordering::Less | cmp::Ordering::Equal => HappenedBeforeOrdering::Before,
+                    cmp::Ordering::Greater => HappenedBeforeOrdering::Concurrent, // Concurrent, e.g. (5, 8) vs. (6, 7)
+                },
                 cmp::Ordering::Equal => self.override_version.cmp(&other.override_version).into(),
                 cmp::Ordering::Greater => {
                     match self.override_version.cmp(&other.override_version) {
                         cmp::Ordering::Less => HappenedBeforeOrdering::Concurrent, // Concurrent, e.g. (6, 7) vs (5, 8)
-                        cmp::Ordering::Equal => HappenedBeforeOrdering::After, // (6, 7) vs (5, 7)
-                        cmp::Ordering::Greater => HappenedBeforeOrdering::After, // (6, 7) vs. (5, 6)
+                        // (6, 7) vs (5, 7); (6, 7) vs. (5, 6).
+                        cmp::Ordering::Equal | cmp::Ordering::Greater => {
+                            HappenedBeforeOrdering::After
+                        }
                     }
                 }
             }
         } else {
             // When we have different ids, then the override_version of one is part of the other's group_version.
             match self.override_version.cmp(&other.group_version) {
-                cmp::Ordering::Less => HappenedBeforeOrdering::Before, // (5, 6) vs (7, 8)
-                cmp::Ordering::Equal => HappenedBeforeOrdering::Before, // (5, 6) vs (6, 7)
+                // (5, 6) vs (7, 8); (5, 6) vs (6, 7).
+                cmp::Ordering::Less | cmp::Ordering::Equal => HappenedBeforeOrdering::Before,
                 cmp::Ordering::Greater => match other.override_version.cmp(&self.group_version) {
-                    cmp::Ordering::Less => HappenedBeforeOrdering::After, // (7, 8) vs (5, 6)
-                    cmp::Ordering::Equal => HappenedBeforeOrdering::After, // (6, 7) vs (5, 6)
+                    // (7, 8) vs (5, 6); (6, 7) vs (5, 6).
+                    cmp::Ordering::Less | cmp::Ordering::Equal => HappenedBeforeOrdering::After,
                     cmp::Ordering::Greater => HappenedBeforeOrdering::Concurrent, // Concurrent (7, 8) vs. (5, 8)
                 },
             }
@@ -972,7 +996,7 @@ impl fmt::Display for OverrideVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "〈{}..., {}:{}, {}...〉",
+            "〈{}..., {}:{}, {}...〉",
             self.group_version, self.override_position, self.override_version, self.group_version,
         )
     }

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "Codec helpers consistently accept owned protobuf messages and small value-ref enums."
+)]
+
 pub mod columnar_history;
 pub mod operations;
 pub use columnar_history::*;
@@ -74,6 +79,9 @@ pub fn encode_update_id(id: UpdateId) -> proto::HistoryId {
     }
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_update_id(id: proto::HistoryId) -> Result<UpdateId, CodecError> {
     Ok(UpdateId {
         version: id.version,
@@ -91,6 +99,9 @@ pub fn encode_indexed_update_id(id: &UpdateIdWithIndex) -> proto::HistoryId {
     }
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_indexed_update_id(id: proto::HistoryId) -> Result<UpdateIdWithIndex, CodecError> {
     Ok(IdWithIndex {
         id: UpdateId {
@@ -127,6 +138,9 @@ pub fn encode_primitive_value(value: ModelPrimitiveValueRef<'_>) -> proto::Primi
     encoded
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_primitive_value(
     mut value: proto::PrimitiveValue,
 ) -> Result<ModelPrimitiveValue, CodecError> {
@@ -147,7 +161,7 @@ pub fn decode_primitive_value(
         proto::primitive_value::Value::Boolean(value) => Ok(ModelPrimitiveValue::Boolean(value)),
         proto::primitive_value::Value::Binary(value) => Ok(ModelPrimitiveValue::Binary(value)),
         proto::primitive_value::Value::Date(value) => {
-            let date = decode_date(*value)?;
+            let date = decode_date(&value)?;
             Ok(ModelPrimitiveValue::Date(date))
         }
         proto::primitive_value::Value::Timestamp(value) => {
@@ -230,6 +244,9 @@ pub fn encode_primitive_array(
     }
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_primitive_array(
     mut value: proto::PrimitiveArrayValue,
 ) -> Result<ModelPrimitiveValueArray, CodecError> {
@@ -259,7 +276,7 @@ pub fn decode_primitive_array(
             Ok(ModelPrimitiveValueArray::Binary(values.values))
         }
         proto::primitive_array_value::Value::Date(values) => {
-            let dates: Vec<NaiveDate> = values.values.into_iter().map(decode_date).try_collect()?;
+            let dates: Vec<NaiveDate> = values.values.iter().map(decode_date).try_collect()?;
             Ok(ModelPrimitiveValueArray::Date(dates))
         }
         proto::primitive_array_value::Value::Timestamp(values) => {
@@ -286,6 +303,9 @@ pub fn encode_basic_value(value: ModelBasicValueRef<'_>) -> proto::BasicValue {
     encoded
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_basic_value(mut value: proto::BasicValue) -> Result<ModelBasicValue, CodecError> {
     let value = value.value.take().context(MissingOneofSnafu {
         name: "BasicValue.value",
@@ -320,6 +340,9 @@ pub fn encode_nullable_basic_value(
     encoded
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_nullable_basic_value(
     mut value: proto::NullableBasicValue,
 ) -> Result<ModelNullableBasicValue, CodecError> {
@@ -356,6 +379,9 @@ pub fn encode_nullable_primitive_value(
     encoded
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_nullable_primitive_value(
     mut value: proto::NullablePrimitiveValue,
 ) -> Result<ModelNullablePrimitiveValue, CodecError> {
@@ -381,6 +407,9 @@ pub fn encode_counter_value(value: ModelCounterValueRef) -> proto::CounterValue 
     encoded
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_counter_value(
     mut value: proto::CounterValue,
 ) -> Result<ModelCounterValue, CodecError> {
@@ -396,6 +425,9 @@ pub fn decode_counter_value(
     }
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn encode_state_snapshot_value(
     data_type: &ReplicatedDataType,
     value: SnapshotStateValueRef<'_>,
@@ -427,6 +459,9 @@ pub fn encode_state_snapshot_value(
     }
 }
 
+/// # Errors
+///
+/// See `CodecError` for failure conditions.
 pub fn decode_state_snapshot_value(
     data_type: &ReplicatedDataType,
     value: StateSnapshotWireValue,
@@ -459,7 +494,7 @@ fn encode_date(value: NaiveDate) -> proto::Date {
     }
 }
 
-fn decode_date(value: proto::Date) -> Result<NaiveDate, CodecError> {
+pub(crate) fn decode_date(value: &proto::Date) -> Result<NaiveDate, CodecError> {
     NaiveDate::from_ymd_opt(value.year, value.month, value.day).context(InvalidDateSnafu {
         year: value.year,
         month: value.month,

@@ -246,6 +246,7 @@ where
         f.debug_struct("RouteTransportSend")
             .field("send_id", &self.send_id)
             .field("route", &self.route)
+            .field("payload", &"<serializable payload>")
             .finish()
     }
 }

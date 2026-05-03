@@ -254,8 +254,7 @@ fn tcp_listener_empty_scripted_line_closes_cleanly() {
     );
     assert!(
         received.is_empty(),
-        "expected no bytes from empty scripted TCP send, got {:?}",
-        received
+        "expected no bytes from empty scripted TCP send, got {received:?}"
     );
 }
 
@@ -530,20 +529,21 @@ impl SpawnedNetcat {
         self.binding_released = false;
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Call sites build owned diagnostic context strings for this panic path."
+    )]
     fn panic_with_child_diagnostics(
         &mut self,
         context: String,
         observed_status: Option<ExitStatus>,
     ) -> ! {
-        let (status, stdout, stderr) = match observed_status {
-            Some(status) => {
-                let (stdout, stderr) = self.collect_exited_output();
-                (status, stdout, stderr)
-            }
-            None => {
-                let output = self.kill_and_collect_in_place();
-                (output.status, output.stdout, output.stderr)
-            }
+        let (status, stdout, stderr) = if let Some(status) = observed_status {
+            let (stdout, stderr) = self.collect_exited_output();
+            (status, stdout, stderr)
+        } else {
+            let output = self.kill_and_collect_in_place();
+            (output.status, output.stdout, output.stderr)
         };
         panic!(
             "{context}\nexit status: {}\nstdout:\n{}\nstderr:\n{}",
@@ -584,6 +584,10 @@ fn spawn_netcat_with_reserved_bind(kind: ReservedSocketKind, args: &[&str]) -> S
     spawn_netcat_owned(command_args, Some(socket_lease))
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The helper owns command arguments and optional leases for spawned-process lifetime management."
+)]
 fn spawn_netcat_owned(
     command_args: Vec<String>,
     socket_lease: Option<ReservedSocketLease>,

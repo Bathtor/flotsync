@@ -45,6 +45,9 @@ pub struct SchemaOperation<'a, RowId, ChangeId> {
     pub operation: RowOperation<'a, RowId, ChangeId>,
 }
 impl<RowId, ChangeId> SchemaOperation<'_, RowId, ChangeId> {
+    /// # Errors
+    ///
+    /// See `SchemaValueError` for failure conditions.
     pub fn validate_against_schema(&self, schema: &Schema) -> Result<(), SchemaValueError> {
         self.operation.validate_against_schema(schema)
     }
@@ -105,6 +108,9 @@ impl<RowId, ChangeId> RowOperation<'_, RowId, ChangeId> {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `SchemaValueError` for failure conditions.
     pub fn validate_against_schema(&self, schema: &Schema) -> Result<(), SchemaValueError> {
         match self {
             RowOperation::Insert { snapshot, .. } => validate_schema_snapshot(schema, snapshot),
@@ -172,6 +178,9 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `RowSnapshotEncodeError<V::Error>` for failure conditions.
     pub fn encode_snapshot<V>(
         &self,
         schema: &Schema,
@@ -188,6 +197,14 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         writer.end().context(SchemaVisitSnafu)
     }
 
+    /// # Errors
+    ///
+    /// See `RowSnapshotDecodeError<D::Error>` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a field name yielded by `schema.columns.keys()` cannot be resolved back to a
+    /// schema field from the same map.
     pub fn decode_snapshot<D>(
         schema: &Schema,
         decoder: &mut D,
@@ -357,6 +374,10 @@ fn validate_snapshot_field<ChangeId>(
 /// Validate partial operation field payloads against a schema.
 ///
 /// Any subset is allowed, but field names must exist and each field may appear at most once.
+///
+/// # Errors
+///
+/// See `SchemaValueError` for failure conditions.
 pub fn validate_schema_operation_fields<Id>(
     schema: &Schema,
     fields: &[OperationFieldValue<'_, Id>],

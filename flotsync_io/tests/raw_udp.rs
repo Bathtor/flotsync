@@ -51,6 +51,10 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This driver integration test covers both UDP send modes and closed-socket nacks in one socket lifecycle."
+)]
 fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
     init_test_logger();
 
@@ -99,7 +103,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 saw_unconnected_receive = true;
             }
             other => {
-                log::debug!("ignoring unrelated raw UDP event: {:?}", other);
+                log::debug!("ignoring unrelated raw UDP event: {other:?}");
             }
         }
     }
@@ -162,7 +166,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
                 saw_connected_receive = true;
             }
             other => {
-                log::debug!("ignoring unrelated raw UDP event: {:?}", other);
+                log::debug!("ignoring unrelated raw UDP event: {other:?}");
             }
         }
     }
@@ -322,6 +326,10 @@ fn udp_driver_reports_bind_failures_and_socket_configuration_changes() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This driver integration test covers UDP read suspension and resumption with reserved sockets."
+)]
 fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
     init_test_logger();
 
@@ -430,8 +438,7 @@ fn udp_driver_read_suspends_and_resumes_when_ingress_capacity_returns() {
             }
             other => {
                 log::debug!(
-                    "ignoring unrelated raw UDP event while waiting for resume/receive: {:?}",
-                    other
+                    "ignoring unrelated raw UDP event while waiting for resume/receive: {other:?}"
                 );
             }
         }

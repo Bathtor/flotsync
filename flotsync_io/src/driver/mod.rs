@@ -49,6 +49,10 @@ const DEFAULT_THREAD_NAME: &str = "flotsync-io-driver";
 /// forwarding thread.
 pub trait DriverEventSink: Send + Sync + 'static {
     /// Publishes a raw driver event to the configured consumer.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     fn publish(&self, event: DriverEvent) -> Result<()>;
 }
 
@@ -141,6 +145,10 @@ impl<T> DriverRequest<T> {
     /// Attempts to retrieve the completed driver reply without blocking.
     ///
     /// `Ok(None)` means the driver has not produced a reply yet.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn try_receive(&mut self) -> Result<Option<T>> {
         match self.receiver.try_recv() {
             Ok(Some(reply)) => reply.map(Some),
@@ -178,17 +186,25 @@ impl fmt::Debug for IoDriver {
         f.debug_struct("IoDriver")
             .field("config", &self.config)
             .field("running", &self.handle.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl IoDriver {
     /// Starts the dedicated mio driver thread and waits until the runtime is ready.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn start(config: DriverConfig) -> Result<Self> {
         Self::start_with_logger(config, default_runtime_logger())
     }
 
     /// Starts the dedicated mio driver thread with the supplied runtime logger.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn start_with_logger(config: DriverConfig, logger: RuntimeLogger) -> Result<Self> {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let event_sink: Arc<dyn DriverEventSink> =
@@ -199,6 +215,10 @@ impl IoDriver {
     }
 
     /// Starts the dedicated mio driver thread and publishes raw events to the supplied sink.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn start_with_event_sink(
         config: DriverConfig,
         event_sink: Arc<dyn DriverEventSink>,
@@ -207,6 +227,10 @@ impl IoDriver {
     }
 
     /// Starts the dedicated mio driver thread with explicit runtime logger and event sink.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn start_with_logger_and_event_sink(
         config: DriverConfig,
         logger: RuntimeLogger,
@@ -318,6 +342,10 @@ impl IoDriver {
     /// [`ListenerId`] in the listener handle table and a unique shared `mio::Token` in the
     /// readiness table, but it does not yet bind or register a socket. The returned request
     /// resolves once that bookkeeping is installed on the driver thread.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn reserve_listener(&self) -> Result<DriverRequest<ListenerId>> {
         self.request(|reply_tx| ControlCommand::ReserveListener { reply_tx })
     }
@@ -328,6 +356,10 @@ impl IoDriver {
     /// [`ConnectionId`] in the connection handle table and a unique shared `mio::Token` in the
     /// readiness table, but it does not yet create or register a socket. The returned request
     /// resolves once that bookkeeping is installed on the driver thread.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn reserve_connection(&self) -> Result<DriverRequest<ConnectionId>> {
         self.request(|reply_tx| ControlCommand::ReserveConnection { reply_tx })
     }
@@ -338,6 +370,10 @@ impl IoDriver {
     /// [`SocketId`] in the socket handle table and a unique shared `mio::Token` in the readiness
     /// table, but it does not yet bind or register a socket. The returned request resolves once
     /// that bookkeeping is installed on the driver thread.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn reserve_socket(&self) -> Result<DriverRequest<SocketId>> {
         self.request(|reply_tx| ControlCommand::ReserveSocket { reply_tx })
     }
@@ -346,6 +382,10 @@ impl IoDriver {
     ///
     /// Once the request resolves, the driver has returned both the typed handle slot and the
     /// shared readiness token slot to their internal LIFO free lists.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn release_listener(&self, listener_id: ListenerId) -> Result<DriverRequest<()>> {
         self.request(|reply_tx| ControlCommand::ReleaseListener {
             listener_id,
@@ -357,6 +397,10 @@ impl IoDriver {
     ///
     /// Once the request resolves, the driver has returned both the typed handle slot and the
     /// shared readiness token slot to their internal LIFO free lists.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn release_connection(&self, connection_id: ConnectionId) -> Result<DriverRequest<()>> {
         self.request(|reply_tx| ControlCommand::ReleaseConnection {
             connection_id,
@@ -368,6 +412,10 @@ impl IoDriver {
     ///
     /// Once the request resolves, the driver has returned both the typed handle slot and the
     /// shared readiness token slot to their internal LIFO free lists.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn release_socket(&self, socket_id: SocketId) -> Result<DriverRequest<()>> {
         self.request(|reply_tx| ControlCommand::ReleaseSocket {
             socket_id,
@@ -376,11 +424,19 @@ impl IoDriver {
     }
 
     /// Enqueues a transport command for processing on the dedicated driver thread.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn dispatch(&self, command: DriverCommand) -> Result<()> {
         self.send_control(ControlCommand::Dispatch(command))
     }
 
     /// Attempts to retrieve the next emitted transport event without blocking.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn try_next_event(&self) -> Result<Option<DriverEvent>> {
         let Some(event_rx) = &self.event_rx else {
             return Err(Error::DriverEventReceiverUnavailable);
@@ -396,6 +452,10 @@ impl IoDriver {
     }
 
     /// Stops the driver thread and waits for it to exit.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn shutdown(mut self) -> Result<()> {
         self.shutdown_inner()
     }

@@ -3,7 +3,7 @@ use crate::{
     SocketPort,
     zeroconf::{ServiceType, TxtRecord, prelude::TTxtRecord},
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, ffi::OsString};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +132,10 @@ mod kompact_implementation {
             }
         }
 
+        #[allow(
+            clippy::needless_pass_by_value,
+            reason = "The FSM hands owned options to this transition; the error path still logs them."
+        )]
         fn start_service(&mut self, options: Options) -> StateUpdate<ComponentState> {
             match ServiceConfig::try_from_options(options.clone()) {
                 Ok(config) => {
@@ -220,31 +224,34 @@ mod kompact_implementation {
         fn on_start(&mut self) -> Handled {
             transform_state_match!(self, state, {
                 // There's nothing to do. We don't know the port, so we can't start the service.
-                old_state@ComponentState::Uninitialised => StateUpdate::ok(old_state),
+                old_state @ ComponentState::Uninitialised => StateUpdate::ok(old_state),
                 ComponentState::Initialised { options } => self.start_service(options),
                 ComponentState::Starting { .. } => {
                     StateUpdate::invalid("Illegal state, component was in Starting state when being started!")
                 }
-                ComponentState::Running { .. }  => {
+                ComponentState::Running { .. } => {
                     StateUpdate::invalid("Illegal state, component was in Running/Starting state when being started!")
                 }
             })
         }
         fn on_stop(&mut self) -> Handled {
             transform_state_match!(self, state, {
-                            old_state @
-            (ComponentState::Uninitialised | ComponentState::Initialised { .. }) => StateUpdate::ok(old_state),
-                            ComponentState::Running {
-                                config,
-                                shutdown_handle, ..
-                            } | ComponentState::Starting { config, shutdown_handle } => {
-                                self.stop_service(config, shutdown_handle)
-                            }
-                        })
+                old_state @ (
+                    ComponentState::Uninitialised | ComponentState::Initialised { .. }
+                ) => {
+                    StateUpdate::ok(old_state)
+                }
+                ComponentState::Running {
+                    config,
+                    shutdown_handle, ..
+                } | ComponentState::Starting { config, shutdown_handle } => {
+                    self.stop_service(config, shutdown_handle)
+                }
+            })
         }
         fn on_kill(&mut self) -> Handled {
             transform_state_match!(self, state, {
-                 ComponentState::Running {
+                ComponentState::Running {
                     config,
                     shutdown_handle, ..
                 } | ComponentState::Starting { config, shutdown_handle } => {
@@ -343,14 +350,9 @@ fn build_mdns_service(
         },
         |s| {
             s.into_string().map_or_else(
-                |s| {
-                    log::warn!("Could not turn hostname '{s:?}' into Rust String");
-                    FALLBACK_HOST_NAME.to_string()
-                },
+                |s| fallback_host_name_from_non_utf8(&s),
                 |mut s| {
-                    if s.ends_with(".local") {
-                        let _ = s.split_off(s.len() - 6);
-                    }
+                    trim_local_dns_suffix(&mut s);
                     s
                 },
             )
@@ -360,4 +362,24 @@ fn build_mdns_service(
     service.set_name(&service_name);
     service.set_txt_record(txt_record);
     service
+}
+
+#[allow(
+    clippy::unnecessary_debug_formatting,
+    reason = "Debug formatting preserves escaping for hostnames that failed UTF-8 conversion."
+)]
+fn fallback_host_name_from_non_utf8(host_name: &OsString) -> String {
+    log::warn!("Could not turn hostname '{host_name:?}' into Rust String");
+    FALLBACK_HOST_NAME.to_string()
+}
+
+fn trim_local_dns_suffix(host_name: &mut String) {
+    const LOCAL_DNS_SUFFIX: &[u8] = b".local";
+    if host_name
+        .as_bytes()
+        .get(host_name.len().saturating_sub(LOCAL_DNS_SUFFIX.len())..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(LOCAL_DNS_SUFFIX))
+    {
+        host_name.truncate(host_name.len() - LOCAL_DNS_SUFFIX.len());
+    }
 }

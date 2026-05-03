@@ -381,7 +381,8 @@ impl WireVersionVector {
             VersionVector::Full(vector) => Self::Full(vector.clone()),
             VersionVector::Override { version, .. } => Self::Override {
                 group_version: version.group_version(),
-                override_position: version.override_position as u32,
+                override_position: u32::try_from(version.override_position)
+                    .expect("wire version override position must fit into u32"),
                 override_version: version.override_version(),
             },
             VersionVector::Synced { version, .. } => Self::Synced {

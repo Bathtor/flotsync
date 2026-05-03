@@ -83,6 +83,10 @@ where
     }
 
     /// Create one in-memory dataset from complete row snapshots and a `'static` schema.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn with_static_schema_and_row_snapshots<'snapshot, I>(
         schema: &'static Schema,
         rows: I,
@@ -96,6 +100,10 @@ where
     }
 
     /// Create one in-memory dataset from complete row snapshots and an owned schema.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn with_owned_schema_and_row_snapshots<'snapshot, I>(
         schema: Schema,
         rows: I,
@@ -111,6 +119,10 @@ where
     /// Create one in-memory dataset from complete row snapshots.
     ///
     /// Each snapshot must contain the full row state for the associated schema.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn from_row_snapshots<'snapshot, I>(
         schema: impl Into<SchemaSource>,
         rows: I,
@@ -129,6 +141,10 @@ where
 
     /// Create one in-memory dataset from complete row snapshots and retained
     /// row tombstone flags.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn from_row_snapshots_with_tombstones<'snapshot, I>(
         schema: impl Into<SchemaSource>,
         rows: I,
@@ -191,6 +207,10 @@ where
     }
 
     /// Iterate the ids of rows that are not currently tombstoned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the row-id index points outside the row storage.
     pub fn active_row_ids(&self) -> impl Iterator<Item = &RowId> {
         self.row_id_map.iter().filter_map(|(row_id, row_index)| {
             let row = self
@@ -224,6 +244,10 @@ where
     ///
     /// Field names must be unique and complete for the schema.
     /// Returns the inserted row index on success.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn push_row_from_named_fields<I, Name>(
         &mut self,
         fields: I,
@@ -238,6 +262,10 @@ where
     }
 
     /// Validate and append one row represented by a complete schema snapshot.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn push_row_snapshot<'snapshot>(
         &mut self,
         row_id: RowId,
@@ -255,6 +283,10 @@ where
     }
 
     /// Validate and append one retained row record.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn push_row_record<'snapshot>(
         &mut self,
         record: RowRecord<'snapshot, RowId, OperationId>,
@@ -283,12 +315,20 @@ where
     }
 
     /// Validate an existing row by index against this dataset's schema.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn validate_row(&self, row_index: usize) -> Result<(), InMemoryDataError> {
         let row = self.row(row_index)?;
         self.validate_row_value(row)
     }
 
     /// Get one field value by row index and field name.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn field(
         &self,
         row_index: usize,
@@ -304,6 +344,10 @@ where
     }
 
     /// Get a mutable reference to one field value by row index and field name.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn field_mut(
         &mut self,
         row_index: usize,
@@ -319,6 +363,10 @@ where
     }
 
     /// Iterate `(field_name, field_value)` pairs for one row.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataError` for failure conditions.
     pub fn iter_row_fields(
         &self,
         row_index: usize,
@@ -339,6 +387,10 @@ where
     /// 1. `encoder.begin(row_count)`
     /// 2. for each row: `begin_row` -> row snapshot encoding -> `end_row`
     /// 3. `encoder.end()`
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataSnapshotEncodeError<E::Error>` for failure conditions.
     pub fn encode_data_snapshots<E>(
         &self,
         encoder: &mut E,
@@ -364,6 +416,10 @@ where
     ///
     /// Each row is decoded lazily field-by-field and history-backed fields are reconstructed via
     /// each CRDT's `from_snapshot_nodes` API.
+    ///
+    /// # Errors
+    ///
+    /// See `InMemoryDataSnapshotDecodeError<D::Error>` for failure conditions.
     pub fn decode_data_snapshots<D>(
         schema: impl Into<SchemaSource>,
         decoder: &mut D,
@@ -579,6 +635,10 @@ where
     ///
     /// The method consumes `self` and only returns an updated instance if the full operation
     /// applies successfully.
+    ///
+    /// # Errors
+    ///
+    /// See `OperationError` for failure conditions.
     pub fn apply_schema_operation(
         mut self,
         operation: SchemaOperation<'_, RowId, OperationId>,
@@ -898,6 +958,10 @@ fn collect_pending_updates<'a>(
     Ok(collected)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "This constructor is the central schema-to-in-memory type mapping table."
+)]
 fn build_initial_field_value<OperationId>(
     field_name: &str,
     data_type: &ReplicatedDataType,
@@ -1042,6 +1106,10 @@ where
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "This decision table enumerates every initial latest-value-wins representation."
+)]
 fn build_initial_lww_value<OperationId>(
     field_name: &str,
     value_type: &NullableBasicDataType,
@@ -1396,6 +1464,10 @@ where
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "This operation builder deliberately keeps the public target-value to concrete CRDT operation mapping in one exhaustive match."
+)]
 fn build_field_operation<OperationId>(
     field_name: &str,
     current_value: &InMemoryFieldValue<OperationId>,
@@ -1779,7 +1851,7 @@ where
         (
             InMemoryFieldValue::LinearList(current),
             super::super::public_api::FieldTargetValue::PrimitiveArray(target),
-        ) => build_linear_list_operation(current, target, operation_id)
+        ) => build_linear_list_operation(current, target, &operation_id)
             .map(|value| value.map(OperationValue::LinearList)),
         (
             InMemoryFieldValue::MonotonicCounter(current),
@@ -1817,6 +1889,10 @@ where
     }
 }
 
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "The helper shares the operation-result shape used by neighbouring builders and call sites."
+)]
 fn build_lww_operation<OperationId, T>(
     current: &LinearLatestValueWins<IdWithIndex<OperationId>, T>,
     target: T,
@@ -1891,7 +1967,7 @@ type LinearListOperations<OperationId> =
 fn build_linear_list_operation<OperationId>(
     current: &LinearListValue<OperationId>,
     target: PrimitiveValueArray,
-    operation_id: OperationId,
+    operation_id: &OperationId,
 ) -> crate::OperationResult<Option<LinearListOperations<OperationId>>>
 where
     OperationId:
@@ -1900,7 +1976,7 @@ where
     macro_rules! build_linear_list_op {
         ($current:expr, $target:expr, $decode:ident) => {{
             let target_values = $decode($target).map_err(operation_invalid_value)?;
-            let diff = linear_list_diff($current, &target_values, operation_id.clone())
+            let diff = linear_list_diff($current, &target_values, &operation_id)
                 .context(crate::LinearListDiffSnafu)?;
             let operations = diff.into_operations();
             if operations.is_empty() {
@@ -1959,6 +2035,10 @@ fn map_data_operation_value<Id, InputValue, OutputValue, E>(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Applying operation values is an exhaustive CRDT variant dispatch table."
+)]
 fn apply_operation_value<OperationId>(
     field_value: &mut InMemoryFieldValue<OperationId>,
     operation_value: OperationValue<OperationId>,
@@ -2527,6 +2607,11 @@ pub enum LinearLatestValueWinsValue<OperationId> {
 }
 impl<OperationId> LinearLatestValueWinsValue<OperationId> {
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::match_same_arms,
+        reason = "The method is an explicit matrix between runtime value variants and schema-level nullable basic types."
+    )]
     pub fn matches_type(&self, expected: &NullableBasicDataType) -> bool {
         match (self, expected) {
             (
@@ -2696,6 +2781,10 @@ impl<OperationId> LinearLatestValueWinsValue<OperationId> {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Snapshot encoding writes every primitive array shape explicitly to preserve wire compatibility."
+    )]
     fn encode_snapshot<S, E>(&self, sink: &mut S) -> Result<(), E>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -3425,6 +3514,10 @@ fn decode_state_snapshot_field<OperationId>(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "Snapshot decoding mirrors each latest-value-wins variant in the wire format."
+)]
 fn decode_latest_value_wins_snapshot<OperationId, E, I>(
     value_type: &NullableBasicDataType,
     nodes: I,

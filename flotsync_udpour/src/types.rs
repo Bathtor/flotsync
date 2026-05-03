@@ -67,6 +67,10 @@ pub struct PartCount(NonZeroU32);
 
 impl PartCount {
     /// Wraps one raw part count while enforcing the protocol's non-zero rule.
+    ///
+    /// # Errors
+    ///
+    /// See `UDPourTypeError` for failure conditions.
     pub fn new(value: u32) -> Result<Self, UDPourTypeError> {
         let value = NonZeroU32::new(value).context(ZeroPartCountSnafu)?;
         Ok(Self(value))

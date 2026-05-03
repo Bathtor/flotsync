@@ -60,6 +60,10 @@ pub enum ExampleBuildError {
 
 /// Build a schema that covers every supported CRDT/data-type combination in the operations model.
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The exhaustive schema intentionally lists every supported CRDT/data-type combination."
+)]
 pub fn exhaustive_schema() -> Schema {
     let mut columns = HashMap::with_capacity(EXHAUSTIVE_SCHEMA_FIELD_COUNT);
 
@@ -124,7 +128,7 @@ pub fn exhaustive_schema() -> Schema {
     for primitive_type in primitive_types() {
         insert_field(
             &mut columns,
-            total_order_register_field_name(Direction::Ascending, primitive_type),
+            total_order_register_field_name(&Direction::Ascending, primitive_type),
             ReplicatedDataType::TotalOrderRegister {
                 value_type: primitive_type,
                 direction: Direction::Ascending,
@@ -132,7 +136,7 @@ pub fn exhaustive_schema() -> Schema {
         );
         insert_field(
             &mut columns,
-            total_order_register_field_name(Direction::Descending, primitive_type),
+            total_order_register_field_name(&Direction::Descending, primitive_type),
             ReplicatedDataType::TotalOrderRegister {
                 value_type: primitive_type,
                 direction: Direction::Descending,
@@ -177,7 +181,7 @@ pub fn exhaustive_schema() -> Schema {
     set_field_default(&mut columns, "monotonic_counter_uint".to_owned(), 42u64);
     set_field_default(
         &mut columns,
-        total_order_register_field_name(Direction::Ascending, PrimitiveType::UInt),
+        total_order_register_field_name(&Direction::Ascending, PrimitiveType::UInt),
         42u64,
     );
     set_field_default(
@@ -196,6 +200,14 @@ pub fn exhaustive_schema() -> Schema {
 ///
 /// The `change_ids` iterator must yield at least [`EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT`]
 /// ids and `row_ids` must yield at least [`EXHAUSTIVE_SCHEMA_OPERATION_COUNT`] ids.
+///
+/// # Errors
+///
+/// See `ExampleBuildError` for failure conditions.
+#[allow(
+    clippy::too_many_lines,
+    reason = "The exhaustive operation builder mirrors the exhaustive schema field set."
+)]
 pub fn exhaustive_schema_operations<RowId, ChangeId>(
     row_ids: impl Iterator<Item = RowId>,
     change_ids: impl Iterator<Item = ChangeId>,
@@ -288,13 +300,13 @@ where
         operations.push(single_field_operation(
             row_ids.next_id()?,
             ids.next_id()?,
-            total_order_register_field_name(Direction::Ascending, primitive_type),
+            total_order_register_field_name(&Direction::Ascending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
         operations.push(single_field_operation(
             row_ids.next_id()?,
             ids.next_id()?,
-            total_order_register_field_name(Direction::Descending, primitive_type),
+            total_order_register_field_name(&Direction::Descending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
     }
@@ -350,6 +362,10 @@ where
 /// Build one combined schema operation containing one field update for every field in [`exhaustive_schema`].
 ///
 /// The iterator must yield at least [`EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT`] IDs.
+///
+/// # Errors
+///
+/// See `ExampleBuildError` for failure conditions.
 pub fn exhaustive_schema_operation<RowId, ChangeId>(
     row_id: RowId,
     ids: impl Iterator<Item = ChangeId>,
@@ -419,11 +435,11 @@ where
 
     for primitive_type in primitive_types() {
         fields.push(field(
-            total_order_register_field_name(Direction::Ascending, primitive_type),
+            total_order_register_field_name(&Direction::Ascending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
         fields.push(field(
-            total_order_register_field_name(Direction::Descending, primitive_type),
+            total_order_register_field_name(&Direction::Descending, primitive_type),
             OperationValue::TotalOrderRegisterSet(primitive_value(primitive_type)),
         ));
     }
@@ -730,7 +746,7 @@ fn linear_list_field_name(primitive_type: PrimitiveType) -> String {
     format!("linear_list_{}", primitive_label(primitive_type))
 }
 
-fn total_order_register_field_name(direction: Direction, primitive_type: PrimitiveType) -> String {
+fn total_order_register_field_name(direction: &Direction, primitive_type: PrimitiveType) -> String {
     format!(
         "total_order_register_{}_{}",
         direction_label(direction),
@@ -750,7 +766,7 @@ fn nullable_label(nullable: bool) -> &'static str {
     if nullable { "nullable" } else { "non_null" }
 }
 
-fn direction_label(direction: Direction) -> &'static str {
+fn direction_label(direction: &Direction) -> &'static str {
     match direction {
         Direction::Ascending => "ascending",
         Direction::Descending => "descending",
@@ -854,6 +870,10 @@ mod tests {
         Descending,
     }
 
+    fn count_as_u32(count: usize) -> u32 {
+        u32::try_from(count).expect("exhaustive schema test count must fit into u32")
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
     enum BasicCoverageKey {
         Primitive(PrimitiveCoverageKey),
@@ -932,7 +952,7 @@ mod tests {
         }
     }
 
-    fn direction_coverage_key(direction: Direction) -> DirectionCoverageKey {
+    fn direction_coverage_key(direction: &Direction) -> DirectionCoverageKey {
         match direction {
             Direction::Ascending => DirectionCoverageKey::Ascending,
             Direction::Descending => DirectionCoverageKey::Descending,
@@ -1012,7 +1032,7 @@ mod tests {
                 value_type,
                 direction,
             } => SchemaCoverageKey::TotalOrderRegister {
-                direction: direction_coverage_key(direction.clone()),
+                direction: direction_coverage_key(direction),
                 value_type: primitive_coverage_key(*value_type),
             },
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, .. } => {
@@ -1078,7 +1098,7 @@ mod tests {
                 },
                 OperationValue::TotalOrderRegisterSet(_),
             ) => OperationCoverageKey::TotalOrderRegisterSet {
-                direction: direction_coverage_key(direction.clone()),
+                direction: direction_coverage_key(direction),
                 value_type: primitive_coverage_key(*value_type),
             },
             (
@@ -1134,7 +1154,7 @@ mod tests {
 
             for direction in [Direction::Ascending, Direction::Descending] {
                 coverage.insert(SchemaCoverageKey::TotalOrderRegister {
-                    direction: direction_coverage_key(direction),
+                    direction: direction_coverage_key(&direction),
                     value_type: primitive_type,
                 });
             }
@@ -1179,7 +1199,7 @@ mod tests {
 
             for direction in [Direction::Ascending, Direction::Descending] {
                 coverage.insert(OperationCoverageKey::TotalOrderRegisterSet {
-                    direction: direction_coverage_key(direction),
+                    direction: direction_coverage_key(&direction),
                     value_type: primitive_type,
                 });
             }
@@ -1274,7 +1294,7 @@ mod tests {
 
     #[test]
     fn exhaustive_schema_operation_accepts_exact_minimum_id_count() {
-        let ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32;
+        let ids = 0u32..count_as_u32(EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT);
         let operation = exhaustive_schema_operation(7u32, ids).unwrap();
         let RowOperation::Update { fields, .. } = &operation.operation else {
             panic!("expected combined update operation");
@@ -1284,15 +1304,16 @@ mod tests {
 
     #[test]
     fn exhaustive_schema_operations_accept_exact_minimum_id_count() {
-        let row_ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_COUNT as u32;
-        let change_ids = 10_000u32..10_000u32 + EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32;
+        let row_ids = 0u32..count_as_u32(EXHAUSTIVE_SCHEMA_OPERATION_COUNT);
+        let change_ids =
+            10_000u32..10_000u32 + count_as_u32(EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT);
         let operations = exhaustive_schema_operations(row_ids, change_ids).unwrap();
         assert_eq!(operations.len(), EXHAUSTIVE_SCHEMA_OPERATION_COUNT);
     }
 
     #[test]
     fn exhaustive_schema_operation_reports_insufficient_ids() {
-        let ids = 0u32..(EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT as u32 - 1);
+        let ids = 0u32..(count_as_u32(EXHAUSTIVE_SCHEMA_OPERATION_MIN_ID_COUNT) - 1);
         let err = exhaustive_schema_operation(7u32, ids).unwrap_err();
         assert_matches!(
             err,
@@ -1306,9 +1327,9 @@ mod tests {
 
     #[test]
     fn exhaustive_schema_operations_report_insufficient_ids() {
-        let row_ids = 0u32..EXHAUSTIVE_SCHEMA_OPERATION_COUNT as u32;
+        let row_ids = 0u32..count_as_u32(EXHAUSTIVE_SCHEMA_OPERATION_COUNT);
         let change_ids =
-            10_000u32..10_000u32 + (EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT as u32 - 1);
+            10_000u32..10_000u32 + (count_as_u32(EXHAUSTIVE_SCHEMA_OPERATIONS_MIN_ID_COUNT) - 1);
         let err = exhaustive_schema_operations(row_ids, change_ids).unwrap_err();
         assert_matches!(
             err,

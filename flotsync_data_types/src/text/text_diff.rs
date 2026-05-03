@@ -378,6 +378,7 @@ It seemed as though the ocean itself refused to let go. 🌊⚓🪝
 mod debug_helpers {
     use super::{GraphemeCursor, TextDiff};
     use similar::DiffOp;
+    use std::fmt::Write as _;
 
     #[allow(clippy::print_stderr, reason = "This is designed for debug printing.")]
     pub fn print_diff_changes<'a>(diff: &TextDiff<'a, 'a, '_, str>) {
@@ -388,10 +389,12 @@ mod debug_helpers {
                     diff_str.push_str(entry.as_str().unwrap());
                 }
                 similar::ChangeTag::Delete => {
-                    diff_str.push_str(&format!("\x1b[31m{}\x1b[0m", entry.as_str().unwrap()));
+                    write!(diff_str, "\x1b[31m{}\x1b[0m", entry.as_str().unwrap())
+                        .expect("writing to String should not fail");
                 }
                 similar::ChangeTag::Insert => {
-                    diff_str.push_str(&format!("\x1b[32m{}\x1b[0m", entry.as_str().unwrap()));
+                    write!(diff_str, "\x1b[32m{}\x1b[0m", entry.as_str().unwrap())
+                        .expect("writing to String should not fail");
                 }
             }
         }
@@ -424,7 +427,8 @@ mod debug_helpers {
                     let mut old_text = String::new();
                     from_cursor.skip(*old_index);
                     from_cursor.copy_to_until(&mut old_text, old_index + old_len);
-                    diff_str.push_str(&format!("\x1b[31m{old_text}\x1b[0m"));
+                    write!(diff_str, "\x1b[31m{old_text}\x1b[0m")
+                        .expect("writing to String should not fail");
                 }
                 similar::DiffOp::Insert {
                     old_index,
@@ -435,7 +439,8 @@ mod debug_helpers {
                     let mut new_text = String::new();
                     to_cursor.skip(*new_index);
                     to_cursor.copy_to_until(&mut new_text, new_index + new_len);
-                    diff_str.push_str(&format!("\x1b[32m{new_text}\x1b[0m"));
+                    write!(diff_str, "\x1b[32m{new_text}\x1b[0m")
+                        .expect("writing to String should not fail");
                 }
                 similar::DiffOp::Replace {
                     old_index,
@@ -451,8 +456,10 @@ mod debug_helpers {
                     let mut new_text = String::new();
                     to_cursor.skip(*new_index);
                     to_cursor.copy_to_until(&mut new_text, new_index + new_len);
-                    diff_str.push_str(&format!("\x1b[31m{old_text}\x1b[0m"));
-                    diff_str.push_str(&format!("\x1b[32m{new_text}\x1b[0m"));
+                    write!(diff_str, "\x1b[31m{old_text}\x1b[0m")
+                        .expect("writing to String should not fail");
+                    write!(diff_str, "\x1b[32m{new_text}\x1b[0m")
+                        .expect("writing to String should not fail");
                 }
             }
         }

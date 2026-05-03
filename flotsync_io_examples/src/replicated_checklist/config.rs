@@ -118,7 +118,11 @@ fn read_group_id(config: &Config) -> Result<GroupId, ChecklistConfigError> {
             message: format!("must be a non-negative integer, got {value}"),
         }
     );
-    Ok(GroupId(Uuid::from_u128(value as u128)))
+    let value = u128::try_from(value).map_err(|_| ChecklistConfigError::InvalidConfig {
+        key: GROUP_ID_KEY,
+        message: format!("must be a non-negative integer, got {value}"),
+    })?;
+    Ok(GroupId(Uuid::from_u128(value)))
 }
 
 fn read_ordered_members(config: &Config) -> Result<Vec<MemberIdentity>, ChecklistConfigError> {

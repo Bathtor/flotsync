@@ -204,16 +204,14 @@ impl RouteTransportManager {
             .config()
             .read_or_default(&kompact::config_keys::system::LABEL)
             .unwrap_or_else(|_| String::from("<unlabelled-route-transport-test-system>"));
-        if requested_local_addr != socket_key.local_addr {
-            panic!(
-                "route-transport test system '{system_label}' saw inconsistent manager-owned UDP bind state for {socket_key:?}; requested_bind resolved to {requested_local_addr}"
-            );
-        }
-        if requested_local_addr.port() != 0 {
-            panic!(
-                "route-transport test system '{system_label}' attempted manager-owned exact UDP bind for {socket_key:?}; the test bind budget only supports port-zero manager-owned binds"
-            );
-        }
+        assert!(
+            requested_local_addr == socket_key.local_addr,
+            "route-transport test system '{system_label}' saw inconsistent manager-owned UDP bind state for {socket_key:?}; requested_bind resolved to {requested_local_addr}"
+        );
+        assert!(
+            requested_local_addr.port() == 0,
+            "route-transport test system '{system_label}' attempted manager-owned exact UDP bind for {socket_key:?}; the test bind budget only supports port-zero manager-owned binds"
+        );
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
             panic!(
@@ -233,6 +231,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn test_manager_owned_udp_bind_policy(
         &mut self,
         _request_id: UdpOpenRequestId,
@@ -263,6 +265,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn complete_test_manager_owned_udp_bind(
         &mut self,
         _request_id: UdpOpenRequestId,
@@ -287,6 +293,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn fail_test_manager_owned_udp_bind(&mut self, _request_id: UdpOpenRequestId) {}
 
     #[cfg(test)]
@@ -305,6 +315,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn release_test_manager_owned_udp_bind(&mut self, _socket_id: SocketId) {}
 
     fn handle_submit(
@@ -561,7 +575,7 @@ impl RouteTransportManager {
                 starting.socket_id,
                 starting.origin,
                 starting.queued_sends,
-                classify_udp_connect_failure_for_discovery(&error),
+                &classify_udp_connect_failure_for_discovery(&error),
             );
             self.ctx.system().kill(starting.runtime);
             return;
@@ -900,7 +914,7 @@ impl RouteTransportManager {
         socket_id: SocketId,
         origin: UdpSocketStartOrigin,
         queued_sends: Vec<QueuedUdpSend>,
-        discovery_reason: ConnectionFailureReason,
+        discovery_reason: &ConnectionFailureReason,
     ) {
         match origin {
             UdpSocketStartOrigin::ManagerOwned => {
@@ -919,7 +933,7 @@ impl RouteTransportManager {
             failed_routes.insert(queued.route);
         }
         for route in failed_routes {
-            self.report_route_failed(TransportRouteKey::Udp(route), discovery_reason.clone());
+            self.report_route_failed(TransportRouteKey::Udp(route), (*discovery_reason).clone());
         }
         for queued in queued_sends {
             self.fail_pending_send(
@@ -1267,8 +1281,9 @@ fn classify_transport_send_failure(reason: SendFailureReason) -> RouteTransportN
 fn classify_open_failure_for_nack(reason: OpenFailureReason) -> RouteTransportNackReason {
     match reason {
         OpenFailureReason::InvalidHandle => RouteTransportNackReason::RouteUnknown,
-        OpenFailureReason::DriverUnavailable => RouteTransportNackReason::RouteUnavailable,
-        OpenFailureReason::Io(_) => RouteTransportNackReason::RouteUnavailable,
+        OpenFailureReason::DriverUnavailable | OpenFailureReason::Io(_) => {
+            RouteTransportNackReason::RouteUnavailable
+        }
     }
 }
 
@@ -1514,7 +1529,6 @@ mod tests {
         }
 
         fn wait_for_send_ack_future(
-            &self,
             future: KFuture<TransportRouteTransportSubmitResult>,
         ) -> TransportRouteKey {
             match future
@@ -1532,7 +1546,6 @@ mod tests {
         }
 
         fn wait_for_send_nack(
-            &self,
             future: KFuture<TransportRouteTransportSubmitResult>,
         ) -> (TransportRouteKey, RouteTransportNackReason) {
             match future
@@ -1602,11 +1615,10 @@ mod tests {
                             return Some(buffered_count);
                         }
                     }
-                    if live && max_observed.get() == 0 {
-                        panic!(
-                            "UDPour child became live before any startup datagram was buffered for {socket_key:?}"
-                        );
-                    }
+                    assert!(
+                        !(live && max_observed.get() == 0),
+                        "UDPour child became live before any startup datagram was buffered for {socket_key:?}"
+                    );
                     None
                 },
                 StartupBufferedDatagramsTimeout {
@@ -1788,11 +1800,11 @@ mod tests {
         let submit2 = harness.send_async(route_send(send_id2, route2, b"second target".to_vec()));
 
         assert_eq!(
-            harness.wait_for_send_ack_future(submit1),
+            UdpManagerHarness::wait_for_send_ack_future(submit1),
             TransportRouteKey::Udp(route1)
         );
         assert_eq!(
-            harness.wait_for_send_ack_future(submit2),
+            UdpManagerHarness::wait_for_send_ack_future(submit2),
             TransportRouteKey::Udp(route2)
         );
         assert_eq!(harness.live_udp_socket_count(), 1);
@@ -1905,7 +1917,7 @@ mod tests {
         receiver_harness.wait_for_bridge_payload_frames(receiver_socket_id, buffered_count + 3);
 
         assert_eq!(
-            sender_harness.wait_for_send_ack_future(submit),
+            UdpManagerHarness::wait_for_send_ack_future(submit),
             TransportRouteKey::Udp(route)
         );
         sender_harness.wait_for_bridge_frame_type(sender_socket_id, 0x81);
@@ -1943,13 +1955,13 @@ mod tests {
                 socket_id,
                 UdpSocketStartOrigin::ExternalDormant,
                 vec![QueuedUdpSend { send_id, route }],
-                ConnectionFailureReason::TimedOut,
+                &ConnectionFailureReason::TimedOut,
             );
         });
 
         harness.wait_for_dormant_socket(socket_key);
         assert_eq!(harness.dormant_udp_socket_count(), 1);
-        let (coverage_key, reason) = harness.wait_for_send_nack(submit);
+        let (coverage_key, reason) = UdpManagerHarness::wait_for_send_nack(submit);
         assert_eq!(coverage_key, TransportRouteKey::Udp(route));
         assert_eq!(reason, RouteTransportNackReason::RouteUnavailable);
     }

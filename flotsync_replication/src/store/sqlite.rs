@@ -86,6 +86,10 @@ pub struct SqliteReplicationStore {
 
 impl SqliteReplicationStore {
     /// Create one empty in-memory store for `local_member`.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
         Self::in_memory_with_schema_sources(
             local_member,
@@ -94,6 +98,10 @@ impl SqliteReplicationStore {
     }
 
     /// Open one disk-backed `SQLite` store for `local_member`.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::file_with_schema_sources(
             local_member,
@@ -103,6 +111,10 @@ impl SqliteReplicationStore {
     }
 
     /// Create one in-memory store with the provided application schema sources.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn in_memory_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         schema_sources: I,
@@ -125,6 +137,10 @@ impl SqliteReplicationStore {
     }
 
     /// Open one disk-backed `SQLite` store with the provided application schema sources.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn file_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         path: impl AsRef<Path>,
@@ -1643,6 +1659,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "This store roundtrip test keeps related group, dataset, and update assertions in one fixture."
+    )]
     fn sqlite_store_roundtrips_group_dataset_and_update_records() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();

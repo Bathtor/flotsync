@@ -147,6 +147,10 @@ impl ReservedSocketLease {
     ///
     /// Tests use this before teardown so the lease once again owns a live
     /// reservation socket before the driver or bridge releases the port.
+    ///
+    /// # Errors
+    ///
+    /// See `io::Error` for failure conditions.
     pub fn rebind_binding(&mut self, index: usize) -> io::Result<()> {
         self.reserved[index].ensure_bound()
     }
@@ -169,7 +173,7 @@ impl Drop for ReservedSocketLease {
         }
         RESERVED_SOCKET_BROKER.release(rebound);
         assert!(
-            !(!failed_rebinds.is_empty() && !std::thread::panicking()),
+            failed_rebinds.is_empty() || std::thread::panicking(),
             "failed to rebind reserved test sockets before returning them to the broker: {}",
             failed_rebinds.join("; ")
         );
@@ -201,6 +205,14 @@ pub fn set_test_system_label(config: &mut KompactConfig, label_prefix: &str) {
 }
 
 /// Binds one blocking `TcpListener` at the reserved address held by `lease`.
+///
+/// # Errors
+///
+/// See `io::Error` for failure conditions.
+///
+/// # Panics
+///
+/// Panics if `index` is out of bounds or does not refer to a TCP listener reservation.
 pub fn bind_reserved_tcp_listener(
     lease: &ReservedSocketLease,
     index: usize,
@@ -224,6 +236,14 @@ pub fn bind_reserved_tcp_listener(
 }
 
 /// Binds one blocking `UdpSocket` at the reserved address held by `lease`.
+///
+/// # Errors
+///
+/// See `io::Error` for failure conditions.
+///
+/// # Panics
+///
+/// Panics if `index` is out of bounds or does not refer to a UDP socket reservation.
 pub fn bind_reserved_udp_socket(
     lease: &ReservedSocketLease,
     index: usize,
@@ -246,6 +266,10 @@ pub fn bind_reserved_udp_socket(
 }
 
 /// Installs the captured test logger once for both the `log` facade and Kompact's `slog` logger.
+///
+/// # Panics
+///
+/// Panics if the `slog` to `log` bridge cannot be installed.
 pub fn init_test_logger() {
     static LOGGER: OnceLock<()> = OnceLock::new();
     static LOGGER_GUARD: OnceLock<slog_scope::GlobalLoggerGuard> = OnceLock::new();
@@ -265,6 +289,10 @@ pub fn build_test_kompact_system() -> KompactSystem {
 }
 
 /// Builds a Kompact system whose logs follow libtest output capture after applying extra config.
+///
+/// # Panics
+///
+/// Panics if the test logger cannot be installed or the Kompact system cannot be built.
 pub fn build_test_kompact_system_with(configure: impl FnOnce(&mut KompactConfig)) -> KompactSystem {
     init_test_logger();
 
@@ -275,6 +303,10 @@ pub fn build_test_kompact_system_with(configure: impl FnOnce(&mut KompactConfig)
 }
 
 /// Builds a Kompact system with a manually-driven timer after applying extra config.
+///
+/// # Panics
+///
+/// Panics if the test logger cannot be installed or the Kompact system cannot be built.
 pub fn build_test_kompact_system_with_manual_timer(
     configure: impl FnOnce(&mut KompactConfig),
 ) -> (KompactSystem, kompact::timer::ManualTimer) {
@@ -459,7 +491,7 @@ impl ReservedSocketBroker {
 
         // Each caller declares its full socket requirement up front. That keeps
         // the process-local broker free of hold-and-wait deadlocks.
-        'acquire_sockets: while Instant::now() < deadline {
+        while Instant::now() < deadline {
             if acquired.len() == kinds.len() {
                 trace.completed(&state.build_reservation_counters(&trace, &acquired, kinds));
                 self.complete_reservation_phase(state, requested_tcp, requested_udp);
@@ -507,7 +539,6 @@ impl ReservedSocketBroker {
                         &state.build_reservation_counters(&trace, &acquired, kinds),
                         next_kind,
                     );
-                    continue 'acquire_sockets;
                 }
                 Err(error) => {
                     trace.acquire_failed(
@@ -517,7 +548,6 @@ impl ReservedSocketBroker {
                     );
                     // Wait for leases to be returned before retrying to acquire another socket.
                     state = self.wait_for_changes(state);
-                    continue 'acquire_sockets;
                 }
             }
         }
@@ -1240,6 +1270,10 @@ where
 }
 
 /// Waits until `probe` returns one value using the supplied poll cadence.
+///
+/// # Panics
+///
+/// Panics with `failure_message` if `probe` does not return a value before `timeout`.
 pub fn eventually_value_with_poll<T, M>(
     timeout: Duration,
     poll_interval: Duration,
@@ -1299,6 +1333,10 @@ pub fn eventually_component_state<C, M>(
 }
 
 /// Asserts that `predicate` never becomes true during `duration`.
+///
+/// # Panics
+///
+/// Panics with `failure_message` if `predicate` becomes true before `duration` elapses.
 pub fn assert_never<M>(duration: Duration, mut predicate: impl FnMut() -> bool, failure_message: M)
 where
     M: Display,
@@ -1321,6 +1359,10 @@ where
 }
 
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].
+///
+/// # Panics
+///
+/// Panics if the request fails or does not produce a reply before [`WAIT_TIMEOUT`].
 #[must_use]
 pub fn wait_for_driver_request<T>(mut request: DriverRequest<T>) -> T {
     eventually_value(
@@ -1335,6 +1377,10 @@ pub fn wait_for_driver_request<T>(mut request: DriverRequest<T>) -> T {
 }
 
 /// Waits for the next driver event matching `predicate`.
+///
+/// # Panics
+///
+/// Panics if driver event retrieval fails or no matching event arrives before [`WAIT_TIMEOUT`].
 pub fn wait_for_driver_event(
     driver: &IoDriver,
     mut predicate: impl FnMut(&DriverEvent) -> bool,
@@ -1357,6 +1403,10 @@ pub fn wait_for_driver_event(
 }
 
 /// Asserts that no driver event arrives for `duration`.
+///
+/// # Panics
+///
+/// Panics if a driver event arrives, or if driver event retrieval fails, during `duration`.
 pub fn assert_no_driver_event(driver: &IoDriver, duration: Duration) {
     assert_never(
         duration,
@@ -1370,6 +1420,10 @@ pub fn assert_no_driver_event(driver: &IoDriver, duration: Duration) {
 }
 
 /// Receives until `predicate` selects a value.
+///
+/// # Panics
+///
+/// Panics if no event is received before [`WAIT_TIMEOUT`].
 pub fn recv_until<T>(rx: &mpsc::Receiver<T>, mut predicate: impl FnMut(&T) -> bool) -> T {
     loop {
         let value = rx
@@ -1382,6 +1436,10 @@ pub fn recv_until<T>(rx: &mpsc::Receiver<T>, mut predicate: impl FnMut(&T) -> bo
 }
 
 /// Starts a component and waits for the lifecycle future to complete.
+///
+/// # Panics
+///
+/// Panics if the component does not start successfully before [`WAIT_TIMEOUT`].
 pub fn start_component<C>(system: &KompactSystem, component: &Arc<Component<C>>)
 where
     C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
@@ -1393,6 +1451,10 @@ where
 }
 
 /// Kills a component and waits for the lifecycle future to complete.
+///
+/// # Panics
+///
+/// Panics if the component does not stop successfully before [`WAIT_TIMEOUT`].
 pub fn kill_component<C>(system: &KompactSystem, component: Arc<Component<C>>)
 where
     C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
@@ -1463,6 +1525,10 @@ impl<T> BufferedReceiver<T> {
 
     /// Waits for the next event that satisfies `predicate`, preserving
     /// unrelated events for later checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no matching event is received before `timeout`.
     pub fn recv_matching(&self, timeout: Duration, mut predicate: impl FnMut(&T) -> bool) -> T {
         let deadline = Instant::now() + timeout;
         loop {
@@ -1485,6 +1551,11 @@ impl<T> BufferedReceiver<T> {
     /// Waits for the next event that satisfies `predicate`, but aborts early
     /// if `fail_fast` identifies one event that proves the expected state
     /// transition cannot happen anymore.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `fail_fast` rejects an observed event or if no matching event is received before
+    /// `timeout`.
     pub fn recv_matching_or_fail(
         &self,
         timeout: Duration,
@@ -1520,6 +1591,11 @@ impl<T> BufferedReceiver<T> {
     /// A disconnected sender is treated as a harness failure rather than as
     /// silence because negative assertions rely on the probe staying live for
     /// the entire observation window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a buffered or newly received event matches `predicate`, or if the sender
+    /// disconnects before `duration` elapses.
     pub fn assert_no_match(&self, duration: Duration, mut predicate: impl FnMut(&T) -> bool)
     where
         T: Debug,
@@ -1715,11 +1791,11 @@ impl CapturedOutput {
     fn emit_complete_lines(&mut self) {
         while let Some(newline_index) = self.pending.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = self.pending.drain(..=newline_index).collect();
-            self.emit_bytes(&line);
+            Self::emit_bytes(&line);
         }
     }
 
-    fn emit_bytes(&self, bytes: &[u8]) {
+    fn emit_bytes(bytes: &[u8]) {
         let text = String::from_utf8_lossy(bytes);
         print!("{text}");
         let _ = io::stdout().flush();
@@ -1736,7 +1812,7 @@ impl Write for CapturedOutput {
     fn flush(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             let remaining = std::mem::take(&mut self.pending);
-            self.emit_bytes(&remaining);
+            Self::emit_bytes(&remaining);
         }
         Ok(())
     }

@@ -509,7 +509,7 @@ where
         })
         .map_err(|op| match op {
             DataOperation::Insert { value, .. } => value,
-            _ => unreachable!(
+            DataOperation::Delete { .. } => unreachable!(
                 "apply_operation should not return a different operation type on error."
             ),
         })
@@ -544,6 +544,10 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The insertion path is a single CRDT transition over predecessor, successor, and sibling-order cases."
+    )]
     fn apply_operation(
         &mut self,
         operation: DataOperation<Self::Id, Value>,

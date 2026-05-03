@@ -305,6 +305,10 @@ impl ColumnarValueBuffer {
 }
 
 /// Encode a columnar history snapshot for a `LatestValueWins` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn encode_columnar_latest_value_wins_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, ModelNullableBasicValue>],
     value_type: &NullableBasicDataType,
@@ -329,6 +333,10 @@ pub fn encode_columnar_latest_value_wins_history_snapshot(
 }
 
 /// Decode a columnar history snapshot for a `LatestValueWins` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn decode_columnar_latest_value_wins_history_snapshot(
     snapshot: proto::HistorySnapshot,
     value_type: NullableBasicDataType,
@@ -360,6 +368,10 @@ pub fn decode_columnar_latest_value_wins_history_snapshot(
 }
 
 /// Encode a columnar history snapshot for a `LinearString` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn encode_columnar_linear_string_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, String>],
 ) -> ColumnarResult<proto::HistorySnapshot> {
@@ -381,6 +393,10 @@ pub fn encode_columnar_linear_string_history_snapshot(
 }
 
 /// Decode a columnar history snapshot for a `LinearString` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn decode_columnar_linear_string_history_snapshot(
     snapshot: proto::HistorySnapshot,
 ) -> ColumnarResult<Vec<SnapshotNode<UpdateIdWithIndex, String>>> {
@@ -411,6 +427,10 @@ pub fn decode_columnar_linear_string_history_snapshot(
 }
 
 /// Encode a columnar history snapshot for a `LinearList` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn encode_columnar_linear_list_history_snapshot(
     nodes: &[SnapshotNode<UpdateIdWithIndex, ModelPrimitiveValueArray>],
     value_type: PrimitiveType,
@@ -433,6 +453,10 @@ pub fn encode_columnar_linear_list_history_snapshot(
 }
 
 /// Decode a columnar history snapshot for a `LinearList` field.
+///
+/// # Errors
+///
+/// See `ColumnarHistoryCodecError` for failure conditions.
 pub fn decode_columnar_linear_list_history_snapshot(
     snapshot: proto::HistorySnapshot,
     value_type: PrimitiveType,
@@ -476,7 +500,7 @@ fn encode_columnar_history_snapshot<'a>(
             Some(value) => encode_value_span(data_type, value, &mut values)?,
         };
         let mut meta = proto::HistoryNodeMeta::default();
-        set_self_id_fields(&mut meta, node.id);
+        set_self_id_fields(&mut meta, &node.id);
         set_origin_left_fields(&mut meta, node.left);
         set_origin_right_fields(&mut meta, node.right);
         meta.deleted = node.deleted;
@@ -505,7 +529,7 @@ fn decode_columnar_history_snapshot<Id>(
     for meta in snapshot.nodes {
         let node = decode_columnar_history_node(
             data_type,
-            meta,
+            &meta,
             &values,
             &mut next_value_offset,
             &decode_id,
@@ -571,7 +595,7 @@ fn decode_columnar_value_buffer(
 
 fn decode_columnar_history_node<Id>(
     data_type: &ReplicatedDataType,
-    meta: proto::HistoryNodeMeta,
+    meta: &proto::HistoryNodeMeta,
     values: &ColumnarValueBuffer,
     next_value_offset: &mut usize,
     decode_id: impl Fn(proto::HistoryId) -> Result<Id, CodecError>,
@@ -639,9 +663,9 @@ fn encode_value_span(
         )) => (values.append_primitive(value)?, false),
         ColumnarHistoryNodeValueRef::LatestValueWins(ModelNullableBasicValueRef::Value(
             ModelBasicValueRef::Array(value),
-        )) => (values.append_array(value)?, false),
+        ))
+        | ColumnarHistoryNodeValueRef::LinearList(value) => (values.append_array(value)?, false),
         ColumnarHistoryNodeValueRef::LinearString(value) => (values.append_string(value)?, false),
-        ColumnarHistoryNodeValueRef::LinearList(value) => (values.append_array(value)?, false),
     };
 
     Ok(encoded)
@@ -771,7 +795,7 @@ fn history_primitive_type(data_type: &ReplicatedDataType) -> ColumnarResult<Prim
     }
 }
 
-fn set_self_id_fields(meta: &mut proto::HistoryNodeMeta, id: proto::HistoryId) {
+fn set_self_id_fields(meta: &mut proto::HistoryNodeMeta, id: &proto::HistoryId) {
     meta.version = id.version;
     meta.node_index = id.node_index;
     meta.chunk_index = id.chunk_index;
@@ -956,6 +980,10 @@ fn slice_primitive_value(
     })
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "each enum variant is listed explicitly to keep wire value coverage auditable"
+)]
 fn array_ref_len(values: &ModelPrimitiveValueArrayRef<'_>) -> usize {
     match values {
         ModelPrimitiveValueArrayRef::String(values) => values.len(),

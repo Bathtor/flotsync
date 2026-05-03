@@ -114,6 +114,14 @@ where
         .collect()
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Decoding `f32` from the in-memory f64 representation intentionally narrows precision."
+)]
+fn narrow_f64_to_f32(value: OrderedFloat<f64>) -> f32 {
+    value.into_inner() as f32
+}
+
 fn decode_single_char<T>(value: &str) -> Result<char, DecodeValueError> {
     let mut chars = value.chars();
     let Some(ch) = chars.next() else {
@@ -180,16 +188,12 @@ where
             .as_ref()
             .map(IntegerValueRef::Timestamp)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::MonotonicCounter(CounterValue::Byte(value)) => {
+        InMemoryFieldValue::MonotonicCounter(CounterValue::Byte(value))
+        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
             Ok(IntegerValueRef::Byte(value))
         }
-        InMemoryFieldValue::MonotonicCounter(CounterValue::UInt(value)) => {
-            Ok(IntegerValueRef::UInt(value))
-        }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
-            Ok(IntegerValueRef::Byte(value))
-        }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
+        InMemoryFieldValue::MonotonicCounter(CounterValue::UInt(value))
+        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
             Ok(IntegerValueRef::UInt(value))
         }
         InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Int(value)) => {
@@ -268,6 +272,10 @@ where
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The small reference enum is a local extraction result and is intentionally consumed by conversion helpers."
+)]
 fn convert_integer_value<T>(value: IntegerValueRef<'_>) -> Result<T, DecodeValueError>
 where
     T: TryFrom<u8> + TryFrom<u64> + TryFrom<i64>,
@@ -280,6 +288,10 @@ where
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The small reference enum is a local extraction result and is intentionally consumed by conversion helpers."
+)]
 fn convert_integer_vec<T>(value: IntegerVecRef<'_>) -> Result<Vec<T>, DecodeValueError>
 where
     T: TryFrom<u8> + TryFrom<u64> + TryFrom<i64>,
@@ -676,7 +688,7 @@ where
     fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         let value = extract_float_value_ref(value)
             .map_err(|err| map_extract_error::<Self, _>(value, err))?;
-        Ok(Cow::Owned(value.into_inner() as f32))
+        Ok(Cow::Owned(narrow_f64_to_f32(*value)))
     }
 }
 
@@ -789,7 +801,7 @@ where
             Ok(values) => Ok(Cow::Owned(
                 values
                     .iter()
-                    .map(|value| value.into_inner() as f32)
+                    .map(|value| narrow_f64_to_f32(*value))
                     .collect(),
             )),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -797,7 +809,7 @@ where
                 InMemoryFieldValue::LinearList(LinearListValue::Float(values)) => Ok(Cow::Owned(
                     values
                         .iter()
-                        .map(|value| value.into_inner() as f32)
+                        .map(|value| narrow_f64_to_f32(*value))
                         .collect(),
                 )),
                 _ => Err(type_mismatch::<Self, _>(value)),

@@ -37,6 +37,10 @@ pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
 }
 
 /// Decodes one frame from an `IoPayload`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers hand off transport payloads as owned values even though decoding currently borrows internally"
+)]
 pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError> {
     ensure!(
         payload.len() >= FRAME_HEADER_LEN,

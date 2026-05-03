@@ -57,6 +57,14 @@ pub struct HttpServerArgs {
 }
 
 /// Runs the HTTP server example until stdin reaches EOF or the listener fails.
+///
+/// # Errors
+///
+/// See `Error` for failure conditions.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Example entry points consume parsed CLI argument structs."
+)]
 pub fn run(args: HttpServerArgs) -> Result<()> {
     let runtime = ExampleRuntime::setup(&args.runtime)?;
     let (outcome_promise, outcome_future) = new_outcome_promise();
@@ -230,8 +238,11 @@ impl HttpListenerComponent {
         complete_outcome(&mut self.outcome, Ok(()));
     }
 
-    fn fail_and_die(&mut self, message: String) -> Handled {
-        complete_outcome(&mut self.outcome, Err(Whatever::without_source(message)));
+    fn fail_and_die(&mut self, message: &str) -> Handled {
+        complete_outcome(
+            &mut self.outcome,
+            Err(Whatever::without_source(message.to_owned())),
+        );
         Handled::DieNow
     }
 }
@@ -248,7 +259,7 @@ impl ComponentLifecycle for HttpListenerComponent {
             let listener_reply = match open.await {
                 Ok(reply) => reply,
                 Err(error) => {
-                    return async_self.fail_and_die(format!(
+                    return async_self.fail_and_die(&format!(
                         "HTTP listener open reply dropped before completion: {error}"
                     ));
                 }
@@ -263,7 +274,7 @@ impl ComponentLifecycle for HttpListenerComponent {
                     Handled::Ok
                 }
                 Err(error) => {
-                    async_self.fail_and_die(format!("failed to open HTTP listener: {error:?}"))
+                    async_self.fail_and_die(&format!("failed to open HTTP listener: {error:?}"))
                 }
             }
         })
@@ -457,7 +468,7 @@ impl HttpConnectionComponent {
             TcpSessionEvent::SendNack {
                 transmission_id,
                 reason,
-            } => self.fail_and_die(format!(
+            } => self.fail_and_die(&format!(
                 "HTTP response send {} failed for {}: {:?}",
                 transmission_id, self.peer_addr, reason
             )),
@@ -482,7 +493,7 @@ impl HttpConnectionComponent {
                 if self.response_started && reason == CloseReason::Graceful {
                     return Handled::DieNow;
                 }
-                self.fail_and_die(format!(
+                self.fail_and_die(&format!(
                     "HTTP session for {} closed before a response completed: {:?}",
                     self.peer_addr, reason
                 ))
@@ -492,7 +503,7 @@ impl HttpConnectionComponent {
 
     fn handle_received_payload(&mut self, payload: IoPayload) -> Handled {
         if self.response_started {
-            return self.fail_and_die(format!(
+            return self.fail_and_die(&format!(
                 "HTTP session for {} received bytes after committing the single supported response",
                 self.peer_addr
             ));
@@ -602,7 +613,7 @@ impl HttpConnectionComponent {
 
     fn start_response(&mut self, response: HttpResponseSpec) {
         let Some(session) = self.session_state.session().cloned() else {
-            let _ = self.fail_and_die(format!(
+            let _ = self.fail_and_die(&format!(
                 "HTTP session for {} became unavailable before sending a response",
                 self.peer_addr
             ));
@@ -632,7 +643,7 @@ impl HttpConnectionComponent {
                             if encode_plan.response.include_body =>
                         {
                             writer
-                                .adopt_payload(build_echo_body_payload(&mut encode_plan)?)
+                                .adopt_payload(build_echo_body_payload(&mut encode_plan))
                                 .await?;
                         }
                         HttpResponseBody::Static(_) | HttpResponseBody::EchoedRequestBody => {}
@@ -641,7 +652,7 @@ impl HttpConnectionComponent {
                 })
                 .await;
             if let Err(error) = send_result {
-                return async_self.fail_and_die(format!(
+                return async_self.fail_and_die(&format!(
                     "failed to encode HTTP response for {peer_addr}: {error}",
                 ));
             }
@@ -649,7 +660,7 @@ impl HttpConnectionComponent {
         });
     }
 
-    fn fail_and_die(&mut self, message: String) -> Handled {
+    fn fail_and_die(&mut self, message: &str) -> Handled {
         self.session_state.request_close(true);
         log::error!("{message}");
         Handled::DieNow
@@ -666,7 +677,7 @@ impl ComponentLifecycle for HttpConnectionComponent {
             let accept_reply = match pending.accept(async_self.actor_ref()).await {
                 Ok(reply) => reply,
                 Err(error) => {
-                    return async_self.fail_and_die(format!(
+                    return async_self.fail_and_die(&format!(
                         "HTTP pending-session accept reply dropped before completion: {error}"
                     ));
                 }
@@ -678,7 +689,7 @@ impl ComponentLifecycle for HttpConnectionComponent {
                 }
                 Err(error) => {
                     let peer_addr = async_self.peer_addr;
-                    async_self.fail_and_die(format!(
+                    async_self.fail_and_die(&format!(
                         "failed to accept inbound HTTP session from {peer_addr}: {error}",
                     ))
                 }
@@ -938,9 +949,7 @@ async fn write_response_head(
     Ok(())
 }
 
-fn build_echo_body_payload(
-    plan: &mut ResponseEncodePlan,
-) -> flotsync_io::errors::Result<IoPayload> {
+fn build_echo_body_payload(plan: &mut ResponseEncodePlan) -> IoPayload {
     let mut parts = Vec::with_capacity(plan.body_slices.len());
     for slice in &plan.body_slices {
         let payload = plan.retained_input[slice.payload_index]
@@ -963,7 +972,7 @@ fn build_echo_body_payload(
             });
         parts.push(payload);
     }
-    Ok(IoPayload::chain(parts))
+    IoPayload::chain(parts)
 }
 
 #[cfg(test)]

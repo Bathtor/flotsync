@@ -60,6 +60,9 @@ impl std::fmt::Display for GroupId {
 pub struct DatasetId(String);
 
 impl DatasetId {
+    /// # Errors
+    ///
+    /// See `DatasetIdError` for failure conditions.
     pub fn try_new(value: impl Into<String>) -> Result<Self, DatasetIdError> {
         let value = value.into();
 
