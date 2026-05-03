@@ -38,9 +38,10 @@ use flotsync_replication::{
     SnapshotRowsRequest,
     SqliteReplicationStore,
     StoreError,
+    SummaryRequest,
     load_replication_runtime_with_runtime_config_toml,
 };
-use futures_util::FutureExt;
+use futures_util::{FutureExt, future::join_all};
 use kompact::prelude::block_on;
 use snafu::prelude::*;
 use std::{
@@ -372,6 +373,7 @@ impl ChecklistRepl {
             ChecklistCommand::Events { limit } => self.print_events(limit),
             ChecklistCommand::Sync => self.sync()?,
             ChecklistCommand::Members => self.print_members(),
+            ChecklistCommand::Check => self.check_members(),
             ChecklistCommand::Me => self.print_me(),
             ChecklistCommand::Help => println!("{}", checklist_help()),
             ChecklistCommand::Quit => return Ok(false),
@@ -508,6 +510,41 @@ impl ChecklistRepl {
                 ""
             };
             println!("{index}: {member}{marker}");
+        }
+    }
+
+    fn check_members(&self) {
+        println!("group {}", self.config.group_id);
+        let requests =
+            self.config
+                .ordered_members
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, member)| {
+                    let replication = self.replication.clone();
+                    let group_id = self.config.group_id;
+                    async move {
+                        let request = SummaryRequest {
+                            group_id,
+                            target: member.clone(),
+                        };
+                        let result = replication.request_summary(request).await;
+                        (index, member, result)
+                    }
+                });
+        let summaries = block_on(join_all(requests));
+        let local_member = self.config.local_member.clone();
+        for (index, member, result) in summaries {
+            let marker = if member == local_member { " (me)" } else { "" };
+            match result {
+                Ok(summary) => {
+                    println!("{index}: {member}{marker} has {}", summary.has_versions);
+                }
+                Err(error) => {
+                    println!("{index}: {member}{marker} unavailable: {error}");
+                }
+            }
         }
     }
 

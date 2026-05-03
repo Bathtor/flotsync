@@ -36,6 +36,24 @@ pub(super) enum SnapshotRowsError {
 }
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(summary))]
+pub(super) enum SummaryError {
+    #[snafu(display("Group {group_id} is not hosted by this runtime."))]
+    UnknownGroup { group_id: GroupId },
+    #[snafu(display("Summary target {target} is not a member of group {group_id}."))]
+    TargetNotInGroup {
+        group_id: GroupId,
+        target: MemberIdentity,
+    },
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+}
+
+#[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub(crate) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different canonical member order."))]

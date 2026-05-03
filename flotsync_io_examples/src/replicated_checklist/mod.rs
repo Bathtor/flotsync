@@ -206,6 +206,8 @@ pub enum ChecklistCommand {
     Sync,
     /// Print configured group members.
     Members,
+    /// Ask each configured member for its current group summary.
+    Check,
     /// Print local member and store details.
     Me,
     /// Print command help.
@@ -1246,6 +1248,10 @@ mod tests {
             Some(ChecklistCommand::Members)
         );
         assert_eq!(
+            parse_checklist_command("check").expect("command should parse"),
+            Some(ChecklistCommand::Check)
+        );
+        assert_eq!(
             parse_checklist_command("me").expect("command should parse"),
             Some(ChecklistCommand::Me)
         );
@@ -1308,12 +1314,14 @@ mod tests {
             "events",
             "sync",
             "members",
+            "check",
             "me",
             "help",
             "quit",
             "Add one new checklist item",
             "Publish local changes and apply received updates",
             "Print configured group members",
+            "Ask each configured member for its current group summary",
             "Exit the REPL",
         ] {
             assert!(

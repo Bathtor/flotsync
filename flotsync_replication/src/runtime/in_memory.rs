@@ -482,7 +482,7 @@ struct AppliedRemoteOperation {
 /// All touched datasets are first materialised into working copies so the batch
 /// either commits atomically into local state or returns an error without
 /// partially replacing dataset maps.
-pub(super) fn apply_one_update_batch(
+pub(super) fn apply_one_update(
     group: &mut LoadedGroupMeta,
     working_datasets: &mut HashMap<DatasetId, LocalDataset>,
     update: &ReplicationUpdateRecord,

@@ -1,4 +1,4 @@
-use super::ReplicationRuntimeComponent;
+use super::{ReplicationRuntimeComponent, summary_request_manager::SummaryRequestManager};
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
@@ -86,6 +86,15 @@ mod config_keys {
         doc = "Configured local UDP bind address owned by the replication runtime endpoint binder.",
         version = "0.1.0"
     }
+
+    kompact_config! {
+        SUMMARY_REQUEST_TIMEOUT,
+        key = "flotsync.replication.runtime.summary-request-timeout",
+        type = DurationValue,
+        default = Duration::from_secs(2),
+        doc = "Maximum wait for a summary response from a peer.",
+        version = "0.1.0"
+    }
 }
 
 /// Startup and shutdown failures for the internal delivery runtime host.
@@ -116,6 +125,7 @@ pub(crate) enum RuntimeHostError {
 #[derive(Clone, Copy, Debug)]
 struct DeliveryRuntimeHostConfig {
     control_timeout: Duration,
+    summary_request_timeout: Duration,
     local_endpoint_bind_addr: SocketAddr,
 }
 
@@ -126,6 +136,13 @@ impl DeliveryRuntimeHostConfig {
             .read_or_default(&config_keys::CONTROL_TIMEOUT)
             .map_err(|error| RuntimeHostError::InvalidConfig {
                 key: config_keys::CONTROL_TIMEOUT.key,
+                message: error.to_string(),
+            })?;
+        let summary_request_timeout = system
+            .config()
+            .read_or_default(&config_keys::SUMMARY_REQUEST_TIMEOUT)
+            .map_err(|error| RuntimeHostError::InvalidConfig {
+                key: config_keys::SUMMARY_REQUEST_TIMEOUT.key,
                 message: error.to_string(),
             })?;
         let local_endpoint_bind_addr = system
@@ -146,6 +163,7 @@ impl DeliveryRuntimeHostConfig {
                 )?;
         Ok(Self {
             control_timeout,
+            summary_request_timeout,
             local_endpoint_bind_addr,
         })
     }
@@ -183,6 +201,7 @@ struct RuntimeTopology {
     #[cfg_attr(not(test), allow(dead_code))]
     preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
+    summary_request_manager: Arc<Component<SummaryRequestManager>>,
     runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
@@ -199,7 +218,7 @@ impl RuntimeTopology {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
-        local_endpoint_bind_addr: SocketAddr,
+        host_config: DeliveryRuntimeHostConfig,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Self {
         let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -232,24 +251,45 @@ impl RuntimeTopology {
         let reliable_delivery =
             system.create(move || ReliableDeliveryComponent::new(reliable_manager_ref));
         let preconfigured_peer_routes = system.create(move || {
-            PreconfiguredPeerRoutesComponent::new(local_endpoint_bind_addr, route_publish_mode)
+            PreconfiguredPeerRoutesComponent::new(
+                host_config.local_endpoint_bind_addr,
+                route_publish_mode,
+            )
         });
         let preconfigured_peer_routes_ref = preconfigured_peer_routes
             .actor_ref()
             .hold()
             .expect("preconfigured peer routes must expose a strong actor ref");
         let local_endpoint_manager =
-            system.create(move || LocalEndpointManager::new(local_endpoint_bind_addr));
-        let runtime_memberships = group_memberships.clone();
-        let runtime_local_member = local_member.clone();
-        let runtime_component = system.create(move || {
-            ReplicationRuntimeComponent::new(
-                runtime_local_member.clone(),
-                store.clone(),
-                listener.clone(),
-                runtime_memberships.clone(),
-            )
-        });
+            system.create(move || LocalEndpointManager::new(host_config.local_endpoint_bind_addr));
+        let summary_request_manager = {
+            let summary_manager_memberships = group_memberships.clone();
+            let summary_manager_local_member = local_member.clone();
+            system.create(move || {
+                SummaryRequestManager::new(
+                    summary_manager_local_member.clone(),
+                    summary_manager_memberships.clone(),
+                    host_config.summary_request_timeout,
+                )
+            })
+        };
+        let summary_request_manager_ref = summary_request_manager
+            .actor_ref()
+            .hold()
+            .expect("summary request manager must expose a strong actor ref");
+        let runtime_component = {
+            let runtime_memberships = group_memberships.clone();
+            let runtime_local_member = local_member.clone();
+            system.create(move || {
+                ReplicationRuntimeComponent::new(
+                    runtime_local_member.clone(),
+                    store.clone(),
+                    listener.clone(),
+                    runtime_memberships.clone(),
+                    summary_request_manager_ref.clone(),
+                )
+            })
+        };
 
         Self {
             driver,
@@ -261,6 +301,7 @@ impl RuntimeTopology {
             preconfigured_peer_routes,
             preconfigured_peer_routes_ref,
             local_endpoint_manager,
+            summary_request_manager,
             runtime_component,
         }
     }
@@ -300,6 +341,11 @@ impl RuntimeTopology {
             &self.reliable_delivery,
             &self.runtime_component,
             "reliable delivery -> replication runtime",
+        )?;
+        Self::connect_components::<ReliableDeliveryPort, _, _>(
+            &self.reliable_delivery,
+            &self.summary_request_manager,
+            "reliable delivery -> summary request manager",
         )?;
         Ok(())
     }
@@ -355,6 +401,12 @@ impl RuntimeTopology {
         )?;
         Self::start_component(
             system,
+            &self.summary_request_manager,
+            "summary_request_manager",
+            control_timeout,
+        )?;
+        Self::start_component(
+            system,
             &self.runtime_component,
             "replication_runtime",
             control_timeout,
@@ -371,6 +423,12 @@ impl RuntimeTopology {
             system,
             &self.runtime_component,
             "replication_runtime",
+            control_timeout,
+        )?;
+        Self::stop_component(
+            system,
+            &self.summary_request_manager,
+            "summary_request_manager",
             control_timeout,
         )?;
         Self::stop_component(
@@ -543,7 +601,7 @@ impl DeliveryRuntimeHost {
             local_member,
             store,
             listener,
-            host_config.local_endpoint_bind_addr,
+            host_config,
             route_publish_mode,
         );
         topology.connect_all()?;

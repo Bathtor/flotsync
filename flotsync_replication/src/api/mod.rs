@@ -337,6 +337,26 @@ pub type SnapshotRowBatch = SmallVec<[SnapshotRow; 16]>;
 /// should drain or drop them promptly.
 pub type SnapshotRowProvider = dyn BatchProvider<Batch = SnapshotRowBatch>;
 
+/// Request one peer's current version vector for a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryRequest {
+    /// Replication group whose progress should be reported.
+    pub group_id: GroupId,
+    /// Group member that should answer the request.
+    pub target: MemberIdentity,
+}
+
+/// One peer's reported replication progress for a group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Summary {
+    /// Replication group described by this summary.
+    pub group_id: GroupId,
+    /// Member that produced this summary.
+    pub responder: MemberIdentity,
+    /// Group version vector currently known to `responder`.
+    pub has_versions: VersionVector,
+}
+
 /// One row entry in an initial dataset state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialRowState {
@@ -545,6 +565,9 @@ pub trait ReplicationApi: Send + Sync {
         &self,
         request: SnapshotRowsRequest,
     ) -> BoxFuture<'_, Result<SnapshotRows, ApiError>>;
+
+    /// Ask one group member for its current group version vector.
+    fn request_summary(&self, request: SummaryRequest) -> BoxFuture<'_, Result<Summary, ApiError>>;
 
     /// Create one new fixed-membership replication group rooted at this member.
     ///

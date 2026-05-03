@@ -24,10 +24,10 @@ use crate::{
     },
     runtime::messages::{
         DatasetUpdateMessage,
-        UpdateBatchMessage,
-        decode_update_batch_proto,
+        UpdateMessage,
+        decode_update_proto,
         decode_version_vector_proto,
-        encode_update_batch_proto,
+        encode_update_proto,
         encode_version_vector_proto,
     },
 };
@@ -533,7 +533,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     update_version BLOB NOT NULL,
     sender TEXT NOT NULL,
     applied_locally INTEGER NOT NULL,
-    update_batch BLOB NOT NULL,
+    update_message BLOB NOT NULL,
     PRIMARY KEY (group_id, update_node_index, update_version),
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
@@ -987,7 +987,7 @@ async fn load_replication_update(
     let member_count = load_group_member_count(connection, group_id).await?;
     let row = sqlx::query(
         "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND update_node_index = ?2
@@ -1019,7 +1019,7 @@ async fn load_replication_updates(
     let sql = match filter {
         ReplicationUpdateFilter::All => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
 ORDER BY update_version, update_node_index
@@ -1027,7 +1027,7 @@ ORDER BY update_version, update_node_index
         }
         ReplicationUpdateFilter::PendingApply => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND applied_locally = 0
@@ -1036,7 +1036,7 @@ ORDER BY update_version, update_node_index
         }
         ReplicationUpdateFilter::Applied => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND applied_locally = 1
@@ -1071,7 +1071,7 @@ async fn append_replication_update(
     connection: &mut SqliteStoreConnection,
     update: &ReplicationUpdateRecord,
 ) -> Result<(), StoreError> {
-    let update_batch = encode_stored_update_batch(update);
+    let update_message = encode_stored_update(update);
     sqlx::query(
         "
 INSERT INTO dataset_updates (
@@ -1080,7 +1080,7 @@ INSERT INTO dataset_updates (
     update_version,
     sender,
     applied_locally,
-    update_batch
+    update_message
 )
 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ",
@@ -1090,7 +1090,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     .bind(encode_update_version_sort_key_vec(update.update_id.version))
     .bind(update.sender.to_string())
     .bind(update.applied_locally)
-    .bind(update_batch)
+    .bind(update_message)
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -1282,8 +1282,8 @@ fn decode_stored_version_vector(
         .map_err(|source| invalid_stored_object("version vector", source))
 }
 
-fn encode_stored_update_batch(update: &ReplicationUpdateRecord) -> Vec<u8> {
-    let message = UpdateBatchMessage {
+fn encode_stored_update(update: &ReplicationUpdateRecord) -> Vec<u8> {
+    let message = UpdateMessage {
         group_id: update.group_id,
         update_id: update.update_id,
         read_versions: update.read_versions.clone(),
@@ -1296,9 +1296,7 @@ fn encode_stored_update_batch(update: &ReplicationUpdateRecord) -> Vec<u8> {
             })
             .collect(),
     };
-    encode_update_batch_proto(&message)
-        .encode_to_bytes()
-        .to_vec()
+    encode_update_proto(&message).encode_to_bytes().to_vec()
 }
 
 fn decode_stored_update_row(
@@ -1309,14 +1307,14 @@ fn decode_stored_update_row(
 ) -> Result<ReplicationUpdateRecord, StoreError> {
     let sender = decode_member_identity(&row.get::<String, _>("sender"))?;
     let applied_locally = row.get::<bool, _>("applied_locally");
-    let update_batch =
-        replication_proto::UpdateBatch::decode_from_slice(&row.get::<Vec<u8>, _>("update_batch"))
+    let update_message =
+        replication_proto::Update::decode_from_slice(&row.get::<Vec<u8>, _>("update_message"))
             .map_err(|source| SqliteStoreError::DecodeStoredProto {
-            object: "update batch",
-            source,
-        })?;
-    let message = decode_update_batch_proto(update_batch, member_count)
-        .map_err(|source| invalid_stored_object("update batch", source))?;
+                object: "update",
+                source,
+            })?;
+    let message = decode_update_proto(update_message, member_count)
+        .map_err(|source| invalid_stored_object("update", source))?;
     ensure!(
         message.group_id == *expected_group_id,
         StoredUpdateGroupMismatchSnafu {
@@ -1484,14 +1482,14 @@ enum SqliteStoreError {
     #[snafu(display("Stored {object} sort key had invalid length {len}."))]
     InvalidStoredSortKey { object: &'static str, len: usize },
     #[snafu(display(
-        "Stored update batch belonged to group '{actual_group_id}', expected '{expected_group_id}'."
+        "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
     ))]
     StoredUpdateGroupMismatch {
         expected_group_id: GroupId,
         actual_group_id: GroupId,
     },
     #[snafu(display(
-        "Stored update batch contained update id '{actual_update_id:?}', expected '{expected_update_id:?}'."
+        "Stored update contained update id '{actual_update_id:?}', expected '{expected_update_id:?}'."
     ))]
     StoredUpdateIdMismatch {
         expected_update_id: UpdateId,

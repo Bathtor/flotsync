@@ -13,7 +13,9 @@ import "flotsync/versions/v1/versions.proto";
 message RuntimeMessage {
   oneof body {
     BootstrapGroup bootstrap_group = 1;
-    UpdateBatch update_batch = 2;
+    Update update = 2;
+    SummaryRequest summary_request = 3;
+    Summary summary = 4;
   }
 }
 
@@ -29,8 +31,8 @@ message BootstrapGroup {
   repeated flotsync.discovery.v1.Identifier members = 2;
 }
 
-// One causal replication update batch delivered through GroupBroadcast.
-message UpdateBatch {
+// One causal replication update delivered through GroupBroadcast.
+message Update {
   bytes group_id = 1;
   flotsync.datamodel.v1.HistoryId update_id = 2;
 
@@ -43,7 +45,20 @@ message UpdateBatch {
   repeated DatasetUpdate dataset_updates = 4;
 }
 
-// All schema operations for one dataset within a single update batch.
+// Request a peer's currently durable group version vector.
+message SummaryRequest {
+  bytes group_id = 1;
+  bytes correlation_id = 2;
+}
+
+// Current durable group version vector for one responding peer.
+message Summary {
+  bytes group_id = 1;
+  bytes correlation_id = 2;
+  flotsync.versions.v1.VersionVector has_versions = 3;
+}
+
+// All schema operations for one dataset within a single update.
 message DatasetUpdate {
   string dataset_id = 1;
   repeated flotsync.datamodel.v1.SchemaOperation operations = 2;

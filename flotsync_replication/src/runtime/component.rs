@@ -1,4 +1,5 @@
 use super::{
+    envelope::{encode_runtime_payload, placeholder_signed_footer},
     errors::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
@@ -15,16 +16,18 @@ use super::{
         SnapshotRowsError,
         StoreGroupSnafu,
         StoreStartupSnafu,
+        SummaryError,
         inbound,
         publish,
         snapshot,
+        summary,
     },
     in_memory::{
         LoadedGroupMeta,
         PendingUpdateSet,
         PreparedLocalChanges,
         TouchedGroupRows,
-        apply_one_update_batch,
+        apply_one_update,
         collect_group_row_scope,
         collect_record_row_scope,
         validate_inbound_update_read_versions,
@@ -34,11 +37,14 @@ use super::{
         BootstrapGroupMessage,
         DatasetUpdateMessage,
         RuntimeMessage,
-        UpdateBatchMessage,
+        SummaryMessage,
+        SummaryRequestMessage,
+        UpdateMessage,
         WireRuntimeMessage,
-        WireUpdateBatchMessage,
+        WireUpdateMessage,
     },
     replay,
+    summary_request_manager::SummaryRequestManagerMessage,
 };
 use crate::{
     GroupMembers,
@@ -82,6 +88,8 @@ use crate::{
         SnapshotRows,
         SnapshotRowsRequest,
         StoreError,
+        Summary,
+        SummaryRequest,
         providers::VecRowProvider,
     },
     delivery::{
@@ -105,20 +113,12 @@ use crate::{
             ReliableMessageEnvelope,
             ReliableMessageHeader,
         },
-        shared::{
-            DeliveryClass,
-            DetachedSignature,
-            EncryptedPayload,
-            MessageId,
-            SignatureScheme,
-            SignedEnvelopeFooter,
-        },
+        shared::{DeliveryClass, EncryptedPayload, MessageId},
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::OwnedRow;
-use flotsync_messages::buffa::Message as BuffaMessage;
-use flotsync_utils::BoxFuture;
+use flotsync_utils::{BoxFuture, KClaimablePromise};
 use futures_util::FutureExt;
 use kompact::prelude::*;
 use snafu::prelude::*;
@@ -359,12 +359,26 @@ pub enum ReplicationRuntimeMessage {
     PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
     /// Request a local snapshot stream through the component interface.
     SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>),
+    /// Ask one group member for its current group version vector.
+    RequestSummary(Ask<SummaryRequest, Result<Summary, ApiError>>),
     /// Create one new fixed-membership group through the component interface.
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     /// Request one group-membership change through the component interface.
     ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>),
     #[cfg(test)]
     Test(ReplicationRuntimeTestMessage),
+}
+
+/// Delivery path that should carry one inbound summary response.
+enum SummaryReplyRoute {
+    /// Reply to a recipient-addressed reliable request and acknowledge it after
+    /// the response is submitted.
+    Reliable {
+        recipient: MemberIdentity,
+        processed: KClaimablePromise<()>,
+    },
+    /// Reply to a group-broadcast request by publishing the summary to the group.
+    GroupBroadcast,
 }
 
 #[cfg(test)]
@@ -378,7 +392,7 @@ pub enum ReplicationRuntimeTestMessage {
     /// mailbox turn after startup.
     Ping(Ask<(), ()>),
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
-    ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
+    ApplyUpdate(Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>),
 }
 
 #[cfg(test)]
@@ -398,12 +412,12 @@ impl ReplicationRuntimeMessage {
         )))
     }
 
-    pub(super) fn test_apply_update_batch(
+    pub(super) fn test_apply_update(
         promise: KPromise<Result<(), InboundDeliveryError>>,
         sender: MemberIdentity,
-        message: UpdateBatchMessage,
+        message: UpdateMessage,
     ) -> Self {
-        Self::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(Ask::new(
+        Self::Test(ReplicationRuntimeTestMessage::ApplyUpdate(Ask::new(
             promise,
             (sender, message),
         )))
@@ -424,15 +438,17 @@ pub struct ReplicationRuntimeComponent {
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     group_memberships: SharedGroupMemberships,
+    summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
 }
 
 impl ReplicationRuntimeComponent {
     /// Construct one replication runtime component for one local member.
-    pub fn new(
+    pub(super) fn new(
         local_member: MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         group_memberships: SharedGroupMemberships,
+        summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -442,6 +458,7 @@ impl ReplicationRuntimeComponent {
             store,
             listener,
             group_memberships,
+            summary_request_manager,
         }
     }
 
@@ -596,6 +613,70 @@ impl ReplicationRuntimeComponent {
         ReadToken::from_group_versions(group_versions)
     }
 
+    fn validate_summary_request(&self, request: &SummaryRequest) -> Result<(), SummaryError> {
+        let memberships = self.group_memberships.snapshot();
+        let members =
+            memberships
+                .members(&request.group_id)
+                .context(summary::UnknownGroupSnafu {
+                    group_id: request.group_id,
+                })?;
+        ensure!(
+            members.contains(&request.target),
+            summary::TargetNotInGroupSnafu {
+                group_id: request.group_id,
+                target: request.target.clone(),
+            }
+        );
+        Ok(())
+    }
+
+    async fn load_summary_versions_from_store(
+        store: Arc<dyn ReplicationStore>,
+        group_id: GroupId,
+    ) -> Result<Option<VersionVector>, StoreError> {
+        let mut transaction = store.begin_read_transaction().await?;
+        let group = transaction.load_replication_group(&group_id).await?;
+        transaction.rollback().await?;
+        Ok(group.map(|group| group.version_vector))
+    }
+
+    fn summary_message_for_request(
+        message: SummaryRequestMessage,
+        has_versions: VersionVector,
+    ) -> RuntimeMessage {
+        RuntimeMessage::Summary(SummaryMessage::new(
+            message.group_id,
+            message.correlation_id,
+            has_versions,
+        ))
+    }
+
+    async fn load_summary_message_from_store(
+        store: Arc<dyn ReplicationStore>,
+        message: SummaryRequestMessage,
+    ) -> Result<RuntimeMessage, InboundDeliveryError> {
+        let has_versions = Self::load_summary_versions_from_store(store, message.group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let has_versions = has_versions.context(inbound::UnknownHostedGroupSnafu {
+            group_id: message.group_id,
+        })?;
+        Ok(Self::summary_message_for_request(message, has_versions))
+    }
+
+    fn summary_for_request(
+        group_id: GroupId,
+        responder: MemberIdentity,
+        has_versions: VersionVector,
+    ) -> Summary {
+        Summary {
+            group_id,
+            responder,
+            has_versions,
+        }
+    }
+
     /// Persist one newly observed group definition.
     ///
     /// If the same group already exists with the same canonical membership
@@ -714,12 +795,53 @@ impl ReplicationRuntimeComponent {
             }));
     }
 
-    /// Encode one runtime message into the temporary byte payload expected by
-    /// the current delivery-envelope boundary.
-    fn encode_runtime_payload(message: &RuntimeMessage) -> bytes::Bytes {
-        // Temporary byte serialisation at the delivery-envelope boundary.
-        // See flotsync-ylo for the payload/encryption redesign.
-        message.encode_to_proto().encode_to_bytes()
+    fn submit_reliable_runtime_message(
+        &mut self,
+        recipient: MemberIdentity,
+        message: &RuntimeMessage,
+    ) {
+        let payload = encode_runtime_payload(message);
+        self.reliable_delivery
+            .trigger(ReliableDeliveryPortRequest::Submit(
+                ReliableDeliverySubmit {
+                    envelope: ReliableMessageEnvelope {
+                        header: ReliableMessageHeader {
+                            sender: self.local_member.clone(),
+                            recipient,
+                            message_id: MessageId(Uuid::new_v4()),
+                        },
+                        payload: EncryptedPayload {
+                            ciphertext: payload,
+                        },
+                        footer: placeholder_signed_footer(),
+                    },
+                },
+            ));
+    }
+
+    fn submit_group_runtime_message(
+        &mut self,
+        group_id: GroupId,
+        message: &RuntimeMessage,
+        delivery_class: DeliveryClass,
+    ) {
+        let payload = encode_runtime_payload(message);
+        self.group_broadcast
+            .trigger(GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
+                delivery_class,
+                envelope: GroupMessageEnvelope {
+                    header: GroupMessageHeader {
+                        group_id,
+                        sender: self.local_member.clone(),
+                        message_id: MessageId(Uuid::new_v4()),
+                    },
+                    payload: EncryptedPayload {
+                        ciphertext: payload,
+                    },
+                    footer: placeholder_signed_footer(),
+                },
+                suppress_self_delivery: true,
+            }));
     }
 
     /// Submit the reliable bootstrap fan-out for one newly created group.
@@ -728,28 +850,13 @@ impl ReplicationRuntimeComponent {
             group_id,
             members: members.ordered_members(),
         });
-        let payload = Self::encode_runtime_payload(&message);
+        let local_member = self.local_member.clone();
         for recipient in members
             .ordered_members()
             .into_iter()
-            .filter(|member| member != &self.local_member)
+            .filter(|member| member != &local_member)
         {
-            self.reliable_delivery
-                .trigger(ReliableDeliveryPortRequest::Submit(
-                    ReliableDeliverySubmit {
-                        envelope: ReliableMessageEnvelope {
-                            header: ReliableMessageHeader {
-                                sender: self.local_member.clone(),
-                                recipient,
-                                message_id: MessageId(Uuid::new_v4()),
-                            },
-                            payload: EncryptedPayload {
-                                ciphertext: payload.clone(),
-                            },
-                            footer: placeholder_signed_footer(),
-                        },
-                    },
-                ));
+            self.submit_reliable_runtime_message(recipient, &message);
         }
     }
 
@@ -798,7 +905,7 @@ impl ReplicationRuntimeComponent {
     /// schema operation produced for the publish batch is encoded with exactly
     /// that change id. The surrounding publish transaction captures `ReadVV`
     /// before applying the mutations, persists the same `UpdateId` and `ReadVV`,
-    /// and sends both values in the outbound `UpdateBatch`.
+    /// and sends both values in the outbound `Update`.
     ///
     /// `last_changed_versions` is the causal frontier of the new update and is
     /// stored on every row image affected by the publish.
@@ -870,7 +977,7 @@ impl ReplicationRuntimeComponent {
     /// Convert one runtime update message into the durable update-record shape.
     fn build_replication_update_record(
         sender: MemberIdentity,
-        message: UpdateBatchMessage,
+        message: UpdateMessage,
         applied_locally: bool,
     ) -> ReplicationUpdateRecord {
         ReplicationUpdateRecord {
@@ -992,7 +1099,7 @@ impl ReplicationRuntimeComponent {
             .await
             .context(publish::StoreAccessSnafu)?;
 
-        let message = RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+        let message = RuntimeMessage::Update(UpdateMessage {
             group_id,
             update_id,
             read_versions,
@@ -1005,13 +1112,63 @@ impl ReplicationRuntimeComponent {
                 })
                 .collect(),
         });
-        let payload = Self::encode_runtime_payload(&message);
+        let payload = encode_runtime_payload(&message);
         Ok(PreparedLocalPublish {
             group_id,
             update_id,
             read_token,
             payload,
             row_changes: prepared_local_changes.row_changes,
+        })
+    }
+
+    fn submit_summary_reply(
+        &mut self,
+        route: SummaryReplyRoute,
+        message: SummaryRequestMessage,
+        summary: &RuntimeMessage,
+    ) -> Result<(), InboundDeliveryError> {
+        match route {
+            SummaryReplyRoute::Reliable {
+                recipient,
+                processed,
+            } => {
+                self.submit_reliable_runtime_message(recipient, summary);
+                processed
+                    .complete()
+                    .context(inbound::CompleteProcessedPromiseSnafu {
+                        group_id: message.group_id,
+                    })?;
+            }
+            SummaryReplyRoute::GroupBroadcast => {
+                self.submit_group_runtime_message(
+                    message.group_id,
+                    summary,
+                    DeliveryClass::BestEffort,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_inbound_summary_request(
+        &mut self,
+        context: InboundDeliveryContext,
+        route: SummaryReplyRoute,
+        message: SummaryRequestMessage,
+    ) -> Handled {
+        let store = self.store.clone();
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = async {
+                let summary = Self::load_summary_message_from_store(store, message).await?;
+                async_self.submit_summary_reply(route, message, &summary)
+            }
+            .await;
+            if let Err(error) = reply {
+                let failure = InboundDeliveryFailure::new(context, error);
+                let action = async_self.record_inbound_failure(&failure);
+                panic_if_fatal_inbound_failure(action, &failure);
+            }
         })
     }
 
@@ -1074,10 +1231,22 @@ impl ReplicationRuntimeComponent {
                     }
                 }))
             }
-            WireRuntimeMessage::UpdateBatch(_) => Err(InboundDeliveryFailure::new(
+            WireRuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
                 context,
                 InboundDeliveryError::UnexpectedReliableMessage,
             )),
+            WireRuntimeMessage::SummaryRequest(message) => {
+                let sender = deliver.envelope.header.sender.clone();
+                Ok(self.handle_inbound_summary_request(
+                    context,
+                    SummaryReplyRoute::Reliable {
+                        recipient: sender,
+                        processed: deliver.processed,
+                    },
+                    message,
+                ))
+            }
+            WireRuntimeMessage::Summary(_) => Ok(Handled::Ok),
         }
     }
 
@@ -1099,9 +1268,13 @@ impl ReplicationRuntimeComponent {
                 context,
                 InboundDeliveryError::UnexpectedGroupMessage,
             )),
-            WireRuntimeMessage::UpdateBatch(message) => {
-                Ok(self.handle_update_batch(context, sender, message))
-            }
+            WireRuntimeMessage::Update(message) => Ok(self.handle_update(context, sender, message)),
+            WireRuntimeMessage::SummaryRequest(message) => Ok(self.handle_inbound_summary_request(
+                context,
+                SummaryReplyRoute::GroupBroadcast,
+                message,
+            )),
+            WireRuntimeMessage::Summary(_) => Ok(Handled::Ok),
         }
     }
 
@@ -1111,10 +1284,10 @@ impl ReplicationRuntimeComponent {
         clippy::too_many_lines,
         reason = "The inbound transaction is intentionally linear to keep causality checks and rollback handling auditable."
     )]
-    async fn persist_and_apply_update_batch(
+    async fn persist_and_apply_update(
         &mut self,
         sender: MemberIdentity,
-        message: WireUpdateBatchMessage,
+        message: WireUpdateMessage,
     ) -> Result<Vec<ListenerDataChanges>, InboundDeliveryError> {
         let group_id = message.group_id;
         let mut transaction = self
@@ -1261,7 +1434,7 @@ impl ReplicationRuntimeComponent {
         let mut event_batches = Vec::new();
         for ready_update in &apply_plan.ready_chain {
             let applied_batch =
-                apply_one_update_batch(&mut local_group, &mut working_datasets, ready_update)?;
+                apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
             listener_read_token = listener_read_token
                 .with_group_version(group_id, local_group.version_vector.clone());
             if !applied_batch.row_changes.is_empty() {
@@ -1289,16 +1462,14 @@ impl ReplicationRuntimeComponent {
         Ok(event_batches)
     }
 
-    fn handle_update_batch(
+    fn handle_update(
         &mut self,
         context: InboundDeliveryContext,
         sender: MemberIdentity,
-        message: WireUpdateBatchMessage,
+        message: WireUpdateMessage,
     ) -> Handled {
         Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .persist_and_apply_update_batch(sender, message)
-                .await;
+            let reply = async_self.persist_and_apply_update(sender, message).await;
             let error = match reply {
                 Ok(event_batches) => {
                     notify_listener_batches(async_self.listener.clone(), event_batches)
@@ -1361,6 +1532,50 @@ impl ReplicationRuntimeComponent {
                 .context(ApiExternalSnafu);
             async_self.reply_api(promise, "snapshot_rows", reply);
         })
+    }
+
+    fn handle_request_summary(
+        &mut self,
+        ask: Ask<SummaryRequest, Result<Summary, ApiError>>,
+    ) -> Handled {
+        let (promise, request) = ask.take();
+        if request.target == self.local_member {
+            if let Err(error) = self.validate_summary_request(&request) {
+                let reply = Err(error).boxed().context(ApiExternalSnafu);
+                self.reply_api(promise, "request_summary", reply);
+                return Handled::Ok;
+            }
+            let responder = self.local_member.clone();
+            let store = self.store.clone();
+            return Handled::block_on(self, async move |async_self| {
+                let reply = async {
+                    let has_versions =
+                        Self::load_summary_versions_from_store(store, request.group_id)
+                            .await
+                            .context(summary::StoreAccessSnafu)?;
+                    let has_versions = has_versions.context(summary::UnknownGroupSnafu {
+                        group_id: request.group_id,
+                    })?;
+                    Ok::<_, SummaryError>(Self::summary_for_request(
+                        request.group_id,
+                        responder,
+                        has_versions,
+                    ))
+                }
+                .await
+                .boxed()
+                .context(ApiExternalSnafu);
+                async_self.reply_api(promise, "request_summary", reply);
+            });
+        }
+        // Temporary glue: public runtime API requests currently enter through
+        // this component and are then routed to the dedicated summary manager.
+        // See flotsync-ozi for revisiting this component boundary.
+        self.summary_request_manager
+            .tell(SummaryRequestManagerMessage::RequestSummary(Ask::new(
+                promise, request,
+            )));
+        Handled::Ok
     }
 
     fn handle_create_group(
@@ -1434,14 +1649,14 @@ impl ReplicationRuntimeComponent {
     }
 
     #[cfg(test)]
-    fn handle_test_apply_update_batch(
+    fn handle_test_apply_update(
         &mut self,
-        ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
+        ask: Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>,
     ) -> Handled {
         let (promise, (sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self
-                .persist_and_apply_update_batch(sender, WireUpdateBatchMessage::from(message))
+                .persist_and_apply_update(sender, WireUpdateMessage::from(message))
                 .await
             {
                 Ok(event_batches) => {
@@ -1515,6 +1730,7 @@ impl Actor for ReplicationRuntimeComponent {
         match msg {
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
             ReplicationRuntimeMessage::SnapshotRows(ask) => self.handle_snapshot_rows(ask),
+            ReplicationRuntimeMessage::RequestSummary(ask) => self.handle_request_summary(ask),
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
                 self.handle_change_group_membership(ask)
@@ -1528,9 +1744,9 @@ impl Actor for ReplicationRuntimeComponent {
                 self.handle_test_install_group(ask)
             }
             #[cfg(test)]
-            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
-                ask,
-            )) => self.handle_test_apply_update_batch(ask),
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdate(ask)) => {
+                self.handle_test_apply_update(ask)
+            }
         }
     }
 }
@@ -1554,15 +1770,6 @@ fn handled_after_inbound_failure(
 ) -> Handled {
     panic_if_fatal_inbound_failure(action, failure);
     Handled::Ok
-}
-
-fn placeholder_signed_footer() -> SignedEnvelopeFooter {
-    SignedEnvelopeFooter {
-        signature: DetachedSignature {
-            scheme: SignatureScheme::Ed25519,
-            bytes: bytes::Bytes::from_static(b"runtime-placeholder-signature"),
-        },
-    }
 }
 
 async fn notify_listener_batches(

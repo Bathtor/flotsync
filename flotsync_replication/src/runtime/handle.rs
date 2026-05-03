@@ -19,6 +19,8 @@ use crate::api::{
     RuntimeSnafu,
     SnapshotRows,
     SnapshotRowsRequest,
+    Summary,
+    SummaryRequest,
 };
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
@@ -30,7 +32,7 @@ use std::{any::Any, sync::Arc, thread};
 #[cfg(test)]
 use super::{
     errors::{GroupInstallError, InboundDeliveryError},
-    messages::UpdateBatchMessage,
+    messages::UpdateMessage,
 };
 #[cfg(test)]
 use crate::{GroupMembers, api::MemberIdentity};
@@ -252,6 +254,12 @@ impl ReplicationApi for ReplicationRuntime {
         self.ask(move |promise| ReplicationRuntimeMessage::SnapshotRows(Ask::new(promise, request)))
     }
 
+    fn request_summary(&self, request: SummaryRequest) -> ApiFuture<'_, Summary> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::RequestSummary(Ask::new(promise, request))
+        })
+    }
+
     fn create_group(&self, req: CreateGroupRequest) -> ApiFuture<'_, GroupId> {
         self.ask(move |promise| ReplicationRuntimeMessage::CreateGroup(Ask::new(promise, req)))
     }
@@ -302,19 +310,19 @@ impl ReplicationRuntime {
         }
     }
 
-    pub(super) fn apply_update_batch_for_test(
+    pub(super) fn apply_update_for_test(
         &self,
         sender: MemberIdentity,
-        message: UpdateBatchMessage,
+        message: UpdateMessage,
     ) -> Result<(), InboundDeliveryError> {
         let future = self.runtime_ref().ask_with(|promise| {
-            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
+            ReplicationRuntimeMessage::test_apply_update(promise, sender, message)
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
             Err(error) => {
                 panic!(
-                    "replication runtime component became unavailable during test apply_update_batch: {error:?}"
+                    "replication runtime component became unavailable during test apply_update: {error:?}"
                 )
             }
         }

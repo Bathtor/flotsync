@@ -16,7 +16,7 @@ use super::{
         validate_update_mapping,
     },
     load_replication_runtime,
-    messages::{DatasetUpdateMessage, UpdateBatchMessage},
+    messages::{DatasetUpdateMessage, UpdateMessage},
 };
 use crate::{
     GroupMembers,
@@ -57,6 +57,7 @@ use crate::{
         SnapshotRow,
         SnapshotRowsRequest,
         StoreError,
+        SummaryRequest,
         process_batches,
     },
 };
@@ -1010,6 +1011,46 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
 }
 
 #[test]
+fn request_summary_reports_local_versions() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: test_row_id(group_id, dataset_id, 120_001),
+            row: crate::row_values! {
+                "title" => "local summary",
+            },
+        }],
+    );
+
+    let summary = wait_for_test_reply(fixture.runtime.request_summary(SummaryRequest {
+        group_id,
+        target: alice_member.clone(),
+    }))
+    .expect("summary request should succeed");
+
+    assert_eq!(summary.responder, alice_member);
+    assert_eq!(
+        summary.has_versions,
+        VersionVector::initial(NonZeroUsize::new(1).expect("one member"))
+            .with_update_applied(receipt.update_id)
+    );
+}
+
+#[test]
 fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -1484,6 +1525,54 @@ fn publish_changes_delivers_remote_data_changed_event() {
 }
 
 #[test]
+fn request_summary_returns_remote_current_version_vector() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
+
+    alice_runtime.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
+    );
+    bob_runtime.host().publish_direct_peer_route(
+        alice_member.clone(),
+        alice_runtime.host().advertised_loopback_udp_addr(),
+    );
+
+    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member, bob_member.clone()],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    wait_for_group_install(bob_runtime, group_id);
+
+    let summary = wait_for_test_reply(alice_runtime.request_summary(SummaryRequest {
+        group_id,
+        target: bob_member.clone(),
+    }))
+    .expect("summary request should succeed");
+
+    assert_eq!(summary.group_id, group_id);
+    assert_eq!(summary.responder, bob_member);
+    assert_eq!(
+        summary.has_versions,
+        VersionVector::initial(NonZeroUsize::new(2).expect("two members"))
+    );
+}
+
+#[test]
 fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicates() {
     // Causal buffering path:
     // 1. install a two-member group only on Bob,
@@ -1538,7 +1627,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     .encoded_operation;
 
     let member_count = NonZeroUsize::new(2).expect("group has two members");
-    let first_message = UpdateBatchMessage {
+    let first_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 1,
@@ -1552,7 +1641,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     };
     let mut second_read_versions = VersionVector::initial(member_count);
     second_read_versions.increment_at(0);
-    let second_message = UpdateBatchMessage {
+    let second_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 2,
@@ -1566,12 +1655,12 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
     };
 
     bob_runtime
-        .apply_update_batch_for_test(alice_member.clone(), second_message)
+        .apply_update_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should buffer");
     assert!(bob_fixture.listener.captured_data_changes().is_empty());
 
     bob_runtime
-        .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
+        .apply_update_for_test(alice_member.clone(), first_message.clone())
         .expect("first update should apply and drain the pending second update");
     bob_fixture.listener.wait_for_data_change_count(2);
     assert_eq!(
@@ -1592,7 +1681,7 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         ]
     );
     bob_runtime
-        .apply_update_batch_for_test(alice_member, first_message)
+        .apply_update_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
 }
@@ -1650,9 +1739,9 @@ fn inbound_listener_read_token_preserves_unrelated_hosted_group_progress() {
     .encoded_operation;
     let member_count = NonZeroUsize::new(2).expect("group has two members");
     bob_runtime
-        .apply_update_batch_for_test(
+        .apply_update_for_test(
             alice_member,
-            UpdateBatchMessage {
+            UpdateMessage {
                 group_id: inbound_group_id,
                 update_id: UpdateId {
                     version: 1,
@@ -1753,9 +1842,9 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
 
     let member_count = NonZeroUsize::new(2).expect("group has two members");
     bob_runtime
-        .apply_update_batch_for_test(
+        .apply_update_for_test(
             alice_member.clone(),
-            UpdateBatchMessage {
+            UpdateMessage {
                 group_id,
                 update_id: UpdateId {
                     version: 1,
@@ -1814,9 +1903,9 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     let mut edit_read_versions = VersionVector::initial(member_count);
     edit_read_versions.increment_at(0);
     restarted_runtime
-        .apply_update_batch_for_test(
+        .apply_update_for_test(
             alice_member.clone(),
-            UpdateBatchMessage {
+            UpdateMessage {
                 group_id,
                 update_id: UpdateId {
                     version: 2,
@@ -1863,9 +1952,9 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
     delete_read_versions.increment_at(0);
     delete_read_versions.increment_at(0);
     restarted_runtime
-        .apply_update_batch_for_test(
+        .apply_update_for_test(
             alice_member,
-            UpdateBatchMessage {
+            UpdateMessage {
                 group_id,
                 update_id: UpdateId {
                     version: 3,
@@ -2031,7 +2120,7 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     .expect("second operation should apply")
     .encoded_operation;
     let member_count = NonZeroUsize::new(2).expect("group has two members");
-    let first_message = UpdateBatchMessage {
+    let first_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 1,
@@ -2045,7 +2134,7 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     };
     let mut second_read_versions = VersionVector::initial(member_count);
     second_read_versions.increment_at(0);
-    let second_message = UpdateBatchMessage {
+    let second_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 2,
@@ -2059,7 +2148,7 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     };
 
     runtime
-        .apply_update_batch_for_test(alice_member.clone(), second_message)
+        .apply_update_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should persist pending state");
     drop(runtime);
 
@@ -2067,7 +2156,7 @@ fn buffered_updates_survive_runtime_restart_and_drain_from_store() {
     let restarted_runtime =
         load_runtime_with_parts(app_bob_id(), store.clone(), restarted_listener.clone());
     restarted_runtime
-        .apply_update_batch_for_test(alice_member, first_message)
+        .apply_update_for_test(alice_member, first_message)
         .expect("missing predecessor should apply and drain the persisted successor");
     restarted_listener.wait_for_data_change_count(2);
     assert_eq!(
@@ -2165,7 +2254,7 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     .expect("second operation should apply")
     .encoded_operation;
     let member_count = NonZeroUsize::new(2).expect("group has two members");
-    let first_message = UpdateBatchMessage {
+    let first_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 1,
@@ -2179,7 +2268,7 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     };
     let mut second_read_versions = VersionVector::initial(member_count);
     second_read_versions.increment_at(0);
-    let second_message = UpdateBatchMessage {
+    let second_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 2,
@@ -2193,11 +2282,11 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     };
 
     runtime
-        .apply_update_batch_for_test(alice_member.clone(), second_message)
+        .apply_update_for_test(alice_member.clone(), second_message)
         .expect("out-of-order update should persist pending state");
     store.fail_next_apply_dataset_row_patch(dataset_id.clone());
     let error = runtime
-        .apply_update_batch_for_test(alice_member.clone(), first_message.clone())
+        .apply_update_for_test(alice_member.clone(), first_message.clone())
         .expect_err("store write failure should abort the whole ready chain");
     assert!(matches!(error, InboundDeliveryError::StoreAccess { .. }));
     assert!(listener.captured_data_changes().is_empty());
@@ -2243,7 +2332,7 @@ fn causally_ready_apply_chain_rolls_back_when_store_write_fails() {
     );
 
     runtime
-        .apply_update_batch_for_test(alice_member, first_message)
+        .apply_update_for_test(alice_member, first_message)
         .expect("retry after rollback should succeed");
     listener.wait_for_data_change_count(2);
 }
@@ -2304,7 +2393,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     .expect("conflicting operation should apply")
     .encoded_operation;
 
-    let buffered_message = UpdateBatchMessage {
+    let buffered_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 2,
@@ -2320,7 +2409,7 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
             operations: vec![first_operation],
         }],
     };
-    let conflicting_message = UpdateBatchMessage {
+    let conflicting_message = UpdateMessage {
         group_id,
         update_id: UpdateId {
             version: 2,
@@ -2338,10 +2427,10 @@ fn buffered_updates_reject_conflicting_duplicate_payloads() {
     };
 
     bob_runtime
-        .apply_update_batch_for_test(alice_member.clone(), buffered_message)
+        .apply_update_for_test(alice_member.clone(), buffered_message)
         .expect("first out-of-order update should buffer");
     let error = bob_runtime
-        .apply_update_batch_for_test(alice_member, conflicting_message)
+        .apply_update_for_test(alice_member, conflicting_message)
         .expect_err("conflicting duplicate payload should fail");
     match error {
         InboundDeliveryError::ConflictingPersistedUpdate {
