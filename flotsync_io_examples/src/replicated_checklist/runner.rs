@@ -732,6 +732,8 @@ fn format_timestamp(timestamp: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotsync_io::test_support::{ReservedSocketKind, reserve_sockets};
+    use flotsync_replication::RowKey;
     use uuid::Uuid;
 
     fn test_config(group_id: GroupId, store_path: PathBuf) -> ChecklistAppConfig {
@@ -741,12 +743,76 @@ mod tests {
             local_member: MemberIdentity::from_array(["alice"]),
             store_path,
             group_id,
-            ordered_members: vec![
-                MemberIdentity::from_array(["alice"]),
-                MemberIdentity::from_array(["bob"]),
-            ],
+            ordered_members: vec![MemberIdentity::from_array(["alice"])],
             local_endpoint_bind_addr: "127.0.0.1:45100".parse().unwrap(),
         }
+    }
+
+    fn test_runtime_config_toml(local_endpoint: std::net::SocketAddr) -> String {
+        format!(
+            r#"
+            [flotsync.io]
+            bind-reuse-address = true
+
+            [flotsync.replication.runtime]
+            local-endpoint-bind-addr = "{local_endpoint}"
+            "#,
+        )
+    }
+
+    fn sync_working_set(replication: &dyn ReplicationApi, working_set: &mut ChecklistWorkingSet) {
+        let plan = working_set
+            .prepare_sync()
+            .expect("sync plan should build")
+            .expect("dirty checklist row should produce a sync plan");
+        let read_token = working_set
+            .read_token()
+            .expect("working set should have a read token");
+        let receipt = block_on(replication.publish_changes(PublishChangesRequest {
+            read_token,
+            changes: plan.mutations.clone(),
+        }))
+        .expect("checklist sync publish should succeed");
+        working_set.set_read_token(receipt.read_token);
+        working_set.finish_successful_sync(Some(plan));
+    }
+
+    #[test]
+    fn checklist_rename_with_two_insert_hunks_syncs() {
+        let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+        let group_id = GroupId(Uuid::from_u128(0x45d0));
+        let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        config.runtime_config_toml = test_runtime_config_toml(endpoint_lease.addr(0));
+        let store = Arc::new(
+            SqliteReplicationStore::in_memory_with_schema_sources(
+                config.local_member.clone(),
+                [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
+            )
+            .expect("store should build"),
+        );
+        block_on(ensure_configured_group(store.as_ref(), &config))
+            .expect("static group should be prepared");
+        let (listener, _listener_receiver) = ChecklistListener::pair();
+        let replication = block_on(load_replication_runtime_with_runtime_config_toml(
+            Identifier::from_array(["flotsync", "examples", "replicated-checklist"]),
+            store,
+            listener,
+            ReplicationConfig::default(),
+            &config.runtime_config_toml,
+        ))
+        .expect("runtime should load");
+        let mut working_set = load_checklist_working_set(replication.as_ref(), group_id)
+            .expect("working set should load");
+        let row_key = RowKey(Uuid::from_u128(1));
+
+        working_set.add_item_with_key(row_key, "a");
+        sync_working_set(replication.as_ref(), &mut working_set);
+        // This rename produces two insert hunks around the existing character.
+        working_set
+            .rename_item(ItemSelector::RowKey(row_key), "xay")
+            .expect("rename should apply locally");
+
+        sync_working_set(replication.as_ref(), &mut working_set);
     }
 
     #[test]

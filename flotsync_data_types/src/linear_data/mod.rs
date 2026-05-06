@@ -6,7 +6,8 @@ mod coalesced;
 pub(crate) mod snapshot;
 pub use coalesced::{
     Composite,
-    IdGeneratorWithZeroIndex,
+    IdGeneratorWithIndex,
+    // IdGeneratorWithZeroIndex,
     IdWithIndex,
     IdWithIndexRange,
     NodeIdRange,

@@ -1011,6 +1011,58 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
 }
 
 #[test]
+fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_id() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member],
+        initial_state: None,
+    }))
+    .expect("create_group should succeed");
+    let row_id = test_row_id(group_id, dataset_id.clone(), 121_000);
+
+    let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
+    let insert_receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "a",
+            },
+        }],
+    );
+
+    let update_receipt = publish_changes(
+        fixture.runtime.as_ref(),
+        insert_receipt.read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "xay",
+            },
+        }],
+    );
+
+    assert_eq!(update_receipt.update_id.version, 2);
+    assert_eq!(
+        snapshot_string_field(
+            fixture.runtime.as_ref(),
+            group_id,
+            dataset_id,
+            &row_id,
+            "title",
+        ),
+        "xay"
+    );
+}
+
+#[test]
 fn request_summary_reports_local_versions() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();

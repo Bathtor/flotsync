@@ -5,6 +5,7 @@ use crate::{
     linear_data::{
         Composite,
         DataOperation,
+        IdGeneratorWithIndex,
         IdWithIndex,
         IdWithIndexRange,
         LinearData,
@@ -103,7 +104,9 @@ where
 
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>> =
         Vec::with_capacity(basic_diff.len());
-    let mut next_insert_index: u32 = 0;
+    let mut operation_ids = std::iter::once(operation_id.clone());
+    let mut id_generator = IdGeneratorWithIndex::new(&mut operation_ids);
+    let mut pending_reserved_indices: Option<usize> = None;
 
     for change in basic_diff {
         match change {
@@ -124,8 +127,8 @@ where
                     base,
                     old_index,
                     insert_values,
-                    operation_id,
-                    &mut next_insert_index,
+                    &mut id_generator,
+                    &mut pending_reserved_indices,
                     &mut operations,
                 )?;
             }
@@ -144,8 +147,8 @@ where
                     base,
                     insert_at,
                     insert_values,
-                    operation_id,
-                    &mut next_insert_index,
+                    &mut id_generator,
+                    &mut pending_reserved_indices,
                     &mut operations,
                 )?;
             }
@@ -187,47 +190,45 @@ where
     Ok(())
 }
 
-fn append_insert_operation<Id, T>(
+fn append_insert_operation<Id, T, IdIter>(
     base: &LinearList<Id, T>,
     position: usize,
     values: Vec<T>,
-    operation_id: &Id,
-    next_insert_index: &mut u32,
+    id_generator: &mut IdGeneratorWithIndex<'_, IdIter>,
+    pending_reserved_indices: &mut Option<usize>,
     operations: &mut Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
 ) -> Result<(), DiffError>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    IdIter: Iterator<Item = Id>,
     T: fmt::Debug + 'static,
 {
     if values.is_empty() {
         return Ok(());
     }
 
-    let insert_id = reserve_insert_id(operation_id, next_insert_index, values.len())?;
+    let insert_id = reserve_insert_id(id_generator, pending_reserved_indices, values.len())?;
     let link_ids = resolve_insert_link_ids(base, position)?;
     operations.push(link_ids.insert_operation(insert_id, values));
     Ok(())
 }
 
-fn reserve_insert_id<Id>(
-    operation_id: &Id,
-    next_insert_index: &mut u32,
+fn reserve_insert_id<Id, IdIter>(
+    id_generator: &mut IdGeneratorWithIndex<'_, IdIter>,
+    pending_reserved_indices: &mut Option<usize>,
     value_count: usize,
 ) -> Result<IdWithIndex<Id>, DiffError>
 where
     Id: Clone,
+    IdIter: Iterator<Item = Id>,
 {
-    let insert_id = IdWithIndex {
-        id: operation_id.clone(),
-        index: *next_insert_index,
+    let insert_id = if let Some(skip) = pending_reserved_indices.take() {
+        id_generator.nth(skip).context(IndexExhaustedSnafu)?
+    } else {
+        id_generator.next().context(IndexExhaustedSnafu)?
     };
     ensure!(insert_id.can_address(value_count), IndexExhaustedSnafu);
-
-    let consumed = u32::try_from(value_count).map_err(|_| DiffError::IndexExhausted)?;
-    let next_index = next_insert_index
-        .checked_add(consumed)
-        .ok_or(DiffError::IndexExhausted)?;
-    *next_insert_index = next_index;
+    *pending_reserved_indices = Some(value_count.saturating_sub(1));
 
     Ok(insert_id)
 }
@@ -921,6 +922,7 @@ mod tests {
         let diff = linear_diff(&base, &[0, 1, 2, 3, 4], &17).unwrap();
 
         let mut insert_indices: Vec<_> = diff
+            .clone()
             .into_operations()
             .into_iter()
             .filter_map(|operation| match operation {
@@ -931,6 +933,44 @@ mod tests {
         insert_indices.sort_unstable();
 
         assert_eq!(insert_indices, vec![0, 1]);
+
+        let mut updated = base.clone();
+        for operation in diff.into_operations() {
+            let operation = ListOperation::from_operation(operation);
+            updated.apply_operation(operation).unwrap();
+        }
+        assert_eq!(
+            updated.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn linear_diff_multiple_insert_hunks_reserve_insert_chunk_lengths() {
+        let base = new_list([2]);
+        let diff = linear_diff(&base, &[0, 1, 2, 3], &17).unwrap();
+
+        let insert_indices = diff
+            .clone()
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(insert_indices, vec![0, 2]);
+
+        let mut updated = base.clone();
+        for operation in diff.into_operations() {
+            let operation = ListOperation::from_operation(operation);
+            updated.apply_operation(operation).unwrap();
+        }
+        assert_eq!(
+            updated.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]

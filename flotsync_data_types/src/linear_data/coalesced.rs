@@ -1212,30 +1212,111 @@ struct NodePosition {
     node_start_position: usize,
 }
 
-pub struct IdGeneratorWithZeroIndex<'a, I>
+// /// An [[`IdWithIndex`]] generator that only uses `0` as `index` and always increments the underlying iterator.
+// pub struct IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     underlying: &'a mut I,
+// }
+// impl<'a, I> IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     pub fn new(iter: &'a mut I) -> Self {
+//         Self { underlying: iter }
+//     }
+// }
+// impl<I> Iterator for IdGeneratorWithZeroIndex<'_, I>
+// where
+//     I: Iterator,
+// {
+//     type Item = IdWithIndex<I::Item>;
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.underlying
+//             .next()
+//             .map(|id| IdWithIndex { id, index: 0 })
+//     }
+// }
+
+/// An [[`IdWithIndex`]] generator that increments `index` first and only increments the underlying iterator when it has exhausted the `u32` index space.
+pub struct IdGeneratorWithIndex<'a, I>
 where
     I: Iterator,
 {
     underlying: &'a mut I,
+    current_id: Option<I::Item>,
+    exhausted: bool,
+    next_index: u64,
 }
-impl<'a, I> IdGeneratorWithZeroIndex<'a, I>
+impl<'a, I> IdGeneratorWithIndex<'a, I>
 where
     I: Iterator,
 {
     pub fn new(iter: &'a mut I) -> Self {
-        Self { underlying: iter }
+        Self {
+            underlying: iter,
+            current_id: None,
+            exhausted: false,
+            next_index: 0,
+        }
+    }
+
+    fn load_next_major_id(&mut self) -> Option<()> {
+        self.current_id = self.underlying.next();
+        if self.current_id.is_none() {
+            self.exhausted = true;
+            return None;
+        }
+        Some(())
+    }
+
+    fn advance_to_next_major_id(&mut self) -> Option<()> {
+        self.next_index = 0;
+        self.load_next_major_id()
+    }
+
+    fn advance_to_available_index(&mut self) -> Option<()> {
+        if self.exhausted {
+            return None;
+        }
+        if self.current_id.is_none() {
+            self.load_next_major_id()?;
+        } else if self.next_index > u64::from(u32::MAX) {
+            self.advance_to_next_major_id()?;
+        }
+        Some(())
     }
 }
-impl<I> Iterator for IdGeneratorWithZeroIndex<'_, I>
+impl<I> Iterator for IdGeneratorWithIndex<'_, I>
 where
     I: Iterator,
+    I::Item: Clone,
 {
     type Item = IdWithIndex<I::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.underlying
-            .next()
-            .map(|id| IdWithIndex { id, index: 0 })
+        self.advance_to_available_index()?;
+        let index = u32::try_from(self.next_index).expect(
+            "We already reset this if necessary and possible, so this should always work now.",
+        );
+        self.next_index += 1;
+        self.current_id.clone().map(|id| IdWithIndex { id, index })
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let n64 = u64::try_from(n).unwrap_or(u64::MAX);
+        if n64 > 0 {
+            self.advance_to_available_index()?;
+            let remaining_indices_for_id = u64::from(u32::MAX) + 1 - self.next_index;
+            if n64 < remaining_indices_for_id {
+                self.next_index += n64;
+            } else {
+                self.advance_to_next_major_id()?;
+            }
+        }
+        self.next()
     }
 }
 
@@ -1501,5 +1582,129 @@ where
                 end: Some(end),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools;
+
+    use super::{IdGeneratorWithIndex, IdWithIndex};
+
+    fn indexed(id: u32, index: u32) -> IdWithIndex<u32> {
+        IdWithIndex { id, index }
+    }
+
+    #[test]
+    fn id_generator_with_index_reuses_major_id_with_increasing_indices() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.next(), Some(indexed(7, 0)));
+        assert_eq!(generator.next(), Some(indexed(7, 1)));
+        assert_eq!(generator.next(), Some(indexed(7, 2)));
+    }
+
+    #[test]
+    fn id_generator_with_index_does_not_consume_id_until_polled() {
+        let mut ids = [7, 8].into_iter();
+        {
+            let _generator = IdGeneratorWithIndex::new(&mut ids);
+        }
+
+        assert_eq!(ids.collect_vec(), vec![7, 8]);
+    }
+
+    #[test]
+    #[allow(clippy::iter_nth_zero)]
+    fn id_generator_with_index_nth_zero_matches_next() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(0), Some(indexed(7, 0)));
+        assert_eq!(generator.next(), Some(indexed(7, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_skips_within_current_major_id() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(2), Some(indexed(7, 2)));
+        assert_eq!(generator.next(), Some(indexed(7, 3)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_skips_can_be_chained() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(2), Some(indexed(7, 2)));
+        assert_eq!(generator.next(), Some(indexed(7, 3)));
+        assert_eq!(generator.nth(3), Some(indexed(7, 7)));
+        assert_eq!(generator.next(), Some(indexed(7, 8)));
+    }
+
+    #[test]
+    fn id_generator_with_index_next_advances_after_last_index() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX);
+
+        assert_eq!(generator.next(), Some(indexed(7, u32::MAX)));
+        assert_eq!(generator.next(), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_can_land_on_last_index() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX) - 1;
+
+        assert_eq!(generator.nth(1), Some(indexed(7, u32::MAX)));
+        assert_eq!(generator.next(), Some(indexed(8, 0)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_can_cross_one_major_id_boundary() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX) - 1;
+
+        /// Should *not* wrap into 8, 3! Land on next major id when exhausted.
+        assert_eq!(generator.nth(5), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_cannot_cross_multiple_major_id_boundaries() {
+        let mut ids = [7, 8, 9].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        let full_index_space = u32::MAX as usize + 1;
+
+        assert_eq!(generator.nth(full_index_space * 2), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+        assert_eq!(generator.nth(full_index_space * 2), Some(indexed(9, 0)));
+        assert_eq!(generator.next(), Some(indexed(9, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_next_returns_none_without_major_ids() {
+        let mut ids = std::iter::empty::<u32>();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.next(), None);
+        assert_eq!(generator.nth(3), None);
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_exhausts_without_next_major_id() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX);
+
+        assert_eq!(generator.nth(1), None);
+        assert_eq!(generator.next(), None);
     }
 }

@@ -3,7 +3,7 @@ use crate::{
     linear_data::{
         Composite,
         DataOperation,
-        IdGeneratorWithZeroIndex,
+        IdGeneratorWithIndex,
         IdWithIndex,
         LinearData,
         VecCoalescedLinearDataIter,
@@ -185,13 +185,14 @@ pub fn linear_diff<Id>(
 where
     Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
-    let mut id_with_index_generator = IdGeneratorWithZeroIndex::new(id_generator);
+    let mut id_with_index_generator = IdGeneratorWithIndex::new(id_generator);
     let current_text = base.to_string();
     let basic_diff = text_diff::diff(&current_text, changed);
 
     // Convert the TextChange to DataOperations over `base`.
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, String>> =
         Vec::with_capacity(basic_diff.len());
+    let mut pending_reserved_indices: Option<usize> = None;
     for change in basic_diff {
         match change {
             text_diff::TextChange::Insert { at, value } => {
@@ -225,11 +226,18 @@ where
                     }
                 };
                 let value_graphemes = GraphemeString::new(value);
-                let op_id = id_with_index_generator.next().context(IdsExhaustedSnafu)?;
+                let op_id = if let Some(skip) = pending_reserved_indices {
+                    id_with_index_generator
+                        .nth(skip)
+                        .context(IdsExhaustedSnafu)?
+                } else {
+                    id_with_index_generator.next().context(IdsExhaustedSnafu)?
+                };
                 require!(
                     op_id.can_address(value_graphemes.len()),
                     IndexExhaustedSnafu.build()
                 );
+                pending_reserved_indices = Some(value_graphemes.len().saturating_sub(1));
                 operations.push(node_insert_ids.insert_operation(op_id, value_graphemes.unwrap()));
             }
             text_diff::TextChange::Delete { at, len } => {
@@ -250,7 +258,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        linear_data::tests::TestIdGenerator,
+        linear_data::{DataOperation, tests::TestIdGenerator},
         text::{
             LinearString,
             LinearStringDiff,
@@ -339,6 +347,31 @@ mod tests {
 
         single_delete_diff.apply_to(&mut linear).unwrap();
         assert_eq!(linear.to_string(), "");
+    }
+
+    #[test]
+    fn linear_string_diff_with_two_insert_positions() {
+        let mut linear = LinearString::with_value("a".to_owned(), 1);
+        let mut update_ids = std::iter::once(2);
+
+        let diff = linear_diff(&linear, "ray", &mut update_ids).unwrap();
+        assert!(!diff.is_empty());
+        assert_eq!(diff.num_operations(), 2);
+        assert_eq!(diff.num_insert_operations(), 2);
+
+        let insert_indices = diff
+            .clone()
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(insert_indices, vec![0, 1]);
+
+        diff.apply_to(&mut linear).unwrap();
+        assert_eq!(linear.to_string(), "ray");
     }
 
     #[test]
