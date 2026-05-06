@@ -9,7 +9,7 @@ pub trait Composite: Sized {
     /// E.g. `u8` for a `Vec<u8>`.
     type Element: ?Sized;
 
-    /// The element iterator type return by [[Composite::iter]].
+    /// The element iterator type return by [[`Composite::iter`]].
     type Iter<'a>: Iterator<Item = &'a Self::Element>
     where
         Self: 'a;
@@ -45,7 +45,7 @@ pub enum DeleteError {
     NotFound,
 }
 
-/// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
+/// An implementation of [[`LinearData`]] using a [[Vec]] to track the individual operation nodes.
 ///
 /// # Coalescing
 /// Sequences with identical metadata are coalesced into a single node to save space.
@@ -54,7 +54,7 @@ pub enum DeleteError {
 ///
 /// This requires Values to implement the [[Composite]] trait, to facilitate coalescing and splitting.
 ///
-/// Otherwise the same properties as the [[VecLinearData]] apply.
+/// Otherwise the same properties as the [[`VecLinearData`]] apply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VecCoalescedLinearData<Id, Value> {
     /// The number of values in Insert nodes in `base`.
@@ -79,7 +79,7 @@ where
     }
 
     pub(crate) fn from_base_snapshot(base: VecLinearData<IdWithIndex<BaseId>, Value>) -> Self {
-        let len = base.iter_values().map(|value| value.len()).sum();
+        let len = base.iter_values().map(Composite::len).sum();
         Self { len, base }
     }
 
@@ -151,7 +151,7 @@ where
         }
     }
 
-    /// The number of elements, i.e. [[Composite::Element]] that are not deleted.
+    /// The number of elements, i.e. [[`Composite::Element`]] that are not deleted.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -181,6 +181,10 @@ where
     /// Delete the (sub-range of the) node corresponding to [start, end].
     ///
     /// Returns Err (and deletes nothing) if this range is not part of a single node.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Range deletion has several structurally distinct split cases; keeping them together preserves the invariant checks."
+    )]
     pub fn delete_range(
         &mut self,
         start: &IdWithIndex<BaseId>,
@@ -199,25 +203,6 @@ where
             .enumerate()
             .find(|(_index, node)| node.contains(start))
             .ok_or(DeleteError::NotFound)?;
-
-        enum DeleteMode {
-            Suffix {
-                node_index: usize,
-            },
-            Subrange {
-                node_index: usize,
-            },
-            Full {
-                node_index: usize,
-            },
-            Prefix {
-                node_index: usize,
-            },
-            Skip {
-                #[allow(unused, reason = "Useful for debugging and takes no extra space.")]
-                node_index: usize,
-            },
-        }
 
         let item_from_node = |node_index: usize,
                               node: &Node<IdWithIndex<BaseId>, Value>,
@@ -303,6 +288,10 @@ where
     }
 
     /// Returns the ids that make up insert nodes in the given `range` of element positions.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Inclusive, exclusive, and unbounded ranges need separate boundary resolution for clear error-free ID slicing."
+    )]
     pub fn ids_in_range<R>(&self, range: R) -> Option<NodeIdRange<BaseId>>
     where
         R: RangeBounds<usize>,
@@ -397,10 +386,9 @@ where
                             if *position == next_position {
                                 // This is fine.
                                 break;
-                            } else {
-                                // The range's end does not occur in the collection.
-                                return None;
                             }
+                            // The range's end does not occur in the collection.
+                            return None;
                         }
                         std::ops::Bound::Unbounded => {
                             // Very well, we reached the end.
@@ -477,11 +465,10 @@ where
                 // The position is somewhere within this node's value.
                 node_index_at_position_opt = Some(node_index);
                 break;
-            } else {
-                assert!(position > current_node_start_position);
-                // We are looking for a later node.
-                current_node_start_position += node_value_len;
             }
+            assert!(position > current_node_start_position);
+            // We are looking for a later node.
+            current_node_start_position += node_value_len;
         }
         node_index_at_position_opt.map(|node_index| NodePosition {
             node_index,
@@ -491,6 +478,10 @@ where
 
     /// Splits the node at `node_index` according to `mode` around `split_index` and returns
     /// the node index of the new node with the id that matches `split_index`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Node splitting owns the value during in-place replacement and keeps the index arithmetic in one invariant-preserving block."
+    )]
     fn split_node(&mut self, node_index: usize, split_index: u32, mut mode: SplitMode) -> usize {
         let target_node = &mut self.base.nodes[node_index];
         assert!(
@@ -661,7 +652,7 @@ where
             .base
             .nodes
             .iter()
-            .flat_map(|n| match n.operation {
+            .filter_map(|n| match n.operation {
                 Operation::Insert { ref value } => Some(value.len()),
                 _ => None,
             })
@@ -758,7 +749,7 @@ where
         })
         .map_err(|op| match op {
             DataOperation::Insert { value, .. } => value,
-            _ => {
+            DataOperation::Delete { .. } => {
                 // The apply_operation should not return a different operation type on error.
                 unreachable!();
             }
@@ -810,6 +801,10 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Insert application validates predecessor, successor, duplicate, and sibling-order cases as one CRDT transition."
+    )]
     fn apply_operation(
         &mut self,
         operation: DataOperation<Self::Id, Value>,
@@ -1102,7 +1097,7 @@ where
 
 /// Just a newtype to wrap the slice for debug printing.
 struct DebugSlice<'a, BaseId, Value>(&'a [Node<IdWithIndex<BaseId>, Value>]);
-impl<'a, BaseId, Value> DebugFormatting for DebugSlice<'a, BaseId, Value>
+impl<BaseId, Value> DebugFormatting for DebugSlice<'_, BaseId, Value>
 where
     BaseId: fmt::Display + 'static,
     Value: Composite + fmt::Display + 'static,
@@ -1111,8 +1106,8 @@ where
         write!(f, "{{ ")?;
         for (index, node) in self.0.iter().enumerate() {
             let content = match node.operation {
-                Operation::Insert { ref value } => format!("'{}'", value),
-                Operation::Delete { ref value } => format!("[^'{}']", value),
+                Operation::Insert { ref value } => format!("'{value}'"),
+                Operation::Delete { ref value } => format!("[^'{value}']"),
                 Operation::Beginning => "$".to_owned(),
                 Operation::End => "X".to_owned(),
                 Operation::Invalid => "?!?".to_owned(),
@@ -1137,6 +1132,25 @@ where
         }
         write!(f, " }}")
     }
+}
+
+enum DeleteMode {
+    Suffix {
+        node_index: usize,
+    },
+    Subrange {
+        node_index: usize,
+    },
+    Full {
+        node_index: usize,
+    },
+    Prefix {
+        node_index: usize,
+    },
+    Skip {
+        #[allow(unused, reason = "Useful for debugging and takes no extra space.")]
+        node_index: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1183,9 +1197,8 @@ where
         if let Some(ref mut node_iter) = self.current_node_iter {
             if let Some(next) = node_iter.next() {
                 return Some(next);
-            } else {
-                self.current_node_iter = None;
             }
+            self.current_node_iter = None;
         }
         self.next_from_underlying()
     }
@@ -1199,30 +1212,111 @@ struct NodePosition {
     node_start_position: usize,
 }
 
-pub struct IdGeneratorWithZeroIndex<'a, I>
+// /// An [[`IdWithIndex`]] generator that only uses `0` as `index` and always increments the underlying iterator.
+// pub struct IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     underlying: &'a mut I,
+// }
+// impl<'a, I> IdGeneratorWithZeroIndex<'a, I>
+// where
+//     I: Iterator,
+// {
+//     pub fn new(iter: &'a mut I) -> Self {
+//         Self { underlying: iter }
+//     }
+// }
+// impl<I> Iterator for IdGeneratorWithZeroIndex<'_, I>
+// where
+//     I: Iterator,
+// {
+//     type Item = IdWithIndex<I::Item>;
+//
+//     fn next(&mut self) -> Option<Self::Item> {
+//         self.underlying
+//             .next()
+//             .map(|id| IdWithIndex { id, index: 0 })
+//     }
+// }
+
+/// An [[`IdWithIndex`]] generator that increments `index` first and only increments the underlying iterator when it has exhausted the `u32` index space.
+pub struct IdGeneratorWithIndex<'a, I>
 where
     I: Iterator,
 {
     underlying: &'a mut I,
+    current_id: Option<I::Item>,
+    exhausted: bool,
+    next_index: u64,
 }
-impl<'a, I> IdGeneratorWithZeroIndex<'a, I>
+impl<'a, I> IdGeneratorWithIndex<'a, I>
 where
     I: Iterator,
 {
     pub fn new(iter: &'a mut I) -> Self {
-        Self { underlying: iter }
+        Self {
+            underlying: iter,
+            current_id: None,
+            exhausted: false,
+            next_index: 0,
+        }
+    }
+
+    fn load_next_major_id(&mut self) -> Option<()> {
+        self.current_id = self.underlying.next();
+        if self.current_id.is_none() {
+            self.exhausted = true;
+            return None;
+        }
+        Some(())
+    }
+
+    fn advance_to_next_major_id(&mut self) -> Option<()> {
+        self.next_index = 0;
+        self.load_next_major_id()
+    }
+
+    fn advance_to_available_index(&mut self) -> Option<()> {
+        if self.exhausted {
+            return None;
+        }
+        if self.current_id.is_none() {
+            self.load_next_major_id()?;
+        } else if self.next_index > u64::from(u32::MAX) {
+            self.advance_to_next_major_id()?;
+        }
+        Some(())
     }
 }
-impl<'a, I> Iterator for IdGeneratorWithZeroIndex<'a, I>
+impl<I> Iterator for IdGeneratorWithIndex<'_, I>
 where
     I: Iterator,
+    I::Item: Clone,
 {
     type Item = IdWithIndex<I::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.underlying
-            .next()
-            .map(|id| IdWithIndex { id, index: 0 })
+        self.advance_to_available_index()?;
+        let index = u32::try_from(self.next_index).expect(
+            "We already reset this if necessary and possible, so this should always work now.",
+        );
+        self.next_index += 1;
+        self.current_id.clone().map(|id| IdWithIndex { id, index })
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let n64 = u64::try_from(n).unwrap_or(u64::MAX);
+        if n64 > 0 {
+            self.advance_to_available_index()?;
+            let remaining_indices_for_id = u64::from(u32::MAX) + 1 - self.next_index;
+            if n64 < remaining_indices_for_id {
+                self.next_index += n64;
+            } else {
+                self.advance_to_next_major_id()?;
+            }
+        }
+        self.next()
     }
 }
 
@@ -1239,10 +1333,11 @@ impl<Id> IdWithIndex<Id>
 where
     Id: Clone,
 {
-    /// The maximum length of a single [[Composite]] addressed by an [[IdWithIndex]] starting
+    /// The maximum length of a single [[Composite]] addressed by an [[`IdWithIndex`]] starting
     /// at index 0.
     pub const MAX_LENGTH: usize = u32::MAX as usize;
 
+    #[must_use]
     pub fn zero(id: Id) -> Self {
         IdWithIndex { id, index: 0 }
     }
@@ -1251,12 +1346,14 @@ where
     ///
     /// # Panics
     /// - If there are no indices left.
+    #[must_use]
     pub fn increment(&self) -> Self {
         self.checked_increment()
             .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the next sub-id (i.e. the next `index`), if there is one left.
+    #[must_use]
     pub fn checked_increment(&self) -> Option<Self> {
         let mut next = self.clone();
         next.index.checked_add(1u32).map(|next_index| {
@@ -1269,12 +1366,14 @@ where
     ///
     /// # Panics
     /// - If index is 0.
+    #[must_use]
     pub fn decrement(&self) -> Self {
         self.checked_decrement()
             .expect("Cannot support more that 2^32 individual operations per id")
     }
 
     /// Gives the previous sub-id (i.e. the previous `index`), if index is not 0.
+    #[must_use]
     pub fn checked_decrement(&self) -> Option<Self> {
         let mut prev = self.clone();
         prev.index.checked_sub(1u32).map(|prev_index| {
@@ -1286,24 +1385,26 @@ where
     /// Whether we can address all elements in a `num_elements` sized [[Composite]]
     /// if the first element is at `self.index`.
     #[inline]
+    #[must_use]
     pub fn can_address(&self, num_elements: usize) -> bool {
         if num_elements == 0 {
             return true;
         }
-        let last_offset = match u32::try_from(num_elements - 1) {
-            Ok(last_offset) => last_offset,
-            Err(_) => return false,
+        let Ok(last_offset) = u32::try_from(num_elements - 1) else {
+            return false;
         };
         self.index.checked_add(last_offset).is_some()
     }
 
     /// Returns the number of elements in a [[Composite]] that can at most be addressed by this id.
     #[inline]
+    #[must_use]
     pub fn addressable_len(&self) -> usize {
         (Self::MAX_LENGTH.saturating_sub(self.index as usize)).saturating_add(1)
     }
 
     /// Returns `true` iff `other` is the same as what `self.increment()` would return.
+    #[must_use]
     pub fn is_followed_by(&self, other: &Self) -> bool
     where
         Id: PartialEq,
@@ -1312,8 +1413,7 @@ where
             && self
                 .index
                 .checked_add(1)
-                .map(|next_index| next_index == other.index)
-                .unwrap_or(false)
+                .is_some_and(|next_index| next_index == other.index)
     }
 
     fn index_diff(&self, other: &IdWithIndex<Id>) -> u32
@@ -1326,19 +1426,22 @@ where
             .expect("Index different overflowed")
     }
 
+    #[must_use]
     pub fn checked_next_after(&self, num_elements: usize) -> Option<Self> {
         let offset = u32::try_from(num_elements).ok()?;
         self.checked_add_offset(offset)
     }
 
+    #[must_use]
     pub fn checked_add_offset(&self, rhs: u32) -> Option<Self> {
         let mut next = self.clone();
         next.index = next.index.checked_add(rhs)?;
         Some(next)
     }
 
-    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the largest
+    /// Returns a new id where `id` is the the same as `self.id` and `index` is the largest
     /// possible value.
+    #[must_use]
     pub fn with_max_index(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -1346,8 +1449,9 @@ where
         }
     }
 
-    /// Returns a new id where `id` is the the same as `self.id` and `index`` is the smallest
+    /// Returns a new id where `id` is the the same as `self.id` and `index` is the smallest
     /// possible value (i.e. 0).
+    #[must_use]
     pub fn with_zero_index(&self) -> Self {
         Self {
             id: self.id.clone(),
@@ -1388,7 +1492,7 @@ where
 
 /// A range of indices identifying a particular contiguous range of ids.
 ///
-/// This range is inclusive: [id:start_index, id:end_index]
+/// This range is inclusive: [`id:start_index`, `id:end_index`]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdWithIndexRange<Id> {
     pub id: Id,
@@ -1411,6 +1515,9 @@ where
         self.start_index == self.end_index
     }
 
+    /// # Panics
+    ///
+    /// Panics if this range's start index is greater than its end index.
     pub fn len(&self) -> u32 {
         assert!(self.start_index <= self.end_index);
         self.end_index - self.start_index
@@ -1454,7 +1561,7 @@ where
     where
         Value: Composite + fmt::Debug + 'static,
     {
-        for id_range in self.contained.iter() {
+        for id_range in &self.contained {
             let start = id_range.first();
             let end = id_range.last();
             let op = DataOperation::Delete {
@@ -1475,5 +1582,129 @@ where
                 end: Some(end),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use itertools::Itertools;
+
+    use super::{IdGeneratorWithIndex, IdWithIndex};
+
+    fn indexed(id: u32, index: u32) -> IdWithIndex<u32> {
+        IdWithIndex { id, index }
+    }
+
+    #[test]
+    fn id_generator_with_index_reuses_major_id_with_increasing_indices() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.next(), Some(indexed(7, 0)));
+        assert_eq!(generator.next(), Some(indexed(7, 1)));
+        assert_eq!(generator.next(), Some(indexed(7, 2)));
+    }
+
+    #[test]
+    fn id_generator_with_index_does_not_consume_id_until_polled() {
+        let mut ids = [7, 8].into_iter();
+        {
+            let _generator = IdGeneratorWithIndex::new(&mut ids);
+        }
+
+        assert_eq!(ids.collect_vec(), vec![7, 8]);
+    }
+
+    #[test]
+    #[allow(clippy::iter_nth_zero)]
+    fn id_generator_with_index_nth_zero_matches_next() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(0), Some(indexed(7, 0)));
+        assert_eq!(generator.next(), Some(indexed(7, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_skips_within_current_major_id() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(2), Some(indexed(7, 2)));
+        assert_eq!(generator.next(), Some(indexed(7, 3)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_skips_can_be_chained() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.nth(2), Some(indexed(7, 2)));
+        assert_eq!(generator.next(), Some(indexed(7, 3)));
+        assert_eq!(generator.nth(3), Some(indexed(7, 7)));
+        assert_eq!(generator.next(), Some(indexed(7, 8)));
+    }
+
+    #[test]
+    fn id_generator_with_index_next_advances_after_last_index() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX);
+
+        assert_eq!(generator.next(), Some(indexed(7, u32::MAX)));
+        assert_eq!(generator.next(), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_can_land_on_last_index() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX) - 1;
+
+        assert_eq!(generator.nth(1), Some(indexed(7, u32::MAX)));
+        assert_eq!(generator.next(), Some(indexed(8, 0)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_can_cross_one_major_id_boundary() {
+        let mut ids = [7, 8].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX) - 1;
+
+        /// Should *not* wrap into 8, 3! Land on next major id when exhausted.
+        assert_eq!(generator.nth(5), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_cannot_cross_multiple_major_id_boundaries() {
+        let mut ids = [7, 8, 9].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        let full_index_space = u32::MAX as usize + 1;
+
+        assert_eq!(generator.nth(full_index_space * 2), Some(indexed(8, 0)));
+        assert_eq!(generator.next(), Some(indexed(8, 1)));
+        assert_eq!(generator.nth(full_index_space * 2), Some(indexed(9, 0)));
+        assert_eq!(generator.next(), Some(indexed(9, 1)));
+    }
+
+    #[test]
+    fn id_generator_with_index_next_returns_none_without_major_ids() {
+        let mut ids = std::iter::empty::<u32>();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+
+        assert_eq!(generator.next(), None);
+        assert_eq!(generator.nth(3), None);
+    }
+
+    #[test]
+    fn id_generator_with_index_nth_exhausts_without_next_major_id() {
+        let mut ids = [7].into_iter();
+        let mut generator = IdGeneratorWithIndex::new(&mut ids);
+        generator.next_index = u64::from(u32::MAX);
+
+        assert_eq!(generator.nth(1), None);
+        assert_eq!(generator.next(), None);
     }
 }

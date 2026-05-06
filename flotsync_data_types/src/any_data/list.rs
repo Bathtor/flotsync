@@ -5,6 +5,7 @@ use crate::{
     linear_data::{
         Composite,
         DataOperation,
+        IdGeneratorWithIndex,
         IdWithIndex,
         IdWithIndexRange,
         LinearData,
@@ -31,23 +32,26 @@ pub enum DiffError {
     Internal { source: InternalError },
 }
 
-/// A set of list changes that can be applied to a [[LinearList]].
+/// A set of list changes that can be applied to a [[`LinearList`]].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearListDiff<Id, T> {
     operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
 }
 impl<Id, T> LinearListDiff<Id, T> {
     /// Returns `true` iff this diff is empty, i.e. a no-op.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 
     /// Returns how many individual operations there are in this diff.
+    #[must_use]
     pub fn num_operations(&self) -> usize {
         self.operations.len()
     }
 
     /// Returns how many operations in this diff are inserts.
+    #[must_use]
     pub fn num_insert_operations(&self) -> usize {
         self.operations
             .iter()
@@ -56,6 +60,7 @@ impl<Id, T> LinearListDiff<Id, T> {
     }
 
     /// Returns how many operations in this diff are deletes.
+    #[must_use]
     pub fn num_delete_operations(&self) -> usize {
         self.operations
             .iter()
@@ -81,10 +86,14 @@ impl<Id, T> LinearListDiff<Id, T> {
 ///
 /// This uses slice diffing internally and translates those segments into equivalent linear list
 /// operations. All inserts in one diff share `operation_id` and consume consecutive index space.
+///
+/// # Errors
+///
+/// See `DiffError` for failure conditions.
 pub fn linear_diff<Id, T>(
     base: &LinearList<Id, T>,
     changed: &[T],
-    operation_id: Id,
+    operation_id: &Id,
 ) -> Result<LinearListDiff<Id, T>, DiffError>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -95,7 +104,9 @@ where
 
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, Vec<T>>> =
         Vec::with_capacity(basic_diff.len());
-    let mut next_insert_index: u32 = 0;
+    let mut operation_ids = std::iter::once(operation_id.clone());
+    let mut id_generator = IdGeneratorWithIndex::new(&mut operation_ids);
+    let mut pending_reserved_indices: Option<usize> = None;
 
     for change in basic_diff {
         match change {
@@ -116,8 +127,8 @@ where
                     base,
                     old_index,
                     insert_values,
-                    &operation_id,
-                    &mut next_insert_index,
+                    &mut id_generator,
+                    &mut pending_reserved_indices,
                     &mut operations,
                 )?;
             }
@@ -136,8 +147,8 @@ where
                     base,
                     insert_at,
                     insert_values,
-                    &operation_id,
-                    &mut next_insert_index,
+                    &mut id_generator,
+                    &mut pending_reserved_indices,
                     &mut operations,
                 )?;
             }
@@ -171,51 +182,53 @@ where
                 range.start, range.end
             ),
         })?;
-    operations.extend(range_ids.delete_operations().map(|op| op.into_operation()));
+    operations.extend(
+        range_ids
+            .delete_operations()
+            .map(ListOperation::into_operation),
+    );
     Ok(())
 }
 
-fn append_insert_operation<Id, T>(
+fn append_insert_operation<Id, T, IdIter>(
     base: &LinearList<Id, T>,
     position: usize,
     values: Vec<T>,
-    operation_id: &Id,
-    next_insert_index: &mut u32,
+    id_generator: &mut IdGeneratorWithIndex<'_, IdIter>,
+    pending_reserved_indices: &mut Option<usize>,
     operations: &mut Vec<DataOperation<IdWithIndex<Id>, Vec<T>>>,
 ) -> Result<(), DiffError>
 where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    IdIter: Iterator<Item = Id>,
     T: fmt::Debug + 'static,
 {
     if values.is_empty() {
         return Ok(());
     }
 
-    let insert_id = reserve_insert_id(operation_id, next_insert_index, values.len())?;
+    let insert_id = reserve_insert_id(id_generator, pending_reserved_indices, values.len())?;
     let link_ids = resolve_insert_link_ids(base, position)?;
     operations.push(link_ids.insert_operation(insert_id, values));
     Ok(())
 }
 
-fn reserve_insert_id<Id>(
-    operation_id: &Id,
-    next_insert_index: &mut u32,
+fn reserve_insert_id<Id, IdIter>(
+    id_generator: &mut IdGeneratorWithIndex<'_, IdIter>,
+    pending_reserved_indices: &mut Option<usize>,
     value_count: usize,
 ) -> Result<IdWithIndex<Id>, DiffError>
 where
     Id: Clone,
+    IdIter: Iterator<Item = Id>,
 {
-    let insert_id = IdWithIndex {
-        id: operation_id.clone(),
-        index: *next_insert_index,
+    let insert_id = if let Some(skip) = pending_reserved_indices.take() {
+        id_generator.nth(skip).context(IndexExhaustedSnafu)?
+    } else {
+        id_generator.next().context(IndexExhaustedSnafu)?
     };
     ensure!(insert_id.can_address(value_count), IndexExhaustedSnafu);
-
-    let consumed = u32::try_from(value_count).map_err(|_| DiffError::IndexExhausted)?;
-    let next_index = next_insert_index
-        .checked_add(consumed)
-        .ok_or(DiffError::IndexExhausted)?;
-    *next_insert_index = next_index;
+    *pending_reserved_indices = Some(value_count.saturating_sub(1));
 
     Ok(insert_id)
 }
@@ -299,7 +312,7 @@ impl<T> Composite for ListChunk<T> {
     }
 }
 
-/// A convergent linear list CRDT backed by [[VecCoalescedLinearData]].
+/// A convergent linear list CRDT backed by [[`VecCoalescedLinearData`]].
 ///
 /// `LinearList` models an ordered sequence of values `T`. Inserts can add one item or a chunk
 /// of items in one operation. Concurrent inserts at the same position are resolved
@@ -335,7 +348,7 @@ where
 
     /// Create a list initialized with `initial_values`.
     ///
-    /// If `initial_values` is empty this is equivalent to [[LinearList::new]].
+    /// If `initial_values` is empty this is equivalent to [[`LinearList::new`]].
     ///
     /// # Example
     ///
@@ -357,16 +370,19 @@ where
     }
 
     /// Number of visible elements in the list.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
     /// Whether the list contains no visible elements.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
     /// Iterate over visible values in list order.
+    #[must_use]
     pub fn iter(&self) -> LinearListIter<'_, Id, T> {
         LinearListIter {
             underlying: self.data.iter_values(),
@@ -374,6 +390,10 @@ where
     }
 
     /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// See `S::Error` for failure conditions.
     pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<IdWithIndex<Id>, [T]>,
@@ -382,6 +402,9 @@ where
             .encode_snapshot(sink, |value| value.values.as_slice())
     }
 
+    /// # Errors
+    ///
+    /// See `SnapshotReadError<E>` for failure conditions.
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
         E: snafu::Error + Send + Sync + 'static,
@@ -405,6 +428,10 @@ where
     ///
     /// This is primarily useful after reconstructing a value from an external snapshot or other
     /// untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// See `IntegrityError` for failure conditions.
     pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
         self.data.validate_integrity()
     }
@@ -419,6 +446,10 @@ where
     /// let mut list = LinearList::new(id_generator.next().unwrap());
     /// list.append(next_id_with_index(), [1, 2, 3]);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the appended chunk.
     pub fn append<Values>(&mut self, id: IdWithIndex<Id>, values: Values)
     where
         Values: IntoIterator<Item = T>,
@@ -442,6 +473,10 @@ where
     /// Prepend one chunk of values at the front.
     ///
     /// Empty chunks are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the prepended chunk.
     pub fn prepend<Values>(&mut self, id: IdWithIndex<Id>, values: Values)
     where
         Values: IntoIterator<Item = T>,
@@ -465,7 +500,14 @@ where
     /// Insert a chunk at `position`.
     ///
     /// Inserting at `self.len()` is append-like.
+    ///
+    /// # Errors
+    ///
     /// Returns the original chunk if `position` is out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the inserted chunk.
     pub fn insert_at<Values>(
         &mut self,
         position: usize,
@@ -497,6 +539,14 @@ where
     }
 
     /// Convenience wrapper for inserting a single item at `position`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original value if `position` is out of bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the failed single-item insert does not return exactly one value.
     pub fn insert_item_at(
         &mut self,
         position: usize,
@@ -518,7 +568,7 @@ where
 
     /// Return ids covering a contiguous visible range.
     ///
-    /// The returned wrapper can be applied directly via [[NodeIdRangeList::delete]]
+    /// The returned wrapper can be applied directly via [[`NodeIdRangeList::delete`]]
     /// or converted into replayable operations.
     pub fn ids_in_range<R>(&self, range: R) -> Option<NodeIdRangeList<Id>>
     where
@@ -528,6 +578,7 @@ where
     }
 
     /// Resolve the concrete ids at the given visible position.
+    #[must_use]
     pub fn ids_at_pos(&self, position: usize) -> Option<NodeIds<IdWithIndex<Id>>> {
         self.data.ids_at_pos(position)
     }
@@ -545,6 +596,10 @@ where
     /// Build an append operation for replication.
     ///
     /// Returns `None` for empty chunks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the append operation chunk.
     pub fn append_operation<Values>(
         &self,
         id: IdWithIndex<Id>,
@@ -571,6 +626,10 @@ where
     /// Build a prepend operation for replication.
     ///
     /// Returns `None` for empty chunks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the prepend operation chunk.
     pub fn prepend_operation<Values>(
         &self,
         id: IdWithIndex<Id>,
@@ -597,7 +656,16 @@ where
     /// Build an insert operation at `position` for replication.
     ///
     /// Inserting at `self.len()` is append-like.
-    /// Returns `Ok(None)` for empty chunks and `Err(values)` for out-of-bounds positions.
+    ///
+    /// Returns `Ok(None)` for empty chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(values)` for out-of-bounds positions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` cannot address every value in the insert operation chunk.
     pub fn insert_operation_at<Values>(
         &self,
         position: usize,
@@ -632,6 +700,7 @@ where
     /// Build a delete operation for the value at `position`.
     ///
     /// Returns `None` if the position is out of bounds.
+    #[must_use]
     pub fn delete_operation_at(&self, position: usize) -> Option<ListOperation<Id, T>> {
         let node_ids = self.data.ids_at_pos(position)?;
         Some(ListOperation {
@@ -643,6 +712,8 @@ where
     }
 
     /// Apply a replicated operation received from another replica.
+    ///
+    /// # Errors
     ///
     /// The original operation is returned unchanged on failure.
     pub fn apply_operation(
@@ -716,9 +787,9 @@ where
     }
 }
 
-/// A replication operation for [[LinearList]].
+/// A replication operation for [[`LinearList`]].
 ///
-/// This wraps a low-level [[DataOperation]] and keeps list payloads as `Vec<T>`.
+/// This wraps a low-level [[`DataOperation`]] and keeps list payloads as `Vec<T>`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListOperation<Id, T> {
     op: DataOperation<IdWithIndex<Id>, Vec<T>>,
@@ -733,7 +804,7 @@ impl<Id, T> ListOperation<Id, T> {
     }
 }
 
-/// Convenience wrapper around [[NodeIdRange]] when using it with [[LinearList]].
+/// Convenience wrapper around [[`NodeIdRange`]] when using it with [[`LinearList`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeIdRangeList<Id>(NodeIdRange<Id>);
 impl<Id> NodeIdRangeList<Id>
@@ -741,6 +812,8 @@ where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
+    ///
+    /// # Errors
     ///
     /// Returns the first failing range if unsuccessful.
     /// In this case the previous deletes will have been applied.
@@ -771,10 +844,23 @@ impl<'a, Id, T> Iterator for LinearListIter<'a, Id, T> {
     }
 }
 
+impl<'a, Id, T> IntoIterator for &'a LinearList<Id, T>
+where
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    T: fmt::Debug + 'static,
+{
+    type IntoIter = LinearListIter<'a, Id, T>;
+    type Item = &'a T;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linear_data::tests::TestIdGenerator;
+    use crate::linear_data::tests::{TestIdGenerator, interleavings_with_local_order};
     use itertools::Itertools;
 
     type Id = u32;
@@ -795,7 +881,7 @@ mod tests {
     #[test]
     fn linear_diff_noop_is_empty() {
         let base = new_list([1, 2, 3]);
-        let diff = linear_diff(&base, &[1, 2, 3], 99).unwrap();
+        let diff = linear_diff(&base, &[1, 2, 3], &99).unwrap();
 
         assert!(diff.is_empty());
         assert_eq!(diff.num_operations(), 0);
@@ -807,14 +893,14 @@ mod tests {
     #[test]
     fn linear_diff_updates_only_changed_middle_segment() {
         let base = new_list([1, 2, 3, 4]);
-        let diff = linear_diff(&base, &[1, 9, 3, 4], 42).unwrap();
+        let diff = linear_diff(&base, &[1, 9, 3, 4], &42).unwrap();
 
         assert_eq!(diff.num_operations(), 2);
         assert_eq!(diff.num_insert_operations(), 1);
         assert_eq!(diff.num_delete_operations(), 1);
         assert_eq!(
             diff.values_inserted()
-                .map(|chunk| chunk.to_vec())
+                .map(<[i32]>::to_vec)
                 .collect::<Vec<_>>(),
             vec![vec![9]]
         );
@@ -833,9 +919,10 @@ mod tests {
     #[test]
     fn linear_diff_multiple_insert_hunks_allocate_distinct_indices() {
         let base = new_list([1, 2, 3]);
-        let diff = linear_diff(&base, &[0, 1, 2, 3, 4], 17).unwrap();
+        let diff = linear_diff(&base, &[0, 1, 2, 3, 4], &17).unwrap();
 
         let mut insert_indices: Vec<_> = diff
+            .clone()
             .into_operations()
             .into_iter()
             .filter_map(|operation| match operation {
@@ -846,6 +933,44 @@ mod tests {
         insert_indices.sort_unstable();
 
         assert_eq!(insert_indices, vec![0, 1]);
+
+        let mut updated = base.clone();
+        for operation in diff.into_operations() {
+            let operation = ListOperation::from_operation(operation);
+            updated.apply_operation(operation).unwrap();
+        }
+        assert_eq!(
+            updated.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn linear_diff_multiple_insert_hunks_reserve_insert_chunk_lengths() {
+        let base = new_list([2]);
+        let diff = linear_diff(&base, &[0, 1, 2, 3], &17).unwrap();
+
+        let insert_indices = diff
+            .clone()
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(insert_indices, vec![0, 2]);
+
+        let mut updated = base.clone();
+        for operation in diff.into_operations() {
+            let operation = ListOperation::from_operation(operation);
+            updated.apply_operation(operation).unwrap();
+        }
+        assert_eq!(
+            updated.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -901,7 +1026,7 @@ mod tests {
         let mut a = base.clone();
         let mut b = base;
 
-        let mut op_id_generator = TestIdGenerator::without_ids(a.iter_ids().cloned());
+        let mut op_id_generator = TestIdGenerator::without_ids(a.iter_ids().copied());
         let op = a
             .insert_operation_at(1, op_id_generator.next_with_zero_index().unwrap(), [9, 8])
             .unwrap()
@@ -1019,49 +1144,6 @@ mod tests {
             vec![op1, op2]
         });
 
-        // Generate all interleavings preserving per-writer causal order.
-        fn interleavings_with_local_order(
-            per_writer_count: usize,
-            num_writers: usize,
-        ) -> Vec<Vec<usize>> {
-            let total_steps = per_writer_count * num_writers;
-            let mut out = Vec::new();
-            let mut current = Vec::with_capacity(total_steps);
-            let mut next_for_writer = vec![0usize; num_writers];
-
-            fn dfs(
-                per_writer_count: usize,
-                total_steps: usize,
-                current: &mut Vec<usize>,
-                next_for_writer: &mut [usize],
-                out: &mut Vec<Vec<usize>>,
-            ) {
-                if current.len() == total_steps {
-                    out.push(current.clone());
-                    return;
-                }
-
-                for writer in 0..next_for_writer.len() {
-                    if next_for_writer[writer] < per_writer_count {
-                        next_for_writer[writer] += 1;
-                        current.push(writer);
-                        dfs(per_writer_count, total_steps, current, next_for_writer, out);
-                        current.pop();
-                        next_for_writer[writer] -= 1;
-                    }
-                }
-            }
-
-            dfs(
-                per_writer_count,
-                total_steps,
-                &mut current,
-                &mut next_for_writer,
-                &mut out,
-            );
-            out
-        }
-
         let schedules = interleavings_with_local_order(2, 3);
         assert_eq!(schedules.len(), 90);
 
@@ -1084,13 +1166,11 @@ mod tests {
                 assert_eq!(
                     previous.iter().copied().collect::<Vec<_>>(),
                     list.iter().copied().collect::<Vec<_>>(),
-                    "Result content did not match for schedule: {:?}",
-                    schedule_trace
+                    "Result content did not match for schedule: {schedule_trace:?}"
                 );
                 assert_eq!(
                     previous, &list,
-                    "Result structure did not match for schedule: {:?}",
-                    schedule_trace
+                    "Result structure did not match for schedule: {schedule_trace:?}"
                 );
             }
             previous_result = Some(list);

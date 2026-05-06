@@ -1,7 +1,32 @@
-use super::*;
+use super::{
+    BasicDataType,
+    BasicTypeMismatchSnafu,
+    BasicValueRef,
+    CounterTypeMismatchSnafu,
+    CounterValueRef,
+    DataModelValueError,
+    FiniteStateValueNotInSchemaSnafu,
+    InvalidSnapshotValueForTypeSnafu,
+    NullabilityMismatchSnafu,
+    NullableBasicDataType,
+    NullableBasicValueRef,
+    NullablePrimitiveType,
+    NullablePrimitiveValueRef,
+    PrimitiveType,
+    PrimitiveTypeMismatchSnafu,
+    PrimitiveValueArray,
+    PrimitiveValueRef,
+    ReplicatedDataType,
+    SnapshotStateValueRef,
+    ensure,
+};
 use crate::schema::values::NullablePrimitiveValueArray;
 
 /// Ensure that a basic value matches the expected schema type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_basic_type(
     expected: &BasicDataType,
     value: &BasicValueRef<'_>,
@@ -11,6 +36,10 @@ pub fn ensure_basic_type(
 }
 
 /// Ensure that a nullable basic value matches the expected schema type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_nullable_basic_type(
     expected: &NullableBasicDataType,
     value: &NullableBasicValueRef<'_>,
@@ -31,6 +60,10 @@ pub fn ensure_nullable_basic_type(
 }
 
 /// Ensure that a primitive value kind matches the expected schema type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_primitive_type(
     expected: PrimitiveType,
     actual: PrimitiveType,
@@ -43,6 +76,10 @@ pub fn ensure_primitive_type(
 }
 
 /// Ensure that a primitive array element type matches the expected schema type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_primitive_array_type(
     expected: PrimitiveType,
     actual: PrimitiveType,
@@ -51,6 +88,10 @@ pub fn ensure_primitive_array_type(
 }
 
 /// Ensure that a counter value matches the schema's range configuration.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_counter_type(
     expected_small_range: bool,
     actual: CounterValueRef,
@@ -66,6 +107,10 @@ pub fn ensure_counter_type(
 }
 
 /// Ensure that a nullable primitive value matches the expected schema type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_nullable_primitive_type(
     expected: NullablePrimitiveType,
     actual: NullablePrimitiveValueRef<'_>,
@@ -88,6 +133,10 @@ pub fn ensure_nullable_primitive_type(
 }
 
 /// Ensure that a finite-state register value matches the schema and allowed state set.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_finite_state_value(
     value_type: NullablePrimitiveType,
     states: &NullablePrimitiveValueArray,
@@ -108,6 +157,10 @@ pub fn ensure_finite_state_value(
 }
 
 /// Ensure that a snapshot state value matches the schema data type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_snapshot_state_value_type(
     data_type: &ReplicatedDataType,
     value: SnapshotStateValueRef<'_>,
@@ -130,6 +183,10 @@ pub fn ensure_snapshot_state_value_type(
 }
 
 /// Ensure that a snapshot history node payload matches the schema data type.
+///
+/// # Errors
+///
+/// See `DataModelValueError` for failure conditions.
 pub fn ensure_snapshot_history_value_type(
     data_type: &ReplicatedDataType,
     value: &NullableBasicValueRef<'_>,

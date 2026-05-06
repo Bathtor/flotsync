@@ -1,6 +1,18 @@
 use crate::{
     roaring_helpers::{MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError, select_bitmap_chunk},
-    types::*,
+    types::{
+        AckFrame,
+        Checksum,
+        FrameType,
+        MessageId,
+        NeedPartsFrame,
+        NoLongerAvailableFrame,
+        PartCount,
+        PayloadFrame,
+        UDPourFrame,
+        UDPourHeader,
+        UDPourTypeError,
+    },
     wire::{DecodeFromBuf, EncodeToBufMut},
 };
 #[cfg(test)]
@@ -25,6 +37,10 @@ pub(crate) fn encoded_frame_len(frame: &UDPourFrame) -> usize {
 }
 
 /// Decodes one frame from an `IoPayload`.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "callers hand off transport payloads as owned values even though decoding currently borrows internally"
+)]
 pub(crate) fn decode_frame(payload: IoPayload) -> Result<UDPourFrame, CodecError> {
     ensure!(
         payload.len() >= FRAME_HEADER_LEN,
@@ -190,6 +206,7 @@ fn encode_header(header: UDPourHeader) -> BytesMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{PROTOCOL_VERSION, PartNumber};
     use bytes::Bytes;
 
     fn raw_frame(bytes: Vec<u8>) -> IoPayload {

@@ -3,7 +3,7 @@ use crate::{
     linear_data::{
         Composite,
         DataOperation,
-        IdGeneratorWithZeroIndex,
+        IdGeneratorWithIndex,
         IdWithIndex,
         LinearData,
         VecCoalescedLinearDataIter,
@@ -37,7 +37,7 @@ where
     Internal { source: InternalError },
 }
 
-/// A set of changes that can be applied to a [[LinearString]].
+/// A set of changes that can be applied to a [[`LinearString`]].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LinearStringDiff<Id> {
     operations: Vec<DataOperation<IdWithIndex<Id>, String>>,
@@ -47,6 +47,10 @@ where
     Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Apply all the changes in this diff to `target`.
+    ///
+    /// # Errors
+    ///
+    /// See `ApplyError<Id>` for failure conditions.
     pub fn apply_to(self, target: &mut LinearString<Id>) -> Result<(), ApplyError<Id>> {
         let mut iter = self.operations.into_iter();
 
@@ -70,9 +74,10 @@ where
     }
 
     /// Return all ids that are being newly introduced by applying this diff.
+    #[must_use]
     pub fn new_ids(&self) -> BTreeSet<Id> {
         let mut ids = BTreeSet::new();
-        for op in self.operations.iter() {
+        for op in &self.operations {
             match op {
                 DataOperation::Insert { id, .. } => {
                     ids.insert(id.id.clone());
@@ -84,16 +89,19 @@ where
     }
 
     /// Returns `true` iff this diff is empty, i.e. a no-op.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.operations.is_empty()
     }
 
     /// Returns how many individual operations there in this diff.
+    #[must_use]
     pub fn num_operations(&self) -> usize {
         self.operations.len()
     }
 
     /// Returns how many of the operations in this diff are inserts.
+    #[must_use]
     pub fn num_insert_operations(&self) -> usize {
         self.operations
             .iter()
@@ -102,6 +110,7 @@ where
     }
 
     /// Returns how many of the operations in this diff are deletes.
+    #[must_use]
     pub fn num_delete_operations(&self) -> usize {
         self.operations
             .iter()
@@ -111,7 +120,7 @@ where
 
     /// Returns an iterator over the values that are to be inserted.
     pub fn values_inserted(&self) -> impl Iterator<Item = &str> {
-        self.operations.iter().flat_map(|op| match op {
+        self.operations.iter().filter_map(|op| match op {
             DataOperation::Insert { value, .. } => Some(value.as_str()),
             DataOperation::Delete { .. } => None,
         })
@@ -126,7 +135,7 @@ where
     Id: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for op in self.operations.iter() {
+        for op in &self.operations {
             match op {
                 DataOperation::Insert {
                     id,
@@ -164,6 +173,10 @@ pub enum DiffError {
 /// new node ids as required.
 /// Each inserted diff fragment uses a single major id and fails if its addressed indices would
 /// exceed `u32::MAX`.
+///
+/// # Errors
+///
+/// See `DiffError` for failure conditions.
 pub fn linear_diff<Id>(
     base: &LinearString<Id>,
     changed: &str,
@@ -172,13 +185,14 @@ pub fn linear_diff<Id>(
 where
     Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
-    let mut id_with_index_generator = IdGeneratorWithZeroIndex::new(id_generator);
+    let mut id_with_index_generator = IdGeneratorWithIndex::new(id_generator);
     let current_text = base.to_string();
     let basic_diff = text_diff::diff(&current_text, changed);
 
     // Convert the TextChange to DataOperations over `base`.
     let mut operations: Vec<DataOperation<IdWithIndex<Id>, String>> =
         Vec::with_capacity(basic_diff.len());
+    let mut pending_reserved_indices: Option<usize> = None;
     for change in basic_diff {
         match change {
             text_diff::TextChange::Insert { at, value } => {
@@ -195,29 +209,35 @@ where
                     );
                     base.ids_after_head()
                 } else {
-                    match base.ids_at_pos(at) {
-                        // TextChange always outputs the position where the first inserted character
-                        // should be after the insertion happened.
-                        Some(node_ids) => node_ids.before(),
-                        None => {
-                            // If it wants to insert at the end, it will return the length of the
-                            // string as position (which is consistent with above).
-                            ensure!(
-                                at == base.len(),
-                                InternalSnafu {
-                                    context: format!("Insert position {at} did not exist in base."),
-                                }
-                            );
-                            base.ids_before_end()
-                        }
+                    // TextChange always outputs the position where the first inserted character
+                    // should be after the insertion happened.
+                    if let Some(node_ids) = base.ids_at_pos(at) {
+                        node_ids.before()
+                    } else {
+                        // If it wants to insert at the end, it will return the length of the
+                        // string as position (which is consistent with above).
+                        ensure!(
+                            at == base.len(),
+                            InternalSnafu {
+                                context: format!("Insert position {at} did not exist in base."),
+                            }
+                        );
+                        base.ids_before_end()
                     }
                 };
                 let value_graphemes = GraphemeString::new(value);
-                let op_id = id_with_index_generator.next().context(IdsExhaustedSnafu)?;
+                let op_id = if let Some(skip) = pending_reserved_indices {
+                    id_with_index_generator
+                        .nth(skip)
+                        .context(IdsExhaustedSnafu)?
+                } else {
+                    id_with_index_generator.next().context(IdsExhaustedSnafu)?
+                };
                 require!(
                     op_id.can_address(value_graphemes.len()),
                     IndexExhaustedSnafu.build()
                 );
+                pending_reserved_indices = Some(value_graphemes.len().saturating_sub(1));
                 operations.push(node_insert_ids.insert_operation(op_id, value_graphemes.unwrap()));
             }
             text_diff::TextChange::Delete { at, len } => {
@@ -238,7 +258,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::{
-        linear_data::tests::TestIdGenerator,
+        linear_data::{DataOperation, tests::TestIdGenerator},
         text::{
             LinearString,
             LinearStringDiff,
@@ -248,6 +268,32 @@ mod tests {
     };
     use flotsync_utils::{debugging::DebugFormatting, option_when, svec16, testing::SVec16};
     use itertools::Itertools;
+
+    struct MultiStepWriter {
+        id: usize,
+        linear: LinearString<u32>,
+        ops: Vec<LinearStringDiff<u32>>,
+    }
+
+    struct SyncWriter {
+        id: usize,
+        linear: LinearString<u32>,
+        ops: Vec<LinearStringDiff<u32>>,
+        next_sync_for: [usize; 3],
+    }
+
+    fn apply_diffs(
+        diffs: &[LinearStringDiff<u32>],
+        linear: &mut LinearString<u32>,
+    ) -> Result<(), ()> {
+        for op in diffs {
+            // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
+            op.clone().apply_to(linear).map_err(|_| ())?;
+            linear.validate_integrity().unwrap();
+            // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_with_empty_string() {
@@ -301,6 +347,31 @@ mod tests {
 
         single_delete_diff.apply_to(&mut linear).unwrap();
         assert_eq!(linear.to_string(), "");
+    }
+
+    #[test]
+    fn linear_string_diff_with_two_insert_positions() {
+        let mut linear = LinearString::with_value("a".to_owned(), 1);
+        let mut update_ids = std::iter::once(2);
+
+        let diff = linear_diff(&linear, "ray", &mut update_ids).unwrap();
+        assert!(!diff.is_empty());
+        assert_eq!(diff.num_operations(), 2);
+        assert_eq!(diff.num_insert_operations(), 2);
+
+        let insert_indices = diff
+            .clone()
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(insert_indices, vec![0, 1]);
+
+        diff.apply_to(&mut linear).unwrap();
+        assert_eq!(linear.to_string(), "ray");
     }
 
     #[test]
@@ -371,7 +442,7 @@ mod tests {
     }
 
     fn check_diff_and_apply(from: &LinearString<u32>, to: &str, error_context: &str) {
-        let mut id_generator = TestIdGenerator::without_ids(from.iter_ids().cloned());
+        let mut id_generator = TestIdGenerator::without_ids(from.iter_ids().copied());
 
         // println!("Producing diff between\n '{}'\n and\n '{}'", from, to);
         let diff = linear_diff(from, to, &mut id_generator).expect(error_context);
@@ -406,7 +477,7 @@ mod tests {
     fn test_single_step_convergence() {
         // For each group, check that no matter in which order we apply the two diffs,
         // they produce the same result (doesn't matter what it is, as long as its the same).
-        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+        for group in &SMALL_CHANGE_TEST_GROUPS {
             // println!("### \n### Checking Group: {group:?}\n###");
             let mut id_generator = TestIdGenerator::new();
             let base = LinearString::with_value(group[0].to_owned(), id_generator.next().unwrap());
@@ -457,19 +528,14 @@ mod tests {
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
         let shared_base = LinearString::new(id_generator.next().unwrap());
-        struct Writer {
-            id: usize,
-            linear: LinearString<u32>,
-            ops: Vec<LinearStringDiff<u32>>,
-        }
         let mut writers: Vec<_> = (0..3)
-            .map(|id| Writer {
+            .map(|id| MultiStepWriter {
                 id,
                 linear: shared_base.clone(),
                 ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
             })
             .collect();
-        for group in SMALL_CHANGE_TEST_GROUPS.iter() {
+        for group in &SMALL_CHANGE_TEST_GROUPS {
             for (writer_index, writer) in writers.iter_mut().enumerate() {
                 let op =
                     linear_diff(&writer.linear, group[writer_index], &mut id_generator).unwrap();
@@ -487,7 +553,7 @@ mod tests {
             let mut linear = perm[0].linear.clone();
             //println!("### Base is '{}':\n {}", linear, linear.debug_fmt());
             for writer in &perm[1..] {
-                for op in writer.ops.iter() {
+                for op in &writer.ops {
                     //println!("### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
                     op.clone().apply_to(&mut linear).unwrap();
                     linear.validate_integrity().unwrap();
@@ -498,13 +564,11 @@ mod tests {
                 assert_eq!(
                     last_result.to_string(),
                     linear.to_string(),
-                    "Result strings did not match for permutation: {}",
-                    permutation_str
+                    "Result strings did not match for permutation: {permutation_str}"
                 );
                 assert_eq!(
                     last_result, &linear,
-                    "Results did not match for permutation: {}",
-                    permutation_str
+                    "Results did not match for permutation: {permutation_str}"
                 );
             }
             // permutation_results.push(linear);
@@ -657,33 +721,14 @@ mod tests {
         let mut id_generator = TestIdGenerator::new();
         // Begin and end nodes need to have the same ids, of course.
         let shared_base = LinearString::new(id_generator.next().unwrap());
-        struct Writer {
-            id: usize,
-            linear: LinearString<u32>,
-            ops: Vec<LinearStringDiff<u32>>,
-            next_sync_for: [usize; 3],
-        }
-        let mut writers: [Writer; 3] = std::array::from_fn(|id| Writer {
+        let mut writers: [SyncWriter; 3] = std::array::from_fn(|id| SyncWriter {
             id,
             linear: shared_base.clone(),
             ops: Vec::with_capacity(SMALL_CHANGE_TEST_GROUPS.len()),
             next_sync_for: [0; 3],
         });
 
-        fn apply_diffs(
-            diffs: &[LinearStringDiff<u32>],
-            linear: &mut LinearString<u32>,
-        ) -> Result<(), ()> {
-            for op in diffs.iter() {
-                // println!("##### Applying op\n{}\nto\n {}", op, linear.debug_fmt());
-                op.clone().apply_to(linear).map_err(|_| ())?;
-                linear.validate_integrity().unwrap();
-                // println!("##### Got '{}':\n {}", linear, linear.debug_fmt());
-            }
-            Ok(())
-        }
-
-        'scenario_loop: for scenario in SYNC_SCENARIOS.iter() {
+        'scenario_loop: for scenario in &SYNC_SCENARIOS {
             //println!("##########\n### Scenario #{scenario_index} ###\n#########");
             for (group_index, group) in SMALL_CHANGE_TEST_GROUPS.iter().enumerate() {
                 //println!("### Starting write #{group_index} ###");
@@ -766,8 +811,7 @@ mod tests {
                     assert_eq!(
                         last_result.to_string(),
                         linear.to_string(),
-                        "Result strings did not match for permutation: {}",
-                        permutation_str
+                        "Result strings did not match for permutation: {permutation_str}"
                     );
                     // They might structurally differ in delete splits.
                     // assert_eq!(

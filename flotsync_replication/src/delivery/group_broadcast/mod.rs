@@ -3,7 +3,16 @@
 use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
-    route_transport::*,
+    route_transport::{
+        FlotsyncSerializable,
+        RouteDiscoveryPort,
+        RouteSharingKind,
+        RouteTransportActorMessage,
+        RouteTransportSend,
+        RouteTransportSubmitResult,
+        SendRouteCandidate,
+        TransportRouteKey,
+    },
     shared::{DeliveryClass, EncryptedPayload, MessageId, RouteSendId, SignedEnvelopeFooter},
 };
 use crate::{
@@ -112,6 +121,7 @@ pub struct GroupBroadcastComponent {
 impl GroupBroadcastComponent {
     /// Create one new group-broadcast component around the shared
     /// group-membership view and route-transport actor.
+    #[must_use]
     pub fn new(
         group_memberships: SharedGroupMemberships,
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
@@ -128,7 +138,7 @@ impl GroupBroadcastComponent {
         }
     }
 
-    fn handle_submit_request(&mut self, submit: GroupBroadcastSubmit) -> Handled {
+    fn handle_submit_request(&mut self, submit: &GroupBroadcastSubmit) -> Handled {
         let envelope = submit.envelope.clone();
         let message_id = envelope.header.message_id;
         if self.accepted_submits.contains(&message_id) {
@@ -347,7 +357,7 @@ ignore_lifecycle!(GroupBroadcastComponent);
 impl Provide<GroupBroadcastPort> for GroupBroadcastComponent {
     fn handle(&mut self, request: GroupBroadcastPortRequest) -> Handled {
         match request {
-            GroupBroadcastPortRequest::Submit(submit) => self.handle_submit_request(submit),
+            GroupBroadcastPortRequest::Submit(submit) => self.handle_submit_request(&submit),
         }
     }
 }
@@ -486,7 +496,7 @@ mod tests {
             bind_external_socket: bool,
         ) -> Self {
             let system = build_delivery_test_system();
-            let manager_owned_udp_sockets = if bind_external_socket { 0 } else { 1 };
+            let manager_owned_udp_sockets = usize::from(!bind_external_socket);
             let core = TransportHarnessCore::with_socket_budgets(
                 system,
                 default_udpour_config(),
@@ -570,12 +580,12 @@ mod tests {
                 sharing: RouteSharingKind::Exclusive,
                 preference_rank: RoutePreferenceRank::new(1),
             };
-            let route_peer = peer.clone();
+            let expected_peer = peer.clone();
             self.discovery_source.on_definition(|component| {
                 component
                     .discovery
                     .trigger(TransportDiscoveryRouteUpdate::PeerRoutes {
-                        peer: route_peer,
+                        peer,
                         classification: super::super::shared::ReachabilityClass::Reachable,
                         routes: vec![route],
                     });
@@ -583,7 +593,7 @@ mod tests {
             eventually_component_state(
                 FULL_STACK_WAIT_TIMEOUT,
                 &self.broadcast,
-                |component| component.knows_direct_route(&peer),
+                |component| component.knows_direct_route(&expected_peer),
                 "timed out waiting for group-broadcast route publication",
             );
         }

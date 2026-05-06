@@ -1,5 +1,5 @@
 #[allow(unused)]
-use crate::errors::*;
+use crate::errors::{Result, ZeroconfSnafu};
 #[allow(unused)]
 use snafu::prelude::*;
 

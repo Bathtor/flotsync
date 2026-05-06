@@ -29,6 +29,9 @@ where
         )
     }
 
+    /// # Errors
+    ///
+    /// See `PromiseErr` for failure conditions.
     pub fn take_promise(self) -> Result<KPromise<T>, PromiseErr> {
         let mut guard = self.inner.lock().map_err(|_| PromiseErr::ChannelBroken)?;
         guard.take().ok_or(PromiseErr::AlreadyFulfilled)

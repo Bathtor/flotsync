@@ -99,11 +99,12 @@ pub enum DecodeValueError {
     },
 }
 
-/// A marker trait that a type can be extracted from an [[InMemoryFieldValue]].
+/// A marker trait that a type can be extracted from an [[`InMemoryFieldValue`]].
 pub trait Decode<OperationId>: ToOwned {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError>;
+    /// # Errors
+    ///
+    /// See `DecodeValueError` for failure conditions.
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError>;
 }
 
 pub type OperationResult<T> = Result<T, OperationError>;
@@ -129,6 +130,8 @@ pub trait RowRead<OperationId> {
 pub trait RowOperations<OperationId>: RowRead<OperationId> {
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
+    /// # Errors
+    ///
     /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
     fn get_field_value<'a, T>(&'a self, field_name: &str) -> Result<Cow<'a, T>, DecodeValueError>
     where
@@ -138,6 +141,8 @@ pub trait RowOperations<OperationId>: RowRead<OperationId> {
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
     /// Returns `Ok(None)` if the field is `NULL`.
+    ///
+    /// # Errors
     ///
     /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
     fn get_nullable_field_value<'a, T>(
@@ -198,6 +203,7 @@ pub struct OwnedRow<OperationId> {
 }
 
 impl<OperationId> OwnedRow<OperationId> {
+    #[must_use]
     pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
         Self { fields }
     }
@@ -209,7 +215,7 @@ impl<OperationId> RowRead<OperationId> for OwnedRow<OperationId> {
     }
 }
 
-/// This is equivalent to [[RowOperations]] but operating directly on schema fields.
+/// This is equivalent to [[`RowOperations`]] but operating directly on schema fields.
 pub trait FieldOperations<OperationId> {
     /// Get the current value of this field in `row`.
     ///
@@ -219,6 +225,10 @@ pub trait FieldOperations<OperationId> {
         R: RowOperations<OperationId>;
 
     /// Get the current value of this field in `row` converted to `T` (owned or reference, as feasible).
+    ///
+    /// # Errors
+    ///
+    /// See `DecodeValueError` for failure conditions.
     fn get_value<'a, R, T>(&self, row: &'a R) -> Result<Cow<'a, T>, DecodeValueError>
     where
         R: RowOperations<OperationId>,
@@ -228,6 +238,10 @@ pub trait FieldOperations<OperationId> {
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
     /// Returns `Ok(None)` if the field is `NULL`.
+    ///
+    /// # Errors
+    ///
+    /// See `DecodeValueError` for failure conditions.
     fn get_nullable_value<'a, T, R>(
         &self,
         row: &'a R,
@@ -240,7 +254,7 @@ pub trait FieldOperations<OperationId> {
 
 /// Operations that can be performed on table with a given [[Schema]].
 ///
-/// All operations apply to the underlying data and return a [[SchemaOperation]] that can be sent
+/// All operations apply to the underlying data and return a [[`SchemaOperation`]] that can be sent
 /// over the network to be applied at other nodes.
 pub trait TableOperations<RowId, OperationId> {
     /// A representation of a single row in this table.
@@ -257,11 +271,15 @@ pub trait TableOperations<RowId, OperationId> {
     /// Insert a fresh row identified by `row_id` and with the `initial_values`.
     ///
     /// Any field omitted from `initial_values` will use its schema-level default when defined.
-    /// If a field is omitted and has no schema default, the insert will be rejected.
     /// If any field has more than one value provided, the last one will be used.
     ///
     /// It is crucial to ensure that `operation_id` is globally unique to prevent insert/insert type
     /// conflicts, which are not resolvable.
+    ///
+    /// # Errors
+    ///
+    /// If a field is omitted and has no schema default, the insert will be rejected.
+    /// See `OperationError` for failure conditions.
     fn insert_row<'a, I>(
         &mut self,
         operation_id: OperationId,
@@ -276,6 +294,10 @@ pub trait TableOperations<RowId, OperationId> {
     /// Unspecified fields will remain unchanged.
     ///
     /// If any field has more than one value provided, the last one will be used.
+    ///
+    /// # Errors
+    ///
+    /// See `OperationError` for failure conditions.
     fn modify_row<'a, I>(
         &mut self,
         operation_id: OperationId,
@@ -286,6 +308,10 @@ pub trait TableOperations<RowId, OperationId> {
         I: IntoIterator<Item = schema::PendingFieldUpdate<'a>>;
 
     /// Delete the existing row with `row_id`.
+    ///
+    /// # Errors
+    ///
+    /// See `OperationError` for failure conditions.
     fn delete_row(
         &mut self,
         operation_id: OperationId,

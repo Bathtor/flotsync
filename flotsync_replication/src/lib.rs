@@ -10,7 +10,7 @@ pub mod runtime;
 pub mod store;
 
 pub use api::*;
-pub use runtime::load_replication_runtime;
+pub use runtime::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
 pub use store::SqliteReplicationStore;
 
 /// Immutable snapshot of the groups currently hosted locally and their
@@ -23,6 +23,7 @@ pub struct GroupMemberships {
 
 impl GroupMemberships {
     /// Create one empty membership snapshot.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -36,13 +37,20 @@ impl GroupMemberships {
 
     /// Returns `true` when the given group currently exists in the local
     /// delivery view.
+    #[must_use]
     pub fn contains_group(&self, group_id: &GroupId) -> bool {
         self.groups.contains_key(group_id)
     }
 
     /// Return the currently known members for the given group when present.
+    #[must_use]
     pub fn members(&self, group_id: &GroupId) -> Option<&GroupMembers> {
         self.groups.get(group_id)
+    }
+
+    /// Return the ids of all locally hosted groups in this snapshot.
+    pub fn group_ids(&self) -> impl Iterator<Item = &GroupId> {
+        self.groups.keys()
     }
 
     /// Replace the membership set for one group inside this snapshot.
@@ -60,6 +68,7 @@ pub struct SharedGroupMemberships {
 
 impl SharedGroupMemberships {
     /// Create one new shared snapshot handle around the provided initial view.
+    #[must_use]
     pub fn new(initial: GroupMemberships) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
@@ -67,6 +76,7 @@ impl SharedGroupMemberships {
     }
 
     /// Load the current immutable snapshot.
+    #[must_use]
     pub fn snapshot(&self) -> Arc<GroupMemberships> {
         self.inner.load_full()
     }
@@ -109,11 +119,24 @@ pub struct GroupMembers {
 
 impl GroupMembers {
     /// Build one single-member group with that member at canonical index `0`.
+    ///
+    /// # Errors
+    ///
+    /// See `GroupMembersError` for failure conditions.
     pub fn singleton(member: MemberIdentity) -> Result<Self, GroupMembersError> {
         Self::from_ordered_members([member])
     }
 
     /// Build one indexed member set from the canonical group member order.
+    ///
+    /// # Errors
+    ///
+    /// See `GroupMembersError` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a member index cannot be represented after the group size was already checked
+    /// against [`u32::MAX`].
     pub fn from_ordered_members(
         ordered_members: impl IntoIterator<Item = MemberIdentity>,
     ) -> Result<Self, GroupMembersError> {
@@ -136,11 +159,13 @@ impl GroupMembers {
     }
 
     /// Return whether this group currently includes `member`.
+    #[must_use]
     pub fn contains(&self, member: &MemberIdentity) -> bool {
         self.member_indices.get(member).is_some()
     }
 
     /// Return the fixed producer index assigned to `member`, if present.
+    #[must_use]
     pub fn member_index(&self, member: &MemberIdentity) -> Option<MemberIndex> {
         self.member_indices.get(member).copied()
     }
@@ -151,6 +176,7 @@ impl GroupMembers {
     }
 
     /// Return the canonical bootstrap order for this group.
+    #[must_use]
     pub fn ordered_members(&self) -> Vec<MemberIdentity> {
         let mut ordered_members: Vec<_> = self
             .member_indices
@@ -165,11 +191,13 @@ impl GroupMembers {
     }
 
     /// Return whether this member set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.member_indices.is_empty()
     }
 
     /// Return the number of members in this group.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.member_indices.len()
     }

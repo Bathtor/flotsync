@@ -1,4 +1,7 @@
-use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
+use super::{
+    ReplicationRuntimeMessage,
+    host::{DeliveryRuntimeHost, RuntimeHostError},
+};
 use crate::api::{
     ApiError,
     ApiResult,
@@ -7,25 +10,29 @@ use crate::api::{
     GroupId,
     GroupMigration,
     LoadError,
+    PublishChangesRequest,
     PublishReceipt,
     ReplicationApi,
     ReplicationConfig,
     ReplicationEventListener,
     ReplicationStore,
-    RowMutation,
     RuntimeSnafu,
+    SnapshotRows,
+    SnapshotRowsRequest,
+    Summary,
+    SummaryRequest,
 };
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc, thread};
 
 #[cfg(test)]
 use super::{
     errors::{GroupInstallError, InboundDeliveryError},
-    messages::UpdateBatchMessage,
+    messages::UpdateMessage,
 };
 #[cfg(test)]
 use crate::{GroupMembers, api::MemberIdentity};
@@ -46,21 +53,77 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `listener` receives replication events produced by inbound delivery.
 /// `config` carries public runtime policy knobs; the current runtime only honours
 /// the migration-policy shape while the deeper protocol remains unimplemented.
+///
+/// # Errors
+///
+/// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
-    let runtime = load_replication_runtime_typed(application_id, store, listener, config).await?;
+    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        None,
+    )
+    .await?;
     Ok(runtime)
 }
 
+/// Create one concrete replication runtime with an additional in-memory TOML
+/// config fragment merged into the internal Kompact runtime config.
+///
+/// The TOML string only needs to live until this function returns; Kompact
+/// copies it into its config builder before the runtime system is built.
+///
+/// # Errors
+///
+/// See `LoadError` for failure conditions.
+pub async fn load_replication_runtime_with_runtime_config_toml(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    runtime_config_toml: &str,
+) -> Result<Arc<dyn ReplicationApi>, LoadError> {
+    let runtime = load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        Some(runtime_config_toml),
+    )
+    .await?;
+    Ok(runtime)
+}
+
+#[cfg(test)]
 pub(super) async fn load_replication_runtime_typed(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    load_replication_runtime_typed_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        config,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     let local_member = store
         .local_member_identity()
@@ -69,7 +132,7 @@ pub(super) async fn load_replication_runtime_typed(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let host = DeliveryRuntimeHost::start(local_member, store, listener)
+    let host = start_delivery_runtime_host(local_member, store, listener, runtime_config_toml)
         .boxed()
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
@@ -86,6 +149,51 @@ pub(super) async fn load_replication_runtime_typed(
         host,
         _config: config,
     }))
+}
+
+fn start_delivery_runtime_host(
+    local_member: crate::api::MemberIdentity,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    runtime_config_toml: Option<&str>,
+) -> Result<DeliveryRuntimeHost, RuntimeHostError> {
+    let runtime_config_toml = runtime_config_toml.map(str::to_owned);
+    // Temporary workaround for https://github.com/kompics/kompact/issues/223:
+    // Kompact startup currently enters a futures-executor LocalPool internally.
+    // Run it outside the caller's async executor until Kompact has an
+    // async-friendly startup path or clearer non-panicking failure mode.
+    let start_thread = thread::Builder::new()
+        .name("flotsync-runtime-start".to_owned())
+        .spawn(move || {
+            DeliveryRuntimeHost::start_with_runtime_config_toml(
+                &local_member,
+                store,
+                listener,
+                runtime_config_toml.as_deref(),
+            )
+        })
+        .map_err(|source| RuntimeHostError::BuildSystem {
+            message: format!("failed to spawn runtime startup thread: {source}"),
+        })?;
+
+    start_thread
+        .join()
+        .map_err(|payload| RuntimeHostError::BuildSystem {
+            message: format!(
+                "runtime startup thread panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ),
+        })?
+}
+
+fn panic_payload_message(payload: &(dyn Any + Send + 'static)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    }
 }
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
@@ -136,9 +244,19 @@ impl Drop for ReplicationRuntime {
 }
 
 impl ReplicationApi for ReplicationRuntime {
-    fn publish_changes(&self, changes: Vec<RowMutation>) -> ApiFuture<'_, PublishReceipt> {
+    fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {
         self.ask(move |promise| {
-            ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, changes))
+            ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, request))
+        })
+    }
+
+    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotRows> {
+        self.ask(move |promise| ReplicationRuntimeMessage::SnapshotRows(Ask::new(promise, request)))
+    }
+
+    fn request_summary(&self, request: SummaryRequest) -> ApiFuture<'_, Summary> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::RequestSummary(Ask::new(promise, request))
         })
     }
 
@@ -184,25 +302,27 @@ impl ReplicationRuntime {
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
-            Err(_) => {
-                panic!("replication runtime component became unavailable during test install")
+            Err(error) => {
+                panic!(
+                    "replication runtime component became unavailable during test install: {error:?}"
+                )
             }
         }
     }
 
-    pub(super) fn apply_update_batch_for_test(
+    pub(super) fn apply_update_for_test(
         &self,
         sender: MemberIdentity,
-        message: UpdateBatchMessage,
+        message: UpdateMessage,
     ) -> Result<(), InboundDeliveryError> {
         let future = self.runtime_ref().ask_with(|promise| {
-            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
+            ReplicationRuntimeMessage::test_apply_update(promise, sender, message)
         });
         match wait_for_test_reply(future) {
             Ok(reply) => reply,
-            Err(_) => {
+            Err(error) => {
                 panic!(
-                    "replication runtime component became unavailable during test apply_update_batch"
+                    "replication runtime component became unavailable during test apply_update: {error:?}"
                 )
             }
         }

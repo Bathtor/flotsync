@@ -107,6 +107,7 @@ pub struct ProtoSchemaSnapshotEncoder<'schema> {
 
 impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
     /// Create an empty row encoder bound to `schema`.
+    #[must_use]
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
@@ -117,6 +118,10 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
     }
 
     /// Finish encoding and return the owned protobuf row snapshot.
+    ///
+    /// # Errors
+    ///
+    /// See `SnapshotAdapterError` for failure conditions.
     pub fn into_row_snapshot(self) -> Result<proto::RowSnapshot, SnapshotAdapterError> {
         self.validate_finished()?;
         Ok(self.row)
@@ -167,11 +172,7 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
         Ok((schema_field_name.as_str(), &schema_field.data_type))
     }
 
-    fn push_state_field(
-        &mut self,
-        field_name: &'schema str,
-        wire_value: StateSnapshotWireValue,
-    ) -> Result<(), SnapshotAdapterError> {
+    fn push_state_field(&mut self, field_name: &'schema str, wire_value: StateSnapshotWireValue) {
         let mut field = proto::SnapshotField {
             field_name: field_name.to_string(),
             ..proto::SnapshotField::default()
@@ -194,7 +195,6 @@ impl<'schema> ProtoSchemaSnapshotEncoder<'schema> {
             }
         }
         self.row.fields.push(field);
-        Ok(())
     }
 
     fn begin_history_field<'row, Node>(
@@ -264,7 +264,8 @@ impl<'schema> SchemaSnapshotEncoder<UpdateId> for ProtoSchemaSnapshotEncoder<'sc
             }
         );
         let wire_value = encode_state_snapshot_value(data_type, value).context(CodecSnafu)?;
-        self.push_state_field(field_name, wire_value)
+        self.push_state_field(field_name, wire_value);
+        Ok(())
     }
 
     fn prepare_latest_value_wins_field<'a>(
@@ -434,8 +435,8 @@ pub struct LatestValueWinsHistoryFieldSink<'schema, 'row> {
     value_type: &'schema NullableBasicDataType,
 }
 
-impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRef<'value>>
-    for LatestValueWinsHistoryFieldSink<'schema, 'row>
+impl<'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRef<'value>>
+    for LatestValueWinsHistoryFieldSink<'_, '_>
 {
     type Error = SnapshotAdapterError;
 
@@ -454,7 +455,7 @@ impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, NullableBasicValueRe
         self.state
             .as_mut()
             .context(HistoryFieldClosedSnafu)?
-            .push_node(index, owned_latest_value_wins_node(node))
+            .push_node(index, owned_latest_value_wins_node(&node))
     }
 
     fn end(&mut self) -> Result<(), Self::Error> {
@@ -471,9 +472,7 @@ pub struct LinearStringHistoryFieldSink<'schema, 'row> {
     state: Option<HistoryFieldEncoderState<'schema, 'row, SnapshotNode<UpdateIdWithIndex, String>>>,
 }
 
-impl<'schema, 'row> SnapshotSink<UpdateIdWithIndex, str>
-    for LinearStringHistoryFieldSink<'schema, 'row>
-{
+impl SnapshotSink<UpdateIdWithIndex, str> for LinearStringHistoryFieldSink<'_, '_> {
     type Error = SnapshotAdapterError;
 
     fn begin(&mut self, header: SnapshotHeader) -> Result<(), Self::Error> {
@@ -491,7 +490,7 @@ impl<'schema, 'row> SnapshotSink<UpdateIdWithIndex, str>
         self.state
             .as_mut()
             .context(HistoryFieldClosedSnafu)?
-            .push_node(index, owned_linear_string_node(node))
+            .push_node(index, owned_linear_string_node(&node))
     }
 
     fn end(&mut self) -> Result<(), Self::Error> {
@@ -514,8 +513,8 @@ pub struct LinearListHistoryFieldSink<'schema, 'row> {
     value_type: PrimitiveType,
 }
 
-impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayRef<'value>>
-    for LinearListHistoryFieldSink<'schema, 'row>
+impl SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>
+    for LinearListHistoryFieldSink<'_, '_>
 {
     type Error = SnapshotAdapterError;
 
@@ -534,7 +533,7 @@ impl<'schema, 'row, 'value> SnapshotSink<UpdateIdWithIndex, PrimitiveValueArrayR
         self.state
             .as_mut()
             .context(HistoryFieldClosedSnafu)?
-            .push_node(index, owned_linear_list_node(node))
+            .push_node(index, owned_linear_list_node(&node))
     }
 
     fn end(&mut self) -> Result<(), Self::Error> {
@@ -556,6 +555,10 @@ pub struct ProtoSchemaSnapshotDecoder {
 
 impl ProtoSchemaSnapshotDecoder {
     /// Create a row decoder that consumes `row` destructively.
+    ///
+    /// # Errors
+    ///
+    /// See `SnapshotAdapterError` for failure conditions.
     pub fn new(row: proto::RowSnapshot) -> Result<Self, SnapshotAdapterError> {
         let raw_field_count = row.fields.len();
         let mut fields = HashMap::with_capacity(raw_field_count);
@@ -811,7 +814,7 @@ impl SnapshotNodeSource<UpdateIdWithIndex, PrimitiveValueArray> for LinearListHi
 }
 
 fn owned_latest_value_wins_node(
-    node: SnapshotNodeRef<'_, UpdateIdWithIndex, NullableBasicValueRef<'_>>,
+    node: &SnapshotNodeRef<'_, UpdateIdWithIndex, NullableBasicValueRef<'_>>,
 ) -> SnapshotNode<UpdateIdWithIndex, NullableBasicValue> {
     SnapshotNode {
         id: node.id.clone(),
@@ -823,7 +826,7 @@ fn owned_latest_value_wins_node(
 }
 
 fn owned_linear_string_node(
-    node: SnapshotNodeRef<'_, UpdateIdWithIndex, str>,
+    node: &SnapshotNodeRef<'_, UpdateIdWithIndex, str>,
 ) -> SnapshotNode<UpdateIdWithIndex, String> {
     SnapshotNode {
         id: node.id.clone(),
@@ -835,7 +838,7 @@ fn owned_linear_string_node(
 }
 
 fn owned_linear_list_node(
-    node: SnapshotNodeRef<'_, UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>,
+    node: &SnapshotNodeRef<'_, UpdateIdWithIndex, PrimitiveValueArrayRef<'_>>,
 ) -> PrimitiveValueArrayNode {
     SnapshotNode {
         id: node.id.clone(),
@@ -853,7 +856,7 @@ pub struct ProtoDataSnapshotRowEncoder<'schema, 'row> {
     inner: &'row mut ProtoSchemaSnapshotEncoder<'schema>,
 }
 
-impl<'schema, 'row> SchemaSnapshotEncoder<UpdateId> for ProtoDataSnapshotRowEncoder<'schema, 'row> {
+impl<'schema> SchemaSnapshotEncoder<UpdateId> for ProtoDataSnapshotRowEncoder<'schema, '_> {
     type Error = SnapshotAdapterError;
 
     type LatestValueWinsFieldSink<'a>
@@ -926,6 +929,7 @@ pub struct ProtoDataSnapshotEncoder<'schema> {
 
 impl<'schema> ProtoDataSnapshotEncoder<'schema> {
     /// Create an empty dataset encoder bound to `schema`.
+    #[must_use]
     pub fn new(schema: &'schema Schema) -> Self {
         Self {
             schema,
@@ -936,6 +940,9 @@ impl<'schema> ProtoDataSnapshotEncoder<'schema> {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `SnapshotAdapterError` for failure conditions.
     pub fn into_snapshot(self) -> Result<proto::DataSnapshot, SnapshotAdapterError> {
         self.validate_finished()?;
         Ok(self.snapshot)
@@ -979,7 +986,7 @@ impl<'schema> flotsync_data_types::schema::datamodel::DataSnapshotEncoder<Update
         Ok(())
     }
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowEncoder<'a>, Self::Error> {
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowEncoder<'_>, Self::Error> {
         let row_count = self.expected_row_count.context(BeginRequiredSnafu {
             target: "data snapshot encoder",
         })?;
@@ -1057,7 +1064,7 @@ impl flotsync_data_types::schema::datamodel::DataSnapshotDecoder<UpdateId>
         Ok(self.rows.len())
     }
 
-    fn begin_row<'a>(&'a mut self, row_index: usize) -> Result<Self::RowDecoder<'a>, Self::Error> {
+    fn begin_row(&mut self, row_index: usize) -> Result<Self::RowDecoder<'_>, Self::Error> {
         ensure!(
             self.began,
             BeginRequiredSnafu {

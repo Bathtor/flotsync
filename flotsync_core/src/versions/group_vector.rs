@@ -7,7 +7,7 @@ use core::fmt;
 use itertools::Itertools;
 use std::{collections::BTreeMap, num::NonZeroUsize};
 
-/// A [[versionVector]] together with the corresponding group-membership information.
+/// A [[`VersionVector`]] together with the corresponding group-membership information.
 ///
 /// Aligned such that the version at position `p` belongs to the group member at index `p`.
 #[derive(Clone, Debug)]
@@ -21,9 +21,13 @@ impl<G> GroupVersionVector<G>
 where
     G: GroupMembership,
 {
-    /// Create a new instance of [[GroupVersionVector]] if the arguments match in length.
+    /// Create a new instance of [[`GroupVersionVector`]] if the arguments match in length.
     ///
     /// Otherwise return the arguments unchanged in the `Err` variant.
+    #[allow(
+        clippy::missing_errors_doc,
+        reason = "Err returns the original inputs unchanged rather than reporting an error."
+    )]
     pub fn new_checked(
         group_members: G,
         versions: VersionVector,
@@ -39,9 +43,12 @@ where
         }
     }
 
-    /// Create a new instance of [[GroupVersionVector]].
+    /// Create a new instance of [[`GroupVersionVector`]].
+    ///
+    /// # Panics
     ///
     /// Panics if the arguments do not match in length.
+    #[must_use]
     pub fn new(group_members: G, versions: VersionVector) -> Self {
         Self::new_checked(group_members, versions).unwrap_or_else(|e| {
             panic!("Require matching group size, but there were {} group members compared to a length {} version vector.",
@@ -50,19 +57,23 @@ where
         })
     }
 
+    #[must_use]
     pub fn group_members(&self) -> &G {
         &self.group_members
     }
 
+    #[must_use]
     pub fn versions(&self) -> &VersionVector {
         &self.versions
     }
 
     /// Returns the size of the group and vector.
+    #[must_use]
     pub fn len(&self) -> NonZeroUsize {
         self.versions.num_members()
     }
 
+    #[must_use]
     pub fn format_line_by_line(&self) -> GroupVersionVectorLineByLineDisplay<'_, G> {
         GroupVersionVectorLineByLineDisplay(self)
     }
@@ -87,6 +98,11 @@ where
     /// - self = <a -> 5, b -> 3, c -> 1>
     /// - other = <a -> 5, b -> 1, c -> 4>
     /// - result = <c -> [2, 3, 4]>
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the branch table mirrors compact version-vector representations and is easier to audit together"
+    )]
+    #[must_use]
     pub fn missing_to<'a, O>(
         &self,
         other: &'a GroupVersionVector<O>,
@@ -102,11 +118,6 @@ where
             self.versions.hb_cmp(&other.versions) != HappenedBeforeOrdering::After,
             "It's probably not intended to invoke a.missing_to(b) when b < a. a={self}, b={other}"
         );
-
-        // Basically (current, updated] as a Vec.
-        fn missing_versions_between(current: u64, updated: u64) -> Vec<u64> {
-            (current..=updated).skip(1).collect_vec()
-        }
 
         let mut result: BTreeMap<&Identifier, Vec<u64>> = BTreeMap::new();
         match (&self.versions, &other.versions) {
@@ -300,16 +311,16 @@ where
             .zip(self.versions.iter())
             .map(|(id, version)| format!("{id} -> {version}"))
             .join(", ");
-        write!(f, "〈{entries}〉")
+        write!(f, "〈{entries}〉")
     }
 }
 
-/// A printer wrapper for [[GroupVersionVector]] that displays entries one-per line.
+/// A printer wrapper for [[`GroupVersionVector`]] that displays entries one-per line.
 ///
-/// Use with [[GroupVersionVector::format_line_by_line()]].
+/// Use with [[`GroupVersionVector::format_line_by_line()`]].
 pub struct GroupVersionVectorLineByLineDisplay<'a, G>(&'a GroupVersionVector<G>);
 
-impl<'a, G> fmt::Display for GroupVersionVectorLineByLineDisplay<'a, G>
+impl<G> fmt::Display for GroupVersionVectorLineByLineDisplay<'_, G>
 where
     G: GroupMembership,
 {
@@ -321,6 +332,11 @@ where
             .zip(self.0.versions.iter())
             .map(|(id, version)| format!(" {id} -> {version}"))
             .join(",\n");
-        write!(f, "〈\n{entries}\n〉")
+        write!(f, "〈\n{entries}\n〉")
     }
+}
+
+// Basically (current, updated] as a Vec.
+fn missing_versions_between(current: u64, updated: u64) -> Vec<u64> {
+    (current..=updated).skip(1).collect_vec()
 }

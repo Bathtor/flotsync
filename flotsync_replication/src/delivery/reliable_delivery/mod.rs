@@ -9,8 +9,33 @@ use super::{
         ReliableDeliveryPortRequest,
     },
     ingress::InboundDeliveryMeta,
-    route_transport::*,
-    shared::*,
+    route_transport::{
+        FlotsyncSerializable,
+        RouteDiscoveryPort,
+        RouteSharingKind,
+        RouteTransportActorMessage,
+        RouteTransportNackReason,
+        RouteTransportSend,
+        RouteTransportSubmitResult,
+        SendRouteCandidate,
+        TransportRouteKey,
+    },
+    shared::{
+        ActiveRouteRecord,
+        DetachedSignature,
+        EncryptedPayload,
+        LogicalRouteId,
+        MailboxItemId,
+        MessageId,
+        PendingRouteReason,
+        RelayIdentity,
+        RouteActiveState,
+        RouteSendId,
+        SignatureScheme,
+        SignedEnvelopeFooter,
+        StableRouteKey,
+        WorkScopeKey,
+    },
 };
 use crate::api::MemberIdentity;
 use bytes::Bytes;
@@ -201,11 +226,13 @@ pub struct ReliableDeliveryComponent {
     retry_queue: RetryQueue,
     retry_timer: Option<ScheduledTimer>,
     retry_delay: Duration,
+    recipient_ack_timeout: Duration,
 }
 
 impl ReliableDeliveryComponent {
     /// Create one new reliable-delivery component around the shared
     /// route-transport actor.
+    #[must_use]
     pub fn new(
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
     ) -> Self {
@@ -221,6 +248,7 @@ impl ReliableDeliveryComponent {
             retry_queue: RetryQueue::new(),
             retry_timer: None,
             retry_delay: DEFAULT_RETRY_DELAY,
+            recipient_ack_timeout: DEFAULT_RECIPIENT_ACK_TIMEOUT,
         }
     }
 
@@ -275,6 +303,26 @@ impl ReliableDeliveryComponent {
                     DEFAULT_RETRY_DELAY
                 );
                 DEFAULT_RETRY_DELAY
+            }
+        }
+    }
+
+    fn load_recipient_ack_timeout(&self) -> Duration {
+        match self
+            .ctx
+            .config()
+            .read_or_default(&config_keys::RECIPIENT_ACK_TIMEOUT)
+        {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Failed to load reliable-delivery recipient ack timeout from {}: {}. Falling back to {:?}",
+                    config_keys::RECIPIENT_ACK_TIMEOUT.key,
+                    error,
+                    DEFAULT_RECIPIENT_ACK_TIMEOUT
+                );
+                DEFAULT_RECIPIENT_ACK_TIMEOUT
             }
         }
     }
@@ -361,11 +409,7 @@ impl ReliableDeliveryComponent {
             }
         };
         let message_id = envelope.header.message_id;
-        if self.inbound_deliveries.contains_key(&message_id) {
-            debug!(
-                self.log(),
-                "Reliable delivery dropped duplicate inbound envelope message_id={message_id}"
-            );
+        if self.handle_inbound_envelope_if_already_tracked(message_id) {
             return Handled::Ok;
         }
 
@@ -402,6 +446,41 @@ impl ReliableDeliveryComponent {
         Handled::Ok
     }
 
+    /// Return whether an inbound envelope matched existing receiver-side state
+    /// and was handled without re-delivering it to the semantic owner.
+    fn handle_inbound_envelope_if_already_tracked(&mut self, message_id: MessageId) -> bool {
+        let existing_state = self
+            .inbound_deliveries
+            .get(&message_id)
+            .map(|pending| pending.state);
+        let Some(state) = existing_state else {
+            return false;
+        };
+
+        match state {
+            PendingInboundDeliveryState::AwaitingProcessed => {
+                debug!(
+                    self.log(),
+                    "Reliable delivery dropped duplicate inbound envelope message_id={message_id} while awaiting processed completion"
+                );
+            }
+            PendingInboundDeliveryState::AckPending => {
+                debug!(
+                    self.log(),
+                    "Reliable delivery observed duplicate inbound envelope message_id={message_id} while recipient ack is pending; retrying ack dispatch"
+                );
+                self.try_dispatch_inbound_ack(message_id);
+            }
+            PendingInboundDeliveryState::AckInFlight => {
+                debug!(
+                    self.log(),
+                    "Reliable delivery dropped duplicate inbound envelope message_id={message_id} while recipient ack is already in flight"
+                );
+            }
+        }
+        true
+    }
+
     fn handle_inbound_recipient_ack(&mut self, ack: delivery_proto::RecipientAckWire) -> Handled {
         let ack = match recipient_ack_from_wire(ack) {
             Ok(ack) => ack,
@@ -413,14 +492,26 @@ impl ReliableDeliveryComponent {
                 return Handled::Ok;
             }
         };
-        let Some(work_item) = self.sender_work_items.get_mut(&ack.header.message_id) else {
+        let message_id = ack.header.message_id;
+        if !self.sender_work_items.contains_key(&message_id) {
             debug!(
                 self.log(),
-                "Reliable delivery ignored recipient ack for unknown message_id={}",
-                ack.header.message_id
+                "Reliable delivery ignored recipient ack for unknown message_id={}", message_id
             );
             return Handled::Ok;
-        };
+        }
+        self.cancel_retry(RetryKey::Sender(message_id));
+        debug!(
+            self.log(),
+            "Reliable delivery observed recipient ack for message_id={} from recipient={} original_sender={}",
+            message_id,
+            ack.header.recipient,
+            ack.header.original_sender
+        );
+        let work_item = self
+            .sender_work_items
+            .get_mut(&message_id)
+            .expect("sender work item was checked above");
         work_item.recipient_ack = RecipientAckStatus::Observed { ack };
         Handled::Ok
     }
@@ -441,7 +532,7 @@ impl ReliableDeliveryComponent {
                     self.log(),
                     "Reliable delivery observed processed completion for {message_id}"
                 );
-                self.finish_processed_delivery(message_id).await
+                self.finish_processed_delivery(message_id).await;
             }
             Err(_error) => {
                 // If every clone of the processed handle disappears before one
@@ -570,11 +661,20 @@ impl ReliableDeliveryComponent {
         match future.await {
             Ok(RouteTransportSubmitResult::Sent { .. }) => {
                 self.cancel_retry(RetryKey::Sender(message_id));
+                let mut should_schedule_ack_timeout = false;
                 if let Some(work_item) = self.sender_work_items.get_mut(&message_id) {
-                    // TODO(flotsync-46r): Add a sender-side recipient-ack
-                    // timeout so a receiver that never acks cannot leave the
-                    // sender work item stuck in this state indefinitely.
                     work_item.recipient_route.state = RouteActiveState::AwaitingRecipientAck;
+                    if matches!(work_item.recipient_ack, RecipientAckStatus::Pending) {
+                        should_schedule_ack_timeout = true;
+                    } else {
+                        debug!(
+                            self.log(),
+                            "Reliable delivery skipped recipient ack timeout for message_id={message_id} because ack was already observed"
+                        );
+                    }
+                }
+                if should_schedule_ack_timeout {
+                    self.schedule_retry(RetryKey::Sender(message_id), self.recipient_ack_timeout);
                 }
             }
             Ok(RouteTransportSubmitResult::SendFailed { reason, .. }) => {
@@ -751,16 +851,16 @@ impl ReliableDeliveryComponent {
         };
         let delay = next_due_at.saturating_duration_since(now);
         let timer = self.schedule_once(delay, move |component, expected_timer| {
-            component.handle_retry_timeout(expected_timer)
+            component.handle_retry_timeout(&expected_timer)
         });
         self.retry_timer = Some(timer);
     }
 
-    fn handle_retry_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+    fn handle_retry_timeout(&mut self, expected_timer: &ScheduledTimer) -> Handled {
         let Some(active_timer) = self.retry_timer.take() else {
             return Handled::Ok;
         };
-        if active_timer != expected_timer {
+        if &active_timer != expected_timer {
             self.retry_timer = Some(active_timer);
             return Handled::Ok;
         }
@@ -768,12 +868,68 @@ impl ReliableDeliveryComponent {
         let ready = self.retry_queue.take_ready(now);
         for key in ready {
             match key {
-                RetryKey::Sender(message_id) => self.try_dispatch_sender_message(message_id),
+                RetryKey::Sender(message_id) => self.handle_sender_retry_timeout(message_id),
                 RetryKey::InboundAck(message_id) => self.try_dispatch_inbound_ack(message_id),
             }
         }
         self.set_retry_timer(now);
         Handled::Ok
+    }
+
+    fn handle_sender_retry_timeout(&mut self, message_id: MessageId) {
+        let Some(work_item) = self.sender_work_items.get(&message_id) else {
+            debug!(
+                self.log(),
+                "Reliable delivery ignored stale sender retry for unknown message_id={message_id}"
+            );
+            return;
+        };
+        if matches!(work_item.recipient_ack, RecipientAckStatus::Observed { .. }) {
+            debug!(
+                self.log(),
+                "Reliable delivery ignored sender retry for message_id={message_id} because recipient ack was already observed"
+            );
+            return;
+        }
+
+        match &work_item.recipient_route.state {
+            RouteActiveState::AwaitingRecipientAck => {
+                let sender = work_item.submit.envelope.header.sender.clone();
+                let recipient = work_item.submit.envelope.header.recipient.clone();
+                warn!(
+                    self.log(),
+                    "Reliable delivery recipient ack timed out for message_id={} sender={} recipient={} after {:?}; retrying envelope delivery",
+                    message_id,
+                    sender,
+                    recipient,
+                    self.recipient_ack_timeout
+                );
+                self.mark_sender_work_pending_retry(
+                    message_id,
+                    PendingRouteReason::BackoffInEffect,
+                );
+                self.try_dispatch_sender_message(message_id);
+            }
+            RouteActiveState::PendingRoute { .. } | RouteActiveState::Queued => {
+                self.try_dispatch_sender_message(message_id);
+            }
+            RouteActiveState::AttemptingDirect { send_id } => {
+                debug!(
+                    self.log(),
+                    "Reliable delivery ignored sender retry for message_id={} because direct send {} is still in flight",
+                    message_id,
+                    format_args!("{send_id:?}")
+                );
+            }
+            RouteActiveState::AwaitingRelayStore { send_id } => {
+                debug!(
+                    self.log(),
+                    "Reliable delivery ignored sender retry for message_id={} because relay store {} is still in flight",
+                    message_id,
+                    format_args!("{send_id:?}")
+                );
+            }
+        }
     }
 
     #[cfg(test)]
@@ -792,6 +948,7 @@ impl ReliableDeliveryComponent {
 impl ComponentLifecycle for ReliableDeliveryComponent {
     fn on_start(&mut self) -> Handled {
         self.retry_delay = self.load_retry_delay();
+        self.recipient_ack_timeout = self.load_recipient_ack_timeout();
         Handled::Ok
     }
 
@@ -840,7 +997,7 @@ type TransportRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
 type TransportDiscoveryRouteUpdate = super::contracts::DiscoveryRouteUpdate<TransportRouteKey>;
 
 mod config_keys {
-    use super::*;
+    use super::{DEFAULT_RECIPIENT_ACK_TIMEOUT, Duration, kompact_config};
     use kompact::config::DurationValue;
 
     kompact_config! {
@@ -851,9 +1008,19 @@ mod config_keys {
         doc = "Base retry delay for direct reliable-delivery sends and semantic recipient acknowledgements.",
         version = "0.1.0"
     }
+
+    kompact_config! {
+        RECIPIENT_ACK_TIMEOUT,
+        key = "flotsync.reliable-delivery.recipient-ack-timeout",
+        type = DurationValue,
+        default = DEFAULT_RECIPIENT_ACK_TIMEOUT,
+        doc = "Maximum wait for a semantic recipient acknowledgement after a reliable-delivery envelope send succeeds.",
+        version = "0.1.0"
+    }
 }
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_mins(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Receiver-side state for one inbound reliable-delivery envelope after it was
@@ -1013,6 +1180,7 @@ mod tests {
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
                 build_delivery_test_system,
+                build_delivery_test_system_with,
                 default_udpour_config,
                 member_identity,
             },
@@ -1023,6 +1191,8 @@ mod tests {
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
     };
     use std::{collections::HashSet, net::SocketAddr, sync::mpsc, time::Duration};
+
+    const TEST_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_millis(50);
 
     #[derive(ComponentDefinition)]
     struct ReliableDeliveryClientProbe {
@@ -1072,7 +1242,20 @@ mod tests {
 
     impl FullStackHarness {
         fn new(local_member: MemberIdentity) -> Self {
-            let system = build_delivery_test_system();
+            Self::with_system(local_member, build_delivery_test_system())
+        }
+
+        fn with_recipient_ack_timeout(
+            local_member: MemberIdentity,
+            recipient_ack_timeout: Duration,
+        ) -> Self {
+            let system = build_delivery_test_system_with(|config| {
+                config.set_config_value(&config_keys::RECIPIENT_ACK_TIMEOUT, recipient_ack_timeout);
+            });
+            Self::with_system(local_member, system)
+        }
+
+        fn with_system(local_member: MemberIdentity, system: KompactSystem) -> Self {
             let core = TransportHarnessCore::with_socket_budgets(
                 system,
                 default_udpour_config(),
@@ -1081,10 +1264,12 @@ mod tests {
                 0,
             );
             let manager_ref = core.manager_ref();
-            let ingress = core.system().create(|| {
+            let local_members: Arc<HashSet<MemberIdentity>> =
+                Arc::new([local_member].into_iter().collect());
+            let ingress = core.system().create(move || {
                 DeliveryIngressComponent::new(DeliveryInterestConfig {
                     group_memberships: SharedGroupMemberships::new(GroupMemberships::new()),
-                    local_members: Arc::new([local_member.clone()].into_iter().collect()),
+                    local_members,
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
@@ -1144,6 +1329,7 @@ mod tests {
                 sharing: RouteSharingKind::Exclusive,
                 preference_rank: RoutePreferenceRank::new(1),
             };
+            let expected_peer = peer.clone();
             self.discovery_source.on_definition(|component| {
                 component
                     .discovery
@@ -1153,6 +1339,12 @@ mod tests {
                         routes: vec![route],
                     });
             });
+            eventually_component_state(
+                WAIT_TIMEOUT,
+                &self.reliable,
+                |component| component.knows_direct_route(&expected_peer),
+                "timed out waiting for reliable-delivery route publication",
+            );
         }
 
         fn submit(&self, submit: ReliableDeliverySubmit) {
@@ -1173,6 +1365,37 @@ mod tests {
             }
         }
 
+        fn expect_no_delivery(&self, timeout: Duration) {
+            match self.client_rx.recv_timeout(timeout) {
+                Ok(ReliableDeliveryPortIndication::Deliver(deliver)) => panic!(
+                    "unexpected reliable delivery indication for message_id={}",
+                    deliver.envelope.header.message_id
+                ),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("reliable delivery indication sender disconnected")
+                }
+            }
+        }
+
+        fn inject_recipient_ack(&self, ack: &RecipientAck) {
+            self.reliable.on_definition(|component| {
+                let frame = ack.to_wire_format();
+                let Some(delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+                    frame,
+                )) = frame.boundary
+                else {
+                    panic!("recipient ack must encode as reliable delivery boundary");
+                };
+                let Some(delivery_proto::reliable_delivery_frame::Body::RecipientAck(ack)) =
+                    frame.body
+                else {
+                    panic!("recipient ack must encode as recipient ack body");
+                };
+                let _ = component.handle_inbound_recipient_ack(*ack);
+            });
+        }
+
         fn wait_for_sender_ack_observed(&self, message_id: MessageId) {
             eventually_component_state(
                 WAIT_TIMEOUT,
@@ -1190,14 +1413,14 @@ mod tests {
             );
         }
 
-        fn wait_for_sender_route_state(&self, message_id: MessageId, expected: RouteActiveState) {
+        fn wait_for_sender_route_state(&self, message_id: MessageId, expected: &RouteActiveState) {
             eventually_component_state(
                 WAIT_TIMEOUT,
                 &self.reliable,
                 |component| {
                     component
                         .sender_work_item(message_id)
-                        .is_some_and(|work_item| work_item.recipient_route.state == expected)
+                        .is_some_and(|work_item| &work_item.recipient_route.state == expected)
                 },
                 format_args!(
                     "timed out waiting for sender-side route state {expected:?} for {message_id:?}"
@@ -1227,7 +1450,7 @@ mod tests {
             );
         }
 
-        fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: Bytes) {
+        fn wait_for_sender_ciphertext(&self, message_id: MessageId, expected: &Bytes) {
             eventually_component_state(
                 WAIT_TIMEOUT,
                 &self.reliable,
@@ -1235,7 +1458,8 @@ mod tests {
                     component
                         .sender_work_item(message_id)
                         .is_some_and(|work_item| {
-                            work_item.submit.envelope.payload.ciphertext == expected
+                            work_item.submit.envelope.payload.ciphertext.as_ref()
+                                == expected.as_ref()
                         })
                 },
                 format_args!(
@@ -1270,6 +1494,42 @@ mod tests {
         }
     }
 
+    fn reliable_submit(
+        sender: MemberIdentity,
+        recipient: MemberIdentity,
+        message_id: MessageId,
+        payload: &'static [u8],
+    ) -> ReliableDeliverySubmit {
+        ReliableDeliverySubmit {
+            envelope: ReliableMessageEnvelope {
+                header: ReliableMessageHeader {
+                    sender,
+                    recipient,
+                    message_id,
+                },
+                payload: EncryptedPayload {
+                    ciphertext: Bytes::from_static(payload),
+                },
+                footer: placeholder_signed_footer(),
+            },
+        }
+    }
+
+    fn recipient_ack(
+        original_sender: MemberIdentity,
+        recipient: MemberIdentity,
+        message_id: MessageId,
+    ) -> RecipientAck {
+        RecipientAck {
+            header: RecipientAckHeader {
+                message_id,
+                original_sender,
+                recipient,
+            },
+            footer: placeholder_signed_footer(),
+        }
+    }
+
     #[test]
     fn reliable_delivery_round_trips_direct_envelope_and_processed_ack() {
         let alice = member_identity(&["alice"]);
@@ -1297,7 +1557,7 @@ mod tests {
 
         let deliver = receiver.wait_for_delivery();
         assert_eq!(deliver.envelope.header.message_id, message_id);
-        sender.wait_for_sender_route_state(message_id, RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
         receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AwaitingProcessed);
 
         deliver
@@ -1307,6 +1567,155 @@ mod tests {
 
         sender.wait_for_sender_ack_observed(message_id);
         receiver.wait_for_inbound_clear(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_timeout_redelivers_unprocessed_envelope() {
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let sender =
+            FullStackHarness::with_recipient_ack_timeout(alice.clone(), TEST_RECIPIENT_ACK_TIMEOUT);
+        let receiver = FullStackHarness::new(bob.clone());
+
+        sender.publish_direct_route(bob.clone(), receiver.local_addr);
+
+        let message_id = MessageId(Uuid::from_u128(41));
+        sender.submit(reliable_submit(
+            alice,
+            bob,
+            message_id,
+            b"retry bootstrap payload",
+        ));
+
+        let deliver = receiver.wait_for_delivery();
+        assert_eq!(deliver.envelope.header.message_id, message_id);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
+        drop(deliver);
+        receiver.wait_for_inbound_clear(message_id);
+
+        let redelivered = receiver.wait_for_delivery();
+        assert_eq!(redelivered.envelope.header.message_id, message_id);
+        assert_eq!(
+            redelivered.envelope.payload.ciphertext,
+            Bytes::from_static(b"retry bootstrap payload")
+        );
+    }
+
+    #[test]
+    fn recipient_ack_cancels_timeout_redelivery() {
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let sender =
+            FullStackHarness::with_recipient_ack_timeout(alice.clone(), TEST_RECIPIENT_ACK_TIMEOUT);
+        let receiver = FullStackHarness::new(bob.clone());
+
+        sender.publish_direct_route(bob.clone(), receiver.local_addr);
+        receiver.publish_direct_route(alice.clone(), sender.local_addr);
+
+        let message_id = MessageId(Uuid::from_u128(42));
+        sender.submit(reliable_submit(
+            alice,
+            bob,
+            message_id,
+            b"ack cancels timeout",
+        ));
+
+        let deliver = receiver.wait_for_delivery();
+        deliver
+            .processed
+            .complete()
+            .expect("processed completion should succeed exactly once");
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
+        sender.wait_for_sender_ack_observed(message_id);
+
+        receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
+    }
+
+    #[test]
+    fn duplicate_inbound_envelope_is_dropped_while_awaiting_processed() {
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let sender =
+            FullStackHarness::with_recipient_ack_timeout(alice.clone(), TEST_RECIPIENT_ACK_TIMEOUT);
+        let receiver = FullStackHarness::new(bob.clone());
+
+        sender.publish_direct_route(bob.clone(), receiver.local_addr);
+
+        let message_id = MessageId(Uuid::from_u128(43));
+        sender.submit(reliable_submit(
+            alice,
+            bob,
+            message_id,
+            b"duplicate while processing",
+        ));
+
+        let deliver = receiver.wait_for_delivery();
+        assert_eq!(deliver.envelope.header.message_id, message_id);
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
+        receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AwaitingProcessed);
+
+        receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
+        deliver
+            .processed
+            .complete()
+            .expect("processed completion should succeed exactly once");
+    }
+
+    #[test]
+    fn duplicate_inbound_envelope_retries_pending_recipient_ack_without_redelivery() {
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let sender =
+            FullStackHarness::with_recipient_ack_timeout(alice.clone(), TEST_RECIPIENT_ACK_TIMEOUT);
+        let receiver = FullStackHarness::new(bob.clone());
+
+        sender.publish_direct_route(bob.clone(), receiver.local_addr);
+
+        let message_id = MessageId(Uuid::from_u128(44));
+        sender.submit(reliable_submit(
+            alice.clone(),
+            bob.clone(),
+            message_id,
+            b"duplicate while ack pending",
+        ));
+
+        let deliver = receiver.wait_for_delivery();
+        sender.wait_for_sender_route_state(message_id, &RouteActiveState::AwaitingRecipientAck);
+        deliver
+            .processed
+            .complete()
+            .expect("processed completion should succeed exactly once");
+        receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AckPending);
+
+        receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
+        receiver.publish_direct_route(alice, sender.local_addr);
+        sender.wait_for_sender_ack_observed(message_id);
+        receiver.wait_for_inbound_clear(message_id);
+    }
+
+    #[test]
+    fn late_recipient_ack_is_accepted_for_pending_sender_work() {
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let sender = FullStackHarness::new(alice.clone());
+
+        let message_id = MessageId(Uuid::from_u128(45));
+        sender.submit(reliable_submit(
+            alice.clone(),
+            bob.clone(),
+            message_id,
+            b"pending route late ack",
+        ));
+        sender.wait_for_sender_route_state(
+            message_id,
+            &RouteActiveState::PendingRoute {
+                retry_after: None,
+                reason: PendingRouteReason::PeerCurrentlyUnreachable,
+            },
+        );
+
+        sender.inject_recipient_ack(&recipient_ack(alice, bob, message_id));
+        sender.wait_for_sender_ack_observed(message_id);
     }
 
     #[test]
@@ -1359,6 +1768,6 @@ mod tests {
             },
         });
 
-        sender.wait_for_sender_ciphertext(message_id, Bytes::from_static(b"first payload"));
+        sender.wait_for_sender_ciphertext(message_id, &Bytes::from_static(b"first payload"));
     }
 }

@@ -21,6 +21,10 @@ used both as a quick manual validation tool and as a compact reference for how t
 exercise the listener/session model with a familiar request/response workload without introducing
 Tokio or a higher-level server framework that would hide the `flotsync_io` transport surface.
 
+`replicated_checklist` is a manual replication-slice example. It is line-oriented and configured
+entirely from one node-specific TOML file so two terminals or two machines can stage local edits and
+exchange them only when the user runs `sync`.
+
 ## What It Covers
 
 - `tcp connect --remote ADDR [--bind ADDR]`
@@ -47,6 +51,15 @@ For `http_server`, the current example intentionally does not cover:
 - routing beyond `GET /`, `HEAD /`, and `POST /echo`
 
 That broader HTTP behavior is outside the scope of this example.
+
+For `replicated_checklist`, the current example intentionally does not cover:
+
+- automatic discovery
+- group creation or membership changes from the REPL
+- automatic synchronisation after every edit
+- offline catch-up or replay after extended disconnection
+
+The group id and ordered members are static config values for this manual slice.
 
 ## Examples
 
@@ -129,3 +142,56 @@ By default the helper runs a small suite covering `GET /`, `HEAD /`, `POST /echo
 negative `404` case. Use `--case post_echo` to run one case only. The current example server
 always responds with `Connection: close`, so the harness should expect EOF after each response.
 Add `--verbose` if you want the raw `h11` event dump after each case summary.
+
+## Replicated Checklist
+
+Start two checklist peers with node-specific configs:
+
+```toml
+# alice.toml
+[flotsync.examples.replicated-checklist]
+local-member = "alice"
+store-path = "alice.sqlite"
+group-id = 123
+ordered-members = ["alice", "bob"]
+
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "127.0.0.1:45100"
+
+[[flotsync.replication.runtime.static-peer-routes]]
+name = "bob"
+protocol = "udp"
+ip = "127.0.0.1"
+port = 45101
+```
+
+```toml
+# bob.toml
+[flotsync.examples.replicated-checklist]
+local-member = "bob"
+store-path = "bob.sqlite"
+group-id = 123
+ordered-members = ["alice", "bob"]
+
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "127.0.0.1:45101"
+
+[[flotsync.replication.runtime.static-peer-routes]]
+name = "alice"
+protocol = "udp"
+ip = "127.0.0.1"
+port = 45100
+```
+
+Run each peer in a separate terminal:
+
+```bash
+cargo run -p flotsync_io_examples --bin replicated_checklist -- alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- bob.toml
+```
+
+Local edit commands update the in-process working set. Run `sync` when you want that peer to
+publish dirty rows and then apply queued incoming events.
+
+Concrete Alice/Bob manual acceptance flows for the replicated checklist are documented in
+[`replicated_checklist_scenarios.md`](replicated_checklist_scenarios.md).

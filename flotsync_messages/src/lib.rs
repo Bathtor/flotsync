@@ -7,14 +7,24 @@ pub use uuid::Uuid;
 pub mod codecs;
 pub mod snapshots;
 
-include!(concat!(env!("OUT_DIR"), "/flotsync_messages.rs"));
+mod generated {
+    #![allow(
+        clippy::pedantic,
+        reason = "generated Buffa code is linted at the generator level, not by editing OUT_DIR output"
+    )]
 
-pub use flotsync::{
-    datamodel::v1 as datamodel,
-    delivery::v1 as delivery,
-    discovery::v1 as discovery,
-    replication::v1 as replication,
-    versions::v1 as versions,
+    include!(concat!(env!("OUT_DIR"), "/flotsync_messages.rs"));
+}
+
+pub use generated::{
+    flotsync,
+    flotsync::{
+        datamodel::v1 as datamodel,
+        delivery::v1 as delivery,
+        discovery::v1 as discovery,
+        replication::v1 as replication,
+        versions::v1 as versions,
+    },
 };
 
 pub type InMemoryData =

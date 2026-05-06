@@ -15,6 +15,7 @@ impl<T: Error> Errors<T> {
     /// Whether there are no errors stored in here.
     ///
     /// This would generally be considered an somewhat illegal state.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         match self {
             Errors::Single(_) => false,
@@ -23,6 +24,7 @@ impl<T: Error> Errors<T> {
     }
 
     /// The number of errors currently stored.
+    #[must_use]
     pub fn len(&self) -> usize {
         match self {
             Errors::Single(_) => 1,
@@ -58,14 +60,15 @@ impl<T: Error> fmt::Display for Errors<T> {
 }
 impl<T: Error> Error for Errors<T> {}
 
-/// Extension methods for [[Result]] over [[Errors]] values.
+/// Extension methods for [[`Result`]] over [[`Errors`]] values.
 pub trait ErrorsResultExt {
     type Error;
 
     /// Update the errors with `error`.
     fn push_err(&mut self, error: Self::Error);
 
-    /// Produce a new value with `error`` appended.
+    /// Produce a new value with `error` appended.
+    #[must_use]
     fn append_err(self, error: Self::Error) -> Self;
 }
 
@@ -80,7 +83,7 @@ where
             Ok(_) => {
                 *self = Err(Errors::Multiple {
                     errors: vec![error],
-                })
+                });
             }
             Err(e) => e.push(error),
         }
@@ -92,11 +95,15 @@ where
     }
 }
 
-/// Extension methods to return [[Errors]] values.
+/// Extension methods to return [[`Errors`]] values.
 pub trait ErrorsExt {
     type Item;
 
     /// Return Ok if `predicate` returns `Ok` for all members, otherwise return the collected Err values.
+    ///
+    /// # Errors
+    ///
+    /// See `E` for failure conditions.
     fn ensure_for_all<P, E>(self, predicate: P) -> Result<(), E>
     where
         P: Fn(Self::Item) -> std::result::Result<(), E>,
@@ -116,7 +123,7 @@ where
     {
         #[allow(clippy::manual_try_fold)]
         self.fold(Ok(()), |acc, item| match predicate(item) {
-            Ok(_) => acc,
+            Ok(()) => acc,
             Err(e) => acc.append_err(e),
         })
     }

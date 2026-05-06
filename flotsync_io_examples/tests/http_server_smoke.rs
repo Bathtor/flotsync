@@ -433,20 +433,21 @@ impl SpawnedHttpServer {
         self.binding_released = false;
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Call sites build owned diagnostic context strings for this panic path."
+    )]
     fn panic_with_child_diagnostics(
         &mut self,
         context: String,
         observed_status: Option<ExitStatus>,
     ) -> ! {
-        let (status, stdout, stderr) = match observed_status {
-            Some(status) => {
-                let (stdout, stderr) = self.collect_exited_output();
-                (status, stdout, stderr)
-            }
-            None => {
-                let output = self.kill_and_collect_in_place();
-                (output.status, output.stdout, output.stderr)
-            }
+        let (status, stdout, stderr) = if let Some(status) = observed_status {
+            let (stdout, stderr) = self.collect_exited_output();
+            (status, stdout, stderr)
+        } else {
+            let output = self.kill_and_collect_in_place();
+            (output.status, output.stdout, output.stderr)
         };
         panic!(
             "{context}\nexit status: {}\nstdout:\n{}\nstderr:\n{}",

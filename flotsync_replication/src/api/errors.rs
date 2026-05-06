@@ -1,3 +1,4 @@
+use super::ids::{GroupId, MemberIdentity};
 use flotsync_core::member::Identifier;
 use snafu::prelude::*;
 use std::error::Error;
@@ -39,15 +40,24 @@ pub enum ListenerError {
     ListenerExternal { source: BoxError },
 }
 
+impl From<BoxError> for ListenerError {
+    fn from(source: BoxError) -> Self {
+        Self::ListenerExternal { source }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum ApiError {
     #[snafu(display("Replication API operation failed: {source}"))]
     ApiExternal { source: BoxError },
-    #[snafu(display("Replication runtime terminated after inbound delivery failure: {fault}"))]
-    RuntimeTerminated { fault: String },
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
+    #[snafu(display("Timed out waiting for summary from member {target} in group {group_id}."))]
+    SummaryTimedOut {
+        group_id: GroupId,
+        target: MemberIdentity,
+    },
     #[snafu(display("Replication runtime operation '{operation}' is not implemented yet."))]
     UnsupportedOperation { operation: &'static str },
 }

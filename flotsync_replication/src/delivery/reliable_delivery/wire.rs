@@ -7,7 +7,13 @@ use crate::delivery::wire::{
     signature_to_wire_format,
 };
 
-use super::*;
+use super::{
+    EncryptedPayload,
+    RecipientAck,
+    RecipientAckHeader,
+    ReliableMessageEnvelope,
+    ReliableMessageHeader,
+};
 use flotsync_messages::{buffa::MessageField, delivery as delivery_proto};
 use snafu::prelude::*;
 

@@ -1,7 +1,16 @@
-use super::*;
+use super::{DebugFormatting, LinearData, RangeBounds, VecCoalescedLinearDataIter, fmt};
 use crate::{
     IntegrityError,
-    linear_data::*,
+    linear_data::{
+        DataOperation,
+        IdWithIndex,
+        IdWithIndexRange,
+        LinkIds,
+        NodeIdRange,
+        NodeIds,
+        VecCoalescedLinearData,
+        VecLinearData,
+    },
     snapshot::{SnapshotNode, SnapshotReadError, SnapshotSink},
     text::grapheme_string::GraphemeString,
 };
@@ -94,10 +103,12 @@ where
     }
 
     /// This is the number of UTF-8 Graphemes in this string.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.data.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
@@ -120,6 +131,10 @@ where
     }
 
     /// Encode a stable, ordered snapshot stream of the current in-memory state.
+    ///
+    /// # Errors
+    ///
+    /// See `S::Error` for failure conditions.
     pub fn encode_snapshot<S>(&self, sink: &mut S) -> Result<(), S::Error>
     where
         S: SnapshotSink<IdWithIndex<Id>, str>,
@@ -127,6 +142,9 @@ where
         self.data.encode_snapshot(sink, |value| value.as_str())
     }
 
+    /// # Errors
+    ///
+    /// See `SnapshotReadError<E>` for failure conditions.
     pub fn from_snapshot_nodes<E, I>(nodes: I) -> Result<Self, SnapshotReadError<E>>
     where
         E: snafu::Error + Send + Sync + 'static,
@@ -150,6 +168,10 @@ where
     ///
     /// This is primarily useful after reconstructing a value from an external snapshot or other
     /// untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// See `IntegrityError` for failure conditions.
     pub fn validate_integrity(&self) -> Result<(), IntegrityError> {
         self.data.validate_integrity()
     }
@@ -231,7 +253,7 @@ where
     }
 }
 
-/// Convenience wrapper around [[NodeIdRange]] when using it with [[LinearString]].
+/// Convenience wrapper around [[`NodeIdRange`]] when using it with [[`LinearString`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeIdRangeString<Id>(NodeIdRange<Id>);
 impl<Id> NodeIdRangeString<Id>
@@ -239,6 +261,8 @@ where
     Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     /// Tries to delete all the nodes contained in the range.
+    ///
+    /// # Errors
     ///
     /// Returns the first failing range if unsuccessful.
     /// In this case the previous deletes will have been applied.
@@ -299,6 +323,16 @@ pub(crate) mod tests {
     mod linear_string {
         use super::*;
         use flotsync_utils::testing::BOOLEAN_DOMAIN;
+        use std::string::String;
+        use unicode_segmentation::UnicodeSegmentation;
+
+        fn empty_checks(l: &LinearString<u32>) {
+            l.validate_integrity().unwrap();
+            assert_eq!(l.ids_at_pos(0), None);
+            assert_eq!(l.ids_in_range(0..=0), None);
+            assert_eq!(l.len(), 0);
+            assert_eq!(l.to_string().as_str(), "");
+        }
 
         #[test]
         fn single_value_roundtrip() {
@@ -391,9 +425,9 @@ pub(crate) mod tests {
             assert_eq!(linear.to_string(), reference);
 
             // Make an insertion.
-            const INSERT_STR: &str = "yet important ";
+            let insert_str = "yet important ";
             let char_index_at_test_index_three = TEST_VALUES[..=3].iter().map(|s| s.len()).sum();
-            reference.insert_str(char_index_at_test_index_three, INSERT_STR);
+            reference.insert_str(char_index_at_test_index_three, insert_str);
 
             // This happens to work, because this text only uses ascii chars.
             let nodes_at_test_index_three =
@@ -402,35 +436,35 @@ pub(crate) mod tests {
                 .insert_before(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    INSERT_STR.to_string(),
+                    insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
-            const FRONT_INSERT_STR: &str = "Not ";
-            reference.insert_str(0, FRONT_INSERT_STR);
+            let front_insert_str = "Not ";
+            reference.insert_str(0, front_insert_str);
             let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
             nodes_at_beginning
                 .insert_before(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    FRONT_INSERT_STR.to_string(),
+                    front_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
-            const END_INSERT_STR: &str = "!?";
-            reference.push_str(END_INSERT_STR);
+            let end_insert_str = "!?";
+            reference.push_str(end_insert_str);
             let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
             nodes_at_end
                 .insert_after(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    END_INSERT_STR.to_string(),
+                    end_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
@@ -452,11 +486,11 @@ pub(crate) mod tests {
             assert_eq!(linear.to_string(), reference);
 
             // Make an insertion.
-            const INSERT_STR: &str = " inte brå ";
+            let insert_str = " inte brå ";
 
             let byte_index_at_test_index_seven =
                 UNICODE_TEST_VALUES[..=7].iter().map(|s| s.len()).sum();
-            reference.insert_str(byte_index_at_test_index_seven, INSERT_STR);
+            reference.insert_str(byte_index_at_test_index_seven, insert_str);
 
             let char_index_at_test_index_seven = UNICODE_TEST_VALUES[..=7]
                 .iter()
@@ -468,35 +502,35 @@ pub(crate) mod tests {
                 .insert_before(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    INSERT_STR.to_string(),
+                    insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
-            const FRONT_INSERT_STR: &str = "Нет ";
-            reference.insert_str(0, FRONT_INSERT_STR);
+            let front_insert_str = "Нет ";
+            reference.insert_str(0, front_insert_str);
             let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
             nodes_at_beginning
                 .insert_before(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    FRONT_INSERT_STR.to_string(),
+                    front_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
-            const END_INSERT_STR: &str = "⸘";
-            reference.push_str(END_INSERT_STR);
+            let end_insert_str = "⸘";
+            reference.push_str(end_insert_str);
             let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
             nodes_at_end
                 .insert_after(
                     &mut linear,
                     IdWithIndex::zero(id_generator.next().unwrap()),
-                    END_INSERT_STR.to_string(),
+                    end_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
@@ -567,13 +601,6 @@ pub(crate) mod tests {
             assert_eq!(linear.to_string().as_str(), "A test string.");
 
             // Delete everything (in various ways).
-            fn empty_checks(l: &LinearString<u32>) {
-                l.validate_integrity().unwrap();
-                assert_eq!(l.ids_at_pos(0), None);
-                assert_eq!(l.ids_in_range(0..=0), None);
-                assert_eq!(l.len(), 0);
-                assert_eq!(l.to_string().as_str(), "");
-            }
             linear.with_copy(|mut l| {
                 let ids_for_everything = l.ids_in_range(0..l.len()).unwrap();
                 assert_eq!(ids_for_everything.delete(&mut l), Ok(()));
@@ -756,43 +783,43 @@ pub(crate) mod tests {
             assert_eq!(linear.to_string(), reference);
 
             // Make an insertion.
-            const INSERT_STR: &str = "yet important ";
+            let insert_str = "yet important ";
             let char_index_at_test_index_three = TEST_VALUES[..=3].iter().map(|s| s.len()).sum();
-            reference.insert_str(char_index_at_test_index_three, INSERT_STR);
+            reference.insert_str(char_index_at_test_index_three, insert_str);
             let nodes_at_three = linear.ids_at_pos(3).unwrap();
             nodes_at_three
                 .insert_after(
                     &mut linear,
                     id_generator.next().unwrap(),
-                    INSERT_STR.to_string(),
+                    insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an prepend-like insertion.
-            const FRONT_INSERT_STR: &str = "Not ";
-            reference.insert_str(0, FRONT_INSERT_STR);
+            let front_insert_str = "Not ";
+            reference.insert_str(0, front_insert_str);
             let nodes_at_beginning = linear.ids_at_pos(0).unwrap();
             nodes_at_beginning
                 .insert_before(
                     &mut linear,
                     id_generator.next().unwrap(),
-                    FRONT_INSERT_STR.to_string(),
+                    front_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
             assert_eq!(linear.to_string(), reference);
 
             // Make an append-like insertion.
-            const END_INSERT_STR: &str = "!?";
-            reference.push_str(END_INSERT_STR);
+            let end_insert_str = "!?";
+            reference.push_str(end_insert_str);
             let nodes_at_end = linear.ids_at_pos(linear.len() - 1).unwrap();
             nodes_at_end
                 .insert_after(
                     &mut linear,
                     id_generator.next().unwrap(),
-                    END_INSERT_STR.to_string(),
+                    end_insert_str.to_string(),
                 )
                 .expect("failed to insert");
             linear.validate_integrity().unwrap();
@@ -814,13 +841,13 @@ pub(crate) mod tests {
 
             let ids_at_two = linear.ids_at_pos(2).unwrap();
             assert_eq!(
-                ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                ids_at_two.delete(&mut linear).map(String::as_str),
                 Some("simple")
             );
             assert_eq!(linear.to_string().as_str(), "A  test string.");
             // Doing it again should be fine but change nothing.
             assert_eq!(
-                ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                ids_at_two.delete(&mut linear).map(String::as_str),
                 Some("simple")
             );
             assert_eq!(linear.to_string().as_str(), "A  test string.");
@@ -828,7 +855,7 @@ pub(crate) mod tests {
             // Delete the space that's now at this position.
             let new_ids_at_two = linear.ids_at_pos(2).unwrap();
             assert_eq!(
-                new_ids_at_two.delete(&mut linear).map(|s| s.as_str()),
+                new_ids_at_two.delete(&mut linear).map(String::as_str),
                 Some(" ")
             );
             assert_eq!(linear.to_string().as_str(), "A test string.");

@@ -171,7 +171,7 @@ impl ManagerOwnedUdpBindBudget {
                 "manager-owned UDP bind request_id={request_id:?} bound at {actual_local_addr}, but reserved slot {} expected {}; requested_local_addr={}",
                 claimed.slot_index, claimed.reserved_bind_addr, claimed.requested_local_addr,
             );
-            let restore_result = self.restore_slot(claimed);
+            let restore_result = self.restore_slot(&claimed);
             return match restore_result {
                 Ok(()) => Err(message),
                 Err(error) => Err(format!(
@@ -194,7 +194,7 @@ impl ManagerOwnedUdpBindBudget {
         let claimed = self.pending_slots.remove(&request_id).ok_or_else(|| {
             format!("manager-owned UDP bind budget lost failed request_id={request_id:?}")
         })?;
-        self.restore_slot(claimed)
+        self.restore_slot(&claimed)
     }
 
     /// Restore one closed live manager-owned UDP socket back into the
@@ -203,11 +203,11 @@ impl ManagerOwnedUdpBindBudget {
         let Some(claimed) = self.live_slots.remove(&socket_id) else {
             return Ok(false);
         };
-        self.restore_slot(claimed)?;
+        self.restore_slot(&claimed)?;
         Ok(true)
     }
 
-    fn restore_slot(&mut self, claimed: ClaimedManagerOwnedUdpBind) -> Result<(), String> {
+    fn restore_slot(&mut self, claimed: &ClaimedManagerOwnedUdpBind) -> Result<(), String> {
         self.lease
             .rebind_binding(claimed.slot_index)
             .map_err(|error| {
@@ -592,14 +592,22 @@ impl Drop for TransportHarnessCore {
 
 /// Build a Kompact system for the semantic delivery full-stack tests.
 pub(crate) fn build_delivery_test_system() -> KompactSystem {
+    build_delivery_test_system_with(|_| {})
+}
+
+/// Build a Kompact system for semantic delivery tests with extra config.
+pub(crate) fn build_delivery_test_system_with(
+    configure: impl FnOnce(&mut KompactConfig),
+) -> KompactSystem {
     build_test_kompact_system_with(|config| {
         set_test_system_label(config, "replication-delivery-test-system");
         enable_bind_reuse_address(config);
         configure_replication_runtime(config);
+        configure(config);
     })
 }
 
-/// Build the shared UDPour config used by the semantic full-stack tests.
+/// Build the shared `UDPour` config used by the semantic full-stack tests.
 pub(crate) fn default_udpour_config() -> UDPourConfig {
     UDPourConfig::default()
 }

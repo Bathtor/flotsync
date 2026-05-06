@@ -18,6 +18,11 @@ use kompact::prelude::*;
 use std::{sync::mpsc, time::Duration};
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    reason = "This Kompact integration test verifies shared UDP indications and private send acknowledgements end to end."
+)]
 fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     init_test_logger();
 

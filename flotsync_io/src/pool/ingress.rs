@@ -41,6 +41,10 @@ impl IngressPool {
     /// Attempts to acquire one writable ingress chunk without blocking.
     ///
     /// Returns `Ok(None)` when the pool is currently out of capacity.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn try_acquire(&self) -> Result<Option<IngressBuffer>> {
         let chunk = {
             let mut state = self.lock_state()?;
@@ -54,6 +58,7 @@ impl IngressPool {
     }
 
     /// Returns the configuration used by this pool.
+    #[must_use]
     pub fn config(&self) -> IoPoolConfig {
         self.config.clone()
     }
@@ -131,7 +136,7 @@ impl IngressPoolState {
                     "ingress pool state is poisoned; dropping returned chunks"
                 );
             }
-        };
+        }
     }
 
     pub(super) fn release_live_chunks_from_weak(
@@ -167,6 +172,10 @@ pub struct IngressBuffer {
 
 impl IngressBuffer {
     /// Returns the full writable byte slice for the reserved chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer has already been committed.
     pub fn writable(&mut self) -> &mut [u8] {
         self.chunk
             .as_deref_mut()
@@ -174,6 +183,11 @@ impl IngressBuffer {
     }
 
     /// Returns the chunk capacity in bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer has already been committed.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.chunk
             .as_deref()
@@ -182,6 +196,14 @@ impl IngressBuffer {
     }
 
     /// Commits the written prefix of the buffer and returns it as an [`IoLease`].
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer was already committed before this call.
     pub fn commit(mut self, written_bytes: usize) -> Result<IoLease> {
         let chunk = self.chunk.take().expect("ingress buffer committed twice");
         let chunk_capacity = chunk.len();

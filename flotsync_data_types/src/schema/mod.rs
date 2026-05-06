@@ -22,6 +22,10 @@ pub struct Schema {
     pub metadata: HashMap<String, String>,
 }
 impl Schema {
+    /// # Panics
+    ///
+    /// Panics if any field has an invalid default value or if two fields share the same name.
+    #[must_use]
     pub fn from_fields<const N: usize>(fields: [Field; N]) -> Self {
         let mut columns = HashMap::with_capacity(N);
         for field in fields {
@@ -30,7 +34,7 @@ impl Schema {
             {
                 panic!("Invalid default value for field '{}': {source}", field.name);
             }
-            if let Some(existing_field) = columns.insert(field.name.to_string(), field) {
+            if let Some(existing_field) = columns.insert(field.name.clone(), field) {
                 panic!("Duplicate field name: {}", existing_field.name);
             }
         }
@@ -40,10 +44,12 @@ impl Schema {
         }
     }
 
+    #[must_use]
     pub fn borrow(&self) -> Cow<'_, Schema> {
         Cow::Borrowed(self)
     }
 
+    #[must_use]
     pub fn field(&self, field_name: &str) -> Option<&Field> {
         self.columns.get(field_name)
     }
@@ -170,6 +176,9 @@ impl Field {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `values::OrderedValueError` for failure conditions.
     pub fn finite_state_register<S, I, V>(
         name: S,
         states: I,
@@ -256,7 +265,7 @@ pub enum ReplicatedDataType {
     ///
     /// Merging happens at the UTF-8 grapheme level, so not character splitting is possible.
     LinearString,
-    /// A list implementation with similar semantics to [[ReplicatedDataType::LinearString]],
+    /// A list implementation with similar semantics to [[`ReplicatedDataType::LinearString`]],
     /// but where values can be any primitive type, not just UTF-8 graphemes.
     LinearList { value_type: PrimitiveType },
     /// A unsigned integer monotonically incrementing counter.
@@ -265,8 +274,8 @@ pub enum ReplicatedDataType {
     ///
     /// Saturates at the max value of the underlying type without overflow.
     MonotonicCounter {
-        /// If `true` this corresponds to a [[PrimitiveType::Byte]] underlying value,
-        /// otherwise [[PrimitiveType::UInt]].
+        /// If `true` this corresponds to a [[`PrimitiveType::Byte`]] underlying value,
+        /// otherwise [[`PrimitiveType::UInt`]].
         small_range: bool,
     },
     /// Similar to a monotonic counter, but instead of applying integer increments,
@@ -279,7 +288,7 @@ pub enum ReplicatedDataType {
         /// for descending order, lowest value wins.
         direction: Direction,
     },
-    /// Like the [[TotalOrderRegister]] but with an explicitly defined linear state space.
+    /// Like the [[`TotalOrderRegister`]] but with an explicitly defined linear state space.
     ///
     /// Transitions are only possible from values with lower indices to values with higher indices,
     /// and in conflicts the value with the highest index wins.
@@ -331,11 +340,11 @@ impl ReplicatedDataType {
     fn is_nullable(&self) -> bool {
         match self {
             Self::LatestValueWins { value_type } => value_type.is_nullable(),
-            Self::LinearString => false,
-            Self::LinearList { .. } => false,
-            Self::MonotonicCounter { .. } => false,
-            Self::TotalOrderRegister { .. } => false,
             Self::TotalOrderFiniteStateRegister { value_type, .. } => value_type.is_nullable(),
+            Self::LinearString
+            | Self::LinearList { .. }
+            | Self::MonotonicCounter { .. }
+            | Self::TotalOrderRegister { .. } => false,
         }
     }
 
@@ -390,19 +399,21 @@ impl fmt::Display for BasicDataType {
     }
 }
 
-/// Nullability wrapper for [[BasicDataType]].
+/// Nullability wrapper for [[`BasicDataType`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NullableBasicDataType {
     NonNull(BasicDataType),
     Nullable(BasicDataType),
 }
 impl NullableBasicDataType {
+    #[must_use]
     pub fn value_type(&self) -> &BasicDataType {
         match self {
             Self::NonNull(value_type) | Self::Nullable(value_type) => value_type,
         }
     }
 
+    #[must_use]
     pub fn is_nullable(&self) -> bool {
         matches!(self, Self::Nullable(_))
     }
@@ -470,19 +481,21 @@ impl fmt::Display for PrimitiveType {
     }
 }
 
-/// Nullability wrapper for [[PrimitiveType]].
+/// Nullability wrapper for [[`PrimitiveType`]].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum NullablePrimitiveType {
     NonNull(PrimitiveType),
     Nullable(PrimitiveType),
 }
 impl NullablePrimitiveType {
+    #[must_use]
     pub fn value_type(self) -> PrimitiveType {
         match self {
             Self::NonNull(value_type) | Self::Nullable(value_type) => value_type,
         }
     }
 
+    #[must_use]
     pub fn is_nullable(self) -> bool {
         matches!(self, Self::Nullable(_))
     }

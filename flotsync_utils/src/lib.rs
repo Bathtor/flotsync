@@ -49,6 +49,7 @@ macro_rules! require {
 pub struct IString(Box<str>);
 
 impl IString {
+    #[must_use]
     pub fn new(s: String) -> Self {
         Self(s.into_boxed_str())
     }
@@ -96,7 +97,7 @@ mod tests {
 
             assert_eq!(istring, istring);
             assert_eq!(istring.as_ref(), s_ref);
-            assert_eq!(istring.to_string(), s.to_string());
+            assert_eq!(istring.to_string(), s.clone());
         }
     }
 }

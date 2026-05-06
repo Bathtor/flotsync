@@ -24,6 +24,7 @@ impl HappenedBeforeOrdering {
     /// - `Before` becomes `After`.
     /// - `After` becomes `Before`.
     /// - Everything else stays the same.
+    #[must_use]
     pub const fn reverse(self) -> HappenedBeforeOrdering {
         match self {
             HappenedBeforeOrdering::Before => HappenedBeforeOrdering::After,
@@ -49,28 +50,28 @@ impl From<HappenedBeforeOrdering> for Option<cmp::Ordering> {
             HappenedBeforeOrdering::Before => Some(cmp::Ordering::Less),
             HappenedBeforeOrdering::Equal => Some(cmp::Ordering::Equal),
             HappenedBeforeOrdering::After => Some(cmp::Ordering::Greater),
-            HappenedBeforeOrdering::Concurrent => None,
-            HappenedBeforeOrdering::Incomparable => None,
+            HappenedBeforeOrdering::Concurrent | HappenedBeforeOrdering::Incomparable => None,
         }
     }
 }
 
 /// Trait for types that can establish a [happened-before order](HappenedBeforeOrdering).
 ///
-/// This is a form of partial order, so the same rules as [[PartialOrd]] apply, but an additional variants of incomparable is "concurrent".
+/// This is a form of partial order, so the same rules as [[`PartialOrd`]] apply, but an additional variants of incomparable is "concurrent".
 pub trait HappenedBeforeOrd<Rhs = Self>: PartialEq<Rhs>
 where
     Rhs: ?Sized,
 {
     fn hb_cmp(&self, other: &Rhs) -> HappenedBeforeOrdering;
 
-    /// Get something that can be used to compare using [[PartialOrd]] for this instance.
+    /// Get something that can be used to compare using [[`PartialOrd`]] for this instance.
+    #[must_use]
     fn ord(&self) -> HappenedBeforePartialOrdWrapper<'_, Self> {
         HappenedBeforePartialOrdWrapper(self)
     }
 }
 
-/// A wrapper that allows [[HappenedBeforeOrd]] types to be treated as [[PartialOrd]].
+/// A wrapper that allows [[`HappenedBeforeOrd`]] types to be treated as [[`PartialOrd`]].
 ///
 /// This is just a workaround for the orphan rules.
 pub struct HappenedBeforePartialOrdWrapper<'a, T: ?Sized>(&'a T);

@@ -17,6 +17,7 @@ use flotsync_messages::{
 };
 use snafu::prelude::*;
 use std::num::NonZeroUsize;
+use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub(crate) enum RuntimeMessageError {
@@ -28,32 +29,39 @@ pub(crate) enum RuntimeMessageError {
     MissingBody,
     #[snafu(display("Bootstrap group message must include at least one member."))]
     EmptyBootstrapGroup,
-    #[snafu(display("Update batch message must include at least one dataset update."))]
-    EmptyUpdateBatch,
+    #[snafu(display("Update message must include at least one dataset update."))]
+    EmptyUpdate,
     #[snafu(display(
-        "Update batch dataset entry for '{dataset_id}' must include at least one operation."
+        "Update dataset entry for '{dataset_id}' must include at least one operation."
     ))]
     EmptyDatasetUpdate { dataset_id: String },
-    #[snafu(display("Update batch message did not include an update id."))]
+    #[snafu(display("Update message did not include an update id."))]
     MissingUpdateId,
-    #[snafu(display("Update batch message did not include read versions."))]
+    #[snafu(display("Update message did not include read versions."))]
     MissingReadVersions,
-    #[snafu(display("Bootstrap group message field '{field}' was invalid: {source}"))]
+    #[snafu(display("Summary message did not include versions."))]
+    MissingSummaryVersions,
+    #[snafu(display("Runtime message field '{field}' was invalid: {source}"))]
     InvalidWireValue {
         field: &'static str,
         source: WireValueDecodeError,
     },
-    #[snafu(display("Update batch field '{field}' was invalid: {source}"))]
+    #[snafu(display("Runtime message field '{field}' was not a valid UUID: {source}"))]
+    InvalidCorrelationId {
+        field: &'static str,
+        source: uuid::Error,
+    },
+    #[snafu(display("Update field '{field}' was invalid: {source}"))]
     InvalidUpdateId {
         field: &'static str,
         source: DatamodelCodecError,
     },
-    #[snafu(display("Update batch field '{field}' was invalid: {source}"))]
+    #[snafu(display("Version-vector field '{field}' was invalid: {source}"))]
     InvalidReadVersions {
         field: &'static str,
         source: WireVersionVectorError,
     },
-    #[snafu(display("Update batch dataset id '{value}' was invalid: {source}"))]
+    #[snafu(display("Update dataset id '{value}' was invalid: {source}"))]
     InvalidDatasetId {
         value: String,
         source: DatasetIdError,
@@ -93,19 +101,23 @@ pub(crate) enum WireVersionVectorError {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuntimeMessage {
     BootstrapGroup(BootstrapGroupMessage),
-    UpdateBatch(UpdateBatchMessage),
+    Update(UpdateMessage),
+    SummaryRequest(SummaryRequestMessage),
+    Summary(SummaryMessage),
 }
 
 /// One decoded wire message before all runtime context is available.
 ///
 /// Bootstrap messages can decode directly into their runtime form, but inbound
-/// update batches may still carry compact read-version encodings that need the
-/// hosted group member count before they can become a full `VersionVector`.
+/// updates and summaries may still carry compact version encodings that need
+/// the hosted group member count before they can become a full `VersionVector`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WireRuntimeMessage {
     /// Bootstrap messages already have their full runtime shape once decoded.
     BootstrapGroup(BootstrapGroupMessage),
-    UpdateBatch(WireUpdateBatchMessage),
+    Update(WireUpdateMessage),
+    SummaryRequest(SummaryRequestMessage),
+    Summary(WireSummaryMessage),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +127,7 @@ pub(crate) struct BootstrapGroupMessage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UpdateBatchMessage {
+pub(crate) struct UpdateMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
     pub(crate) read_versions: VersionVector,
@@ -123,7 +135,7 @@ pub(crate) struct UpdateBatchMessage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct WireUpdateBatchMessage {
+pub(crate) struct WireUpdateMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
     /// Compact wire representation kept until the hosted group member count is known.
@@ -131,7 +143,33 @@ pub(crate) struct WireUpdateBatchMessage {
     pub(crate) dataset_updates: Vec<DatasetUpdateMessage>,
 }
 
-/// Compact wire-only form for version vectors used inside inbound update batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SummaryRequestMessage {
+    pub(crate) group_id: GroupId,
+    pub(crate) correlation_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SummaryVersionsMessage<V> {
+    pub(crate) group_id: GroupId,
+    pub(crate) correlation_id: Uuid,
+    pub(crate) has_versions: V,
+}
+
+pub(crate) type SummaryMessage = SummaryVersionsMessage<VersionVector>;
+pub(crate) type WireSummaryMessage = SummaryVersionsMessage<WireVersionVector>;
+
+impl<V> SummaryVersionsMessage<V> {
+    pub(crate) fn new(group_id: GroupId, correlation_id: Uuid, has_versions: V) -> Self {
+        Self {
+            group_id,
+            correlation_id,
+            has_versions,
+        }
+    }
+}
+
+/// Compact wire-only form for version vectors used inside inbound updates.
 ///
 /// The runtime message model keeps a full `VersionVector`, while the protobuf
 /// wire shape prefers more compact encodings such as "all members synced" or
@@ -139,7 +177,7 @@ pub(crate) struct WireUpdateBatchMessage {
 /// protobuf type so the runtime can validate and normalise wire values before
 /// they become a domain `VersionVector`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum WireVersionVector {
+pub(crate) enum WireVersionVector {
     Full(PureVersionVector),
     Override {
         group_version: u64,
@@ -170,7 +208,7 @@ impl DatasetUpdateMessage {
         dataset_updates: Vec<replication_proto::DatasetUpdate>,
     ) -> Result<Vec<Self>, RuntimeMessageError> {
         if dataset_updates.is_empty() {
-            return EmptyUpdateBatchSnafu.fail();
+            return EmptyUpdateSnafu.fail();
         }
 
         let mut decoded_updates = Vec::with_capacity(dataset_updates.len());
@@ -205,10 +243,22 @@ impl RuntimeMessage {
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
-            RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::UpdateBatch(
+            RuntimeMessage::Update(message) => replication_proto::RuntimeMessage {
+                body: Some(replication_proto::runtime_message::Body::Update(Box::new(
+                    message.to_proto(),
+                ))),
+                ..replication_proto::RuntimeMessage::default()
+            },
+            RuntimeMessage::SummaryRequest(message) => replication_proto::RuntimeMessage {
+                body: Some(replication_proto::runtime_message::Body::SummaryRequest(
                     Box::new(message.to_proto()),
                 )),
+                ..replication_proto::RuntimeMessage::default()
+            },
+            RuntimeMessage::Summary(message) => replication_proto::RuntimeMessage {
+                body: Some(replication_proto::runtime_message::Body::Summary(Box::new(
+                    message.to_proto(),
+                ))),
                 ..replication_proto::RuntimeMessage::default()
             },
         }
@@ -230,35 +280,56 @@ impl BootstrapGroupMessage {
     }
 }
 
-impl UpdateBatchMessage {
-    fn to_proto(&self) -> replication_proto::UpdateBatch {
+impl UpdateMessage {
+    fn to_proto(&self) -> replication_proto::Update {
         let read_versions = WireVersionVector::from_runtime(&self.read_versions).to_proto();
         let dataset_updates = self
             .dataset_updates
             .iter()
             .map(DatasetUpdateMessage::to_proto)
             .collect();
-        replication_proto::UpdateBatch {
+        replication_proto::Update {
             group_id: self.group_id.0.as_bytes().to_vec(),
             update_id: MessageField::some(encode_update_id(self.update_id)),
             read_versions: MessageField::some(read_versions),
             dataset_updates,
-            ..replication_proto::UpdateBatch::default()
+            ..replication_proto::Update::default()
         }
     }
 }
 
-pub(crate) fn encode_update_batch_proto(
-    message: &UpdateBatchMessage,
-) -> replication_proto::UpdateBatch {
+impl SummaryRequestMessage {
+    fn to_proto(self) -> replication_proto::SummaryRequest {
+        replication_proto::SummaryRequest {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            correlation_id: self.correlation_id.as_bytes().to_vec(),
+            ..replication_proto::SummaryRequest::default()
+        }
+    }
+}
+
+impl SummaryMessage {
+    fn to_proto(&self) -> replication_proto::Summary {
+        replication_proto::Summary {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            correlation_id: self.correlation_id.as_bytes().to_vec(),
+            has_versions: MessageField::some(
+                WireVersionVector::from_runtime(&self.has_versions).to_proto(),
+            ),
+            ..replication_proto::Summary::default()
+        }
+    }
+}
+
+pub(crate) fn encode_update_proto(message: &UpdateMessage) -> replication_proto::Update {
     message.to_proto()
 }
 
-pub(crate) fn decode_update_batch_proto(
-    message: replication_proto::UpdateBatch,
+pub(crate) fn decode_update_proto(
+    message: replication_proto::Update,
     num_members: NonZeroUsize,
-) -> Result<UpdateBatchMessage, RuntimeMessageError> {
-    WireUpdateBatchMessage::from_proto(message)?.into_runtime(num_members)
+) -> Result<UpdateMessage, RuntimeMessageError> {
+    WireUpdateMessage::from_proto(message)?.into_runtime(num_members)
 }
 
 pub(crate) fn encode_version_vector_proto(
@@ -307,34 +378,49 @@ impl WireRuntimeMessage {
                     members,
                 }))
             }
-            replication_proto::runtime_message::Body::UpdateBatch(message) => Ok(
-                WireRuntimeMessage::UpdateBatch(WireUpdateBatchMessage::from_proto(*message)?),
+            replication_proto::runtime_message::Body::Update(message) => Ok(
+                WireRuntimeMessage::Update(WireUpdateMessage::from_proto(*message)?),
+            ),
+            replication_proto::runtime_message::Body::SummaryRequest(message) => {
+                let group_id = group_id_from_wire(&message.group_id, "summary_request.group_id")
+                    .context(InvalidWireValueSnafu {
+                        field: "summary_request.group_id",
+                    })?;
+                let correlation_id = correlation_id_from_wire(
+                    &message.correlation_id,
+                    "summary_request.correlation_id",
+                )?;
+                Ok(WireRuntimeMessage::SummaryRequest(SummaryRequestMessage {
+                    group_id,
+                    correlation_id,
+                }))
+            }
+            replication_proto::runtime_message::Body::Summary(message) => Ok(
+                WireRuntimeMessage::Summary(WireSummaryMessage::from_proto(*message)?),
             ),
         }
     }
 }
 
-impl WireUpdateBatchMessage {
-    fn from_proto(
-        mut message: replication_proto::UpdateBatch,
-    ) -> Result<Self, RuntimeMessageError> {
-        let group_id = group_id_from_wire(&message.group_id, "update_batch.group_id").context(
+impl WireUpdateMessage {
+    fn from_proto(mut message: replication_proto::Update) -> Result<Self, RuntimeMessageError> {
+        let group_id = group_id_from_wire(&message.group_id, "update.group_id").context(
             InvalidWireValueSnafu {
-                field: "update_batch.group_id",
+                field: "update.group_id",
             },
         )?;
         let Some(update_id) = message.update_id.take() else {
             return MissingUpdateIdSnafu.fail();
         };
         let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
-            field: "update_batch.update_id",
+            field: "update.update_id",
         })?;
         let Some(read_versions) = message.read_versions.take() else {
             return MissingReadVersionsSnafu.fail();
         };
         let read_versions =
             WireVersionVector::from_proto(read_versions).context(InvalidReadVersionsSnafu {
-                field: "update_batch.read_versions",
+                field: "update.read_versions",
             })?;
         let dataset_updates = DatasetUpdateMessage::decode_proto_vec(message.dataset_updates)?;
         Ok(Self {
@@ -348,14 +434,14 @@ impl WireUpdateBatchMessage {
     pub(crate) fn into_runtime(
         self,
         num_members: NonZeroUsize,
-    ) -> Result<UpdateBatchMessage, RuntimeMessageError> {
+    ) -> Result<UpdateMessage, RuntimeMessageError> {
         let read_versions =
             self.read_versions
                 .to_runtime(num_members)
                 .context(InvalidReadVersionsSnafu {
-                    field: "update_batch.read_versions",
+                    field: "update.read_versions",
                 })?;
-        Ok(UpdateBatchMessage {
+        Ok(UpdateMessage {
             group_id: self.group_id,
             update_id: self.update_id,
             read_versions,
@@ -364,8 +450,8 @@ impl WireUpdateBatchMessage {
     }
 }
 
-impl From<UpdateBatchMessage> for WireUpdateBatchMessage {
-    fn from(message: UpdateBatchMessage) -> Self {
+impl From<UpdateMessage> for WireUpdateMessage {
+    fn from(message: UpdateMessage) -> Self {
         Self {
             group_id: message.group_id,
             update_id: message.update_id,
@@ -375,13 +461,51 @@ impl From<UpdateBatchMessage> for WireUpdateBatchMessage {
     }
 }
 
+impl WireSummaryMessage {
+    fn from_proto(mut message: replication_proto::Summary) -> Result<Self, RuntimeMessageError> {
+        let group_id = group_id_from_wire(&message.group_id, "summary.group_id").context(
+            InvalidWireValueSnafu {
+                field: "summary.group_id",
+            },
+        )?;
+        let correlation_id =
+            correlation_id_from_wire(&message.correlation_id, "summary.correlation_id")?;
+        let Some(has_versions) = message.has_versions.take() else {
+            return MissingSummaryVersionsSnafu.fail();
+        };
+        let has_versions =
+            WireVersionVector::from_proto(has_versions).context(InvalidReadVersionsSnafu {
+                field: "summary.has_versions",
+            })?;
+        Ok(Self::new(group_id, correlation_id, has_versions))
+    }
+
+    pub(crate) fn into_runtime(
+        self,
+        num_members: NonZeroUsize,
+    ) -> Result<SummaryMessage, RuntimeMessageError> {
+        let has_versions =
+            self.has_versions
+                .to_runtime(num_members)
+                .context(InvalidReadVersionsSnafu {
+                    field: "summary.has_versions",
+                })?;
+        Ok(SummaryMessage::new(
+            self.group_id,
+            self.correlation_id,
+            has_versions,
+        ))
+    }
+}
+
 impl WireVersionVector {
     fn from_runtime(version_vector: &VersionVector) -> Self {
         match version_vector {
             VersionVector::Full(vector) => Self::Full(vector.clone()),
             VersionVector::Override { version, .. } => Self::Override {
                 group_version: version.group_version(),
-                override_position: version.override_position as u32,
+                override_position: u32::try_from(version.override_position)
+                    .expect("wire version override position must fit into u32"),
                 override_version: version.override_version(),
             },
             VersionVector::Synced { version, .. } => Self::Synced {
@@ -509,11 +633,27 @@ impl WireVersionVector {
     }
 }
 
+fn correlation_id_from_wire(
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<Uuid, RuntimeMessageError> {
+    Uuid::from_slice(bytes).context(InvalidCorrelationIdSnafu { field })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WireVersionVector;
+    use super::{
+        RuntimeMessage,
+        SummaryMessage,
+        SummaryRequestMessage,
+        WireRuntimeMessage,
+        WireVersionVector,
+    };
+    use crate::api::GroupId;
     use flotsync_core::versions::{OverrideVersion, PureVersionVector, VersionVector};
+    use flotsync_messages::buffa::Message as _;
     use std::num::NonZeroUsize;
+    use uuid::Uuid;
 
     #[test]
     fn wire_version_vector_round_trips_full_override_and_synced() {
@@ -537,5 +677,45 @@ mod tests {
                 .expect("runtime decode should work");
             assert_eq!(decoded_vector, vector);
         }
+    }
+
+    #[test]
+    fn summary_messages_round_trip_through_runtime_envelope() {
+        let group_id = GroupId(Uuid::from_u128(101));
+        let correlation_id = Uuid::from_u128(202);
+        let summary_request = RuntimeMessage::SummaryRequest(SummaryRequestMessage {
+            group_id,
+            correlation_id,
+        });
+        let request_payload = summary_request.encode_to_proto().encode_to_bytes();
+
+        assert_eq!(
+            WireRuntimeMessage::decode_from_slice(&request_payload)
+                .expect("summary request should decode"),
+            WireRuntimeMessage::SummaryRequest(SummaryRequestMessage {
+                group_id,
+                correlation_id,
+            })
+        );
+
+        let has_versions = VersionVector::Full(PureVersionVector::from([2, 4]));
+        let summary = RuntimeMessage::Summary(SummaryMessage::new(
+            group_id,
+            correlation_id,
+            has_versions.clone(),
+        ));
+        let summary_payload = summary.encode_to_proto().encode_to_bytes();
+        let decoded_summary =
+            WireRuntimeMessage::decode_from_slice(&summary_payload).expect("summary should decode");
+
+        let WireRuntimeMessage::Summary(decoded_summary) = decoded_summary else {
+            panic!("summary payload should decode as a summary");
+        };
+        assert_eq!(
+            decoded_summary
+                .into_runtime(NonZeroUsize::new(2).expect("two members"))
+                .expect("summary versions should normalise"),
+            SummaryMessage::new(group_id, correlation_id, has_versions)
+        );
     }
 }

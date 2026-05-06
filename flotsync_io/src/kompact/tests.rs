@@ -219,6 +219,10 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
 }
 
 #[test]
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
+)]
 fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
     init_test_logger();
 
@@ -265,6 +269,11 @@ fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    reason = "This Kompact integration test verifies multi-recipient UDP bridge routing end to end."
+)]
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     init_test_logger();
 
@@ -284,9 +293,9 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     let (reply2_tx, reply2_rx) = mpsc::channel();
     let reply2 = system.create(move || UdpSendResultProbe::new(reply2_tx));
 
-    let _bridge_to_observer1 = biconnect_components::<UdpPort, _, _>(&bridge, &observer1)
+    biconnect_components::<UdpPort, _, _>(&bridge, &observer1)
         .expect("bridge/observer1 connection");
-    let _bridge_to_observer2 = biconnect_components::<UdpPort, _, _>(&bridge, &observer2)
+    biconnect_components::<UdpPort, _, _>(&bridge, &observer2)
         .expect("bridge/observer2 connection");
 
     start_component(&system, &driver_component);
@@ -459,8 +468,6 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
         .rebind_binding(1)
         .expect("rebind reserved UDP sender");
     drop(bridge_handle);
-    drop(_bridge_to_observer1);
-    drop(_bridge_to_observer2);
     kill_component(&system, reply1);
     kill_component(&system, reply2);
     kill_component(&system, observer1);
@@ -472,6 +479,11 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    reason = "This Kompact integration test verifies UDP configuration fan-out end to end."
+)]
 fn udp_bridge_broadcasts_socket_configuration_indications() {
     init_test_logger();
 
@@ -486,9 +498,9 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
     let (observer2_tx, observer2_rx) = mpsc::channel();
     let observer2 = system.create(move || UdpObserver::new(observer2_tx));
 
-    let _bridge_to_observer1 = biconnect_components::<UdpPort, _, _>(&bridge, &observer1)
+    let bridge_to_observer1 = biconnect_components::<UdpPort, _, _>(&bridge, &observer1)
         .expect("bridge/observer1 connection");
-    let _bridge_to_observer2 = biconnect_components::<UdpPort, _, _>(&bridge, &observer2)
+    let bridge_to_observer2 = biconnect_components::<UdpPort, _, _>(&bridge, &observer2)
         .expect("bridge/observer2 connection");
 
     start_component(&system, &driver_component);
@@ -583,8 +595,8 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
         .rebind_binding(0)
         .expect("rebind reserved UDP socket");
     drop(bridge_handle);
-    drop(_bridge_to_observer1);
-    drop(_bridge_to_observer2);
+    drop(bridge_to_observer1);
+    drop(bridge_to_observer2);
     kill_component(&system, observer1);
     kill_component(&system, observer2);
     kill_component(&system, bridge);
@@ -658,7 +670,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
                 ));
             }
             other => {
-                log::debug!("ignoring unrelated TCP session event in test: {:?}", other);
+                log::debug!("ignoring unrelated TCP session event in test: {other:?}");
             }
         }
     }
@@ -698,6 +710,10 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
 }
 
 #[test]
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
+)]
 fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     init_test_logger();
 
@@ -798,6 +814,10 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
 }
 
 #[test]
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
+)]
 fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     init_test_logger();
 
@@ -897,6 +917,10 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
 }
 
 #[test]
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
+)]
 fn dropping_pending_tcp_session_rejects_the_connection() {
     init_test_logger();
 

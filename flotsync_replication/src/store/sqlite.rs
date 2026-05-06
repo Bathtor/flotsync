@@ -4,12 +4,16 @@ use crate::{
         DatasetRowPatch,
         DatasetRowSlice,
         DatasetRowWrite,
+        DatasetRowsBatch,
         DatasetUpdateRecord,
         GroupId,
         MemberIdentity,
         MemberIndex,
         ReplicationGroupRecord,
+        ReplicationRowRecord,
+        ReplicationRowSnapshot,
         ReplicationStore,
+        ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
         ReplicationUpdateFilter,
         ReplicationUpdateRecord,
@@ -20,10 +24,10 @@ use crate::{
     },
     runtime::messages::{
         DatasetUpdateMessage,
-        UpdateBatchMessage,
-        decode_update_batch_proto,
+        UpdateMessage,
+        decode_update_proto,
         decode_version_vector_proto,
-        encode_update_batch_proto,
+        encode_update_proto,
         encode_version_vector_proto,
     },
 };
@@ -31,7 +35,6 @@ use flotsync_core::{
     member::IdentifierParseError,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::schema::datamodel::RowSnapshot;
 use flotsync_messages::{
     buffa::Message as _,
     codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
@@ -48,14 +51,15 @@ use sqlx::{
     QueryBuilder,
     Row,
     Sqlite,
+    SqliteConnection,
     SqlitePool,
-    pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error as StdError,
     num::NonZeroUsize,
+    path::Path,
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -82,6 +86,10 @@ pub struct SqliteReplicationStore {
 
 impl SqliteReplicationStore {
     /// Create one empty in-memory store for `local_member`.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
         Self::in_memory_with_schema_sources(
             local_member,
@@ -89,7 +97,24 @@ impl SqliteReplicationStore {
         )
     }
 
+    /// Open one disk-backed `SQLite` store for `local_member`.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::file_with_schema_sources(
+            local_member,
+            path,
+            std::iter::empty::<(DatasetId, SchemaSource)>(),
+        )
+    }
+
     /// Create one in-memory store with the provided application schema sources.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
     pub fn in_memory_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         schema_sources: I,
@@ -108,6 +133,40 @@ impl SqliteReplicationStore {
             })?
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(local_member, schema_sources, connect_options)
+    }
+
+    /// Open one disk-backed `SQLite` store with the provided application schema sources.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub fn file_with_schema_sources<I, S>(
+        local_member: MemberIdentity,
+        path: impl AsRef<Path>,
+        schema_sources: I,
+    ) -> Result<Self, StoreError>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        let connect_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(local_member, schema_sources, connect_options)
+    }
+
+    fn from_connect_options<I, S>(
+        local_member: MemberIdentity,
+        schema_sources: I,
+        connect_options: SqliteConnectOptions,
+    ) -> Result<Self, StoreError>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
         let pool = block_on(
             SqlitePoolOptions::new()
                 .min_connections(1)
@@ -152,9 +211,8 @@ impl ReplicationStore for SqliteReplicationStore {
         let pool = self.pool.clone();
         let schema_sources = self.schema_sources.clone();
         async move {
-            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut *connection)
+            let connection = pool
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .context(SqlxSnafu)?;
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
@@ -164,21 +222,36 @@ impl ReplicationStore for SqliteReplicationStore {
         }
         .boxed()
     }
+
+    fn begin_read_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
+        let pool = self.pool.clone();
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            let connection = pool.begin_with("BEGIN").await.context(SqlxSnafu)?;
+            Ok(Box::new(SqliteReplicationStoreTransaction::new(
+                connection,
+                schema_sources,
+            )) as Box<dyn ReplicationStoreReadTransaction>)
+        }
+        .boxed()
+    }
 }
 
-/// One open store transaction backed by a dedicated pooled SQLite connection.
+/// One open store transaction backed by `SQLx`'s transaction guard.
 ///
 /// `connection` becomes `None` after explicit commit or rollback. Dropping an
-/// open transaction returns the connection to the pool while SQLite rolls the
-/// uncommitted transaction back implicitly.
+/// open transaction lets `SQLx` queue a rollback before returning the connection
+/// to the pool.
 struct SqliteReplicationStoreTransaction {
-    connection: Option<SqliteStoreConnection>,
+    connection: Option<SqliteStoreTransaction>,
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
 }
 
 impl SqliteReplicationStoreTransaction {
     fn new(
-        connection: SqliteStoreConnection,
+        connection: SqliteStoreTransaction,
         schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     ) -> Self {
         Self {
@@ -187,7 +260,7 @@ impl SqliteReplicationStoreTransaction {
         }
     }
 
-    fn assert_open_connection(&mut self) -> &mut SqliteStoreConnection {
+    fn assert_open_connection(&mut self) -> &mut SqliteStoreTransaction {
         self.connection
             .as_mut()
             .expect("sqlite replication transaction must not be used after commit or rollback")
@@ -198,9 +271,60 @@ impl Drop for SqliteReplicationStoreTransaction {
     fn drop(&mut self) {
         if self.connection.is_some() {
             warn!(
-                "dropping sqlite replication transaction with uncommitted work; returning connection to the pool so SQLite can roll the transaction back"
+                "dropping open sqlite replication transaction; SQLx will roll it back before returning the connection to the pool"
             );
         }
+    }
+}
+
+impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
+    fn load_replication_group<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
+    }
+
+    fn load_replication_groups_for_ids<'a>(
+        &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
+            .boxed()
+    }
+
+    fn scan_dataset_row_batch<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            scan_dataset_row_batch(
+                self.assert_open_connection(),
+                schema_sources.as_ref(),
+                group_id,
+                dataset_id,
+                after,
+                limit,
+            )
+            .await
+        }
+        .boxed()
+    }
+
+    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        async move {
+            let connection = self
+                .connection
+                .take()
+                .expect("sqlite replication transaction must not roll back twice");
+            connection.rollback().await.context(SqlxSnafu)?;
+            Ok(())
+        }
+        .boxed()
     }
 }
 
@@ -212,16 +336,24 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
-    fn load_replication_groups<'a>(
-        &'a mut self,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
     }
 
-    fn insert_replication_group<'a>(
+    fn load_replication_groups_for_ids<'a>(
         &'a mut self,
+        group_ids: &'a HashSet<GroupId>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
+            .boxed()
+    }
+
+    fn insert_replication_group(
+        &mut self,
         group: ReplicationGroupRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
     }
 
@@ -261,10 +393,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn apply_dataset_row_patch<'a>(
-        &'a mut self,
+    fn apply_dataset_row_patch(
+        &mut self,
         patch: DatasetRowPatch,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             apply_dataset_row_patch(
@@ -299,10 +431,10 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn append_replication_update<'a>(
-        &'a mut self,
+    fn append_replication_update(
+        &mut self,
         update: ReplicationUpdateRecord,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { append_replication_update(self.assert_open_connection(), &update).await }
             .boxed()
     }
@@ -321,45 +453,33 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
-            let mut connection = self
+            let connection = self
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not commit twice");
-            let commit_result = sqlx::query("COMMIT")
-                .execute(&mut *connection)
-                .await
-                .context(SqlxSnafu)
-                .map(|_| ())
-                .map_err(StoreError::from);
-            if commit_result.is_err()
-                && let Err(rollback_error) = sqlx::query("ROLLBACK").execute(&mut *connection).await
-            {
-                warn!("sqlite rollback after failed commit also failed: {rollback_error}");
-            }
-            commit_result
+            connection.commit().await.context(SqlxSnafu)?;
+            Ok(())
         }
         .boxed()
     }
 
     fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
-            let mut connection = self
+            let connection = self
                 .connection
                 .take()
                 .expect("sqlite replication transaction must not roll back twice");
-            sqlx::query("ROLLBACK")
-                .execute(&mut *connection)
-                .await
-                .context(SqlxSnafu)?;
+            connection.rollback().await.context(SqlxSnafu)?;
             Ok(())
         }
         .boxed()
     }
 }
 
-type SqliteStoreConnection = PoolConnection<Sqlite>;
+type SqliteStoreConnection = SqliteConnection;
+type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 
-/// SQLite compares BLOBs lexicographically. Fixed-width big-endian encodings
+/// `SQLite` compares BLOBs lexicographically. Fixed-width big-endian encodings
 /// therefore preserve the natural ordering of `u64` values across the full
 /// range, so `ORDER BY update_version` remains numerically correct even above
 /// `i64::MAX`.
@@ -400,6 +520,8 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     dataset_id TEXT NOT NULL,
     row_key TEXT NOT NULL,
     row_snapshot BLOB NOT NULL,
+    row_tombstoned INTEGER NOT NULL DEFAULT 0,
+    row_last_changed_versions BLOB NOT NULL,
     PRIMARY KEY (group_id, dataset_id, row_key),
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );
@@ -411,7 +533,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     update_version BLOB NOT NULL,
     sender TEXT NOT NULL,
     applied_locally INTEGER NOT NULL,
-    update_batch BLOB NOT NULL,
+    update_message BLOB NOT NULL,
     PRIMARY KEY (group_id, update_node_index, update_version),
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
@@ -419,7 +541,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     ];
     for statement in schema_statements {
         sqlx::query(statement)
-            .execute(&mut **connection)
+            .execute(&mut *connection)
             .await
             .context(SqlxSnafu)?;
     }
@@ -438,7 +560,7 @@ WHERE group_id = ?1
 ",
     )
     .bind(group_id.to_string())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(row) = row else {
@@ -470,9 +592,46 @@ FROM replication_groups
 ORDER BY group_id
 ",
     )
-    .fetch_all(&mut **connection)
+    .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
+    let mut groups = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        let group_id = decode_group_id(&group_id)?;
+        if let Some(group) = load_replication_group(connection, &group_id).await? {
+            groups.push(group);
+        }
+    }
+    Ok(groups)
+}
+
+async fn load_replication_groups_for_ids(
+    connection: &mut SqliteStoreConnection,
+    requested_group_ids: &HashSet<GroupId>,
+) -> Result<Vec<ReplicationGroupRecord>, StoreError> {
+    if requested_group_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT group_id
+FROM replication_groups
+WHERE group_id IN (",
+    );
+    {
+        let mut separated = query_builder.separated(", ");
+        for group_id in requested_group_ids {
+            separated.push_bind(group_id.to_string());
+        }
+    }
+    query_builder.push(") ORDER BY group_id");
+
+    let group_ids = query_builder
+        .build_query_scalar::<String>()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
     let mut groups = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
         let group_id = decode_group_id(&group_id)?;
@@ -501,7 +660,7 @@ VALUES (?1, ?2, ?3, ?4)
     .bind(i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?)
     .bind(i64::from(group.local_member_index.as_u32()))
     .bind(version_vector)
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
 
@@ -516,7 +675,7 @@ VALUES (?1, ?2, ?3)
         .bind(group.group_id.to_string())
         .bind(member_index)
         .bind(member.to_string())
-        .execute(&mut **connection)
+        .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
     }
@@ -537,7 +696,7 @@ WHERE group_id = ?1
     )
     .bind(group_id.to_string())
     .bind(encode_stored_version_vector(version_vector))
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .rows_affected();
@@ -585,9 +744,10 @@ async fn load_dataset_rows(
         .context(MissingSchemaSnafu {
             dataset_id: dataset_id.clone(),
         })?;
+    let member_count = load_group_member_count(connection, group_id).await?;
     let mut query_builder = QueryBuilder::<Sqlite>::new(
         "
-SELECT row_key, row_snapshot
+SELECT row_key, row_snapshot, row_tombstoned, row_last_changed_versions
 FROM dataset_rows
 WHERE group_id = ",
     );
@@ -604,7 +764,7 @@ WHERE group_id = ",
     query_builder.push(")");
     let stored_rows = query_builder
         .build()
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
     for row in stored_rows {
@@ -613,13 +773,104 @@ WHERE group_id = ",
             schema.as_schema(),
             &row.get::<Vec<u8>, _>("row_snapshot"),
         )?;
-        rows.insert(row_key, Some(row_snapshot));
+        rows.insert(
+            row_key,
+            Some(ReplicationRowRecord {
+                row_id: row_key,
+                snapshot: row_snapshot,
+                tombstoned: row.get::<bool, _>("row_tombstoned"),
+                last_changed_versions: decode_dataset_row_last_changed_versions(
+                    &row,
+                    member_count,
+                )?,
+            }),
+        );
     }
     Ok(DatasetRowSlice {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
         rows,
+    })
+}
+
+/// Scan rows in lexicographic row-key order.
+///
+/// `after` is an exclusive lower bound. When the result contains exactly
+/// `limit` rows, `next_after` is set to the last returned row key so callers can
+/// continue with `row_key > next_after`.
+async fn scan_dataset_row_batch(
+    connection: &mut SqliteStoreConnection,
+    schema_sources: &HashMap<DatasetId, SchemaSource>,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    after: Option<RowKey>,
+    limit: NonZeroUsize,
+) -> Result<DatasetRowsBatch, StoreError> {
+    let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
+    if !dataset_exists {
+        return Ok(DatasetRowsBatch {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            dataset_exists,
+            rows: Vec::new(),
+            next_after: None,
+        });
+    }
+
+    let schema = schema_sources
+        .get(dataset_id)
+        .cloned()
+        .context(MissingSchemaSnafu {
+            dataset_id: dataset_id.clone(),
+        })?;
+    let member_count = load_group_member_count(connection, group_id).await?;
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT row_key, row_snapshot, row_tombstoned, row_last_changed_versions
+FROM dataset_rows
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    query_builder.push(" AND dataset_id = ");
+    query_builder.push_bind(dataset_id.as_str());
+    if let Some(after) = after {
+        query_builder.push(" AND row_key > ");
+        query_builder.push_bind(after.to_string());
+    }
+    query_builder.push(" ORDER BY row_key LIMIT ");
+    query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+
+    let stored_rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    let mut rows = Vec::with_capacity(stored_rows.len());
+    for row in stored_rows {
+        let row_key = decode_row_key(&row.get::<String, _>("row_key"))?;
+        let row_snapshot = decode_dataset_row_snapshot(
+            schema.as_schema(),
+            &row.get::<Vec<u8>, _>("row_snapshot"),
+        )?;
+        rows.push(ReplicationRowRecord {
+            row_id: row_key,
+            snapshot: row_snapshot,
+            tombstoned: row.get::<bool, _>("row_tombstoned"),
+            last_changed_versions: decode_dataset_row_last_changed_versions(&row, member_count)?,
+        });
+    }
+    let next_after = if rows.len() == limit.get() {
+        rows.last().map(|row| row.row_id)
+    } else {
+        None
+    };
+    Ok(DatasetRowsBatch {
+        group_id: *group_id,
+        dataset_id: dataset_id.clone(),
+        dataset_exists,
+        rows,
+        next_after,
     })
 }
 
@@ -632,73 +883,100 @@ async fn apply_dataset_row_patch(
         return Ok(());
     }
 
-    let schema = if patch
-        .actions
-        .iter()
-        .any(|action| matches!(action, DatasetRowWrite::Put { .. }))
-    {
-        let schema =
-            schema_sources
-                .get(&patch.dataset_id)
-                .cloned()
-                .context(MissingSchemaSnafu {
-                    dataset_id: patch.dataset_id.clone(),
-                })?;
-        ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
-        Some(schema)
-    } else {
-        None
-    };
+    let schema = schema_sources
+        .get(&patch.dataset_id)
+        .cloned()
+        .context(MissingSchemaSnafu {
+            dataset_id: patch.dataset_id.clone(),
+        })?;
+    ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
 
     for action in &patch.actions {
-        match action {
-            DatasetRowWrite::Put { row_key, row } => {
-                let schema = schema
-                    .as_ref()
-                    .expect("put actions require a schema-loaded dataset patch");
-                let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), row)?;
-                sqlx::query(
-                    "
-INSERT INTO dataset_rows (group_id, dataset_id, row_key, row_snapshot)
-VALUES (?1, ?2, ?3, ?4)
+        let (row_key, snapshot, tombstoned) = match action {
+            DatasetRowWrite::UpsertActive { row_key, snapshot } => {
+                ensure_dataset_row_upsert_active_is_valid(
+                    connection,
+                    &patch.group_id,
+                    &patch.dataset_id,
+                    row_key,
+                )
+                .await?;
+                (row_key, snapshot, false)
+            }
+            DatasetRowWrite::UpsertTombstone { row_key, snapshot } => (row_key, snapshot, true),
+        };
+        let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
+        sqlx::query(
+            "
+INSERT INTO dataset_rows (
+    group_id,
+    dataset_id,
+    row_key,
+    row_snapshot,
+    row_tombstoned,
+    row_last_changed_versions
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ON CONFLICT(group_id, dataset_id, row_key) DO UPDATE
-SET row_snapshot = excluded.row_snapshot
+SET row_snapshot = excluded.row_snapshot,
+    row_tombstoned = excluded.row_tombstoned,
+    row_last_changed_versions = excluded.row_last_changed_versions
 ",
-                )
-                .bind(patch.group_id.to_string())
-                .bind(patch.dataset_id.as_str())
-                .bind(row_key.to_string())
-                .bind(row_snapshot)
-                .execute(&mut **connection)
-                .await
-                .context(SqlxSnafu)?;
-            }
-            DatasetRowWrite::Delete { row_key } => {
-                let rows_affected = sqlx::query(
-                    "
-DELETE FROM dataset_rows
-WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
-",
-                )
-                .bind(patch.group_id.to_string())
-                .bind(patch.dataset_id.as_str())
-                .bind(row_key.to_string())
-                .execute(&mut **connection)
-                .await
-                .context(SqlxSnafu)?
-                .rows_affected();
-                ensure!(
-                    rows_affected == 1,
-                    MissingStoredDatasetRowSnafu {
-                        group_id: patch.group_id,
-                        dataset_id: patch.dataset_id.clone(),
-                        row_key: *row_key,
-                    }
-                );
-            }
-        }
+        )
+        .bind(patch.group_id.to_string())
+        .bind(patch.dataset_id.as_str())
+        .bind(row_key.to_string())
+        .bind(row_snapshot)
+        .bind(tombstoned)
+        .bind(encode_stored_version_vector(&patch.last_changed_versions))
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
     }
     Ok(())
+}
+
+async fn ensure_dataset_row_upsert_active_is_valid(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    row_key: &RowKey,
+) -> Result<(), StoreError> {
+    let existing_tombstoned =
+        load_dataset_row_tombstoned(connection, group_id, dataset_id, row_key).await?;
+    ensure!(
+        existing_tombstoned != Some(true),
+        InvalidDatasetRowStateTransitionSnafu {
+            group_id: *group_id,
+            dataset_id: dataset_id.clone(),
+            row_key: *row_key,
+            from: "tombstone",
+            to: "active",
+        }
+    );
+    Ok(())
+}
+
+async fn load_dataset_row_tombstoned(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+    row_key: &RowKey,
+) -> Result<Option<bool>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT row_tombstoned
+FROM dataset_rows
+WHERE group_id = ?1 AND dataset_id = ?2 AND row_key = ?3
+",
+    )
+    .bind(group_id.to_string())
+    .bind(dataset_id.as_str())
+    .bind(row_key.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(row.map(|row| row.get::<bool, _>("row_tombstoned")))
 }
 
 async fn load_replication_update(
@@ -709,7 +987,7 @@ async fn load_replication_update(
     let member_count = load_group_member_count(connection, group_id).await?;
     let row = sqlx::query(
         "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND update_node_index = ?2
@@ -719,7 +997,7 @@ WHERE group_id = ?1
     .bind(group_id.to_string())
     .bind(i64::from(update_id.node_index))
     .bind(encode_update_version_sort_key_vec(update_id.version))
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(row) = row else {
@@ -729,7 +1007,7 @@ WHERE group_id = ?1
         group_id,
         member_count,
         update_id,
-        row,
+        &row,
     )?))
 }
 
@@ -741,7 +1019,7 @@ async fn load_replication_updates(
     let sql = match filter {
         ReplicationUpdateFilter::All => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
 ORDER BY update_version, update_node_index
@@ -749,7 +1027,7 @@ ORDER BY update_version, update_node_index
         }
         ReplicationUpdateFilter::PendingApply => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND applied_locally = 0
@@ -758,7 +1036,7 @@ ORDER BY update_version, update_node_index
         }
         ReplicationUpdateFilter::Applied => {
             "
-SELECT update_node_index, update_version, sender, applied_locally, update_batch
+SELECT update_node_index, update_version, sender, applied_locally, update_message
 FROM dataset_updates
 WHERE group_id = ?1
   AND applied_locally = 1
@@ -769,7 +1047,7 @@ ORDER BY update_version, update_node_index
     let member_count = load_group_member_count(connection, group_id).await?;
     let rows = sqlx::query(sql)
         .bind(group_id.to_string())
-        .fetch_all(&mut **connection)
+        .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
 
@@ -783,7 +1061,7 @@ ORDER BY update_version, update_node_index
             group_id,
             member_count,
             update_id,
-            row,
+            &row,
         )?);
     }
     Ok(updates)
@@ -793,7 +1071,7 @@ async fn append_replication_update(
     connection: &mut SqliteStoreConnection,
     update: &ReplicationUpdateRecord,
 ) -> Result<(), StoreError> {
-    let update_batch = encode_stored_update_batch(update);
+    let update_message = encode_stored_update(update);
     sqlx::query(
         "
 INSERT INTO dataset_updates (
@@ -802,7 +1080,7 @@ INSERT INTO dataset_updates (
     update_version,
     sender,
     applied_locally,
-    update_batch
+    update_message
 )
 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
 ",
@@ -812,8 +1090,8 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6)
     .bind(encode_update_version_sort_key_vec(update.update_id.version))
     .bind(update.sender.to_string())
     .bind(update.applied_locally)
-    .bind(update_batch)
-    .execute(&mut **connection)
+    .bind(update_message)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     Ok(())
@@ -836,7 +1114,7 @@ WHERE group_id = ?1
     .bind(group_id.to_string())
     .bind(i64::from(update_id.node_index))
     .bind(encode_update_version_sort_key_vec(update_id.version))
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .rows_affected();
@@ -864,7 +1142,7 @@ ORDER BY member_index
 ",
     )
     .bind(group_id.to_string())
-    .fetch_all(&mut **connection)
+    .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     ensure!(
@@ -895,7 +1173,7 @@ WHERE group_id = ?1
 ",
     )
     .bind(group_id.to_string())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     let Some(member_count) = member_count else {
@@ -922,7 +1200,7 @@ WHERE group_id = ?1 AND dataset_id = ?2
     )
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
-    .fetch_optional(&mut **connection)
+    .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?
     .is_some();
@@ -944,7 +1222,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
     )
     .bind(group_id.to_string())
     .bind(dataset_id.as_str())
-    .execute(&mut **connection)
+    .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
     Ok(())
@@ -952,7 +1230,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
 
 fn encode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
-    row: &RowSnapshot<'static, UpdateId>,
+    row: &ReplicationRowSnapshot,
 ) -> Result<Vec<u8>, StoreError> {
     let row = encode_row_snapshot(row, schema)
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
@@ -962,7 +1240,7 @@ fn encode_dataset_row_snapshot(
 fn decode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
     bytes: &[u8],
-) -> Result<RowSnapshot<'static, UpdateId>, StoreError> {
+) -> Result<ReplicationRowSnapshot, StoreError> {
     let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
         SqliteStoreError::DecodeStoredProto {
             object: "dataset row snapshot",
@@ -971,6 +1249,16 @@ fn decode_dataset_row_snapshot(
     })?;
     decode_row_snapshot(row, schema)
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))
+}
+
+fn decode_dataset_row_last_changed_versions(
+    row: &sqlx::sqlite::SqliteRow,
+    member_count: NonZeroUsize,
+) -> Result<VersionVector, StoreError> {
+    let versions = row
+        .try_get::<Vec<u8>, _>("row_last_changed_versions")
+        .context(SqlxSnafu)?;
+    decode_stored_version_vector(&versions, member_count)
 }
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
@@ -994,8 +1282,8 @@ fn decode_stored_version_vector(
         .map_err(|source| invalid_stored_object("version vector", source))
 }
 
-fn encode_stored_update_batch(update: &ReplicationUpdateRecord) -> Vec<u8> {
-    let message = UpdateBatchMessage {
+fn encode_stored_update(update: &ReplicationUpdateRecord) -> Vec<u8> {
+    let message = UpdateMessage {
         group_id: update.group_id,
         update_id: update.update_id,
         read_versions: update.read_versions.clone(),
@@ -1008,27 +1296,25 @@ fn encode_stored_update_batch(update: &ReplicationUpdateRecord) -> Vec<u8> {
             })
             .collect(),
     };
-    encode_update_batch_proto(&message)
-        .encode_to_bytes()
-        .to_vec()
+    encode_update_proto(&message).encode_to_bytes().to_vec()
 }
 
 fn decode_stored_update_row(
     expected_group_id: &GroupId,
     member_count: NonZeroUsize,
     update_id: UpdateId,
-    row: sqlx::sqlite::SqliteRow,
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ReplicationUpdateRecord, StoreError> {
     let sender = decode_member_identity(&row.get::<String, _>("sender"))?;
     let applied_locally = row.get::<bool, _>("applied_locally");
-    let update_batch =
-        replication_proto::UpdateBatch::decode_from_slice(&row.get::<Vec<u8>, _>("update_batch"))
+    let update_message =
+        replication_proto::Update::decode_from_slice(&row.get::<Vec<u8>, _>("update_message"))
             .map_err(|source| SqliteStoreError::DecodeStoredProto {
-            object: "update batch",
-            source,
-        })?;
-    let message = decode_update_batch_proto(update_batch, member_count)
-        .map_err(|source| invalid_stored_object("update batch", source))?;
+                object: "update",
+                source,
+            })?;
+    let message = decode_update_proto(update_message, member_count)
+        .map_err(|source| invalid_stored_object("update", source))?;
     ensure!(
         message.group_id == *expected_group_id,
         StoredUpdateGroupMismatchSnafu {
@@ -1142,28 +1428,30 @@ fn invalid_stored_object(
 
 #[derive(Debug, Snafu)]
 enum SqliteStoreError {
-    #[snafu(display("SQLite operation failed."))]
+    #[snafu(display("SQLite operation failed: {source}"))]
     Sqlx { source: sqlx::Error },
-    #[snafu(display("SQLite connection URL '{database_url}' was invalid."))]
+    #[snafu(display("SQLite connection URL '{database_url}' was invalid: {source}"))]
     ParseSqliteUrl {
         database_url: String,
         source: sqlx::Error,
     },
-    #[snafu(display("Stored group id was not a valid UUID."))]
+    #[snafu(display("Stored group id was not a valid UUID: {source}"))]
     InvalidGroupId { source: uuid::Error },
-    #[snafu(display("Stored row key was not a valid UUID."))]
+    #[snafu(display("Stored row key was not a valid UUID: {source}"))]
     InvalidRowKey { source: uuid::Error },
-    #[snafu(display("Stored member identity '{raw}' was invalid."))]
+    #[snafu(display("Stored member identity '{raw}' was invalid: {source}"))]
     InvalidMemberIdentity {
         raw: String,
         source: IdentifierParseError,
     },
     #[snafu(display("Stored group had no members."))]
     EmptyGroupMembers,
-    #[snafu(display("Stored member count overflowed the supported range."))]
+    #[snafu(display("Stored member count overflowed the supported range: {source}"))]
     MemberCountOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Stored member index overflowed the supported range."))]
+    #[snafu(display("Stored member index overflowed the supported range: {source}"))]
     MemberIndexOverflow { source: std::num::TryFromIntError },
+    #[snafu(display("Dataset row scan limit overflowed the supported range: {source}"))]
+    RowLimitOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
         "Stored local member index {local_member_index} is out of bounds for {member_count} members."
     ))]
@@ -1181,12 +1469,12 @@ enum SqliteStoreError {
     },
     #[snafu(display("Stored schema source for dataset '{dataset_id}' was missing."))]
     MissingSchema { dataset_id: DatasetId },
-    #[snafu(display("Stored {object} blob could not be decoded."))]
+    #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
     DecodeStoredProto {
         object: &'static str,
         source: flotsync_messages::buffa::DecodeError,
     },
-    #[snafu(display("Stored {object} was invalid."))]
+    #[snafu(display("Stored {object} was invalid: {source}"))]
     InvalidStoredObject {
         object: &'static str,
         source: Box<dyn StdError + Send + Sync>,
@@ -1194,14 +1482,14 @@ enum SqliteStoreError {
     #[snafu(display("Stored {object} sort key had invalid length {len}."))]
     InvalidStoredSortKey { object: &'static str, len: usize },
     #[snafu(display(
-        "Stored update batch belonged to group '{actual_group_id}', expected '{expected_group_id}'."
+        "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
     ))]
     StoredUpdateGroupMismatch {
         expected_group_id: GroupId,
         actual_group_id: GroupId,
     },
     #[snafu(display(
-        "Stored update batch contained update id '{actual_update_id:?}', expected '{expected_update_id:?}'."
+        "Stored update contained update id '{actual_update_id:?}', expected '{expected_update_id:?}'."
     ))]
     StoredUpdateIdMismatch {
         expected_update_id: UpdateId,
@@ -1210,12 +1498,14 @@ enum SqliteStoreError {
     #[snafu(display("Stored group '{group_id}' was missing."))]
     MissingStoredGroup { group_id: GroupId },
     #[snafu(display(
-        "Stored dataset row '{group_id}/{dataset_id}/{row_key}' was missing for the requested action."
+        "Stored dataset row '{group_id}/{dataset_id}/{row_key}' cannot transition from {from} to {to}."
     ))]
-    MissingStoredDatasetRow {
+    InvalidDatasetRowStateTransition {
         group_id: GroupId,
         dataset_id: DatasetId,
         row_key: RowKey,
+        from: &'static str,
+        to: &'static str,
     },
     #[snafu(display("Stored update '{group_id}/{update_id:?}' was missing."))]
     MissingStoredUpdate {
@@ -1235,11 +1525,16 @@ impl From<SqliteStoreError> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{DatasetRowPatch, DatasetRowWrite, ReplicationUpdateFilter};
+    use crate::api::{
+        DatasetRowPatch,
+        DatasetRowWrite,
+        ReplicationRowRecord,
+        ReplicationUpdateFilter,
+    };
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1282,6 +1577,12 @@ mod tests {
         }
     }
 
+    fn sample_last_changed_versions() -> VersionVector {
+        let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
+        version_vector.increment_at(0);
+        version_vector
+    }
+
     fn insert_row_patch(
         group_id: GroupId,
         dataset_id: &DatasetId,
@@ -1294,14 +1595,72 @@ mod tests {
         DatasetRowPatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::Put {
+            actions: vec![DatasetRowWrite::UpsertActive {
                 row_key,
-                row: snapshot.clone().into_owned(),
+                snapshot: snapshot.clone().into_owned(),
             }],
+            last_changed_versions: sample_last_changed_versions(),
         }
     }
 
+    fn title_snapshot(
+        schema: &Arc<Schema>,
+        row_key: RowKey,
+        title: &str,
+    ) -> ReplicationRowSnapshot {
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let operation = source_data
+            .insert_row(
+                UpdateId {
+                    node_index: 0,
+                    version: 1,
+                },
+                row_key.0,
+                vec![
+                    schema
+                        .columns
+                        .get("title")
+                        .expect("title field should exist")
+                        .initial(title)
+                        .expect("field value should build"),
+                ],
+            )
+            .expect("row insert should succeed");
+        let RowOperation::Insert { snapshot, .. } = operation.operation else {
+            panic!("expected insert operation");
+        };
+        snapshot.into_owned()
+    }
+
     #[test]
+    fn dropping_open_sqlite_transaction_releases_store() {
+        let store = Arc::new(SqliteReplicationStore::in_memory(local_member()).unwrap());
+        let transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        drop(transaction);
+
+        let (probe_result_tx, probe_result_rx) = std::sync::mpsc::channel();
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let probe_result =
+                wait_for_store_future(store.begin_transaction()).map(|transaction| {
+                    wait_for_store_future(transaction.rollback())
+                        .expect("probe transaction should roll back");
+                });
+            let _ = probe_result_tx.send(probe_result);
+        });
+
+        let probe_result = probe_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping an open transaction should release the SQLite store promptly");
+        probe_result.expect("dropped transaction should leave the SQLite store usable");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "This store roundtrip test keeps related group, dataset, and update assertions in one fixture."
+    )]
     fn sqlite_store_roundtrips_group_dataset_and_update_records() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
@@ -1337,8 +1696,13 @@ mod tests {
             encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
         let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
         let expected_row = match &row_patch.actions[0] {
-            DatasetRowWrite::Put { row, .. } => row.clone(),
-            DatasetRowWrite::Delete { .. } => panic!("expected row put patch"),
+            DatasetRowWrite::UpsertActive { row_key, snapshot } => ReplicationRowRecord {
+                row_id: *row_key,
+                snapshot: snapshot.clone(),
+                tombstoned: false,
+                last_changed_versions: row_patch.last_changed_versions.clone(),
+            },
+            DatasetRowWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
         };
         let update = ReplicationUpdateRecord {
             group_id,
@@ -1411,6 +1775,235 @@ mod tests {
             .expect("updates should load")
             .as_slice(),
             [only] if only == &update
+        ));
+    }
+
+    #[test]
+    fn sqlite_store_loads_replication_groups_by_requested_ids() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let first_group_id = GroupId(Uuid::from_u128(10_001));
+        let second_group_id = GroupId(Uuid::from_u128(10_002));
+        let missing_group_id = GroupId(Uuid::from_u128(10_003));
+        let first_group = sample_group(first_group_id);
+        let second_group = sample_group(second_group_id);
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(first_group))
+            .expect("first group should store");
+        wait_for_store_future(transaction.insert_replication_group(second_group))
+            .expect("second group should store");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let requested_group_ids = HashSet::from([first_group_id, missing_group_id]);
+        let mut write_transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        let loaded_groups = wait_for_store_future(
+            write_transaction.load_replication_groups_for_ids(&requested_group_ids),
+        )
+        .expect("requested groups should load through write transaction");
+        assert_eq!(
+            loaded_groups
+                .iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            vec![first_group_id]
+        );
+        wait_for_store_future(write_transaction.rollback()).expect("rollback should succeed");
+
+        let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
+            .expect("transaction should start");
+        let loaded_groups = wait_for_store_future(
+            read_transaction.load_replication_groups_for_ids(&requested_group_ids),
+        )
+        .expect("requested groups should load through read transaction");
+        assert_eq!(
+            loaded_groups
+                .iter()
+                .map(|group| group.group_id)
+                .collect::<Vec<_>>(),
+            vec![first_group_id]
+        );
+        wait_for_store_future(read_transaction.rollback()).expect("rollback should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(104));
+        let row_key = RowKey(Uuid::from_u128(204));
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let operation = source_data
+            .insert_row(
+                UpdateId {
+                    node_index: 0,
+                    version: 1,
+                },
+                row_key.0,
+                vec![
+                    schema
+                        .columns
+                        .get("title")
+                        .expect("title field should exist")
+                        .initial("deleted")
+                        .expect("field value should build"),
+                ],
+            )
+            .expect("row insert should succeed");
+        let RowOperation::Insert { snapshot, .. } = &operation.operation else {
+            panic!("expected insert operation");
+        };
+        let stored_row = ReplicationRowRecord {
+            row_id: row_key,
+            snapshot: snapshot.clone().into_owned(),
+            tombstoned: true,
+            last_changed_versions: sample_last_changed_versions(),
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowWrite::UpsertTombstone {
+                row_key,
+                snapshot: stored_row.snapshot.clone(),
+            }],
+            last_changed_versions: stored_row.last_changed_versions.clone(),
+        }))
+        .expect("row patch should store");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        let requested_row_keys = [row_key];
+        let mut requested_row_keys = requested_row_keys.iter();
+        let loaded_rows = wait_for_store_future(transaction.load_dataset_rows(
+            &group_id,
+            &dataset_id,
+            &mut requested_row_keys,
+        ))
+        .expect("row slice should load");
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        assert_eq!(
+            loaded_rows.rows.get(&row_key).cloned().flatten(),
+            Some(stored_row)
+        );
+    }
+
+    #[test]
+    fn sqlite_store_scans_dataset_rows_in_key_order() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(106));
+        let first_row_key = RowKey(Uuid::from_u128(206));
+        let second_row_key = RowKey(Uuid::from_u128(207));
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![
+                DatasetRowWrite::UpsertActive {
+                    row_key: second_row_key,
+                    snapshot: title_snapshot(&schema, second_row_key, "second"),
+                },
+                DatasetRowWrite::UpsertActive {
+                    row_key: first_row_key,
+                    snapshot: title_snapshot(&schema, first_row_key, "first"),
+                },
+            ],
+            last_changed_versions: sample_last_changed_versions(),
+        }))
+        .expect("rows should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let first_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
+            &group_id,
+            &dataset_id,
+            None,
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        ))
+        .expect("first batch should scan");
+        let second_batch = wait_for_store_future(transaction.scan_dataset_row_batch(
+            &group_id,
+            &dataset_id,
+            first_batch.next_after,
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        ))
+        .expect("second batch should scan");
+        wait_for_store_future(transaction.rollback()).expect("read should roll back");
+
+        assert_eq!(first_batch.rows[0].row_id, first_row_key);
+        assert_eq!(first_batch.next_after, Some(first_row_key));
+        assert_eq!(second_batch.rows[0].row_id, second_row_key);
+        assert_eq!(second_batch.next_after, Some(second_row_key));
+    }
+
+    #[test]
+    fn sqlite_store_rejects_tombstone_to_active_row_transition() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(105));
+        let row_key = RowKey(Uuid::from_u128(205));
+        let tombstone_snapshot = title_snapshot(&schema, row_key, "deleted");
+        let active_snapshot = title_snapshot(&schema, row_key, "resurrected");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
+            .expect("group should store");
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id: dataset_id.clone(),
+            actions: vec![DatasetRowWrite::UpsertTombstone {
+                row_key,
+                snapshot: tombstone_snapshot,
+            }],
+            last_changed_versions: sample_last_changed_versions(),
+        }))
+        .expect("missing-to-tombstone upsert should store");
+
+        let error = wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+            group_id,
+            dataset_id,
+            actions: vec![DatasetRowWrite::UpsertActive {
+                row_key,
+                snapshot: active_snapshot,
+            }],
+            last_changed_versions: sample_last_changed_versions(),
+        }))
+        .expect_err("tombstone-to-active upsert should fail");
+        wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
+
+        assert!(matches!(
+            error,
+            StoreError::StoreExternal { ref source }
+                if source.to_string().contains("cannot transition from tombstone to active")
         ));
     }
 

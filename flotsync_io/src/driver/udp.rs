@@ -335,11 +335,15 @@ impl UdpRuntimeState {
         clippy::too_many_arguments,
         reason = "driver send handlers take runtime resources explicitly to stay testable"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "UDP send handling validates connection state, target policy, payload size, and event publication together."
+    )]
     pub(super) fn handle_send(
         &mut self,
         socket_id: SocketId,
         transmission_id: TransmissionId,
-        payload: IoPayload,
+        payload: &IoPayload,
         target: Option<SocketAddr>,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
@@ -500,17 +504,14 @@ impl UdpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ReleasedUdpSocket>> {
         loop {
-            let mut ingress_buffer = match ingress_pool.try_acquire()? {
-                Some(buffer) => buffer,
-                None => {
-                    let suspended = self.suspend_read(socket_id, registry);
-                    if suspended {
-                        event_sink.publish(super::DriverEvent::Udp(UdpEvent::ReadSuspended {
-                            socket_id,
-                        }))?;
-                    }
-                    return Ok(None);
+            let Some(mut ingress_buffer) = ingress_pool.try_acquire()? else {
+                let suspended = self.suspend_read(socket_id, registry);
+                if suspended {
+                    event_sink.publish(super::DriverEvent::Udp(UdpEvent::ReadSuspended {
+                        socket_id,
+                    }))?;
                 }
+                return Ok(None);
             };
 
             let recv_result = {
@@ -855,7 +856,7 @@ fn apply_udp_socket_option(socket: &MioUdpSocket, option: UdpSocketOption) -> io
 
 fn send_udp_payload(
     socket: &mut MioUdpSocket,
-    payload: IoPayload,
+    payload: &IoPayload,
     target: UdpSendTarget,
     udp_send_scratch: &mut [u8],
 ) -> io::Result<usize> {
@@ -957,9 +958,10 @@ mod tests {
                 return event;
             }
 
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for flotsync_io driver event");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for flotsync_io driver event"
+            );
 
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -993,10 +995,7 @@ mod tests {
                     local_addr,
                 }) if bound_socket_id == socket_id => return local_addr,
                 other => {
-                    log::debug!(
-                        "ignoring unrelated event while waiting for bind: {:?}",
-                        other
-                    );
+                    log::debug!("ignoring unrelated event while waiting for bind: {other:?}");
                 }
             }
         }
@@ -1076,7 +1075,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                    log::debug!("ignoring unrelated UDP event: {other:?}");
                 }
             }
         }
@@ -1124,8 +1123,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP connect: {other:?}"
                     );
                 }
             }
@@ -1160,7 +1158,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated UDP event: {:?}", other);
+                    log::debug!("ignoring unrelated UDP event: {other:?}");
                 }
             }
         }
@@ -1205,8 +1203,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP SendNack: {other:?}"
                     );
                 }
             }
@@ -1247,8 +1244,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP connect: {other:?}"
                     );
                 }
             }
@@ -1279,8 +1275,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP SendNack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP SendNack: {other:?}"
                     );
                 }
             }
@@ -1321,8 +1316,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP configure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP configure: {other:?}"
                     );
                 }
             }
@@ -1383,8 +1377,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP multicast join: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP multicast join: {other:?}"
                     );
                 }
             }
@@ -1412,8 +1405,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for UDP multicast leave: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for UDP multicast leave: {other:?}"
                     );
                 }
             }
@@ -1423,6 +1415,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "This integration-style test exercises the full suspend/resume UDP read flow."
+    )]
     fn udp_read_suspends_and_resumes_when_ingress_capacity_returns() {
         init_test_logger();
 
@@ -1468,8 +1464,7 @@ mod tests {
                 }) if socket_id == receiver_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for first UDP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for first UDP receive: {other:?}"
                     );
                 }
             }
@@ -1493,8 +1488,7 @@ mod tests {
                 }) if socket_id == receiver_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for second UDP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for second UDP receive: {other:?}"
                     );
                 }
             }
@@ -1518,8 +1512,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for ReadSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for ReadSuspended: {other:?}"
                     );
                 }
             }
@@ -1544,8 +1537,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for ReadResumed/Received: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for ReadResumed/Received: {other:?}"
                     );
                 }
             }
@@ -1609,7 +1601,7 @@ mod tests {
             .handle_send(
                 socket_id,
                 transmission_id,
-                IoPayload::Bytes(Bytes::from_static(b"blocked")),
+                &IoPayload::Bytes(Bytes::from_static(b"blocked")),
                 Some(receiver_addr),
                 poll.registry(),
                 &event_sink,
@@ -1645,7 +1637,7 @@ mod tests {
             .handle_send(
                 socket_id,
                 resumed_transmission_id,
-                IoPayload::Bytes(Bytes::from_static(b"resumed")),
+                &IoPayload::Bytes(Bytes::from_static(b"resumed")),
                 Some(receiver_addr),
                 poll.registry(),
                 &event_sink,

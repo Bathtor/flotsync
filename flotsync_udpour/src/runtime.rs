@@ -1,16 +1,25 @@
-//! Kompact runtime adapter for the UDPour protocol.
+//! Kompact runtime adapter for the `UDPour` protocol.
 //!
 //! This module binds the pure sender/receiver state machines to one shared UDP
 //! socket from `flotsync_io`, owns the mapping from logical multipart messages
 //! to concrete UDP sends, and surfaces route-transport failures at the
 //! component boundary.
 
+#[cfg(test)]
+use crate::types::UDPourHeader;
 use crate::{
     codec::{FRAME_HEADER_LEN, decode_frame, encoded_frame_len},
     receiver::{ReceiverAction, ReceiverConfig, ReceiverMachine},
     roaring_helpers::{MIN_ENCODED_NON_EMPTY_BITMAP_LEN, RoaringBitmapError},
     sender::{SenderAction, SenderConfig, SenderError, SenderMachine},
-    types::*,
+    types::{
+        AckFrame,
+        MessageId,
+        NeedPartsFrame,
+        NoLongerAvailableFrame,
+        PayloadFrame,
+        UDPourFrame,
+    },
     wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::*;
@@ -27,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// One logical outbound transfer request for the UDPour runtime.
+/// One logical outbound transfer request for the `UDPour` runtime.
 #[derive(Clone, Debug)]
 pub struct UDPourSend {
     /// Route-level UDP target that should receive every `Payload` retransmission.
@@ -72,7 +81,7 @@ impl fmt::Display for UDPourSendFailureReason {
     }
 }
 
-/// Directed outcome of one outbound UDPour submission.
+/// Directed outcome of one outbound `UDPour` submission.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UDPourSubmitResult {
     /// All initial `Payload` datagrams were accepted by the UDP transport.
@@ -137,7 +146,7 @@ impl fmt::Display for UDPourEncodeFailure {
     }
 }
 
-/// Kompact port exported by the UDPour runtime component.
+/// Kompact port exported by the `UDPour` runtime component.
 ///
 /// This port is indication-only: the runtime triggers fully reassembled
 /// deliveries upward here, while directed outbound submission uses actor ask on
@@ -150,9 +159,9 @@ impl Port for UDPourPort {
     type Indication = UDPourDeliver;
 }
 
-/// Kompact configuration keys that control UDPour runtime pacing.
+/// Kompact configuration keys that control `UDPour` runtime pacing.
 pub mod config_keys {
-    use super::*;
+    use super::{Duration, DurationValue, Result, UsizeValue, kompact_config};
 
     kompact_config! {
         SEND_DELAY,
@@ -183,7 +192,7 @@ pub mod config_keys {
     }
 }
 
-/// Runtime configuration for the UDPour component.
+/// Runtime configuration for the `UDPour` component.
 #[derive(Clone, Debug)]
 pub struct UDPourConfig {
     /// Sender-side multipart retention and message-id reuse policy.
@@ -200,6 +209,10 @@ pub struct UDPourConfig {
 
 impl UDPourConfig {
     /// Builds runtime configuration from the sender/receiver state-machine configs.
+    ///
+    /// # Errors
+    ///
+    /// See `UDPourConfigError` for failure conditions.
     pub fn new(
         sender: SenderConfig,
         mut receiver: ReceiverConfig,
@@ -234,7 +247,7 @@ impl Default for UDPourConfig {
     }
 }
 
-/// Configuration errors for the UDPour runtime.
+/// Configuration errors for the `UDPour` runtime.
 #[derive(Debug, Snafu)]
 pub enum UDPourConfigError {
     #[snafu(display("runtime poll interval must be greater than zero"))]
@@ -256,7 +269,7 @@ pub(crate) enum RuntimeEncodeError {
     EmptyEncodedFrame,
 }
 
-/// Runtime pacing policy for outbound UDPour datagrams.
+/// Runtime pacing policy for outbound `UDPour` datagrams.
 #[derive(Clone, Debug)]
 struct UDPourSendRateControl {
     send_delay: Duration,
@@ -280,7 +293,7 @@ impl Default for UDPourSendRateControl {
     }
 }
 
-/// Owned outbound scheduling state for one UDPour socket runtime.
+/// Owned outbound scheduling state for one `UDPour` socket runtime.
 #[derive(Debug)]
 struct OutboundDispatcherState {
     send_rate: UDPourSendRateControl,
@@ -396,6 +409,7 @@ struct ProcessedNeedPartsSnapshot {
 
 impl UDPourComponent {
     /// Creates one runtime component bound to one already-open UDP socket.
+    #[must_use]
     pub fn new(socket_id: SocketId, egress_pool: EgressPool, config: UDPourConfig) -> Self {
         let sender = SenderMachine::new(config.sender.clone());
         let receiver = ReceiverMachine::new(config.receiver.clone());
@@ -670,6 +684,10 @@ impl UDPourComponent {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact scheduled callbacks deliver timer handles by value"
+    )]
     fn handle_dispatch_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
         let Some(active_timer) = self.dispatcher.dispatch_timer.take() else {
             return Handled::Ok;
@@ -798,6 +816,10 @@ impl UDPourComponent {
         Handled::Ok
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "component messages are consumed at the actor boundary"
+    )]
     fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
         match result {
             UdpSendResult::Ack {
@@ -1049,6 +1071,10 @@ impl UDPourComponent {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact scheduled callbacks deliver timer handles by value"
+    )]
     fn handle_poll_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
         let Some(active_timer) = self.poll_timer.take() else {
             return Handled::Ok;

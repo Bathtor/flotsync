@@ -6,6 +6,8 @@ target/
 
 __pycache__/
 
+/testing/
+
 # Dolt database files (added by bd init)
 .dolt/
 *.db

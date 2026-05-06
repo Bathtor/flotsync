@@ -1207,10 +1207,16 @@ name = "flotsync_io_examples"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "clap",
+ "flotsync_core",
+ "flotsync_data_types",
  "flotsync_io",
+ "flotsync_replication",
+ "futures-util",
  "http",
  "httparse",
+ "itertools 0.14.0",
  "itoa",
  "kompact",
  "log",
@@ -1219,6 +1225,7 @@ dependencies = [
  "slog-stdlog",
  "slog-term",
  "snafu",
+ "uuid",
 ]
 
 [[package]]

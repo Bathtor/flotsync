@@ -45,6 +45,9 @@ pub struct SchemaOperation<'a, RowId, ChangeId> {
     pub operation: RowOperation<'a, RowId, ChangeId>,
 }
 impl<RowId, ChangeId> SchemaOperation<'_, RowId, ChangeId> {
+    /// # Errors
+    ///
+    /// See `SchemaValueError` for failure conditions.
     pub fn validate_against_schema(&self, schema: &Schema) -> Result<(), SchemaValueError> {
         self.operation.validate_against_schema(schema)
     }
@@ -96,6 +99,18 @@ pub enum RowOperation<'a, RowId, ChangeId> {
     Delete { row_id: RowId },
 }
 impl<RowId, ChangeId> RowOperation<'_, RowId, ChangeId> {
+    /// Return the row identifier targeted by this operation.
+    pub fn row_id(&self) -> &RowId {
+        match self {
+            RowOperation::Insert { row_id, .. }
+            | RowOperation::Update { row_id, .. }
+            | RowOperation::Delete { row_id } => row_id,
+        }
+    }
+
+    /// # Errors
+    ///
+    /// See `SchemaValueError` for failure conditions.
     pub fn validate_against_schema(&self, schema: &Schema) -> Result<(), SchemaValueError> {
         match self {
             RowOperation::Insert { snapshot, .. } => validate_schema_snapshot(schema, snapshot),
@@ -131,6 +146,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         }
     }
 
+    #[must_use]
     pub fn from_owned_fields(fields: Vec<(String, InMemoryFieldValue<ChangeId>)>) -> Self {
         Self {
             repr: RowSnapshotRepr::Owned { fields },
@@ -138,6 +154,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 
     /// Materialize this snapshot into an owned `'static` representation.
+    #[must_use]
     pub fn into_owned(self) -> RowSnapshot<'static, ChangeId>
     where
         ChangeId: Clone,
@@ -146,6 +163,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 
     /// Materialize this snapshot as owned `(field_name, value)` pairs.
+    #[must_use]
     pub fn into_owned_fields(self) -> Vec<(String, InMemoryFieldValue<ChangeId>)>
     where
         ChangeId: Clone,
@@ -160,6 +178,9 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         }
     }
 
+    /// # Errors
+    ///
+    /// See `RowSnapshotEncodeError<V::Error>` for failure conditions.
     pub fn encode_snapshot<V>(
         &self,
         schema: &Schema,
@@ -176,6 +197,14 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         writer.end().context(SchemaVisitSnafu)
     }
 
+    /// # Errors
+    ///
+    /// See `RowSnapshotDecodeError<D::Error>` for failure conditions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a field name yielded by `schema.columns.keys()` cannot be resolved back to a
+    /// schema field from the same map.
     pub fn decode_snapshot<D>(
         schema: &Schema,
         decoder: &mut D,
@@ -225,6 +254,22 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
             }
         }
     }
+}
+
+/// One retained row image together with its addressability state.
+///
+/// A [`RowRecord`] is a storage and rehydration shape, not a replicated row
+/// operation. `snapshot` contains the complete row value image, while
+/// `tombstoned` records whether that image is retained only so later CRDT
+/// operations can still address the row after a delete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RowRecord<'a, RowId, ChangeId> {
+    /// Stable row identifier in the dataset that owns this record.
+    pub row_id: RowId,
+    /// Complete value snapshot for the row.
+    pub snapshot: RowSnapshot<'a, ChangeId>,
+    /// Whether the row is deleted but still retained for causal updates.
+    pub tombstoned: bool,
 }
 
 #[derive(Debug, Snafu)]
@@ -329,6 +374,10 @@ fn validate_snapshot_field<ChangeId>(
 /// Validate partial operation field payloads against a schema.
 ///
 /// Any subset is allowed, but field names must exist and each field may appear at most once.
+///
+/// # Errors
+///
+/// See `SchemaValueError` for failure conditions.
 pub fn validate_schema_operation_fields<Id>(
     schema: &Schema,
     fields: &[OperationFieldValue<'_, Id>],

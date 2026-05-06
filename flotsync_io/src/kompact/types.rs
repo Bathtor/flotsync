@@ -234,6 +234,7 @@ pub struct UdpOpenRequestId(pub Uuid);
 
 impl UdpOpenRequestId {
     /// Allocates one fresh UDP open-request correlation id.
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -311,6 +312,7 @@ impl TcpListenerRef {
     }
 
     /// Returns a narrowed recipient for this listener.
+    #[must_use]
     pub fn recipient(&self) -> Recipient<TcpListenerRequest> {
         self.actor.recipient()
     }
@@ -434,11 +436,16 @@ impl TcpSessionEventTarget {
     }
 
     /// Builds one event target from a plain Kompact recipient.
+    #[must_use]
     pub fn from_recipient(recipient: Recipient<TcpSessionEvent>) -> Self {
         Self::new(RecipientTcpSessionEventTarget { recipient })
     }
 
     /// Builds one event target from any local receiver of `TcpSessionEvent`.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "The API accepts receiver values to mirror Kompact's receiver-to-recipient conversion style."
+    )]
     pub fn from_receiver<R>(receiver: R) -> Self
     where
         R: Receiver<TcpSessionEvent>,
@@ -491,6 +498,10 @@ where
 ///
 /// Unlike Kompact's `Recipient`, this helper can carry one small `Copy` tag and combine it with
 /// each forwarded `TcpSessionEvent` using the supplied `wrap` function before telling the actor.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The factory consumes actor-ref factories to build a durable event target."
+)]
 pub fn tagged_tcp_session_event_target<A, M, Tag>(
     target: A,
     tag: Tag,
@@ -598,6 +609,7 @@ impl TcpSessionRef {
     }
 
     /// Returns the shared egress pool owned by the underlying raw driver instance.
+    #[must_use]
     pub fn egress_pool(&self) -> &EgressPool {
         &self.egress_pool
     }
@@ -622,6 +634,10 @@ impl TcpSessionRef {
 
     /// Serialises one payload through a growable async writer and sends it once the closure
     /// completes successfully.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub async fn send_with<T, F>(
         &self,
         transmission_id: TransmissionId,
@@ -643,6 +659,10 @@ impl TcpSessionRef {
 
     /// Serialises one payload through a growable async writer, sends it, and then requests a
     /// graceful close once the send drains.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub async fn send_and_close_with<T, F>(
         &self,
         transmission_id: TransmissionId,
@@ -679,6 +699,7 @@ impl TcpSessionRef {
     ///
     /// This is provided for integration points that specifically require a `Recipient`, but it
     /// pays the normal Kompact recipient adapter overhead on each use.
+    #[must_use]
     pub fn recipient(&self) -> Recipient<TcpSessionRequest> {
         self.actor.recipient()
     }

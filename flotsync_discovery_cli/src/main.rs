@@ -1,5 +1,15 @@
 use clap::Parser;
-use flotsync_discovery::{kompact::prelude::*, services::*, uuid::Uuid};
+use flotsync_discovery::{
+    kompact::prelude::*,
+    services::{
+        MDNS_ANNOUNCEMENT_SERVICE_DEFAULT_OPTIONS,
+        MdnsAnnouncementComponent,
+        PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
+        PeerAnnouncementComponent,
+        peer_announcement_startup_signal,
+    },
+    uuid::Uuid,
+};
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoDriverComponent, UdpPort};
 use std::{
     io::{BufRead, BufReader},

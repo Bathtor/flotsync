@@ -13,6 +13,10 @@ use std::{io, net::SocketAddr};
 /// On Unix this enables both `SO_REUSEADDR` and `SO_REUSEPORT`, because the
 /// reservation strategy keeps one socket bound while the real test subject
 /// binds the same port.
+///
+/// # Errors
+///
+/// See `io::Error` for failure conditions.
 pub fn configure_bind_reuse(socket: &Socket) -> io::Result<()> {
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
@@ -21,6 +25,7 @@ pub fn configure_bind_reuse(socket: &Socket) -> io::Result<()> {
 }
 
 /// Returns the socket domain that matches the supplied address family.
+#[must_use]
 pub fn socket_domain(addr: SocketAddr) -> Domain {
     match addr {
         SocketAddr::V4(_) => Domain::IPV4,

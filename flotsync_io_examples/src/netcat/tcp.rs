@@ -19,6 +19,10 @@ use snafu::{FromString, Whatever};
 use std::{collections::VecDeque, net::SocketAddr};
 
 /// Runs the TCP flavour of the netcat example.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Example entry points consume parsed mode and scripted input values."
+)]
 pub(super) fn run_tcp(
     runtime: &ExampleRuntime,
     scripted_lines: Vec<String>,

@@ -82,6 +82,9 @@ pub(crate) enum FieldTargetValue {
 }
 
 impl Field {
+    /// # Errors
+    ///
+    /// See `FieldValueBuildError` for failure conditions.
     pub fn with_default<V>(mut self, value: V) -> Result<Self, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,
@@ -92,6 +95,7 @@ impl Field {
         Ok(self)
     }
 
+    #[must_use]
     pub fn without_default(mut self) -> Self {
         self.default_value = None;
         self
@@ -107,7 +111,10 @@ impl Field {
         Ok(Some(target_value))
     }
 
-    pub fn initial<'a, V>(&'a self, value: V) -> Result<InitialFieldValue<'a>, FieldValueBuildError>
+    /// # Errors
+    ///
+    /// See `FieldValueBuildError` for failure conditions.
+    pub fn initial<V>(&self, value: V) -> Result<InitialFieldValue<'_>, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,
     {
@@ -118,7 +125,10 @@ impl Field {
         })
     }
 
-    pub fn set<'a, V>(&'a self, value: V) -> Result<PendingFieldUpdate<'a>, FieldValueBuildError>
+    /// # Errors
+    ///
+    /// See `FieldValueBuildError` for failure conditions.
+    pub fn set<V>(&self, value: V) -> Result<PendingFieldUpdate<'_>, FieldValueBuildError>
     where
         V: Into<NullableBasicValue>,
     {
@@ -444,6 +454,10 @@ where
     <T as TryFrom<u64>>::Error: std::fmt::Debug,
     <T as TryFrom<u8>>::Error: std::fmt::Debug,
 {
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Accepted integer variants have different payload types and share the same conversion path."
+    )]
     match value {
         PrimitiveValue::Int(value) => {
             convert_integer(field_name, Cow::Owned(expected.to_owned()), *value)

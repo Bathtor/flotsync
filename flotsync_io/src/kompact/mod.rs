@@ -59,7 +59,11 @@ pub(super) async fn resolve_kfuture<T: Send>(future: KFuture<Result<T>>) -> Resu
 /// When `force_kill` is `false`, the helper performs graceful shutdown via
 /// [`KompactSystem::shutdown`]. When `force_kill` is `true`, it uses
 /// [`KompactSystem::kill_system`] instead. In both cases the helper logs the
-/// start and successful completion and panics if the shutdown does not finish
+/// start and successful completion.
+///
+/// # Panics
+///
+/// Panics if shutdown fails, if the shutdown worker disconnects, or if shutdown does not finish
 /// within `timeout`.
 pub fn shutdown_system_bounded(system: KompactSystem, timeout: Duration, force_kill: bool) {
     if thread::panicking() {

@@ -1,4 +1,4 @@
-//! Error surface for flotsync_io.
+//! Error surface for `flotsync_io`.
 
 use crate::api::{ConnectionId, ListenerId, SocketId};
 use snafu::Snafu;

@@ -1,4 +1,22 @@
-use super::*;
+use super::{
+    Composite,
+    DataOperation,
+    IntegrityError,
+    InvalidNodeSnafu,
+    LinearData,
+    LinkIds,
+    MissingBeginningBoundarySnafu,
+    MissingEndBoundarySnafu,
+    Node,
+    NodeIds,
+    Operation,
+    VisibleLengthMismatchSnafu,
+    assert_matches,
+    ensure,
+    fmt,
+    option_when,
+    vec,
+};
 use crate::snapshot::{
     SnapshotHeader,
     SnapshotNode,
@@ -8,7 +26,7 @@ use crate::snapshot::{
 };
 use std::{collections::HashMap, hash::Hash};
 
-/// An implementation of [[LinearData]] using a [[Vec]] to track the individual operation nodes.
+/// An implementation of [[`LinearData`]] using a [[Vec]] to track the individual operation nodes.
 ///
 /// # Note
 /// While the natural representation of this data structure is linked nodes,
@@ -491,7 +509,7 @@ where
         })
         .map_err(|op| match op {
             DataOperation::Insert { value, .. } => value,
-            _ => unreachable!(
+            DataOperation::Delete { .. } => unreachable!(
                 "apply_operation should not return a different operation type on error."
             ),
         })
@@ -526,6 +544,10 @@ where
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The insertion path is a single CRDT transition over predecessor, successor, and sibling-order cases."
+    )]
     fn apply_operation(
         &mut self,
         operation: DataOperation<Self::Id, Value>,

@@ -26,6 +26,11 @@ use std::{
 };
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    reason = "This Kompact integration test verifies outbound TCP routing and flow-control events end to end."
+)]
 fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_owner_only() {
     init_test_logger();
 
@@ -106,7 +111,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
                 saw_backpressure_nack = true;
             }
             other => {
-                log::debug!("ignoring unrelated outbound TCP session event: {:?}", other);
+                log::debug!("ignoring unrelated outbound TCP session event: {other:?}");
             }
         }
     }
@@ -131,7 +136,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
                 saw_received = true;
             }
             other => {
-                log::debug!("ignoring unrelated outbound TCP session event: {:?}", other);
+                log::debug!("ignoring unrelated outbound TCP session event: {other:?}");
             }
         }
     }
@@ -163,6 +168,11 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    reason = "This Kompact integration test covers pending TCP session accept/reject and listener close interactions."
+)]
 fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_accepted_session_alive()
  {
     init_test_logger();
@@ -290,6 +300,10 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
 }
 
 #[test]
+#[allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
+)]
 fn dropping_pending_tcp_session_auto_rejects_the_connection() {
     init_test_logger();
 

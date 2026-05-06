@@ -83,6 +83,10 @@ impl TcpListenerEntry {
 /// reject them. While `pending_adoption` is set the connection has a live socket but deliberately
 /// exposes no readiness interest, so no inbound bytes can outrun session routing.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "TCP connection lifecycle flags track independent mio/runtime states."
+)]
 struct TcpConnectionEntry {
     record: ResourceRecord,
     stream: Option<MioTcpStream>,
@@ -213,7 +217,7 @@ struct PendingTcpSend {
 }
 
 impl PendingTcpSend {
-    fn new(transmission_id: TransmissionId, payload: IoPayload) -> Self {
+    fn new(transmission_id: TransmissionId, payload: &IoPayload) -> Self {
         Self {
             transmission_id,
             buffer: payload.cursor(),
@@ -508,6 +512,10 @@ impl TcpRuntimeState {
         Ok(Some(released))
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "The TCP API returns Result consistently with other readiness handlers and leaves room for accept-path errors."
+    )]
     pub(super) fn accept_next(
         &mut self,
         listener_id: ListenerId,
@@ -613,7 +621,7 @@ impl TcpRuntimeState {
         &mut self,
         connection_id: ConnectionId,
         transmission_id: TransmissionId,
-        payload: IoPayload,
+        payload: &IoPayload,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
@@ -631,7 +639,7 @@ impl TcpRuntimeState {
         &mut self,
         connection_id: ConnectionId,
         transmission_id: TransmissionId,
-        payload: IoPayload,
+        payload: &IoPayload,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
@@ -649,7 +657,7 @@ impl TcpRuntimeState {
         &mut self,
         connection_id: ConnectionId,
         transmission_id: TransmissionId,
-        payload: IoPayload,
+        payload: &IoPayload,
         close_after_send: bool,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
@@ -906,6 +914,10 @@ impl TcpRuntimeState {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "TCP send flushing handles partial writes, close-after-send, and event publication in one state transition."
+    )]
     fn flush_pending_send(
         &mut self,
         connection_id: ConnectionId,
@@ -1030,17 +1042,14 @@ impl TcpRuntimeState {
         event_sink: &dyn DriverEventSink,
     ) -> Result<Option<ResourceRecord>> {
         loop {
-            let mut ingress_buffer = match ingress_pool.try_acquire()? {
-                Some(buffer) => buffer,
-                None => {
-                    let suspended = self.suspend_read(connection_id, registry)?;
-                    if suspended {
-                        event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadSuspended {
-                            connection_id,
-                        }))?;
-                    }
-                    return Ok(None);
+            let Some(mut ingress_buffer) = ingress_pool.try_acquire()? else {
+                let suspended = self.suspend_read(connection_id, registry)?;
+                if suspended {
+                    event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ReadSuspended {
+                        connection_id,
+                    }))?;
                 }
+                return Ok(None);
             };
 
             let read_result = {
@@ -1354,9 +1363,10 @@ mod tests {
                 return event;
             }
 
-            if Instant::now() >= deadline {
-                panic!("timed out waiting for flotsync_io driver event");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for flotsync_io driver event"
+            );
 
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1415,8 +1425,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP listen failure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP listen failure: {other:?}"
                     );
                 }
             }
@@ -1479,8 +1488,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP listening event: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP listening event: {other:?}"
                     );
                 }
             }
@@ -1499,8 +1507,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP accepted event: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP accepted event: {other:?}"
                     );
                 }
             }
@@ -1528,8 +1535,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for adopted TCP payload: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for adopted TCP payload: {other:?}"
                     );
                 }
             }
@@ -1652,8 +1658,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP connect: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP connect: {other:?}"
                     );
                 }
             }
@@ -1685,7 +1690,7 @@ mod tests {
                     received_payload = Some(payload.to_vec());
                 }
                 other => {
-                    log::debug!("ignoring unrelated TCP event: {:?}", other);
+                    log::debug!("ignoring unrelated TCP event: {other:?}");
                 }
             }
         }
@@ -1731,8 +1736,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP connect failure: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP connect failure: {other:?}"
                     );
                 }
             }
@@ -1814,8 +1818,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP write suspension/backpressure nack: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP write suspension/backpressure nack: {other:?}"
                     );
                 }
             }
@@ -1891,8 +1894,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP WriteSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP WriteSuspended: {other:?}"
                     );
                 }
             }
@@ -1917,8 +1919,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP SendAck/WriteResumed: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP SendAck/WriteResumed: {other:?}"
                     );
                 }
             }
@@ -2004,8 +2005,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP graceful close: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP graceful close: {other:?}"
                     );
                 }
             }
@@ -2089,8 +2089,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP send-and-close: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP send-and-close: {other:?}"
                     );
                 }
             }
@@ -2105,6 +2104,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "This integration-style test exercises the full suspend/resume TCP read flow."
+    )]
     fn tcp_read_suspends_and_resumes_when_ingress_capacity_returns() {
         init_test_logger();
 
@@ -2165,8 +2168,7 @@ mod tests {
                 }) if received_id == connection_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for first TCP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for first TCP receive: {other:?}"
                     );
                 }
             }
@@ -2179,8 +2181,7 @@ mod tests {
                 }) if received_id == connection_id => break lease,
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for second TCP receive: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for second TCP receive: {other:?}"
                     );
                 }
             }
@@ -2195,8 +2196,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP ReadSuspended: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP ReadSuspended: {other:?}"
                     );
                 }
             }
@@ -2222,8 +2222,7 @@ mod tests {
                 }
                 other => {
                     log::debug!(
-                        "ignoring unrelated event while waiting for TCP ReadResumed/Received: {:?}",
-                        other
+                        "ignoring unrelated event while waiting for TCP ReadResumed/Received: {other:?}"
                     );
                 }
             }

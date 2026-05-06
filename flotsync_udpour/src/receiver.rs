@@ -3,7 +3,21 @@
 //! This module owns `(source, message_id)` reassembly state, repair polling,
 //! whole-message checksum validation, and purge behavior.
 
-use crate::{codec::fit_one_need_parts_frame, types::*};
+use crate::{
+    codec::fit_one_need_parts_frame,
+    types::{
+        AckFrame,
+        Checksum,
+        FrameType,
+        MessageId,
+        NeedPartsFrame,
+        NoLongerAvailableFrame,
+        PartCount,
+        PayloadFrame,
+        UDPourHeader,
+        io_payload_eq,
+    },
+};
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
@@ -71,6 +85,10 @@ impl ReceiverMachine {
     }
 
     /// Accepts one inbound payload frame from a UDP source.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "receiver API stays fallible to match adjacent state machines and allow future validation errors"
+    )]
     pub fn accept_payload(
         &mut self,
         source: SocketAddr,
@@ -206,6 +224,10 @@ impl ReceiverMachine {
     }
 
     /// Accepts one sender `NoLongerAvailable` control frame.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "control frames are message values at the receiver API boundary"
+    )]
     pub fn accept_no_longer_available(
         &mut self,
         source: SocketAddr,
@@ -235,7 +257,7 @@ impl ReceiverMachine {
     /// header from `source`.
     ///
     /// This lets runtime tests distinguish "the bridge observer saw the frame"
-    /// from "the receiving UDPour state machine already consumed the frame and
+    /// from "the receiving `UDPour` state machine already consumed the frame and
     /// reset any dependent repair deadlines".
     pub(crate) fn has_reflected_payload(&self, source: SocketAddr, header: UDPourHeader) -> bool {
         let key = ReceiverTransferKey {
@@ -514,7 +536,7 @@ impl InboundTransfer {
             part_count,
             checksum,
             parts: vec![None; part_count.get() as usize],
-            missing_parts: RoaringBitmap::from_iter(0..part_count.get()),
+            missing_parts: (0..part_count.get()).collect::<RoaringBitmap>(),
             repair_watermark: None,
             regular_part_size: None,
             give_up_deadline: now + config.give_up_timeout,

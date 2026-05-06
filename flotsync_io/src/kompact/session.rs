@@ -341,8 +341,7 @@ fn shutdown_session(session: &mut TcpSession) -> Handled {
     let release = session.driver.release_tcp_session(connection_id);
     Handled::block_on(session, move |async_self| async move {
         match resolve_kfuture(release).await {
-            Ok(()) => {}
-            Err(Error::UnknownConnection { .. }) => {}
+            Ok(()) | Err(Error::UnknownConnection { .. }) => {}
             Err(error) => {
                 warn!(
                     async_self.log(),

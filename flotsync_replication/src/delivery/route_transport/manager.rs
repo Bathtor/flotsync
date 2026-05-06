@@ -3,13 +3,34 @@
 //! This component now owns the concrete UDP route path end to end:
 //!
 //! - opening UDP sockets on demand through the shared bridge port
-//! - creating one child UDPour runtime per live UDP socket
+//! - creating one child `UDPour` runtime per live UDP socket
 //! - serializing `FlotsyncSerializable` payloads into pooled `IoPayload`
 //! - resolving directed route-transport submits via actor `Ask`
 //!
 //! TCP route handling is intentionally deferred via `TODO(flotsync-638)`.
 
-use super::*;
+use super::{
+    ConnectionFailureReason,
+    ConnectionInfoIndication,
+    ConnectionInfoPort,
+    DatagramRouteScope,
+    Debug,
+    FlotsyncSerializable,
+    FlotsyncSerializeError,
+    Hash,
+    IString,
+    InboundTransportMeta,
+    RouteTransportActorMessage,
+    RouteTransportInboundDeliver,
+    RouteTransportNackReason,
+    RouteTransportPort,
+    RouteTransportSend,
+    RouteTransportSubmitResult,
+    SizeHint,
+    TcpRouteKey,
+    TransportRouteKey,
+    UdpRouteKey,
+};
 use crate::delivery::shared::RouteSendId;
 #[cfg(test)]
 use crate::delivery::test_support::ManagerOwnedUdpBindBudget;
@@ -57,15 +78,15 @@ pub struct RouteTransportManager {
     inbound_port: ProvidedPort<TransportRouteTransportPort>,
     connection_info_port: ProvidedPort<TransportConnectionInfoPort>,
     udp_bridge_port: RequiredPort<UdpPort>,
-    /// Inbound UDPour deliveries from child runtimes.
+    /// Inbound `UDPour` deliveries from child runtimes.
     udpour_port: RequiredPort<UDPourPort>,
     /// Concrete system handle needed for direct `trigger_i` startup queueing.
     system: KompactSystem,
     /// Shared bridge handle used to open transport resources on demand.
     bridge: IoBridgeHandle,
-    /// Runtime configuration shared by every live UDP UDPour child.
+    /// Runtime configuration shared by every live UDP `UDPour` child.
     udpour_config: UDPourConfig,
-    /// Policy that decides when a bound UDP socket gains its UDPour child.
+    /// Policy that decides when a bound UDP socket gains its `UDPour` child.
     udp_activation_policy: UdpActivationPolicy,
     /// UDP local sockets currently waiting for a bind result.
     ///
@@ -74,9 +95,9 @@ pub struct RouteTransportManager {
     udp_open_sockets: HashMap<UdpSocketKey, PendingUdpSocketOpen>,
     /// Correlates bridge-local UDP open ids back to the socket key being opened.
     udp_open_requests: HashMap<UdpOpenRequestId, UdpSocketKey>,
-    /// Sockets that are already bound but whose UDPour child is still starting.
+    /// Sockets that are already bound but whose `UDPour` child is still starting.
     udp_starting_sockets: HashMap<UdpSocketKey, StartingUdpSocketHandle>,
-    /// Bound UDP sockets that exist on the bridge but do not yet have a UDPour child.
+    /// Bound UDP sockets that exist on the bridge but do not yet have a `UDPour` child.
     udp_dormant_sockets: HashMap<UdpSocketKey, DormantUdpSocketHandle>,
     /// Live sockets currently waiting for `Broadcast(true)` to apply.
     udp_broadcast_configurations: HashMap<SocketId, UdpSocketKey>,
@@ -98,6 +119,7 @@ pub struct RouteTransportManager {
 
 impl RouteTransportManager {
     /// Creates one manager around the shared bridge handle and UDP child config.
+    #[must_use]
     pub fn new(system: KompactSystem, bridge: IoBridgeHandle, udpour_config: UDPourConfig) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -182,16 +204,14 @@ impl RouteTransportManager {
             .config()
             .read_or_default(&kompact::config_keys::system::LABEL)
             .unwrap_or_else(|_| String::from("<unlabelled-route-transport-test-system>"));
-        if requested_local_addr != socket_key.local_addr {
-            panic!(
-                "route-transport test system '{system_label}' saw inconsistent manager-owned UDP bind state for {socket_key:?}; requested_bind resolved to {requested_local_addr}"
-            );
-        }
-        if requested_local_addr.port() != 0 {
-            panic!(
-                "route-transport test system '{system_label}' attempted manager-owned exact UDP bind for {socket_key:?}; the test bind budget only supports port-zero manager-owned binds"
-            );
-        }
+        assert!(
+            requested_local_addr == socket_key.local_addr,
+            "route-transport test system '{system_label}' saw inconsistent manager-owned UDP bind state for {socket_key:?}; requested_bind resolved to {requested_local_addr}"
+        );
+        assert!(
+            requested_local_addr.port() == 0,
+            "route-transport test system '{system_label}' attempted manager-owned exact UDP bind for {socket_key:?}; the test bind budget only supports port-zero manager-owned binds"
+        );
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
             panic!(
@@ -211,6 +231,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn test_manager_owned_udp_bind_policy(
         &mut self,
         _request_id: UdpOpenRequestId,
@@ -241,6 +265,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn complete_test_manager_owned_udp_bind(
         &mut self,
         _request_id: UdpOpenRequestId,
@@ -265,6 +293,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn fail_test_manager_owned_udp_bind(&mut self, _request_id: UdpOpenRequestId) {}
 
     #[cfg(test)]
@@ -283,6 +315,10 @@ impl RouteTransportManager {
     }
 
     #[cfg(not(test))]
+    #[allow(
+        clippy::unused_self,
+        reason = "Test builds inspect component state here; non-test builds keep the same call shape."
+    )]
     fn release_test_manager_owned_udp_bind(&mut self, _socket_id: SocketId) {}
 
     fn handle_submit(
@@ -539,7 +575,7 @@ impl RouteTransportManager {
                 starting.socket_id,
                 starting.origin,
                 starting.queued_sends,
-                classify_udp_connect_failure_for_discovery(&error),
+                &classify_udp_connect_failure_for_discovery(&error),
             );
             self.ctx.system().kill(starting.runtime);
             return;
@@ -587,9 +623,7 @@ impl RouteTransportManager {
                 return;
             };
             handle.known_routes.insert(route);
-            if route.scope != DatagramRouteScope::Broadcast {
-                LiveUdpSendAction::Dispatch
-            } else {
+            if route.scope == DatagramRouteScope::Broadcast {
                 match &mut handle.broadcast_state {
                     UdpBroadcastState::Disabled => {
                         let socket_id = handle.socket_id;
@@ -605,6 +639,8 @@ impl RouteTransportManager {
                     UdpBroadcastState::Enabled => LiveUdpSendAction::Dispatch,
                     UdpBroadcastState::Failed => LiveUdpSendAction::FailBroadcast,
                 }
+            } else {
+                LiveUdpSendAction::Dispatch
             }
         };
 
@@ -878,7 +914,7 @@ impl RouteTransportManager {
         socket_id: SocketId,
         origin: UdpSocketStartOrigin,
         queued_sends: Vec<QueuedUdpSend>,
-        discovery_reason: ConnectionFailureReason,
+        discovery_reason: &ConnectionFailureReason,
     ) {
         match origin {
             UdpSocketStartOrigin::ManagerOwned => {
@@ -897,7 +933,7 @@ impl RouteTransportManager {
             failed_routes.insert(queued.route);
         }
         for route in failed_routes {
-            self.report_route_failed(TransportRouteKey::Udp(route), discovery_reason.clone());
+            self.report_route_failed(TransportRouteKey::Udp(route), (*discovery_reason).clone());
         }
         for queued in queued_sends {
             self.fail_pending_send(
@@ -1017,9 +1053,9 @@ type TransportRouteTransportPort = RouteTransportPort<TransportRouteKey>;
 type TransportRouteTransportSubmitResult = RouteTransportSubmitResult<TransportRouteKey>;
 
 /// Kompact configuration keys that control when the manager creates per-socket
-/// UDPour children.
+/// `UDPour` children.
 mod config_keys {
-    use super::*;
+    use super::{UsizeValue, kompact_config};
 
     kompact_config! {
         UDP_ACTIVATION_POLICY,
@@ -1031,7 +1067,7 @@ mod config_keys {
     }
 }
 
-/// Upper bound on inbound UDP datagrams forwarded into one per-socket UDPour child while it is
+/// Upper bound on inbound UDP datagrams forwarded into one per-socket `UDPour` child while it is
 /// still starting.
 ///
 /// During this short bring-up window the manager does not keep its own copy of incoming datagrams.
@@ -1039,7 +1075,7 @@ mod config_keys {
 /// `UdpPort` via `KompactSystem::trigger_i`. This counter only exists to bound that queueing.
 const MAX_BUFFERED_STARTUP_DATAGRAMS: usize = 64;
 
-/// When one bound UDP socket should gain its per-socket UDPour child.
+/// When one bound UDP socket should gain its per-socket `UDPour` child.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum UdpActivationPolicy {
     /// Create and connect the child immediately once the socket bind completes.
@@ -1060,7 +1096,7 @@ impl UdpActivationPolicy {
 
 /// Configure the route-transport runtime for the replication full-stack host.
 ///
-/// The current replication runtime keeps per-socket UDPour children dormant
+/// The current replication runtime keeps per-socket `UDPour` children dormant
 /// until a concrete route is first used. That avoids unnecessary startup churn
 /// for sockets that may never carry delivery traffic.
 pub(crate) fn configure_replication_runtime(config: &mut KompactConfig) {
@@ -1110,7 +1146,7 @@ struct PendingUdpSocketOpen {
 }
 
 /// One bound UDP socket that exists on the shared bridge but has not yet
-/// needed a UDPour child.
+/// needed a `UDPour` child.
 struct DormantUdpSocketHandle {
     socket_id: SocketId,
 }
@@ -1131,7 +1167,7 @@ struct StartingUdpSocketHandle {
     buffered_datagram_count: usize,
 }
 
-/// Provenance of one per-socket UDPour child while it is still starting.
+/// Provenance of one per-socket `UDPour` child while it is still starting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UdpSocketStartOrigin {
     /// The manager opened this socket itself and owns the whole resource lifecycle.
@@ -1168,7 +1204,7 @@ enum LiveUdpSendAction {
 /// This intentionally collapses multiple full UDP route keys onto one local
 /// socket whenever they would bind the same concrete local address. In
 /// particular, `ForPeer(...)` policies are normalized to the concrete local
-/// bind shape they resolve to so one child UDPour runtime can multiplex many
+/// bind shape they resolve to so one child `UDPour` runtime can multiplex many
 /// targets on the same socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct UdpSocketKey {
@@ -1245,8 +1281,9 @@ fn classify_transport_send_failure(reason: SendFailureReason) -> RouteTransportN
 fn classify_open_failure_for_nack(reason: OpenFailureReason) -> RouteTransportNackReason {
     match reason {
         OpenFailureReason::InvalidHandle => RouteTransportNackReason::RouteUnknown,
-        OpenFailureReason::DriverUnavailable => RouteTransportNackReason::RouteUnavailable,
-        OpenFailureReason::Io(_) => RouteTransportNackReason::RouteUnavailable,
+        OpenFailureReason::DriverUnavailable | OpenFailureReason::Io(_) => {
+            RouteTransportNackReason::RouteUnavailable
+        }
     }
 }
 
@@ -1282,7 +1319,10 @@ fn classify_udp_connect_failure_for_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delivery::test_support::{BoundReservedUdpSocket, TransportHarnessCore};
+    use crate::delivery::{
+        route_transport::{RoutePreferenceRank, RouteSharingKind, SendRouteCandidate},
+        test_support::{BoundReservedUdpSocket, TransportHarnessCore},
+    };
     use bytes::Bytes;
     use flotsync_io::{
         pool::PayloadWriter,
@@ -1489,7 +1529,6 @@ mod tests {
         }
 
         fn wait_for_send_ack_future(
-            &self,
             future: KFuture<TransportRouteTransportSubmitResult>,
         ) -> TransportRouteKey {
             match future
@@ -1507,7 +1546,6 @@ mod tests {
         }
 
         fn wait_for_send_nack(
-            &self,
             future: KFuture<TransportRouteTransportSubmitResult>,
         ) -> (TransportRouteKey, RouteTransportNackReason) {
             match future
@@ -1577,11 +1615,10 @@ mod tests {
                             return Some(buffered_count);
                         }
                     }
-                    if live && max_observed.get() == 0 {
-                        panic!(
-                            "UDPour child became live before any startup datagram was buffered for {socket_key:?}"
-                        );
-                    }
+                    assert!(
+                        !(live && max_observed.get() == 0),
+                        "UDPour child became live before any startup datagram was buffered for {socket_key:?}"
+                    );
                     None
                 },
                 StartupBufferedDatagramsTimeout {
@@ -1763,11 +1800,11 @@ mod tests {
         let submit2 = harness.send_async(route_send(send_id2, route2, b"second target".to_vec()));
 
         assert_eq!(
-            harness.wait_for_send_ack_future(submit1),
+            UdpManagerHarness::wait_for_send_ack_future(submit1),
             TransportRouteKey::Udp(route1)
         );
         assert_eq!(
-            harness.wait_for_send_ack_future(submit2),
+            UdpManagerHarness::wait_for_send_ack_future(submit2),
             TransportRouteKey::Udp(route2)
         );
         assert_eq!(harness.live_udp_socket_count(), 1);
@@ -1880,7 +1917,7 @@ mod tests {
         receiver_harness.wait_for_bridge_payload_frames(receiver_socket_id, buffered_count + 3);
 
         assert_eq!(
-            sender_harness.wait_for_send_ack_future(submit),
+            UdpManagerHarness::wait_for_send_ack_future(submit),
             TransportRouteKey::Udp(route)
         );
         sender_harness.wait_for_bridge_frame_type(sender_socket_id, 0x81);
@@ -1918,13 +1955,13 @@ mod tests {
                 socket_id,
                 UdpSocketStartOrigin::ExternalDormant,
                 vec![QueuedUdpSend { send_id, route }],
-                ConnectionFailureReason::TimedOut,
+                &ConnectionFailureReason::TimedOut,
             );
         });
 
         harness.wait_for_dormant_socket(socket_key);
         assert_eq!(harness.dormant_udp_socket_count(), 1);
-        let (coverage_key, reason) = harness.wait_for_send_nack(submit);
+        let (coverage_key, reason) = UdpManagerHarness::wait_for_send_nack(submit);
         assert_eq!(coverage_key, TransportRouteKey::Udp(route));
         assert_eq!(reason, RouteTransportNackReason::RouteUnavailable);
     }

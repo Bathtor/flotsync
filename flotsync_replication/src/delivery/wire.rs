@@ -599,7 +599,7 @@ fn member_identity_from_wire_view(
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
     let mut buffer = IdentifierBuf::new();
-    for segment in identifier.segments.iter() {
+    for segment in &identifier.segments {
         let segment = segment.to_owned();
         buffer
             .push_checked(segment.to_owned())
@@ -710,7 +710,7 @@ mod tests {
         }
     }
 
-    fn encode_boundary_frame(frame: proto::DeliveryBoundaryFrame) -> IoPayload {
+    fn encode_boundary_frame(frame: &proto::DeliveryBoundaryFrame) -> IoPayload {
         IoPayload::from(frame.encode_to_bytes())
     }
 
@@ -760,7 +760,7 @@ mod tests {
         let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(boundary);
+        let mut payload = encode_boundary_frame(&boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
@@ -805,7 +805,7 @@ mod tests {
         let group_memberships = group_memberships([group_id]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(boundary);
+        let mut payload = encode_boundary_frame(&boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
@@ -858,7 +858,7 @@ mod tests {
         let group_memberships = group_memberships([]);
         let local_members = members([member(&["charlie"])]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(boundary);
+        let mut payload = encode_boundary_frame(&boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {
@@ -900,7 +900,7 @@ mod tests {
         let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([recipient.clone()]);
-        let mut payload = encode_boundary_frame(boundary);
+        let mut payload = encode_boundary_frame(&boundary);
         let decoded = decode_boundary_frame_if_interested(
             &mut payload,
             DeliveryInterestView {

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::needless_pass_by_value,
+    reason = "Kompact component handlers consume owned message payloads delivered by the actor runtime."
+)]
+
 use super::{
     bridge::{IoBridgeMessage, UdpBridgeEvent},
     listener::{TcpListenerDriverEvent, TcpListenerMessage},
@@ -244,10 +249,18 @@ impl IoDriverComponent {
     ///
     /// A typical Kompact system creates exactly one instance and then passes it to one or more
     /// [`IoBridge`](super::IoBridge) components.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the raw driver buffer configuration is invalid.
+    #[must_use]
     pub fn new(config: DriverConfig) -> Self {
         Self::try_new(config).expect("IoDriverComponent buffer configuration must be valid")
     }
 
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
     pub fn try_new(config: DriverConfig) -> Result<Self> {
         let buffers = IoBufferPools::new(config.buffer_config.clone())?;
         Ok(Self {
@@ -596,6 +609,10 @@ impl IoDriverComponent {
         }
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Shutdown-routing arms remain explicit by command variant."
+    )]
     fn handle_dispatch_tcp(&mut self, command: TcpCommand) {
         let dispatch_result = self
             .driver

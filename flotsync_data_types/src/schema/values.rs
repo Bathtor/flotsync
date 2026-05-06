@@ -8,7 +8,7 @@ pub type UnixTimestamp = i64;
 
 /// Arrays over primitive values.
 ///
-/// Corresponds to the [[super::PrimitiveType]].
+/// Corresponds to the [[`super::PrimitiveType`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrimitiveValueArray {
     String(Vec<String>),
@@ -22,6 +22,11 @@ pub enum PrimitiveValueArray {
     Timestamp(Vec<UnixTimestamp>),
 }
 impl PrimitiveValueArray {
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Each variant wraps a different Vec element type, so the length arms cannot be combined type-safely."
+    )]
     pub fn len(&self) -> usize {
         match self {
             Self::String(values) => values.len(),
@@ -36,6 +41,7 @@ impl PrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -70,7 +76,7 @@ impl_primitive_value_array_from_vec!(f64, Float, |values: Vec<f64>| values
     .collect());
 impl_primitive_value_array_from_vec!(f32, Float, |values: Vec<f32>| values
     .into_iter()
-    .map(|value| OrderedFloat(value as f64))
+    .map(|value| OrderedFloat(f64::from(value)))
     .collect());
 impl_primitive_value_array_from_vec!(bool, Boolean, |values: Vec<bool>| values);
 impl_primitive_value_array_from_vec!(Vec<u8>, Binary, |values: Vec<Vec<u8>>| values);
@@ -78,7 +84,7 @@ impl_primitive_value_array_from_vec!(NaiveDate, Date, |values: Vec<NaiveDate>| v
 
 /// Primitive values.
 ///
-/// Corresponds to the [[super::PrimitiveType]].
+/// Corresponds to the [[`super::PrimitiveType`]].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrimitiveValue {
     String(String),
@@ -92,6 +98,7 @@ pub enum PrimitiveValue {
     Timestamp(UnixTimestamp),
 }
 impl PrimitiveValue {
+    #[must_use]
     pub fn as_ref(&self) -> PrimitiveValueRef<'_> {
         match self {
             Self::String(value) => PrimitiveValueRef::String(value.as_str()),
@@ -106,10 +113,16 @@ impl PrimitiveValue {
         }
     }
 
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants carry different shapes but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         self.as_ref().primitive_type()
     }
 
+    #[must_use]
     pub fn value_type(&self) -> PrimitiveType {
         self.primitive_type()
     }
@@ -120,7 +133,7 @@ macro_rules! impl_primitive_value_from_signed {
         $(
             impl From<$ty> for PrimitiveValue {
                 fn from(value: $ty) -> Self {
-                    Self::Int(value as i64)
+                    Self::Int(i64::from(value))
                 }
             }
         )*
@@ -132,7 +145,7 @@ macro_rules! impl_primitive_value_from_unsigned {
         $(
             impl From<$ty> for PrimitiveValue {
                 fn from(value: $ty) -> Self {
-                    Self::UInt(value as u64)
+                    Self::UInt(u64::from(value))
                 }
             }
         )*
@@ -163,8 +176,32 @@ impl From<u8> for PrimitiveValue {
     }
 }
 
-impl_primitive_value_from_unsigned!(u16, u32, u64, usize);
-impl_primitive_value_from_signed!(i8, i16, i32, i64, isize);
+impl_primitive_value_from_unsigned!(u16, u32);
+impl_primitive_value_from_signed!(i8, i16, i32);
+
+impl From<u64> for PrimitiveValue {
+    fn from(value: u64) -> Self {
+        Self::UInt(value)
+    }
+}
+
+impl From<usize> for PrimitiveValue {
+    fn from(value: usize) -> Self {
+        Self::UInt(value as u64)
+    }
+}
+
+impl From<i64> for PrimitiveValue {
+    fn from(value: i64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl From<isize> for PrimitiveValue {
+    fn from(value: isize) -> Self {
+        Self::Int(value as i64)
+    }
+}
 
 impl From<f64> for PrimitiveValue {
     fn from(value: f64) -> Self {
@@ -174,7 +211,7 @@ impl From<f64> for PrimitiveValue {
 
 impl From<f32> for PrimitiveValue {
     fn from(value: f32) -> Self {
-        Self::Float(OrderedFloat(value as f64))
+        Self::Float(OrderedFloat(f64::from(value)))
     }
 }
 
@@ -204,6 +241,11 @@ pub enum PrimitiveValueRef<'a> {
     Timestamp(UnixTimestamp),
 }
 impl PrimitiveValueRef<'_> {
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store values in different fields but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::String(_) => PrimitiveType::String,
@@ -218,10 +260,12 @@ impl PrimitiveValueRef<'_> {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self) -> PrimitiveType {
         self.primitive_type()
     }
 
+    #[must_use]
     pub fn to_owned(&self) -> PrimitiveValue {
         match self {
             Self::String(value) => PrimitiveValue::String((*value).to_owned()),
@@ -244,6 +288,7 @@ pub enum NullablePrimitiveValue {
     Value(PrimitiveValue),
 }
 impl NullablePrimitiveValue {
+    #[must_use]
     pub fn as_ref(&self) -> NullablePrimitiveValueRef<'_> {
         match self {
             Self::Null => NullablePrimitiveValueRef::Null,
@@ -251,6 +296,7 @@ impl NullablePrimitiveValue {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self, value_type: NullablePrimitiveType) -> NullablePrimitiveType {
         match self {
             Self::Null => value_type,
@@ -273,6 +319,7 @@ pub enum NullablePrimitiveValueRef<'a> {
     Value(PrimitiveValueRef<'a>),
 }
 impl NullablePrimitiveValueRef<'_> {
+    #[must_use]
     pub fn to_owned(&self) -> NullablePrimitiveValue {
         match self {
             Self::Null => NullablePrimitiveValue::Null,
@@ -335,7 +382,7 @@ macro_rules! impl_ordered_value_from_signed {
         $(
             impl From<$ty> for OrderedValue {
                 fn from(value: $ty) -> Self {
-                    Self::Value(PrimitiveValue::Int(value as i64))
+                    Self::Value(PrimitiveValue::Int(i64::from(value)))
                 }
             }
         )*
@@ -347,15 +394,39 @@ macro_rules! impl_ordered_value_from_unsigned {
         $(
             impl From<$ty> for OrderedValue {
                 fn from(value: $ty) -> Self {
-                    Self::Value(PrimitiveValue::UInt(value as u64))
+                    Self::Value(PrimitiveValue::UInt(u64::from(value)))
                 }
             }
         )*
     };
 }
 
-impl_ordered_value_from_unsigned!(u16, u32, u64, usize);
-impl_ordered_value_from_signed!(i8, i16, i32, i64, isize);
+impl_ordered_value_from_unsigned!(u16, u32);
+impl_ordered_value_from_signed!(i8, i16, i32);
+
+impl From<u64> for OrderedValue {
+    fn from(value: u64) -> Self {
+        Self::Value(PrimitiveValue::UInt(value))
+    }
+}
+
+impl From<usize> for OrderedValue {
+    fn from(value: usize) -> Self {
+        Self::Value(PrimitiveValue::UInt(value as u64))
+    }
+}
+
+impl From<i64> for OrderedValue {
+    fn from(value: i64) -> Self {
+        Self::Value(PrimitiveValue::Int(value))
+    }
+}
+
+impl From<isize> for OrderedValue {
+    fn from(value: isize) -> Self {
+        Self::Value(PrimitiveValue::Int(value as i64))
+    }
+}
 
 impl From<f64> for OrderedValue {
     fn from(value: f64) -> Self {
@@ -365,7 +436,7 @@ impl From<f64> for OrderedValue {
 
 impl From<f32> for OrderedValue {
     fn from(value: f32) -> Self {
-        Self::Value(PrimitiveValue::Float(OrderedFloat(value as f64)))
+        Self::Value(PrimitiveValue::Float(OrderedFloat(f64::from(value))))
     }
 }
 
@@ -431,6 +502,9 @@ pub enum NullablePrimitiveValueArray {
     },
 }
 impl NullablePrimitiveValueArray {
+    /// # Errors
+    ///
+    /// See `OrderedValueError` for failure conditions.
     pub fn ordered<I, V>(states: I) -> Result<Self, OrderedValueError>
     where
         I: IntoIterator<Item = V>,
@@ -483,6 +557,7 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn value_type(&self) -> NullablePrimitiveType {
         match self {
             Self::NonNull(values) => NullablePrimitiveType::NonNull(values.primitive_type()),
@@ -492,6 +567,11 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store values in different fields but expose the same primitive-type query."
+    )]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
             Self::NonNull(values) => values.primitive_type(),
@@ -499,10 +579,16 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_nullable(&self) -> bool {
         matches!(self, Self::Nullable { .. })
     }
 
+    #[must_use]
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Nullable and non-null variants store their values in different fields but count them identically."
+    )]
     pub fn value_count(&self) -> usize {
         match self {
             Self::NonNull(values) => values.len(),
@@ -510,10 +596,12 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn state_count(&self) -> usize {
         self.value_count() + usize::from(self.is_nullable())
     }
 
+    #[must_use]
     pub fn null_index(&self) -> Option<usize> {
         match self {
             Self::NonNull(_) => None,
@@ -521,6 +609,7 @@ impl NullablePrimitiveValueArray {
         }
     }
 
+    #[must_use]
     pub fn is_valid(&self) -> bool {
         match self {
             Self::NonNull(_) => true,
@@ -692,6 +781,10 @@ fn fmt_primitive_value_from_array(
     }
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "Display-compatible variants have distinct payload types, so combining arms would obscure type handling."
+)]
 fn fmt_primitive_value(value: &PrimitiveValue, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match value {
         PrimitiveValue::String(value) => fmt_single_quoted_string(value, f),

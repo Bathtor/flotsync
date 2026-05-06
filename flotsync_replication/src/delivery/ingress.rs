@@ -83,6 +83,7 @@ pub enum DeliveryTargetHint {
 impl DeliveryTargetHint {
     /// Return the delivery-domain message id when this target corresponds to
     /// one concrete message.
+    #[must_use]
     pub fn delivery_message_id(&self) -> Option<MessageId> {
         match self {
             Self::GroupBroadcast {
@@ -141,6 +142,7 @@ pub struct DeliveryIngressComponent {
 impl DeliveryIngressComponent {
     /// Creates one new delivery-ingress adapter with the current local-interest
     /// snapshot handles.
+    #[must_use]
     pub fn new(interest: DeliveryInterestConfig) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -563,7 +565,7 @@ mod tests {
             )),
             ..proto::DeliveryBoundaryFrame::default()
         };
-        encode_boundary(boundary)
+        encode_boundary(&boundary)
     }
 
     fn encode_recipient_ack_boundary_frame(
@@ -593,10 +595,10 @@ mod tests {
             )),
             ..proto::DeliveryBoundaryFrame::default()
         };
-        encode_boundary(boundary)
+        encode_boundary(&boundary)
     }
 
-    fn encode_boundary(boundary: proto::DeliveryBoundaryFrame) -> IoPayload {
+    fn encode_boundary(boundary: &proto::DeliveryBoundaryFrame) -> IoPayload {
         IoPayload::from(boundary.encode_to_bytes())
     }
 }

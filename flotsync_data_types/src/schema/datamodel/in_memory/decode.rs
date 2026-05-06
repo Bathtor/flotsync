@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    CounterValue,
+    InMemoryFieldValue,
+    LinearLatestValueWinsValue,
+    LinearListValue,
+    NullablePrimitiveValue,
+    PrimitiveValue,
+    UnixTimestamp,
+};
 use crate::{Decode, DecodeValueError, linear_data::LinearData};
 use chrono::NaiveDate;
 use ordered_float::OrderedFloat;
@@ -106,6 +114,14 @@ where
         .collect()
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Decoding `f32` from the in-memory f64 representation intentionally narrows precision."
+)]
+fn narrow_f64_to_f32(value: OrderedFloat<f64>) -> f32 {
+    value.into_inner() as f32
+}
+
 fn decode_single_char<T>(value: &str) -> Result<char, DecodeValueError> {
     let mut chars = value.chars();
     let Some(ch) = chars.next() else {
@@ -125,9 +141,9 @@ fn try_decode_char_code<T>(code_point: u32) -> Result<char, DecodeValueError> {
     })
 }
 
-fn extract_integer_value_ref<'a, OperationId>(
-    value: &'a InMemoryFieldValue<OperationId>,
-) -> Result<IntegerValueRef<'a>, ExtractFieldError>
+fn extract_integer_value_ref<OperationId>(
+    value: &InMemoryFieldValue<OperationId>,
+) -> Result<IntegerValueRef<'_>, ExtractFieldError>
 where
     OperationId: DecodeOperationIdBounds,
 {
@@ -172,16 +188,12 @@ where
             .as_ref()
             .map(IntegerValueRef::Timestamp)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::MonotonicCounter(CounterValue::Byte(value)) => {
+        InMemoryFieldValue::MonotonicCounter(CounterValue::Byte(value))
+        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
             Ok(IntegerValueRef::Byte(value))
         }
-        InMemoryFieldValue::MonotonicCounter(CounterValue::UInt(value)) => {
-            Ok(IntegerValueRef::UInt(value))
-        }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
-            Ok(IntegerValueRef::Byte(value))
-        }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
+        InMemoryFieldValue::MonotonicCounter(CounterValue::UInt(value))
+        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
             Ok(IntegerValueRef::UInt(value))
         }
         InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Int(value)) => {
@@ -209,9 +221,9 @@ where
     }
 }
 
-fn extract_integer_vec_ref<'a, OperationId>(
-    value: &'a InMemoryFieldValue<OperationId>,
-) -> Result<IntegerVecRef<'a>, ExtractFieldError>
+fn extract_integer_vec_ref<OperationId>(
+    value: &InMemoryFieldValue<OperationId>,
+) -> Result<IntegerVecRef<'_>, ExtractFieldError>
 where
     OperationId: DecodeOperationIdBounds,
 {
@@ -260,6 +272,10 @@ where
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The small reference enum is a local extraction result and is intentionally consumed by conversion helpers."
+)]
 fn convert_integer_value<T>(value: IntegerValueRef<'_>) -> Result<T, DecodeValueError>
 where
     T: TryFrom<u8> + TryFrom<u64> + TryFrom<i64>,
@@ -272,6 +288,10 @@ where
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "The small reference enum is a local extraction result and is intentionally consumed by conversion helpers."
+)]
 fn convert_integer_vec<T>(value: IntegerVecRef<'_>) -> Result<Vec<T>, DecodeValueError>
 where
     T: TryFrom<u8> + TryFrom<u64> + TryFrom<i64>,
@@ -404,9 +424,9 @@ macro_rules! impl_decode_exact_scalar {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 $extractor(value)
                     .map(Cow::Borrowed)
                     .map_err(|err| map_extract_error::<Self, _>(value, err))
@@ -421,9 +441,9 @@ macro_rules! impl_decode_integer_scalar_borrowed {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_value_ref(value)
                     .map_err(|err| map_extract_error::<Self, _>(value, err))?
                 {
@@ -441,9 +461,9 @@ macro_rules! impl_decode_integer_scalar_owned {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 let value = extract_integer_value_ref(value)
                     .map_err(|err| map_extract_error::<Self, _>(value, err))?;
                 Ok(Cow::Owned(convert_integer_value::<Self>(value)?))
@@ -458,9 +478,9 @@ macro_rules! impl_decode_exact_vec_or_list {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match $extractor(value) {
                     Ok(values) => Ok(Cow::Borrowed(values)),
                     Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -482,9 +502,9 @@ macro_rules! impl_decode_integer_vec_borrowed {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_vec_ref(value) {
                     Ok(value) => match value {
                         $(IntegerVecRef::$exact_variant(values) => Ok(Cow::Borrowed(values)),)+
@@ -530,9 +550,9 @@ macro_rules! impl_decode_integer_vec_owned {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_vec_ref(value) {
                     Ok(value) => Ok(Cow::Owned(convert_integer_vec::<$element>(value)?)),
                     Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -575,9 +595,9 @@ macro_rules! impl_decode_box_slice_via_vec {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 let values = <Vec<$element> as Decode<OperationId>>::decode(value)?;
                 Ok(Cow::Owned(values.into_owned().into_boxed_slice()))
             }
@@ -591,9 +611,9 @@ macro_rules! impl_decode_slice_via_vec {
         where
             OperationId: DecodeOperationIdBounds,
         {
-            fn decode<'a>(
-                value: &'a InMemoryFieldValue<OperationId>,
-            ) -> Result<Cow<'a, Self>, DecodeValueError> {
+            fn decode(
+                value: &InMemoryFieldValue<OperationId>,
+            ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match <Vec<$element> as Decode<OperationId>>::decode(value)? {
                     Cow::Borrowed(values) => Ok(Cow::Borrowed(values.as_slice())),
                     Cow::Owned(values) => Ok(Cow::Owned(values)),
@@ -624,9 +644,7 @@ impl<OperationId> Decode<OperationId> for String
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Borrowed(value)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -644,9 +662,7 @@ impl<OperationId> Decode<OperationId> for str
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match <String as Decode<OperationId>>::decode(value)? {
             Cow::Borrowed(value) => Ok(Cow::Borrowed(value.as_str())),
             Cow::Owned(value) => Ok(Cow::Owned(value)),
@@ -658,9 +674,7 @@ impl<OperationId> Decode<OperationId> for f64
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         let value = extract_float_value_ref(value)
             .map_err(|err| map_extract_error::<Self, _>(value, err))?;
         Ok(Cow::Owned(value.into_inner()))
@@ -671,12 +685,10 @@ impl<OperationId> Decode<OperationId> for f32
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         let value = extract_float_value_ref(value)
             .map_err(|err| map_extract_error::<Self, _>(value, err))?;
-        Ok(Cow::Owned(value.into_inner() as f32))
+        Ok(Cow::Owned(narrow_f64_to_f32(*value)))
     }
 }
 
@@ -684,25 +696,22 @@ impl<OperationId> Decode<OperationId> for char
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Owned(decode_single_char::<Self>(value.as_str())?)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
-            Err(ExtractFieldError::TypeMismatch) => match value {
-                InMemoryFieldValue::LinearString(value) => {
+            Err(ExtractFieldError::TypeMismatch) => {
+                if let InMemoryFieldValue::LinearString(value) = value {
                     let rendered: String = value.iter_values().collect();
                     Ok(Cow::Owned(decode_single_char::<Self>(&rendered)?))
-                }
-                _ => {
+                } else {
                     let code_point = convert_integer_value::<u32>(
                         extract_integer_value_ref(value)
                             .map_err(|err| map_extract_error::<Self, _>(value, err))?,
                     )?;
                     Ok(Cow::Owned(try_decode_char_code::<Self>(code_point)?))
                 }
-            },
+            }
         }
     }
 }
@@ -711,9 +720,7 @@ impl<OperationId> Decode<OperationId> for Vec<u8>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_binary_value_ref(value) {
             Ok(value) => Ok(Cow::Borrowed(value)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -769,9 +776,7 @@ impl<OperationId> Decode<OperationId> for Vec<f64>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_float_vec_ref(value) {
             Ok(values) => Ok(Cow::Owned(
                 values.iter().map(|value| value.into_inner()).collect(),
@@ -791,14 +796,12 @@ impl<OperationId> Decode<OperationId> for Vec<f32>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_float_vec_ref(value) {
             Ok(values) => Ok(Cow::Owned(
                 values
                     .iter()
-                    .map(|value| value.into_inner() as f32)
+                    .map(|value| narrow_f64_to_f32(*value))
                     .collect(),
             )),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -806,7 +809,7 @@ where
                 InMemoryFieldValue::LinearList(LinearListValue::Float(values)) => Ok(Cow::Owned(
                     values
                         .iter()
-                        .map(|value| value.into_inner() as f32)
+                        .map(|value| narrow_f64_to_f32(*value))
                         .collect(),
                 )),
                 _ => Err(type_mismatch::<Self, _>(value)),
@@ -819,9 +822,7 @@ impl<OperationId> Decode<OperationId> for Vec<char>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode<'a>(
-        value: &'a InMemoryFieldValue<OperationId>,
-    ) -> Result<Cow<'a, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Owned(value.chars().collect())),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -880,8 +881,20 @@ impl_decode_slice_via_vec!(NaiveDate);
 mod tests {
     use super::*;
     use crate::{
+        IdWithIndex,
         RowOperations,
-        schema::{Direction, Field},
+        any_data::{LinearLatestValueWins, list::LinearList},
+        schema::{
+            BasicDataType,
+            Direction,
+            Field,
+            NullableBasicDataType,
+            PrimitiveType,
+            ReplicatedDataType,
+            Schema,
+            datamodel::{InMemoryData, InMemoryDataRow},
+        },
+        text::LinearString,
     };
     use std::{assert_matches, collections::HashMap};
 
@@ -910,9 +923,7 @@ mod tests {
         IdWithIndex { id: 1, index }
     }
 
-    fn make_row<'a>(
-        data: &'a InMemoryData<(), OperationId>,
-    ) -> InMemoryDataRow<'a, (), OperationId> {
+    fn make_row(data: &InMemoryData<(), OperationId>) -> InMemoryDataRow<'_, (), OperationId> {
         InMemoryDataRow { data, row_index: 0 }
     }
 

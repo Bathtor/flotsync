@@ -20,6 +20,10 @@ use snafu::{FromString, Whatever, prelude::*};
 use std::{collections::VecDeque, net::SocketAddr};
 
 /// Runs the UDP flavour of the netcat example.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Example entry points consume parsed mode and scripted input values."
+)]
 pub(super) fn run_udp(
     runtime: &ExampleRuntime,
     scripted_lines: Vec<String>,
@@ -272,6 +276,10 @@ impl UdpNetcat {
         Handled::Ok
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact delivers UDP send results by value and this handler records the terminal effect."
+    )]
     fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
         let Some(socket_id) = self.socket_state.socket_id() else {
             return Handled::Ok;
@@ -421,6 +429,10 @@ impl UdpNetcat {
         Handled::DieNow
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Call sites build owned diagnostic strings exactly for this terminal log path."
+    )]
     fn fail_and_die(&mut self, message: String) -> Handled {
         self.terminate_failure(message);
         Handled::DieNow

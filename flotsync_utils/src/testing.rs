@@ -45,6 +45,7 @@ pub struct SmallVec<T, const N: usize> {
 }
 
 impl<T: Copy, const N: usize> SmallVec<T, N> {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             data: [None; N],
@@ -52,6 +53,9 @@ impl<T: Copy, const N: usize> SmallVec<T, N> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `M` is larger than this `SmallVec`'s fixed capacity `N`.
     pub const fn from_array<const M: usize>(input: [T; M]) -> Self {
         assert!(M <= N);
 
@@ -80,6 +84,9 @@ impl<T: Copy, const N: usize> SmallVec<T, N> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if `idx` is outside the initialised prefix.
     pub const fn at(&self, idx: usize) -> &T {
         match self.get(idx) {
             Some(v) => v,
@@ -87,6 +94,9 @@ impl<T: Copy, const N: usize> SmallVec<T, N> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if any slot inside the initialised prefix is empty.
     pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
         self.data[..self.len].iter().map(|x| x.unwrap())
     }
@@ -102,9 +112,7 @@ impl<T: Copy, const N: usize> FromIterator<T> for SmallVec<T, N> {
         let mut i = 0;
 
         for v in iter {
-            if i >= N {
-                panic!("SmallVec capacity exceeded");
-            }
+            assert!(i < N, "SmallVec capacity exceeded");
             out.data[i] = Some(v);
             i += 1;
         }

@@ -103,6 +103,10 @@ impl TcpListener {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "Kompact component messages are delivered by value and this handler routes them immediately."
+    )]
     fn handle_request(&mut self, request: TcpListenerRequest) -> Handled {
         match request {
             TcpListenerRequest::Close => self.handle_close_request(),
@@ -130,6 +134,11 @@ impl TcpListener {
         Handled::Ok
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        clippy::match_same_arms,
+        reason = "Listener driver events are delivered by value; repeated state outcomes are kept explicit by event variant."
+    )]
     fn handle_driver_event(&mut self, event: TcpListenerDriverEvent) -> Handled {
         match event {
             TcpListenerDriverEvent::Listening {
@@ -254,6 +263,10 @@ impl TcpListener {
         })
     }
 
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Pending-drop state handling names each lifecycle state even when the resulting action matches."
+    )]
     fn handle_drop_pending(&mut self, connection_id: ConnectionId) -> Handled {
         if !self.pending_connections.remove(&connection_id) {
             return Handled::Ok;
@@ -343,8 +356,7 @@ fn shutdown_listener(listener: &mut TcpListener) -> Handled {
     listener.pending_connections.clear();
     Handled::block_on(listener, move |async_self| async move {
         match resolve_kfuture(release).await {
-            Ok(()) => {}
-            Err(Error::UnknownListener { .. }) => {}
+            Ok(()) | Err(Error::UnknownListener { .. }) => {}
             Err(error) => {
                 warn!(
                     async_self.log(),

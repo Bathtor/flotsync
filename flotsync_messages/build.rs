@@ -52,12 +52,11 @@ fn build_descriptor_set(workspace_root: &Path, descriptor_set: &Path) {
         .arg("messages/proto")
         .output()
         .expect("Run buf build");
-    if !output.status.success() {
-        panic!(
-            "buf build failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "buf build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn emit_buf_rerun_if_changed(workspace_root: &Path) {
@@ -75,12 +74,11 @@ fn emit_buf_rerun_if_changed(workspace_root: &Path) {
         .arg("messages/proto")
         .output()
         .expect("Run buf ls-files");
-    if !output.status.success() {
-        panic!(
-            "buf ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "buf ls-files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     for path in String::from_utf8_lossy(&output.stdout).lines() {
         let path = path.trim();

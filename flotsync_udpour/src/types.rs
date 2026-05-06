@@ -5,10 +5,10 @@ use roaring::RoaringBitmap;
 use snafu::prelude::*;
 use std::num::NonZeroU32;
 
-/// Current UDPour protocol version.
+/// Current `UDPour` protocol version.
 pub(crate) const PROTOCOL_VERSION: u8 = 1;
 
-/// Bitflags carried in the shared UDPour header.
+/// Bitflags carried in the shared `UDPour` header.
 ///
 /// This is a small wrapper rather than a raw `u8` so call sites can describe
 /// intent directly and we have one place to grow future payload/control flags.
@@ -67,12 +67,17 @@ pub struct PartCount(NonZeroU32);
 
 impl PartCount {
     /// Wraps one raw part count while enforcing the protocol's non-zero rule.
+    ///
+    /// # Errors
+    ///
+    /// See `UDPourTypeError` for failure conditions.
     pub fn new(value: u32) -> Result<Self, UDPourTypeError> {
         let value = NonZeroU32::new(value).context(ZeroPartCountSnafu)?;
         Ok(Self(value))
     }
 
     /// Returns the raw count.
+    #[must_use]
     pub fn get(self) -> u32 {
         self.0.get()
     }

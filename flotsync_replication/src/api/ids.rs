@@ -10,10 +10,12 @@ pub type MemberIdentity = Identifier;
 pub struct MemberIndex(u32);
 
 impl MemberIndex {
+    #[must_use]
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
+    #[must_use]
     pub const fn as_u32(self) -> u32 {
         self.0
     }
@@ -58,6 +60,9 @@ impl std::fmt::Display for GroupId {
 pub struct DatasetId(String);
 
 impl DatasetId {
+    /// # Errors
+    ///
+    /// See `DatasetIdError` for failure conditions.
     pub fn try_new(value: impl Into<String>) -> Result<Self, DatasetIdError> {
         let value = value.into();
 
@@ -83,10 +88,12 @@ impl DatasetId {
         Ok(Self(value))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
+    #[must_use]
     pub fn into_string(self) -> String {
         self.0
     }

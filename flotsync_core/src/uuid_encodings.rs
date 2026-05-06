@@ -37,10 +37,19 @@ pub enum UuidEncodingError {
 }
 
 pub trait UuidEncodingExt {
+    /// # Errors
+    ///
+    /// See `UuidEncodingError` for failure conditions.
     fn encode_words(&self) -> Result<String, UuidEncodingError>;
     fn encode_base64(&self) -> String;
 
+    /// # Errors
+    ///
+    /// See `UuidEncodingError` for failure conditions.
     fn decode_words(input: &str) -> Result<Uuid, UuidEncodingError>;
+    /// # Errors
+    ///
+    /// See `UuidEncodingError` for failure conditions.
     fn decode_base64(input: &str) -> Result<Uuid, UuidEncodingError>;
 }
 
@@ -59,18 +68,18 @@ impl UuidEncodingExt for Uuid {
         let bytes = niceware::passphrase_to_bytes(&words).context(DecodeWordsSnafu {
             input: input.to_owned(),
         })?;
-        uuid_from_decoded_bytes(input, bytes)
+        uuid_from_decoded_bytes(input, &bytes)
     }
 
     fn decode_base64(input: &str) -> Result<Uuid, UuidEncodingError> {
         let bytes = URL_SAFE_NO_PAD.decode(input).context(DecodeBase64Snafu {
             input: input.to_owned(),
         })?;
-        uuid_from_decoded_bytes(input, bytes)
+        uuid_from_decoded_bytes(input, &bytes)
     }
 }
 
-fn uuid_from_decoded_bytes(input: &str, bytes: Vec<u8>) -> Result<Uuid, UuidEncodingError> {
+fn uuid_from_decoded_bytes(input: &str, bytes: &[u8]) -> Result<Uuid, UuidEncodingError> {
     if bytes.len() != 16 {
         return InvalidByteLengthSnafu {
             input: input.to_owned(),
@@ -79,7 +88,7 @@ fn uuid_from_decoded_bytes(input: &str, bytes: Vec<u8>) -> Result<Uuid, UuidEnco
         .fail();
     }
     let mut data = [0u8; 16];
-    data.copy_from_slice(&bytes);
+    data.copy_from_slice(bytes);
     Ok(Uuid::from_bytes(data))
 }
 

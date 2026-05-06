@@ -234,7 +234,9 @@ impl ScriptedUdpProxy {
                     *expected_parts = Some(frame.header.part_count.get());
                 }
                 buffered.push(indication);
-                if buffered.len() as u32 != expected_parts.expect("expected_parts just set") {
+                let buffered_parts =
+                    u32::try_from(buffered.len()).expect("test payload part count fits into u32");
+                if buffered_parts != expected_parts.expect("expected_parts just set") {
                     return Vec::new();
                 }
                 *flushed = true;
@@ -312,15 +314,6 @@ impl Provide<UdpPort> for ScriptedUdpProxy {
                 target,
                 reply_to,
             } => match &mut self.request_behavior {
-                ProxyRequestBehavior::Pass => {
-                    self.upstream.trigger(UdpRequest::Send {
-                        socket_id,
-                        transmission_id,
-                        payload,
-                        target,
-                        reply_to,
-                    });
-                }
                 ProxyRequestBehavior::NackFirstSend { reason, fired } if !*fired => {
                     *fired = true;
                     reply_to.tell(UdpSendResult::Nack {
@@ -329,7 +322,7 @@ impl Provide<UdpPort> for ScriptedUdpProxy {
                         reason: *reason,
                     });
                 }
-                ProxyRequestBehavior::NackFirstSend { .. } => {
+                ProxyRequestBehavior::Pass | ProxyRequestBehavior::NackFirstSend { .. } => {
                     self.upstream.trigger(UdpRequest::Send {
                         socket_id,
                         transmission_id,
@@ -485,6 +478,10 @@ impl RuntimeHarness {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "test harness construction wires several Kompact components that are clearer together"
+    )]
     fn build(config: RuntimeHarnessBuildConfig) -> Self {
         let RuntimeHarnessBuildConfig {
             sender_request_behavior,
@@ -640,8 +637,8 @@ impl RuntimeHarness {
             .receiver_runtime
             .on_definition(|component| component.timer_snapshot());
         self.advance_time(duration);
-        self.wait_for_due_timers_to_process(&self.sender_runtime, sender_before, "sender");
-        self.wait_for_due_timers_to_process(&self.receiver_runtime, receiver_before, "receiver");
+        Self::wait_for_due_timers_to_process(&self.sender_runtime, &sender_before, "sender");
+        Self::wait_for_due_timers_to_process(&self.receiver_runtime, &receiver_before, "receiver");
         // This is intentionally scoped to timers that were already armed
         // before the logical-time advance. The helper assumes the harness was
         // otherwise settled before it was called.
@@ -673,23 +670,23 @@ impl RuntimeHarness {
         });
     }
 
-    fn inject_sender_indication(&self, source: SocketAddr, frame: UDPourFrame) {
+    fn inject_sender_indication(&self, source: SocketAddr, frame: &UDPourFrame) {
         self.system.trigger_i(
             UdpIndication::Received {
                 socket_id: self.sender_socket_id,
                 source,
-                payload: encode_frame(&frame).expect("injected sender frame must encode"),
+                payload: encode_frame(frame).expect("injected sender frame must encode"),
             },
             &self.sender_runtime.required_ref(),
         );
     }
 
-    fn inject_receiver_indication(&self, source: SocketAddr, frame: UDPourFrame) {
+    fn inject_receiver_indication(&self, source: SocketAddr, frame: &UDPourFrame) {
         self.system.trigger_i(
             UdpIndication::Received {
                 socket_id: self.receiver_socket_id,
                 source,
-                payload: encode_frame(&frame).expect("injected receiver frame must encode"),
+                payload: encode_frame(frame).expect("injected receiver frame must encode"),
             },
             &self.receiver_runtime.required_ref(),
         );
@@ -811,9 +808,8 @@ impl RuntimeHarness {
     }
 
     fn wait_for_due_timers_to_process(
-        &self,
         component: &Arc<Component<UDPourComponent>>,
-        before: RuntimeTimerSnapshot,
+        before: &RuntimeTimerSnapshot,
         component_name: &str,
     ) {
         eventually_component_state(
@@ -821,8 +817,15 @@ impl RuntimeHarness {
             component,
             |component| {
                 let after = component.timer_snapshot();
-                Self::timer_processed(&before.dispatch_timer, &after.dispatch_timer, after.now)
-                    && Self::timer_processed(&before.poll_timer, &after.poll_timer, after.now)
+                Self::timer_processed(
+                    before.dispatch_timer.as_ref(),
+                    after.dispatch_timer.as_ref(),
+                    after.now,
+                ) && Self::timer_processed(
+                    before.poll_timer.as_ref(),
+                    after.poll_timer.as_ref(),
+                    after.now,
+                )
             },
             format_args!(
                 "timed out waiting for {component_name} runtime to process timers due during manual-time advance"
@@ -831,8 +834,8 @@ impl RuntimeHarness {
     }
 
     fn timer_processed(
-        before: &Option<ActiveTimerSnapshot>,
-        after: &Option<ActiveTimerSnapshot>,
+        before: Option<&ActiveTimerSnapshot>,
+        after: Option<&ActiveTimerSnapshot>,
         now: Instant,
     ) -> bool {
         let Some(before) = before else {
@@ -1249,7 +1252,7 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     let missing_parts = RoaringBitmap::from([0, 1, 2]);
     harness.inject_sender_indication(
         localhost(9001),
-        UDPourFrame::NeedParts(NeedPartsFrame {
+        &UDPourFrame::NeedParts(NeedPartsFrame {
             header: UDPourHeader::control(FrameType::NeedParts, message_id, part_count, checksum)
                 .unwrap(),
             missing_parts,
@@ -1277,7 +1280,7 @@ fn shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry() {
     ] {
         harness.inject_receiver_indication(
             harness.sender_addr,
-            UDPourFrame::Payload(PayloadFrame {
+            &UDPourFrame::Payload(PayloadFrame {
                 header: UDPourHeader::payload(message_id, part_number, part_count, checksum),
                 payload,
             }),
@@ -1301,7 +1304,7 @@ fn send_delay_and_window_pace_multipart_transmission() {
         // of the way, otherwise `NeedParts` retransmissions can overlap with
         // the paced sends and stop testing the behaviour we actually care about.
         ReceiverConfig {
-            repair_interval: Duration::from_secs(60),
+            repair_interval: Duration::from_mins(1),
             ..DEFAULT_RECEIVER_CONFIG
         },
         TestSendRateControl {

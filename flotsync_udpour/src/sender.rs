@@ -3,7 +3,18 @@
 //! This module owns sender-local `message_id` allocation, bounded retention of
 //! original payload parts, and late repair behavior.
 
-use crate::types::*;
+use crate::types::{
+    AckFrame,
+    Checksum,
+    FrameFlags,
+    MessageId,
+    NeedPartsFrame,
+    NoLongerAvailableFrame,
+    PartCount,
+    PartNumber,
+    PayloadFrame,
+    UDPourHeader,
+};
 use bytes::Buf;
 use flotsync_io::prelude::IoPayload;
 use roaring::RoaringBitmap;
@@ -52,7 +63,7 @@ impl Default for SenderConfig {
             max_part_payload_len: NonZeroUsize::new(1024)
                 .expect("default UDPour sender config must use a non-zero part payload length"),
             retention_timeout: Duration::from_secs(5),
-            id_reuse_cooldown: Duration::from_secs(60 * 10),
+            id_reuse_cooldown: Duration::from_mins(10),
             eager_ack_cleanup: false,
         }
     }
@@ -464,7 +475,7 @@ impl LiveMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NeedPartsFrame, PartNumber};
+    use crate::types::{FrameType, NeedPartsFrame, PartNumber};
     use roaring::RoaringBitmap;
 
     #[test]

@@ -34,6 +34,7 @@ pub struct BoundedCollector {
 
 impl BoundedCollector {
     /// Creates one empty collector with the supplied maximum buffered size.
+    #[must_use]
     pub fn new(limit: usize) -> Self {
         Self {
             buffer: Vec::new(),
@@ -51,6 +52,7 @@ impl BoundedCollector {
     /// After [`CollectUntil::Complete`], this contains exactly the completed frame bytes including
     /// the delimiter. Any trailing bytes from the current chunk are reported only through
     /// `trailing_offset` and are not retained in the collector buffer.
+    #[must_use]
     pub fn buffered(&self) -> &[u8] {
         &self.buffer
     }
@@ -61,6 +63,10 @@ impl BoundedCollector {
     /// full buffered frame. This lets callers continue processing trailing bytes from the same
     /// payload without reparsing the frame. The collector does not reset itself automatically
     /// after completion; call [`BoundedCollector::clear`] before reusing it for the next frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `delimiter` is empty.
     pub fn push_until<'a>(&'a mut self, chunk: &[u8], delimiter: &[u8]) -> CollectUntil<'a> {
         assert!(
             !delimiter.is_empty(),

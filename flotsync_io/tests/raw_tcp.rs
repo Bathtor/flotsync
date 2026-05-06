@@ -108,6 +108,10 @@ fn tcp_driver_reports_connect_failure() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This driver integration test covers the outbound TCP session lifecycle end to end."
+)]
 fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close() {
     init_test_logger();
 
@@ -192,7 +196,7 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
                 saw_closed = true;
             }
             other => {
-                log::debug!("ignoring unrelated raw TCP event: {:?}", other);
+                log::debug!("ignoring unrelated raw TCP event: {other:?}");
             }
         }
     }
@@ -268,6 +272,10 @@ fn tcp_driver_outbound_session_lifecycle_handles_remote_close_and_abortive_close
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This driver integration test covers pending listener adoption and rejection in one flow."
+)]
 fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_adopted_sessions_alive()
  {
     init_test_logger();
@@ -443,6 +451,10 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "This driver integration test covers TCP read and write flow-control transitions end to end."
+)]
 fn tcp_driver_reports_read_and_write_flow_control_transitions() {
     init_test_logger();
 
@@ -538,7 +550,7 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
                 saw_backpressure_nack = true;
             }
             other => {
-                log::debug!("ignoring unrelated TCP flow-control event: {:?}", other);
+                log::debug!("ignoring unrelated TCP flow-control event: {other:?}");
             }
         }
     }
@@ -563,7 +575,7 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
                 saw_write_resumed = true;
             }
             other => {
-                log::debug!("ignoring unrelated TCP flow-control event: {:?}", other);
+                log::debug!("ignoring unrelated TCP flow-control event: {other:?}");
             }
         }
     }
@@ -628,7 +640,7 @@ fn tcp_driver_reports_read_and_write_flow_control_transitions() {
                 saw_third_payload = true;
             }
             other => {
-                log::debug!("ignoring unrelated TCP flow-control event: {:?}", other);
+                log::debug!("ignoring unrelated TCP flow-control event: {other:?}");
             }
         }
     }

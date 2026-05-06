@@ -1,4 +1,4 @@
-use super::*;
+use super::Snafu;
 use crate::{SocketPort, kompact::prelude::*};
 use flotsync_io::prelude::{
     ConfigureFailureReason,
@@ -38,7 +38,7 @@ pub struct Options {
 
 impl Options {
     pub const DEFAULT: Self = Self {
-        bind_addr: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+        bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         bind_port: SocketPort(0),
         port: SocketPort(52156),
         announcement_interval: Duration::from_secs(5),
@@ -145,10 +145,12 @@ pub enum PeerAnnouncementMessage {
 }
 
 impl PeerAnnouncementComponent {
+    #[must_use]
     pub fn with_options(options: Options) -> Self {
         Self::with_optional_startup_promise(options, None)
     }
 
+    #[must_use]
     pub fn with_options_and_startup_promise(
         options: Options,
         startup_promise: KPromise<PeerAnnouncementStartupResult>,
@@ -417,18 +419,20 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn handle_udp_indication(&mut self, indication: UdpIndication) -> Handled {
+    fn handle_udp_indication(&mut self, indication: &UdpIndication) -> Handled {
         match indication {
             UdpIndication::Bound {
                 request_id,
                 socket_id,
                 local_addr,
-            } if matches!(self.state, SocketState::Opening { request_id: current } if current == request_id) =>
+            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) =>
             {
                 info!(self.log(), "Sending peer announcements from {local_addr}");
-                self.state = SocketState::EnablingBroadcast { socket_id };
+                self.state = SocketState::EnablingBroadcast {
+                    socket_id: *socket_id,
+                };
                 self.udp.trigger(UdpRequest::Configure {
-                    socket_id,
+                    socket_id: *socket_id,
                     option: UdpSocketOption::Broadcast(true),
                 });
                 Handled::Ok
@@ -437,11 +441,11 @@ impl PeerAnnouncementComponent {
                 request_id,
                 local_addr,
                 reason,
-            } if matches!(self.state, SocketState::Opening { request_id: current } if current == request_id) =>
+            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) =>
             {
                 self.notify_startup_failure(PeerAnnouncementStartupError::BindFailed {
-                    local_addr,
-                    reason,
+                    local_addr: *local_addr,
+                    reason: *reason,
                 });
                 error!(
                     self.log(),
@@ -451,10 +455,12 @@ impl PeerAnnouncementComponent {
                 Handled::DieNow
             }
             UdpIndication::Configured { socket_id, option }
-                if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == socket_id)
-                    && option == UdpSocketOption::Broadcast(true) =>
+                if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == *socket_id)
+                    && *option == UdpSocketOption::Broadcast(true) =>
             {
-                self.state = SocketState::Running { socket_id };
+                self.state = SocketState::Running {
+                    socket_id: *socket_id,
+                };
                 self.notify_startup_success();
                 self.run_announcement_cycle()
             }
@@ -462,11 +468,14 @@ impl PeerAnnouncementComponent {
                 socket_id,
                 option,
                 reason,
-            } if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == socket_id)
-                && option == UdpSocketOption::Broadcast(true) =>
+            } if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == *socket_id)
+                && *option == UdpSocketOption::Broadcast(true) =>
             {
                 self.notify_startup_failure(
-                    PeerAnnouncementStartupError::ConfigureBroadcastFailed { socket_id, reason },
+                    PeerAnnouncementStartupError::ConfigureBroadcastFailed {
+                        socket_id: *socket_id,
+                        reason: *reason,
+                    },
                 );
                 error!(
                     self.log(),
@@ -479,7 +488,7 @@ impl PeerAnnouncementComponent {
                 socket_id,
                 remote_addr: _,
                 reason,
-            } if self.state.socket_id() == Some(socket_id) => {
+            } if self.state.socket_id() == Some(*socket_id) => {
                 info!(
                     self.log(),
                     "Peer announcement UDP socket closed ({reason:?})"
@@ -492,7 +501,7 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
+    fn handle_send_result(&mut self, result: &UdpSendResult) -> Handled {
         let Some(socket_id) = self.state.socket_id() else {
             return Handled::Ok;
         };
@@ -501,7 +510,7 @@ impl PeerAnnouncementComponent {
             UdpSendResult::Ack {
                 socket_id: result_socket_id,
                 transmission_id,
-            } if result_socket_id == socket_id => {
+            } if *result_socket_id == socket_id => {
                 trace!(
                     self.log(),
                     "Peer announcement send acknowledged as tx#{:x}", transmission_id.0
@@ -511,7 +520,7 @@ impl PeerAnnouncementComponent {
                 socket_id: result_socket_id,
                 transmission_id,
                 reason,
-            } if result_socket_id == socket_id => {
+            } if *result_socket_id == socket_id => {
                 debug!(
                     self.log(),
                     "Peer announcement send rejected as tx#{:x}: {reason:?}", transmission_id.0
@@ -544,7 +553,7 @@ impl ComponentLifecycle for PeerAnnouncementComponent {
 
 impl Require<UdpPort> for PeerAnnouncementComponent {
     fn handle(&mut self, indication: UdpIndication) -> Handled {
-        self.handle_udp_indication(indication)
+        self.handle_udp_indication(&indication)
     }
 }
 
@@ -553,7 +562,7 @@ impl Actor for PeerAnnouncementComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
         match msg {
-            PeerAnnouncementMessage::SendResult(result) => self.handle_send_result(result),
+            PeerAnnouncementMessage::SendResult(result) => self.handle_send_result(&result),
         }
     }
 }
@@ -669,7 +678,7 @@ mod tests {
             .with_instance_id(
                 Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("valid UUID"),
             )
-            .with_announcement_interval(Duration::from_secs(60));
+            .with_announcement_interval(Duration::from_mins(1));
         let expected_instance_id = options.instance_id;
 
         let system = build_test_kompact_system();
