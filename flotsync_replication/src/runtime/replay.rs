@@ -142,7 +142,7 @@ pub(super) async fn load_publish_dataset_state(
     let mut replayed_read_base_datasets = HashMap::new();
     if !dataset_ids_that_require_replay.is_empty() {
         let applied_updates = transaction
-            .load_replication_updates(&group_id, ReplicationUpdateFilter::Applied)
+            .load_replication_updates(&group_id, ReplicationUpdateFilter::Applied, None)
             .await
             .context(publish::StoreAccessSnafu)?;
         let replayed_datasets = replay_datasets_at_versions(

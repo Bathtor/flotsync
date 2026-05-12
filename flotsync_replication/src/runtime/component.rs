@@ -1,4 +1,12 @@
+#[cfg(test)]
+use super::messages::UpdateBatchMessage;
 use super::{
+    catch_up_manager::{
+        CatchUpManagerMessage,
+        NeedVersions,
+        ObservedAvailable,
+        subtract_available_ranges,
+    },
     envelope::{encode_runtime_payload, placeholder_signed_footer},
     errors::{
         ConflictingExistingGroupSnafu,
@@ -35,12 +43,14 @@ use super::{
     },
     messages::{
         BootstrapGroupMessage,
-        DatasetUpdateMessage,
         RuntimeMessage,
         SummaryMessage,
         SummaryRequestMessage,
         UpdateMessage,
+        UpdateRangeMessage,
         WireRuntimeMessage,
+        WireSummaryMessage,
+        WireUpdateBatchMessage,
         WireUpdateMessage,
     },
     replay,
@@ -49,6 +59,7 @@ use super::{
 use crate::{
     GroupMembers,
     GroupMemberships,
+    MAX_VERSION_VALUE,
     SharedGroupMemberships,
     api::{
         ApiError,
@@ -101,12 +112,7 @@ use crate::{
             ReliableDeliveryPortIndication,
             ReliableDeliveryPortRequest,
         },
-        group_broadcast::{
-            GroupBroadcastDeliver,
-            GroupBroadcastSubmit,
-            GroupMessageEnvelope,
-            GroupMessageHeader,
-        },
+        group_broadcast::{GroupBroadcastDeliver, GroupMessageHeader},
         reliable_delivery::{
             ReliableDeliveryDeliver,
             ReliableDeliverySubmit,
@@ -120,6 +126,7 @@ use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::OwnedRow;
 use flotsync_utils::{BoxFuture, KClaimablePromise};
 use futures_util::FutureExt;
+use itertools::Itertools;
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{
@@ -136,6 +143,34 @@ struct PreparedLocalPublish {
     read_token: ReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
+}
+
+/// Source-specific sender validation for an inbound update.
+enum InboundUpdateOrigin {
+    /// Direct `Update` delivery where the envelope sender must be the producer.
+    Producer { sender: MemberIdentity },
+    /// Catch-up delivery where the envelope sender forwards another producer's update.
+    Forwarder { sender: MemberIdentity },
+}
+
+/// Result of processing one inbound update.
+struct InboundUpdateOutcome {
+    /// Listener batches produced by updates that became newly applicable.
+    event_batches: Vec<ListenerDataChanges>,
+    /// Producer-version ranges still needed before blocked updates can apply.
+    needed_ranges: Vec<UpdateRangeMessage>,
+    /// Producer versions now known to be present in the local update log.
+    observed_available: Vec<UpdateRangeMessage>,
+}
+
+/// Catch-up notifications derived from one observed summary message.
+struct SummaryCatchUpObservation {
+    /// Group whose local progress was compared with the observed summary.
+    group_id: GroupId,
+    /// Local pending update-log versions that can be advertised as available.
+    observed_available: Vec<UpdateRangeMessage>,
+    /// Versions the summary says exist elsewhere and are not already pending locally.
+    needed_ranges: Vec<UpdateRangeMessage>,
 }
 
 /// One listener notification batch paired with the read token reached by that batch.
@@ -227,11 +262,27 @@ impl InboundDeliveryFailure {
     }
 }
 
+/// Convert a wire summary using an explicit membership snapshot for context.
+fn summary_from_wire(
+    sender: MemberIdentity,
+    message: WireSummaryMessage,
+    memberships: &GroupMemberships,
+) -> Result<Summary, InboundDeliveryError> {
+    let group_id = message.group_id;
+    let members = memberships
+        .members(&group_id)
+        .context(inbound::UnknownHostedGroupSnafu { group_id })?;
+    let member_count = NonZeroUsize::new(members.len()).expect("group members must not be empty");
+    message
+        .into_summary(sender, member_count)
+        .context(inbound::DecodeReadVersionsSnafu { group_id })
+}
+
 /// Snapshot provider backed by one store read transaction.
 ///
 /// The transaction pins a consistent store view while the provider batches rows
 /// from requested datasets. Dropping the provider releases the transaction
-/// through the store implementation's rollback-on-drop path.
+/// through the store implementation's release-on-drop path.
 struct StoreSnapshotRowProvider {
     transaction: Option<Box<dyn ReplicationStoreReadTransaction>>,
     group_id: GroupId,
@@ -252,7 +303,7 @@ impl StoreSnapshotRowProvider {
             return Ok(());
         };
         transaction
-            .rollback()
+            .release()
             .await
             .boxed()
             .context(ProviderExternalSnafu)
@@ -393,6 +444,7 @@ pub enum ReplicationRuntimeTestMessage {
     Ping(Ask<(), ()>),
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
     ApplyUpdate(Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>),
+    ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
 }
 
 #[cfg(test)]
@@ -422,6 +474,17 @@ impl ReplicationRuntimeMessage {
             (sender, message),
         )))
     }
+
+    pub(super) fn test_apply_update_batch(
+        promise: KPromise<Result<(), InboundDeliveryError>>,
+        sender: MemberIdentity,
+        message: UpdateBatchMessage,
+    ) -> Self {
+        Self::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(Ask::new(
+            promise,
+            (sender, message),
+        )))
+    }
 }
 
 /// Stateful Kompact component that hosts one replication runtime.
@@ -439,6 +502,7 @@ pub struct ReplicationRuntimeComponent {
     listener: Arc<dyn ReplicationEventListener>,
     group_memberships: SharedGroupMemberships,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+    catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
 }
 
 impl ReplicationRuntimeComponent {
@@ -449,6 +513,7 @@ impl ReplicationRuntimeComponent {
         listener: Arc<dyn ReplicationEventListener>,
         group_memberships: SharedGroupMemberships,
         summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+        catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -459,6 +524,7 @@ impl ReplicationRuntimeComponent {
             listener,
             group_memberships,
             summary_request_manager,
+            catch_up_manager,
         }
     }
 
@@ -571,7 +637,7 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Persist one set of explicit row patches back into durable storage.
+    /// Persist one set of explicit row patches back into the replication store.
     async fn apply_dataset_row_patches(
         transaction: &mut dyn ReplicationStoreTransaction,
         patches: Vec<DatasetRowPatch>,
@@ -613,6 +679,110 @@ impl ReplicationRuntimeComponent {
         ReadToken::from_group_versions(group_versions)
     }
 
+    /// Return catch-up ranges required before an inbound update can apply.
+    ///
+    /// The update can be blocked both by versions in its read frontier and by
+    /// earlier versions from the same producer. The latter are not present in
+    /// the read frontier because producer updates do not read themselves.
+    fn missing_ranges_for_update_frontier(
+        local_versions: &VersionVector,
+        group_id: GroupId,
+        update_id: UpdateId,
+        read_versions: &VersionVector,
+    ) -> Result<Vec<UpdateRangeMessage>, InboundDeliveryError> {
+        let mut ranges = local_versions
+            .missing_version_ranges_to(read_versions)
+            .into_iter()
+            .map(UpdateRangeMessage::from)
+            .collect_vec();
+        let producer_index = update_id.node_index as usize;
+        ensure!(
+            producer_index < local_versions.num_members().get(),
+            inbound::UpdateProducerIndexNotInGroupSnafu {
+                group_id,
+                producer_index: MemberIndex::new(update_id.node_index),
+            }
+        );
+        let expected_producer_version = local_versions.version_at(producer_index) + 1;
+        if update_id.version > expected_producer_version {
+            ranges.push(UpdateRangeMessage {
+                producer_index: update_id.node_index,
+                start_version: expected_producer_version,
+                end_version: update_id.version - 1,
+            });
+        }
+        Ok(ranges)
+    }
+
+    /// Validate the envelope sender for one inbound update and return the producer identity.
+    ///
+    /// Direct producer sends must come from the canonical producer index.
+    /// Forwarded catch-up updates only require the envelope sender to be a
+    /// group member; the persisted sender remains the canonical producer.
+    fn validated_inbound_update_producer(
+        local_group: &LoadedGroupMeta,
+        group_id: GroupId,
+        origin: InboundUpdateOrigin,
+        update_id: UpdateId,
+    ) -> Result<MemberIdentity, InboundDeliveryError> {
+        let producer_index = MemberIndex::new(update_id.node_index);
+        let producer = local_group
+            .members
+            .member_at_index(producer_index)
+            .context(inbound::UpdateProducerIndexNotInGroupSnafu {
+                group_id,
+                producer_index,
+            })?;
+        match origin {
+            InboundUpdateOrigin::Producer { sender } => {
+                let expected_sender_index = local_group.members.member_index(&sender).context(
+                    inbound::UpdateSenderNotInGroupSnafu {
+                        group_id,
+                        sender: sender.clone(),
+                    },
+                )?;
+                ensure!(
+                    expected_sender_index == producer_index,
+                    inbound::UpdateSenderIndexMismatchSnafu {
+                        group_id,
+                        sender: sender.clone(),
+                        expected_index: expected_sender_index,
+                        actual_index: producer_index,
+                    }
+                );
+                Ok(sender)
+            }
+            InboundUpdateOrigin::Forwarder { sender } => {
+                local_group
+                    .members
+                    .member_index(&sender)
+                    .context(inbound::UpdateSenderNotInGroupSnafu { group_id, sender })?;
+                Ok(producer)
+            }
+        }
+    }
+
+    fn notify_catch_up_needed(&self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {
+        if ranges.is_empty() {
+            return;
+        }
+        self.catch_up_manager
+            .tell(CatchUpManagerMessage::NeedVersions(NeedVersions {
+                group_id,
+                ranges,
+            }));
+    }
+
+    fn notify_catch_up_available(&self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {
+        if ranges.is_empty() {
+            return;
+        }
+        self.catch_up_manager
+            .tell(CatchUpManagerMessage::ObservedAvailable(
+                ObservedAvailable { group_id, ranges },
+            ));
+    }
+
     fn validate_summary_request(&self, request: &SummaryRequest) -> Result<(), SummaryError> {
         let memberships = self.group_memberships.snapshot();
         let members =
@@ -637,7 +807,6 @@ impl ReplicationRuntimeComponent {
     ) -> Result<Option<VersionVector>, StoreError> {
         let mut transaction = store.begin_read_transaction().await?;
         let group = transaction.load_replication_group(&group_id).await?;
-        transaction.rollback().await?;
         Ok(group.map(|group| group.version_vector))
     }
 
@@ -750,14 +919,13 @@ impl ReplicationRuntimeComponent {
         let initial_memberships = self.group_memberships.snapshot().as_ref().clone();
         let mut transaction = self
             .store
-            .begin_transaction()
+            .begin_read_transaction()
             .await
             .context(StoreStartupSnafu)?;
         let persisted_groups = transaction
             .load_replication_groups()
             .await
             .context(StoreStartupSnafu)?;
-        transaction.commit().await.context(StoreStartupSnafu)?;
 
         let mut memberships = initial_memberships;
         for persisted_group in persisted_groups {
@@ -776,23 +944,11 @@ impl ReplicationRuntimeComponent {
 
     /// Submit one encoded live update to the group-broadcast layer.
     fn submit_group_update(&mut self, prepared_publish: &PreparedLocalPublish) {
-        let local_member = self.local_member.clone();
-        self.group_broadcast
-            .trigger(GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
-                delivery_class: DeliveryClass::BestEffort,
-                envelope: GroupMessageEnvelope {
-                    header: GroupMessageHeader {
-                        group_id: prepared_publish.group_id,
-                        sender: local_member,
-                        message_id: MessageId(Uuid::new_v4()),
-                    },
-                    payload: EncryptedPayload {
-                        ciphertext: prepared_publish.payload.clone(),
-                    },
-                    footer: placeholder_signed_footer(),
-                },
-                suppress_self_delivery: true,
-            }));
+        self.group_broadcast.trigger(
+            GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
+                .for_member_in_group(self.local_member.clone(), prepared_publish.group_id)
+                .with_payload(prepared_publish.payload.clone()),
+        );
     }
 
     fn submit_reliable_runtime_message(
@@ -817,31 +973,6 @@ impl ReplicationRuntimeComponent {
                     },
                 },
             ));
-    }
-
-    fn submit_group_runtime_message(
-        &mut self,
-        group_id: GroupId,
-        message: &RuntimeMessage,
-        delivery_class: DeliveryClass,
-    ) {
-        let payload = encode_runtime_payload(message);
-        self.group_broadcast
-            .trigger(GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
-                delivery_class,
-                envelope: GroupMessageEnvelope {
-                    header: GroupMessageHeader {
-                        group_id,
-                        sender: self.local_member.clone(),
-                        message_id: MessageId(Uuid::new_v4()),
-                    },
-                    payload: EncryptedPayload {
-                        ciphertext: payload,
-                    },
-                    footer: placeholder_signed_footer(),
-                },
-                suppress_self_delivery: true,
-            }));
     }
 
     /// Submit the reliable bootstrap fan-out for one newly created group.
@@ -888,10 +1019,12 @@ impl ReplicationRuntimeComponent {
         local_group: &LoadedGroupMeta,
         group_id: GroupId,
     ) -> Result<UpdateId, PublishChangesError> {
-        let next_local_version = local_group
-            .applied_version(local_group.local_member_index)
-            .checked_add(1)
-            .context(publish::ExhaustedUpdateIdsSnafu { group_id })?;
+        let applied_version = local_group.applied_version(local_group.local_member_index);
+        ensure!(
+            applied_version < MAX_VERSION_VALUE,
+            publish::ExhaustedUpdateIdsSnafu { group_id }
+        );
+        let next_local_version = applied_version + 1;
         Ok(UpdateId {
             version: next_local_version,
             node_index: local_group.local_member_index.as_u32(),
@@ -974,7 +1107,7 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Convert one runtime update message into the durable update-record shape.
+    /// Convert one runtime update message into the stored update-record shape.
     fn build_replication_update_record(
         sender: MemberIdentity,
         message: UpdateMessage,
@@ -988,16 +1121,13 @@ impl ReplicationRuntimeComponent {
             dataset_updates: message
                 .dataset_updates
                 .into_iter()
-                .map(|dataset_update| DatasetUpdateRecord {
-                    dataset_id: dataset_update.dataset_id,
-                    operations: dataset_update.operations,
-                })
+                .map(DatasetUpdateRecord::from)
                 .collect(),
             applied_locally,
         }
     }
 
-    /// Publish one local change batch through one durable store transaction.
+    /// Publish one local change batch through one store transaction.
     #[allow(
         clippy::too_many_lines,
         reason = "The transactional publish flow is kept together so store writes, listener notifications, and rollback boundaries stay visible."
@@ -1106,10 +1236,7 @@ impl ReplicationRuntimeComponent {
             dataset_updates: prepared_local_changes
                 .dataset_updates
                 .into_iter()
-                .map(|dataset_update| DatasetUpdateMessage {
-                    dataset_id: dataset_update.dataset_id,
-                    operations: dataset_update.operations,
-                })
+                .map(Into::into)
                 .collect(),
         });
         let payload = encode_runtime_payload(&message);
@@ -1141,10 +1268,10 @@ impl ReplicationRuntimeComponent {
                     })?;
             }
             SummaryReplyRoute::GroupBroadcast => {
-                self.submit_group_runtime_message(
-                    message.group_id,
-                    summary,
-                    DeliveryClass::BestEffort,
+                self.group_broadcast.trigger(
+                    GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
+                        .for_member_in_group(self.local_member.clone(), message.group_id)
+                        .with_payload(encode_runtime_payload(summary)),
                 );
             }
         }
@@ -1212,11 +1339,10 @@ impl ReplicationRuntimeComponent {
                         async_self
                             .install_group_membership_view(persisted_group)
                             .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-                        // Complete `processed` only after the bootstrap group
-                        // is durably installed locally. Failure paths
-                        // intentionally withhold this completion, so the
-                        // sender-side recipient-ack timeout can redeliver the
-                        // same reliable message later.
+                        // Complete `processed` only after the bootstrap group is stored and the
+                        // local membership view is installed. Failure paths intentionally withhold
+                        // this completion, so the sender-side recipient-ack timeout can redeliver
+                        // the same reliable message later.
                         deliver
                             .processed
                             .complete()
@@ -1235,6 +1361,12 @@ impl ReplicationRuntimeComponent {
                 context,
                 InboundDeliveryError::UnexpectedReliableMessage,
             )),
+            WireRuntimeMessage::NeedRange(_) | WireRuntimeMessage::UpdateBatch(_) => {
+                Err(InboundDeliveryFailure::new(
+                    context,
+                    InboundDeliveryError::UnexpectedReliableMessage,
+                ))
+            }
             WireRuntimeMessage::SummaryRequest(message) => {
                 let sender = deliver.envelope.header.sender.clone();
                 Ok(self.handle_inbound_summary_request(
@@ -1246,7 +1378,13 @@ impl ReplicationRuntimeComponent {
                     message,
                 ))
             }
-            WireRuntimeMessage::Summary(_) => Ok(Handled::Ok),
+            WireRuntimeMessage::Summary(message) => {
+                let sender = deliver.envelope.header.sender.clone();
+                let memberships = self.group_memberships.snapshot();
+                let summary = summary_from_wire(sender, message, memberships.as_ref())
+                    .map_err(|error| InboundDeliveryFailure::new(context.clone(), error))?;
+                Ok(self.handle_observed_summary(summary))
+            }
         }
     }
 
@@ -1269,12 +1407,24 @@ impl ReplicationRuntimeComponent {
                 InboundDeliveryError::UnexpectedGroupMessage,
             )),
             WireRuntimeMessage::Update(message) => Ok(self.handle_update(context, sender, message)),
+            WireRuntimeMessage::UpdateBatch(message) => {
+                Ok(self.handle_update_batch(context, sender, message))
+            }
+            WireRuntimeMessage::NeedRange(_) => {
+                // CatchUpManagerComponent owns NeedRange processing on group broadcast.
+                Ok(Handled::Ok)
+            }
+            WireRuntimeMessage::Summary(message) => {
+                let memberships = self.group_memberships.snapshot();
+                let summary = summary_from_wire(sender, message, memberships.as_ref())
+                    .map_err(|error| InboundDeliveryFailure::new(context.clone(), error))?;
+                Ok(self.handle_observed_summary(summary))
+            }
             WireRuntimeMessage::SummaryRequest(message) => Ok(self.handle_inbound_summary_request(
                 context,
                 SummaryReplyRoute::GroupBroadcast,
                 message,
             )),
-            WireRuntimeMessage::Summary(_) => Ok(Handled::Ok),
         }
     }
 
@@ -1286,9 +1436,9 @@ impl ReplicationRuntimeComponent {
     )]
     async fn persist_and_apply_update(
         &mut self,
-        sender: MemberIdentity,
+        origin: InboundUpdateOrigin,
         message: WireUpdateMessage,
-    ) -> Result<Vec<ListenerDataChanges>, InboundDeliveryError> {
+    ) -> Result<InboundUpdateOutcome, InboundDeliveryError> {
         let group_id = message.group_id;
         let mut transaction = self
             .store
@@ -1307,29 +1457,31 @@ impl ReplicationRuntimeComponent {
         let message = message
             .into_runtime(local_group.member_count())
             .context(inbound::DecodeReadVersionsSnafu { group_id })?;
-        let expected_sender_index = local_group.members.member_index(&sender).context(
-            inbound::UpdateSenderNotInGroupSnafu {
-                group_id,
-                sender: sender.clone(),
-            },
+        let producer = Self::validated_inbound_update_producer(
+            &local_group,
+            group_id,
+            origin,
+            message.update_id,
         )?;
-        ensure!(
-            expected_sender_index.as_u32() == message.update_id.node_index,
-            inbound::UpdateSenderIndexMismatchSnafu {
-                group_id,
-                sender: sender.clone(),
-                expected_index: expected_sender_index,
-                actual_index: MemberIndex::new(message.update_id.node_index),
-            }
-        );
-        let inbound_update = Self::build_replication_update_record(sender, message, false);
+        let incoming_available_range = UpdateRangeMessage::from(message.update_id);
+        let mut needed_ranges = Self::missing_ranges_for_update_frontier(
+            &local_group.version_vector,
+            message.group_id,
+            message.update_id,
+            &message.read_versions,
+        )?;
+        let inbound_update = Self::build_replication_update_record(producer, message, false);
         validate_inbound_update_read_versions(&inbound_update)?;
         if local_group.has_applied(inbound_update.update_id) {
             transaction
                 .commit()
                 .await
                 .context(inbound::StoreAccessSnafu)?;
-            return Ok(Vec::new());
+            return Ok(InboundUpdateOutcome {
+                event_batches: Vec::new(),
+                needed_ranges,
+                observed_available: vec![incoming_available_range],
+            });
         }
 
         if let Some(existing_update) = transaction
@@ -1369,9 +1521,15 @@ impl ReplicationRuntimeComponent {
         }
 
         let pending_updates = transaction
-            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply)
+            .load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply, None)
             .await
             .context(inbound::StoreAccessSnafu)?;
+        let mut observed_available = vec![incoming_available_range];
+        observed_available.extend(
+            pending_updates
+                .iter()
+                .map(|update| UpdateRangeMessage::from(update.update_id)),
+        );
         let mut pending_updates = PendingUpdateSet::from_updates(pending_updates);
         let mut local_group = local_group;
         let apply_plan = pending_updates.plan_apply_chain(&local_group);
@@ -1382,11 +1540,24 @@ impl ReplicationRuntimeComponent {
                 .context(inbound::StoreAccessSnafu)?;
         }
         if apply_plan.ready_chain.is_empty() {
+            for blocked_update in &apply_plan.blocked_updates {
+                let blocked_ranges = Self::missing_ranges_for_update_frontier(
+                    &local_group.version_vector,
+                    blocked_update.group_id,
+                    blocked_update.update_id,
+                    &blocked_update.read_versions,
+                )?;
+                needed_ranges.extend(blocked_ranges);
+            }
             transaction
                 .commit()
                 .await
                 .context(inbound::StoreAccessSnafu)?;
-            return Ok(Vec::new());
+            return Ok(InboundUpdateOutcome {
+                event_batches: Vec::new(),
+                needed_ranges,
+                observed_available,
+            });
         }
 
         let touched_dataset_ids = apply_plan
@@ -1451,15 +1622,75 @@ impl ReplicationRuntimeComponent {
                 .await
                 .context(inbound::StoreAccessSnafu)?;
         }
+        for blocked_update in &apply_plan.blocked_updates {
+            let blocked_ranges = Self::missing_ranges_for_update_frontier(
+                &local_group.version_vector,
+                blocked_update.group_id,
+                blocked_update.update_id,
+                &blocked_update.read_versions,
+            )?;
+            needed_ranges.extend(blocked_ranges);
+        }
+        let applied_versions = local_group.version_vector.clone();
         transaction
-            .update_replication_group_version_vector(&group_id, local_group.version_vector)
+            .update_replication_group_version_vector(&group_id, applied_versions)
             .await
             .context(inbound::StoreAccessSnafu)?;
         transaction
             .commit()
             .await
             .context(inbound::StoreAccessSnafu)?;
-        Ok(event_batches)
+        Ok(InboundUpdateOutcome {
+            event_batches,
+            needed_ranges,
+            observed_available,
+        })
+    }
+
+    /// Persist one catch-up batch before emitting catch-up notifications.
+    ///
+    /// Each update is still processed in its own store transaction, but the
+    /// derived catch-up notifications are accumulated until the batch finishes
+    /// or fails. Listener notifications still follow each committed update so a
+    /// later batch failure does not hide already-applied data changes.
+    async fn persist_apply_and_notify_update_batch(
+        &mut self,
+        batch_sender: MemberIdentity,
+        message: WireUpdateBatchMessage,
+    ) -> Result<(), InboundDeliveryError> {
+        let group_id = message.group_id;
+        let mut observed_available = Vec::new();
+        let mut needed_ranges = Vec::new();
+        for update in message.updates {
+            let outcome = match self
+                .persist_and_apply_update(
+                    InboundUpdateOrigin::Forwarder {
+                        sender: batch_sender.clone(),
+                    },
+                    update,
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.notify_catch_up_available(group_id, observed_available);
+                    self.notify_catch_up_needed(group_id, needed_ranges);
+                    return Err(error);
+                }
+            };
+            observed_available.extend(outcome.observed_available);
+            needed_ranges.extend(outcome.needed_ranges);
+            if let Err(error) =
+                notify_listener_batches(self.listener.clone(), outcome.event_batches).await
+            {
+                self.notify_catch_up_available(group_id, observed_available);
+                self.notify_catch_up_needed(group_id, needed_ranges);
+                return Err(error);
+            }
+        }
+        self.notify_catch_up_available(group_id, observed_available);
+        self.notify_catch_up_needed(group_id, needed_ranges);
+        Ok(())
     }
 
     fn handle_update(
@@ -1469,15 +1700,46 @@ impl ReplicationRuntimeComponent {
         message: WireUpdateMessage,
     ) -> Handled {
         Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self.persist_and_apply_update(sender, message).await;
+            let group_id = message.group_id;
+            let reply = async_self
+                .persist_and_apply_update(InboundUpdateOrigin::Producer { sender }, message)
+                .await;
             let error = match reply {
-                Ok(event_batches) => {
-                    notify_listener_batches(async_self.listener.clone(), event_batches)
+                Ok(outcome) => {
+                    async_self.notify_catch_up_available(group_id, outcome.observed_available);
+                    async_self.notify_catch_up_needed(group_id, outcome.needed_ranges);
+                    notify_listener_batches(async_self.listener.clone(), outcome.event_batches)
                         .await
                         .err()
                 }
                 Err(error) => Some(error),
             };
+            if let Some(error) = error {
+                let failure = InboundDeliveryFailure::new(context, error);
+                let action = async_self.record_inbound_failure(&failure);
+                panic_if_fatal_inbound_failure(action, &failure);
+            }
+        })
+    }
+
+    fn handle_update_batch(
+        &mut self,
+        context: InboundDeliveryContext,
+        batch_sender: MemberIdentity,
+        message: WireUpdateBatchMessage,
+    ) -> Handled {
+        // Keep batch application on the component's blocking path. These
+        // helpers borrow component state mutably across awaits, and the
+        // component is intentionally not Sync, so the future cannot be safely
+        // detached with spawn_local. Blocking also prevents live updates or
+        // publishes from interleaving between batch elements and making
+        // listener ordering or catch-up notifications reflect an artificial
+        // intermediate state.
+        Handled::block_on(self, async move |mut async_self| {
+            let error = async_self
+                .persist_apply_and_notify_update_batch(batch_sender, message)
+                .await
+                .err();
             if let Some(error) = error {
                 let failure = InboundDeliveryFailure::new(context, error);
                 let action = async_self.record_inbound_failure(&failure);
@@ -1497,6 +1759,10 @@ impl ReplicationRuntimeComponent {
                     let update_id = prepared_publish.update_id;
                     let read_token = prepared_publish.read_token.clone();
                     async_self.submit_group_update(&prepared_publish);
+                    async_self.notify_catch_up_available(
+                        prepared_publish.group_id,
+                        vec![UpdateRangeMessage::from(update_id)],
+                    );
                     match notify_listener_batches(
                         async_self.listener.clone(),
                         vec![ListenerDataChanges {
@@ -1578,6 +1844,87 @@ impl ReplicationRuntimeComponent {
         Handled::Ok
     }
 
+    /// Inspect local progress after a peer summary and derive catch-up notifications.
+    async fn inspect_summary_catch_up(
+        store: Arc<dyn ReplicationStore>,
+        local_member: MemberIdentity,
+        summary: Summary,
+    ) -> Result<Option<SummaryCatchUpObservation>, InboundDeliveryError> {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let Some(persisted_group) = transaction
+            .load_replication_group(&summary.group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?
+        else {
+            return Ok(None);
+        };
+        let pending_update_ids = transaction
+            .load_replication_update_ids(
+                &summary.group_id,
+                ReplicationUpdateFilter::PendingApply,
+                None,
+            )
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let local_group =
+            LoadedGroupMeta::from_replication_group_record(&local_member, persisted_group)
+                .context(inbound::InvalidPersistedGroupSnafu {
+                    group_id: summary.group_id,
+                })?;
+        let summary_needed_ranges = local_group
+            .version_vector
+            .missing_version_ranges_to(&summary.has_versions)
+            .into_iter()
+            .map(UpdateRangeMessage::from)
+            .collect_vec();
+        let observed_available = pending_update_ids
+            .into_iter()
+            .map(UpdateRangeMessage::from)
+            .collect_vec();
+        let needed_ranges = subtract_available_ranges(&summary_needed_ranges, &observed_available);
+        Ok(Some(SummaryCatchUpObservation {
+            group_id: summary.group_id,
+            observed_available,
+            needed_ranges,
+        }))
+    }
+
+    fn handle_observed_summary(&mut self, summary: Summary) -> Handled {
+        // Summary catch-up is advisory: it reads a store snapshot and sends
+        // catch-up notifications, but it does not mutate runtime component
+        // state. Running it asynchronously can at worst produce stale
+        // best-effort ranges, which the catch-up manager de-duplicates against
+        // later availability observations.
+        self.spawn_local(move |async_self| async move {
+            let store = async_self.store.clone();
+            let local_member = async_self.local_member.clone();
+            match Self::inspect_summary_catch_up(store, local_member, summary).await {
+                Ok(Some(observation)) => {
+                    async_self.notify_catch_up_available(
+                        observation.group_id,
+                        observation.observed_available,
+                    );
+                    async_self
+                        .notify_catch_up_needed(observation.group_id, observation.needed_ranges);
+                }
+                Ok(None) => {
+                    // The summary refers to a group this runtime no longer hosts.
+                }
+                Err(error) => {
+                    warn!(
+                        async_self.log(),
+                        "failed to inspect local progress for summary catch-up: {}", error
+                    );
+                }
+            }
+            Handled::Ok
+        });
+        Handled::Ok
+    }
+
     fn handle_create_group(
         &mut self,
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
@@ -1656,14 +2003,35 @@ impl ReplicationRuntimeComponent {
         let (promise, (sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self
-                .persist_and_apply_update(sender, WireUpdateMessage::from(message))
+                .persist_and_apply_update(
+                    InboundUpdateOrigin::Producer { sender },
+                    WireUpdateMessage::from(message),
+                )
                 .await
             {
-                Ok(event_batches) => {
-                    notify_listener_batches(async_self.listener.clone(), event_batches).await
+                Ok(outcome) => {
+                    notify_listener_batches(async_self.listener.clone(), outcome.event_batches)
+                        .await
                 }
                 Err(error) => Err(error),
             };
+            let _ = promise.fulfil(reply);
+        })
+    }
+
+    #[cfg(test)]
+    fn handle_test_apply_update_batch(
+        &mut self,
+        ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
+    ) -> Handled {
+        let (promise, (batch_sender, message)) = ask.take();
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = async_self
+                .persist_apply_and_notify_update_batch(
+                    batch_sender,
+                    WireUpdateBatchMessage::from(message),
+                )
+                .await;
             let _ = promise.fulfil(reply);
         })
     }
@@ -1747,6 +2115,10 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdate(ask)) => {
                 self.handle_test_apply_update(ask)
             }
+            #[cfg(test)]
+            ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::ApplyUpdateBatch(
+                ask,
+            )) => self.handle_test_apply_update_batch(ask),
         }
     }
 }

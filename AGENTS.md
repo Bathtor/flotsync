@@ -1,6 +1,7 @@
 # Agent Instructions
 
 - Always assume I made manual changes since the last time you ran. Be careful not to accidentally overwrite those changes by regenerating from outdated state.
+- Use "durable" only for explicit persistence/crash-survival guarantees. Do not use it as a general synonym for local, stored, applied, persisted, observed, or current state.
 
 ## Rust Rules
 
@@ -16,9 +17,10 @@
 - Keep Snafu variant names generic inside one error enum. Do not bake call-site names like `PublishStoreAccess` into the variant when the enum type or selector module already provides that context.
 - Reserve manual `map_err(...)` for real error translation cases that `context(...)` cannot express cleanly.
 - Do not manually construct Snafu boxed-source variants with `Box::new(source)`; use `result.boxed().context(SelectorSnafu)` or `context(...)`/`with_context(...)` instead.
+- In Kompact components, the `async_self` argument in `spawn_local` and `Handled::block_on` has access to all of the component's `&mut self` state. Do not clone fields just to pass them into the closure!
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
-- Add developer-facing docs or comments to non-public Rust types, fields, variants, and helper functions when their role, invariants, or lifecycle are not totally obvious from local context.
+- Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
 - Add loop labels when control flow spans non-trivial nested loops or retries.
 - Any test that binds TCP or UDP sockets must declare its full socket requirement up front via `flotsync_io::test_support::reserve_sockets(...)` or a harness built on top of that broker. Do not bind ad hoc sockets or rely on unmanaged ephemeral ports in parallel tests.
 - Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:

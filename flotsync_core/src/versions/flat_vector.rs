@@ -3,6 +3,17 @@ use flotsync_utils::option_when;
 use itertools::Itertools;
 use std::{cmp, fmt, num::NonZeroUsize};
 
+/// One inclusive member-version interval needed to catch one vector up to another.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VersionVectorGap {
+    /// Position of the member whose version is behind.
+    pub member_index: usize,
+    /// First missing version for `member_index`.
+    pub start_version: u64,
+    /// Last missing version for `member_index`.
+    pub end_version: u64,
+}
+
 /// The most general version vector that abstracts over the exact representation.
 #[derive(Clone, Debug, Eq)]
 pub enum VersionVector {
@@ -119,6 +130,35 @@ impl VersionVector {
     pub fn greatest_lower_bound(&self, other: &Self) -> Self {
         assert_same_member_count(self, other);
         self.pointwise_combine(other, cmp::min)
+    }
+
+    /// Return the inclusive per-member intervals needed to catch `self` up to `other`.
+    ///
+    /// Members where `self` is already at or ahead of `other` are omitted. This
+    /// is a frontier catch-up calculation, not a mathematical vector
+    /// difference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the vectors describe different member sets.
+    #[must_use]
+    pub fn missing_version_ranges_to(&self, other: &Self) -> Vec<VersionVectorGap> {
+        assert_same_member_count(self, other);
+        self.iter()
+            .zip(other.iter())
+            .enumerate()
+            .filter_map(|(member_index, (local_version, remote_version))| {
+                if remote_version > local_version {
+                    Some(VersionVectorGap {
+                        member_index,
+                        start_version: local_version + 1,
+                        end_version: remote_version,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// # Panics

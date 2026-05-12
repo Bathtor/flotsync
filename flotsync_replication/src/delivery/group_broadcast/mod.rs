@@ -13,13 +13,21 @@ use super::{
         SendRouteCandidate,
         TransportRouteKey,
     },
-    shared::{DeliveryClass, EncryptedPayload, MessageId, RouteSendId, SignedEnvelopeFooter},
+    shared::{
+        DeliveryClass,
+        EncryptedPayload,
+        MessageId,
+        RouteSendId,
+        SignedEnvelopeFooter,
+        placeholder_signed_footer,
+    },
 };
 use crate::{
     GroupMembers,
     SharedGroupMemberships,
     api::{GroupId, MemberIdentity},
 };
+use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
 use flotsync_utils::{NonOwningPhantomData, option_when};
@@ -66,6 +74,67 @@ pub struct GroupBroadcastSubmit {
     /// Skip the immediate local echo that would otherwise be emitted when the
     /// submitter is a member of the target group.
     pub suppress_self_delivery: bool,
+}
+
+/// First stage of a group-broadcast submit builder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupBroadcastSubmitBuilder {
+    delivery_class: DeliveryClass,
+}
+
+/// Submit builder stage after the sender and group have been selected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupBroadcastSubmitMemberBuilder {
+    delivery_class: DeliveryClass,
+    group_id: GroupId,
+    sender: MemberIdentity,
+}
+
+impl GroupBroadcastPortRequest {
+    /// Start building one signed submit request with a fresh group-broadcast message id.
+    #[must_use]
+    pub fn build_submit(delivery_class: DeliveryClass) -> GroupBroadcastSubmitBuilder {
+        GroupBroadcastSubmitBuilder { delivery_class }
+    }
+}
+
+impl GroupBroadcastSubmitBuilder {
+    /// Select the logical sender and group for this submit request.
+    #[must_use]
+    pub fn for_member_in_group(
+        self,
+        sender: MemberIdentity,
+        group_id: GroupId,
+    ) -> GroupBroadcastSubmitMemberBuilder {
+        GroupBroadcastSubmitMemberBuilder {
+            delivery_class: self.delivery_class,
+            group_id,
+            sender,
+        }
+    }
+}
+
+impl GroupBroadcastSubmitMemberBuilder {
+    /// Finish the submit with already-encrypted payload bytes.
+    ///
+    /// Group broadcast owns the generated envelope identity, current placeholder
+    /// footer, and default self-delivery suppression policy.
+    #[must_use]
+    pub fn with_payload(self, ciphertext: Bytes) -> GroupBroadcastPortRequest {
+        GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
+            delivery_class: self.delivery_class,
+            envelope: GroupMessageEnvelope {
+                header: GroupMessageHeader {
+                    group_id: self.group_id,
+                    sender: self.sender,
+                    message_id: MessageId(Uuid::new_v4()),
+                },
+                payload: EncryptedPayload { ciphertext },
+                footer: placeholder_signed_footer(),
+            },
+            suppress_self_delivery: true,
+        })
+    }
 }
 
 /// Inbound group message delivered by the network-facing broadcast service.
@@ -395,18 +464,6 @@ fn select_best_direct_route(
         .into_iter()
         .filter(|route| route.sharing == RouteSharingKind::Exclusive)
         .max_by_key(|route| route.preference_rank)
-}
-
-#[cfg(test)]
-fn placeholder_signed_footer() -> SignedEnvelopeFooter {
-    SignedEnvelopeFooter {
-        // TODO(flotsync-d8d): Replace this placeholder once the real delivery
-        // signing boundary is available.
-        signature: super::shared::DetachedSignature {
-            scheme: super::shared::SignatureScheme::Ed25519,
-            bytes: bytes::Bytes::from_static(b"placeholder-signature"),
-        },
-    }
 }
 
 #[cfg(test)]

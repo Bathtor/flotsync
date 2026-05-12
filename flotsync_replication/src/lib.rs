@@ -4,6 +4,12 @@ use flotsync_core::member::TrieMap;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
+/// Highest producer/group version accepted by the replication runtime.
+///
+/// The protocol reserves `u64::MAX` as an exhaustion sentinel. Decode paths
+/// reject it before runtime code can derive catch-up intervals from the value.
+pub const MAX_VERSION_VALUE: u64 = u64::MAX - 1;
+
 pub mod api;
 pub mod delivery;
 pub mod runtime;
@@ -170,6 +176,14 @@ impl GroupMembers {
         self.member_indices.get(member).copied()
     }
 
+    /// Return the member assigned to one canonical group index.
+    #[must_use]
+    pub fn member_at_index(&self, index: MemberIndex) -> Option<MemberIdentity> {
+        self.ordered_members()
+            .into_iter()
+            .nth(index.as_u32() as usize)
+    }
+
     /// Iterate all members currently in this group.
     pub fn iter(&self) -> impl Iterator<Item = MemberIdentity> + '_ {
         self.member_indices.iter_keys()
@@ -241,6 +255,7 @@ mod tests {
         assert_eq!(members.member_index(&bob), Some(MemberIndex::new(0)));
         assert_eq!(members.member_index(&alice), Some(MemberIndex::new(1)));
         assert_eq!(members.member_index(&charlie), Some(MemberIndex::new(2)));
+        assert_eq!(members.member_at_index(MemberIndex::new(1)), Some(alice));
         assert!(members.contains(&bob));
     }
 

@@ -10,12 +10,16 @@ import "flotsync/versions/v1/versions.proto";
 //
 // These are not the full replication protocol; they are only the narrow
 // bootstrap plus live-update messages used by the first end-to-end slice.
+// Producer and group version values reserve u64::MAX as an exhaustion sentinel;
+// runtimes reject that value in Update, Summary, and NeedRange payloads.
 message RuntimeMessage {
   oneof body {
     BootstrapGroup bootstrap_group = 1;
     Update update = 2;
     SummaryRequest summary_request = 3;
     Summary summary = 4;
+    NeedRange need_range = 5;
+    UpdateBatch update_batch = 6;
   }
 }
 
@@ -45,17 +49,41 @@ message Update {
   repeated DatasetUpdate dataset_updates = 4;
 }
 
-// Request a peer's currently durable group version vector.
+// Request a peer's currently applied group version vector.
 message SummaryRequest {
   bytes group_id = 1;
   bytes correlation_id = 2;
 }
 
-// Current durable group version vector for one responding peer.
+// Current applied group version vector for one responding peer.
 message Summary {
   bytes group_id = 1;
   bytes correlation_id = 2;
   flotsync.versions.v1.VersionVector has_versions = 3;
+}
+
+// Best-effort request for one or more missing producer update ranges.
+message NeedRange {
+  bytes group_id = 1;
+  repeated UpdateRange ranges = 2;
+}
+
+// Inclusive version range for one producer inside a replication group.
+//
+// If end_version is absent, the range contains exactly start_version.
+// If end_version is present, it must be greater than or equal to start_version.
+// Groups should rotate long before a producer reaches the reserved exhaustion
+// value.
+message UpdateRange {
+  uint32 producer_index = 1;
+  uint64 start_version = 2;
+  optional uint64 end_version = 3;
+}
+
+// Best-effort catch-up fulfilment containing already stored updates.
+message UpdateBatch {
+  bytes group_id = 1;
+  repeated Update updates = 2;
 }
 
 // All schema operations for one dataset within a single update.

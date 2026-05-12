@@ -289,6 +289,13 @@ pub(crate) enum InboundDeliveryError {
         actual_index: MemberIndex,
     },
     #[snafu(display(
+        "Inbound update for group {group_id} claimed producer index {producer_index}, which is outside the group member range.",
+    ))]
+    UpdateProducerIndexNotInGroup {
+        group_id: GroupId,
+        producer_index: MemberIndex,
+    },
+    #[snafu(display(
         "Inbound update for group {group_id} carried invalid read versions: {source}",
     ))]
     DecodeReadVersions {
@@ -350,6 +357,7 @@ impl InboundDeliveryError {
             | Self::MissingDatasetSchema { .. }
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
+            | Self::UpdateProducerIndexNotInGroup { .. }
             | Self::DecodeReadVersions { .. }
             | Self::SelfDependentReadVersions { .. }
             | Self::ConflictingPersistedUpdate { .. }

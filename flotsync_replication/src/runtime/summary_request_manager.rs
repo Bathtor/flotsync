@@ -27,7 +27,7 @@ use snafu::prelude::*;
 use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
 use uuid::Uuid;
 
-/// Local-actor messages understood by [`SummaryRequestManager`].
+/// Local-actor messages understood by [`SummaryRequestManagerComponent`].
 #[derive(Debug)]
 pub(super) enum SummaryRequestManagerMessage {
     /// Ask one group member for its current group version vector.
@@ -95,7 +95,7 @@ impl SummaryInboundFailure {
 
 /// Kompact component that owns summary request/response protocol state.
 #[derive(ComponentDefinition)]
-pub(super) struct SummaryRequestManager {
+pub(super) struct SummaryRequestManagerComponent {
     ctx: ComponentContext<Self>,
     reliable_delivery: RequiredPort<ReliableDeliveryPort>,
     local_member: MemberIdentity,
@@ -104,7 +104,7 @@ pub(super) struct SummaryRequestManager {
     pending_summaries: HashMap<Uuid, PendingSummaryRequest>,
 }
 
-impl SummaryRequestManager {
+impl SummaryRequestManagerComponent {
     pub(super) fn new(
         local_member: MemberIdentity,
         group_memberships: SharedGroupMemberships,
@@ -316,7 +316,9 @@ impl SummaryRequestManager {
             }
             WireRuntimeMessage::BootstrapGroup(_)
             | WireRuntimeMessage::Update(_)
-            | WireRuntimeMessage::SummaryRequest(_) => Handled::Ok,
+            | WireRuntimeMessage::SummaryRequest(_)
+            | WireRuntimeMessage::NeedRange(_)
+            | WireRuntimeMessage::UpdateBatch(_) => Handled::Ok,
         }
     }
 
@@ -356,16 +358,16 @@ impl SummaryRequestManager {
     }
 }
 
-ignore_lifecycle!(SummaryRequestManager);
+ignore_lifecycle!(SummaryRequestManagerComponent);
 
-impl Require<ReliableDeliveryPort> for SummaryRequestManager {
+impl Require<ReliableDeliveryPort> for SummaryRequestManagerComponent {
     fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
         let ReliableDeliveryPortIndication::Deliver(deliver) = indication;
         self.handle_reliable_delivery(deliver)
     }
 }
 
-impl Actor for SummaryRequestManager {
+impl Actor for SummaryRequestManagerComponent {
     type Message = SummaryRequestManagerMessage;
 
     fn receive_local(&mut self, msg: Self::Message) -> Handled {
