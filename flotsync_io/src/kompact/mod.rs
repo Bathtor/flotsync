@@ -4,15 +4,15 @@
 //! - UDP is exposed as a shared typed port capability.
 //! - TCP is exposed as a manager/session actor model.
 
+use crate::errors::{Error, Result};
+use ::kompact::{config_keys::system, prelude::*};
+use std::{sync::mpsc, thread, time::Duration};
+
 mod bridge;
 mod driver_component;
 mod listener;
 mod session;
 mod types;
-
-use crate::errors::{Error, Result};
-use ::kompact::{config_keys::system, prelude::*};
-use std::{sync::mpsc, thread, time::Duration};
 
 pub use bridge::{IoBridge, IoBridgeHandle};
 pub use driver_component::IoDriverComponent;

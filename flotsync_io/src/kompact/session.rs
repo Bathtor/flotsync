@@ -16,6 +16,7 @@ use crate::{
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::net::SocketAddr;
 
 /// Internal session-directed event routed from the shared driver component.
@@ -339,16 +340,16 @@ fn shutdown_session(session: &mut TcpSession) -> HandlerResult {
     }
 
     let release = session.driver.release_tcp_session(connection_id);
-    Handled::block_on(session, move |async_self| async move {
-        match resolve_kfuture(release).await {
-            Ok(()) | Err(Error::UnknownConnection { .. }) => {}
-            Err(error) => {
-                warn!(
-                    async_self.log(),
-                    "failed to release TCP session {} during shutdown: {}", connection_id, error
-                );
-            }
-        }
+    Handled::block_on(session, move |_async_self| async move {
+        resolve_kfuture(release)
+            .await
+            .or_else(|error| match error {
+                Error::UnknownConnection { .. } => Ok(()),
+                error => Err(error),
+            })
+            .with_whatever_benign(|_| {
+                format!("failed to release TCP session {connection_id} during shutdown")
+            })?;
         Handled::OK
     })
 }

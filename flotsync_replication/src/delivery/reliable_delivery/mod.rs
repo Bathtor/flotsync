@@ -41,7 +41,7 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{KClaimablePromise, NonOwningPhantomData};
+use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
@@ -368,14 +368,12 @@ impl ReliableDeliveryComponent {
         &mut self,
         indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
     ) -> HandlerResult {
-        let Some(body) = indication.frame.body else {
-            warn!(
-                self.log(),
+        let body = indication.frame.body.with_whatever_benign(|| {
+            format!(
                 "Reliable delivery dropped inbound frame with empty body target={:?}",
                 indication.meta.target
-            );
-            return Handled::OK;
-        };
+            )
+        })?;
 
         match body {
             delivery_proto::reliable_delivery_frame::Body::Envelope(envelope) => {
@@ -398,16 +396,8 @@ impl ReliableDeliveryComponent {
         &mut self,
         envelope: delivery_proto::ReliableEnvelopeWire,
     ) -> HandlerResult {
-        let envelope = match reliable_envelope_from_wire(envelope) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Reliable delivery dropped inbound envelope that failed to decode: {error}"
-                );
-                return Handled::OK;
-            }
-        };
+        let envelope = reliable_envelope_from_wire(envelope)
+            .whatever_benign("Reliable delivery dropped inbound envelope that failed to decode")?;
         let message_id = envelope.header.message_id;
         if self.handle_inbound_envelope_if_already_tracked(message_id) {
             return Handled::OK;
@@ -485,16 +475,9 @@ impl ReliableDeliveryComponent {
         &mut self,
         ack: delivery_proto::RecipientAckWire,
     ) -> HandlerResult {
-        let ack = match recipient_ack_from_wire(ack) {
-            Ok(ack) => ack,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Reliable delivery dropped inbound recipient ack that failed to decode: {error}"
-                );
-                return Handled::OK;
-            }
-        };
+        let ack = recipient_ack_from_wire(ack).whatever_benign(
+            "Reliable delivery dropped inbound recipient ack that failed to decode",
+        )?;
         let message_id = ack.header.message_id;
         if !self.sender_work_items.contains_key(&message_id) {
             debug!(

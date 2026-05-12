@@ -19,6 +19,7 @@ use crate::{
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::collections::HashSet;
 
 /// Request payload used when accepting one pending inbound TCP connection.
@@ -276,16 +277,15 @@ impl TcpListener {
 
         Handled::block_on(self, move |async_self| async move {
             let reject = async_self.driver.reject_pending_tcp_session(connection_id);
-            match resolve_kfuture(reject).await {
-                Ok(()) => {}
-                Err(Error::UnknownConnection { .. }) => {}
-                Err(error) => {
-                    warn!(
-                        async_self.log(),
-                        "failed to auto-reject pending TCP connection {}: {}", connection_id, error
-                    );
-                }
-            }
+            resolve_kfuture(reject)
+                .await
+                .or_else(|error| match error {
+                    Error::UnknownConnection { .. } => Ok(()),
+                    error => Err(error),
+                })
+                .with_whatever_benign(|_| {
+                    format!("failed to auto-reject pending TCP connection {connection_id}")
+                })?;
             Handled::OK
         })
     }
@@ -357,16 +357,16 @@ fn shutdown_listener(listener: &mut TcpListener) -> HandlerResult {
 
     let release = listener.driver.release_tcp_listener(listener_id);
     listener.pending_connections.clear();
-    Handled::block_on(listener, move |async_self| async move {
-        match resolve_kfuture(release).await {
-            Ok(()) | Err(Error::UnknownListener { .. }) => {}
-            Err(error) => {
-                warn!(
-                    async_self.log(),
-                    "failed to release TCP listener {} during shutdown: {}", listener_id, error
-                );
-            }
-        }
+    Handled::block_on(listener, move |_async_self| async move {
+        resolve_kfuture(release)
+            .await
+            .or_else(|error| match error {
+                Error::UnknownListener { .. } => Ok(()),
+                error => Err(error),
+            })
+            .with_whatever_benign(|_| {
+                format!("failed to release TCP listener {listener_id} during shutdown")
+            })?;
         Handled::OK
     })
 }

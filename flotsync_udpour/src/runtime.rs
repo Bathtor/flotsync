@@ -23,6 +23,7 @@ use crate::{
     wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::*;
+use flotsync_utils::ResultExt as _;
 use kompact::{
     config::{DurationValue, UsizeValue},
     kompact_config,
@@ -730,13 +731,10 @@ impl UDPourComponent {
                 );
             }
             Err(error) => {
-                error!(
-                    self.log(),
-                    "Sender state machine rejected UDPour submit: {error}"
-                );
                 let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
                     reason: UDPourSendFailureReason::State(classify_sender_error(&error)),
                 });
+                Err(error).whatever_benign("Sender state machine rejected UDPour submit")?;
             }
         }
         Handled::OK
@@ -759,16 +757,8 @@ impl UDPourComponent {
     }
 
     fn handle_received(&mut self, source: SocketAddr, payload: IoPayload) -> HandlerResult {
-        let frame = match decode_frame(payload) {
-            Ok(frame) => frame,
-            Err(error) => {
-                error!(
-                    self.log(),
-                    "Dropping invalid UDPour frame from {source}: {error}"
-                );
-                return Handled::OK;
-            }
-        };
+        let frame = decode_frame(payload)
+            .with_whatever_benign(|_| format!("Dropping invalid UDPour frame from {source}"))?;
         let now = self.now();
 
         match frame {
@@ -779,10 +769,11 @@ impl UDPourComponent {
                     }
                 }
                 Err(error) => {
-                    error!(
-                        self.log(),
-                        "Receiver state machine failed while handling payload from {source}: {error}"
-                    );
+                    return Err(error).with_whatever_benign(|_| {
+                        format!(
+                            "Receiver state machine failed while handling payload from {source}"
+                        )
+                    });
                 }
             },
             UDPourFrame::Ack(frame) => {
@@ -800,10 +791,11 @@ impl UDPourComponent {
                     }
                 }
                 Err(error) => {
-                    error!(
-                        self.log(),
-                        "Sender state machine failed while handling NeedParts from {source}: {error}"
-                    );
+                    return Err(error).with_whatever_benign(|_| {
+                        format!(
+                            "Sender state machine failed while handling NeedParts from {source}"
+                        )
+                    });
                 }
             },
             UDPourFrame::NoLongerAvailable(frame) => {

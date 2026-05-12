@@ -201,13 +201,8 @@ mod kompact_implementation {
             config: ServiceConfig,
             shutdown_handle: BlockingThreadShutdown<()>,
         ) -> StateUpdate<ComponentState> {
-            Handled::block_on(self, async move |async_self| {
-                if let Err(e) = shutdown_handle.shutdown().await {
-                    error!(
-                        async_self.log(),
-                        "Could not shutdown mDNS announcement service: {e}"
-                    );
-                }
+            Handled::block_on(self, async move |_async_self| {
+                shutdown_handle.shutdown().await.benign_err()?;
                 Handled::OK
             })
             .and_transition(ComponentState::Initialised {

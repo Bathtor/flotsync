@@ -21,7 +21,7 @@ use crate::{
         shared::{EncryptedPayload, MessageId},
     },
 };
-use flotsync_utils::KClaimablePromise;
+use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
@@ -209,7 +209,7 @@ impl SummaryRequestManagerComponent {
         let pending = self
             .pending_summaries
             .remove(&correlation_id)
-            .expect("checked pending summary must still exist");
+            .whatever_unrecoverable("checked pending summary must still exist")?;
         if pending
             .promise
             .fulfil(Err(ApiError::SummaryTimedOut {

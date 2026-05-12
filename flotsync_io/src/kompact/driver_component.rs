@@ -28,6 +28,7 @@ use crate::{
     pool::{EgressPool, IoBufferPools},
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 /// Internal mailbox for the shared Kompact driver component.
@@ -979,19 +980,11 @@ fn shutdown_driver_component(component: &mut IoDriverComponent) -> HandlerResult
     component.tcp_listener_routes.clear();
     component.tcp_routes.clear();
     let shutdown = component.spawn_off(async move { driver.shutdown() });
-    Handled::block_on(component, move |async_self| async move {
-        match shutdown.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                error!(
-                    async_self.log(),
-                    "failed to stop flotsync_io driver component cleanly: {}", error
-                );
-            }
-            Err(error) => {
-                error!(async_self.log(), "driver shutdown task failed: {}", error);
-            }
-        }
+    Handled::block_on(component, move |_async_self| async move {
+        shutdown
+            .await
+            .whatever_benign("driver shutdown task failed")?
+            .whatever_benign("failed to stop flotsync_io driver component cleanly")?;
         Handled::OK
     })
 }

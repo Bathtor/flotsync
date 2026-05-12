@@ -30,7 +30,7 @@ use crate::{
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{NonOwningPhantomData, option_when};
+use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _, option_when};
 use kompact::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
@@ -219,14 +219,14 @@ impl GroupBroadcastComponent {
         }
 
         let group_memberships = self.group_memberships.snapshot();
-        let Some(group_members) = group_memberships.members(&envelope.header.group_id) else {
-            warn!(
-                self.log(),
-                "Group broadcast dropped submit for unknown group_id={}",
-                envelope.header.group_id.0
-            );
-            return Handled::OK;
-        };
+        let group_members = group_memberships
+            .members(&envelope.header.group_id)
+            .with_whatever_benign(|| {
+                format!(
+                    "Group broadcast dropped submit for unknown group_id={}",
+                    envelope.header.group_id.0
+                )
+            })?;
 
         let should_self_deliver =
             !submit.suppress_self_delivery && group_members.contains(&envelope.header.sender);
@@ -366,14 +366,12 @@ impl GroupBroadcastComponent {
         &mut self,
         indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
     ) -> HandlerResult {
-        let Some(body) = indication.frame.body else {
-            warn!(
-                self.log(),
+        let body = indication.frame.body.with_whatever_benign(|| {
+            format!(
                 "Group broadcast dropped inbound frame with empty body target={:?}",
                 indication.meta.target
-            );
-            return Handled::OK;
-        };
+            )
+        })?;
 
         match body {
             delivery_proto::group_broadcast_frame::Body::Envelope(envelope) => {
@@ -403,13 +401,8 @@ impl GroupBroadcastComponent {
                     ));
                 Handled::OK
             }
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Group broadcast dropped inbound envelope that failed to decode: {error}"
-                );
-                Handled::OK
-            }
+            Err(error) => Err(error)
+                .whatever_benign("Group broadcast dropped inbound envelope that failed to decode"),
         }
     }
 

@@ -26,6 +26,7 @@ use crate::{
     },
 };
 use flotsync_core::versions::UpdateId;
+use flotsync_utils::{OptionExt as _, ResultExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
 use kompact::{KompactLogger, prelude::*};
@@ -526,19 +527,13 @@ impl CatchUpManagerComponent {
     }
 
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
-        let message =
-            match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext) {
-                Ok(message) => message,
-                Err(error) => {
-                    warn!(
-                        self.log(),
-                        "dropping inbound catch-up candidate from {} after decode error: {}",
-                        deliver.envelope.header.sender,
-                        error
-                    );
-                    return Handled::OK;
-                }
-            };
+        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
+            .with_whatever_benign(|_| {
+            format!(
+                "dropping inbound catch-up candidate from {} after decode error",
+                deliver.envelope.header.sender
+            )
+        })?;
         match message {
             WireRuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)
@@ -558,13 +553,14 @@ impl CatchUpManagerComponent {
         message: NeedRangeMessage,
     ) -> HandlerResult {
         let memberships = self.group_memberships.snapshot();
-        let Some(members) = memberships.members(&message.group_id) else {
-            warn!(
-                self.log(),
-                "dropping NeedRange for unknown group {} from {}", message.group_id, sender
-            );
-            return Handled::OK;
-        };
+        let members = memberships
+            .members(&message.group_id)
+            .with_whatever_benign(|| {
+                format!(
+                    "dropping NeedRange for unknown group {} from {}",
+                    message.group_id, sender
+                )
+            })?;
         if !members.contains(sender) {
             warn!(
                 self.log(),
@@ -784,7 +780,7 @@ impl ComponentLifecycle for CatchUpManagerComponent {
             async_self
                 .refresh_known_available_from_store()
                 .await
-                .expect("catch-up manager startup failed");
+                .whatever_unrecoverable("catch-up manager startup failed")?;
             Handled::OK
         })
     }

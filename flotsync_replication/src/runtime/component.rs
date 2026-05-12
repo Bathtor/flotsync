@@ -124,7 +124,7 @@ use crate::{
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::OwnedRow;
-use flotsync_utils::{BoxFuture, KClaimablePromise};
+use flotsync_utils::{BoxFuture, KClaimablePromise, ResultExt as _};
 use futures_util::FutureExt;
 use itertools::Itertools;
 use kompact::prelude::*;
@@ -1908,24 +1908,17 @@ impl ReplicationRuntimeComponent {
         self.spawn_local(move |async_self| async move {
             let store = async_self.store.clone();
             let local_member = async_self.local_member.clone();
-            match Self::inspect_summary_catch_up(store, local_member, summary).await {
-                Ok(Some(observation)) => {
-                    async_self.notify_catch_up_available(
-                        observation.group_id,
-                        observation.observed_available,
-                    );
-                    async_self
-                        .notify_catch_up_needed(observation.group_id, observation.needed_ranges);
-                }
-                Ok(None) => {
-                    // The summary refers to a group this runtime no longer hosts.
-                }
-                Err(error) => {
-                    warn!(
-                        async_self.log(),
-                        "failed to inspect local progress for summary catch-up: {}", error
-                    );
-                }
+            if let Some(observation) = Self::inspect_summary_catch_up(store, local_member, summary)
+                .await
+                .whatever_benign("failed to inspect local progress for summary catch-up")?
+            {
+                async_self.notify_catch_up_available(
+                    observation.group_id,
+                    observation.observed_available,
+                );
+                async_self.notify_catch_up_needed(observation.group_id, observation.needed_ranges);
+            } else {
+                // The summary refers to a group this runtime no longer hosts.
             }
             Handled::OK
         });

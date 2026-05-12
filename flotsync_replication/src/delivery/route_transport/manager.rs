@@ -59,6 +59,7 @@ use flotsync_udpour::{
     UDPourSendFailureReason,
     UDPourSubmitResult,
 };
+use flotsync_utils::OptionExt as _;
 use kompact::{Never, config::UsizeValue, kompact_config, prelude::*};
 #[cfg(test)]
 use std::sync::Mutex;
@@ -783,15 +784,16 @@ impl RouteTransportManager {
     }
 
     fn handle_udp_runtime_indication(&mut self, deliver: UDPourDeliver) -> HandlerResult {
-        let Some(socket_key) = self.udp_socket_ids.get(&deliver.socket_id).copied() else {
-            warn!(
-                self.log(),
-                "Dropping UDPour delivery from unknown socket_id={} and source={}",
-                deliver.socket_id,
-                deliver.source
-            );
-            return Handled::OK;
-        };
+        let socket_key = self
+            .udp_socket_ids
+            .get(&deliver.socket_id)
+            .copied()
+            .with_whatever_benign(|| {
+                format!(
+                    "Dropping UDPour delivery from unknown socket_id={} and source={}",
+                    deliver.socket_id, deliver.source
+                )
+            })?;
         let route = TransportRouteKey::Udp(UdpRouteKey {
             remote_addr: deliver.source,
             scope: DatagramRouteScope::Unicast,

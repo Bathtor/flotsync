@@ -24,6 +24,7 @@ use crate::{
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
+use flotsync_utils::{OptionExt as _, ResultExt as _};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -707,12 +708,9 @@ impl IoBridge {
 
     fn handle_connect_udp_port(&mut self, request: ConnectUdpPortRequest) -> HandlerResult {
         self.udp.connect(request.required);
-        if request.promise.fulfil(Ok(())).is_err() {
-            warn!(
-                self.log(),
-                "dropping UDP port-connect completion because requester disappeared"
-            );
-        }
+        request.promise.fulfil(Ok(())).whatever_benign(
+            "dropping UDP port-connect completion because requester disappeared",
+        )?;
         Handled::OK
     }
 
@@ -734,7 +732,7 @@ impl IoBridge {
             let session_strong = session_component
                 .actor_ref()
                 .hold()
-                .expect("newly created TCP session must be live");
+                .whatever_unrecoverable("newly created TCP session must be live")?;
             async_self.ctx.system().start(&session_component);
 
             let reply = async_self.driver.open_tcp_session(
@@ -772,7 +770,7 @@ impl IoBridge {
             let listener_strong = listener_component
                 .actor_ref()
                 .hold()
-                .expect("newly created TCP listener must be live");
+                .whatever_unrecoverable("newly created TCP listener must be live")?;
             async_self.ctx.system().start(&listener_component);
 
             let reply = async_self
