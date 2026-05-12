@@ -760,6 +760,22 @@ fn publish_changes(
     .expect("publish should succeed")
 }
 
+fn publish_direct_peer_routes(
+    alice_runtime: &Arc<ReplicationRuntime>,
+    alice_member: &MemberIdentity,
+    bob_runtime: &Arc<ReplicationRuntime>,
+    bob_member: &MemberIdentity,
+) {
+    alice_runtime.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
+    );
+    bob_runtime.host().publish_direct_peer_route(
+        alice_member.clone(),
+        alice_runtime.host().advertised_loopback_udp_addr(),
+    );
+}
+
 fn title_update_message(
     group_id: GroupId,
     dataset_id: DatasetId,
@@ -1807,6 +1823,326 @@ fn update_gap_triggers_need_range_and_update_batch_catch_up() {
                 }],
             },
         ]
+    );
+}
+
+#[test]
+fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(50_101));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    alice_runtime
+        .install_group_for_test(group_id, members.clone())
+        .expect("alice group should install");
+    bob_runtime
+        .install_group_for_test(group_id, members)
+        .expect("bob group should install");
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 50_111);
+    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    publish_changes(
+        alice_runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: row_id.clone(),
+            row: crate::row_values! {
+                "title" => "summary catch-up",
+            },
+        }],
+    );
+    assert!(bob_fixture.listener.captured_data_changes().is_empty());
+
+    publish_direct_peer_routes(alice_runtime, &alice_member, bob_runtime, &bob_member);
+    let summary = wait_for_test_reply(bob_runtime.request_summary(SummaryRequest {
+        group_id,
+        target: alice_member,
+    }))
+    .expect("summary request should succeed");
+    assert_eq!(
+        summary.has_versions,
+        VersionVector::initial(NonZeroUsize::new(2).expect("group has two members"))
+            .with_update_applied(UpdateId {
+                node_index: 0,
+                version: 1,
+            })
+    );
+
+    bob_fixture.listener.wait_for_data_change_count(1);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id,
+                title: "summary catch-up".to_owned(),
+            }],
+        }]
+    );
+}
+
+#[test]
+fn pending_apply_need_retries_after_route_appears() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(50_201));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    alice_runtime
+        .install_group_for_test(group_id, members.clone())
+        .expect("alice group should install");
+    bob_runtime
+        .install_group_for_test(group_id, members)
+        .expect("bob group should install");
+
+    let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_211);
+    let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_212);
+    let first_read_token =
+        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let first_receipt = publish_changes(
+        alice_runtime.as_ref(),
+        first_read_token,
+        vec![RowMutation::Upsert {
+            row_id: first_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "pending predecessor",
+            },
+        }],
+    );
+    alice_runtime.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
+    );
+    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
+    let second_receipt = publish_changes(
+        alice_runtime.as_ref(),
+        first_receipt.read_token,
+        vec![RowMutation::Upsert {
+            row_id: second_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "pending successor",
+            },
+        }],
+    );
+    assert_eq!(
+        second_receipt.update_id,
+        UpdateId {
+            node_index: 0,
+            version: 2,
+        }
+    );
+    eventually(
+        TEST_WAIT_TIMEOUT,
+        || {
+            load_persisted_update(
+                bob_fixture.store.as_ref(),
+                group_id,
+                second_receipt.update_id,
+            )
+            .is_some()
+        },
+        "timed out waiting for successor update to persist as pending",
+    );
+    assert!(bob_fixture.listener.captured_data_changes().is_empty());
+
+    bob_runtime.host().publish_direct_peer_route(
+        alice_member,
+        alice_runtime.host().advertised_loopback_udp_addr(),
+    );
+    bob_fixture.listener.wait_for_data_change_count(2);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: first_row_id,
+                    title: "pending predecessor".to_owned(),
+                }],
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: second_row_id,
+                    title: "pending successor".to_owned(),
+                }],
+            },
+        ]
+    );
+}
+
+#[test]
+fn partial_update_batch_retry_narrows_remaining_need() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let alice_listener = Arc::new(ListenerStub::default());
+    let alice_store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
+        app_alice_id(),
+        alice_store,
+        alice_listener,
+        r"
+        [flotsync.replication.runtime.catch-up]
+        max-updates-per-batch = 1
+        ",
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(50_301));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    alice_runtime
+        .install_group_for_test(group_id, members.clone())
+        .expect("alice group should install");
+    bob_runtime
+        .install_group_for_test(group_id, members)
+        .expect("bob group should install");
+
+    let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_311);
+    let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_312);
+    let first_read_token =
+        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let first_receipt = publish_changes(
+        alice_runtime.as_ref(),
+        first_read_token,
+        vec![RowMutation::Upsert {
+            row_id: first_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "partial first",
+            },
+        }],
+    );
+    publish_changes(
+        alice_runtime.as_ref(),
+        first_receipt.read_token,
+        vec![RowMutation::Upsert {
+            row_id: second_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "partial second",
+            },
+        }],
+    );
+    publish_direct_peer_routes(&alice_runtime, &alice_member, bob_runtime, &bob_member);
+    wait_for_test_reply(bob_runtime.request_summary(SummaryRequest {
+        group_id,
+        target: alice_member,
+    }))
+    .expect("summary request should succeed");
+
+    bob_fixture.listener.wait_for_data_change_count(2);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: first_row_id,
+                    title: "partial first".to_owned(),
+                }],
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: second_row_id,
+                    title: "partial second".to_owned(),
+                }],
+            },
+        ]
+    );
+}
+
+#[test]
+fn update_batch_forwarded_by_non_producer_member_applies() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let probe_member = Identifier::from_array(PROBE_MEMBER_SEGMENTS);
+    let dataset_id = docs_dataset_id();
+    let probe_fixture = load_runtime_fixture(
+        app_probe_id(),
+        probe_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let probe_runtime = &probe_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(50_401));
+    probe_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![
+                alice_member.clone(),
+                bob_member.clone(),
+                probe_member,
+            ])
+            .expect("group members should build"),
+        )
+        .expect("probe group should install");
+    let member_count = NonZeroUsize::new(3).expect("group has three members");
+    let (row_id, update) = title_update_message(
+        group_id,
+        dataset_id,
+        50_411,
+        "forwarded by bob",
+        UpdateId {
+            node_index: 0,
+            version: 1,
+        },
+        VersionVector::initial(member_count),
+    );
+    let batch = UpdateBatchMessage {
+        group_id,
+        updates: vec![update],
+    };
+
+    probe_runtime
+        .apply_update_batch_for_test(bob_member, batch)
+        .expect("non-producer member should be allowed to forward update batch");
+    probe_fixture.listener.wait_for_data_change_count(1);
+    assert_eq!(
+        probe_fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id,
+                title: "forwarded by bob".to_owned(),
+            }],
+        }]
     );
 }
 
