@@ -1,5 +1,5 @@
 use super::{
-    errors::InboundDeliveryError,
+    errors::{InboundDeliveryError, PublishChangesError},
     handle::{
         ReplicationRuntime,
         load_replication_runtime_typed,
@@ -16,13 +16,15 @@ use super::{
         validate_update_mapping,
     },
     load_replication_runtime,
-    messages::{DatasetUpdateMessage, UpdateMessage},
+    messages::{DatasetUpdateMessage, UpdateBatchMessage, UpdateMessage},
 };
 use crate::{
     GroupMembers,
     GroupMemberships,
+    MAX_VERSION_VALUE,
     SqliteReplicationStore,
     api::{
+        ApiError,
         CreateGroupRequest,
         DatasetId,
         DatasetRowPatch,
@@ -71,7 +73,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{Arc, LazyLock, Mutex, mpsc},
@@ -278,11 +280,24 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_updates(group_id, filter)
+            .load_replication_updates(group_id, filter, limit)
+    }
+
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update_ids(group_id, filter, limit)
     }
 
     fn append_replication_update(
@@ -745,6 +760,39 @@ fn publish_changes(
     .expect("publish should succeed")
 }
 
+fn title_update_message(
+    group_id: GroupId,
+    dataset_id: DatasetId,
+    row_raw: u128,
+    title: &str,
+    update_id: UpdateId,
+    read_versions: VersionVector,
+) -> (RowId, UpdateMessage) {
+    let row_id = test_row_id(group_id, dataset_id.clone(), row_raw);
+    let mut source_dataset = LocalDataset::new(title_schema_static());
+    let operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => title },
+        update_id,
+    )
+    .expect("operation should build")
+    .expect("operation should apply")
+    .encoded_operation;
+    (
+        row_id,
+        UpdateMessage {
+            group_id,
+            update_id,
+            read_versions,
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id,
+                operations: vec![operation],
+            }],
+        },
+    )
+}
+
 fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
     rows.sort_by_key(|row| match row {
         CapturedRowChange::Upsert { row_id, .. } | CapturedRowChange::Delete { row_id } => {
@@ -881,6 +929,30 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
 
     host.publish_preconfigured_peer_routes();
     host.wait_for_direct_peer_route(&bob_member);
+    host.shutdown();
+}
+
+#[test]
+fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
+    let alice_member = alice_member();
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let mut host = DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
+        &alice_member,
+        store,
+        listener,
+        Some(
+            r"
+            [flotsync.replication.runtime.catch-up]
+            max-updates-per-batch = 0
+            ",
+        ),
+        PreconfiguredPeerRoutesPublishMode::ManualForTest,
+    )
+    .expect("zero catch-up batch size should mean unlimited");
+    host.wait_for_runtime_startup();
     host.shutdown();
 }
 
@@ -1431,6 +1503,76 @@ fn publish_changes_error_display_includes_local_operation_source() {
 }
 
 #[test]
+fn publish_changes_rejects_reserved_local_update_version() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(40_101));
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let version_vector = VersionVector::initial(member_count).with_update_applied(UpdateId {
+        node_index: 0,
+        version: MAX_VERSION_VALUE,
+    });
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            members: vec![alice_member.clone(), bob_member],
+            local_member_index: MemberIndex::new(0),
+            version_vector: version_vector.clone(),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let row_id = test_row_id(group_id, dataset_id, 40_102);
+    let read_token = ReadToken::from_group_versions(HashMap::from([(group_id, version_vector)]));
+
+    let error = wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
+        read_token,
+        changes: vec![RowMutation::Upsert {
+            row_id,
+            row: crate::row_values! {
+                "title" => "too late",
+            },
+        }],
+    }))
+    .expect_err("reserved local update version should fail publish");
+
+    match error {
+        ApiError::ApiExternal { source } => match source.downcast_ref::<PublishChangesError>() {
+            Some(PublishChangesError::ExhaustedUpdateIds {
+                group_id: exhausted_group_id,
+            }) => assert_eq!(*exhausted_group_id, group_id),
+            other => panic!("unexpected publish error source: {other:?}"),
+        },
+        error => panic!("unexpected API error: {error:?}"),
+    }
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).version_vector,
+        VersionVector::initial(member_count).with_update_applied(UpdateId {
+            node_index: 0,
+            version: MAX_VERSION_VALUE,
+        })
+    );
+    assert_eq!(
+        load_persisted_update(
+            store.as_ref(),
+            group_id,
+            UpdateId {
+                node_index: 0,
+                version: u64::MAX,
+            },
+        ),
+        None
+    );
+    assert!(listener.captured_data_changes().is_empty());
+}
+
+#[test]
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -1573,6 +1715,98 @@ fn publish_changes_delivers_remote_data_changed_event() {
             .membership_snapshot()
             .contains_group(&group_id),
         "remote runtime should still host the replicated group"
+    );
+}
+
+#[test]
+fn update_gap_triggers_need_range_and_update_batch_catch_up() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let alice_runtime = &alice_fixture.runtime;
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(50_001));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    alice_runtime
+        .install_group_for_test(group_id, members.clone())
+        .expect("alice group should install");
+    bob_runtime
+        .install_group_for_test(group_id, members)
+        .expect("bob group should install");
+
+    let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_011);
+    let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_012);
+    let first_read_token =
+        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
+    let first_receipt = publish_changes(
+        alice_runtime.as_ref(),
+        first_read_token,
+        vec![RowMutation::Upsert {
+            row_id: first_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "missed first",
+            },
+        }],
+    );
+
+    alice_runtime.host().publish_direct_peer_route(
+        bob_member.clone(),
+        bob_runtime.host().advertised_loopback_udp_addr(),
+    );
+    bob_runtime.host().publish_direct_peer_route(
+        alice_member,
+        alice_runtime.host().advertised_loopback_udp_addr(),
+    );
+
+    let second_receipt = publish_changes(
+        alice_runtime.as_ref(),
+        first_receipt.read_token,
+        vec![RowMutation::Upsert {
+            row_id: second_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "live second",
+            },
+        }],
+    );
+
+    assert_eq!(
+        second_receipt.update_id,
+        UpdateId {
+            node_index: 0,
+            version: 2,
+        }
+    );
+    bob_fixture.listener.wait_for_data_change_count(2);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: first_row_id,
+                    title: "missed first".to_owned(),
+                }],
+            },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id: second_row_id,
+                    title: "live second".to_owned(),
+                }],
+            },
+        ]
     );
 }
 
@@ -1736,6 +1970,190 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         .apply_update_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
+}
+
+#[test]
+fn duplicate_update_batch_delivery_is_ignored() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let schema = title_schema_static();
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(22_001));
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 22_002);
+    let mut source_dataset = LocalDataset::new(schema);
+    let operation = apply_local_upsert(
+        &mut source_dataset,
+        &row_id,
+        crate::row_values! { "title" => "batch first" },
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+    )
+    .expect("operation should build")
+    .expect("operation should apply")
+    .encoded_operation;
+
+    let update = UpdateMessage {
+        group_id,
+        update_id: UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        read_versions: VersionVector::initial(NonZeroUsize::new(2).expect("group has two members")),
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: dataset_id.clone(),
+            operations: vec![operation],
+        }],
+    };
+    let batch = UpdateBatchMessage {
+        group_id,
+        updates: vec![update],
+    };
+
+    bob_runtime
+        .apply_update_batch_for_test(alice_member.clone(), batch.clone())
+        .expect("first update batch should apply");
+    bob_fixture.listener.wait_for_data_change_count(1);
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: row_id.clone(),
+                title: "batch first".to_owned(),
+            }],
+        }]
+    );
+
+    bob_runtime
+        .apply_update_batch_for_test(alice_member, batch)
+        .expect("duplicate update batch should be ignored");
+    assert_eq!(bob_fixture.listener.captured_data_changes().len(), 1);
+}
+
+#[test]
+fn inbound_update_with_out_of_range_producer_index_is_rejected() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(22_101));
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let (_, update) = title_update_message(
+        group_id,
+        dataset_id,
+        22_102,
+        "invalid producer",
+        UpdateId {
+            version: 1,
+            node_index: 2,
+        },
+        VersionVector::initial(member_count),
+    );
+
+    let error = bob_runtime
+        .apply_update_for_test(alice_member, update)
+        .expect_err("out-of-range producer index should fail cleanly");
+    match error {
+        InboundDeliveryError::UpdateProducerIndexNotInGroup { producer_index, .. } => {
+            assert_eq!(producer_index, MemberIndex::new(2));
+        }
+        error => panic!("unexpected inbound update error: {error:?}"),
+    }
+    assert!(bob_fixture.listener.captured_data_changes().is_empty());
+}
+
+#[test]
+fn update_batch_failure_after_first_update_keeps_first_notifications() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let bob_runtime = &bob_fixture.runtime;
+    let group_id = GroupId(Uuid::from_u128(22_201));
+    bob_runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let (first_row_id, first_update) = title_update_message(
+        group_id,
+        dataset_id.clone(),
+        22_202,
+        "first survives",
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        VersionVector::initial(member_count),
+    );
+    let (_, invalid_update) = title_update_message(
+        group_id,
+        dataset_id,
+        22_203,
+        "invalid producer",
+        UpdateId {
+            version: 1,
+            node_index: 2,
+        },
+        VersionVector::initial(member_count),
+    );
+    let batch = UpdateBatchMessage {
+        group_id,
+        updates: vec![first_update, invalid_update],
+    };
+
+    let error = bob_runtime
+        .apply_update_batch_for_test(alice_member, batch)
+        .expect_err("second batch update should fail cleanly");
+    match error {
+        InboundDeliveryError::UpdateProducerIndexNotInGroup { producer_index, .. } => {
+            assert_eq!(producer_index, MemberIndex::new(2));
+        }
+        error => panic!("unexpected update batch error: {error:?}"),
+    }
+    assert_eq!(
+        bob_fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: first_row_id,
+                title: "first survives".to_owned(),
+            }],
+        }]
+    );
 }
 
 #[test]

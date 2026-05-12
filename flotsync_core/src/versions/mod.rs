@@ -173,6 +173,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn version_vector_missing_ranges_omit_members_that_are_not_behind() {
+        let local = VersionVector::Full(PureVersionVector::from([5, 3, 1]));
+        let remote = VersionVector::Full(PureVersionVector::from([5, 1, 4]));
+
+        assert_eq!(
+            local.missing_version_ranges_to(&remote),
+            vec![VersionVectorGap {
+                member_index: 2,
+                start_version: 2,
+                end_version: 4,
+            }]
+        );
+    }
+
+    #[test]
+    fn version_vector_missing_ranges_report_multiple_gaps() {
+        let local = VersionVector::Full(PureVersionVector::from([1, 0, 7, 2]));
+        let remote = VersionVector::Full(PureVersionVector::from([3, 2, 7, 5]));
+
+        assert_eq!(
+            local.missing_version_ranges_to(&remote),
+            vec![
+                VersionVectorGap {
+                    member_index: 0,
+                    start_version: 2,
+                    end_version: 3,
+                },
+                VersionVectorGap {
+                    member_index: 1,
+                    start_version: 1,
+                    end_version: 2,
+                },
+                VersionVectorGap {
+                    member_index: 3,
+                    start_version: 3,
+                    end_version: 5,
+                },
+            ]
+        );
+    }
+
     /// Just some shorthands, to make the tests easier to read.
     mod helpers {
         use super::*;

@@ -1,3 +1,4 @@
+mod catch_up_manager;
 mod component;
 mod envelope;
 mod errors;

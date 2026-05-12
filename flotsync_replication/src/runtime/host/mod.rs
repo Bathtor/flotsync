@@ -1,4 +1,8 @@
-use super::{ReplicationRuntimeComponent, summary_request_manager::SummaryRequestManager};
+use super::{
+    ReplicationRuntimeComponent,
+    catch_up_manager::CatchUpManagerComponent,
+    summary_request_manager::SummaryRequestManagerComponent,
+};
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
@@ -201,7 +205,8 @@ struct RuntimeTopology {
     #[cfg_attr(not(test), allow(dead_code))]
     preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
-    summary_request_manager: Arc<Component<SummaryRequestManager>>,
+    catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
+    summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
     runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
@@ -212,6 +217,7 @@ struct BuiltRuntimeSystem {
 }
 
 impl RuntimeTopology {
+    #[allow(clippy::too_many_lines)]
     fn build(
         system: &KompactSystem,
         group_memberships: &SharedGroupMemberships,
@@ -262,34 +268,46 @@ impl RuntimeTopology {
             .expect("preconfigured peer routes must expose a strong actor ref");
         let local_endpoint_manager =
             system.create(move || LocalEndpointManager::new(host_config.local_endpoint_bind_addr));
-        let summary_request_manager = {
-            let summary_manager_memberships = group_memberships.clone();
-            let summary_manager_local_member = local_member.clone();
-            system.create(move || {
-                SummaryRequestManager::new(
-                    summary_manager_local_member.clone(),
-                    summary_manager_memberships.clone(),
-                    host_config.summary_request_timeout,
-                )
-            })
-        };
+        let catch_up_memberships = group_memberships.clone();
+        let catch_up_local_member = local_member.clone();
+        let catch_up_store = store.clone();
+        let catch_up_manager = system.create(move || {
+            CatchUpManagerComponent::new(
+                catch_up_local_member,
+                catch_up_memberships,
+                catch_up_store,
+            )
+        });
+        let catch_up_manager_ref = catch_up_manager
+            .actor_ref()
+            .hold()
+            .expect("catch-up manager must expose a strong actor ref");
+        let summary_manager_memberships = group_memberships.clone();
+        let summary_manager_local_member = local_member.clone();
+        let summary_request_timeout = host_config.summary_request_timeout;
+        let summary_request_manager = system.create(move || {
+            SummaryRequestManagerComponent::new(
+                summary_manager_local_member,
+                summary_manager_memberships,
+                summary_request_timeout,
+            )
+        });
         let summary_request_manager_ref = summary_request_manager
             .actor_ref()
             .hold()
             .expect("summary request manager must expose a strong actor ref");
-        let runtime_component = {
-            let runtime_memberships = group_memberships.clone();
-            let runtime_local_member = local_member.clone();
-            system.create(move || {
-                ReplicationRuntimeComponent::new(
-                    runtime_local_member.clone(),
-                    store.clone(),
-                    listener.clone(),
-                    runtime_memberships.clone(),
-                    summary_request_manager_ref.clone(),
-                )
-            })
-        };
+        let runtime_memberships = group_memberships.clone();
+        let runtime_local_member = local_member.clone();
+        let runtime_component = system.create(move || {
+            ReplicationRuntimeComponent::new(
+                runtime_local_member,
+                store,
+                listener,
+                runtime_memberships,
+                summary_request_manager_ref,
+                catch_up_manager_ref,
+            )
+        });
 
         Self {
             driver,
@@ -301,6 +319,7 @@ impl RuntimeTopology {
             preconfigured_peer_routes,
             preconfigured_peer_routes_ref,
             local_endpoint_manager,
+            catch_up_manager,
             summary_request_manager,
             runtime_component,
         }
@@ -336,6 +355,11 @@ impl RuntimeTopology {
             &self.group_broadcast,
             &self.runtime_component,
             "group broadcast -> replication runtime",
+        )?;
+        Self::connect_components::<GroupBroadcastPort, _, _>(
+            &self.group_broadcast,
+            &self.catch_up_manager,
+            "group broadcast -> catch-up manager",
         )?;
         Self::connect_components::<ReliableDeliveryPort, _, _>(
             &self.reliable_delivery,
@@ -401,6 +425,12 @@ impl RuntimeTopology {
         )?;
         Self::start_component(
             system,
+            &self.catch_up_manager,
+            "catch_up_manager",
+            control_timeout,
+        )?;
+        Self::start_component(
+            system,
             &self.summary_request_manager,
             "summary_request_manager",
             control_timeout,
@@ -429,6 +459,12 @@ impl RuntimeTopology {
             system,
             &self.summary_request_manager,
             "summary_request_manager",
+            control_timeout,
+        )?;
+        Self::stop_component(
+            system,
+            &self.catch_up_manager,
+            "catch_up_manager",
             control_timeout,
         )?;
         Self::stop_component(

@@ -32,7 +32,7 @@ use std::{any::Any, sync::Arc, thread};
 #[cfg(test)]
 use super::{
     errors::{GroupInstallError, InboundDeliveryError},
-    messages::UpdateMessage,
+    messages::{UpdateBatchMessage, UpdateMessage},
 };
 #[cfg(test)]
 use crate::{GroupMembers, api::MemberIdentity};
@@ -323,6 +323,24 @@ impl ReplicationRuntime {
             Err(error) => {
                 panic!(
                     "replication runtime component became unavailable during test apply_update: {error:?}"
+                )
+            }
+        }
+    }
+
+    pub(super) fn apply_update_batch_for_test(
+        &self,
+        sender: MemberIdentity,
+        message: UpdateBatchMessage,
+    ) -> Result<(), InboundDeliveryError> {
+        let future = self.runtime_ref().ask_with(|promise| {
+            ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
+        });
+        match wait_for_test_reply(future) {
+            Ok(reply) => reply,
+            Err(error) => {
+                panic!(
+                    "replication runtime component became unavailable during test apply_update_batch: {error:?}"
                 )
             }
         }

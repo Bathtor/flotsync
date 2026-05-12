@@ -1,5 +1,14 @@
 use crate::{
-    api::{DatasetId, DatasetIdError, GroupId, MemberIdentity},
+    MAX_VERSION_VALUE,
+    api::{
+        DatasetId,
+        DatasetIdError,
+        DatasetUpdateRecord,
+        GroupId,
+        MemberIdentity,
+        ReplicationUpdateRecord,
+        Summary,
+    },
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -7,7 +16,13 @@ use crate::{
         member_identity_to_wire_format,
     },
 };
-use flotsync_core::versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector};
+use flotsync_core::versions::{
+    OverrideVersion,
+    PureVersionVector,
+    UpdateId,
+    VersionVector,
+    VersionVectorGap,
+};
 use flotsync_messages::{
     buffa::{Message as _, MessageField},
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
@@ -31,6 +46,34 @@ pub(crate) enum RuntimeMessageError {
     EmptyBootstrapGroup,
     #[snafu(display("Update message must include at least one dataset update."))]
     EmptyUpdate,
+    #[snafu(display("NeedRange message must include at least one range."))]
+    EmptyNeedRange,
+    #[snafu(display("UpdateBatch message must include at least one update."))]
+    EmptyUpdateBatch,
+    #[snafu(display(
+        "NeedRange entry for producer {producer_index} had invalid range {start_version}..={end_version}."
+    ))]
+    InvalidNeedRange {
+        producer_index: u32,
+        start_version: u64,
+        end_version: u64,
+    },
+    #[snafu(display(
+        "NeedRange entry for producer {producer_index} used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
+    ))]
+    NeedRangeBoundTooLarge { producer_index: u32, version: u64 },
+    #[snafu(display(
+        "Update id {update_id} used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
+    ))]
+    UpdateVersionBoundTooLarge { update_id: UpdateId, version: u64 },
+    #[snafu(display(
+        "UpdateBatch for group {batch_group} contained update {update} for different group {update_group}."
+    ))]
+    UpdateBatchGroupMismatch {
+        batch_group: GroupId,
+        update_group: GroupId,
+        update: UpdateId,
+    },
     #[snafu(display(
         "Update dataset entry for '{dataset_id}' must include at least one operation."
     ))]
@@ -96,6 +139,10 @@ pub(crate) enum WireVersionVectorError {
         override_position: u32,
         override_version: u64,
     },
+    #[snafu(display(
+        "Version-vector field '{field}' used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
+    ))]
+    VersionBoundTooLarge { field: &'static str, version: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +151,8 @@ pub(crate) enum RuntimeMessage {
     Update(UpdateMessage),
     SummaryRequest(SummaryRequestMessage),
     Summary(SummaryMessage),
+    NeedRange(NeedRangeMessage),
+    UpdateBatch(UpdateBatchMessage),
 }
 
 /// One decoded wire message before all runtime context is available.
@@ -118,6 +167,8 @@ pub(crate) enum WireRuntimeMessage {
     Update(WireUpdateMessage),
     SummaryRequest(SummaryRequestMessage),
     Summary(WireSummaryMessage),
+    NeedRange(NeedRangeMessage),
+    UpdateBatch(WireUpdateBatchMessage),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,6 +209,65 @@ pub(crate) struct SummaryVersionsMessage<V> {
 
 pub(crate) type SummaryMessage = SummaryVersionsMessage<VersionVector>;
 pub(crate) type WireSummaryMessage = SummaryVersionsMessage<WireVersionVector>;
+
+/// Inclusive producer-version range for one canonical group member.
+///
+/// Decoded wire values are normalised so `end_version >= start_version`, and
+/// every bound is at most [`MAX_VERSION_VALUE`]. Runtime-created values must
+/// preserve the same invariant before they reach catch-up tracking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct UpdateRangeMessage {
+    /// Canonical group member index of the producer whose versions are requested.
+    pub(crate) producer_index: u32,
+    /// Inclusive first producer version in this range.
+    ///
+    /// Runtime-created values must already respect [`MAX_VERSION_VALUE`].
+    pub(crate) start_version: u64,
+    /// Inclusive last producer version in this range.
+    ///
+    /// This must be greater than or equal to `start_version`. Runtime-created
+    /// values must already respect [`MAX_VERSION_VALUE`].
+    pub(crate) end_version: u64,
+}
+
+impl From<UpdateId> for UpdateRangeMessage {
+    fn from(update_id: UpdateId) -> Self {
+        Self {
+            producer_index: update_id.node_index,
+            start_version: update_id.version,
+            end_version: update_id.version,
+        }
+    }
+}
+
+impl From<VersionVectorGap> for UpdateRangeMessage {
+    fn from(gap: VersionVectorGap) -> Self {
+        Self {
+            producer_index: u32::try_from(gap.member_index)
+                .expect("group member count must fit producer index"),
+            start_version: gap.start_version,
+            end_version: gap.end_version,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NeedRangeMessage {
+    pub(crate) group_id: GroupId,
+    pub(crate) ranges: Vec<UpdateRangeMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct UpdateBatchMessage {
+    pub(crate) group_id: GroupId,
+    pub(crate) updates: Vec<UpdateMessage>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WireUpdateBatchMessage {
+    pub(crate) group_id: GroupId,
+    pub(crate) updates: Vec<WireUpdateMessage>,
+}
 
 impl<V> SummaryVersionsMessage<V> {
     pub(crate) fn new(group_id: GroupId, correlation_id: Uuid, has_versions: V) -> Self {
@@ -234,6 +344,44 @@ impl DatasetUpdateMessage {
     }
 }
 
+impl From<DatasetUpdateRecord> for DatasetUpdateMessage {
+    fn from(record: DatasetUpdateRecord) -> Self {
+        Self {
+            dataset_id: record.dataset_id,
+            operations: record.operations,
+        }
+    }
+}
+
+impl From<DatasetUpdateMessage> for DatasetUpdateRecord {
+    fn from(message: DatasetUpdateMessage) -> Self {
+        Self {
+            dataset_id: message.dataset_id,
+            operations: message.operations,
+        }
+    }
+}
+
+/// Convert a stored update-log record into the catch-up wire payload.
+///
+/// Store-local metadata such as the recorded sender and `applied_locally` state
+/// is intentionally dropped: receivers only need the update id, read versions,
+/// and dataset operations to replay the missing update.
+impl From<ReplicationUpdateRecord> for UpdateMessage {
+    fn from(record: ReplicationUpdateRecord) -> Self {
+        Self {
+            group_id: record.group_id,
+            update_id: record.update_id,
+            read_versions: record.read_versions,
+            dataset_updates: record
+                .dataset_updates
+                .into_iter()
+                .map(DatasetUpdateMessage::from)
+                .collect(),
+        }
+    }
+}
+
 impl RuntimeMessage {
     pub(crate) fn encode_to_proto(&self) -> replication_proto::RuntimeMessage {
         match self {
@@ -259,6 +407,18 @@ impl RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::Summary(Box::new(
                     message.to_proto(),
                 ))),
+                ..replication_proto::RuntimeMessage::default()
+            },
+            RuntimeMessage::NeedRange(message) => replication_proto::RuntimeMessage {
+                body: Some(replication_proto::runtime_message::Body::NeedRange(
+                    Box::new(message.to_proto()),
+                )),
+                ..replication_proto::RuntimeMessage::default()
+            },
+            RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
+                body: Some(replication_proto::runtime_message::Body::UpdateBatch(
+                    Box::new(message.to_proto()),
+                )),
                 ..replication_proto::RuntimeMessage::default()
             },
         }
@@ -317,6 +477,68 @@ impl SummaryMessage {
                 WireVersionVector::from_runtime(&self.has_versions).to_proto(),
             ),
             ..replication_proto::Summary::default()
+        }
+    }
+}
+
+impl UpdateRangeMessage {
+    fn to_proto(self) -> replication_proto::UpdateRange {
+        replication_proto::UpdateRange {
+            producer_index: self.producer_index,
+            start_version: self.start_version,
+            end_version: (self.end_version != self.start_version).then_some(self.end_version),
+            ..replication_proto::UpdateRange::default()
+        }
+    }
+
+    fn from_proto(message: &replication_proto::UpdateRange) -> Result<Self, RuntimeMessageError> {
+        let end_version = message.end_version.unwrap_or(message.start_version);
+        ensure!(
+            message.start_version <= end_version,
+            InvalidNeedRangeSnafu {
+                producer_index: message.producer_index,
+                start_version: message.start_version,
+                end_version,
+            }
+        );
+        for version in [message.start_version, end_version] {
+            ensure!(
+                version <= MAX_VERSION_VALUE,
+                NeedRangeBoundTooLargeSnafu {
+                    producer_index: message.producer_index,
+                    version,
+                }
+            );
+        }
+        Ok(Self {
+            producer_index: message.producer_index,
+            start_version: message.start_version,
+            end_version,
+        })
+    }
+}
+
+impl NeedRangeMessage {
+    fn to_proto(&self) -> replication_proto::NeedRange {
+        replication_proto::NeedRange {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            ranges: self
+                .ranges
+                .iter()
+                .copied()
+                .map(UpdateRangeMessage::to_proto)
+                .collect(),
+            ..replication_proto::NeedRange::default()
+        }
+    }
+}
+
+impl UpdateBatchMessage {
+    fn to_proto(&self) -> replication_proto::UpdateBatch {
+        replication_proto::UpdateBatch {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            updates: self.updates.iter().map(UpdateMessage::to_proto).collect(),
+            ..replication_proto::UpdateBatch::default()
         }
     }
 }
@@ -398,6 +620,27 @@ impl WireRuntimeMessage {
             replication_proto::runtime_message::Body::Summary(message) => Ok(
                 WireRuntimeMessage::Summary(WireSummaryMessage::from_proto(*message)?),
             ),
+            replication_proto::runtime_message::Body::NeedRange(message) => {
+                let group_id = group_id_from_wire(&message.group_id, "need_range.group_id")
+                    .context(InvalidWireValueSnafu {
+                        field: "need_range.group_id",
+                    })?;
+                if message.ranges.is_empty() {
+                    return EmptyNeedRangeSnafu.fail();
+                }
+                let ranges = message
+                    .ranges
+                    .iter()
+                    .map(UpdateRangeMessage::from_proto)
+                    .collect::<Result<_, _>>()?;
+                Ok(WireRuntimeMessage::NeedRange(NeedRangeMessage {
+                    group_id,
+                    ranges,
+                }))
+            }
+            replication_proto::runtime_message::Body::UpdateBatch(message) => Ok(
+                WireRuntimeMessage::UpdateBatch(WireUpdateBatchMessage::from_proto(*message)?),
+            ),
         }
     }
 }
@@ -415,6 +658,7 @@ impl WireUpdateMessage {
         let update_id = decode_update_id(update_id).context(InvalidUpdateIdSnafu {
             field: "update.update_id",
         })?;
+        ensure_update_id_version_bound(update_id)?;
         let Some(read_versions) = message.read_versions.take() else {
             return MissingReadVersionsSnafu.fail();
         };
@@ -461,6 +705,48 @@ impl From<UpdateMessage> for WireUpdateMessage {
     }
 }
 
+impl From<UpdateBatchMessage> for WireUpdateBatchMessage {
+    fn from(message: UpdateBatchMessage) -> Self {
+        Self {
+            group_id: message.group_id,
+            updates: message
+                .updates
+                .into_iter()
+                .map(WireUpdateMessage::from)
+                .collect(),
+        }
+    }
+}
+
+impl WireUpdateBatchMessage {
+    fn from_proto(message: replication_proto::UpdateBatch) -> Result<Self, RuntimeMessageError> {
+        let group_id = group_id_from_wire(&message.group_id, "update_batch.group_id").context(
+            InvalidWireValueSnafu {
+                field: "update_batch.group_id",
+            },
+        )?;
+        if message.updates.is_empty() {
+            return EmptyUpdateBatchSnafu.fail();
+        }
+        let updates: Vec<WireUpdateMessage> = message
+            .updates
+            .into_iter()
+            .map(WireUpdateMessage::from_proto)
+            .collect::<Result<_, _>>()?;
+        for update in &updates {
+            ensure!(
+                update.group_id == group_id,
+                UpdateBatchGroupMismatchSnafu {
+                    batch_group: group_id,
+                    update_group: update.group_id,
+                    update: update.update_id,
+                }
+            );
+        }
+        Ok(Self { group_id, updates })
+    }
+}
+
 impl WireSummaryMessage {
     fn from_proto(mut message: replication_proto::Summary) -> Result<Self, RuntimeMessageError> {
         let group_id = group_id_from_wire(&message.group_id, "summary.group_id").context(
@@ -495,6 +781,19 @@ impl WireSummaryMessage {
             self.correlation_id,
             has_versions,
         ))
+    }
+
+    pub(crate) fn into_summary(
+        self,
+        responder: MemberIdentity,
+        member_count: NonZeroUsize,
+    ) -> Result<Summary, RuntimeMessageError> {
+        let summary_message = self.into_runtime(member_count)?;
+        Ok(Summary {
+            group_id: summary_message.group_id,
+            responder,
+            has_versions: summary_message.has_versions,
+        })
     }
 }
 
@@ -560,11 +859,22 @@ impl WireVersionVector {
                 if full.entries.is_empty() {
                     return EmptyFullVectorSnafu.fail();
                 }
+                for version in full.entries.iter().copied() {
+                    ensure_version_vector_bound("full.entries", version)?;
+                }
                 Ok(WireVersionVector::Full(PureVersionVector::from(
                     full.entries,
                 )))
             }
             versions_proto::version_vector::Versions::Override(override_vector) => {
+                ensure_version_vector_bound(
+                    "override.group_version",
+                    override_vector.group_version,
+                )?;
+                ensure_version_vector_bound(
+                    "override.override_version",
+                    override_vector.override_version,
+                )?;
                 Ok(WireVersionVector::Override {
                     group_version: override_vector.group_version,
                     override_position: override_vector.override_position,
@@ -572,6 +882,7 @@ impl WireVersionVector {
                 })
             }
             versions_proto::version_vector::Versions::Synced(synced) => {
+                ensure_version_vector_bound("synced.group_version", synced.group_version)?;
                 Ok(WireVersionVector::Synced {
                     group_version: synced.group_version,
                 })
@@ -633,6 +944,28 @@ impl WireVersionVector {
     }
 }
 
+fn ensure_update_id_version_bound(update_id: UpdateId) -> Result<(), RuntimeMessageError> {
+    ensure!(
+        update_id.version <= MAX_VERSION_VALUE,
+        UpdateVersionBoundTooLargeSnafu {
+            update_id,
+            version: update_id.version,
+        }
+    );
+    Ok(())
+}
+
+fn ensure_version_vector_bound(
+    field: &'static str,
+    version: u64,
+) -> Result<(), WireVersionVectorError> {
+    ensure!(
+        version <= MAX_VERSION_VALUE,
+        VersionBoundTooLargeSnafu { field, version }
+    );
+    Ok(())
+}
+
 fn correlation_id_from_wire(
     bytes: &[u8],
     field: &'static str,
@@ -643,17 +976,40 @@ fn correlation_id_from_wire(
 #[cfg(test)]
 mod tests {
     use super::{
+        DatasetUpdateMessage,
+        NeedRangeMessage,
         RuntimeMessage,
+        RuntimeMessageError,
         SummaryMessage,
         SummaryRequestMessage,
+        UpdateBatchMessage,
+        UpdateMessage,
+        UpdateRangeMessage,
         WireRuntimeMessage,
         WireVersionVector,
+        WireVersionVectorError,
     };
-    use crate::api::GroupId;
-    use flotsync_core::versions::{OverrideVersion, PureVersionVector, VersionVector};
-    use flotsync_messages::buffa::Message as _;
+    use crate::api::{DatasetId, GroupId};
+    use flotsync_core::versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector};
+    use flotsync_messages::{buffa::Message as _, datamodel as datamodel_proto};
     use std::num::NonZeroUsize;
     use uuid::Uuid;
+
+    fn test_update_message(
+        group_id: GroupId,
+        update_id: UpdateId,
+        read_versions: VersionVector,
+    ) -> UpdateMessage {
+        UpdateMessage {
+            group_id,
+            update_id,
+            read_versions,
+            dataset_updates: vec![DatasetUpdateMessage {
+                dataset_id: DatasetId::try_new("docs").expect("dataset id should build"),
+                operations: vec![datamodel_proto::SchemaOperation::default()],
+            }],
+        }
+    }
 
     #[test]
     fn wire_version_vector_round_trips_full_override_and_synced() {
@@ -717,5 +1073,173 @@ mod tests {
                 .expect("summary versions should normalise"),
             SummaryMessage::new(group_id, correlation_id, has_versions)
         );
+    }
+
+    #[test]
+    fn update_range_omits_end_version_for_singletons() {
+        let singleton = UpdateRangeMessage {
+            producer_index: 1,
+            start_version: 7,
+            end_version: 7,
+        };
+        let singleton_proto = singleton.to_proto();
+        assert_eq!(singleton_proto.end_version, None);
+        assert_eq!(
+            UpdateRangeMessage::from_proto(&singleton_proto).expect("singleton should decode"),
+            singleton
+        );
+
+        let range = UpdateRangeMessage {
+            producer_index: 1,
+            start_version: 7,
+            end_version: 9,
+        };
+        let range_proto = range.to_proto();
+        assert_eq!(range_proto.end_version, Some(9));
+        assert_eq!(
+            UpdateRangeMessage::from_proto(&range_proto).expect("range should decode"),
+            range
+        );
+    }
+
+    #[test]
+    fn update_range_rejects_reserved_max_bound() {
+        let group_id = GroupId(Uuid::from_u128(303));
+        let payload = RuntimeMessage::NeedRange(NeedRangeMessage {
+            group_id,
+            ranges: vec![UpdateRangeMessage {
+                producer_index: 1,
+                start_version: u64::MAX - 1,
+                end_version: u64::MAX,
+            }],
+        })
+        .encode_to_proto()
+        .encode_to_bytes();
+
+        let error = WireRuntimeMessage::decode_from_slice(&payload)
+            .expect_err("reserved max range bound should be rejected");
+        assert!(matches!(
+            error,
+            RuntimeMessageError::NeedRangeBoundTooLarge {
+                producer_index: 1,
+                version: u64::MAX,
+            }
+        ));
+    }
+
+    #[test]
+    fn update_rejects_reserved_update_id_version() {
+        let group_id = GroupId(Uuid::from_u128(304));
+        let update_id = UpdateId {
+            version: u64::MAX,
+            node_index: 0,
+        };
+        let payload = RuntimeMessage::Update(test_update_message(
+            group_id,
+            update_id,
+            VersionVector::initial(NonZeroUsize::new(2).expect("two members")),
+        ))
+        .encode_to_proto()
+        .encode_to_bytes();
+
+        let error = WireRuntimeMessage::decode_from_slice(&payload)
+            .expect_err("reserved update id version should be rejected");
+        assert!(matches!(
+            error,
+            RuntimeMessageError::UpdateVersionBoundTooLarge {
+                update_id: actual_update_id,
+                version: u64::MAX,
+            } if actual_update_id == update_id
+        ));
+    }
+
+    #[test]
+    fn update_rejects_reserved_read_version_bound() {
+        let group_id = GroupId(Uuid::from_u128(305));
+        let payload = RuntimeMessage::Update(test_update_message(
+            group_id,
+            UpdateId {
+                version: 1,
+                node_index: 0,
+            },
+            VersionVector::Full(PureVersionVector::from([u64::MAX, 0])),
+        ))
+        .encode_to_proto()
+        .encode_to_bytes();
+
+        let error = WireRuntimeMessage::decode_from_slice(&payload)
+            .expect_err("reserved read version should be rejected");
+        assert!(matches!(
+            error,
+            RuntimeMessageError::InvalidReadVersions {
+                field: "update.read_versions",
+                source: WireVersionVectorError::VersionBoundTooLarge {
+                    field: "full.entries",
+                    version: u64::MAX,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn summary_rejects_reserved_version_bound() {
+        let group_id = GroupId(Uuid::from_u128(306));
+        let correlation_id = Uuid::from_u128(307);
+        let payload = RuntimeMessage::Summary(SummaryMessage::new(
+            group_id,
+            correlation_id,
+            VersionVector::Synced {
+                num_members: NonZeroUsize::new(2).expect("two members"),
+                version: u64::MAX,
+            },
+        ))
+        .encode_to_proto()
+        .encode_to_bytes();
+
+        let error = WireRuntimeMessage::decode_from_slice(&payload)
+            .expect_err("reserved summary version should be rejected");
+        assert!(matches!(
+            error,
+            RuntimeMessageError::InvalidReadVersions {
+                field: "summary.has_versions",
+                source: WireVersionVectorError::VersionBoundTooLarge {
+                    field: "synced.group_version",
+                    version: u64::MAX,
+                },
+            }
+        ));
+    }
+
+    #[test]
+    fn update_batch_rejects_mismatched_inner_group() {
+        let batch_group_id = GroupId(Uuid::from_u128(401));
+        let update_group_id = GroupId(Uuid::from_u128(402));
+        let update_id = UpdateId {
+            version: 1,
+            node_index: 0,
+        };
+        let payload = RuntimeMessage::UpdateBatch(UpdateBatchMessage {
+            group_id: batch_group_id,
+            updates: vec![test_update_message(
+                update_group_id,
+                update_id,
+                VersionVector::initial(NonZeroUsize::new(2).expect("two members")),
+            )],
+        })
+        .encode_to_proto()
+        .encode_to_bytes();
+
+        let error = WireRuntimeMessage::decode_from_slice(&payload)
+            .expect_err("mismatched batch group should be rejected");
+        assert!(matches!(
+            error,
+            RuntimeMessageError::UpdateBatchGroupMismatch {
+                batch_group: actual_batch_group,
+                update_group: actual_update_group,
+                update: actual_update,
+            } if actual_batch_group == batch_group_id
+                && actual_update_group == update_group_id
+                && actual_update == update_id
+        ));
     }
 }

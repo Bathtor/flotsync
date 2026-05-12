@@ -13,6 +13,8 @@ flotsync_udpour = { path = "../flotsync_udpour" }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 futures-util = { workspace = true }
+interval = { package = "intervallum", version = "1" }
+itertools = { workspace = true }
 kompact = { workspace = true }
 log = { workspace = true }
 smallvec = "1"

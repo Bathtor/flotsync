@@ -531,9 +531,9 @@ pub trait ReplicationApi: Send + Sync {
     /// local [`ReplicationEventListener`] with the locally applied row changes,
     /// and submitted a best-effort live update broadcast to currently configured
     /// peers. The returned [`PublishReceipt`] identifies the local update that
-    /// was durably recorded.
+    /// was recorded in the store.
     ///
-    /// The method returns [`ApiError`] if validation, local apply, durable store
+    /// The method returns [`ApiError`] if validation, local apply, store
     /// access, listener notification, or runtime availability fails. Failed calls
     /// must not be treated as partially published by applications; callers should
     /// keep their own pending changes until a receipt is returned.
@@ -542,7 +542,7 @@ pub trait ReplicationApi: Send + Sync {
         request: PublishChangesRequest,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
-    /// Open a batched stream over the latest locally durable rows for selected datasets.
+    /// Open a batched stream over the latest locally stored rows for selected datasets.
     ///
     /// The request is scoped to one replication group and an explicit set of
     /// application datasets. The stream reflects the latest state known to the
@@ -572,7 +572,7 @@ pub trait ReplicationApi: Send + Sync {
     /// Create one new fixed-membership replication group rooted at this member.
     ///
     /// `req.members` defines the canonical member order for the new group and
-    /// must include the local member. On success, the runtime durably stores the
+    /// must include the local member. On success, the runtime stores the
     /// group record, installs it in the live runtime view, broadcasts bootstrap
     /// messages to the configured remote members, and returns the newly allocated
     /// [`GroupId`].
@@ -582,7 +582,7 @@ pub trait ReplicationApi: Send + Sync {
     /// replication slice; requests that include it fail with [`ApiError`].
     ///
     /// The method returns [`ApiError`] when membership validation fails, the
-    /// runtime is unavailable, durable group storage fails, or unsupported
+    /// runtime is unavailable, group storage fails, or unsupported
     /// request features are used.
     fn create_group(&self, req: CreateGroupRequest) -> BoxFuture<'_, Result<GroupId, ApiError>>;
 
@@ -617,7 +617,7 @@ pub struct ReplicationGroupRecord {
     pub members: Vec<MemberIdentity>,
     /// Position of the local member within `members`.
     pub local_member_index: MemberIndex,
-    /// Last locally durable version vector for this group.
+    /// Last applied version vector stored for this group.
     pub version_vector: VersionVector,
 }
 
@@ -668,9 +668,9 @@ pub struct DatasetRowSlice {
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
     pub dataset_id: DatasetId,
-    /// Whether this dataset already exists durably for `group_id`.
+    /// Whether this dataset already exists in the store for `group_id`.
     pub dataset_exists: bool,
-    /// Durable state for each requested row key.
+    /// Stored state for each requested row key.
     ///
     /// `None` means the requested row is absent. A present
     /// [`ReplicationRowRecord`] with `tombstoned = true` means the row is
@@ -747,7 +747,7 @@ pub type RowKeyIterator<'a> = dyn Iterator<Item = &'a RowKey> + Send + 'a;
 
 /// Read-only transaction over one replication store implementation.
 ///
-/// Read transactions are rollback-by-default. They are intended for consistent
+/// Read transactions are release-on-drop. They are intended for consistent
 /// snapshot streams and may be held by a provider across multiple `next_batch`
 /// calls, so callers should drain or drop the provider promptly.
 pub trait ReplicationStoreReadTransaction: Send {
@@ -757,6 +757,11 @@ pub trait ReplicationStoreReadTransaction: Send {
         group_id: &'a GroupId,
     ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
 
+    /// Load all persisted replication groups currently known to the store.
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
     /// Load persisted replication groups whose ids are included in `group_ids`.
     ///
     /// Missing ids are omitted from the returned vector so callers can decide
@@ -765,6 +770,33 @@ pub trait ReplicationStoreReadTransaction: Send {
         &'a mut self,
         group_ids: &'a HashSet<GroupId>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load one persisted replication update by `(group_id, update_id)`.
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
+
+    /// Load persisted replication updates for one group using the given filter and optional limit.
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
+
+    /// Load only persisted replication update ids for one group.
+    ///
+    /// This is for availability/frontier checks that must not decode full
+    /// update payloads. Returned ids follow the same ordering and filtering
+    /// rules as [`Self::load_replication_updates`].
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>>;
 
     /// Scan one ordered batch of stored dataset rows.
     ///
@@ -784,9 +816,9 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Explicitly release the read transaction.
     ///
     /// Callers may skip this and simply drop the transaction instead, but an
-    /// explicit rollback allows store implementations to release resources
-    /// promptly and surface rollback failures directly.
-    fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
+    /// explicit release allows store implementations to release resources
+    /// promptly and surface release failures directly.
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
 }
 
 /// One dataset-scoped batch inside a persisted replication update.
@@ -800,9 +832,9 @@ pub struct DatasetUpdateRecord {
 
 /// One persisted replication update recorded by the runtime.
 ///
-/// Stores must preserve at most one durable record for each
+/// Stores must preserve at most one record for each
 /// `(group_id, update_id)` pair. The `applied_locally` flag distinguishes
-/// updates that are already reflected in durable dataset snapshots from updates
+/// updates that are already reflected in stored dataset snapshots from updates
 /// that are still only present in the append-only update log.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplicationUpdateRecord {
@@ -816,7 +848,7 @@ pub struct ReplicationUpdateRecord {
     pub read_versions: VersionVector,
     /// Per-dataset schema operations in transport order.
     pub dataset_updates: Vec<DatasetUpdateRecord>,
-    /// Whether this update is already reflected in durable local dataset state.
+    /// Whether this update is already reflected in stored local dataset state.
     pub applied_locally: bool,
 }
 
@@ -825,10 +857,16 @@ pub struct ReplicationUpdateRecord {
 pub enum ReplicationUpdateFilter {
     /// Return every persisted update for the group.
     All,
-    /// Return only updates that are not yet reflected in durable local state.
+    /// Return only updates that are not yet reflected in stored local state.
     PendingApply,
-    /// Return only updates that are already reflected in durable local state.
+    /// Return only updates that are already reflected in stored local state.
     Applied,
+    /// Return persisted updates for one producer and inclusive version range.
+    ProducerRange {
+        producer_index: MemberIndex,
+        start_version: u64,
+        end_version: u64,
+    },
 }
 
 /// Mutable transaction over one replication store implementation.
@@ -869,14 +907,14 @@ pub trait ReplicationStoreTransaction: Send {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Advance the durable version vector for one existing replication group.
+    /// Advance the stored applied version vector for one existing replication group.
     fn update_replication_group_version_vector<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Load the durable state for the requested dataset row keys.
+    /// Load the stored state for the requested dataset row keys.
     ///
     /// Implementations must include every iterated `row_key` exactly once in
     /// `DatasetRowSlice.rows`.
@@ -887,7 +925,7 @@ pub trait ReplicationStoreTransaction: Send {
         row_keys: &'a mut RowKeyIterator<'a>,
     ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
 
-    /// Apply one explicit set of durable row-level dataset storage actions.
+    /// Apply one explicit set of row-level dataset storage actions.
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowPatch,
@@ -900,17 +938,30 @@ pub trait ReplicationStoreTransaction: Send {
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
 
-    /// Load persisted replication updates for one group using the given filter.
+    /// Load persisted replication updates for one group using the given filter and optional limit.
     fn load_replication_updates<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
+
+    /// Load only persisted replication update ids for one group.
+    ///
+    /// This is for availability/frontier checks that must not decode full
+    /// update payloads. Returned ids follow the same ordering and filtering
+    /// rules as [`Self::load_replication_updates`].
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>>;
 
     /// Append one new persisted replication update record.
     ///
     /// Implementations must preserve the uniqueness of `(group_id, update_id)`
-    /// and reject attempts to overwrite an existing durable update blob.
+    /// and reject attempts to overwrite an existing stored update blob.
     fn append_replication_update(
         &mut self,
         update: ReplicationUpdateRecord,

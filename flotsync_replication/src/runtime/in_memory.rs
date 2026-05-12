@@ -217,6 +217,7 @@ impl PendingUpdateSet {
         PendingApplyPlan {
             already_applied,
             ready_chain,
+            blocked_updates: std::mem::take(&mut self.updates).into_values().collect(),
         }
     }
 }
@@ -225,6 +226,7 @@ impl PendingUpdateSet {
 pub(super) struct PendingApplyPlan {
     pub(super) already_applied: Vec<UpdateId>,
     pub(super) ready_chain: Vec<ReplicationUpdateRecord>,
+    pub(super) blocked_updates: Vec<ReplicationUpdateRecord>,
 }
 
 /// One local dataset together with its current replicated in-memory contents.

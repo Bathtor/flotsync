@@ -218,6 +218,7 @@ impl ReplicationStore for SqliteReplicationStore {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 schema_sources,
+                SqliteReplicationTransactionKind::Write,
             )) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -233,6 +234,7 @@ impl ReplicationStore for SqliteReplicationStore {
             Ok(Box::new(SqliteReplicationStoreTransaction::new(
                 connection,
                 schema_sources,
+                SqliteReplicationTransactionKind::Read,
             )) as Box<dyn ReplicationStoreReadTransaction>)
         }
         .boxed()
@@ -247,34 +249,45 @@ impl ReplicationStore for SqliteReplicationStore {
 struct SqliteReplicationStoreTransaction {
     connection: Option<SqliteStoreTransaction>,
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
+    kind: SqliteReplicationTransactionKind,
 }
 
 impl SqliteReplicationStoreTransaction {
     fn new(
         connection: SqliteStoreTransaction,
         schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
+        kind: SqliteReplicationTransactionKind,
     ) -> Self {
         Self {
             connection: Some(connection),
             schema_sources,
+            kind,
         }
     }
 
     fn assert_open_connection(&mut self) -> &mut SqliteStoreTransaction {
-        self.connection
-            .as_mut()
-            .expect("sqlite replication transaction must not be used after commit or rollback")
+        self.connection.as_mut().expect(
+            "sqlite replication transaction must not be used after commit, rollback, or release",
+        )
     }
 }
 
 impl Drop for SqliteReplicationStoreTransaction {
     fn drop(&mut self) {
-        if self.connection.is_some() {
+        if self.connection.is_some() && self.kind == SqliteReplicationTransactionKind::Write {
             warn!(
                 "dropping open sqlite replication transaction; SQLx will roll it back before returning the connection to the pool"
             );
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqliteReplicationTransactionKind {
+    /// Read-only transaction; dropping it is normal cleanup and should stay quiet.
+    Read,
+    /// Mutable transaction; dropping it means the caller abandoned uncommitted writes.
+    Write,
 }
 
 impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
@@ -285,12 +298,54 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
     }
 
+    fn load_replication_groups(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
+        async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
+    }
+
     fn load_replication_groups_for_ids<'a>(
         &'a mut self,
         group_ids: &'a HashSet<GroupId>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
             .boxed()
+    }
+
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
+        async move {
+            load_replication_update(self.assert_open_connection(), group_id, update_id).await
+        }
+        .boxed()
+    }
+
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
+        async move {
+            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
+        }
+        .boxed()
+    }
+
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        async move {
+            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
+                .await
+        }
+        .boxed()
     }
 
     fn scan_dataset_row_batch<'a>(
@@ -315,12 +370,12 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn rollback(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+    fn release(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
             let connection = self
                 .connection
                 .take()
-                .expect("sqlite replication transaction must not roll back twice");
+                .expect("sqlite replication read transaction must not release twice");
             connection.rollback().await.context(SqlxSnafu)?;
             Ok(())
         }
@@ -424,9 +479,23 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         &'a mut self,
         group_id: &'a GroupId,
         filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
         async move {
-            load_replication_updates(self.assert_open_connection(), group_id, filter).await
+            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
+        }
+        .boxed()
+    }
+
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        async move {
+            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
+                .await
         }
         .boxed()
     }
@@ -1015,38 +1084,25 @@ async fn load_replication_updates(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
     filter: ReplicationUpdateFilter,
+    limit: Option<NonZeroUsize>,
 ) -> Result<Vec<ReplicationUpdateRecord>, StoreError> {
-    let sql = match filter {
-        ReplicationUpdateFilter::All => {
-            "
-SELECT update_node_index, update_version, sender, applied_locally, update_message
-FROM dataset_updates
-WHERE group_id = ?1
-ORDER BY update_version, update_node_index
-"
-        }
-        ReplicationUpdateFilter::PendingApply => {
-            "
-SELECT update_node_index, update_version, sender, applied_locally, update_message
-FROM dataset_updates
-WHERE group_id = ?1
-  AND applied_locally = 0
-ORDER BY update_version, update_node_index
-"
-        }
-        ReplicationUpdateFilter::Applied => {
-            "
-SELECT update_node_index, update_version, sender, applied_locally, update_message
-FROM dataset_updates
-WHERE group_id = ?1
-  AND applied_locally = 1
-ORDER BY update_version, update_node_index
-"
-        }
-    };
     let member_count = load_group_member_count(connection, group_id).await?;
-    let rows = sqlx::query(sql)
-        .bind(group_id.to_string())
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT update_node_index, update_version, sender, applied_locally, update_message
+FROM dataset_updates
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    push_replication_update_filter(&mut query_builder, filter);
+
+    query_builder.push(" ORDER BY update_version, update_node_index");
+    if let Some(limit) = limit {
+        query_builder.push(" LIMIT ");
+        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+    }
+    let rows = query_builder
+        .build()
         .fetch_all(&mut *connection)
         .await
         .context(SqlxSnafu)?;
@@ -1065,6 +1121,71 @@ ORDER BY update_version, update_node_index
         )?);
     }
     Ok(updates)
+}
+
+async fn load_replication_update_ids(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    filter: ReplicationUpdateFilter,
+    limit: Option<NonZeroUsize>,
+) -> Result<Vec<UpdateId>, StoreError> {
+    let mut query_builder = QueryBuilder::<Sqlite>::new(
+        "
+SELECT update_node_index, update_version
+FROM dataset_updates
+WHERE group_id = ",
+    );
+    query_builder.push_bind(group_id.to_string());
+    push_replication_update_filter(&mut query_builder, filter);
+
+    query_builder.push(" ORDER BY update_version, update_node_index");
+    if let Some(limit) = limit {
+        query_builder.push(" LIMIT ");
+        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+    }
+    let rows = query_builder
+        .build()
+        .fetch_all(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+
+    let mut update_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        update_ids.push(UpdateId {
+            node_index: decode_member_index_value(row.get::<i64, _>("update_node_index"))?,
+            version: decode_update_version_sort_key(&row.get::<Vec<u8>, _>("update_version"))?,
+        });
+    }
+    Ok(update_ids)
+}
+
+fn push_replication_update_filter(
+    query_builder: &mut QueryBuilder<'_, Sqlite>,
+    filter: ReplicationUpdateFilter,
+) {
+    match filter {
+        ReplicationUpdateFilter::All => {}
+        ReplicationUpdateFilter::PendingApply => {
+            query_builder.push(" AND applied_locally = ");
+            query_builder.push_bind(false);
+        }
+        ReplicationUpdateFilter::Applied => {
+            query_builder.push(" AND applied_locally = ");
+            query_builder.push_bind(true);
+        }
+        ReplicationUpdateFilter::ProducerRange {
+            producer_index,
+            start_version,
+            end_version,
+        } => {
+            query_builder.push(" AND update_node_index = ");
+            query_builder.push_bind(i64::from(producer_index.as_u32()));
+            query_builder.push(" AND update_version >= ");
+            query_builder.push_bind(encode_update_version_sort_key_vec(start_version));
+            query_builder.push(" AND update_version <= ");
+            query_builder.push_bind(encode_update_version_sort_key_vec(end_version));
+        }
+    }
 }
 
 async fn append_replication_update(
@@ -1632,6 +1753,31 @@ mod tests {
         snapshot.into_owned()
     }
 
+    fn encoded_insert_snapshot(
+        title: &str,
+        schema: &Arc<Schema>,
+    ) -> flotsync_messages::datamodel::SchemaOperation {
+        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let operation = source_data
+            .insert_row(
+                UpdateId {
+                    node_index: 0,
+                    version: 1,
+                },
+                Uuid::from_u128(30_001),
+                vec![
+                    schema
+                        .columns
+                        .get("title")
+                        .expect("title field should exist")
+                        .initial(title)
+                        .expect("field value should build"),
+                ],
+            )
+            .expect("row insert should succeed");
+        encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode")
+    }
+
     #[test]
     fn dropping_open_sqlite_transaction_releases_store() {
         let store = Arc::new(SqliteReplicationStore::in_memory(local_member()).unwrap());
@@ -1770,7 +1916,11 @@ mod tests {
         assert_eq!(loaded_update, update);
         assert!(matches!(
             wait_for_store_future(
-                transaction.load_replication_updates(&group_id, ReplicationUpdateFilter::PendingApply)
+                transaction.load_replication_updates(
+                    &group_id,
+                    ReplicationUpdateFilter::PendingApply,
+                    None,
+                )
             )
             .expect("updates should load")
             .as_slice(),
@@ -1824,7 +1974,102 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first_group_id]
         );
-        wait_for_store_future(read_transaction.rollback()).expect("rollback should succeed");
+        wait_for_store_future(read_transaction.release()).expect("release should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_filters_replication_updates_by_producer_range() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        )
+        .expect("store should build");
+        let group_id = GroupId(Uuid::from_u128(10_011));
+        let group = sample_group(group_id);
+        let encoded_operation = encoded_insert_snapshot("range query", &schema);
+        let update = |node_index, version, sender| ReplicationUpdateRecord {
+            group_id,
+            update_id: UpdateId {
+                node_index,
+                version,
+            },
+            sender,
+            read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            dataset_updates: vec![DatasetUpdateRecord {
+                dataset_id: dataset_id.clone(),
+                operations: vec![encoded_operation.clone()],
+            }],
+            applied_locally: true,
+        };
+        let alice_v1 = update(0, 1, local_member());
+        let alice_v2 = update(0, 2, local_member());
+        let alice_v3 = update(0, 3, local_member());
+        let bob_v1 = update(1, 1, remote_member());
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(group))
+            .expect("group should store");
+        for update in [
+            alice_v1.clone(),
+            alice_v2.clone(),
+            alice_v3.clone(),
+            bob_v1.clone(),
+        ] {
+            wait_for_store_future(transaction.append_replication_update(update))
+                .expect("update should store");
+        }
+
+        let limited_alice = wait_for_store_future(transaction.load_replication_updates(
+            &group_id,
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(0),
+                start_version: 2,
+                end_version: 3,
+            },
+            NonZeroUsize::new(1),
+        ))
+        .expect("range should load");
+        assert_eq!(limited_alice, vec![alice_v2.clone()]);
+
+        let limited_alice_ids = wait_for_store_future(transaction.load_replication_update_ids(
+            &group_id,
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(0),
+                start_version: 2,
+                end_version: 3,
+            },
+            NonZeroUsize::new(1),
+        ))
+        .expect("range ids should load");
+        assert_eq!(limited_alice_ids, vec![alice_v2.update_id]);
+
+        let full_alice = wait_for_store_future(transaction.load_replication_updates(
+            &group_id,
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(0),
+                start_version: 2,
+                end_version: 3,
+            },
+            NonZeroUsize::new(4),
+        ))
+        .expect("range should load");
+        assert_eq!(full_alice, vec![alice_v2, alice_v3]);
+
+        let bob = wait_for_store_future(transaction.load_replication_updates(
+            &group_id,
+            ReplicationUpdateFilter::ProducerRange {
+                producer_index: MemberIndex::new(1),
+                start_version: 1,
+                end_version: 3,
+            },
+            NonZeroUsize::new(4),
+        ))
+        .expect("range should load");
+        assert_eq!(bob, vec![bob_v1]);
+        wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
     }
 
     #[test]
@@ -1951,7 +2196,7 @@ mod tests {
             NonZeroUsize::new(1).expect("limit should be non-zero"),
         ))
         .expect("second batch should scan");
-        wait_for_store_future(transaction.rollback()).expect("read should roll back");
+        wait_for_store_future(transaction.release()).expect("read should release");
 
         assert_eq!(first_batch.rows[0].row_id, first_row_key);
         assert_eq!(first_batch.next_after, Some(first_row_key));
@@ -2067,7 +2312,7 @@ mod tests {
             group_id,
             update_id: UpdateId {
                 node_index: 0,
-                version: u64::MAX,
+                version: u64::MAX - 1,
             },
             sender: local_member(),
             read_versions: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
@@ -2101,6 +2346,6 @@ mod tests {
                 .expect("update should load")
                 .expect("update should exist");
         assert!(loaded_update.applied_locally);
-        assert_eq!(loaded_update.update_id.version, u64::MAX);
+        assert_eq!(loaded_update.update_id.version, u64::MAX - 1);
     }
 }
