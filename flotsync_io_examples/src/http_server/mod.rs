@@ -200,30 +200,30 @@ impl HttpListenerComponent {
         }
     }
 
-    fn handle_listener_event(&mut self, event: TcpListenerEvent) -> Handled {
+    fn handle_listener_event(&mut self, event: TcpListenerEvent) -> HandlerResult {
         match event {
             TcpListenerEvent::Incoming { peer_addr, pending } => {
                 self.spawn_connection(peer_addr, pending);
-                Handled::Ok
+                Handled::OK
             }
             TcpListenerEvent::Closed => {
                 self.state.mark_closed();
                 self.terminate_success();
-                Handled::DieNow
+                Handled::SHUTDOWN
             }
         }
     }
 
-    fn handle_shutdown_requested(&mut self) -> Handled {
+    fn handle_shutdown_requested(&mut self) -> HandlerResult {
         self.shutdown_requested = true;
         if self.state.request_close() {
-            return Handled::Ok;
+            return Handled::OK;
         }
         if matches!(self.state, HttpListenerState::Closed) {
             self.terminate_success();
-            return Handled::DieNow;
+            return Handled::SHUTDOWN;
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn spawn_connection(&mut self, peer_addr: SocketAddr, pending: PendingTcpSession) {
@@ -238,17 +238,17 @@ impl HttpListenerComponent {
         complete_outcome(&mut self.outcome, Ok(()));
     }
 
-    fn fail_and_die(&mut self, message: &str) -> Handled {
+    fn fail_and_die(&mut self, message: &str) -> HandlerResult {
         complete_outcome(
             &mut self.outcome,
             Err(Whatever::without_source(message.to_owned())),
         );
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 }
 
 impl ComponentLifecycle for HttpListenerComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let open = self.bridge_handle.open_tcp_listener(OpenTcpListener {
             local_addr: self.bind_addr,
             incoming_to: self
@@ -271,7 +271,7 @@ impl ComponentLifecycle for HttpListenerComponent {
                     if async_self.shutdown_requested {
                         return async_self.handle_shutdown_requested();
                     }
-                    Handled::Ok
+                    Handled::OK
                 }
                 Err(error) => {
                     async_self.fail_and_die(&format!("failed to open HTTP listener: {error:?}"))
@@ -284,7 +284,7 @@ impl ComponentLifecycle for HttpListenerComponent {
 impl Actor for HttpListenerComponent {
     type Message = HttpListenerMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             HttpListenerMessage::ListenerEvent(event) => self.handle_listener_event(event),
             HttpListenerMessage::ShutdownRequested => self.handle_shutdown_requested(),
@@ -454,7 +454,7 @@ impl HttpConnectionComponent {
         }
     }
 
-    fn handle_session_event(&mut self, event: TcpSessionEvent) -> Handled {
+    fn handle_session_event(&mut self, event: TcpSessionEvent) -> HandlerResult {
         match event {
             TcpSessionEvent::Received { payload } => self.handle_received_payload(payload),
             TcpSessionEvent::SendAck { transmission_id } => {
@@ -463,7 +463,7 @@ impl HttpConnectionComponent {
                     transmission_id,
                     self.peer_addr
                 );
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionEvent::SendNack {
                 transmission_id,
@@ -474,24 +474,24 @@ impl HttpConnectionComponent {
             )),
             TcpSessionEvent::ReadSuspended => {
                 log::debug!("HTTP session read suspended for {}", self.peer_addr);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionEvent::ReadResumed => {
                 log::debug!("HTTP session read resumed for {}", self.peer_addr);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionEvent::WriteSuspended => {
                 log::debug!("HTTP session write suspended for {}", self.peer_addr);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionEvent::WriteResumed => {
                 log::debug!("HTTP session write resumed for {}", self.peer_addr);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionEvent::Closed { reason } => {
                 self.session_state.mark_closed();
                 if self.response_started && reason == CloseReason::Graceful {
-                    return Handled::DieNow;
+                    return Handled::SHUTDOWN;
                 }
                 self.fail_and_die(&format!(
                     "HTTP session for {} closed before a response completed: {:?}",
@@ -501,7 +501,7 @@ impl HttpConnectionComponent {
         }
     }
 
-    fn handle_received_payload(&mut self, payload: IoPayload) -> Handled {
+    fn handle_received_payload(&mut self, payload: IoPayload) -> HandlerResult {
         if self.response_started {
             return self.fail_and_die(&format!(
                 "HTTP session for {} received bytes after committing the single supported response",
@@ -519,7 +519,7 @@ impl HttpConnectionComponent {
                 self.start_response(response);
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn consume_payload(
@@ -656,19 +656,19 @@ impl HttpConnectionComponent {
                     "failed to encode HTTP response for {peer_addr}: {error}",
                 ));
             }
-            Handled::Ok
+            Handled::OK
         });
     }
 
-    fn fail_and_die(&mut self, message: &str) -> Handled {
+    fn fail_and_die(&mut self, message: &str) -> HandlerResult {
         self.session_state.request_close(true);
         log::error!("{message}");
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 }
 
 impl ComponentLifecycle for HttpConnectionComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let pending = self
             .pending
             .take()
@@ -685,7 +685,7 @@ impl ComponentLifecycle for HttpConnectionComponent {
             match accept_reply {
                 Ok(session) => {
                     async_self.session_state.mark_ready(session);
-                    Handled::Ok
+                    Handled::OK
                 }
                 Err(error) => {
                     let peer_addr = async_self.peer_addr;
@@ -701,7 +701,7 @@ impl ComponentLifecycle for HttpConnectionComponent {
 impl Actor for HttpConnectionComponent {
     type Message = TcpSessionEvent;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.handle_session_event(msg)
     }
 }

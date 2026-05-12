@@ -207,7 +207,7 @@ impl GroupBroadcastComponent {
         }
     }
 
-    fn handle_submit_request(&mut self, submit: &GroupBroadcastSubmit) -> Handled {
+    fn handle_submit_request(&mut self, submit: &GroupBroadcastSubmit) -> HandlerResult {
         let envelope = submit.envelope.clone();
         let message_id = envelope.header.message_id;
         if self.accepted_submits.contains(&message_id) {
@@ -215,7 +215,7 @@ impl GroupBroadcastComponent {
                 self.log(),
                 "Group broadcast rejected duplicate submit for existing {message_id}"
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let group_memberships = self.group_memberships.snapshot();
@@ -225,7 +225,7 @@ impl GroupBroadcastComponent {
                 "Group broadcast dropped submit for unknown group_id={}",
                 envelope.header.group_id.0
             );
-            return Handled::Ok;
+            return Handled::OK;
         };
 
         let should_self_deliver =
@@ -233,7 +233,7 @@ impl GroupBroadcastComponent {
 
         let recipients = self.collect_reachable_remote_recipients(group_members, &envelope.header);
         if !should_self_deliver && recipients.is_empty() {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let payload = option_when!(!recipients.is_empty(), {
@@ -257,7 +257,7 @@ impl GroupBroadcastComponent {
                 self.dispatch_direct_send(message_id, recipient, route, Arc::clone(&payload));
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     /// Collect one currently reachable direct recipient route per remote group
@@ -337,11 +337,11 @@ impl GroupBroadcastComponent {
                     async_self.ctx.suicide();
                 }
             }
-            Handled::Ok
+            Handled::OK
         });
     }
 
-    fn handle_discovery_update(&mut self, update: TransportDiscoveryRouteUpdate) -> Handled {
+    fn handle_discovery_update(&mut self, update: TransportDiscoveryRouteUpdate) -> HandlerResult {
         match update {
             TransportDiscoveryRouteUpdate::PeerRoutes { peer, routes, .. } => {
                 if let Some(route) = select_best_direct_route(routes) {
@@ -359,20 +359,20 @@ impl GroupBroadcastComponent {
                 );
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_ingress_indication(
         &mut self,
         indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let Some(body) = indication.frame.body else {
             warn!(
                 self.log(),
                 "Group broadcast dropped inbound frame with empty body target={:?}",
                 indication.meta.target
             );
-            return Handled::Ok;
+            return Handled::OK;
         };
 
         match body {
@@ -386,26 +386,29 @@ impl GroupBroadcastComponent {
                     self.log(),
                     "Group broadcast ignored relay-store confirmation in the direct-only slice"
                 );
-                Handled::Ok
+                Handled::OK
             }
         }
     }
 
-    fn handle_inbound_envelope(&mut self, envelope: delivery_proto::GroupEnvelopeWire) -> Handled {
+    fn handle_inbound_envelope(
+        &mut self,
+        envelope: delivery_proto::GroupEnvelopeWire,
+    ) -> HandlerResult {
         match group_envelope_from_wire(envelope) {
             Ok(envelope) => {
                 self.delivery_port
                     .trigger(GroupBroadcastPortIndication::Deliver(
                         GroupBroadcastDeliver { envelope },
                     ));
-                Handled::Ok
+                Handled::OK
             }
             Err(error) => {
                 warn!(
                     self.log(),
                     "Group broadcast dropped inbound envelope that failed to decode: {error}"
                 );
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -424,7 +427,7 @@ impl GroupBroadcastComponent {
 ignore_lifecycle!(GroupBroadcastComponent);
 
 impl Provide<GroupBroadcastPort> for GroupBroadcastComponent {
-    fn handle(&mut self, request: GroupBroadcastPortRequest) -> Handled {
+    fn handle(&mut self, request: GroupBroadcastPortRequest) -> HandlerResult {
         match request {
             GroupBroadcastPortRequest::Submit(submit) => self.handle_submit_request(&submit),
         }
@@ -432,13 +435,16 @@ impl Provide<GroupBroadcastPort> for GroupBroadcastComponent {
 }
 
 impl Require<TransportGroupBroadcastInboundPort> for GroupBroadcastComponent {
-    fn handle(&mut self, indication: GroupBroadcastInboundDeliver<TransportRouteKey>) -> Handled {
+    fn handle(
+        &mut self,
+        indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
+    ) -> HandlerResult {
         self.handle_ingress_indication(indication)
     }
 }
 
 impl Require<TransportRouteDiscoveryPort> for GroupBroadcastComponent {
-    fn handle(&mut self, indication: TransportDiscoveryRouteUpdate) -> Handled {
+    fn handle(&mut self, indication: TransportDiscoveryRouteUpdate) -> HandlerResult {
         self.handle_discovery_update(indication)
     }
 }
@@ -446,7 +452,7 @@ impl Require<TransportRouteDiscoveryPort> for GroupBroadcastComponent {
 impl Actor for GroupBroadcastComponent {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Message type cannot be instantiated");
     }
 }
@@ -520,18 +526,18 @@ mod tests {
     ignore_lifecycle!(GroupBroadcastClientProbe);
 
     impl Require<GroupBroadcastPort> for GroupBroadcastClientProbe {
-        fn handle(&mut self, indication: GroupBroadcastPortIndication) -> Handled {
+        fn handle(&mut self, indication: GroupBroadcastPortIndication) -> HandlerResult {
             self.indications
                 .send(indication)
                 .expect("group-broadcast indication receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for GroupBroadcastClientProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!("Never type is empty")
         }
     }

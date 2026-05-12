@@ -324,7 +324,7 @@ impl RouteTransportManager {
     fn handle_submit(
         &mut self,
         ask: Ask<TransportRouteTransportSend, TransportRouteTransportSubmitResult>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, send) = ask.take();
         let send_id = send.send_id;
         match send.route.coverage_key {
@@ -346,7 +346,7 @@ impl RouteTransportManager {
                 todo!("TODO(flotsync-638): implement TCP route transport backend")
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_udp_route_send(&mut self, send_id: RouteSendId, route: UdpRouteKey) {
@@ -469,7 +469,7 @@ impl RouteTransportManager {
         );
         self.spawn_local(move |mut async_self| async move {
             async_self.finish_udp_socket_activation(socket_key).await;
-            Handled::Ok
+            Handled::OK
         });
     }
 
@@ -675,7 +675,7 @@ impl RouteTransportManager {
             async_self
                 .dispatch_udp_send(send_id, route, socket_key)
                 .await;
-            Handled::Ok
+            Handled::OK
         });
     }
 
@@ -782,7 +782,7 @@ impl RouteTransportManager {
             .trigger(ConnectionInfoIndication::ReportRouteFailed { route, reason });
     }
 
-    fn handle_udp_runtime_indication(&mut self, deliver: UDPourDeliver) -> Handled {
+    fn handle_udp_runtime_indication(&mut self, deliver: UDPourDeliver) -> HandlerResult {
         let Some(socket_key) = self.udp_socket_ids.get(&deliver.socket_id).copied() else {
             warn!(
                 self.log(),
@@ -790,7 +790,7 @@ impl RouteTransportManager {
                 deliver.socket_id,
                 deliver.source
             );
-            return Handled::Ok;
+            return Handled::OK;
         };
         let route = TransportRouteKey::Udp(UdpRouteKey {
             remote_addr: deliver.source,
@@ -804,7 +804,7 @@ impl RouteTransportManager {
                 remote_addr: Some(deliver.source),
             },
         });
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_udp_received(&mut self, socket_id: SocketId, source: SocketAddr, payload: IoPayload) {
@@ -968,42 +968,42 @@ impl RouteTransportManager {
 }
 
 impl ComponentLifecycle for RouteTransportManager {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         self.udp_activation_policy = self.load_udp_activation_policy();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.shutdown_children();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.shutdown_children();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Provide<TransportRouteTransportPort> for RouteTransportManager {
-    fn handle(&mut self, request: Never) -> Handled {
+    fn handle(&mut self, request: Never) -> HandlerResult {
         match request {}
     }
 }
 
 impl Provide<TransportConnectionInfoPort> for RouteTransportManager {
-    fn handle(&mut self, request: Never) -> Handled {
+    fn handle(&mut self, request: Never) -> HandlerResult {
         match request {}
     }
 }
 
 impl Require<UDPourPort> for RouteTransportManager {
-    fn handle(&mut self, indication: UDPourDeliver) -> Handled {
+    fn handle(&mut self, indication: UDPourDeliver) -> HandlerResult {
         self.handle_udp_runtime_indication(indication)
     }
 }
 
 impl Require<UdpPort> for RouteTransportManager {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         match indication {
             UdpIndication::Bound {
                 request_id,
@@ -1032,14 +1032,14 @@ impl Require<UdpPort> for RouteTransportManager {
             } => self.handle_udp_received(socket_id, source, payload),
             _ => {}
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for RouteTransportManager {
     type Message = TransportRouteTransportMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             RouteTransportActorMessage::Submit(ask) => self.handle_submit(ask),
         }

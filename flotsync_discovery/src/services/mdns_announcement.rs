@@ -208,7 +208,7 @@ mod kompact_implementation {
                         "Could not shutdown mDNS announcement service: {e}"
                     );
                 }
-                Handled::Ok
+                Handled::OK
             })
             .and_transition(ComponentState::Initialised {
                 options: config.options,
@@ -221,7 +221,7 @@ mod kompact_implementation {
         }
     }
     impl ComponentLifecycle for MdnsAnnouncementComponent {
-        fn on_start(&mut self) -> Handled {
+        fn on_start(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 // There's nothing to do. We don't know the port, so we can't start the service.
                 old_state @ ComponentState::Uninitialised => StateUpdate::ok(old_state),
@@ -234,7 +234,7 @@ mod kompact_implementation {
                 }
             })
         }
-        fn on_stop(&mut self) -> Handled {
+        fn on_stop(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 old_state @ (
                     ComponentState::Uninitialised | ComponentState::Initialised { .. }
@@ -249,7 +249,7 @@ mod kompact_implementation {
                 }
             })
         }
-        fn on_kill(&mut self) -> Handled {
+        fn on_kill(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 ComponentState::Running {
                     config,
@@ -267,7 +267,7 @@ mod kompact_implementation {
     impl Actor for MdnsAnnouncementComponent {
         type Message = MdnsAnnouncementMessages;
 
-        fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
             match msg {
                 MdnsAnnouncementMessages::Public(_) => unimplemented!("No public messages yet"),
                 MdnsAnnouncementMessages::Internal(internal) => match internal {

@@ -156,7 +156,7 @@ impl DeliveryIngressComponent {
     fn handle_transport_inbound(
         &mut self,
         mut inbound: RouteTransportInboundDeliver<TransportRouteKey>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let group_memberships = self.interest.group_memberships.snapshot();
         let route = inbound.transport.route;
         // `Ok(None)` means the payload was syntactically valid enough to
@@ -214,7 +214,7 @@ impl DeliveryIngressComponent {
                 );
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
@@ -225,14 +225,17 @@ ignore_requests!(
     DeliveryIngressComponent
 );
 impl Require<TransportInboundPort> for DeliveryIngressComponent {
-    fn handle(&mut self, indication: RouteTransportInboundDeliver<TransportRouteKey>) -> Handled {
+    fn handle(
+        &mut self,
+        indication: RouteTransportInboundDeliver<TransportRouteKey>,
+    ) -> HandlerResult {
         self.handle_transport_inbound(indication)
     }
 }
 impl Actor for DeliveryIngressComponent {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Message type cannot be instantiated");
     }
 }
@@ -279,7 +282,7 @@ mod tests {
     ignore_lifecycle!(TransportInboundProbe);
 
     impl Provide<TransportInboundPort> for TransportInboundProbe {
-        fn handle(&mut self, _request: Never) -> Handled {
+        fn handle(&mut self, _request: Never) -> HandlerResult {
             unreachable!()
         }
     }
@@ -287,7 +290,7 @@ mod tests {
     impl Actor for TransportInboundProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!()
         }
     }
@@ -315,18 +318,18 @@ mod tests {
         fn handle(
             &mut self,
             indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
-        ) -> Handled {
+        ) -> HandlerResult {
             self.events
                 .send(indication)
                 .expect("group-broadcast ingress test receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for GroupBroadcastProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
             match msg {}
         }
     }
@@ -354,18 +357,18 @@ mod tests {
         fn handle(
             &mut self,
             indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
-        ) -> Handled {
+        ) -> HandlerResult {
             self.events
                 .send(indication)
                 .expect("reliable-delivery ingress test receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for ReliableDeliveryProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!()
         }
     }

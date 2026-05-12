@@ -49,7 +49,7 @@ impl LocalEndpointManager {
 ignore_lifecycle!(LocalEndpointManager);
 
 impl Require<UdpPort> for LocalEndpointManager {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         let current_state = std::mem::replace(&mut self.state, LocalEndpointManagerState::Unbound);
         self.state = match (current_state, indication) {
             (
@@ -91,14 +91,14 @@ impl Require<UdpPort> for LocalEndpointManager {
             }
             (state, _) => state,
         };
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for LocalEndpointManager {
     type Message = LocalEndpointManagerMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             LocalEndpointManagerMessage::EnsureBound(ask) => {
                 let (promise, ()) = ask.take();
@@ -123,7 +123,7 @@ impl Actor for LocalEndpointManager {
                         let _ = promise.fulfil(Ok(*binding));
                     }
                 }
-                Handled::Ok
+                Handled::OK
             }
         }
     }

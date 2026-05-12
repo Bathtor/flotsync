@@ -1283,7 +1283,7 @@ impl ReplicationRuntimeComponent {
         context: InboundDeliveryContext,
         route: SummaryReplyRoute,
         message: SummaryRequestMessage,
-    ) -> Handled {
+    ) -> HandlerResult {
         let store = self.store.clone();
         Handled::block_on(self, async move |mut async_self| {
             let reply = async {
@@ -1296,13 +1296,14 @@ impl ReplicationRuntimeComponent {
                 let action = async_self.record_inbound_failure(&failure);
                 panic_if_fatal_inbound_failure(action, &failure);
             }
+            Handled::OK
         })
     }
 
     fn handle_reliable_delivery(
         &mut self,
         deliver: ReliableDeliveryDeliver,
-    ) -> Result<Handled, InboundDeliveryFailure> {
+    ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::reliable(&deliver.envelope.header);
         let message =
             match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
@@ -1355,6 +1356,7 @@ impl ReplicationRuntimeComponent {
                         let action = async_self.record_inbound_failure(&failure);
                         panic_if_fatal_inbound_failure(action, &failure);
                     }
+                    Handled::OK
                 }))
             }
             WireRuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
@@ -1391,7 +1393,7 @@ impl ReplicationRuntimeComponent {
     fn handle_group_delivery(
         &mut self,
         deliver: &GroupBroadcastDeliver,
-    ) -> Result<Handled, InboundDeliveryFailure> {
+    ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::group(&deliver.envelope.header);
         let sender = deliver.envelope.header.sender.clone();
         let message =
@@ -1412,7 +1414,7 @@ impl ReplicationRuntimeComponent {
             }
             WireRuntimeMessage::NeedRange(_) => {
                 // CatchUpManagerComponent owns NeedRange processing on group broadcast.
-                Ok(Handled::Ok)
+                Ok(Handled::OK)
             }
             WireRuntimeMessage::Summary(message) => {
                 let memberships = self.group_memberships.snapshot();
@@ -1698,7 +1700,7 @@ impl ReplicationRuntimeComponent {
         context: InboundDeliveryContext,
         sender: MemberIdentity,
         message: WireUpdateMessage,
-    ) -> Handled {
+    ) -> HandlerResult {
         Handled::block_on(self, async move |mut async_self| {
             let group_id = message.group_id;
             let reply = async_self
@@ -1719,6 +1721,7 @@ impl ReplicationRuntimeComponent {
                 let action = async_self.record_inbound_failure(&failure);
                 panic_if_fatal_inbound_failure(action, &failure);
             }
+            Handled::OK
         })
     }
 
@@ -1727,7 +1730,7 @@ impl ReplicationRuntimeComponent {
         context: InboundDeliveryContext,
         batch_sender: MemberIdentity,
         message: WireUpdateBatchMessage,
-    ) -> Handled {
+    ) -> HandlerResult {
         // Keep batch application on the component's blocking path. These
         // helpers borrow component state mutably across awaits, and the
         // component is intentionally not Sync, so the future cannot be safely
@@ -1745,13 +1748,14 @@ impl ReplicationRuntimeComponent {
                 let action = async_self.record_inbound_failure(&failure);
                 panic_if_fatal_inbound_failure(action, &failure);
             }
+            Handled::OK
         })
     }
 
     fn handle_publish_changes(
         &mut self,
         ask: Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self.publish_changes_transactionally(request).await {
@@ -1782,13 +1786,14 @@ impl ReplicationRuntimeComponent {
                 Err(error) => Err(error).boxed().context(ApiExternalSnafu),
             };
             async_self.reply_api(promise, "publish_changes", reply);
+            Handled::OK
         })
     }
 
     fn handle_snapshot_rows(
         &mut self,
         ask: Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = async_self
@@ -1797,19 +1802,20 @@ impl ReplicationRuntimeComponent {
                 .boxed()
                 .context(ApiExternalSnafu);
             async_self.reply_api(promise, "snapshot_rows", reply);
+            Handled::OK
         })
     }
 
     fn handle_request_summary(
         &mut self,
         ask: Ask<SummaryRequest, Result<Summary, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         if request.target == self.local_member {
             if let Err(error) = self.validate_summary_request(&request) {
                 let reply = Err(error).boxed().context(ApiExternalSnafu);
                 self.reply_api(promise, "request_summary", reply);
-                return Handled::Ok;
+                return Handled::OK;
             }
             let responder = self.local_member.clone();
             let store = self.store.clone();
@@ -1832,6 +1838,7 @@ impl ReplicationRuntimeComponent {
                 .boxed()
                 .context(ApiExternalSnafu);
                 async_self.reply_api(promise, "request_summary", reply);
+                Handled::OK
             });
         }
         // Temporary glue: public runtime API requests currently enter through
@@ -1841,7 +1848,7 @@ impl ReplicationRuntimeComponent {
             .tell(SummaryRequestManagerMessage::RequestSummary(Ask::new(
                 promise, request,
             )));
-        Handled::Ok
+        Handled::OK
     }
 
     /// Inspect local progress after a peer summary and derive catch-up notifications.
@@ -1892,7 +1899,7 @@ impl ReplicationRuntimeComponent {
         }))
     }
 
-    fn handle_observed_summary(&mut self, summary: Summary) -> Handled {
+    fn handle_observed_summary(&mut self, summary: Summary) -> HandlerResult {
         // Summary catch-up is advisory: it reads a store snapshot and sends
         // catch-up notifications, but it does not mutate runtime component
         // state. Running it asynchronously can at worst produce stale
@@ -1920,15 +1927,15 @@ impl ReplicationRuntimeComponent {
                     );
                 }
             }
-            Handled::Ok
+            Handled::OK
         });
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_create_group(
         &mut self,
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, req) = ask.take();
         let created_group = self.prepare_created_group(req);
         let (group_id, members, record) = match created_group {
@@ -1936,7 +1943,7 @@ impl ReplicationRuntimeComponent {
             Err(error) => {
                 let reply = Err(error).boxed().context(ApiExternalSnafu);
                 self.reply_api(promise, "create_group", reply);
-                return Handled::Ok;
+                return Handled::OK;
             }
         };
         Handled::block_on(self, async move |mut async_self| {
@@ -1953,25 +1960,26 @@ impl ReplicationRuntimeComponent {
                 Err(error) => Err(error).boxed().context(ApiExternalSnafu),
             };
             async_self.reply_api(promise, "create_group", reply);
+            Handled::OK
         })
     }
 
     fn handle_change_group_membership(
         &mut self,
         ask: Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, req) = ask.take();
         let _ = req;
         let reply = Err(unavailable_api("change_group_membership"));
         self.reply_api(promise, "change_group_membership", reply);
-        Handled::Ok
+        Handled::OK
     }
 
     #[cfg(test)]
     fn handle_test_install_group(
         &mut self,
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, (group_id, members)) = ask.take();
         let record = self.build_replication_group_record(group_id, &members);
         Handled::block_on(self, async move |mut async_self| {
@@ -1981,6 +1989,7 @@ impl ReplicationRuntimeComponent {
                 Err(error) => Err(error),
             };
             let _ = promise.fulfil(reply);
+            Handled::OK
         })
     }
 
@@ -1989,17 +1998,17 @@ impl ReplicationRuntimeComponent {
         clippy::unused_self,
         reason = "Kompact test messages use the same component method shape as production handlers."
     )]
-    fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> Handled {
+    fn handle_test_ping(&mut self, ask: Ask<(), ()>) -> HandlerResult {
         let (promise, ()) = ask.take();
         let _ = promise.fulfil(());
-        Handled::Ok
+        Handled::OK
     }
 
     #[cfg(test)]
     fn handle_test_apply_update(
         &mut self,
         ask: Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, (sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self
@@ -2016,6 +2025,7 @@ impl ReplicationRuntimeComponent {
                 Err(error) => Err(error),
             };
             let _ = promise.fulfil(reply);
+            Handled::OK
         })
     }
 
@@ -2023,7 +2033,7 @@ impl ReplicationRuntimeComponent {
     fn handle_test_apply_update_batch(
         &mut self,
         ask: Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, (batch_sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = async_self
@@ -2033,12 +2043,13 @@ impl ReplicationRuntimeComponent {
                 )
                 .await;
             let _ = promise.fulfil(reply);
+            Handled::OK
         })
     }
 }
 
 impl ComponentLifecycle for ReplicationRuntimeComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         Handled::block_on(self, async move |mut async_self| {
             let hydrated_memberships = async_self.load_hydrated_runtime_memberships().await;
             match hydrated_memberships {
@@ -2053,20 +2064,21 @@ impl ComponentLifecycle for ReplicationRuntimeComponent {
                     panic!("replication runtime startup failed: {error}");
                 }
             }
+            Handled::OK
         })
     }
 
-    fn on_stop(&mut self) -> Handled {
-        Handled::Ok
+    fn on_stop(&mut self) -> HandlerResult {
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
-        Handled::Ok
+    fn on_kill(&mut self) -> HandlerResult {
+        Handled::OK
     }
 }
 
 impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
-    fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
+    fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> HandlerResult {
         let ReliableDeliveryPortIndication::Deliver(deliver) = indication;
         match self.handle_reliable_delivery(deliver) {
             Ok(handled) => handled,
@@ -2079,7 +2091,7 @@ impl Require<ReliableDeliveryPort> for ReplicationRuntimeComponent {
 }
 
 impl Require<GroupBroadcastPort> for ReplicationRuntimeComponent {
-    fn handle(&mut self, indication: GroupBroadcastPortIndication) -> Handled {
+    fn handle(&mut self, indication: GroupBroadcastPortIndication) -> HandlerResult {
         let GroupBroadcastPortIndication::Deliver(deliver) = indication;
         match self.handle_group_delivery(&deliver) {
             Ok(handled) => handled,
@@ -2094,7 +2106,7 @@ impl Require<GroupBroadcastPort> for ReplicationRuntimeComponent {
 impl Actor for ReplicationRuntimeComponent {
     type Message = ReplicationRuntimeMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
             ReplicationRuntimeMessage::SnapshotRows(ask) => self.handle_snapshot_rows(ask),
@@ -2139,9 +2151,9 @@ fn panic_if_fatal_inbound_failure(action: InboundFailureAction, failure: &Inboun
 fn handled_after_inbound_failure(
     action: InboundFailureAction,
     failure: &InboundDeliveryFailure,
-) -> Handled {
+) -> HandlerResult {
     panic_if_fatal_inbound_failure(action, failure);
-    Handled::Ok
+    Handled::OK
 }
 
 async fn notify_listener_batches(

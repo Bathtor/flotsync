@@ -20,7 +20,7 @@ impl<T> State<T> {
         self.0 = Some(v);
     }
 
-    // pub fn transform<F>(&mut self, transformer: F) -> Handled
+    // pub fn transform<F>(&mut self, transformer: F) -> HandlerResult
     // where
     //     F: FnOnce(T) -> StateUpdate<T>,
     // {
@@ -35,15 +35,15 @@ impl<T> State<T> {
     //             self.set(new_state);
     //             result
     //         }
-    //         StateUpdate::Invalid { msg } => Handled::DieNow,
+    //         StateUpdate::Invalid { msg } => Handled::SHUTDOWN,
     //     }
     // }
 }
 
 #[derive(Debug)]
 pub enum StateUpdate<T> {
-    NoUpdate { old_state: T, result: Handled },
-    Update { new_state: T, result: Handled },
+    NoUpdate { old_state: T, result: HandlerResult },
+    Update { new_state: T, result: HandlerResult },
     Invalid { msg: String },
 }
 impl<T> StateUpdate<T> {
@@ -51,7 +51,7 @@ impl<T> StateUpdate<T> {
     pub const fn ok(old_state: T) -> Self {
         StateUpdate::NoUpdate {
             old_state,
-            result: Handled::Ok,
+            result: Handled::OK,
         }
     }
 
@@ -59,7 +59,7 @@ impl<T> StateUpdate<T> {
     pub const fn transition(new_state: T) -> Self {
         StateUpdate::Update {
             new_state,
-            result: Handled::Ok,
+            result: Handled::OK,
         }
     }
 
@@ -93,7 +93,7 @@ where
     fn and_transition<T>(self, new_state: T) -> StateUpdate<T>;
 }
 
-impl StateHandled for Handled {
+impl StateHandled for HandlerResult {
     fn stay_in<T>(self, old_state: T) -> StateUpdate<T> {
         StateUpdate::NoUpdate {
             old_state,
@@ -136,7 +136,7 @@ macro_rules! transform_state_match {
             }
             StateUpdate::Invalid {msg} => {
                 error!($comp.log(), "The component signalled an invalid state transition: {msg}\nKilling the component so it can be re-initialised into a legal state.");
-                Handled::DieNow
+                Handled::SHUTDOWN
             }
         }
     }};

@@ -357,7 +357,7 @@ impl IoBridge {
         self.owned_sockets.contains(&socket_id)
     }
 
-    fn handle_udp_request(&mut self, request: UdpRequest) -> Handled {
+    fn handle_udp_request(&mut self, request: UdpRequest) -> HandlerResult {
         match request {
             UdpRequest::Bind { request_id, bind } => self.handle_udp_bind_request(request_id, bind),
             UdpRequest::Connect {
@@ -373,15 +373,15 @@ impl IoBridge {
                 reply_to,
             } => {
                 self.handle_udp_send_request(socket_id, transmission_id, payload, target, reply_to);
-                Handled::Ok
+                Handled::OK
             }
             UdpRequest::Configure { socket_id, option } => {
                 self.handle_udp_configure_request(socket_id, option);
-                Handled::Ok
+                Handled::OK
             }
             UdpRequest::Close { socket_id } => {
                 self.handle_udp_close_request(socket_id);
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -390,7 +390,7 @@ impl IoBridge {
         &mut self,
         request_id: UdpOpenRequestId,
         bind: UdpLocalBind,
-    ) -> Handled {
+    ) -> HandlerResult {
         let owner = self
             .actor_ref()
             .hold()
@@ -406,7 +406,7 @@ impl IoBridge {
                         local_addr,
                         reason: open_failure_from_error(&error),
                     });
-                    return Handled::Ok;
+                    return Handled::OK;
                 }
             };
             async_self.owned_sockets.insert(socket_id);
@@ -414,7 +414,7 @@ impl IoBridge {
             async_self
                 .driver
                 .dispatch_udp(UdpCommand::Bind { socket_id, bind });
-            Handled::Ok
+            Handled::OK
         })
     }
 
@@ -423,7 +423,7 @@ impl IoBridge {
         request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
         bind: UdpLocalBind,
-    ) -> Handled {
+    ) -> HandlerResult {
         let owner = self
             .actor_ref()
             .hold()
@@ -440,7 +440,7 @@ impl IoBridge {
                         remote_addr,
                         reason: open_failure_from_error(&error),
                     });
-                    return Handled::Ok;
+                    return Handled::OK;
                 }
             };
             async_self.owned_sockets.insert(socket_id);
@@ -450,7 +450,7 @@ impl IoBridge {
                 remote_addr,
                 bind,
             });
-            Handled::Ok
+            Handled::OK
         })
     }
 
@@ -693,19 +693,19 @@ impl IoBridge {
         }
     }
 
-    fn handle_local_message(&mut self, msg: IoBridgeMessage) -> Handled {
+    fn handle_local_message(&mut self, msg: IoBridgeMessage) -> HandlerResult {
         match msg {
             IoBridgeMessage::OpenTcpListener(ask) => self.handle_open_tcp_listener(ask),
             IoBridgeMessage::OpenTcpSession(ask) => self.handle_open_tcp_session(ask),
             IoBridgeMessage::ConnectUdpPort(ask) => self.handle_connect_udp_port(ask),
             IoBridgeMessage::UdpEvent(event) => {
                 self.handle_udp_event(event);
-                Handled::Ok
+                Handled::OK
             }
         }
     }
 
-    fn handle_connect_udp_port(&mut self, request: ConnectUdpPortRequest) -> Handled {
+    fn handle_connect_udp_port(&mut self, request: ConnectUdpPortRequest) -> HandlerResult {
         self.udp.connect(request.required);
         if request.promise.fulfil(Ok(())).is_err() {
             warn!(
@@ -713,13 +713,13 @@ impl IoBridge {
                 "dropping UDP port-connect completion because requester disappeared"
             );
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_open_tcp_session(
         &mut self,
         ask: Ask<OpenTcpSession, std::result::Result<OpenedTcpSession, OpenFailureReason>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
@@ -750,14 +750,14 @@ impl IoBridge {
                     },
                 ));
             }
-            Handled::Ok
+            Handled::OK
         })
     }
 
     fn handle_open_tcp_listener(
         &mut self,
         ask: Ask<OpenTcpListener, std::result::Result<OpenedTcpListener, OpenFailureReason>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         let driver = self.driver.clone();
         Handled::block_on(self, move |async_self| async move {
@@ -786,23 +786,23 @@ impl IoBridge {
                     },
                 ));
             }
-            Handled::Ok
+            Handled::OK
         })
     }
 }
 
 impl ComponentLifecycle for IoBridge {
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         shutdown_bridge(self)
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         shutdown_bridge(self)
     }
 }
 
 impl Provide<UdpPort> for IoBridge {
-    fn handle(&mut self, request: <UdpPort as Port>::Request) -> Handled {
+    fn handle(&mut self, request: <UdpPort as Port>::Request) -> HandlerResult {
         self.handle_udp_request(request)
     }
 }
@@ -810,16 +810,16 @@ impl Provide<UdpPort> for IoBridge {
 impl Actor for IoBridge {
     type Message = IoBridgeMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.handle_local_message(msg)
     }
 }
 
-fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
+fn shutdown_bridge(bridge: &mut IoBridge) -> HandlerResult {
     if bridge.owned_sockets.is_empty() {
         bridge.udp_open_requests.clear();
         bridge.udp_send_replies.clear();
-        return Handled::Ok;
+        return Handled::OK;
     }
 
     let sockets: Vec<SocketId> = bridge.owned_sockets.drain().collect();
@@ -844,6 +844,7 @@ fn shutdown_bridge(bridge: &mut IoBridge) -> Handled {
                 }
             }
         }
+        Handled::OK
     })
 }
 

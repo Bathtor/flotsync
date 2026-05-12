@@ -320,9 +320,9 @@ impl PeerAnnouncementComponent {
         self.broadcast_message().encode_to_vec()
     }
 
-    fn send_announcement_to_known_targets(&mut self) -> Handled {
+    fn send_announcement_to_known_targets(&mut self) -> HandlerResult {
         let SocketState::Running { socket_id } = self.state else {
-            return Handled::Ok;
+            return Handled::OK;
         };
 
         let targets: HashSet<SocketAddr> = self.broadcast_addresses.values().copied().collect();
@@ -331,7 +331,7 @@ impl PeerAnnouncementComponent {
                 self.log(),
                 "No broadcast targets available for peer announcement"
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let payload = self.encoded_broadcast_message();
@@ -349,13 +349,13 @@ impl PeerAnnouncementComponent {
                 reply_to: reply_to.clone(),
             });
         }
-        Handled::Ok
+        Handled::OK
     }
 
-    fn run_announcement_cycle(&mut self) -> Handled {
+    fn run_announcement_cycle(&mut self) -> HandlerResult {
         self.refresh_broadcast_addresses();
         let handled = self.send_announcement_to_known_targets();
-        if matches!(handled, Handled::Ok) {
+        if matches!(handled, Ok(Handled::Ok)) {
             self.arm_announcement_timer();
         }
         handled
@@ -382,13 +382,13 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn handle_announcement_timeout(&mut self, generation: usize) -> Handled {
+    fn handle_announcement_timeout(&mut self, generation: usize) -> HandlerResult {
         let Some(timer) = self.announcement_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if timer.generation != generation {
             self.announcement_timer = Some(timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.run_announcement_cycle()
@@ -419,7 +419,7 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn handle_udp_indication(&mut self, indication: &UdpIndication) -> Handled {
+    fn handle_udp_indication(&mut self, indication: &UdpIndication) -> HandlerResult {
         match indication {
             UdpIndication::Bound {
                 request_id,
@@ -435,7 +435,7 @@ impl PeerAnnouncementComponent {
                     socket_id: *socket_id,
                     option: UdpSocketOption::Broadcast(true),
                 });
-                Handled::Ok
+                Handled::OK
             }
             UdpIndication::BindFailed {
                 request_id,
@@ -452,7 +452,7 @@ impl PeerAnnouncementComponent {
                     "Could not bind peer announcement socket at {local_addr}: {reason:?}"
                 );
                 self.state = SocketState::Closed;
-                Handled::DieNow
+                Handled::SHUTDOWN
             }
             UdpIndication::Configured { socket_id, option }
                 if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == *socket_id)
@@ -482,7 +482,7 @@ impl PeerAnnouncementComponent {
                     "Could not enable broadcast on peer announcement socket {socket_id}: {reason:?}"
                 );
                 self.request_close();
-                Handled::DieNow
+                Handled::SHUTDOWN
             }
             UdpIndication::Closed {
                 socket_id,
@@ -495,15 +495,15 @@ impl PeerAnnouncementComponent {
                 );
                 self.clear_announcement_timer();
                 self.state = SocketState::Closed;
-                Handled::Ok
+                Handled::OK
             }
-            _ => Handled::Ok,
+            _ => Handled::OK,
         }
     }
 
-    fn handle_send_result(&mut self, result: &UdpSendResult) -> Handled {
+    fn handle_send_result(&mut self, result: &UdpSendResult) -> HandlerResult {
         let Some(socket_id) = self.state.socket_id() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
 
         match result {
@@ -528,31 +528,31 @@ impl PeerAnnouncementComponent {
             }
             _ => {}
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl ComponentLifecycle for PeerAnnouncementComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         self.begin_startup();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.interrupt_startup();
         self.request_close();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.interrupt_startup();
         self.request_close();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Require<UdpPort> for PeerAnnouncementComponent {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         self.handle_udp_indication(&indication)
     }
 }
@@ -560,7 +560,7 @@ impl Require<UdpPort> for PeerAnnouncementComponent {
 impl Actor for PeerAnnouncementComponent {
     type Message = PeerAnnouncementMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             PeerAnnouncementMessage::SendResult(result) => self.handle_send_result(&result),
         }
@@ -602,18 +602,18 @@ mod tests {
     ignore_lifecycle!(UdpRequestProbe);
 
     impl Provide<UdpPort> for UdpRequestProbe {
-        fn handle(&mut self, request: UdpRequest) -> Handled {
+        fn handle(&mut self, request: UdpRequest) -> HandlerResult {
             self.requests
                 .send(request)
                 .expect("UDP request receiver must stay live during tests");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for UdpRequestProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!("Never type is empty")
         }
     }
@@ -707,7 +707,7 @@ mod tests {
             );
 
             let handled = component.send_announcement_to_known_targets();
-            assert!(matches!(handled, Handled::Ok));
+            assert!(matches!(handled, Ok(Handled::Ok)));
         });
 
         let send = recv_until(&requests_rx, |request| {

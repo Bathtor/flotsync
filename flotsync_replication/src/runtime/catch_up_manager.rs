@@ -442,27 +442,31 @@ impl CatchUpManagerComponent {
     }
 
     /// Rebroadcast still-missing ranges when the owning retry timer fires.
-    fn handle_retry(&mut self, group_id: GroupId, expected_timer: &ScheduledTimer) -> Handled {
+    fn handle_retry(
+        &mut self,
+        group_id: GroupId,
+        expected_timer: &ScheduledTimer,
+    ) -> HandlerResult {
         let Some(pending) = self.pending_needs.get_mut(&group_id) else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if pending.retry_timer.as_ref() != Some(expected_timer) {
             // A newer broadcast reset the retry timer, so this stale timer no
             // longer owns the pending need.
-            return Handled::Ok;
+            return Handled::OK;
         }
         pending.retry_timer = None;
         let ranges = pending.to_message_ranges();
         if ranges.is_empty() {
             self.pending_needs.remove(&group_id);
-            return Handled::Ok;
+            return Handled::OK;
         }
         self.broadcast_need_range(group_id, ranges);
         self.schedule_retry_if_needed(group_id);
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_need_versions(&mut self, need: &NeedVersions) -> Handled {
+    fn handle_need_versions(&mut self, need: &NeedVersions) -> HandlerResult {
         debug_assert!(
             !need.ranges.is_empty(),
             "local catch-up needs should not be empty"
@@ -472,15 +476,15 @@ impl CatchUpManagerComponent {
                 self.log(),
                 "ignoring empty local catch-up need for group {}", need.group_id
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
         let needed_versions = ProducerVersionSets::from_ranges(&need.ranges);
         self.record_needed_version_sets(need.group_id, needed_versions);
-        Handled::Ok
+        Handled::OK
     }
 
     /// Absorb newly observed availability and shrink any matching pending demand.
-    fn handle_observed_available(&mut self, observed: &ObservedAvailable) -> Handled {
+    fn handle_observed_available(&mut self, observed: &ObservedAvailable) -> HandlerResult {
         debug_assert!(
             !observed.ranges.is_empty(),
             "observed catch-up availability should not be empty"
@@ -490,7 +494,7 @@ impl CatchUpManagerComponent {
                 self.log(),
                 "ignoring empty observed catch-up availability for group {}", observed.group_id
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
         let available_versions = ProducerVersionSets::from_ranges(&observed.ranges);
         self.known_available
@@ -518,10 +522,10 @@ impl CatchUpManagerComponent {
         if needs_retry_timer {
             self.schedule_retry_if_needed(observed.group_id);
         }
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> Handled {
+    fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
         let message =
             match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext) {
                 Ok(message) => message,
@@ -532,7 +536,7 @@ impl CatchUpManagerComponent {
                         deliver.envelope.header.sender,
                         error
                     );
-                    return Handled::Ok;
+                    return Handled::OK;
                 }
             };
         match message {
@@ -543,7 +547,7 @@ impl CatchUpManagerComponent {
             | WireRuntimeMessage::Update(_)
             | WireRuntimeMessage::SummaryRequest(_)
             | WireRuntimeMessage::Summary(_)
-            | WireRuntimeMessage::UpdateBatch(_) => Handled::Ok,
+            | WireRuntimeMessage::UpdateBatch(_) => Handled::OK,
         }
     }
 
@@ -552,21 +556,21 @@ impl CatchUpManagerComponent {
         &mut self,
         sender: &MemberIdentity,
         message: NeedRangeMessage,
-    ) -> Handled {
+    ) -> HandlerResult {
         let memberships = self.group_memberships.snapshot();
         let Some(members) = memberships.members(&message.group_id) else {
             warn!(
                 self.log(),
                 "dropping NeedRange for unknown group {} from {}", message.group_id, sender
             );
-            return Handled::Ok;
+            return Handled::OK;
         };
         if !members.contains(sender) {
             warn!(
                 self.log(),
                 "dropping NeedRange for group {} from non-member {}", message.group_id, sender
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
         let group_id = message.group_id;
         let member_count = members.len();
@@ -589,7 +593,7 @@ impl CatchUpManagerComponent {
             );
         }
         if ranges.is_empty() {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let requested_versions = ProducerVersionSets::from_ranges(&ranges);
@@ -614,16 +618,16 @@ impl CatchUpManagerComponent {
                 group_id,
                 sender
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.spawn_local(move |mut async_self| async move {
             async_self
                 .fulfil_need_range_from_store(group_id, answerable_ranges)
                 .await;
-            Handled::Ok
+            Handled::OK
         });
-        Handled::Ok
+        Handled::OK
     }
 
     /// Load and broadcast one catch-up response for ranges believed locally available.
@@ -773,7 +777,7 @@ async fn load_update_batch_from_store(
 }
 
 impl ComponentLifecycle for CatchUpManagerComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         self.retry_delay = self.read_retry_delay_from_config();
         self.max_updates_per_batch = self.read_max_updates_per_batch_from_config();
         Handled::block_on(self, async move |mut async_self| {
@@ -781,21 +785,22 @@ impl ComponentLifecycle for CatchUpManagerComponent {
                 .refresh_known_available_from_store()
                 .await
                 .expect("catch-up manager startup failed");
+            Handled::OK
         })
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.cancel_retry_timers();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.on_stop()
     }
 }
 
 impl Require<GroupBroadcastPort> for CatchUpManagerComponent {
-    fn handle(&mut self, indication: GroupBroadcastPortIndication) -> Handled {
+    fn handle(&mut self, indication: GroupBroadcastPortIndication) -> HandlerResult {
         let GroupBroadcastPortIndication::Deliver(deliver) = indication;
         self.handle_group_delivery(&deliver)
     }
@@ -804,7 +809,7 @@ impl Require<GroupBroadcastPort> for CatchUpManagerComponent {
 impl Actor for CatchUpManagerComponent {
     type Message = CatchUpManagerMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match &msg {
             CatchUpManagerMessage::NeedVersions(need) => self.handle_need_versions(need),
             CatchUpManagerMessage::ObservedAvailable(observed) => {
