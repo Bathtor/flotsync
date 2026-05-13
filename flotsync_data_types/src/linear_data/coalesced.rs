@@ -779,7 +779,7 @@ where
         let node = &mut self.base.nodes[node_index];
         match node.operation {
             Operation::Insert { ref value } => {
-                debug_assert!(value.len() == 1);
+                debug_assert_eq!(value.len(), 1);
                 node.operation.delete();
                 self.len -= 1;
                 self.base.len -= 1;
