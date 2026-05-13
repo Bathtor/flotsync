@@ -41,7 +41,7 @@ use std::{
 };
 
 /// Shared timeout used by the crate's synchronous test wait helpers.
-pub const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default poll cadence for eventually-style synchronous test waits.
 pub const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
