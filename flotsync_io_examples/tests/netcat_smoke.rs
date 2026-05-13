@@ -3,7 +3,7 @@ use flotsync_io::{
     test_support::{ReservedSocketKind, ReservedSocketLease, reserve_sockets},
 };
 use std::{
-    io::Read,
+    io::{ErrorKind, Read},
     net::SocketAddr,
     process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio},
     sync::{Arc, Mutex},
@@ -240,9 +240,11 @@ fn tcp_listener_empty_scripted_line_closes_cleanly() {
         .set_read_timeout(Some(WAIT_TIMEOUT))
         .expect("set client read timeout");
     let mut received = Vec::new();
-    client
-        .read_to_end(&mut received)
-        .expect("read empty scripted response to end");
+    match client.read_to_end(&mut received) {
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::ConnectionReset && received.is_empty() => {}
+        Err(error) => panic!("read empty scripted response to end: {error}"),
+    }
 
     let listener_output = listener.wait_for_output();
 

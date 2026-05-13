@@ -452,6 +452,7 @@ struct TcpListenNetcat {
     session_state: TcpAcceptedSessionState,
     queued_lines: VecDeque<String>,
     input_closed: bool,
+    accepted_session_count: usize,
     shutdown_after_input: bool,
     pending_send: bool,
     next_transmission_id: TransmissionId,
@@ -475,6 +476,7 @@ impl TcpListenNetcat {
             session_state: TcpAcceptedSessionState::None,
             queued_lines: VecDeque::new(),
             input_closed: false,
+            accepted_session_count: 0,
             shutdown_after_input,
             pending_send: false,
             next_transmission_id: TransmissionId::ONE,
@@ -586,6 +588,7 @@ impl TcpListenNetcat {
             return Handled::OK;
         }
 
+        self.accepted_session_count = self.accepted_session_count.saturating_add(1);
         self.session_state = TcpAcceptedSessionState::Accepting;
         log::info!("accepting inbound TCP session from {peer_addr}");
         Handled::block_on(self, move |mut async_self| async move {
@@ -661,7 +664,12 @@ impl TcpListenNetcat {
             && self.input_closed
             && self.queued_lines.is_empty()
             && !self.pending_send
-            && !matches!(self.session_state, TcpAcceptedSessionState::Accepting)
+            && matches!(
+                self.session_state,
+                TcpAcceptedSessionState::Open(_)
+                    | TcpAcceptedSessionState::Closing(_)
+                    | TcpAcceptedSessionState::None if self.accepted_session_count > 0
+            )
     }
 
     fn clear_shutdown_timer(&mut self) {

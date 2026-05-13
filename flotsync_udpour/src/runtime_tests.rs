@@ -1170,9 +1170,15 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
-        harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        let frame = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
             matches!(frame, UDPourFrame::Payload(_))
         });
+        let UDPourFrame::Payload(payload) = frame else {
+            unreachable!("filtered to Payload");
+        };
+        if payload.header.part_number != PartNumber(1) {
+            harness.wait_for_receiver_runtime_payload(harness.sender_addr, payload.header);
+        }
     }
 
     harness.advance_time_and_process_due_timers(Duration::from_millis(20));
@@ -1400,14 +1406,25 @@ fn no_longer_available_after_sender_retention_expiry() {
         UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
-        harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        let frame = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
             matches!(frame, UDPourFrame::Payload(_))
         });
+        let UDPourFrame::Payload(payload) = frame else {
+            unreachable!("filtered to Payload");
+        };
+        if payload.header.part_number != PartNumber(1) {
+            harness.wait_for_receiver_runtime_payload(harness.sender_addr, payload.header);
+        }
     }
-    harness.advance_time_and_process_due_timers(Duration::from_millis(20));
-    harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
+    harness.advance_time_and_process_due_timers(Duration::from_millis(11));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(10));
+    let need_parts = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
     });
+    let UDPourFrame::NeedParts(need_parts) = need_parts else {
+        unreachable!("filtered to NeedParts");
+    };
+    harness.wait_for_sender_runtime_need_parts(harness.receiver_addr, &need_parts);
     let nla = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(frame, UDPourFrame::NoLongerAvailable(_))
     });
