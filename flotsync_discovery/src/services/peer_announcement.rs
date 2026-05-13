@@ -16,10 +16,7 @@ use flotsync_io::prelude::{
 };
 use flotsync_messages::{buffa::Message, discovery::Peer};
 use itertools::Itertools;
-use pnet::{
-    datalink::{self, NetworkInterface},
-    util::MacAddr,
-};
+use pnet_datalink::{self as datalink, MacAddr, NetworkInterface};
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
