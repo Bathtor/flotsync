@@ -41,7 +41,7 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{KClaimablePromise, NonOwningPhantomData};
+use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
@@ -327,22 +327,22 @@ impl ReliableDeliveryComponent {
         }
     }
 
-    fn handle_submit_request(&mut self, submit: ReliableDeliverySubmit) -> Handled {
+    fn handle_submit_request(&mut self, submit: ReliableDeliverySubmit) -> HandlerResult {
         let message_id = submit.envelope.header.message_id;
         if self.sender_work_items.contains_key(&message_id) {
             warn!(
                 self.log(),
                 "Reliable delivery rejected duplicate submit for existing {message_id}"
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
         self.sender_work_items
             .insert(message_id, Self::new_sender_work_item(submit));
         self.try_dispatch_sender_message(message_id);
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_discovery_update(&mut self, update: TransportDiscoveryRouteUpdate) -> Handled {
+    fn handle_discovery_update(&mut self, update: TransportDiscoveryRouteUpdate) -> HandlerResult {
         match update {
             TransportDiscoveryRouteUpdate::PeerRoutes { peer, routes, .. } => {
                 if let Some(route) = select_best_direct_route(routes) {
@@ -361,21 +361,19 @@ impl ReliableDeliveryComponent {
                 // the reliable-delivery relay path is implemented.
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_ingress_indication(
         &mut self,
         indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
-    ) -> Handled {
-        let Some(body) = indication.frame.body else {
-            warn!(
-                self.log(),
+    ) -> HandlerResult {
+        let body = indication.frame.body.with_whatever_benign(|| {
+            format!(
                 "Reliable delivery dropped inbound frame with empty body target={:?}",
                 indication.meta.target
-            );
-            return Handled::Ok;
-        };
+            )
+        })?;
 
         match body {
             delivery_proto::reliable_delivery_frame::Body::Envelope(envelope) => {
@@ -389,7 +387,7 @@ impl ReliableDeliveryComponent {
                     self.log(),
                     "Reliable delivery ignored unsupported inbound frame variant={other:?}"
                 );
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -397,20 +395,12 @@ impl ReliableDeliveryComponent {
     fn handle_inbound_envelope(
         &mut self,
         envelope: delivery_proto::ReliableEnvelopeWire,
-    ) -> Handled {
-        let envelope = match reliable_envelope_from_wire(envelope) {
-            Ok(envelope) => envelope,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Reliable delivery dropped inbound envelope that failed to decode: {error}"
-                );
-                return Handled::Ok;
-            }
-        };
+    ) -> HandlerResult {
+        let envelope = reliable_envelope_from_wire(envelope)
+            .whatever_benign("Reliable delivery dropped inbound envelope that failed to decode")?;
         let message_id = envelope.header.message_id;
         if self.handle_inbound_envelope_if_already_tracked(message_id) {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let (processed, processed_future) = KClaimablePromise::create_pair();
@@ -441,9 +431,9 @@ impl ReliableDeliveryComponent {
             async_self
                 .await_processed_delivery(message_id, processed_future)
                 .await;
-            Handled::Ok
+            Handled::OK
         });
-        Handled::Ok
+        Handled::OK
     }
 
     /// Return whether an inbound envelope matched existing receiver-side state
@@ -481,24 +471,20 @@ impl ReliableDeliveryComponent {
         true
     }
 
-    fn handle_inbound_recipient_ack(&mut self, ack: delivery_proto::RecipientAckWire) -> Handled {
-        let ack = match recipient_ack_from_wire(ack) {
-            Ok(ack) => ack,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Reliable delivery dropped inbound recipient ack that failed to decode: {error}"
-                );
-                return Handled::Ok;
-            }
-        };
+    fn handle_inbound_recipient_ack(
+        &mut self,
+        ack: delivery_proto::RecipientAckWire,
+    ) -> HandlerResult {
+        let ack = recipient_ack_from_wire(ack).whatever_benign(
+            "Reliable delivery dropped inbound recipient ack that failed to decode",
+        )?;
         let message_id = ack.header.message_id;
         if !self.sender_work_items.contains_key(&message_id) {
             debug!(
                 self.log(),
                 "Reliable delivery ignored recipient ack for unknown message_id={}", message_id
             );
-            return Handled::Ok;
+            return Handled::OK;
         }
         self.cancel_retry(RetryKey::Sender(message_id));
         debug!(
@@ -513,7 +499,7 @@ impl ReliableDeliveryComponent {
             .get_mut(&message_id)
             .expect("sender work item was checked above");
         work_item.recipient_ack = RecipientAckStatus::Observed { ack };
-        Handled::Ok
+        Handled::OK
     }
 
     #[cfg(test)]
@@ -750,7 +736,7 @@ impl ReliableDeliveryComponent {
             async_self
                 .finish_outbound_envelope_submit(message_id, future)
                 .await;
-            Handled::Ok
+            Handled::OK
         });
     }
 
@@ -813,7 +799,7 @@ impl ReliableDeliveryComponent {
             async_self
                 .dispatch_recipient_ack(message_id, ack, route)
                 .await;
-            Handled::Ok
+            Handled::OK
         });
     }
 
@@ -856,13 +842,13 @@ impl ReliableDeliveryComponent {
         self.retry_timer = Some(timer);
     }
 
-    fn handle_retry_timeout(&mut self, expected_timer: &ScheduledTimer) -> Handled {
+    fn handle_retry_timeout(&mut self, expected_timer: &ScheduledTimer) -> HandlerResult {
         let Some(active_timer) = self.retry_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if &active_timer != expected_timer {
             self.retry_timer = Some(active_timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         let now = self.now();
         let ready = self.retry_queue.take_ready(now);
@@ -873,7 +859,7 @@ impl ReliableDeliveryComponent {
             }
         }
         self.set_retry_timer(now);
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_sender_retry_timeout(&mut self, message_id: MessageId) {
@@ -946,26 +932,26 @@ impl ReliableDeliveryComponent {
 }
 
 impl ComponentLifecycle for ReliableDeliveryComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         self.retry_delay = self.load_retry_delay();
         self.recipient_ack_timeout = self.load_recipient_ack_timeout();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         if let Some(timer) = self.retry_timer.take() {
             self.cancel_timer(timer);
         }
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.on_stop()
     }
 }
 
 impl Provide<ReliableDeliveryPort> for ReliableDeliveryComponent {
-    fn handle(&mut self, request: ReliableDeliveryPortRequest) -> Handled {
+    fn handle(&mut self, request: ReliableDeliveryPortRequest) -> HandlerResult {
         match request {
             ReliableDeliveryPortRequest::Submit(submit) => self.handle_submit_request(submit),
         }
@@ -973,13 +959,16 @@ impl Provide<ReliableDeliveryPort> for ReliableDeliveryComponent {
 }
 
 impl Require<TransportReliableDeliveryInboundPort> for ReliableDeliveryComponent {
-    fn handle(&mut self, indication: ReliableDeliveryInboundDeliver<TransportRouteKey>) -> Handled {
+    fn handle(
+        &mut self,
+        indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
+    ) -> HandlerResult {
         self.handle_ingress_indication(indication)
     }
 }
 
 impl Require<TransportRouteDiscoveryPort> for ReliableDeliveryComponent {
-    fn handle(&mut self, indication: TransportDiscoveryRouteUpdate) -> Handled {
+    fn handle(&mut self, indication: TransportDiscoveryRouteUpdate) -> HandlerResult {
         self.handle_discovery_update(indication)
     }
 }
@@ -987,7 +976,7 @@ impl Require<TransportRouteDiscoveryPort> for ReliableDeliveryComponent {
 impl Actor for ReliableDeliveryComponent {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Message type cannot be instantiated");
     }
 }
@@ -1190,7 +1179,12 @@ mod tests {
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
     };
-    use std::{collections::HashSet, net::SocketAddr, sync::mpsc, time::Duration};
+    use std::{
+        collections::HashSet,
+        net::SocketAddr,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
     const TEST_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_millis(50);
 
@@ -1214,18 +1208,57 @@ mod tests {
     ignore_lifecycle!(ReliableDeliveryClientProbe);
 
     impl Require<ReliableDeliveryPort> for ReliableDeliveryClientProbe {
-        fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
+        fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> HandlerResult {
             self.indications
                 .send(indication)
                 .expect("reliable delivery indication receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for ReliableDeliveryClientProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
+            unreachable!("Never type is empty")
+        }
+    }
+
+    #[derive(ComponentDefinition)]
+    struct ReliableDeliveryIngressProbe {
+        ctx: ComponentContext<Self>,
+        inbound: RequiredPort<TransportReliableDeliveryInboundPort>,
+        events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>,
+    }
+
+    impl ReliableDeliveryIngressProbe {
+        fn new(events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>) -> Self {
+            Self {
+                ctx: ComponentContext::uninitialised(),
+                inbound: RequiredPort::uninitialised(),
+                events,
+            }
+        }
+    }
+
+    ignore_lifecycle!(ReliableDeliveryIngressProbe);
+
+    impl Require<TransportReliableDeliveryInboundPort> for ReliableDeliveryIngressProbe {
+        fn handle(
+            &mut self,
+            indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
+        ) -> HandlerResult {
+            self.events
+                .send(indication)
+                .expect("reliable delivery ingress probe receiver must stay live");
+            Handled::OK
+        }
+    }
+
+    impl Actor for ReliableDeliveryIngressProbe {
+        type Message = Never;
+
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!("Never type is empty")
         }
     }
@@ -1234,8 +1267,10 @@ mod tests {
         core: TransportHarnessCore,
         ingress: Arc<Component<DeliveryIngressComponent>>,
         reliable: Arc<Component<ReliableDeliveryComponent>>,
+        ingress_probe: Arc<Component<ReliableDeliveryIngressProbe>>,
         discovery_source: Arc<Component<DiscoveryRouteSource>>,
         client: Arc<Component<ReliableDeliveryClientProbe>>,
+        ingress_probe_rx: mpsc::Receiver<ReliableDeliveryInboundDeliver<TransportRouteKey>>,
         client_rx: mpsc::Receiver<ReliableDeliveryPortIndication>,
         local_addr: SocketAddr,
     }
@@ -1276,6 +1311,10 @@ mod tests {
             let reliable = core
                 .system()
                 .create(move || ReliableDeliveryComponent::new(manager_ref.clone()));
+            let (ingress_probe_tx, ingress_probe_rx) = mpsc::channel();
+            let ingress_probe = core
+                .system()
+                .create(move || ReliableDeliveryIngressProbe::new(ingress_probe_tx));
             let discovery_source = core.system().create(DiscoveryRouteSource::new);
             let (client_tx, client_rx) = mpsc::channel();
             let client = core
@@ -1289,6 +1328,11 @@ mod tests {
             .expect("route transport manager must connect to delivery ingress");
             biconnect_components::<TransportReliableDeliveryInboundPort, _, _>(&ingress, &reliable)
                 .expect("delivery ingress must connect to reliable delivery");
+            biconnect_components::<TransportReliableDeliveryInboundPort, _, _>(
+                &ingress,
+                &ingress_probe,
+            )
+            .expect("delivery ingress must connect to reliable delivery ingress probe");
             biconnect_components::<TransportRouteDiscoveryPort, _, _>(&discovery_source, &reliable)
                 .expect("discovery source must connect to reliable delivery");
             biconnect_components::<ReliableDeliveryPort, _, _>(&reliable, &client)
@@ -1297,6 +1341,7 @@ mod tests {
             core.start();
             start_component(core.system(), &ingress);
             start_component(core.system(), &reliable);
+            start_component(core.system(), &ingress_probe);
             start_component(core.system(), &discovery_source);
             start_component(core.system(), &client);
 
@@ -1312,8 +1357,10 @@ mod tests {
                 core,
                 ingress,
                 reliable,
+                ingress_probe,
                 discovery_source,
                 client,
+                ingress_probe_rx,
                 client_rx,
                 local_addr,
             }
@@ -1374,6 +1421,28 @@ mod tests {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     panic!("reliable delivery indication sender disconnected")
+                }
+            }
+        }
+
+        fn wait_for_ingress_envelope_count(&self, message_id: MessageId, expected_count: usize) {
+            let deadline = Instant::now() + WAIT_TIMEOUT;
+            let mut observed_count = 0;
+            while observed_count < expected_count {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                let indication = self
+                    .ingress_probe_rx
+                    .recv_timeout(timeout)
+                    .expect("timed out waiting for reliable delivery ingress envelope");
+                let Some(delivery_proto::reliable_delivery_frame::Body::Envelope(envelope)) =
+                    indication.frame.body
+                else {
+                    continue;
+                };
+                let envelope = reliable_envelope_from_wire(*envelope)
+                    .expect("ingress probe should observe decodable reliable envelopes");
+                if envelope.header.message_id == message_id {
+                    observed_count += 1;
                 }
             }
         }
@@ -1475,6 +1544,11 @@ mod tests {
                 .core
                 .system()
                 .kill_notify(self.client.clone())
+                .wait_timeout(WAIT_TIMEOUT);
+            let _ = self
+                .core
+                .system()
+                .kill_notify(self.ingress_probe.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
                 .core
@@ -1687,7 +1761,8 @@ mod tests {
             .expect("processed completion should succeed exactly once");
         receiver.wait_for_inbound_state(message_id, PendingInboundDeliveryState::AckPending);
 
-        receiver.expect_no_delivery(TEST_RECIPIENT_ACK_TIMEOUT * 2);
+        receiver.wait_for_ingress_envelope_count(message_id, 2);
+        receiver.expect_no_delivery(Duration::from_millis(20));
         receiver.publish_direct_route(alice, sender.local_addr);
         sender.wait_for_sender_ack_observed(message_id);
         receiver.wait_for_inbound_clear(message_id);

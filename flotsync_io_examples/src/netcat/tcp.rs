@@ -228,7 +228,7 @@ impl TcpConnectNetcat {
         }
     }
 
-    fn handle_input(&mut self, input: NetcatInput) -> Handled {
+    fn handle_input(&mut self, input: NetcatInput) -> HandlerResult {
         match input {
             NetcatInput::Line(line) => {
                 self.queued_lines.push_back(line);
@@ -240,10 +240,10 @@ impl TcpConnectNetcat {
         }
         self.start_next_send();
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_session_event(&mut self, event: TcpSessionEvent) -> Handled {
+    fn handle_session_event(&mut self, event: TcpSessionEvent) -> HandlerResult {
         match event {
             TcpSessionEvent::Received { payload } => {
                 log::debug!("TCP recv");
@@ -283,7 +283,7 @@ impl TcpConnectNetcat {
         }
 
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
     fn start_next_send(&mut self) {
@@ -309,7 +309,7 @@ impl TcpConnectNetcat {
                 })
                 .await;
             match send_result {
-                Ok(()) => Handled::Ok,
+                Ok(()) => Handled::OK,
                 Err(error) => async_self.fail_and_die(format!(
                     "failed to encode TCP payload from stdin/script input: {error}"
                 )),
@@ -347,33 +347,33 @@ impl TcpConnectNetcat {
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> Handled {
+    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
         let Some(timer) = self.shutdown_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if timer.generation != generation {
             self.shutdown_timer = Some(timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {
-            return Handled::Ok;
+            return Handled::OK;
         }
         let Some(session) = self.state.session().cloned() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         session.close(false);
         self.state = TcpConnectState::Closing(session);
-        Handled::Ok
+        Handled::OK
     }
 
-    fn finish_and_die(&mut self) -> Handled {
+    fn finish_and_die(&mut self) -> HandlerResult {
         self.terminate_success();
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
-    fn fail_and_die(&mut self, message: String) -> Handled {
+    fn fail_and_die(&mut self, message: String) -> HandlerResult {
         self.terminate_failure(message);
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
     fn terminate_success(&mut self) {
@@ -388,7 +388,7 @@ impl TcpConnectNetcat {
 }
 
 impl ComponentLifecycle for TcpConnectNetcat {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let open = self.bridge_handle.open_tcp_session(OpenTcpSession {
             remote_addr: self.config.remote,
             local_addr: self.config.bind,
@@ -396,7 +396,7 @@ impl ComponentLifecycle for TcpConnectNetcat {
                 .actor_ref()
                 .recipient_with(TcpConnectMessage::SessionEvent),
         });
-        Handled::block_on(self, move |mut async_self| async move {
+        self.spawn_local(move |mut async_self| async move {
             let session_reply = match open.await {
                 Ok(reply) => reply,
                 Err(error) => {
@@ -410,30 +410,31 @@ impl ComponentLifecycle for TcpConnectNetcat {
                     log::info!("TCP connected to {}", opened.peer_addr);
                     async_self.state = TcpConnectState::Ready(opened.session);
                     async_self.start_next_send();
-                    Handled::Ok
+                    Handled::OK
                 }
                 Err(error) => {
                     async_self.fail_and_die(format!("failed to open TCP session: {error:?}"))
                 }
             }
-        })
+        });
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for TcpConnectNetcat {
     type Message = TcpConnectMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             TcpConnectMessage::Input(input) => self.handle_input(input),
             TcpConnectMessage::SessionEvent(event) => self.handle_session_event(event),
@@ -451,6 +452,7 @@ struct TcpListenNetcat {
     session_state: TcpAcceptedSessionState,
     queued_lines: VecDeque<String>,
     input_closed: bool,
+    accepted_session_count: usize,
     shutdown_after_input: bool,
     pending_send: bool,
     next_transmission_id: TransmissionId,
@@ -474,6 +476,7 @@ impl TcpListenNetcat {
             session_state: TcpAcceptedSessionState::None,
             queued_lines: VecDeque::new(),
             input_closed: false,
+            accepted_session_count: 0,
             shutdown_after_input,
             pending_send: false,
             next_transmission_id: TransmissionId::ONE,
@@ -483,7 +486,7 @@ impl TcpListenNetcat {
         }
     }
 
-    fn handle_input(&mut self, input: NetcatInput) -> Handled {
+    fn handle_input(&mut self, input: NetcatInput) -> HandlerResult {
         match input {
             NetcatInput::Line(line) => {
                 self.queued_lines.push_back(line);
@@ -495,10 +498,10 @@ impl TcpListenNetcat {
         }
         self.start_next_send();
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_listener_event(&mut self, event: TcpListenerEvent) -> Handled {
+    fn handle_listener_event(&mut self, event: TcpListenerEvent) -> HandlerResult {
         match event {
             TcpListenerEvent::Incoming { peer_addr, pending } => {
                 self.handle_pending_session(peer_addr, pending)
@@ -511,7 +514,7 @@ impl TcpListenNetcat {
         }
     }
 
-    fn handle_session_event(&mut self, event: TcpSessionEvent) -> Handled {
+    fn handle_session_event(&mut self, event: TcpSessionEvent) -> HandlerResult {
         match event {
             TcpSessionEvent::Received { payload } => {
                 log::debug!("TCP recv");
@@ -551,14 +554,14 @@ impl TcpListenNetcat {
         }
 
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_pending_session(
         &mut self,
         peer_addr: SocketAddr,
         pending: PendingTcpSession,
-    ) -> Handled {
+    ) -> HandlerResult {
         if !matches!(self.session_state, TcpAcceptedSessionState::None)
             || matches!(
                 self.listener_state,
@@ -573,18 +576,19 @@ impl TcpListenNetcat {
                         async_self.terminate_failure(format!(
                             "TCP pending-session reject reply dropped before completion: {error}"
                         ));
-                        return Handled::Ok;
+                        return Handled::OK;
                     }
                 };
                 if let Err(error) = reject_reply {
                     return async_self
                         .fail_and_die(format!("failed to reject inbound TCP session: {error}"));
                 }
-                Handled::Ok
+                Handled::OK
             });
-            return Handled::Ok;
+            return Handled::OK;
         }
 
+        self.accepted_session_count = self.accepted_session_count.saturating_add(1);
         self.session_state = TcpAcceptedSessionState::Accepting;
         log::info!("accepting inbound TCP session from {peer_addr}");
         Handled::block_on(self, move |mut async_self| async move {
@@ -601,7 +605,7 @@ impl TcpListenNetcat {
                     async_self.session_state = TcpAcceptedSessionState::Open(session);
                     async_self.start_next_send();
                     async_self.set_shutdown_timer_if_idle();
-                    Handled::Ok
+                    Handled::OK
                 }
                 Err(error) => async_self
                     .fail_and_die(format!("failed to accept inbound TCP session: {error}")),
@@ -631,7 +635,7 @@ impl TcpListenNetcat {
                 })
                 .await;
             match send_result {
-                Ok(()) => Handled::Ok,
+                Ok(()) => Handled::OK,
                 Err(error) => async_self.fail_and_die(format!(
                     "failed to encode TCP payload from stdin/script input: {error}"
                 )),
@@ -660,7 +664,12 @@ impl TcpListenNetcat {
             && self.input_closed
             && self.queued_lines.is_empty()
             && !self.pending_send
-            && !matches!(self.session_state, TcpAcceptedSessionState::Accepting)
+            && matches!(
+                self.session_state,
+                TcpAcceptedSessionState::Open(_)
+                    | TcpAcceptedSessionState::Closing(_)
+                    | TcpAcceptedSessionState::None if self.accepted_session_count > 0
+            )
     }
 
     fn clear_shutdown_timer(&mut self) {
@@ -669,51 +678,51 @@ impl TcpListenNetcat {
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> Handled {
+    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
         let Some(timer) = self.shutdown_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if timer.generation != generation {
             self.shutdown_timer = Some(timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         if let Some(session) = self.session_state.session().cloned() {
             session.close(false);
             self.session_state = TcpAcceptedSessionState::Closing(session);
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         if let Some(listener) = self.listener_state.listener().cloned() {
             listener.tell(TcpListenerRequest::Close);
             self.listener_state = TcpListenerState::Closing(listener);
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.finish_if_terminal()
     }
 
-    fn finish_if_terminal(&mut self) -> Handled {
+    fn finish_if_terminal(&mut self) -> HandlerResult {
         self.set_shutdown_timer_if_idle();
         if matches!(self.listener_state, TcpListenerState::Closed)
             && matches!(self.session_state, TcpAcceptedSessionState::None)
         {
             return self.finish_and_die();
         }
-        Handled::Ok
+        Handled::OK
     }
 
-    fn finish_and_die(&mut self) -> Handled {
+    fn finish_and_die(&mut self) -> HandlerResult {
         self.terminate_success();
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
-    fn fail_and_die(&mut self, message: String) -> Handled {
+    fn fail_and_die(&mut self, message: String) -> HandlerResult {
         self.terminate_failure(message);
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
     fn terminate_success(&mut self) {
@@ -728,14 +737,14 @@ impl TcpListenNetcat {
 }
 
 impl ComponentLifecycle for TcpListenNetcat {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let open = self.bridge_handle.open_tcp_listener(OpenTcpListener {
             local_addr: self.config.bind,
             incoming_to: self
                 .actor_ref()
                 .recipient_with(TcpListenMessage::ListenerEvent),
         });
-        Handled::block_on(self, move |mut async_self| async move {
+        self.spawn_local(move |mut async_self| async move {
             let listener_reply = match open.await {
                 Ok(reply) => reply,
                 Err(error) => {
@@ -754,25 +763,26 @@ impl ComponentLifecycle for TcpListenNetcat {
                         .fail_and_die(format!("failed to open TCP listener: {error:?}"));
                 }
             }
-            Handled::Ok
-        })
+            Handled::OK
+        });
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for TcpListenNetcat {
     type Message = TcpListenMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             TcpListenMessage::Input(input) => self.handle_input(input),
             TcpListenMessage::SessionEvent(event) => self.handle_session_event(event),

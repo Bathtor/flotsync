@@ -158,7 +158,7 @@ impl UdpNetcat {
         }
     }
 
-    fn handle_input(&mut self, input: NetcatInput) -> Handled {
+    fn handle_input(&mut self, input: NetcatInput) -> HandlerResult {
         match input {
             NetcatInput::Line(line) => {
                 self.queued_lines.push_back(line);
@@ -170,10 +170,10 @@ impl UdpNetcat {
         }
         self.start_next_send();
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_indication(&mut self, indication: UdpIndication) -> Handled {
+    fn handle_indication(&mut self, indication: UdpIndication) -> HandlerResult {
         match indication {
             UdpIndication::Bound {
                 request_id,
@@ -273,16 +273,16 @@ impl UdpNetcat {
         }
 
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
     #[allow(
         clippy::needless_pass_by_value,
         reason = "Kompact delivers UDP send results by value and this handler records the terminal effect."
     )]
-    fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
+    fn handle_send_result(&mut self, result: UdpSendResult) -> HandlerResult {
         let Some(socket_id) = self.socket_state.socket_id() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
 
         match result {
@@ -306,7 +306,7 @@ impl UdpNetcat {
 
         self.start_next_send();
         self.set_shutdown_timer_if_idle();
-        Handled::Ok
+        Handled::OK
     }
 
     fn trigger_open_request(&mut self, request_id: UdpOpenRequestId) {
@@ -368,7 +368,7 @@ impl UdpNetcat {
                     target,
                     reply_to,
                 });
-                Handled::Ok
+                Handled::OK
             });
             return;
         }
@@ -404,38 +404,38 @@ impl UdpNetcat {
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> Handled {
+    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
         let Some(timer) = self.shutdown_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if timer.generation != generation {
             self.shutdown_timer = Some(timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {
-            return Handled::Ok;
+            return Handled::OK;
         }
         let UdpSocketState::Ready(socket_id) = self.socket_state else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         log::debug!("UDP close requested");
         self.udp.trigger(UdpRequest::Close { socket_id });
         self.socket_state = UdpSocketState::Closing(socket_id);
-        Handled::Ok
+        Handled::OK
     }
 
-    fn finish_and_die(&mut self) -> Handled {
+    fn finish_and_die(&mut self) -> HandlerResult {
         self.terminate_success();
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
     #[allow(
         clippy::needless_pass_by_value,
         reason = "Call sites build owned diagnostic strings exactly for this terminal log path."
     )]
-    fn fail_and_die(&mut self, message: String) -> Handled {
+    fn fail_and_die(&mut self, message: String) -> HandlerResult {
         self.terminate_failure(message);
-        Handled::DieNow
+        Handled::SHUTDOWN
     }
 
     fn terminate_success(&mut self) {
@@ -451,26 +451,26 @@ impl UdpNetcat {
 }
 
 impl ComponentLifecycle for UdpNetcat {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let request_id = UdpOpenRequestId::new();
         self.socket_state = UdpSocketState::Opening(request_id);
         self.trigger_open_request(request_id);
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.clear_shutdown_timer();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Require<UdpPort> for UdpNetcat {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         self.handle_indication(indication)
     }
 }
@@ -478,7 +478,7 @@ impl Require<UdpPort> for UdpNetcat {
 impl Actor for UdpNetcat {
     type Message = UdpNetcatMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             UdpNetcatMessage::Input(input) => self.handle_input(input),
             UdpNetcatMessage::SendResult(result) => self.handle_send_result(result),

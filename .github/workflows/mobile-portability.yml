@@ -19,15 +19,19 @@ env:
 jobs:
   compile-only:
     name: compile-only (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-apple-ios
-          - aarch64-apple-ios-sim
-          - aarch64-linux-android
-          - i686-unknown-linux-gnu
+        include:
+          - target: aarch64-apple-ios
+            runner: macos-latest
+          - target: aarch64-apple-ios-sim
+            runner: macos-latest
+          - target: aarch64-linux-android
+            runner: ubuntu-latest
+          - target: i686-unknown-linux-gnu
+            runner: ubuntu-latest
 
     steps:
       - name: Check out repository
@@ -58,7 +62,7 @@ jobs:
         run: >
           cargo check --locked --lib --target ${{ matrix.target }}
           -p flotsync_core
-          -p flotsync_datagram_transfer
+          -p flotsync_udpour
           -p flotsync_data_types
           -p flotsync_messages
           -p flotsync_replication

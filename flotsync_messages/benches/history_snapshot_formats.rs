@@ -1,4 +1,4 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
     IdWithIndex,
@@ -31,7 +31,7 @@ use flotsync_messages::{
     },
     datamodel as proto,
 };
-use std::time::Duration;
+use std::{hint::black_box, time::Duration};
 
 struct CollectSink<Id, Borrowed: ?Sized, Owned, Mapper> {
     nodes: Vec<SnapshotNode<Id, Owned>>,

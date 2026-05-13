@@ -28,6 +28,7 @@ use crate::{
     pool::{EgressPool, IoBufferPools},
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 /// Internal mailbox for the shared Kompact driver component.
@@ -762,7 +763,7 @@ impl IoDriverComponent {
         }
     }
 
-    fn handle_local_message(&mut self, msg: IoDriverComponentMessage) -> Handled {
+    fn handle_local_message(&mut self, msg: IoDriverComponentMessage) -> HandlerResult {
         match msg {
             IoDriverComponentMessage::ReserveUdpSocket(ask) => self.handle_reserve_udp_socket(ask),
             IoDriverComponentMessage::ReleaseUdpSocket(ask) => self.handle_release_udp_socket(ask),
@@ -782,15 +783,15 @@ impl IoDriverComponent {
             }
             IoDriverComponentMessage::DispatchUdp(command) => {
                 self.handle_dispatch_udp(command);
-                Handled::Ok
+                Handled::OK
             }
             IoDriverComponentMessage::DispatchTcp(command) => {
                 self.handle_dispatch_tcp(command);
-                Handled::Ok
+                Handled::OK
             }
             IoDriverComponentMessage::DriverEvent(event) => {
                 self.handle_driver_event(event);
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -798,30 +799,32 @@ impl IoDriverComponent {
     fn handle_reserve_udp_socket(
         &mut self,
         ask: Ask<ActorRefStrong<IoBridgeMessage>, Result<SocketId>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, owner) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self.reserve_udp_socket_for(owner).await;
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping UDP socket reservation reply");
             }
+            Handled::OK
         })
     }
 
-    fn handle_release_udp_socket(&mut self, ask: Ask<SocketId, Result<()>>) -> Handled {
+    fn handle_release_udp_socket(&mut self, ask: Ask<SocketId, Result<()>>) -> HandlerResult {
         let (promise, socket_id) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self.release_udp_socket_inner(socket_id).await;
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping UDP socket release reply");
             }
+            Handled::OK
         })
     }
 
     fn handle_open_tcp_session(
         &mut self,
         ask: Ask<OpenTcpSessionRegistration, Result<ConnectionId>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self
@@ -830,13 +833,14 @@ impl IoDriverComponent {
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP session open reply");
             }
+            Handled::OK
         })
     }
 
     fn handle_open_tcp_listener(
         &mut self,
         ask: Ask<OpenTcpListenerRegistration, Result<ListenerId>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self
@@ -845,33 +849,36 @@ impl IoDriverComponent {
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP listener open reply");
             }
+            Handled::OK
         })
     }
 
-    fn handle_release_tcp_session(&mut self, ask: Ask<ConnectionId, Result<()>>) -> Handled {
+    fn handle_release_tcp_session(&mut self, ask: Ask<ConnectionId, Result<()>>) -> HandlerResult {
         let (promise, connection_id) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self.release_tcp_session_inner(connection_id).await;
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP session release reply");
             }
+            Handled::OK
         })
     }
 
-    fn handle_release_tcp_listener(&mut self, ask: Ask<ListenerId, Result<()>>) -> Handled {
+    fn handle_release_tcp_listener(&mut self, ask: Ask<ListenerId, Result<()>>) -> HandlerResult {
         let (promise, listener_id) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self.release_tcp_listener_inner(listener_id).await;
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP listener release reply");
             }
+            Handled::OK
         })
     }
 
     fn handle_adopt_accepted_tcp_session(
         &mut self,
         ask: Ask<AdoptAcceptedTcpSessionRegistration, Result<()>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self
@@ -880,10 +887,14 @@ impl IoDriverComponent {
             if promise.fulfil(reply).is_err() {
                 debug!(async_self.log(), "dropping TCP session adoption reply");
             }
+            Handled::OK
         })
     }
 
-    fn handle_reject_pending_tcp_session(&mut self, ask: Ask<ConnectionId, Result<()>>) -> Handled {
+    fn handle_reject_pending_tcp_session(
+        &mut self,
+        ask: Ask<ConnectionId, Result<()>>,
+    ) -> HandlerResult {
         let (promise, connection_id) = ask.take();
         Handled::block_on(self, move |mut async_self| async move {
             let reply = async_self
@@ -895,12 +906,13 @@ impl IoDriverComponent {
                     "dropping TCP pending-session reject reply"
                 );
             }
+            Handled::OK
         })
     }
 }
 
 impl ComponentLifecycle for IoDriverComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         let actor = self
             .actor_ref()
             .hold()
@@ -918,7 +930,7 @@ impl ComponentLifecycle for IoDriverComponent {
                     self.log(),
                     "failed to load flotsync_io bind reuse config: {}", error
                 );
-                return Handled::DieNow;
+                return Handled::SHUTDOWN;
             }
         };
         let mut config = self.config.clone();
@@ -931,23 +943,23 @@ impl ComponentLifecycle for IoDriverComponent {
         ) {
             Ok(driver) => {
                 self.driver = Some(driver);
-                Handled::Ok
+                Handled::OK
             }
             Err(error) => {
                 error!(
                     self.log(),
                     "failed to start flotsync_io driver component: {}", error
                 );
-                Handled::DieNow
+                Handled::SHUTDOWN
             }
         }
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         shutdown_driver_component(self)
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         shutdown_driver_component(self)
     }
 }
@@ -955,32 +967,25 @@ impl ComponentLifecycle for IoDriverComponent {
 impl Actor for IoDriverComponent {
     type Message = IoDriverComponentMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.handle_local_message(msg)
     }
 }
 
-fn shutdown_driver_component(component: &mut IoDriverComponent) -> Handled {
+fn shutdown_driver_component(component: &mut IoDriverComponent) -> HandlerResult {
     let Some(driver) = component.driver.take() else {
-        return Handled::Ok;
+        return Handled::OK;
     };
     component.udp_routes.clear();
     component.tcp_listener_routes.clear();
     component.tcp_routes.clear();
     let shutdown = component.spawn_off(async move { driver.shutdown() });
-    Handled::block_on(component, move |async_self| async move {
-        match shutdown.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                error!(
-                    async_self.log(),
-                    "failed to stop flotsync_io driver component cleanly: {}", error
-                );
-            }
-            Err(error) => {
-                error!(async_self.log(), "driver shutdown task failed: {}", error);
-            }
-        }
+    Handled::block_on(component, move |_async_self| async move {
+        shutdown
+            .await
+            .whatever_benign("driver shutdown task failed")?
+            .whatever_benign("failed to stop flotsync_io driver component cleanly")?;
+        Handled::OK
     })
 }
 

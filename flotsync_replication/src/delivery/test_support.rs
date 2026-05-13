@@ -81,7 +81,7 @@ impl DiscoveryRouteSource {
 ignore_lifecycle!(DiscoveryRouteSource);
 
 impl Provide<RouteDiscoveryPort<TransportRouteKey>> for DiscoveryRouteSource {
-    fn handle(&mut self, _request: Never) -> Handled {
+    fn handle(&mut self, _request: Never) -> HandlerResult {
         unreachable!("route discovery test source is indication-only")
     }
 }
@@ -89,7 +89,7 @@ impl Provide<RouteDiscoveryPort<TransportRouteKey>> for DiscoveryRouteSource {
 impl Actor for DiscoveryRouteSource {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Never type is empty")
     }
 }

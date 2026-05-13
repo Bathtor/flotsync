@@ -1,5 +1,5 @@
 use flotsync_replication::{GroupId, MemberIdentity};
-use kompact::config::{Config, ConfigError, parse_config_str};
+use kompact::config::{Config, parse_config_str};
 use snafu::prelude::*;
 use std::{
     net::SocketAddr,
@@ -127,18 +127,17 @@ fn read_group_id(config: &Config) -> Result<GroupId, ChecklistConfigError> {
 
 fn read_ordered_members(config: &Config) -> Result<Vec<MemberIdentity>, ChecklistConfigError> {
     let members_lookup = config.select(ORDERED_MEMBERS_KEY);
-    members_lookup
-        .value()
-        .map_err(|source| ChecklistConfigError::InvalidConfig {
-            key: ORDERED_MEMBERS_KEY,
-            message: source.to_string(),
-        })?;
+    let member_entries =
+        members_lookup
+            .array_entries()
+            .map_err(|source| ChecklistConfigError::InvalidConfig {
+                key: ORDERED_MEMBERS_KEY,
+                message: source.to_string(),
+            })?;
 
     let mut members = Vec::new();
-    // TODO(flotsync-6in): Replace this index probing once Kompact exposes
-    // selected config arrays as a slice or iterator.
-    for index in 0.. {
-        match members_lookup.get_index(index).as_string() {
+    for (index, member_lookup) in member_entries {
+        match member_lookup.as_string() {
             Ok(value) => {
                 let member = MemberIdentity::from_str(&value).map_err(|source| {
                     ChecklistConfigError::InvalidConfig {
@@ -155,7 +154,6 @@ fn read_ordered_members(config: &Config) -> Result<Vec<MemberIdentity>, Checklis
                 );
                 members.push(member);
             }
-            Err(error) if is_missing_path(&error) => break,
             Err(error) => {
                 return Err(ChecklistConfigError::InvalidConfig {
                     key: ORDERED_MEMBERS_KEY,
@@ -196,10 +194,6 @@ fn read_string(config: &Config, key: &'static str) -> Result<String, ChecklistCo
             key,
             message: source.to_string(),
         })
-}
-
-fn is_missing_path(error: &ConfigError) -> bool {
-    matches!(error, ConfigError::PathError(path) if path.is_missing())
 }
 
 #[cfg(test)]

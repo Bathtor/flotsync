@@ -1,5 +1,8 @@
 use std::{fmt, future::Future, marker::PhantomData, pin::Pin};
 
+use kompact::prelude::{HandlerError, HandlerResultExt as _};
+use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
+
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
@@ -18,13 +21,239 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// logically owning a `T`.
 pub type NonOwningPhantomData<T> = PhantomData<fn() -> T>;
 
+/// Snafu `Whatever` context helpers that immediately classify handler errors.
+pub trait ResultExt<T, E>: Sized {
+    /// Add eager `Whatever` context and classify failures as benign handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Benign`] when `self` is `Err`.
+    fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+
+    /// Add lazy `Whatever` context and classify failures as benign handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Benign`] when `self` is `Err`.
+    fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+
+    /// Add eager `Whatever` context and classify failures as recoverable handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Recoverable`] when `self` is `Err`.
+    fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+
+    /// Add lazy `Whatever` context and classify failures as recoverable handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Recoverable`] when `self` is `Err`.
+    fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+
+    /// Add eager `Whatever` context and classify failures as unrecoverable handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Unrecoverable`] when `self` is `Err`.
+    fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+
+    /// Add lazy `Whatever` context and classify failures as unrecoverable handler errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Unrecoverable`] when `self` is `Err`.
+    fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>;
+}
+
+impl<T, E> ResultExt<T, E> for Result<T, E> {
+    fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::whatever_context::<S, snafu::Whatever>(self, context).benign_err()
+    }
+
+    fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::with_whatever_context::<F, S, snafu::Whatever>(self, context).benign_err()
+    }
+
+    fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::whatever_context::<S, snafu::Whatever>(self, context).recoverable_err()
+    }
+
+    fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::with_whatever_context::<F, S, snafu::Whatever>(self, context)
+            .recoverable_err()
+    }
+
+    fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::whatever_context::<S, snafu::Whatever>(self, context).unrecoverable_err()
+    }
+
+    fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce(&mut E) -> S,
+        S: Into<String>,
+        E: Into<<snafu::Whatever as FromString>::Source>,
+    {
+        SnafuResultExt::with_whatever_context::<F, S, snafu::Whatever>(self, context)
+            .unrecoverable_err()
+    }
+}
+
 pub trait OptionExt<T> {
+    /// Construct `Some` only when `cond` is true.
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T>;
+
+    /// Add eager `Whatever` context and classify absence as a benign handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Benign`] when `self` is `None`.
+    fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>;
+
+    /// Add lazy `Whatever` context and classify absence as a benign handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Benign`] when `self` is `None`.
+    fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>;
+
+    /// Add eager `Whatever` context and classify absence as a recoverable handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Recoverable`] when `self` is `None`.
+    fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>;
+
+    /// Add lazy `Whatever` context and classify absence as a recoverable handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Recoverable`] when `self` is `None`.
+    fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>;
+
+    /// Add eager `Whatever` context and classify absence as an unrecoverable handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Unrecoverable`] when `self` is `None`.
+    fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>;
+
+    /// Add lazy `Whatever` context and classify absence as an unrecoverable handler error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerError::Unrecoverable`] when `self` is `None`.
+    fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>;
 }
 
 impl<T> OptionExt<T> for Option<T> {
     fn when(cond: bool, thunk: impl FnOnce() -> T) -> Option<T> {
         if cond { Some(thunk()) } else { None }
+    }
+
+    fn whatever_benign<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+    {
+        SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).benign_err()
+    }
+
+    fn with_whatever_benign<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>,
+    {
+        SnafuOptionExt::with_whatever_context::<F, S, snafu::Whatever>(self, context).benign_err()
+    }
+
+    fn whatever_recoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+    {
+        SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).recoverable_err()
+    }
+
+    fn with_whatever_recoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>,
+    {
+        SnafuOptionExt::with_whatever_context::<F, S, snafu::Whatever>(self, context)
+            .recoverable_err()
+    }
+
+    fn whatever_unrecoverable<S>(self, context: S) -> Result<T, HandlerError>
+    where
+        S: Into<String>,
+    {
+        SnafuOptionExt::whatever_context::<S, snafu::Whatever>(self, context).unrecoverable_err()
+    }
+
+    fn with_whatever_unrecoverable<F, S>(self, context: F) -> Result<T, HandlerError>
+    where
+        F: FnOnce() -> S,
+        S: Into<String>,
+    {
+        SnafuOptionExt::with_whatever_context::<F, S, snafu::Whatever>(self, context)
+            .unrecoverable_err()
     }
 }
 

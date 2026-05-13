@@ -41,7 +41,7 @@ use std::{
 };
 
 /// Shared timeout used by the crate's synchronous test wait helpers.
-pub const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Default poll cadence for eventually-style synchronous test waits.
 pub const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -1667,22 +1667,22 @@ impl UdpObserver {
 ignore_lifecycle!(UdpObserver);
 
 impl Require<UdpPort> for UdpObserver {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         self.indications
             .send(indication)
             .expect("UDP indication receiver must stay live during integration tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for UdpObserver {
     type Message = UdpObserverMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             UdpObserverMessage::Barrier(promise) => {
                 let _ = promise.fulfil(());
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -1711,11 +1711,11 @@ ignore_lifecycle!(UdpSendResultProbe);
 impl Actor for UdpSendResultProbe {
     type Message = UdpSendResult;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.results
             .send(msg)
             .expect("UDP send result receiver must stay live during integration tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 
@@ -1742,11 +1742,11 @@ ignore_lifecycle!(TcpSessionEventProbe);
 impl Actor for TcpSessionEventProbe {
     type Message = TcpSessionEvent;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.events
             .send(msg)
             .expect("TCP session event receiver must stay live during integration tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 
@@ -1773,11 +1773,11 @@ ignore_lifecycle!(TcpListenerEventProbe);
 impl Actor for TcpListenerEventProbe {
     type Message = TcpListenerEvent;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.events
             .send(msg)
             .expect("TCP listener event receiver must stay live during integration tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 

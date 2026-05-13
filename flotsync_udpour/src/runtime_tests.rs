@@ -123,22 +123,22 @@ impl TransferProbe {
 ignore_lifecycle!(TransferProbe);
 
 impl Require<UDPourPort> for TransferProbe {
-    fn handle(&mut self, indication: UDPourDeliver) -> Handled {
+    fn handle(&mut self, indication: UDPourDeliver) -> HandlerResult {
         self.indications
             .send(indication)
             .expect("transfer indication receiver must stay live during tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for TransferProbe {
     type Message = TransferProbeMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             TransferProbeMessage::Barrier(promise) => {
                 let _ = promise.fulfil(());
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -305,7 +305,7 @@ impl ScriptedUdpProxy {
 ignore_lifecycle!(ScriptedUdpProxy);
 
 impl Provide<UdpPort> for ScriptedUdpProxy {
-    fn handle(&mut self, request: UdpRequest) -> Handled {
+    fn handle(&mut self, request: UdpRequest) -> HandlerResult {
         match request {
             UdpRequest::Send {
                 socket_id,
@@ -334,23 +334,23 @@ impl Provide<UdpPort> for ScriptedUdpProxy {
             },
             other => self.upstream.trigger(other),
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Require<UdpPort> for ScriptedUdpProxy {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         for forwarded in self.transform_indication(indication) {
             self.downstream.trigger(forwarded);
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Actor for ScriptedUdpProxy {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Never type is empty")
     }
 }
@@ -1170,9 +1170,15 @@ fn repair_path_emits_need_parts_and_retransmits_only_missing_part() {
         UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
-        harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        let frame = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
             matches!(frame, UDPourFrame::Payload(_))
         });
+        let UDPourFrame::Payload(payload) = frame else {
+            unreachable!("filtered to Payload");
+        };
+        if payload.header.part_number != PartNumber(1) {
+            harness.wait_for_receiver_runtime_payload(harness.sender_addr, payload.header);
+        }
     }
 
     harness.advance_time_and_process_due_timers(Duration::from_millis(20));
@@ -1400,14 +1406,25 @@ fn no_longer_available_after_sender_retention_expiry() {
         UDPourSubmitResult::Sent
     ));
     for _ in 0..3 {
-        harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
+        let frame = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
             matches!(frame, UDPourFrame::Payload(_))
         });
+        let UDPourFrame::Payload(payload) = frame else {
+            unreachable!("filtered to Payload");
+        };
+        if payload.header.part_number != PartNumber(1) {
+            harness.wait_for_receiver_runtime_payload(harness.sender_addr, payload.header);
+        }
     }
-    harness.advance_time_and_process_due_timers(Duration::from_millis(20));
-    harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
+    harness.advance_time_and_process_due_timers(Duration::from_millis(11));
+    harness.advance_time_and_process_due_timers(Duration::from_millis(10));
+    let need_parts = harness.wait_for_bridge_frame(harness.sender_socket_id, |frame| {
         matches!(frame, UDPourFrame::NeedParts(_))
     });
+    let UDPourFrame::NeedParts(need_parts) = need_parts else {
+        unreachable!("filtered to NeedParts");
+    };
+    harness.wait_for_sender_runtime_need_parts(harness.receiver_addr, &need_parts);
     let nla = harness.wait_for_bridge_frame(harness.receiver_socket_id, |frame| {
         matches!(frame, UDPourFrame::NoLongerAvailable(_))
     });

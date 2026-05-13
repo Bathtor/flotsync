@@ -16,7 +16,7 @@ uuid = { workspace = true }
 buffa-build = "0.3"
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 flotsync_data_types = { path = "../flotsync_data_types", features = ["test-support"] }
 
 [[bench]]

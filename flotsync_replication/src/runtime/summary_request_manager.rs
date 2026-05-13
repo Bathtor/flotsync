@@ -21,7 +21,7 @@ use crate::{
         shared::{EncryptedPayload, MessageId},
     },
 };
-use flotsync_utils::KClaimablePromise;
+use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;
 use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
@@ -199,17 +199,17 @@ impl SummaryRequestManagerComponent {
         &mut self,
         correlation_id: Uuid,
         expected_timer: &ScheduledTimer,
-    ) -> Handled {
+    ) -> HandlerResult {
         let Some(pending) = self.pending_summaries.get(&correlation_id) else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if &pending.timeout_timer != expected_timer {
-            return Handled::Ok;
+            return Handled::OK;
         }
         let pending = self
             .pending_summaries
             .remove(&correlation_id)
-            .expect("checked pending summary must still exist");
+            .whatever_unrecoverable("checked pending summary must still exist")?;
         if pending
             .promise
             .fulfil(Err(ApiError::SummaryTimedOut {
@@ -220,7 +220,7 @@ impl SummaryRequestManagerComponent {
         {
             warn!(self.log(), "dropping request_summary timeout reply");
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn record_inbound_failure(&self, failure: &SummaryInboundFailure) -> InboundFailureAction {
@@ -261,14 +261,14 @@ impl SummaryRequestManagerComponent {
         sender: MemberIdentity,
         processed: KClaimablePromise<()>,
         message: WireSummaryMessage,
-    ) -> Handled {
+    ) -> HandlerResult {
         let reply = self.handle_summary_payload(sender, processed, message);
         if let Err(error) = reply {
             let failure = SummaryInboundFailure::new(context, error);
             let action = self.record_inbound_failure(&failure);
             return handled_after_inbound_failure(action, &failure);
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_summary_payload(
@@ -296,7 +296,7 @@ impl SummaryRequestManagerComponent {
         Ok(())
     }
 
-    fn handle_reliable_delivery(&mut self, deliver: ReliableDeliveryDeliver) -> Handled {
+    fn handle_reliable_delivery(&mut self, deliver: ReliableDeliveryDeliver) -> HandlerResult {
         let context = SummaryInboundContext::reliable(&deliver.envelope.header);
         let message =
             match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
@@ -318,19 +318,19 @@ impl SummaryRequestManagerComponent {
             | WireRuntimeMessage::Update(_)
             | WireRuntimeMessage::SummaryRequest(_)
             | WireRuntimeMessage::NeedRange(_)
-            | WireRuntimeMessage::UpdateBatch(_) => Handled::Ok,
+            | WireRuntimeMessage::UpdateBatch(_) => Handled::OK,
         }
     }
 
     fn handle_request_summary(
         &mut self,
         ask: Ask<SummaryRequest, Result<Summary, ApiError>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         if let Err(error) = self.validate_summary_request(&request) {
             let reply = Err(error).boxed().context(ApiExternalSnafu);
             self.reply_api(promise, "request_summary", reply);
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let correlation_id = Uuid::new_v4();
@@ -354,14 +354,14 @@ impl SummaryRequestManagerComponent {
             correlation_id,
         });
         self.submit_reliable_runtime_message(request.target, &message);
-        Handled::Ok
+        Handled::OK
     }
 }
 
 ignore_lifecycle!(SummaryRequestManagerComponent);
 
 impl Require<ReliableDeliveryPort> for SummaryRequestManagerComponent {
-    fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> Handled {
+    fn handle(&mut self, indication: ReliableDeliveryPortIndication) -> HandlerResult {
         let ReliableDeliveryPortIndication::Deliver(deliver) = indication;
         self.handle_reliable_delivery(deliver)
     }
@@ -370,7 +370,7 @@ impl Require<ReliableDeliveryPort> for SummaryRequestManagerComponent {
 impl Actor for SummaryRequestManagerComponent {
     type Message = SummaryRequestManagerMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             SummaryRequestManagerMessage::RequestSummary(ask) => self.handle_request_summary(ask),
         }
@@ -389,7 +389,7 @@ fn panic_if_fatal_inbound_failure(action: InboundFailureAction, failure: &Summar
 fn handled_after_inbound_failure(
     action: InboundFailureAction,
     failure: &SummaryInboundFailure,
-) -> Handled {
+) -> HandlerResult {
     panic_if_fatal_inbound_failure(action, failure);
-    Handled::Ok
+    Handled::OK
 }

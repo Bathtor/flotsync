@@ -27,6 +27,7 @@ use crate::{
     SharedGroupMemberships,
     api::{GroupId, MemberIdentity},
 };
+use flotsync_utils::ResultExt as _;
 use kompact::{Never, prelude::*};
 use std::{collections::HashSet, sync::Arc};
 
@@ -156,21 +157,25 @@ impl DeliveryIngressComponent {
     fn handle_transport_inbound(
         &mut self,
         mut inbound: RouteTransportInboundDeliver<TransportRouteKey>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let group_memberships = self.interest.group_memberships.snapshot();
         let route = inbound.transport.route;
         // `Ok(None)` means the payload was syntactically valid enough to
         // classify, but the shallow public header showed it is irrelevant to
         // the current local-interest snapshot.
-        match decode_boundary_frame_if_interested(
+        let decoded_frame = decode_boundary_frame_if_interested(
             &mut inbound.payload,
             DeliveryInterestView {
                 group_memberships: group_memberships.as_ref(),
                 local_members: self.interest.local_members.as_ref(),
                 hosted_mailboxes: self.interest.hosted_mailboxes.as_ref(),
             },
-        ) {
-            Ok(Some(DecodedDeliveryFrame::GroupBroadcast { target, frame })) => {
+        )
+        .with_whatever_benign(|_| {
+            format!("Delivery ingress dropped one malformed inbound payload via {route:?}")
+        })?;
+        match decoded_frame {
+            Some(DecodedDeliveryFrame::GroupBroadcast { target, frame }) => {
                 let meta = InboundDeliveryMeta {
                     transport: inbound.transport,
                     delivery_message_id: target.delivery_message_id(),
@@ -184,7 +189,7 @@ impl DeliveryIngressComponent {
                 self.group_broadcast_inbound_port
                     .trigger(GroupBroadcastInboundDeliver { meta, frame });
             }
-            Ok(Some(DecodedDeliveryFrame::ReliableDelivery { target, frame })) => {
+            Some(DecodedDeliveryFrame::ReliableDelivery { target, frame }) => {
                 let meta = InboundDeliveryMeta {
                     transport: inbound.transport,
                     delivery_message_id: target.delivery_message_id(),
@@ -198,23 +203,15 @@ impl DeliveryIngressComponent {
                 self.reliable_delivery_inbound_port
                     .trigger(ReliableDeliveryInboundDeliver { meta, frame });
             }
-            Ok(None) => {
+            None => {
                 debug!(
                     self.log(),
                     "Delivery ingress dropped one inbound payload via {:?} because it is not locally relevant",
                     route
                 );
             }
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Delivery ingress dropped one malformed inbound payload via {:?}: {}",
-                    route,
-                    error
-                );
-            }
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
@@ -225,14 +222,17 @@ ignore_requests!(
     DeliveryIngressComponent
 );
 impl Require<TransportInboundPort> for DeliveryIngressComponent {
-    fn handle(&mut self, indication: RouteTransportInboundDeliver<TransportRouteKey>) -> Handled {
+    fn handle(
+        &mut self,
+        indication: RouteTransportInboundDeliver<TransportRouteKey>,
+    ) -> HandlerResult {
         self.handle_transport_inbound(indication)
     }
 }
 impl Actor for DeliveryIngressComponent {
     type Message = Never;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
         unreachable!("Message type cannot be instantiated");
     }
 }
@@ -279,7 +279,7 @@ mod tests {
     ignore_lifecycle!(TransportInboundProbe);
 
     impl Provide<TransportInboundPort> for TransportInboundProbe {
-        fn handle(&mut self, _request: Never) -> Handled {
+        fn handle(&mut self, _request: Never) -> HandlerResult {
             unreachable!()
         }
     }
@@ -287,7 +287,7 @@ mod tests {
     impl Actor for TransportInboundProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!()
         }
     }
@@ -315,18 +315,18 @@ mod tests {
         fn handle(
             &mut self,
             indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
-        ) -> Handled {
+        ) -> HandlerResult {
             self.events
                 .send(indication)
                 .expect("group-broadcast ingress test receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for GroupBroadcastProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
             match msg {}
         }
     }
@@ -354,18 +354,18 @@ mod tests {
         fn handle(
             &mut self,
             indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
-        ) -> Handled {
+        ) -> HandlerResult {
             self.events
                 .send(indication)
                 .expect("reliable-delivery ingress test receiver must stay live");
-            Handled::Ok
+            Handled::OK
         }
     }
 
     impl Actor for ReliableDeliveryProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
             unreachable!()
         }
     }

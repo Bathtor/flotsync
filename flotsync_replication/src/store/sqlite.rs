@@ -1160,7 +1160,7 @@ WHERE group_id = ",
 }
 
 fn push_replication_update_filter(
-    query_builder: &mut QueryBuilder<'_, Sqlite>,
+    query_builder: &mut QueryBuilder<Sqlite>,
     filter: ReplicationUpdateFilter,
 ) {
     match filter {

@@ -23,6 +23,7 @@ use crate::{
     wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::*;
+use flotsync_utils::ResultExt as _;
 use kompact::{
     config::{DurationValue, UsizeValue},
     kompact_config,
@@ -639,7 +640,7 @@ impl UDPourComponent {
                         );
                     }
                     async_self.try_dispatch_outbound();
-                    return Handled::Ok;
+                    return Handled::OK;
                 }
             };
 
@@ -653,7 +654,7 @@ impl UDPourComponent {
                         )),
                     );
                 }
-                return Handled::Ok;
+                return Handled::OK;
             }
 
             async_self.pending_transmissions.insert(transmission_id, datagram);
@@ -668,7 +669,7 @@ impl UDPourComponent {
                 reply_to,
             });
             async_self.try_dispatch_outbound();
-            Handled::Ok
+            Handled::OK
         });
     }
 
@@ -688,25 +689,25 @@ impl UDPourComponent {
         clippy::needless_pass_by_value,
         reason = "Kompact scheduled callbacks deliver timer handles by value"
     )]
-    fn handle_dispatch_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+    fn handle_dispatch_timeout(&mut self, expected_timer: ScheduledTimer) -> HandlerResult {
         let Some(active_timer) = self.dispatcher.dispatch_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if active_timer != expected_timer {
             self.dispatcher.dispatch_timer = Some(active_timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         self.try_dispatch_outbound();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_submit(&mut self, ask: Ask<UDPourSend, UDPourSubmitResult>) -> Handled {
+    fn handle_submit(&mut self, ask: Ask<UDPourSend, UDPourSubmitResult>) -> HandlerResult {
         let (promise, send) = ask.take();
         if self.socket_closed {
             let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
                 reason: UDPourSendFailureReason::Transport(SendFailureReason::Closed),
             });
-            return Handled::Ok;
+            return Handled::OK;
         }
         let now = self.now();
         match self.sender.start_transfer(send.payload, now) {
@@ -730,21 +731,18 @@ impl UDPourComponent {
                 );
             }
             Err(error) => {
-                error!(
-                    self.log(),
-                    "Sender state machine rejected UDPour submit: {error}"
-                );
                 let _ = promise.fulfil(UDPourSubmitResult::SendFailed {
                     reason: UDPourSendFailureReason::State(classify_sender_error(&error)),
                 });
+                Err(error).whatever_benign("Sender state machine rejected UDPour submit")?;
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_udp_indication(&mut self, indication: UdpIndication) -> Handled {
+    fn handle_udp_indication(&mut self, indication: UdpIndication) -> HandlerResult {
         if indication.socket_id() != Some(self.socket_id) {
-            return Handled::Ok;
+            return Handled::OK;
         }
         match indication {
             UdpIndication::Received {
@@ -752,23 +750,15 @@ impl UDPourComponent {
             } => self.handle_received(source, payload),
             UdpIndication::Closed { .. } => {
                 self.handle_socket_closed();
-                Handled::Ok
+                Handled::OK
             }
-            _ => Handled::Ok,
+            _ => Handled::OK,
         }
     }
 
-    fn handle_received(&mut self, source: SocketAddr, payload: IoPayload) -> Handled {
-        let frame = match decode_frame(payload) {
-            Ok(frame) => frame,
-            Err(error) => {
-                error!(
-                    self.log(),
-                    "Dropping invalid UDPour frame from {source}: {error}"
-                );
-                return Handled::Ok;
-            }
-        };
+    fn handle_received(&mut self, source: SocketAddr, payload: IoPayload) -> HandlerResult {
+        let frame = decode_frame(payload)
+            .with_whatever_benign(|_| format!("Dropping invalid UDPour frame from {source}"))?;
         let now = self.now();
 
         match frame {
@@ -779,10 +769,11 @@ impl UDPourComponent {
                     }
                 }
                 Err(error) => {
-                    error!(
-                        self.log(),
-                        "Receiver state machine failed while handling payload from {source}: {error}"
-                    );
+                    return Err(error).with_whatever_benign(|_| {
+                        format!(
+                            "Receiver state machine failed while handling payload from {source}"
+                        )
+                    });
                 }
             },
             UDPourFrame::Ack(frame) => {
@@ -800,10 +791,11 @@ impl UDPourComponent {
                     }
                 }
                 Err(error) => {
-                    error!(
-                        self.log(),
-                        "Sender state machine failed while handling NeedParts from {source}: {error}"
-                    );
+                    return Err(error).with_whatever_benign(|_| {
+                        format!(
+                            "Sender state machine failed while handling NeedParts from {source}"
+                        )
+                    });
                 }
             },
             UDPourFrame::NoLongerAvailable(frame) => {
@@ -813,21 +805,21 @@ impl UDPourComponent {
             }
         }
 
-        Handled::Ok
+        Handled::OK
     }
 
     #[allow(
         clippy::needless_pass_by_value,
         reason = "component messages are consumed at the actor boundary"
     )]
-    fn handle_send_result(&mut self, result: UdpSendResult) -> Handled {
+    fn handle_send_result(&mut self, result: UdpSendResult) -> HandlerResult {
         match result {
             UdpSendResult::Ack {
                 socket_id,
                 transmission_id,
             } if socket_id == self.socket_id => {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
-                    return Handled::Ok;
+                    return Handled::OK;
                 };
 
                 if pending.counts_towards_sent() {
@@ -862,7 +854,7 @@ impl UDPourComponent {
                 reason,
             } if socket_id == self.socket_id => {
                 let Some(pending) = self.pending_transmissions.remove(&transmission_id) else {
-                    return Handled::Ok;
+                    return Handled::OK;
                 };
                 if reason == SendFailureReason::Backpressure {
                     self.dispatcher.next_send_allowed_at = Some(
@@ -870,7 +862,7 @@ impl UDPourComponent {
                             .max(self.now() + self.dispatcher.send_rate.backpressure_retry_delay),
                     );
                     self.enqueue_front(pending);
-                    return Handled::Ok;
+                    return Handled::OK;
                 }
                 if pending.is_outbound_payload_datagram() {
                     self.report_send_failure(
@@ -889,7 +881,7 @@ impl UDPourComponent {
             }
             _ => {}
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_sender_action(&mut self, action: SenderAction, source: Option<SocketAddr>) {
@@ -1075,49 +1067,49 @@ impl UDPourComponent {
         clippy::needless_pass_by_value,
         reason = "Kompact scheduled callbacks deliver timer handles by value"
     )]
-    fn handle_poll_timeout(&mut self, expected_timer: ScheduledTimer) -> Handled {
+    fn handle_poll_timeout(&mut self, expected_timer: ScheduledTimer) -> HandlerResult {
         let Some(active_timer) = self.poll_timer.take() else {
-            return Handled::Ok;
+            return Handled::OK;
         };
         if active_timer != expected_timer {
             self.poll_timer = Some(active_timer);
-            return Handled::Ok;
+            return Handled::OK;
         }
         self.poll_runtime();
         self.set_poll_timer();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl ComponentLifecycle for UDPourComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         self.dispatcher.send_rate = self.load_send_rate_control();
         self.dispatcher.next_send_allowed_at = Some(self.now());
         self.set_poll_timer();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         self.clear_poll_timer();
         self.clear_dispatch_timer();
-        Handled::Ok
+        Handled::OK
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         self.clear_poll_timer();
         self.clear_dispatch_timer();
-        Handled::Ok
+        Handled::OK
     }
 }
 
 impl Provide<UDPourPort> for UDPourComponent {
-    fn handle(&mut self, _request: Never) -> Handled {
+    fn handle(&mut self, _request: Never) -> HandlerResult {
         unreachable!("Never cannot be triggered");
     }
 }
 
 impl Require<UdpPort> for UDPourComponent {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         self.handle_udp_indication(indication)
     }
 }
@@ -1125,7 +1117,7 @@ impl Require<UdpPort> for UDPourComponent {
 impl Actor for UDPourComponent {
     type Message = UDPourComponentMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             UDPourComponentMessage::Submit(ask) => self.handle_submit(ask),
             UDPourComponentMessage::SendResult(result) => self.handle_send_result(result),

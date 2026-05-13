@@ -155,7 +155,7 @@ impl PreconfiguredPeerRoutesComponent {
 }
 
 impl ComponentLifecycle for PreconfiguredPeerRoutesComponent {
-    fn on_start(&mut self) -> Handled {
+    fn on_start(&mut self) -> HandlerResult {
         match PreconfiguredPeerRoutesConfig::from_config(self.ctx.config()) {
             Ok(config) => {
                 info!(
@@ -166,7 +166,7 @@ impl ComponentLifecycle for PreconfiguredPeerRoutesComponent {
                     self.publish_mode
                 );
                 self.routes = config.routes;
-                Handled::Ok
+                Handled::OK
             }
             Err(error) => {
                 error!(
@@ -180,11 +180,11 @@ impl ComponentLifecycle for PreconfiguredPeerRoutesComponent {
 }
 
 impl Require<UdpPort> for PreconfiguredPeerRoutesComponent {
-    fn handle(&mut self, indication: UdpIndication) -> Handled {
+    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
         if let UdpIndication::Bound { local_addr, .. } = indication {
             self.record_local_endpoint_bound(local_addr);
         }
-        Handled::Ok
+        Handled::OK
     }
 }
 
@@ -196,17 +196,17 @@ ignore_requests!(
 impl Actor for PreconfiguredPeerRoutesComponent {
     type Message = PreconfiguredPeerRoutesMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             #[cfg(test)]
             PreconfiguredPeerRoutesMessage::Publish(update) => {
                 self.discovery.trigger(update);
-                Handled::Ok
+                Handled::OK
             }
             #[cfg(test)]
             PreconfiguredPeerRoutesMessage::PublishPreconfiguredRoutes => {
                 self.publish_preconfigured_routes();
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -220,25 +220,15 @@ pub(super) struct PreconfiguredPeerRoutesConfig {
 impl PreconfiguredPeerRoutesConfig {
     pub(super) fn from_config(config: &Config) -> Result<Self, RuntimeHostError> {
         let routes_lookup = config.select(STATIC_PEER_ROUTES_KEY);
-        if let Err(error) = routes_lookup.value() {
-            if is_missing_path(&error) {
-                return Ok(Self { routes: Vec::new() });
-            }
-            return Err(invalid_static_routes_config(&error));
-        }
-
         let mut routes = Vec::new();
-        // TODO(flotsync-6in): Replace this index probing once Kompact exposes
-        // selected config arrays as a slice or iterator.
-        for index in 0.. {
-            let route_entry_lookup = routes_lookup.get_index(index);
-            match route_entry_lookup.value() {
-                Ok(_) => {
-                    routes.push(parse_peer_route(route_entry_lookup, index)?);
-                }
-                Err(error) if is_missing_path(&error) => break,
-                Err(error) => return Err(invalid_static_routes_config(&error)),
-            }
+        let route_entries = match routes_lookup.array_entries() {
+            Ok(route_entries) => route_entries,
+            Err(error) if is_missing_path(&error) => return Ok(Self { routes }),
+            Err(error) => return Err(invalid_static_routes_config(&error)),
+        };
+
+        for (index, route_entry_lookup) in route_entries {
+            routes.push(parse_peer_route(route_entry_lookup, index)?);
         }
 
         Ok(Self { routes })

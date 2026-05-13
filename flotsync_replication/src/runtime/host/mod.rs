@@ -16,6 +16,7 @@ use crate::{
         reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},
         route_transport::{
             RouteDiscoveryPort,
+            RouteTransportActorMessage,
             RouteTransportPort,
             TransportRouteKey,
             manager::{RouteTransportManager, configure_replication_runtime},
@@ -33,7 +34,7 @@ use flotsync_io::test_support::{
 };
 use flotsync_io::{
     kompact::shutdown_system_bounded,
-    prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent},
+    prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
 use flotsync_udpour::UDPourConfig;
 use kompact::{KompactLogger, prelude::*};
@@ -118,8 +119,11 @@ pub(crate) enum RuntimeHostError {
         component: &'static str,
         message: String,
     },
-    #[snafu(display("Failed to connect runtime bridge UDP to route transport: {message}"))]
-    ConnectUdp { message: String },
+    #[snafu(display("Failed to connect runtime bridge UDP to '{component}': {message}"))]
+    ConnectUdp {
+        component: &'static str,
+        message: String,
+    },
     #[snafu(display("Failed to bind the runtime local delivery endpoint: {message}"))]
     BindLocalEndpoint { message: String },
     #[snafu(display("Failed to connect runtime components for {link}: {message}"))]
@@ -194,20 +198,134 @@ pub(crate) struct DeliveryRuntimeHost {
     local_endpoint_lease: ReservedSocketLease,
 }
 
-struct RuntimeTopology {
-    driver: Arc<Component<IoDriverComponent>>,
-    bridge: Arc<Component<IoBridge>>,
-    manager: Arc<Component<RouteTransportManager>>,
-    ingress: Arc<Component<DeliveryIngressComponent>>,
-    group_broadcast: Arc<Component<GroupBroadcastComponent>>,
-    reliable_delivery: Arc<Component<ReliableDeliveryComponent>>,
-    preconfigured_peer_routes: Arc<Component<PreconfiguredPeerRoutesComponent>>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
-    local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
-    catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
-    summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
-    runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
+/// Type-erased lifecycle operations for one concrete Kompact component.
+trait RuntimeLifecycleComponent: Send + Sync {
+    fn start(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError>;
+
+    fn stop(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError>;
+}
+
+/// A component topology that can expose its concrete lifecycle nodes in start order.
+///
+/// Topologies with fixed component fields can return an iterator over those fields
+/// directly. Larger or dynamic topologies can choose their own storage shape as long
+/// as the exposed node order is the desired startup order.
+trait ComponentTopology {
+    /// Expose this topology's lifecycle components in the order they should start.
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent>;
+
+    /// Start every lifecycle node in the order exposed by `nodes`.
+    fn start_all(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        for component in self.nodes() {
+            component.start(system, control_timeout)?;
+        }
+        Ok(())
+    }
+
+    /// Stop every lifecycle node in the reverse order exposed by `nodes`.
+    fn stop_all(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        for component in self.nodes().rev() {
+            component.stop(system, control_timeout)?;
+        }
+        Ok(())
+    }
+}
+
+fn connect_components<P, C1, C2>(
+    source: &Arc<Component<C1>>,
+    target: &Arc<Component<C2>>,
+    link: &'static str,
+) -> Result<(), RuntimeHostError>
+where
+    P: Port + 'static,
+    C1: ComponentDefinition + Sized + 'static + Provide<P> + ProvideRef<P>,
+    C2: ComponentDefinition + Sized + 'static + Require<P> + RequireRef<P>,
+{
+    biconnect_components::<P, _, _>(source, target).map_err(|error| {
+        RuntimeHostError::ConnectComponents {
+            link,
+            message: describe_component_connect_error(&error).to_owned(),
+        }
+    })?;
+    Ok(())
+}
+
+fn describe_component_connect_error(error: &TryDualLockError) -> &'static str {
+    match error {
+        TryDualLockError::LeftWouldBlock => "provider component lock would block",
+        TryDualLockError::RightWouldBlock => "requirer component lock would block",
+        TryDualLockError::LeftPoisoned => "provider component lock was poisoned",
+        TryDualLockError::RightPoisoned => "requirer component lock was poisoned",
+    }
+}
+
+fn connect_udp_component<C>(
+    udp_connect_handle: &IoBridgeHandle,
+    component: &Arc<Component<C>>,
+) -> Result<(), RuntimeHostError>
+where
+    C: ComponentDefinition
+        + ComponentLifecycle
+        + Require<UdpPort>
+        + RequireRef<UdpPort>
+        + Sized
+        + 'static,
+{
+    block_on(udp_connect_handle.connect_udp(component)).map_err(|error| {
+        RuntimeHostError::ConnectUdp {
+            component: C::type_name(),
+            message: error.to_string(),
+        }
+    })
+}
+
+impl<C> RuntimeLifecycleComponent for Arc<Component<C>>
+where
+    C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
+{
+    fn start(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        system
+            .start_notify(self)
+            .wait_timeout(control_timeout)
+            .map_err(|error| RuntimeHostError::StartComponent {
+                component: C::type_name(),
+                message: error.to_string(),
+            })
+    }
+
+    fn stop(
+        &self,
+        system: &KompactSystem,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        system
+            .stop_notify(self)
+            .wait_timeout(control_timeout)
+            .map_err(|error| RuntimeHostError::StopComponent {
+                component: C::type_name(),
+                message: error.to_string(),
+            })
+    }
 }
 
 struct BuiltRuntimeSystem {
@@ -216,162 +334,346 @@ struct BuiltRuntimeSystem {
     local_endpoint_lease: ReservedSocketLease,
 }
 
-impl RuntimeTopology {
-    #[allow(clippy::too_many_lines)]
+struct IoTopology {
+    driver: Arc<Component<IoDriverComponent>>,
+    bridge: Arc<Component<IoBridge>>,
+}
+
+impl IoTopology {
+    fn build(system: &KompactSystem) -> Self {
+        let driver = IoDriverComponent::new(DriverConfig::default());
+        let driver = system.create(move || driver);
+        let bridge = IoBridge::new(&driver);
+        let bridge = system.create(move || bridge);
+        Self { driver, bridge }
+    }
+
+    /// Connect the already-started IO bridge to every UDP consumer in the runtime.
+    fn connect_udp_ports(
+        &self,
+        transport: &TransportTopology,
+        discovery: &DiscoveryTopology,
+    ) -> Result<(), RuntimeHostError> {
+        let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
+        connect_udp_component(&udp_connect_handle, transport.route_transport_manager())?;
+        connect_udp_component(&udp_connect_handle, discovery.local_endpoint_manager())?;
+        connect_udp_component(&udp_connect_handle, discovery.route_discovery_provider())
+    }
+}
+
+impl ComponentTopology for IoTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        std::iter::once(&self.driver as &dyn RuntimeLifecycleComponent).chain(std::iter::once(
+            &self.bridge as &dyn RuntimeLifecycleComponent,
+        ))
+    }
+}
+
+struct TransportTopology {
+    manager: Arc<Component<RouteTransportManager>>,
+}
+
+impl TransportTopology {
+    fn build(system: &KompactSystem, bridge: &Arc<Component<IoBridge>>) -> Self {
+        let manager = RouteTransportManager::new(
+            system.clone(),
+            IoBridgeHandle::from_component(bridge),
+            UDPourConfig::default(),
+        );
+        let manager = system.create(move || manager);
+        Self { manager }
+    }
+
+    fn manager_ref(&self) -> ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>> {
+        self.manager
+            .actor_ref()
+            .hold()
+            .expect("route transport manager must expose a strong actor ref")
+    }
+
+    fn route_transport_manager(&self) -> &Arc<Component<RouteTransportManager>> {
+        &self.manager
+    }
+}
+
+impl ComponentTopology for TransportTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        std::iter::once(&self.manager as &dyn RuntimeLifecycleComponent)
+    }
+}
+
+struct DeliveryTopology {
+    ingress: Arc<Component<DeliveryIngressComponent>>,
+    group_broadcast: Arc<Component<GroupBroadcastComponent>>,
+    reliable_delivery: Arc<Component<ReliableDeliveryComponent>>,
+}
+
+impl DeliveryTopology {
     fn build(
         system: &KompactSystem,
-        group_memberships: &SharedGroupMemberships,
-        local_member: &MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
+        group_memberships: SharedGroupMemberships,
+        local_member: MemberIdentity,
+        manager_ref: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+    ) -> Self {
+        let ingress = DeliveryIngressComponent::new(DeliveryInterestConfig {
+            group_memberships: group_memberships.clone(),
+            local_members: Arc::new([local_member].into_iter().collect()),
+            hosted_mailboxes: Arc::new(HashSet::new()),
+        });
+        let ingress = system.create(move || ingress);
+        let group_broadcast = GroupBroadcastComponent::new(group_memberships, manager_ref.clone());
+        let group_broadcast = system.create(move || group_broadcast);
+        let reliable_delivery = ReliableDeliveryComponent::new(manager_ref);
+        let reliable_delivery = system.create(move || reliable_delivery);
+        Self {
+            ingress,
+            group_broadcast,
+            reliable_delivery,
+        }
+    }
+
+    fn connect_transport(&self, transport: &TransportTopology) -> Result<(), RuntimeHostError> {
+        connect_components::<TransportRoutePort, _, _>(
+            transport.route_transport_manager(),
+            &self.ingress,
+            "route transport -> ingress",
+        )
+    }
+
+    fn connect_internal_routes(&self) -> Result<(), RuntimeHostError> {
+        connect_components::<GroupBroadcastInboundRoutePort, _, _>(
+            &self.ingress,
+            &self.group_broadcast,
+            "ingress -> group broadcast",
+        )?;
+        connect_components::<ReliableDeliveryInboundRoutePort, _, _>(
+            &self.ingress,
+            &self.reliable_delivery,
+            "ingress -> reliable delivery",
+        )
+    }
+
+    fn connect_discovery(&self, discovery: &DiscoveryTopology) -> Result<(), RuntimeHostError> {
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.route_discovery_provider(),
+            &self.group_broadcast,
+            "preconfigured peer routes -> group broadcast",
+        )?;
+        connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+            discovery.route_discovery_provider(),
+            &self.reliable_delivery,
+            "preconfigured peer routes -> reliable delivery",
+        )
+    }
+
+    fn group_broadcast_provider(&self) -> &Arc<Component<GroupBroadcastComponent>> {
+        &self.group_broadcast
+    }
+
+    fn reliable_delivery_provider(&self) -> &Arc<Component<ReliableDeliveryComponent>> {
+        &self.reliable_delivery
+    }
+}
+
+impl ComponentTopology for DeliveryTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        std::iter::once(&self.ingress as &dyn RuntimeLifecycleComponent)
+            .chain(std::iter::once(
+                &self.group_broadcast as &dyn RuntimeLifecycleComponent,
+            ))
+            .chain(std::iter::once(
+                &self.reliable_delivery as &dyn RuntimeLifecycleComponent,
+            ))
+    }
+}
+
+struct DiscoveryTopology {
+    preconfigured_peer_routes: Arc<Component<PreconfiguredPeerRoutesComponent>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
+    local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
+}
+
+impl DiscoveryTopology {
+    fn build(
+        system: &KompactSystem,
         host_config: DeliveryRuntimeHostConfig,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Self {
-        let driver = system.create(|| IoDriverComponent::new(DriverConfig::default()));
-        let driver_for_bridge = driver.clone();
-        let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
-        let bridge_handle = IoBridgeHandle::from_component(&bridge);
-        let manager_system = system.clone();
-        let manager = system.create(move || {
-            RouteTransportManager::new(manager_system, bridge_handle, UDPourConfig::default())
-        });
-        let manager_ref = manager
-            .actor_ref()
-            .hold()
-            .expect("route transport manager must expose a strong actor ref");
-        let ingress_memberships = group_memberships.clone();
-        let ingress_local_member = local_member.clone();
-        let ingress = system.create(move || {
-            DeliveryIngressComponent::new(DeliveryInterestConfig {
-                group_memberships: ingress_memberships,
-                local_members: Arc::new([ingress_local_member.clone()].into_iter().collect()),
-                hosted_mailboxes: Arc::new(HashSet::new()),
-            })
-        });
-        let broadcast_memberships = group_memberships.clone();
-        let broadcast_manager_ref = manager_ref.clone();
-        let reliable_manager_ref = manager_ref;
-        let group_broadcast = system.create(move || {
-            GroupBroadcastComponent::new(broadcast_memberships, broadcast_manager_ref)
-        });
-        let reliable_delivery =
-            system.create(move || ReliableDeliveryComponent::new(reliable_manager_ref));
-        let preconfigured_peer_routes = system.create(move || {
-            PreconfiguredPeerRoutesComponent::new(
-                host_config.local_endpoint_bind_addr,
-                route_publish_mode,
-            )
-        });
+        let preconfigured_peer_routes = PreconfiguredPeerRoutesComponent::new(
+            host_config.local_endpoint_bind_addr,
+            route_publish_mode,
+        );
+        let preconfigured_peer_routes = system.create(move || preconfigured_peer_routes);
         let preconfigured_peer_routes_ref = preconfigured_peer_routes
             .actor_ref()
             .hold()
             .expect("preconfigured peer routes must expose a strong actor ref");
         let local_endpoint_manager =
-            system.create(move || LocalEndpointManager::new(host_config.local_endpoint_bind_addr));
-        let catch_up_memberships = group_memberships.clone();
-        let catch_up_local_member = local_member.clone();
-        let catch_up_store = store.clone();
-        let catch_up_manager = system.create(move || {
-            CatchUpManagerComponent::new(
-                catch_up_local_member,
-                catch_up_memberships,
-                catch_up_store,
-            )
-        });
+            LocalEndpointManager::new(host_config.local_endpoint_bind_addr);
+        let local_endpoint_manager = system.create(move || local_endpoint_manager);
+        Self {
+            preconfigured_peer_routes,
+            preconfigured_peer_routes_ref,
+            local_endpoint_manager,
+        }
+    }
+
+    fn route_discovery_provider(&self) -> &Arc<Component<PreconfiguredPeerRoutesComponent>> {
+        &self.preconfigured_peer_routes
+    }
+
+    fn local_endpoint_manager(&self) -> &Arc<Component<LocalEndpointManager>> {
+        &self.local_endpoint_manager
+    }
+}
+
+impl ComponentTopology for DiscoveryTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        std::iter::once(&self.preconfigured_peer_routes as &dyn RuntimeLifecycleComponent).chain(
+            std::iter::once(&self.local_endpoint_manager as &dyn RuntimeLifecycleComponent),
+        )
+    }
+}
+
+struct RuntimeLogicTopology {
+    catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
+    summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
+    runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
+}
+
+impl RuntimeLogicTopology {
+    fn build(
+        system: &KompactSystem,
+        group_memberships: SharedGroupMemberships,
+        local_member: MemberIdentity,
+        store: Arc<dyn ReplicationStore>,
+        listener: Arc<dyn ReplicationEventListener>,
+        host_config: DeliveryRuntimeHostConfig,
+    ) -> Self {
+        let catch_up_manager = CatchUpManagerComponent::new(
+            local_member.clone(),
+            group_memberships.clone(),
+            store.clone(),
+        );
+        let catch_up_manager = system.create(move || catch_up_manager);
         let catch_up_manager_ref = catch_up_manager
             .actor_ref()
             .hold()
             .expect("catch-up manager must expose a strong actor ref");
-        let summary_manager_memberships = group_memberships.clone();
-        let summary_manager_local_member = local_member.clone();
-        let summary_request_timeout = host_config.summary_request_timeout;
-        let summary_request_manager = system.create(move || {
-            SummaryRequestManagerComponent::new(
-                summary_manager_local_member,
-                summary_manager_memberships,
-                summary_request_timeout,
-            )
-        });
+        let summary_request_manager = SummaryRequestManagerComponent::new(
+            local_member.clone(),
+            group_memberships.clone(),
+            host_config.summary_request_timeout,
+        );
+        let summary_request_manager = system.create(move || summary_request_manager);
         let summary_request_manager_ref = summary_request_manager
             .actor_ref()
             .hold()
             .expect("summary request manager must expose a strong actor ref");
-        let runtime_memberships = group_memberships.clone();
-        let runtime_local_member = local_member.clone();
-        let runtime_component = system.create(move || {
-            ReplicationRuntimeComponent::new(
-                runtime_local_member,
-                store,
-                listener,
-                runtime_memberships,
-                summary_request_manager_ref,
-                catch_up_manager_ref,
-            )
-        });
-
+        let runtime_component = ReplicationRuntimeComponent::new(
+            local_member,
+            store,
+            listener,
+            group_memberships,
+            summary_request_manager_ref,
+            catch_up_manager_ref,
+        );
+        let runtime_component = system.create(move || runtime_component);
         Self {
-            driver,
-            bridge,
-            manager,
-            ingress,
-            group_broadcast,
-            reliable_delivery,
-            preconfigured_peer_routes,
-            preconfigured_peer_routes_ref,
-            local_endpoint_manager,
             catch_up_manager,
             summary_request_manager,
             runtime_component,
         }
     }
 
-    fn connect_all(&self) -> Result<(), RuntimeHostError> {
-        Self::connect_components::<TransportRoutePort, _, _>(
-            &self.manager,
-            &self.ingress,
-            "route transport -> ingress",
-        )?;
-        Self::connect_components::<GroupBroadcastInboundRoutePort, _, _>(
-            &self.ingress,
-            &self.group_broadcast,
-            "ingress -> group broadcast",
-        )?;
-        Self::connect_components::<ReliableDeliveryInboundRoutePort, _, _>(
-            &self.ingress,
-            &self.reliable_delivery,
-            "ingress -> reliable delivery",
-        )?;
-        Self::connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
-            &self.preconfigured_peer_routes,
-            &self.group_broadcast,
-            "preconfigured peer routes -> group broadcast",
-        )?;
-        Self::connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
-            &self.preconfigured_peer_routes,
-            &self.reliable_delivery,
-            "preconfigured peer routes -> reliable delivery",
-        )?;
-        Self::connect_components::<GroupBroadcastPort, _, _>(
-            &self.group_broadcast,
+    fn connect_delivery(&self, delivery: &DeliveryTopology) -> Result<(), RuntimeHostError> {
+        connect_components::<GroupBroadcastPort, _, _>(
+            delivery.group_broadcast_provider(),
             &self.runtime_component,
             "group broadcast -> replication runtime",
         )?;
-        Self::connect_components::<GroupBroadcastPort, _, _>(
-            &self.group_broadcast,
+        connect_components::<GroupBroadcastPort, _, _>(
+            delivery.group_broadcast_provider(),
             &self.catch_up_manager,
             "group broadcast -> catch-up manager",
         )?;
-        Self::connect_components::<ReliableDeliveryPort, _, _>(
-            &self.reliable_delivery,
+        connect_components::<ReliableDeliveryPort, _, _>(
+            delivery.reliable_delivery_provider(),
             &self.runtime_component,
             "reliable delivery -> replication runtime",
         )?;
-        Self::connect_components::<ReliableDeliveryPort, _, _>(
-            &self.reliable_delivery,
+        connect_components::<ReliableDeliveryPort, _, _>(
+            delivery.reliable_delivery_provider(),
             &self.summary_request_manager,
             "reliable delivery -> summary request manager",
-        )?;
-        Ok(())
+        )
+    }
+}
+
+impl ComponentTopology for RuntimeLogicTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        std::iter::once(&self.catch_up_manager as &dyn RuntimeLifecycleComponent)
+            .chain(std::iter::once(
+                &self.summary_request_manager as &dyn RuntimeLifecycleComponent,
+            ))
+            .chain(std::iter::once(
+                &self.runtime_component as &dyn RuntimeLifecycleComponent,
+            ))
+    }
+}
+
+struct RuntimeTopology {
+    io: IoTopology,
+    transport: TransportTopology,
+    delivery: DeliveryTopology,
+    discovery: DiscoveryTopology,
+    runtime: RuntimeLogicTopology,
+}
+
+impl RuntimeTopology {
+    fn build(
+        system: &KompactSystem,
+        group_memberships: SharedGroupMemberships,
+        local_member: MemberIdentity,
+        store: Arc<dyn ReplicationStore>,
+        listener: Arc<dyn ReplicationEventListener>,
+        host_config: DeliveryRuntimeHostConfig,
+        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+    ) -> Self {
+        let io = IoTopology::build(system);
+        let transport = TransportTopology::build(system, &io.bridge);
+        let manager_ref = transport.manager_ref();
+        let delivery = DeliveryTopology::build(
+            system,
+            group_memberships.clone(),
+            local_member.clone(),
+            manager_ref,
+        );
+        let discovery = DiscoveryTopology::build(system, host_config, route_publish_mode);
+        let runtime = RuntimeLogicTopology::build(
+            system,
+            group_memberships,
+            local_member,
+            store,
+            listener,
+            host_config,
+        );
+
+        Self {
+            io,
+            transport,
+            delivery,
+            discovery,
+            runtime,
+        }
+    }
+
+    fn connect_all(&self) -> Result<(), RuntimeHostError> {
+        self.delivery.connect_transport(&self.transport)?;
+        self.delivery.connect_internal_routes()?;
+        self.delivery.connect_discovery(&self.discovery)?;
+        self.runtime.connect_delivery(&self.delivery)
     }
 
     fn start_all(
@@ -379,68 +681,13 @@ impl RuntimeTopology {
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        Self::start_component(system, &self.driver, "io_driver", control_timeout)?;
-        Self::start_component(system, &self.bridge, "io_bridge", control_timeout)?;
-        let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
-        block_on(udp_connect_handle.connect_udp(&self.manager)).map_err(|error| {
-            RuntimeHostError::ConnectUdp {
-                message: format!("{error:?}"),
-            }
-        })?;
-        block_on(udp_connect_handle.connect_udp(&self.local_endpoint_manager)).map_err(
-            |error| RuntimeHostError::ConnectUdp {
-                message: format!("{error:?}"),
-            },
-        )?;
-        block_on(udp_connect_handle.connect_udp(&self.preconfigured_peer_routes)).map_err(
-            |error| RuntimeHostError::ConnectUdp {
-                message: format!("{error:?}"),
-            },
-        )?;
-        Self::start_component(system, &self.manager, "route_transport", control_timeout)?;
-        Self::start_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
-        Self::start_component(
-            system,
-            &self.group_broadcast,
-            "group_broadcast",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.reliable_delivery,
-            "reliable_delivery",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.preconfigured_peer_routes,
-            "preconfigured_peer_routes",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.local_endpoint_manager,
-            "local_endpoint_manager",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.catch_up_manager,
-            "catch_up_manager",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.summary_request_manager,
-            "summary_request_manager",
-            control_timeout,
-        )?;
-        Self::start_component(
-            system,
-            &self.runtime_component,
-            "replication_runtime",
-            control_timeout,
-        )?;
+        self.io.start_all(system, control_timeout)?;
+        self.io
+            .connect_udp_ports(&self.transport, &self.discovery)?;
+        self.transport.start_all(system, control_timeout)?;
+        self.delivery.start_all(system, control_timeout)?;
+        self.discovery.start_all(system, control_timeout)?;
+        self.runtime.start_all(system, control_timeout)?;
         Ok(())
     }
 
@@ -449,108 +696,23 @@ impl RuntimeTopology {
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        Self::stop_component(
-            system,
-            &self.runtime_component,
-            "replication_runtime",
-            control_timeout,
-        )?;
-        Self::stop_component(
-            system,
-            &self.summary_request_manager,
-            "summary_request_manager",
-            control_timeout,
-        )?;
-        Self::stop_component(
-            system,
-            &self.catch_up_manager,
-            "catch_up_manager",
-            control_timeout,
-        )?;
-        Self::stop_component(
-            system,
-            &self.reliable_delivery,
-            "reliable_delivery",
-            control_timeout,
-        )?;
-        Self::stop_component(
-            system,
-            &self.group_broadcast,
-            "group_broadcast",
-            control_timeout,
-        )?;
-        Self::stop_component(system, &self.ingress, "delivery_ingress", control_timeout)?;
-        Self::stop_component(
-            system,
-            &self.preconfigured_peer_routes,
-            "preconfigured_peer_routes",
-            control_timeout,
-        )?;
-        Self::stop_component(
-            system,
-            &self.local_endpoint_manager,
-            "local_endpoint_manager",
-            control_timeout,
-        )?;
-        Self::stop_component(system, &self.manager, "route_transport", control_timeout)?;
-        Self::stop_component(system, &self.bridge, "io_bridge", control_timeout)?;
-        Self::stop_component(system, &self.driver, "io_driver", control_timeout)?;
+        self.runtime.stop_all(system, control_timeout)?;
+        self.discovery.stop_all(system, control_timeout)?;
+        self.delivery.stop_all(system, control_timeout)?;
+        self.transport.stop_all(system, control_timeout)?;
+        self.io.stop_all(system, control_timeout)?;
         Ok(())
     }
+}
 
-    fn connect_components<P, C1, C2>(
-        source: &Arc<Component<C1>>,
-        target: &Arc<Component<C2>>,
-        link: &'static str,
-    ) -> Result<(), RuntimeHostError>
-    where
-        P: Port + 'static,
-        C1: ComponentDefinition + Sized + 'static + Provide<P> + ProvideRef<P>,
-        C2: ComponentDefinition + Sized + 'static + Require<P> + RequireRef<P>,
-    {
-        biconnect_components::<P, _, _>(source, target).map_err(|error| {
-            RuntimeHostError::ConnectComponents {
-                link,
-                message: format!("{error:?}"),
-            }
-        })?;
-        Ok(())
-    }
-
-    fn start_component<C>(
-        system: &KompactSystem,
-        component: &Arc<Component<C>>,
-        name: &'static str,
-        control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError>
-    where
-        C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
-    {
-        system
-            .start_notify(component)
-            .wait_timeout(control_timeout)
-            .map_err(|error| RuntimeHostError::StartComponent {
-                component: name,
-                message: format!("{error:?}"),
-            })
-    }
-
-    fn stop_component<C>(
-        system: &KompactSystem,
-        component: &Arc<Component<C>>,
-        name: &'static str,
-        control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError>
-    where
-        C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
-    {
-        system
-            .stop_notify(component)
-            .wait_timeout(control_timeout)
-            .map_err(|error| RuntimeHostError::StopComponent {
-                component: name,
-                message: format!("{error:?}"),
-            })
+impl ComponentTopology for RuntimeTopology {
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        self.io
+            .nodes()
+            .chain(self.transport.nodes())
+            .chain(self.delivery.nodes())
+            .chain(self.discovery.nodes())
+            .chain(self.runtime.nodes())
     }
 }
 
@@ -588,7 +750,7 @@ impl DeliveryRuntimeHost {
     }
 
     pub(crate) fn runtime_component(&self) -> &Arc<Component<ReplicationRuntimeComponent>> {
-        &self.topology().runtime_component
+        &self.topology().runtime.runtime_component
     }
 
     /// Start one new delivery runtime host for a single local member.
@@ -633,8 +795,8 @@ impl DeliveryRuntimeHost {
         let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
         let topology = RuntimeTopology::build(
             &system,
-            &group_memberships,
-            local_member,
+            group_memberships.clone(),
+            local_member.clone(),
             store,
             listener,
             host_config,
@@ -643,7 +805,7 @@ impl DeliveryRuntimeHost {
         topology.connect_all()?;
         topology.start_all(&system, host_config.control_timeout)?;
         let local_endpoint = ensure_local_endpoint_bound(
-            &topology.local_endpoint_manager,
+            &topology.discovery.local_endpoint_manager,
             host_config.control_timeout,
         )
         .map_err(|error| {
@@ -722,6 +884,7 @@ impl DeliveryRuntimeHost {
         update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
         self.topology()
+            .discovery
             .preconfigured_peer_routes_ref
             .tell(PreconfiguredPeerRoutesMessage::Publish(update));
     }
@@ -729,6 +892,7 @@ impl DeliveryRuntimeHost {
     #[cfg(test)]
     pub(crate) fn publish_preconfigured_peer_routes_for_test(&self) {
         self.topology()
+            .discovery
             .preconfigured_peer_routes_ref
             .tell(PreconfiguredPeerRoutesMessage::PublishPreconfiguredRoutes);
     }
@@ -945,7 +1109,7 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
     let broadcast_peer = peer.clone();
     eventually_component_state(
         FULL_STACK_WAIT_TIMEOUT,
-        &topology.group_broadcast,
+        &topology.delivery.group_broadcast,
         |component| component.knows_direct_route(&broadcast_peer),
         format_args!("timed out waiting for group-broadcast route publication for peer={peer}"),
     );
@@ -953,7 +1117,7 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
     let reliable_peer = peer.clone();
     eventually_component_state(
         FULL_STACK_WAIT_TIMEOUT,
-        &topology.reliable_delivery,
+        &topology.delivery.reliable_delivery,
         |component| component.knows_direct_route(&reliable_peer),
         format_args!("timed out waiting for reliable-delivery route publication for peer={peer}"),
     );

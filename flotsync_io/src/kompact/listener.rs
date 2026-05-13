@@ -19,6 +19,7 @@ use crate::{
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::collections::HashSet;
 
 /// Request payload used when accepting one pending inbound TCP connection.
@@ -107,13 +108,13 @@ impl TcpListener {
         clippy::needless_pass_by_value,
         reason = "Kompact component messages are delivered by value and this handler routes them immediately."
     )]
-    fn handle_request(&mut self, request: TcpListenerRequest) -> Handled {
+    fn handle_request(&mut self, request: TcpListenerRequest) -> HandlerResult {
         match request {
             TcpListenerRequest::Close => self.handle_close_request(),
         }
     }
 
-    fn handle_close_request(&mut self) -> Handled {
+    fn handle_close_request(&mut self) -> HandlerResult {
         let Some(listener_id) = self.listener_id else {
             if !self.terminal {
                 self.fulfil_open_failure(OpenFailureReason::DriverUnavailable);
@@ -123,15 +124,15 @@ impl TcpListener {
                 self.terminal = true;
             }
             self.ctx.suicide();
-            return Handled::Ok;
+            return Handled::OK;
         };
         if self.terminal {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.driver
             .dispatch_tcp(TcpCommand::CloseListener { listener_id });
-        Handled::Ok
+        Handled::OK
     }
 
     #[allow(
@@ -139,7 +140,7 @@ impl TcpListener {
         clippy::match_same_arms,
         reason = "Listener driver events are delivered by value; repeated state outcomes are kept explicit by event variant."
     )]
-    fn handle_driver_event(&mut self, event: TcpListenerDriverEvent) -> Handled {
+    fn handle_driver_event(&mut self, event: TcpListenerDriverEvent) -> HandlerResult {
         match event {
             TcpListenerDriverEvent::Listening {
                 listener_id,
@@ -179,13 +180,13 @@ impl TcpListener {
                 self.ctx.suicide();
             }
         }
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_accept_pending(
         &mut self,
         ask: Ask<AcceptPendingTcpSession, Result<TcpSessionRef>>,
-    ) -> Handled {
+    ) -> HandlerResult {
         let (promise, request) = ask.take();
         if !self.pending_connections.remove(&request.connection_id) {
             let fulfil_result = promise.fulfil(Err(Error::UnknownConnection {
@@ -194,7 +195,7 @@ impl TcpListener {
             if fulfil_result.is_err() {
                 debug!(self.log(), "dropping TCP pending-session accept reply");
             }
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         let driver = self.driver.clone();
@@ -238,17 +239,18 @@ impl TcpListener {
                     }
                 }
             }
+            Handled::OK
         })
     }
 
-    fn handle_reject_pending(&mut self, ask: Ask<ConnectionId, Result<()>>) -> Handled {
+    fn handle_reject_pending(&mut self, ask: Ask<ConnectionId, Result<()>>) -> HandlerResult {
         let (promise, connection_id) = ask.take();
         if !self.pending_connections.remove(&connection_id) {
             let fulfil_result = promise.fulfil(Err(Error::UnknownConnection { connection_id }));
             if fulfil_result.is_err() {
                 debug!(self.log(), "dropping TCP pending-session reject reply");
             }
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         Handled::block_on(self, move |async_self| async move {
@@ -260,6 +262,7 @@ impl TcpListener {
                     "dropping TCP pending-session reject reply"
                 );
             }
+            Handled::OK
         })
     }
 
@@ -267,23 +270,23 @@ impl TcpListener {
         clippy::match_same_arms,
         reason = "Pending-drop state handling names each lifecycle state even when the resulting action matches."
     )]
-    fn handle_drop_pending(&mut self, connection_id: ConnectionId) -> Handled {
+    fn handle_drop_pending(&mut self, connection_id: ConnectionId) -> HandlerResult {
         if !self.pending_connections.remove(&connection_id) {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         Handled::block_on(self, move |async_self| async move {
             let reject = async_self.driver.reject_pending_tcp_session(connection_id);
-            match resolve_kfuture(reject).await {
-                Ok(()) => {}
-                Err(Error::UnknownConnection { .. }) => {}
-                Err(error) => {
-                    warn!(
-                        async_self.log(),
-                        "failed to auto-reject pending TCP connection {}: {}", connection_id, error
-                    );
-                }
-            }
+            resolve_kfuture(reject)
+                .await
+                .or_else(|error| match error {
+                    Error::UnknownConnection { .. } => Ok(()),
+                    error => Err(error),
+                })
+                .with_whatever_benign(|_| {
+                    format!("failed to auto-reject pending TCP connection {connection_id}")
+                })?;
+            Handled::OK
         })
     }
 
@@ -315,11 +318,11 @@ impl TcpListener {
 }
 
 impl ComponentLifecycle for TcpListener {
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         shutdown_listener(self)
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         shutdown_listener(self)
     }
 }
@@ -327,7 +330,7 @@ impl ComponentLifecycle for TcpListener {
 impl Actor for TcpListener {
     type Message = TcpListenerMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             TcpListenerMessage::Request(request) => self.handle_request(request),
             TcpListenerMessage::DriverEvent(event) => self.handle_driver_event(event),
@@ -340,29 +343,30 @@ impl Actor for TcpListener {
     }
 }
 
-fn shutdown_listener(listener: &mut TcpListener) -> Handled {
+fn shutdown_listener(listener: &mut TcpListener) -> HandlerResult {
     if listener.terminal {
         listener.listener_id = None;
         listener.pending_connections.clear();
-        return Handled::Ok;
+        return Handled::OK;
     }
 
     let Some(listener_id) = listener.listener_id.take() else {
         listener.pending_connections.clear();
-        return Handled::Ok;
+        return Handled::OK;
     };
 
     let release = listener.driver.release_tcp_listener(listener_id);
     listener.pending_connections.clear();
-    Handled::block_on(listener, move |async_self| async move {
-        match resolve_kfuture(release).await {
-            Ok(()) | Err(Error::UnknownListener { .. }) => {}
-            Err(error) => {
-                warn!(
-                    async_self.log(),
-                    "failed to release TCP listener {} during shutdown: {}", listener_id, error
-                );
-            }
-        }
+    Handled::block_on(listener, move |_async_self| async move {
+        resolve_kfuture(release)
+            .await
+            .or_else(|error| match error {
+                Error::UnknownListener { .. } => Ok(()),
+                error => Err(error),
+            })
+            .with_whatever_benign(|_| {
+                format!("failed to release TCP listener {listener_id} during shutdown")
+            })?;
+        Handled::OK
     })
 }

@@ -201,14 +201,9 @@ mod kompact_implementation {
             config: ServiceConfig,
             shutdown_handle: BlockingThreadShutdown<()>,
         ) -> StateUpdate<ComponentState> {
-            Handled::block_on(self, async move |async_self| {
-                if let Err(e) = shutdown_handle.shutdown().await {
-                    error!(
-                        async_self.log(),
-                        "Could not shutdown mDNS announcement service: {e}"
-                    );
-                }
-                Handled::Ok
+            Handled::block_on(self, async move |_async_self| {
+                shutdown_handle.shutdown().await.benign_err()?;
+                Handled::OK
             })
             .and_transition(ComponentState::Initialised {
                 options: config.options,
@@ -221,7 +216,7 @@ mod kompact_implementation {
         }
     }
     impl ComponentLifecycle for MdnsAnnouncementComponent {
-        fn on_start(&mut self) -> Handled {
+        fn on_start(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 // There's nothing to do. We don't know the port, so we can't start the service.
                 old_state @ ComponentState::Uninitialised => StateUpdate::ok(old_state),
@@ -234,7 +229,7 @@ mod kompact_implementation {
                 }
             })
         }
-        fn on_stop(&mut self) -> Handled {
+        fn on_stop(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 old_state @ (
                     ComponentState::Uninitialised | ComponentState::Initialised { .. }
@@ -249,7 +244,7 @@ mod kompact_implementation {
                 }
             })
         }
-        fn on_kill(&mut self) -> Handled {
+        fn on_kill(&mut self) -> HandlerResult {
             transform_state_match!(self, state, {
                 ComponentState::Running {
                     config,
@@ -267,7 +262,7 @@ mod kompact_implementation {
     impl Actor for MdnsAnnouncementComponent {
         type Message = MdnsAnnouncementMessages;
 
-        fn receive_local(&mut self, msg: Self::Message) -> Handled {
+        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
             match msg {
                 MdnsAnnouncementMessages::Public(_) => unimplemented!("No public messages yet"),
                 MdnsAnnouncementMessages::Internal(internal) => match internal {

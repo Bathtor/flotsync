@@ -115,11 +115,11 @@ ignore_lifecycle!(TaggedSessionEventProbe);
 impl Actor for TaggedSessionEventProbe {
     type Message = TaggedSessionEvent;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         self.events
             .send(msg)
             .expect("tagged TCP session event receiver must stay live during integration tests");
-        Handled::Ok
+        Handled::OK
     }
 }
 

@@ -16,6 +16,7 @@ use crate::{
     pool::EgressPool,
 };
 use ::kompact::prelude::*;
+use flotsync_utils::ResultExt as _;
 use std::net::SocketAddr;
 
 /// Internal session-directed event routed from the shared driver component.
@@ -128,7 +129,7 @@ impl TcpSession {
         }
     }
 
-    fn handle_request(&mut self, request: TcpSessionRequest) -> Handled {
+    fn handle_request(&mut self, request: TcpSessionRequest) -> HandlerResult {
         match request {
             TcpSessionRequest::Send {
                 transmission_id,
@@ -146,20 +147,20 @@ impl TcpSession {
         &mut self,
         transmission_id: crate::api::TransmissionId,
         payload: crate::api::IoPayload,
-    ) -> Handled {
+    ) -> HandlerResult {
         let Some(connection_id) = self.connection_id else {
             self.events_to.tell(TcpSessionEvent::SendNack {
                 transmission_id,
                 reason: SendFailureReason::InvalidState,
             });
-            return Handled::Ok;
+            return Handled::OK;
         };
         if self.terminal {
             self.events_to.tell(TcpSessionEvent::SendNack {
                 transmission_id,
                 reason: SendFailureReason::Closed,
             });
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.driver.dispatch_tcp(TcpCommand::Send {
@@ -167,27 +168,27 @@ impl TcpSession {
             transmission_id,
             payload,
         });
-        Handled::Ok
+        Handled::OK
     }
 
     fn handle_send_and_close_request(
         &mut self,
         transmission_id: crate::api::TransmissionId,
         payload: crate::api::IoPayload,
-    ) -> Handled {
+    ) -> HandlerResult {
         let Some(connection_id) = self.connection_id else {
             self.events_to.tell(TcpSessionEvent::SendNack {
                 transmission_id,
                 reason: SendFailureReason::InvalidState,
             });
-            return Handled::Ok;
+            return Handled::OK;
         };
         if self.terminal {
             self.events_to.tell(TcpSessionEvent::SendNack {
                 transmission_id,
                 reason: SendFailureReason::Closed,
             });
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.driver.dispatch_tcp(TcpCommand::SendAndClose {
@@ -195,10 +196,10 @@ impl TcpSession {
             transmission_id,
             payload,
         });
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_close_request(&mut self, abort: bool) -> Handled {
+    fn handle_close_request(&mut self, abort: bool) -> HandlerResult {
         let Some(connection_id) = self.connection_id else {
             self.fulfil_open_failure(OpenFailureReason::DriverUnavailable);
             if self.opened {
@@ -208,20 +209,20 @@ impl TcpSession {
             }
             self.terminal = true;
             self.ctx.suicide();
-            return Handled::Ok;
+            return Handled::OK;
         };
         if self.terminal {
-            return Handled::Ok;
+            return Handled::OK;
         }
 
         self.driver.dispatch_tcp(TcpCommand::Close {
             connection_id,
             abort,
         });
-        Handled::Ok
+        Handled::OK
     }
 
-    fn handle_driver_event(&mut self, event: TcpSessionDriverEvent) -> Handled {
+    fn handle_driver_event(&mut self, event: TcpSessionDriverEvent) -> HandlerResult {
         match event {
             TcpSessionDriverEvent::Opened {
                 connection_id,
@@ -230,22 +231,22 @@ impl TcpSession {
                 self.connection_id = Some(connection_id);
                 self.opened = true;
                 self.fulfil_open_success(peer_addr);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::OpenFailed { reason } => {
                 self.fulfil_open_failure(reason);
                 self.terminal = true;
                 self.ctx.suicide();
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::Received { payload } => {
                 self.events_to.tell(TcpSessionEvent::Received { payload });
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::SendAck { transmission_id } => {
                 self.events_to
                     .tell(TcpSessionEvent::SendAck { transmission_id });
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::SendNack {
                 transmission_id,
@@ -255,29 +256,29 @@ impl TcpSession {
                     transmission_id,
                     reason,
                 });
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::ReadSuspended => {
                 self.events_to.tell(TcpSessionEvent::ReadSuspended);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::ReadResumed => {
                 self.events_to.tell(TcpSessionEvent::ReadResumed);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::WriteSuspended => {
                 self.events_to.tell(TcpSessionEvent::WriteSuspended);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::WriteResumed => {
                 self.events_to.tell(TcpSessionEvent::WriteResumed);
-                Handled::Ok
+                Handled::OK
             }
             TcpSessionDriverEvent::Closed { reason } => {
                 self.events_to.tell(TcpSessionEvent::Closed { reason });
                 self.terminal = true;
                 self.ctx.suicide();
-                Handled::Ok
+                Handled::OK
             }
         }
     }
@@ -310,11 +311,11 @@ impl TcpSession {
 }
 
 impl ComponentLifecycle for TcpSession {
-    fn on_stop(&mut self) -> Handled {
+    fn on_stop(&mut self) -> HandlerResult {
         shutdown_session(self)
     }
 
-    fn on_kill(&mut self) -> Handled {
+    fn on_kill(&mut self) -> HandlerResult {
         shutdown_session(self)
     }
 }
@@ -322,7 +323,7 @@ impl ComponentLifecycle for TcpSession {
 impl Actor for TcpSession {
     type Message = TcpSessionMessage;
 
-    fn receive_local(&mut self, msg: Self::Message) -> Handled {
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             TcpSessionMessage::Request(request) => self.handle_request(request),
             TcpSessionMessage::DriverEvent(event) => self.handle_driver_event(event),
@@ -330,24 +331,25 @@ impl Actor for TcpSession {
     }
 }
 
-fn shutdown_session(session: &mut TcpSession) -> Handled {
+fn shutdown_session(session: &mut TcpSession) -> HandlerResult {
     let Some(connection_id) = session.connection_id.take() else {
-        return Handled::Ok;
+        return Handled::OK;
     };
     if session.terminal {
-        return Handled::Ok;
+        return Handled::OK;
     }
 
     let release = session.driver.release_tcp_session(connection_id);
-    Handled::block_on(session, move |async_self| async move {
-        match resolve_kfuture(release).await {
-            Ok(()) | Err(Error::UnknownConnection { .. }) => {}
-            Err(error) => {
-                warn!(
-                    async_self.log(),
-                    "failed to release TCP session {} during shutdown: {}", connection_id, error
-                );
-            }
-        }
+    Handled::block_on(session, move |_async_self| async move {
+        resolve_kfuture(release)
+            .await
+            .or_else(|error| match error {
+                Error::UnknownConnection { .. } => Ok(()),
+                error => Err(error),
+            })
+            .with_whatever_benign(|_| {
+                format!("failed to release TCP session {connection_id} during shutdown")
+            })?;
+        Handled::OK
     })
 }

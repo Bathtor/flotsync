@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 kompact = { workspace = true }
+snafu = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
