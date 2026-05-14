@@ -251,7 +251,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
     kill_component(&system, observer2);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -346,5 +346,5 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
     kill_component(&system, observer2);
     kill_component(&system, bridge2);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }

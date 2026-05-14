@@ -164,7 +164,7 @@ fn tcp_bridge_routes_outbound_session_lifecycle_and_flow_control_events_to_the_o
     kill_component(&system, session_probe2);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -296,7 +296,7 @@ fn tcp_listener_accepts_and_rejects_pending_sessions_and_listener_close_keeps_ac
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -372,5 +372,5 @@ fn dropping_pending_tcp_session_auto_rejects_the_connection() {
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }

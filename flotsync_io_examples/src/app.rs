@@ -1,6 +1,6 @@
 use clap::Args;
 use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
-use kompact::prelude::{Component, KompactConfig, KompactSystem};
+use kompact::prelude::{BlockingFutureExt, Component, KompactConfig, KompactSystem};
 use slog::{Drain, Level, Logger, o};
 use snafu::{FromString, Whatever, prelude::*};
 use std::{
@@ -61,7 +61,7 @@ impl ExampleRuntime {
 
         let mut config = KompactConfig::default();
         runtime_config.apply_to(&mut config);
-        let system = config.build().map_err(|error| {
+        let system = config.build().wait().map_err(|error| {
             Whatever::without_source(format!("failed to build Kompact system: {error}"))
         })?;
 
@@ -118,7 +118,7 @@ impl ExampleRuntime {
         drop(bridge_component);
         drop(driver_component);
 
-        match system.shutdown() {
+        match system.shutdown().wait() {
             Ok(()) => Ok(()),
             Err(message) => whatever!("failed to shut down Kompact system: {message}"),
         }

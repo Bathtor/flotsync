@@ -969,6 +969,7 @@ fn build_runtime_system(
     }
     let system = config
         .build()
+        .wait()
         .map_err(|error| RuntimeHostError::BuildSystem {
             message: error.to_string(),
         })?;

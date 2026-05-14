@@ -664,7 +664,7 @@ mod tests {
         drop(connection);
         kill_component(&system, component);
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -742,7 +742,7 @@ mod tests {
         drop(connection);
         kill_component(&system, component);
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -780,7 +780,7 @@ mod tests {
         }
 
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -829,7 +829,7 @@ mod tests {
         );
 
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -892,7 +892,7 @@ mod tests {
         drop(connection);
         kill_component(&system, component);
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -944,7 +944,7 @@ mod tests {
 
         drop(connection);
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]
@@ -1006,6 +1006,6 @@ mod tests {
 
         drop(connection);
         kill_component(&system, probe);
-        system.shutdown().expect("Kompact shutdown");
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 }

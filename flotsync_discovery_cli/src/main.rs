@@ -49,7 +49,7 @@ enum ActiveService {
 fn main() {
     let args = Args::parse();
 
-    let kompact_system = KompactConfig::default().build().expect("system");
+    let kompact_system = KompactConfig::default().build().wait().expect("system");
 
     let _active_service = if args.active {
         let instance_id = Uuid::new_v4();
@@ -87,7 +87,10 @@ fn main() {
     wait_for_enter();
 
     log::info!("Shutting down service...");
-    kompact_system.shutdown().expect("Kompact System shutdown");
+    kompact_system
+        .shutdown()
+        .wait()
+        .expect("Kompact System shutdown");
 }
 
 fn start_peer_announcement(
@@ -128,7 +131,7 @@ fn start_peer_announcement(
 
 fn shutdown_after_start_error(system: &KompactSystem, error: &str) -> ! {
     eprintln!("Could not start peer announcement service: {error}");
-    if let Err(shutdown_error) = system.clone().shutdown() {
+    if let Err(shutdown_error) = system.clone().shutdown().wait() {
         eprintln!("Could not shut down Kompact system after startup failure: {shutdown_error}");
     }
     std::process::exit(1)

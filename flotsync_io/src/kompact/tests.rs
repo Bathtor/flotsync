@@ -171,7 +171,7 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
     kill_component(&system, observer);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -215,7 +215,7 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
     kill_component(&system, observer);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -475,7 +475,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
 
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -602,7 +602,7 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
 
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -706,7 +706,7 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     kill_component(&system, event_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -810,7 +810,7 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -913,7 +913,7 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]
@@ -994,5 +994,5 @@ fn dropping_pending_tcp_session_rejects_the_connection() {
     kill_component(&system, listener_probe);
     kill_component(&system, bridge);
     kill_component(&system, driver_component);
-    system.shutdown().expect("Kompact shutdown");
+    system.shutdown().wait().expect("Kompact shutdown");
 }

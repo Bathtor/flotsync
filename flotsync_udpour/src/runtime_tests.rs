@@ -880,7 +880,7 @@ impl RuntimeHarness {
         kill_component(&self.system, self.observer);
         kill_component(&self.system, self.bridge);
         kill_component(&self.system, self.driver);
-        self.system.shutdown().expect("Kompact shutdown");
+        self.system.shutdown().wait().expect("Kompact shutdown");
     }
 }
 

@@ -70,7 +70,7 @@ pub fn shutdown_system_bounded(system: KompactSystem, timeout: Duration, force_k
         let _ = if force_kill {
             system.kill_system()
         } else {
-            system.shutdown()
+            system.shutdown().wait()
         };
         return;
     }
@@ -93,7 +93,7 @@ pub fn shutdown_system_bounded(system: KompactSystem, timeout: Duration, force_k
         let shutdown_result = if force_kill {
             system.kill_system()
         } else {
-            system.shutdown()
+            system.shutdown().wait()
         };
         let _ = shutdown_tx.send(shutdown_result);
     });
