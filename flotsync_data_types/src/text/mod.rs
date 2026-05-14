@@ -375,6 +375,31 @@ mod tests {
     }
 
     #[test]
+    fn linear_string_diff_reserves_indices_for_multi_grapheme_insert_hunks() {
+        let mut linear = LinearString::with_value("c".to_owned(), 1);
+        let mut update_ids = std::iter::once(2);
+
+        let diff = linear_diff(&linear, "abcde", &mut update_ids).unwrap();
+        assert!(!diff.is_empty());
+        assert_eq!(diff.num_operations(), 2);
+        assert_eq!(diff.num_insert_operations(), 2);
+
+        let insert_indices = diff
+            .clone()
+            .into_operations()
+            .into_iter()
+            .filter_map(|operation| match operation {
+                DataOperation::Insert { id, .. } => Some(id.index),
+                DataOperation::Delete { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(insert_indices, vec![0, 2]);
+
+        diff.apply_to(&mut linear).unwrap();
+        assert_eq!(linear.to_string(), "abcde");
+    }
+
+    #[test]
     fn diff_and_apply_small_changes() {
         // Do all possible transitions within each group.
         for (row, group) in SMALL_CHANGE_TEST_GROUPS.iter().enumerate() {
