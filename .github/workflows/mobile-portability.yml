@@ -55,6 +55,20 @@ jobs:
           version: 1.67.0
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure Android C toolchain
+        if: matrix.target == 'aarch64-linux-android'
+        run: |
+          ndk_bin="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "CC_aarch64_linux_android=$ndk_bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$ndk_bin/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ndk_bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+
+      - name: Install i686 C toolchain
+        if: matrix.target == 'i686-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-multilib libc6-dev-i386
+
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
