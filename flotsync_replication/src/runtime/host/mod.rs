@@ -38,7 +38,12 @@ use flotsync_io::{
 use flotsync_udpour::UDPourConfig;
 use flotsync_utils::{FutureTimeoutExt as _, TimeoutError};
 use futures_util::{FutureExt, future::BoxFuture};
-use kompact::{KompactLogger, prelude::*};
+use kompact::{
+    KompactLogger,
+    config::{ConfigError, ConfigLoadingError},
+    prelude::*,
+    runtime::KompactError,
+};
 use snafu::prelude::*;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -106,8 +111,11 @@ mod config_keys {
 /// Startup and shutdown failures for the internal delivery runtime host.
 #[derive(Debug, Snafu)]
 pub(crate) enum RuntimeHostError {
-    #[snafu(display("Failed to build Kompact system for the replication runtime: {message}"))]
-    BuildSystem { message: String },
+    #[snafu(display("Failed to build Kompact system for the replication runtime: {source}"))]
+    BuildSystem {
+        #[snafu(source(from(KompactError, RuntimeBuildSystemError::from)))]
+        source: RuntimeBuildSystemError,
+    },
     #[snafu(display("Invalid replication runtime host config at {key}: {message}"))]
     InvalidConfig { key: &'static str, message: String },
     #[snafu(display("Failed to start runtime component '{component}': {source}"))]
@@ -115,10 +123,10 @@ pub(crate) enum RuntimeHostError {
         component: &'static str,
         source: RuntimeControlError,
     },
-    #[snafu(display("Failed to stop runtime component '{component}': {message}"))]
+    #[snafu(display("Failed to stop runtime component '{component}': {source}"))]
     StopComponent {
         component: &'static str,
-        message: String,
+        source: RuntimeControlError,
     },
     #[snafu(display("Failed to connect runtime bridge UDP to '{component}': {message}"))]
     ConnectUdp {
@@ -139,12 +147,43 @@ pub(crate) enum RuntimeHostError {
     ConnectComponents { link: &'static str, message: String },
 }
 
+/// Send-safe wrapper around Kompact build failures.
+///
+/// This exists because `KompactError::Other` stores `Box<dyn Error>` without
+/// `Send + Sync`, while replication load errors eventually box runtime-host
+/// failures into the public send-safe `BoxError` shape.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum RuntimeBuildSystemError {
+    #[snafu(display("Kompact system state was poisoned"))]
+    Poisoned,
+    #[snafu(display("Kompact config loading failed: {source}"))]
+    ConfigLoading { source: ConfigLoadingError },
+    #[snafu(display("Kompact config lookup failed: {source}"))]
+    Config { source: ConfigError },
+    #[snafu(display("Kompact reported an opaque build error: {message}"))]
+    Other { message: String },
+}
+
+impl From<KompactError> for RuntimeBuildSystemError {
+    fn from(error: KompactError) -> Self {
+        match error {
+            KompactError::Poisoned => Self::Poisoned,
+            KompactError::ConfigLoadingError(source) => Self::ConfigLoading { source },
+            KompactError::ConfigError(source) => Self::Config { source },
+            KompactError::Other(source) => Self::Other {
+                message: source.to_string(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub(crate) enum RuntimeControlError {
     #[snafu(display("timed out: {source}"))]
     Timeout { source: TimeoutError },
-    #[snafu(display("control future failed: {source}"))]
+    #[snafu(display("Kompact control future failed: {source}"))]
     ControlFuture { source: BoxError },
     #[snafu(display("{message}"))]
     Failed { message: String },
@@ -357,13 +396,15 @@ where
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        system
-            .stop_notify(self)
-            .wait_timeout(control_timeout)
-            .map_err(|error| RuntimeHostError::StopComponent {
-                component: C::type_name(),
-                message: error.to_string(),
-            })
+        block_on(
+            system
+                .stop_notify(self)
+                .map(|result| result.boxed().context(ControlFutureSnafu))
+                .timeout_fold_err(control_timeout),
+        )
+        .context(StopComponentSnafu {
+            component: C::type_name(),
+        })
     }
 }
 
@@ -981,12 +1022,7 @@ async fn build_runtime_system(
         &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
         local_endpoint_bind_addr,
     );
-    let system = config
-        .build()
-        .await
-        .map_err(|error| RuntimeHostError::BuildSystem {
-            message: error.to_string(),
-        })?;
+    let system = config.build().await.context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem {
         system,
         local_endpoint_lease,
@@ -1002,12 +1038,7 @@ async fn build_runtime_system(
     if let Some(runtime_config_toml) = runtime_config_toml {
         config.load_config_str(runtime_config_toml);
     }
-    let system = config
-        .build()
-        .await
-        .map_err(|error| RuntimeHostError::BuildSystem {
-            message: error.to_string(),
-        })?;
+    let system = config.build().await.context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem { system })
 }
 

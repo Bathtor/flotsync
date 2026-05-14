@@ -1883,7 +1883,8 @@ dependencies = [
 [[package]]
 name = "kompact"
 version = "0.12.0"
-source = "git+https://github.com/kompics/kompact?branch=master#abf3fa776afd0cff182b82ff5f5f94712ab84b3a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b31ebc24c4bc38227d8d8bd61d077c344c6bf55caf4d11a1721c35c6108da711"
 dependencies = [
  "arc-swap",
  "async-std",
@@ -1904,11 +1905,13 @@ dependencies = [
  "num_cpus",
  "oncemutex",
  "owning_ref",
+ "regex",
  "rustc-hash 2.1.2",
  "rustc_version",
  "slog",
  "slog-async",
  "slog-term",
+ "snafu",
  "synchronoise",
  "toml",
  "uuid",
@@ -1917,7 +1920,8 @@ dependencies = [
 [[package]]
 name = "kompact-actor-derive"
 version = "0.12.0"
-source = "git+https://github.com/kompics/kompact?branch=master#abf3fa776afd0cff182b82ff5f5f94712ab84b3a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d3427e9ba8e455c179686f47d008711d161e95d30ced2548730ed0145703b3e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1927,7 +1931,8 @@ dependencies = [
 [[package]]
 name = "kompact-component-derive"
 version = "0.12.0"
-source = "git+https://github.com/kompics/kompact?branch=master#abf3fa776afd0cff182b82ff5f5f94712ab84b3a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03cdbb481ae78f009ea384a3523c08d71db0feac5fd82d421b2a8471143268ce"
 dependencies = [
  "proc-macro2",
  "quote",

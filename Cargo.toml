@@ -27,6 +27,3 @@ uuid = "1"
 kompact = "0.12"
 log = "0.4"
 sqlx = { version = "0.9.0-alpha.1", default-features = false, features = ["sqlite", "runtime-async-std"] }
-
-[patch.crates-io]
-kompact = { git = "https://github.com/kompics/kompact", branch = "master" }
