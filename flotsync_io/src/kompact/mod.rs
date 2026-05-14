@@ -6,7 +6,7 @@
 
 use crate::errors::{Error, Result};
 use ::kompact::{config_keys::system, prelude::*};
-use std::{sync::mpsc, thread, time::Duration};
+use std::{thread, time::Duration};
 
 mod bridge;
 mod driver_component;
@@ -58,20 +58,20 @@ pub(super) async fn resolve_kfuture<T: Send>(future: KFuture<Result<T>>) -> Resu
 ///
 /// When `force_kill` is `false`, the helper performs graceful shutdown via
 /// [`KompactSystem::shutdown`]. When `force_kill` is `true`, it uses
-/// [`KompactSystem::kill_system`] instead. In both cases the helper logs the
-/// start and successful completion.
+/// [`KompactSystem::kill_system`] instead, which is synchronous and has no
+/// upstream timeout future. In both cases the helper logs the start and
+/// successful completion.
 ///
 /// # Panics
 ///
-/// Panics if shutdown fails, if the shutdown worker disconnects, or if shutdown does not finish
-/// within `timeout`.
+/// Panics if shutdown fails or if graceful shutdown does not finish within `timeout`.
 pub fn shutdown_system_bounded(system: KompactSystem, timeout: Duration, force_kill: bool) {
     if thread::panicking() {
-        let _ = if force_kill {
-            system.kill_system()
+        if force_kill {
+            let _ = system.kill_system();
         } else {
-            system.shutdown().wait()
-        };
+            let _ = system.shutdown().wait_timeout(timeout);
+        }
         return;
     }
 
@@ -84,43 +84,37 @@ pub fn shutdown_system_bounded(system: KompactSystem, timeout: Duration, force_k
     } else {
         "graceful shutdown"
     };
-    log::debug!(
-        "Starting {shutdown_kind} for Kompact system '{system_label}' with timeout {timeout:?}."
-    );
+    if force_kill {
+        log::debug!("Starting {shutdown_kind} for Kompact system '{system_label}'.");
+    } else {
+        log::debug!(
+            "Starting {shutdown_kind} for Kompact system '{system_label}' with timeout {timeout:?}."
+        );
+    }
 
-    let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let shutdown_result = if force_kill {
-            system.kill_system()
-        } else {
-            system.shutdown().wait()
-        };
-        let _ = shutdown_tx.send(shutdown_result);
-    });
+    let shutdown_result = if force_kill {
+        system.kill_system()
+    } else {
+        system
+            .shutdown()
+            .wait_timeout(timeout)
+            .unwrap_or_else(|error| {
+                log::error!(
+                    "Timed out during {shutdown_kind} for Kompact system '{system_label}' after {timeout:?}: {error}."
+                );
+                panic!(
+                    "timed out during {shutdown_kind} for Kompact system '{system_label}' after {timeout:?}: {error}"
+                );
+            })
+    };
 
-    match shutdown_rx.recv_timeout(timeout) {
-        Ok(Ok(())) => {
+    match shutdown_result {
+        Ok(()) => {
             log::debug!("Completed {shutdown_kind} for Kompact system '{system_label}'.");
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             log::error!("Failed {shutdown_kind} for Kompact system '{system_label}': {error}");
             panic!("failed {shutdown_kind} for Kompact system '{system_label}': {error}");
-        }
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            log::error!(
-                "Timed out during {shutdown_kind} for Kompact system '{system_label}' after {timeout:?}."
-            );
-            panic!(
-                "timed out during {shutdown_kind} for Kompact system '{system_label}' after {timeout:?}"
-            );
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            log::error!(
-                "Shutdown thread disconnected unexpectedly during {shutdown_kind} for Kompact system '{system_label}'."
-            );
-            panic!(
-                "shutdown thread disconnected unexpectedly during {shutdown_kind} for Kompact system '{system_label}'"
-            );
         }
     }
 }

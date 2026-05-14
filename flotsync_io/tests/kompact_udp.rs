@@ -7,7 +7,6 @@ use flotsync_io::{
         UdpSendResultProbe,
         build_test_kompact_system_with,
         enable_bind_reuse_address,
-        init_test_logger,
         kill_component,
         recv_until,
         reserve_sockets,
@@ -24,8 +23,6 @@ use std::{sync::mpsc, time::Duration};
     reason = "This Kompact integration test verifies shared UDP indications and private send acknowledgements end to end."
 )]
 fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
-    init_test_logger();
-
     let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
@@ -256,8 +253,6 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
 
 #[test]
 fn udp_bridge_shutdown_releases_owned_socket_bindings() {
-    init_test_logger();
-
     let mut socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));

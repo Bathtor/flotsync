@@ -1,4 +1,4 @@
-use super::RuntimeHostError;
+use super::{BindLocalEndpointSnafu, ControlFutureSnafu, RuntimeControlError, RuntimeHostError};
 use flotsync_io::prelude::{
     SocketId,
     UdpIndication,
@@ -7,8 +7,11 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
+use flotsync_utils::FutureTimeoutExt as _;
+use futures_util::FutureExt as _;
 use kompact::prelude::*;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use snafu::ResultExt;
+use std::{error::Error as StdError, net::SocketAddr, sync::Arc, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LocalEndpointBinding {
@@ -18,7 +21,7 @@ pub(super) struct LocalEndpointBinding {
 
 #[derive(Debug)]
 pub(super) enum LocalEndpointManagerMessage {
-    EnsureBound(Ask<(), Result<LocalEndpointBinding, RuntimeHostError>>),
+    EnsureBound(Ask<(), Result<LocalEndpointBinding, RuntimeControlError>>),
 }
 
 /// Single local delivery-endpoint owner for the current runtime slice.
@@ -84,9 +87,9 @@ impl Require<UdpPort> for LocalEndpointManager {
                     reason,
                 },
             ) if request_id == indicated_request_id => {
-                let _ = promise.fulfil(Err(RuntimeHostError::BindLocalEndpoint {
-                    message: format!("bind at {local_addr} failed: {reason:?}"),
-                }));
+                let _ = promise.fulfil(Err(RuntimeControlError::failed(format!(
+                    "bind at {local_addr} failed: {reason:?}"
+                ))));
                 LocalEndpointManagerState::Unbound
             }
             (state, _) => state,
@@ -115,9 +118,9 @@ impl Actor for LocalEndpointManager {
                         });
                     }
                     LocalEndpointManagerState::Binding { .. } => {
-                        let _ = promise.fulfil(Err(RuntimeHostError::BindLocalEndpoint {
-                            message: "local endpoint bind already in progress".to_owned(),
-                        }));
+                        let _ = promise.fulfil(Err(RuntimeControlError::failed(
+                            "local endpoint bind already in progress",
+                        )));
                     }
                     LocalEndpointManagerState::Bound(binding) => {
                         let _ = promise.fulfil(Ok(*binding));
@@ -133,12 +136,17 @@ enum LocalEndpointManagerState {
     Unbound,
     Binding {
         request_id: UdpOpenRequestId,
-        promise: KPromise<Result<LocalEndpointBinding, RuntimeHostError>>,
+        promise: KPromise<Result<LocalEndpointBinding, RuntimeControlError>>,
     },
     Bound(LocalEndpointBinding),
 }
 
-pub(super) fn ensure_local_endpoint_bound(
+/// Ask the local endpoint manager to bind its configured UDP endpoint.
+///
+/// The caller must pass a live component whose actor ref can still be upgraded
+/// to a strong ref. `control_timeout` bounds the whole ask/response exchange,
+/// including the UDP bind indication that fulfils the manager promise.
+pub(super) async fn ensure_local_endpoint_bound(
     local_endpoint_manager: &Arc<Component<LocalEndpointManager>>,
     control_timeout: Duration,
 ) -> Result<LocalEndpointBinding, RuntimeHostError> {
@@ -149,8 +157,17 @@ pub(super) fn ensure_local_endpoint_bound(
     let future = local_endpoint_ref
         .ask_with(|promise| LocalEndpointManagerMessage::EnsureBound(Ask::new(promise, ())));
     future
-        .wait_timeout(control_timeout)
-        .map_err(|error| RuntimeHostError::BindLocalEndpoint {
-            message: format!("{error:?}"),
-        })?
+        .map(flatten_local_endpoint_ask_result)
+        .timeout_fold_err(control_timeout)
+        .await
+        .context(BindLocalEndpointSnafu)
+}
+
+fn flatten_local_endpoint_ask_result<E>(
+    result: Result<Result<LocalEndpointBinding, RuntimeControlError>, E>,
+) -> Result<LocalEndpointBinding, RuntimeControlError>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    result.boxed().context(ControlFutureSnafu)?
 }

@@ -28,7 +28,6 @@ use crate::{
         build_test_kompact_system,
         build_test_kompact_system_with,
         enable_bind_reuse_address,
-        init_test_logger,
         kill_component,
         localhost,
         recv_until,
@@ -125,8 +124,6 @@ impl Actor for TaggedSessionEventProbe {
 
 #[test]
 fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
-    init_test_logger();
-
     let (_reservation, reserved_addr) = hold_reusable_udp_reservation();
 
     let system = build_test_kompact_system();
@@ -224,8 +221,6 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
     reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
 )]
 fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
-    init_test_logger();
-
     let (_reservation, reserved_addr) = hold_reusable_tcp_reservation();
 
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
@@ -275,8 +270,6 @@ fn tcp_listener_reuse_config_allows_binding_to_a_reserved_port() {
     reason = "This Kompact integration test verifies multi-recipient UDP bridge routing end to end."
 )]
 fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
-    init_test_logger();
-
     let mut socket_lease =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
@@ -485,8 +478,6 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
     reason = "This Kompact integration test verifies UDP configuration fan-out end to end."
 )]
 fn udp_bridge_broadcasts_socket_configuration_indications() {
-    init_test_logger();
-
     let mut socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -607,8 +598,6 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
 
 #[test]
 fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
-    init_test_logger();
-
     let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let listener =
         bind_reserved_tcp_listener(&listener_lease, 0).expect("bind reserved TCP listener");
@@ -715,8 +704,6 @@ fn tcp_bridge_opens_sessions_and_routes_events_to_the_session_recipient() {
     reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
 )]
 fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
-    init_test_logger();
-
     let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -819,8 +806,6 @@ fn tcp_listener_exposes_pending_sessions_before_session_io_begins() {
     reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
 )]
 fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
-    init_test_logger();
-
     let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
@@ -922,8 +907,6 @@ fn tcp_pending_session_accept_tagged_forwards_runtime_tagged_events() {
     reason = "The receive helper filters to one event variant and the fallback keeps assertion diagnostics precise."
 )]
 fn dropping_pending_tcp_session_rejects_the_connection() {
-    init_test_logger();
-
     let mut listener_lease = reserve_sockets(&[ReservedSocketKind::TcpListener]);
     let system = build_test_kompact_system_with(enable_bind_reuse_address);
     let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));

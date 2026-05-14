@@ -8,7 +8,7 @@ use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
     GroupMemberships,
     SharedGroupMemberships,
-    api::{MemberIdentity, ReplicationEventListener, ReplicationStore},
+    api::{BoxError, MemberIdentity, ReplicationEventListener, ReplicationStore},
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
@@ -27,7 +27,6 @@ use crate::{
 use flotsync_io::test_support::{
     ReservedSocketKind,
     ReservedSocketLease,
-    build_test_kompact_system_with,
     enable_bind_reuse_address,
     reserve_sockets,
     set_test_system_label,
@@ -37,6 +36,8 @@ use flotsync_io::{
     prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
 use flotsync_udpour::UDPourConfig;
+use flotsync_utils::{FutureTimeoutExt as _, TimeoutError};
+use futures_util::{FutureExt, future::BoxFuture};
 use kompact::{KompactLogger, prelude::*};
 use snafu::prelude::*;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
@@ -53,7 +54,7 @@ use discovery::{
     PreconfiguredPeerRoutesConfig,
     PreconfiguredPeerRoutesMessage,
 };
-use local_endpoint::{LocalEndpointManager, ensure_local_endpoint_bound};
+use local_endpoint::LocalEndpointManager;
 
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
@@ -109,10 +110,10 @@ pub(crate) enum RuntimeHostError {
     BuildSystem { message: String },
     #[snafu(display("Invalid replication runtime host config at {key}: {message}"))]
     InvalidConfig { key: &'static str, message: String },
-    #[snafu(display("Failed to start runtime component '{component}': {message}"))]
+    #[snafu(display("Failed to start runtime component '{component}': {source}"))]
     StartComponent {
         component: &'static str,
-        message: String,
+        source: RuntimeControlError,
     },
     #[snafu(display("Failed to stop runtime component '{component}': {message}"))]
     StopComponent {
@@ -124,10 +125,43 @@ pub(crate) enum RuntimeHostError {
         component: &'static str,
         message: String,
     },
-    #[snafu(display("Failed to bind the runtime local delivery endpoint: {message}"))]
-    BindLocalEndpoint { message: String },
+    #[snafu(display("Failed to bind the runtime local delivery endpoint: {source}"))]
+    BindLocalEndpoint { source: RuntimeControlError },
+    #[snafu(display(
+        "Failed to bind the runtime local delivery endpoint: {source}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
+    ))]
+    BindLocalEndpointInSystem {
+        source: RuntimeControlError,
+        configured_bind_addr: SocketAddr,
+        system_label: String,
+    },
     #[snafu(display("Failed to connect runtime components for {link}: {message}"))]
     ConnectComponents { link: &'static str, message: String },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum RuntimeControlError {
+    #[snafu(display("timed out: {source}"))]
+    Timeout { source: TimeoutError },
+    #[snafu(display("control future failed: {source}"))]
+    ControlFuture { source: BoxError },
+    #[snafu(display("{message}"))]
+    Failed { message: String },
+}
+
+impl RuntimeControlError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
+        }
+    }
+}
+
+impl From<TimeoutError> for RuntimeControlError {
+    fn from(source: TimeoutError) -> Self {
+        Self::Timeout { source }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,11 +234,11 @@ pub(crate) struct DeliveryRuntimeHost {
 
 /// Type-erased lifecycle operations for one concrete Kompact component.
 trait RuntimeLifecycleComponent: Send + Sync {
-    fn start(
-        &self,
-        system: &KompactSystem,
+    fn start<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError>;
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>>;
 
     fn stop(
         &self,
@@ -223,13 +257,13 @@ trait ComponentTopology {
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent>;
 
     /// Start every lifecycle node in the order exposed by `nodes`.
-    fn start_all(
+    async fn start_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
         for component in self.nodes() {
-            component.start(system, control_timeout)?;
+            component.start(system, control_timeout).await?;
         }
         Ok(())
     }
@@ -275,7 +309,7 @@ fn describe_component_connect_error(error: &TryDualLockError) -> &'static str {
     }
 }
 
-fn connect_udp_component<C>(
+async fn connect_udp_component<C>(
     udp_connect_handle: &IoBridgeHandle,
     component: &Arc<Component<C>>,
 ) -> Result<(), RuntimeHostError>
@@ -287,30 +321,35 @@ where
         + Sized
         + 'static,
 {
-    block_on(udp_connect_handle.connect_udp(component)).map_err(|error| {
-        RuntimeHostError::ConnectUdp {
+    udp_connect_handle
+        .connect_udp(component)
+        .await
+        .map_err(|error| RuntimeHostError::ConnectUdp {
             component: C::type_name(),
             message: error.to_string(),
-        }
-    })
+        })
 }
 
 impl<C> RuntimeLifecycleComponent for Arc<Component<C>>
 where
     C: ComponentDefinition + ComponentLifecycle + Sized + 'static,
 {
-    fn start(
-        &self,
-        system: &KompactSystem,
+    fn start<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError> {
-        system
-            .start_notify(self)
-            .wait_timeout(control_timeout)
-            .map_err(|error| RuntimeHostError::StartComponent {
-                component: C::type_name(),
-                message: error.to_string(),
-            })
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
+        async move {
+            system
+                .start_notify(self)
+                .map(|result| result.boxed().context(ControlFutureSnafu))
+                .timeout_fold_err(control_timeout)
+                .await
+                .context(StartComponentSnafu {
+                    component: C::type_name(),
+                })
+        }
+        .boxed()
     }
 
     fn stop(
@@ -348,16 +387,15 @@ impl IoTopology {
         Self { driver, bridge }
     }
 
-    /// Connect the already-started IO bridge to every UDP consumer in the runtime.
-    fn connect_udp_ports(
+    async fn connect_udp_ports(
         &self,
         transport: &TransportTopology,
         discovery: &DiscoveryTopology,
     ) -> Result<(), RuntimeHostError> {
         let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
-        connect_udp_component(&udp_connect_handle, transport.route_transport_manager())?;
-        connect_udp_component(&udp_connect_handle, discovery.local_endpoint_manager())?;
-        connect_udp_component(&udp_connect_handle, discovery.route_discovery_provider())
+        connect_udp_component(&udp_connect_handle, transport.route_transport_manager()).await?;
+        connect_udp_component(&udp_connect_handle, discovery.local_endpoint_manager()).await?;
+        connect_udp_component(&udp_connect_handle, discovery.route_discovery_provider()).await
     }
 }
 
@@ -676,18 +714,19 @@ impl RuntimeTopology {
         self.runtime.connect_delivery(&self.delivery)
     }
 
-    fn start_all(
+    async fn start_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.io.start_all(system, control_timeout)?;
+        self.io.start_all(system, control_timeout).await?;
         self.io
-            .connect_udp_ports(&self.transport, &self.discovery)?;
-        self.transport.start_all(system, control_timeout)?;
-        self.delivery.start_all(system, control_timeout)?;
-        self.discovery.start_all(system, control_timeout)?;
-        self.runtime.start_all(system, control_timeout)?;
+            .connect_udp_ports(&self.transport, &self.discovery)
+            .await?;
+        self.transport.start_all(system, control_timeout).await?;
+        self.delivery.start_all(system, control_timeout).await?;
+        self.discovery.start_all(system, control_timeout).await?;
+        self.runtime.start_all(system, control_timeout).await?;
         Ok(())
     }
 
@@ -753,19 +792,9 @@ impl DeliveryRuntimeHost {
         &self.topology().runtime.runtime_component
     }
 
-    /// Start one new delivery runtime host for a single local member.
-    #[cfg(test)]
-    pub(crate) fn start(
-        local_member: &MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-    ) -> Result<Self, RuntimeHostError> {
-        Self::start_with_runtime_config_toml(local_member, store, listener, None)
-    }
-
     /// Start one new delivery runtime host with an additional in-memory TOML
     /// config fragment merged into the Kompact runtime config.
-    pub(crate) fn start_with_runtime_config_toml(
+    pub(crate) async fn start_with_runtime_config_toml(
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
@@ -778,16 +807,17 @@ impl DeliveryRuntimeHost {
             runtime_config_toml,
             PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound,
         )
+        .await
     }
 
-    fn start_with_options(
+    async fn start_with_options(
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
         runtime_config_toml: Option<&str>,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Result<Self, RuntimeHostError> {
-        let built_system = build_runtime_system(runtime_config_toml)?;
+        let built_system = build_runtime_system(runtime_config_toml).await?;
         let system = built_system.system.clone();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
@@ -803,11 +833,14 @@ impl DeliveryRuntimeHost {
             route_publish_mode,
         );
         topology.connect_all()?;
-        topology.start_all(&system, host_config.control_timeout)?;
-        let local_endpoint = ensure_local_endpoint_bound(
+        topology
+            .start_all(&system, host_config.control_timeout)
+            .await?;
+        let local_endpoint = local_endpoint::ensure_local_endpoint_bound(
             &topology.discovery.local_endpoint_manager,
             host_config.control_timeout,
         )
+        .await
         .map_err(|error| {
             annotate_local_endpoint_bind_error(&system, host_config.local_endpoint_bind_addr, error)
         })?;
@@ -831,7 +864,7 @@ impl DeliveryRuntimeHost {
     }
 
     #[cfg(test)]
-    pub(super) fn start_with_route_publish_mode_for_test(
+    pub(super) async fn start_with_route_publish_mode_for_test(
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
@@ -845,6 +878,7 @@ impl DeliveryRuntimeHost {
             runtime_config_toml,
             route_publish_mode,
         )
+        .await
     }
 
     pub(crate) fn shutdown(&mut self) {
@@ -931,27 +965,28 @@ impl Drop for DeliveryRuntimeHost {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "The test and production cfg variants share a Result-returning interface."
-)]
-fn build_runtime_system(
+async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let local_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let local_endpoint_bind_addr = local_endpoint_lease.addr(0).to_string();
-    let system = build_test_kompact_system_with(|config| {
-        set_test_system_label(config, "replication-runtime-host-test-system");
-        enable_bind_reuse_address(config);
-        configure_replication_runtime(config);
-        if let Some(runtime_config_toml) = runtime_config_toml {
-            config.load_config_str(runtime_config_toml);
-        }
-        config.set_config_value(
-            &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
-            local_endpoint_bind_addr,
-        );
-    });
+    let mut config = kompact::test_support::test_kompact_config();
+    set_test_system_label(&mut config, "replication-runtime-host-test-system");
+    enable_bind_reuse_address(&mut config);
+    configure_replication_runtime(&mut config);
+    if let Some(runtime_config_toml) = runtime_config_toml {
+        config.load_config_str(runtime_config_toml);
+    }
+    config.set_config_value(
+        &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
+        local_endpoint_bind_addr,
+    );
+    let system = config
+        .build()
+        .await
+        .map_err(|error| RuntimeHostError::BuildSystem {
+            message: error.to_string(),
+        })?;
     Ok(BuiltRuntimeSystem {
         system,
         local_endpoint_lease,
@@ -959,7 +994,7 @@ fn build_runtime_system(
 }
 
 #[cfg(not(test))]
-fn build_runtime_system(
+async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
     let mut config = KompactConfig::default();
@@ -969,7 +1004,7 @@ fn build_runtime_system(
     }
     let system = config
         .build()
-        .wait()
+        .await
         .map_err(|error| RuntimeHostError::BuildSystem {
             message: error.to_string(),
         })?;
@@ -984,9 +1019,9 @@ fn release_reserved_runtime_local_endpoint_binding(
     let reserved_addr = local_endpoint_lease.addr(0);
     if reserved_addr != local_addr {
         return Err(RuntimeHostError::BindLocalEndpoint {
-            message: format!(
+            source: RuntimeControlError::failed(format!(
                 "runtime host bound local endpoint at {local_addr}, but the reserved test socket expected {reserved_addr}"
-            ),
+            )),
         });
     }
     local_endpoint_lease.activate_live_binding(0);
@@ -1008,17 +1043,17 @@ fn annotate_local_endpoint_bind_error(
     configured_bind_addr: SocketAddr,
     error: RuntimeHostError,
 ) -> RuntimeHostError {
-    let RuntimeHostError::BindLocalEndpoint { message } = error else {
+    let RuntimeHostError::BindLocalEndpoint { source } = error else {
         return error;
     };
     let system_label = system
         .config()
         .read_or_default(&kompact::config_keys::system::LABEL)
         .unwrap_or_else(|_| String::from("<unlabelled-runtime-host-system>"));
-    RuntimeHostError::BindLocalEndpoint {
-        message: format!(
-            "{message}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
-        ),
+    RuntimeHostError::BindLocalEndpointInSystem {
+        source,
+        configured_bind_addr,
+        system_label,
     }
 }
 

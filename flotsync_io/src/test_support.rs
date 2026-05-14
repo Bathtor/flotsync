@@ -33,6 +33,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub use kompact::test_support::{build_test_kompact_system, init_test_logger};
+
 /// Shared timeout used by the crate's synchronous test wait helpers.
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -256,21 +258,6 @@ pub fn bind_reserved_udp_socket(
     configure_bind_reuse(&socket)?;
     socket.bind(&SockAddr::from(reserved.addr))?;
     Ok(socket.into())
-}
-
-/// Installs the captured test logger once for both the `log` facade and Kompact's `slog` logger.
-///
-/// # Panics
-///
-/// Panics if another `log` facade logger has already been installed.
-pub fn init_test_logger() {
-    kompact::test_support::init_test_logger();
-}
-
-/// Builds a Kompact system whose logs follow libtest output capture.
-#[must_use]
-pub fn build_test_kompact_system() -> KompactSystem {
-    build_test_kompact_system_with(|_| {})
 }
 
 /// Builds a Kompact system whose logs follow libtest output capture after applying extra config.

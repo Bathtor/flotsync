@@ -1,6 +1,5 @@
 # Agent Instructions
 
-- Always assume I made manual changes since the last time you ran. Be careful not to accidentally overwrite those changes by regenerating from outdated state.
 - Use "durable" only for explicit persistence/crash-survival guarantees. Do not use it as a general synonym for local, stored, applied, persisted, observed, or current state.
 
 ## Rust Rules

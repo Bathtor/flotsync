@@ -569,7 +569,6 @@ mod tests {
     use super::*;
     use flotsync_io::test_support::{
         build_test_kompact_system,
-        init_test_logger,
         kill_component,
         recv_until,
         start_component,
@@ -617,8 +616,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_binds_and_enables_broadcast() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
@@ -669,8 +666,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_deduplicates_targets_and_uses_configured_instance_id() {
-        init_test_logger();
-
         let options = Options::DEFAULT
             .with_instance_id(
                 Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("valid UUID"),
@@ -747,8 +742,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_closes_socket_on_kill() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
@@ -785,8 +778,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_interrupts_startup_waiter_on_kill() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
@@ -834,8 +825,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_reports_startup_success_after_broadcast_is_enabled() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
@@ -897,8 +886,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_reports_bind_failure_to_startup_waiter() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
@@ -949,8 +936,6 @@ mod tests {
 
     #[test]
     fn peer_announcement_component_reports_configure_failure_to_startup_waiter() {
-        init_test_logger();
-
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));

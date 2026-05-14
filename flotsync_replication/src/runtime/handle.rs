@@ -1,7 +1,4 @@
-use super::{
-    ReplicationRuntimeMessage,
-    host::{DeliveryRuntimeHost, RuntimeHostError},
-};
+use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
 use crate::api::{
     ApiError,
     ApiResult,
@@ -27,7 +24,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
 use snafu::prelude::*;
-use std::{any::Any, sync::Arc, thread};
+use std::sync::Arc;
 
 #[cfg(test)]
 use super::{
@@ -132,11 +129,17 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let host = start_delivery_runtime_host(local_member, store, listener, runtime_config_toml)
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let host = DeliveryRuntimeHost::start_with_runtime_config_toml(
+        &local_member,
+        store,
+        listener,
+        runtime_config_toml,
+    )
+    .await
+    .boxed()
+    .context(RuntimeSnafu {
+        application_id: application_id.clone(),
+    })?;
     let runtime_component = host.runtime_component().clone();
     let runtime_ref = runtime_component
         .actor_ref()
@@ -149,51 +152,6 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         host,
         _config: config,
     }))
-}
-
-fn start_delivery_runtime_host(
-    local_member: crate::api::MemberIdentity,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    runtime_config_toml: Option<&str>,
-) -> Result<DeliveryRuntimeHost, RuntimeHostError> {
-    let runtime_config_toml = runtime_config_toml.map(str::to_owned);
-    // Temporary workaround for https://github.com/kompics/kompact/issues/223:
-    // Kompact startup currently enters a futures-executor LocalPool internally.
-    // Run it outside the caller's async executor until Kompact has an
-    // async-friendly startup path or clearer non-panicking failure mode.
-    let start_thread = thread::Builder::new()
-        .name("flotsync-runtime-start".to_owned())
-        .spawn(move || {
-            DeliveryRuntimeHost::start_with_runtime_config_toml(
-                &local_member,
-                store,
-                listener,
-                runtime_config_toml.as_deref(),
-            )
-        })
-        .map_err(|source| RuntimeHostError::BuildSystem {
-            message: format!("failed to spawn runtime startup thread: {source}"),
-        })?;
-
-    start_thread
-        .join()
-        .map_err(|payload| RuntimeHostError::BuildSystem {
-            message: format!(
-                "runtime startup thread panicked: {}",
-                panic_payload_message(payload.as_ref())
-            ),
-        })?
-}
-
-fn panic_payload_message(payload: &(dyn Any + Send + 'static)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_owned()
-    }
 }
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
