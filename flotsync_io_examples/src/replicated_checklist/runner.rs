@@ -779,6 +779,8 @@ mod tests {
 
     #[test]
     fn checklist_rename_with_two_insert_hunks_syncs() {
+        kompact::test_support::init_test_logger();
+
         let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
         let group_id = GroupId(Uuid::from_u128(0x45d0));
         let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));

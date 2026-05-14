@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, marker::PhantomData, pin::Pin};
+use std::{fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
 
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
@@ -8,10 +8,46 @@ pub mod debugging;
 pub mod err;
 pub mod testing;
 
+pub use async_std::future::TimeoutError;
 pub use claimable_promise::KClaimablePromise;
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Stable timeout extension for futures.
+///
+/// This mirrors async-std's unstable `FutureExt::timeout` method shape while
+/// delegating to its stable free function.
+pub trait FutureTimeoutExt: Future + Sized {
+    /// Return a future that completes with this future's output or a timeout.
+    #[must_use]
+    fn timeout(
+        self,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Self::Output, TimeoutError>> {
+        async_std::future::timeout(timeout, self)
+    }
+
+    /// Return a future that completes with this fallible future's result or a timeout error.
+    ///
+    /// The timeout error is converted into the future's own error type, which
+    /// keeps callers from having to unpack nested timeout and operation errors.
+    #[must_use]
+    fn timeout_fold_err<T, E>(self, timeout: Duration) -> impl Future<Output = Result<T, E>>
+    where
+        Self: Future<Output = Result<T, E>>,
+        E: From<TimeoutError>,
+    {
+        async move {
+            match async_std::future::timeout(timeout, self).await {
+                Ok(result) => result,
+                Err(error) => Err(E::from(error)),
+            }
+        }
+    }
+}
+
+impl<F> FutureTimeoutExt for F where F: Future {}
 
 /// Non-owning phantom marker for generic parameters that affect a type's API
 /// surface but are neither stored nor dropped by that type.

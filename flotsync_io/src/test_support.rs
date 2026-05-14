@@ -9,20 +9,14 @@ use crate::{
     socket_support::{configure_bind_reuse, socket_domain},
 };
 use futures_util::FutureExt;
-use kompact::{
-    KompactLogger,
-    config_keys::system,
-    default_components::install_manual_timer,
-    prelude::*,
-};
-use slog::{Drain, Logger, PushFnValue, o};
+use kompact::{config_keys::system, default_components::install_manual_timer, prelude::*};
 use socket2::{Protocol, SockAddr, Socket, Type};
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     fmt::{Debug, Display},
     future::Future,
-    io::{self, Write},
+    io,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     pin::pin,
     process::Command,
@@ -32,13 +26,14 @@ use std::{
         LazyLock,
         Mutex,
         MutexGuard,
-        OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
     thread::{self, ThreadId},
     time::{Duration, Instant},
 };
+
+pub use kompact::test_support::{build_test_kompact_system, init_test_logger};
 
 /// Shared timeout used by the crate's synchronous test wait helpers.
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -265,29 +260,6 @@ pub fn bind_reserved_udp_socket(
     Ok(socket.into())
 }
 
-/// Installs the captured test logger once for both the `log` facade and Kompact's `slog` logger.
-///
-/// # Panics
-///
-/// Panics if the `slog` to `log` bridge cannot be installed.
-pub fn init_test_logger() {
-    static LOGGER: OnceLock<()> = OnceLock::new();
-    static LOGGER_GUARD: OnceLock<slog_scope::GlobalLoggerGuard> = OnceLock::new();
-
-    LOGGER.get_or_init(|| {
-        let guard = slog_scope::set_global_logger(captured_log_logger());
-        let _ = LOGGER_GUARD.set(guard);
-        slog_stdlog::init().expect("install slog/log bridge");
-        log::set_max_level(log::LevelFilter::Trace);
-    });
-}
-
-/// Builds a Kompact system whose logs follow libtest output capture.
-#[must_use]
-pub fn build_test_kompact_system() -> KompactSystem {
-    build_test_kompact_system_with(|_| {})
-}
-
 /// Builds a Kompact system whose logs follow libtest output capture after applying extra config.
 ///
 /// # Panics
@@ -298,8 +270,8 @@ pub fn build_test_kompact_system_with(configure: impl FnOnce(&mut KompactConfig)
 
     let mut config = KompactConfig::default();
     configure(&mut config);
-    config.logger(captured_kompact_logger());
-    config.build().expect("build KompactSystem")
+    kompact::test_support::configure_test_logger(&mut config);
+    config.build().wait().expect("build KompactSystem")
 }
 
 /// Builds a Kompact system with a manually-driven timer after applying extra config.
@@ -315,36 +287,9 @@ pub fn build_test_kompact_system_with_manual_timer(
     let mut config = KompactConfig::default();
     configure(&mut config);
     let timer = install_manual_timer(&mut config);
-    config.logger(captured_kompact_logger());
-    let system = config.build().expect("build KompactSystem");
+    kompact::test_support::configure_test_logger(&mut config);
+    let system = config.build().wait().expect("build KompactSystem");
     (system, timer)
-}
-
-fn captured_log_logger() -> Logger {
-    let decorator = slog_term::PlainSyncDecorator::new(CapturedOutput::default());
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    Logger::root(
-        drain,
-        o!(
-            "location" => PushFnValue(|record: &slog::Record<'_>, serializer| {
-                serializer.emit(format_args!("{}:{}", record.file(), record.line()))
-            })
-        ),
-    )
-}
-
-fn captured_kompact_logger() -> KompactLogger {
-    let decorator = slog_term::PlainSyncDecorator::new(CapturedOutput::default());
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
-    let drain = slog_async::Async::new(drain).chan_size(1024).build().fuse();
-    Logger::root_typed(
-        Arc::new(drain),
-        o!(
-            "location" => PushFnValue(|record: &slog::Record<'_>, serializer| {
-                serializer.emit(format_args!("{}:{}", record.file(), record.line()))
-            })
-        ),
-    )
 }
 
 /// Process-local broker for reservation sockets used by one test binary.
@@ -1778,48 +1723,5 @@ impl Actor for TcpListenerEventProbe {
             .send(msg)
             .expect("TCP listener event receiver must stay live during integration tests");
         Handled::OK
-    }
-}
-
-/// Writer that routes test log output through libtest's captured stdout path.
-#[derive(Default)]
-struct CapturedOutput {
-    pending: Vec<u8>,
-}
-
-impl CapturedOutput {
-    fn emit_complete_lines(&mut self) {
-        while let Some(newline_index) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let line: Vec<u8> = self.pending.drain(..=newline_index).collect();
-            Self::emit_bytes(&line);
-        }
-    }
-
-    fn emit_bytes(bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
-        print!("{text}");
-        let _ = io::stdout().flush();
-    }
-}
-
-impl Write for CapturedOutput {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.pending.extend_from_slice(buf);
-        self.emit_complete_lines();
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        if !self.pending.is_empty() {
-            let remaining = std::mem::take(&mut self.pending);
-            Self::emit_bytes(&remaining);
-        }
-        Ok(())
-    }
-}
-
-impl Drop for CapturedOutput {
-    fn drop(&mut self) {
-        let _ = self.flush();
     }
 }

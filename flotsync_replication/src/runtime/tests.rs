@@ -592,8 +592,13 @@ fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
         SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
     );
     let listener = Arc::new(ListenerStub::default());
-    let host =
-        DeliveryRuntimeHost::start(local_member, store, listener).expect("host should start");
+    let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
+        local_member,
+        store,
+        listener,
+        None,
+    ))
+    .expect("host should start");
     host.wait_for_runtime_startup();
     host
 }
@@ -933,14 +938,15 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
         SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
     );
     let listener = Arc::new(ListenerStub::default());
-    let mut host = DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
-        &alice_member,
-        store,
-        listener,
-        Some(runtime_config_toml.as_str()),
-        PreconfiguredPeerRoutesPublishMode::ManualForTest,
-    )
-    .expect("host should start");
+    let mut host =
+        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
+            &alice_member,
+            store,
+            listener,
+            Some(runtime_config_toml.as_str()),
+            PreconfiguredPeerRoutesPublishMode::ManualForTest,
+        ))
+        .expect("host should start");
     host.wait_for_runtime_startup();
 
     host.publish_preconfigured_peer_routes();
@@ -955,19 +961,20 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
         SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
     );
     let listener = Arc::new(ListenerStub::default());
-    let mut host = DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
-        &alice_member,
-        store,
-        listener,
-        Some(
-            r"
+    let mut host =
+        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
+            &alice_member,
+            store,
+            listener,
+            Some(
+                r"
             [flotsync.replication.runtime.catch-up]
             max-updates-per-batch = 0
             ",
-        ),
-        PreconfiguredPeerRoutesPublishMode::ManualForTest,
-    )
-    .expect("zero catch-up batch size should mean unlimited");
+            ),
+            PreconfiguredPeerRoutesPublishMode::ManualForTest,
+        ))
+        .expect("zero catch-up batch size should mean unlimited");
     host.wait_for_runtime_startup();
     host.shutdown();
 }
