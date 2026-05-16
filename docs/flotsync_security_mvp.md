@@ -10,7 +10,8 @@ The MVP secures replication delivery envelopes by default:
 
 - runtime payloads are encrypted before they leave the replication runtime
 - delivery envelopes are signed by the claimed sender
-- group secrets are installed during bootstrap and stored with group metadata
+- group secrets are installed during bootstrap and stored with group metadata,
+  encrypted by a device-local application database secret
 - local identities and trusted peer identities come from external key files
 
 The first pass does not try to solve discovery trust, key rotation, revocation,
@@ -33,16 +34,23 @@ Rationale: keeping crypto behind a narrow crate boundary makes the dependency
 direction clear and prevents Kompact, storage, or transport concerns from
 leaking into low-level security code.
 
-## 3. Configuration Boundary
+## 3. Setup Boundary
 
-`flotsync_security` accepts typed configuration and key material. It does not
+`flotsync_security` accepts typed key material and protocol inputs. It does not
 parse TOML or Kompact configuration.
 
-Application-facing crates parse their existing config format once and translate
-that into typed security inputs for the replication runtime.
+For this MVP slice, the replicated-checklist example reads local setup inputs
+from its application config before replication starts: a temporary plaintext
+local database secret, a local private JWKS path, and trusted public JWKS paths.
+`ensure_configured_group` parses and validates those files, provisions the
+replication store, and then starts replication.
+
+Replication runtime reads provisioned security state from `ReplicationStore`
+with normal group metadata.
 
 Rationale: the project should not grow multiple independent config parsers for
-the same application configuration.
+the same application configuration, and security state that belongs to a group
+should enter runtime through the same store path as the rest of the group state.
 
 ## 4. Identity Keys
 
@@ -72,11 +80,12 @@ first secure example harder to run and easier to misconfigure.
 
 ## 6. Trust Model
 
-The MVP uses configured trusted public JWKS files.
+The MVP uses trusted public JWKS files supplied during replicated-checklist
+setup.
 
 Bootstrap messages also carry member public keys. For now, recipients validate
-bootstrap-carried keys against configured trust when both are available, and
-reject mismatches.
+bootstrap-carried keys against the public keys provisioned during setup when
+both are available, and reject mismatches.
 
 Rationale: this preserves the long-term bootstrap shape while avoiding an
 unauthenticated "trust whatever the bootstrap says" model.
@@ -85,16 +94,24 @@ unauthenticated "trust whatever the bootstrap says" model.
 
 Group symmetric keys belong to the replication group, not to files.
 
-Each local store keeps the group secret material as an encrypted BLOB next to
-the existing `replication_groups` metadata. The BLOB is encrypted to the local
-member's X25519 public key and opened with the local X25519 private key.
+Each local store keeps sensitive group-security material in encrypted columns or
+an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
+material is encrypted at rest with a device-local application database secret.
+
+For this MVP slice, replicated-checklist reads that database secret from
+plaintext application config during setup. Long term, the secret should come
+from OS-backed secure storage through the `keyring` crate.
+
+The stored group-security material includes the group symmetric key, cipher
+suite metadata, and member public keys needed to verify and open group traffic
+without a global trust lookup.
 
 The group id is the group key epoch. Membership or key changes create a new
 group id through migration rather than mutating the old group's key material.
 
 Rationale: group metadata, membership, version state, and group key material are
-normally needed together. Storing the encrypted group secret with the group
-record keeps that lifecycle explicit.
+normally needed together. Storing encrypted group-security material with the
+group record keeps that lifecycle explicit.
 
 ## 8. Group Payload Encryption
 
@@ -157,6 +174,9 @@ Rationale: bootstrap happens before recipients share the group key. HPKE gives a
 standard public-key encryption path for exactly that case, while keeping
 multi-message session state out of the first slice.
 
+Inbound bootstrap stores accepted group-security material through the
+`ReplicationStore` sensitive-column path before installing membership.
+
 ## 11. Acknowledgements
 
 Reliable-delivery recipient acknowledgements are signed by the recipient using
@@ -185,6 +205,7 @@ The following are deliberately outside this MVP and tracked separately:
 
 - key rotation and revocation
 - passphrase-protected identity files
+- OS keyring storage for the local database secret
 - discovery-published public keys
 - certificate or PKI-based trust
 - relay or TCP session encryption
