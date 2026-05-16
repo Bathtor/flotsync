@@ -1,6 +1,7 @@
 # Agent Instructions
 
 - Use "durable" only for explicit persistence/crash-survival guarantees. Do not use it as a general synonym for local, stored, applied, persisted, observed, or current state.
+- Do not plan "migrations" of any kind at this point. We are still building up the project. There are no existing deployments or database state or any such thing we need to handle.
 
 ## Rust Rules
 

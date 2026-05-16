@@ -820,7 +820,13 @@ mod tests {
     use super::*;
     use crate::{
         SqliteReplicationStore,
-        api::{DatasetId, DatasetUpdateRecord, ReplicationGroupRecord, ReplicationUpdateRecord},
+        api::{
+            DatasetId,
+            DatasetUpdateRecord,
+            ReplicationGroupRecord,
+            ReplicationUpdateRecord,
+            current_slice_placeholder_group_security_material,
+        },
     };
     use flotsync_core::{member::Identifier, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
@@ -866,6 +872,7 @@ mod tests {
             members: vec![local_member(), remote_member()],
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
 

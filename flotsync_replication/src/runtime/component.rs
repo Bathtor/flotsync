@@ -101,6 +101,7 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
+        current_slice_placeholder_group_security_material,
         providers::VecRowProvider,
     },
     delivery::{
@@ -665,6 +666,7 @@ impl ReplicationRuntimeComponent {
             members: members.ordered_members(),
             local_member_index,
             version_vector: VersionVector::initial(member_count),
+            security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
 

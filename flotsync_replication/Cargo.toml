@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 arc-swap = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }

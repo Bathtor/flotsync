@@ -10,7 +10,7 @@ regex = "1"
 snafu = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 ahash = "0.8"
-base64 = "0.22"
+base64 = { workspace = true }
 niceware = "1"
 
 [dev-dependencies]

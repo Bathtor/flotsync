@@ -39,6 +39,7 @@ use flotsync_replication::{
     SqliteReplicationStore,
     StoreError,
     SummaryRequest,
+    current_slice_placeholder_group_security_material,
     load_replication_runtime_with_runtime_config_toml,
 };
 use futures_util::{FutureExt, future::join_all};
@@ -678,6 +679,9 @@ async fn ensure_configured_group(
                 members: config.ordered_members.clone(),
                 local_member_index,
                 version_vector: VersionVector::initial(member_count),
+                security_material: current_slice_placeholder_group_security_material(
+                    config.group_id,
+                ),
             })
             .await
             .context(static_group_error::StoreSnafu)?;

@@ -1,9 +1,11 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec};
 use std::{
     collections::{HashMap, HashSet},
+    fmt,
     num::NonZeroUsize,
     sync::Arc,
 };
@@ -603,12 +605,24 @@ pub trait ReplicationApi: Send + Sync {
     ) -> BoxFuture<'_, Result<GroupMigration, ApiError>>;
 }
 
+/// Current encrypted-store-secret setup for the active security-storage slice.
+///
+/// Version `1` denotes XChaCha20-Poly1305 with random nonces and authenticated
+/// data chosen by the encryption boundary. Store implementations persist the
+/// numeric value opaquely and must not derive cipher behaviour from it.
+pub(crate) const STORE_SECRET_CRYPTO_V1: StoreSecretCryptoVersion =
+    StoreSecretCryptoVersion::new(1);
+
+/// Nonce width used by [`STORE_SECRET_CRYPTO_V1`] implementation.
+const STORE_SECRET_CRYPTO_NONCE_LENGTH_V1: usize = 24;
+
 /// One persisted replication group together with its local progress.
 ///
 /// This is the group-level record that anchors dataset snapshots and persisted
 /// replication updates in the store. The canonical member order is significant
 /// because it defines the stable `MemberIndex` values used in version vectors
-/// and `UpdateId.node_index`.
+/// and `UpdateId.node_index`. Sensitive group-security material is already
+/// encrypted by the setup/runtime boundary before it enters the store.
 #[derive(Clone)]
 pub struct ReplicationGroupRecord {
     /// Stable replication-group identifier.
@@ -619,6 +633,8 @@ pub struct ReplicationGroupRecord {
     pub local_member_index: MemberIndex,
     /// Last applied version vector stored for this group.
     pub version_vector: VersionVector,
+    /// Already-encrypted group-security material needed by runtime operation.
+    pub security_material: EncryptedGroupSecurityMaterial,
 }
 
 impl ReplicationGroupRecord {
@@ -650,7 +666,157 @@ impl std::fmt::Debug for ReplicationGroupRecord {
             .field("members", &self.members)
             .field("local_member_index", &self.local_member_index)
             .field("version_vector", &self.version_vector)
+            .field("security_material", &self.security_material)
             .finish()
+    }
+}
+
+/// Cryptographic setup version for one encrypted store secret.
+///
+/// Store implementations persist and compare the value opaquely. The
+/// encryption boundary owns the mapping from version numbers to concrete
+/// cryptographic setups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StoreSecretCryptoVersion(u16);
+
+impl StoreSecretCryptoVersion {
+    /// Build a store-secret crypto version from its wire/storage value.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Return the integer value stored in backend metadata columns.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+}
+
+/// Caller-defined id for the device-local database secret used to encrypt one store cell.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StoreSecretKeyId(String);
+
+impl StoreSecretKeyId {
+    /// Build a store-secret key id from its storage value.
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Return the key id string stored in backend metadata columns.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One already-encrypted secret cell stored by replication storage.
+///
+/// `key_id` identifies the device-local database secret used by the caller,
+/// `crypto_version` identifies the encryption setup, `nonce` is opaque nonce
+/// material for this cell, and `ciphertext` contains the encrypted payload
+/// including the AEAD authentication tag.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EncryptedStoreSecret {
+    /// Cryptographic setup version for this encrypted cell.
+    pub crypto_version: StoreSecretCryptoVersion,
+    /// Caller-defined id of the device-local database secret.
+    pub key_id: StoreSecretKeyId,
+    /// Opaque nonce bytes supplied by the encryption boundary.
+    pub nonce: Box<[u8]>,
+    /// Encrypted bytes including the AEAD authentication tag.
+    pub ciphertext: Box<[u8]>,
+}
+
+impl fmt::Debug for EncryptedStoreSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncryptedStoreSecret")
+            .field("crypto_version", &self.crypto_version)
+            .field("key_id", &self.key_id)
+            .field("nonce_len", &self.nonce.len())
+            .field("ciphertext_len", &self.ciphertext.len())
+            .finish()
+    }
+}
+
+/// Build placeholder group-security material for the current security-storage slice.
+///
+/// This is a temporary bridge for `flotsync-sec.10`: group records need
+/// encrypted security columns before replicated checklist setup provisions real
+/// encrypted values from configuration. The returned bytes are not decryptable
+/// production security material and this helper must be removed with that task.
+#[doc(hidden)]
+#[must_use]
+pub fn current_slice_placeholder_group_security_material(
+    group_id: GroupId,
+) -> EncryptedGroupSecurityMaterial {
+    let seed = group_id.0.as_u128().to_le_bytes()[0];
+    EncryptedGroupSecurityMaterial {
+        encrypted_group_secret: EncryptedStoreSecret {
+            crypto_version: STORE_SECRET_CRYPTO_V1,
+            key_id: StoreSecretKeyId::new("current-slice-placeholder-key"),
+            nonce: vec![seed; STORE_SECRET_CRYPTO_NONCE_LENGTH_V1].into_boxed_slice(),
+            ciphertext: vec![seed, seed.wrapping_add(1), seed.wrapping_add(2)].into_boxed_slice(),
+        },
+    }
+}
+
+/// Encrypted group-security material persisted with one replication group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptedGroupSecurityMaterial {
+    /// Encrypted group secret payload for the replication group.
+    pub encrypted_group_secret: EncryptedStoreSecret,
+}
+
+/// Encrypted local member private key material.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptedLocalMemberPrivateKeys {
+    /// Encrypted private JWKS/key payload for the local member.
+    pub secret: EncryptedStoreSecret,
+}
+
+/// One stored encrypted local-private key bundle for a member identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalMemberPrivateKeysRecord {
+    /// Member identity these private keys belong to.
+    pub member_id: MemberIdentity,
+    /// Already-encrypted local private key material.
+    pub private_keys: EncryptedLocalMemberPrivateKeys,
+}
+
+/// Trusted public key material for one member identity.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedMemberPublicKeysRecord {
+    /// Member identity these public keys belong to.
+    pub member_id: MemberIdentity,
+    /// Opaque signing public key bytes.
+    pub signing_public_key: Box<[u8]>,
+    /// Opaque encryption public key bytes.
+    pub encryption_public_key: Box<[u8]>,
+}
+
+impl fmt::Debug for TrustedMemberPublicKeysRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alternate = f.alternate();
+        let mut debug = f.debug_struct("TrustedMemberPublicKeysRecord");
+        debug.field("member_id", &self.member_id);
+        if alternate {
+            let signing_public_key = URL_SAFE_NO_PAD.encode(&self.signing_public_key);
+            let encryption_public_key = URL_SAFE_NO_PAD.encode(&self.encryption_public_key);
+            debug
+                .field("signing_public_key", &signing_public_key)
+                .field("encryption_public_key", &encryption_public_key)
+                .finish()
+        } else {
+            debug
+                .field("signing_public_key_len", &self.signing_public_key.len())
+                .field(
+                    "encryption_public_key_len",
+                    &self.encryption_public_key.len(),
+                )
+                .finish()
+        }
     }
 }
 
@@ -770,6 +936,18 @@ pub trait ReplicationStoreReadTransaction: Send {
         &'a mut self,
         group_ids: &'a HashSet<GroupId>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load encrypted local-private key material for one member identity.
+    fn load_local_member_private_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>>;
+
+    /// Load trusted public key material for one member identity.
+    fn load_trusted_member_public_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>>;
 
     /// Load one persisted replication update by `(group_id, update_id)`.
     fn load_replication_update<'a>(
@@ -907,6 +1085,30 @@ pub trait ReplicationStoreTransaction: Send {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
+    /// Load encrypted local-private key material for one member identity.
+    fn load_local_member_private_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>>;
+
+    /// Insert encrypted local-private key material or confirm it is already stored unchanged.
+    fn ensure_local_member_private_keys(
+        &mut self,
+        record: LocalMemberPrivateKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Load trusted public key material for one member identity.
+    fn load_trusted_member_public_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>>;
+
+    /// Insert trusted public key material or confirm it is already stored unchanged.
+    fn ensure_trusted_member_public_keys(
+        &mut self,
+        record: TrustedMemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
     /// Advance the stored applied version vector for one existing replication group.
     fn update_replication_group_version_vector<'a>(
         &'a mut self,
@@ -1005,4 +1207,41 @@ pub trait ReplicationStore: Send + Sync {
     fn begin_read_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trusted_public_keys_record() -> TrustedMemberPublicKeysRecord {
+        TrustedMemberPublicKeysRecord {
+            member_id: MemberIdentity::from_array(["debug", "alice"]),
+            signing_public_key: Box::from([1_u8, 2, 3]),
+            encryption_public_key: Box::from([4_u8, 5, 6]),
+        }
+    }
+
+    #[test]
+    fn trusted_public_keys_debug_prints_lengths_by_default() {
+        let output = format!("{:?}", trusted_public_keys_record());
+
+        assert_eq!(
+            output,
+            r#"TrustedMemberPublicKeysRecord { member_id: Identifier(i"debug", i"alice"), signing_public_key_len: 3, encryption_public_key_len: 3 }"#,
+        );
+    }
+
+    #[test]
+    fn trusted_public_keys_alternate_debug_prints_base64url() {
+        let output = format!("{:#?}", trusted_public_keys_record());
+
+        assert_eq!(
+            output,
+            r#"TrustedMemberPublicKeysRecord {
+    member_id: Identifier(i"debug", i"alice"),
+    signing_public_key: "AQID",
+    encryption_public_key: "BAUG",
+}"#,
+        );
+    }
 }

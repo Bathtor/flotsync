@@ -6,7 +6,11 @@ use crate::{
         DatasetRowWrite,
         DatasetRowsBatch,
         DatasetUpdateRecord,
+        EncryptedGroupSecurityMaterial,
+        EncryptedLocalMemberPrivateKeys,
+        EncryptedStoreSecret,
         GroupId,
+        LocalMemberPrivateKeysRecord,
         MemberIdentity,
         MemberIndex,
         ReplicationGroupRecord,
@@ -21,6 +25,9 @@ use crate::{
         RowKeyIterator,
         SchemaSource,
         StoreError,
+        StoreSecretCryptoVersion,
+        StoreSecretKeyId,
+        TrustedMemberPublicKeysRecord,
     },
     runtime::messages::{
         DatasetUpdateMessage,
@@ -312,6 +319,22 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
+    fn load_local_member_private_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
+        async move { load_local_member_private_keys(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
+    fn load_trusted_member_public_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
+        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
     fn load_replication_update<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -410,6 +433,40 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
+    }
+
+    fn load_local_member_private_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
+        async move { load_local_member_private_keys(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
+    fn ensure_local_member_private_keys(
+        &mut self,
+        record: LocalMemberPrivateKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { ensure_local_member_private_keys(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn load_trusted_member_public_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
+        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
+    fn ensure_trusted_member_public_keys(
+        &mut self,
+        record: TrustedMemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move {
+            ensure_trusted_member_public_keys(self.assert_open_connection(), &record).await
+        }
+        .boxed()
     }
 
     fn update_replication_group_version_vector<'a>(
@@ -562,7 +619,11 @@ CREATE TABLE IF NOT EXISTS replication_groups (
     group_id TEXT PRIMARY KEY NOT NULL,
     member_count INTEGER NOT NULL,
     local_member_index INTEGER NOT NULL,
-    version_vector BLOB NOT NULL
+    version_vector BLOB NOT NULL,
+    group_secret_crypto_version INTEGER NOT NULL,
+    group_secret_key_id TEXT NOT NULL,
+    group_secret_nonce BLOB NOT NULL,
+    group_secret_ciphertext BLOB NOT NULL
 );
 ",
         "
@@ -607,6 +668,22 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
+        "
+CREATE TABLE IF NOT EXISTS local_members (
+    member_identity TEXT PRIMARY KEY NOT NULL,
+    private_keys_crypto_version INTEGER NOT NULL,
+    private_keys_key_id TEXT NOT NULL,
+    private_keys_nonce BLOB NOT NULL,
+    private_keys_ciphertext BLOB NOT NULL
+);
+",
+        "
+CREATE TABLE IF NOT EXISTS known_peers (
+    member_identity TEXT PRIMARY KEY NOT NULL,
+    signing_public_key BLOB NOT NULL,
+    encryption_public_key BLOB NOT NULL
+);
+",
     ];
     for statement in schema_statements {
         sqlx::query(statement)
@@ -623,7 +700,14 @@ async fn load_replication_group(
 ) -> Result<Option<ReplicationGroupRecord>, StoreError> {
     let row = sqlx::query(
         "
-SELECT member_count, local_member_index, version_vector
+SELECT
+    member_count,
+    local_member_index,
+    version_vector,
+    group_secret_crypto_version,
+    group_secret_key_id,
+    group_secret_nonce,
+    group_secret_ciphertext
 FROM replication_groups
 WHERE group_id = ?1
 ",
@@ -641,6 +725,15 @@ WHERE group_id = ?1
         decode_member_index(row.get::<i64, _>("local_member_index"), member_count)?;
     let version_vector =
         decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
+    let encrypted_group_secret = decode_encrypted_store_secret(
+        row.get("group_secret_crypto_version"),
+        row.get("group_secret_key_id"),
+        row.get("group_secret_nonce"),
+        row.get("group_secret_ciphertext"),
+    )?;
+    let security_material = EncryptedGroupSecurityMaterial {
+        encrypted_group_secret,
+    };
     let members = load_group_members(connection, group_id, member_count).await?;
 
     Ok(Some(ReplicationGroupRecord {
@@ -648,6 +741,7 @@ WHERE group_id = ?1
         members,
         local_member_index,
         version_vector,
+        security_material,
     }))
 }
 
@@ -719,16 +813,55 @@ async fn insert_replication_group(
     ensure_member_index_in_bounds(group.local_member_index, member_count)?;
 
     let version_vector = encode_stored_version_vector(&group.version_vector);
+    let stored_member_count =
+        i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?;
     sqlx::query(
         "
-INSERT INTO replication_groups (group_id, member_count, local_member_index, version_vector)
-VALUES (?1, ?2, ?3, ?4)
+INSERT INTO replication_groups (
+    group_id,
+    member_count,
+    local_member_index,
+    version_vector,
+    group_secret_crypto_version,
+    group_secret_key_id,
+    group_secret_nonce,
+    group_secret_ciphertext
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ",
     )
     .bind(group.group_id.to_string())
-    .bind(i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?)
+    .bind(stored_member_count)
     .bind(i64::from(group.local_member_index.as_u32()))
     .bind(version_vector)
+    .bind(i64::from(
+        group
+            .security_material
+            .encrypted_group_secret
+            .crypto_version
+            .as_u16(),
+    ))
+    .bind(
+        group
+            .security_material
+            .encrypted_group_secret
+            .key_id
+            .as_str(),
+    )
+    .bind(
+        group
+            .security_material
+            .encrypted_group_secret
+            .nonce
+            .as_ref(),
+    )
+    .bind(
+        group
+            .security_material
+            .encrypted_group_secret
+            .ciphertext
+            .as_ref(),
+    )
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -748,6 +881,142 @@ VALUES (?1, ?2, ?3)
         .await
         .context(SqlxSnafu)?;
     }
+    Ok(())
+}
+
+async fn load_local_member_private_keys(
+    connection: &mut SqliteStoreConnection,
+    member_id: &MemberIdentity,
+) -> Result<Option<LocalMemberPrivateKeysRecord>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT private_keys_crypto_version, private_keys_key_id, private_keys_nonce, private_keys_ciphertext
+FROM local_members
+WHERE member_identity = ?1
+",
+    )
+    .bind(member_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let encrypted_private_keys = decode_encrypted_store_secret(
+        row.get("private_keys_crypto_version"),
+        row.get("private_keys_key_id"),
+        row.get("private_keys_nonce"),
+        row.get("private_keys_ciphertext"),
+    )?;
+    Ok(Some(LocalMemberPrivateKeysRecord {
+        member_id: member_id.clone(),
+        private_keys: EncryptedLocalMemberPrivateKeys {
+            secret: encrypted_private_keys,
+        },
+    }))
+}
+
+async fn ensure_local_member_private_keys(
+    connection: &mut SqliteStoreConnection,
+    record: &LocalMemberPrivateKeysRecord,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_local_member_private_keys(connection, &record.member_id).await? {
+        ensure!(
+            existing == *record,
+            ConflictingMemberSecurityMaterialSnafu {
+                object: "local member private keys",
+                member_id: record.member_id.clone(),
+            }
+        );
+        return Ok(());
+    }
+
+    let secret = &record.private_keys.secret;
+    sqlx::query(
+        "
+INSERT INTO local_members (
+    member_identity,
+    private_keys_crypto_version,
+    private_keys_key_id,
+    private_keys_nonce,
+    private_keys_ciphertext
+)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+    )
+    .bind(record.member_id.to_string())
+    .bind(i64::from(secret.crypto_version.as_u16()))
+    .bind(secret.key_id.as_str())
+    .bind(secret.nonce.as_ref())
+    .bind(secret.ciphertext.as_ref())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn load_trusted_member_public_keys(
+    connection: &mut SqliteStoreConnection,
+    member_id: &MemberIdentity,
+) -> Result<Option<TrustedMemberPublicKeysRecord>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT signing_public_key, encryption_public_key
+FROM known_peers
+WHERE member_identity = ?1
+",
+    )
+    .bind(member_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(TrustedMemberPublicKeysRecord {
+        member_id: member_id.clone(),
+        signing_public_key: row
+            .get::<Vec<u8>, _>("signing_public_key")
+            .into_boxed_slice(),
+        encryption_public_key: row
+            .get::<Vec<u8>, _>("encryption_public_key")
+            .into_boxed_slice(),
+    }))
+}
+
+async fn ensure_trusted_member_public_keys(
+    connection: &mut SqliteStoreConnection,
+    record: &TrustedMemberPublicKeysRecord,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_trusted_member_public_keys(connection, &record.member_id).await? {
+        ensure!(
+            existing == *record,
+            ConflictingMemberSecurityMaterialSnafu {
+                object: "trusted member public keys",
+                member_id: record.member_id.clone(),
+            }
+        );
+        return Ok(());
+    }
+
+    sqlx::query(
+        "
+INSERT INTO known_peers (
+    member_identity,
+    signing_public_key,
+    encryption_public_key
+)
+VALUES (?1, ?2, ?3)
+",
+    )
+    .bind(record.member_id.to_string())
+    .bind(record.signing_public_key.as_ref())
+    .bind(record.encryption_public_key.as_ref())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
     Ok(())
 }
 
@@ -1486,6 +1755,24 @@ fn decode_update_version_sort_key(bytes: &[u8]) -> Result<u64, StoreError> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+/// Decode one encrypted secret cell from `SQLite` scalar column values.
+fn decode_encrypted_store_secret(
+    raw_crypto_version: i64,
+    key_id: String,
+    nonce: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> Result<EncryptedStoreSecret, StoreError> {
+    let crypto_version = u16::try_from(raw_crypto_version)
+        .context(SecretCryptoVersionOverflowSnafu)
+        .map_err(StoreError::from)?;
+    Ok(EncryptedStoreSecret {
+        crypto_version: StoreSecretCryptoVersion::new(crypto_version),
+        key_id: StoreSecretKeyId::new(key_id),
+        nonce: nonce.into_boxed_slice(),
+        ciphertext: ciphertext.into_boxed_slice(),
+    })
+}
+
 fn decode_non_zero_member_count(member_count: i64) -> Result<NonZeroUsize, StoreError> {
     let member_count = usize::try_from(member_count).context(MemberCountOverflowSnafu)?;
     NonZeroUsize::new(member_count)
@@ -1571,6 +1858,8 @@ enum SqliteStoreError {
     MemberCountOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Stored member index overflowed the supported range: {source}"))]
     MemberIndexOverflow { source: std::num::TryFromIntError },
+    #[snafu(display("Stored secret crypto version overflowed the supported range: {source}"))]
+    SecretCryptoVersionOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Dataset row scan limit overflowed the supported range: {source}"))]
     RowLimitOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
@@ -1602,6 +1891,13 @@ enum SqliteStoreError {
     },
     #[snafu(display("Stored {object} sort key had invalid length {len}."))]
     InvalidStoredSortKey { object: &'static str, len: usize },
+    #[snafu(display(
+        "Stored {object} for member '{member_id}' conflicts with requested material."
+    ))]
+    ConflictingMemberSecurityMaterial {
+        object: &'static str,
+        member_id: MemberIdentity,
+    },
     #[snafu(display(
         "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
     ))]
@@ -1651,6 +1947,7 @@ mod tests {
         DatasetRowWrite,
         ReplicationRowRecord,
         ReplicationUpdateFilter,
+        current_slice_placeholder_group_security_material,
     };
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
@@ -1686,6 +1983,15 @@ mod tests {
         Arc::new(Schema::from_fields([Field::linear_string("title")]))
     }
 
+    fn sample_encrypted_secret(label: &str, seed: u8) -> EncryptedStoreSecret {
+        EncryptedStoreSecret {
+            crypto_version: StoreSecretCryptoVersion::new(1),
+            key_id: StoreSecretKeyId::new(format!("test-key-{label}")),
+            nonce: Vec::from([seed, seed.wrapping_add(1)]).into_boxed_slice(),
+            ciphertext: Box::from([seed, seed.wrapping_add(1), seed.wrapping_add(2)]),
+        }
+    }
+
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
         let members = vec![local_member(), remote_member()];
         let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
@@ -1695,6 +2001,23 @@ mod tests {
             members,
             local_member_index: MemberIndex::new(0),
             version_vector,
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        }
+    }
+
+    fn is_conflicting_member_security_material(
+        error: &StoreError,
+        object: &'static str,
+        member_id: &MemberIdentity,
+    ) -> bool {
+        match error {
+            StoreError::StoreExternal { source } => matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::ConflictingMemberSecurityMaterial {
+                    object: stored_object,
+                    member_id: stored_member_id,
+                }) if *stored_object == object && stored_member_id == member_id
+            ),
         }
     }
 
@@ -1887,6 +2210,7 @@ mod tests {
             .expect("group should exist");
         assert_eq!(loaded_group.group_id, group.group_id);
         assert_eq!(loaded_group.members, group.members);
+        assert_eq!(loaded_group.security_material, group.security_material);
         assert_eq!(
             loaded_group.version_vector.iter().collect::<Vec<_>>(),
             updated_version_vector.iter().collect::<Vec<_>>()
@@ -1975,6 +2299,134 @@ mod tests {
             vec![first_group_id]
         );
         wait_for_store_future(read_transaction.release()).expect("release should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_local_member_private_keys() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let record = LocalMemberPrivateKeysRecord {
+            member_id: local_member(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret("private", 42),
+            },
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
+            .expect("private keys should store");
+        wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
+            .expect("same private keys should be accepted");
+        let loaded =
+            wait_for_store_future(transaction.load_local_member_private_keys(&record.member_id))
+                .expect("private keys should load")
+                .expect("private keys should exist");
+        assert_eq!(loaded, record);
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
+            .expect("transaction should start");
+        let loaded = wait_for_store_future(
+            read_transaction.load_local_member_private_keys(&record.member_id),
+        )
+        .expect("private keys should load through read transaction")
+        .expect("private keys should exist");
+        assert_eq!(loaded, record);
+        wait_for_store_future(read_transaction.release()).expect("release should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_rejects_conflicting_local_member_private_keys() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let record = LocalMemberPrivateKeysRecord {
+            member_id: local_member(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret("private", 42),
+            },
+        };
+        let conflicting_record = LocalMemberPrivateKeysRecord {
+            member_id: record.member_id.clone(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret("private", 43),
+            },
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
+            .expect("private keys should store");
+        let error =
+            wait_for_store_future(transaction.ensure_local_member_private_keys(conflicting_record))
+                .expect_err("conflicting private keys should fail");
+        assert!(is_conflicting_member_security_material(
+            &error,
+            "local member private keys",
+            &record.member_id,
+        ));
+        wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_trusted_member_public_keys() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let record = TrustedMemberPublicKeysRecord {
+            member_id: remote_member(),
+            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
+            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
+            .expect("trusted public keys should store");
+        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
+            .expect("same trusted public keys should be accepted");
+        let loaded =
+            wait_for_store_future(transaction.load_trusted_member_public_keys(&record.member_id))
+                .expect("trusted public keys should load")
+                .expect("trusted public keys should exist");
+        assert_eq!(loaded, record);
+        wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+        let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
+            .expect("transaction should start");
+        let loaded = wait_for_store_future(
+            read_transaction.load_trusted_member_public_keys(&record.member_id),
+        )
+        .expect("trusted public keys should load through read transaction")
+        .expect("trusted public keys should exist");
+        assert_eq!(loaded, record);
+        wait_for_store_future(read_transaction.release()).expect("release should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_rejects_conflicting_trusted_member_public_keys() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let record = TrustedMemberPublicKeysRecord {
+            member_id: remote_member(),
+            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
+            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
+        };
+        let conflicting_record = TrustedMemberPublicKeysRecord {
+            member_id: record.member_id.clone(),
+            signing_public_key: Vec::from([9_u8, 8, 7, 6]).into_boxed_slice(),
+            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
+        };
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
+            .expect("trusted public keys should store");
+        let error = wait_for_store_future(
+            transaction.ensure_trusted_member_public_keys(conflicting_record),
+        )
+        .expect_err("conflicting trusted public keys should fail");
+        assert!(is_conflicting_member_security_material(
+            &error,
+            "trusted member public keys",
+            &record.member_id,
+        ));
+        wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
     }
 
     #[test]

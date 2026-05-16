@@ -1399,6 +1399,7 @@ name = "flotsync_replication"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "base64",
  "bytes",
  "flotsync_core",
  "flotsync_data_types",

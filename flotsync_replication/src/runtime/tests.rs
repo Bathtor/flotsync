@@ -33,6 +33,7 @@ use crate::{
         GroupId,
         ListenerError,
         ListenerExternalSnafu,
+        LocalMemberPrivateKeysRecord,
         MemberIdentity,
         MemberIndex,
         ProviderExternalSnafu,
@@ -60,6 +61,8 @@ use crate::{
         SnapshotRowsRequest,
         StoreError,
         SummaryRequest,
+        TrustedMemberPublicKeysRecord,
+        current_slice_placeholder_group_security_material,
         process_batches,
     },
 };
@@ -201,6 +204,46 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")
             .insert_replication_group(group)
+    }
+
+    fn load_local_member_private_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_local_member_private_keys(member_id)
+    }
+
+    fn ensure_local_member_private_keys(
+        &mut self,
+        record: LocalMemberPrivateKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_local_member_private_keys(record)
+    }
+
+    fn load_trusted_member_public_keys<'a>(
+        &'a mut self,
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_trusted_member_public_keys(member_id)
+    }
+
+    fn ensure_trusted_member_public_keys(
+        &mut self,
+        record: TrustedMemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_trusted_member_public_keys(record)
     }
 
     fn update_replication_group_version_vector<'a>(
@@ -999,6 +1042,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(2).expect("group should have two members"),
             ),
+            security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
     let listener = Arc::new(ListenerStub::default());
@@ -1547,6 +1591,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
             members: vec![alice_member.clone(), bob_member],
             local_member_index: MemberIndex::new(0),
             version_vector: version_vector.clone(),
+            security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
     let listener = Arc::new(ListenerStub::default());
