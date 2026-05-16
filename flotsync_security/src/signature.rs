@@ -1,0 +1,93 @@
+use crate::{
+    error::{InvalidSignatureBytesSnafu, Result, SignSignatureSnafu, VerifySignatureSnafu},
+    identity::{LocalMemberKeys, PublicMemberKeys},
+    util::hash_len_prefixed,
+};
+use ed25519_dalek::{Digest, Sha512, Signature};
+use snafu::prelude::*;
+
+/// Byte length of an Ed25519ph frame signature.
+pub const SIGNATURE_LENGTH: usize = 64;
+
+/// Sign the public frame header and ciphertext as one detached Ed25519ph frame.
+///
+/// # Errors
+///
+/// Returns [`crate::SecurityError::SignSignature`] if the Ed25519ph signing
+/// operation rejects the prehashed transcript.
+pub fn sign_frame(
+    local_keys: &LocalMemberKeys,
+    parts: SignedFrameParts<'_>,
+) -> Result<FrameSignature> {
+    let signature: Signature = local_keys
+        .signing_key
+        .sign_prehashed(signature_transcript(parts), None)
+        .context(SignSignatureSnafu)?;
+    Ok(FrameSignature {
+        bytes: signature.to_bytes(),
+    })
+}
+
+/// Verify a detached Ed25519ph frame signature over the header and ciphertext.
+///
+/// # Errors
+///
+/// Returns [`crate::SecurityError::InvalidSignatureBytes`] when the signature
+/// bytes do not form a valid Ed25519ph signature, or
+/// [`crate::SecurityError::VerifySignature`] when the signature does not verify
+/// against the supplied frame parts.
+pub fn verify_frame_signature(
+    public_keys: &PublicMemberKeys,
+    parts: SignedFrameParts<'_>,
+    signature: &FrameSignature,
+) -> Result<()> {
+    let signature =
+        Signature::try_from(signature.as_bytes().as_slice()).context(InvalidSignatureBytesSnafu)?;
+    public_keys
+        .signing_key
+        .verify_prehashed(signature_transcript(parts), None, &signature)
+        .context(VerifySignatureSnafu)
+}
+
+/// Replication frame components covered by a detached signature.
+#[derive(Clone, Copy, Debug)]
+pub struct SignedFrameParts<'a> {
+    /// Stable protocol frame kind, not a display label.
+    pub frame_kind: &'static str,
+    /// Public frame header bytes that remain visible on the wire.
+    pub public_header: &'a [u8],
+    /// Ciphertext bytes, including any AEAD authentication tag.
+    pub ciphertext: &'a [u8],
+}
+
+/// Detached Ed25519ph frame signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameSignature {
+    bytes: [u8; SIGNATURE_LENGTH],
+}
+
+impl FrameSignature {
+    /// Build a detached signature from raw Ed25519ph signature bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; SIGNATURE_LENGTH]) -> Self {
+        Self { bytes }
+    }
+
+    /// Return the raw Ed25519ph signature bytes.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; SIGNATURE_LENGTH] {
+        &self.bytes
+    }
+}
+
+const DOMAIN_SIGNATURE: &[u8] = b"flotsync/security/signature/v1";
+
+/// Build the domain-separated prehash transcript that is signed or verified.
+fn signature_transcript(parts: SignedFrameParts<'_>) -> Sha512 {
+    let mut transcript = Sha512::new();
+    hash_len_prefixed(&mut transcript, DOMAIN_SIGNATURE);
+    hash_len_prefixed(&mut transcript, parts.frame_kind.as_bytes());
+    hash_len_prefixed(&mut transcript, parts.public_header);
+    hash_len_prefixed(&mut transcript, parts.ciphertext);
+    transcript
+}

@@ -71,6 +71,26 @@ pub struct Identifier {
 }
 
 impl Identifier {
+    /// The number of segments in `self`.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns whether `self` contains no segments.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// The number of bytes in the identifier.
+    ///
+    /// This does *not* include any separators.
+    #[must_use]
+    pub fn num_bytes(&self) -> usize {
+        self.segments.iter().map(IdentifierSegment::len).sum()
+    }
+
     pub fn segments(self) -> impl Iterator<Item = IdentifierSegment> {
         self.segments.into_iter()
     }

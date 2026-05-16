@@ -50,7 +50,7 @@ Identity key files use JWKS/JWK, parsed through `jose-jwk`.
 
 Each local private identity file contains two OKP keys:
 
-- Ed25519 for signing and signature verification
+- Ed25519 identity keys used with Ed25519ph for signing and signature verification
 - X25519 for public-key encryption and HPKE key transport
 
 The matching public JWKS contains the two public keys and is intended to be easy
@@ -104,6 +104,13 @@ The nonce is derived from existing public envelope context: group id, frame
 kind, sender identity, and delivery message id. The nonce is public information
 and is not transmitted separately.
 
+Delivery message ids are required to be unique under one group key. Nonce
+derivation hashes the immutable context with SHA-256 and uses the leftmost 12
+bytes as the ChaCha20-Poly1305 nonce. Fixed byte positions in a secure digest
+are not treated as weaker than other fixed positions; the relevant residual risk
+is digest-prefix collision probability, which is acceptable for this MVP under
+the message-id uniqueness requirement.
+
 The public routing header stays clear so delivery ingress can perform cheap
 local-interest classification, but the same header is included as authenticated
 encryption context.
@@ -115,14 +122,18 @@ algorithm ids, key ids, epochs, or nonces on every message.
 
 ## 9. Signatures
 
-Delivery envelopes are signed with Ed25519.
+Delivery envelopes are signed with Ed25519ph.
 
-The group-message signature covers a domain separator, frame kind, canonical
-public header, and the ciphertext including the authentication tag.
+The group-message signature prehash transcript is streamed through SHA-512 and
+covers a domain separator, frame kind, canonical public header, and the
+ciphertext including the authentication tag.
 
-Rationale: the authentication tag proves that the ciphertext and authenticated
-context were produced by someone with the group key. The signature separately
-proves that the claimed sender signed this exact sealed envelope.
+Rationale: group ciphertexts may become large. Ed25519ph avoids building a
+second contiguous signing buffer containing the full ciphertext while preserving
+a standard Ed25519-family signature mode. The authentication tag proves that the
+ciphertext and authenticated context were produced by someone with the group
+key. The signature separately proves that the claimed sender signed this exact
+sealed envelope.
 
 ## 10. Bootstrap Encryption
 
@@ -148,7 +159,8 @@ multi-message session state out of the first slice.
 
 ## 11. Acknowledgements
 
-Reliable-delivery recipient acknowledgements are signed by the recipient.
+Reliable-delivery recipient acknowledgements are signed by the recipient using
+the same Ed25519ph transcript convention.
 
 The sender only treats an acknowledgement as completing work after verifying the
 signature against the expected recipient public key and delivery message id.
@@ -160,8 +172,8 @@ signal. The recipient must prove that it accepted the message.
 
 The normal runtime has no insecure "off" mode.
 
-Tests use deterministic identities and group keys from `flotsync_security`
-test-support helpers instead of plaintext placeholders.
+Tests use crate-internal deterministic identities, deterministic group keys, and
+`flotsync_security` test-support RNG helpers instead of plaintext placeholders.
 
 Rationale: keeping a plaintext mode in the production path would complicate the
 security boundary. Deterministic fixtures give tests the convenience they need
