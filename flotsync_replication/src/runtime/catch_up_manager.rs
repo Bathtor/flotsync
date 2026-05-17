@@ -298,13 +298,6 @@ pub(super) struct CatchUpManagerComponent {
 }
 
 impl CatchUpManagerComponent {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
-        )
-    )]
     pub(super) fn new(
         local_member: MemberIdentity,
         group_memberships: SharedGroupMemberships,

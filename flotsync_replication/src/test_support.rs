@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::delivery::security::DeliverySecurity;
 use crate::{
     api::{
         EncryptedLocalMemberPrivateKeys,
@@ -8,13 +10,13 @@ use crate::{
         ReplicationApi,
         ReplicationConfig,
         ReplicationEventListener,
+        ReplicationSecuritySecrets,
         ReplicationStore,
         RuntimeSnafu,
         StoreSecretKeyId,
         TrustedMemberPublicKeysRecord,
     },
-    delivery::security::DeliverySecurity,
-    runtime::handle::load_replication_runtime_typed_with_security_for_test,
+    runtime::handle::load_replication_runtime_with_runtime_config_toml,
 };
 use flotsync_core::member::Identifier;
 use flotsync_security::{
@@ -66,24 +68,13 @@ pub async fn load_replication_runtime_with_test_security_toml(
         std::iter::empty::<MemberIdentity>(),
     )
     .await?;
-    let security = DeliverySecurity::load(
-        store.clone(),
-        &local_member,
-        Arc::new(test_store_secret_key()),
-        StoreSecretKeyId::new(TEST_STORE_SECRET_KEY_ID),
-    )
-    .await
-    .boxed()
-    .context(RuntimeSnafu {
-        application_id: application_id.clone(),
-    })?;
-    let runtime = load_replication_runtime_typed_with_security_for_test(
+    let runtime = load_replication_runtime_with_runtime_config_toml(
         application_id,
         store,
         listener,
         config,
-        security,
-        Some(runtime_config_toml),
+        test_replication_security_secrets(),
+        runtime_config_toml,
     )
     .await?;
     Ok(runtime)
@@ -184,6 +175,15 @@ pub(crate) async fn load_test_delivery_security(
     .await
     .boxed()
     .context(RuntimeSnafu { application_id })
+}
+
+/// Build the deterministic runtime security input used by test runtime support.
+#[must_use]
+pub fn test_replication_security_secrets() -> ReplicationSecuritySecrets {
+    ReplicationSecuritySecrets::new(
+        StoreSecretKeyId::new(TEST_STORE_SECRET_KEY_ID),
+        Arc::new(test_store_secret_key()),
+    )
 }
 
 /// Build deterministic seed material for one test member identity.

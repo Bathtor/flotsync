@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = { workspace = true }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_replication = { path = "../flotsync_replication" }
+flotsync_security = { path = "../flotsync_security" }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 http = "1"

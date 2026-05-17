@@ -1,11 +1,10 @@
-#[cfg(any(test, feature = "test-support"))]
-use crate::api::LocalMemberPrivateKeysRecord;
 use crate::{
     GroupMembers,
     api::{
         BoxError,
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
+        LocalMemberPrivateKeysRecord,
         MemberIdentity,
         ReplicationStore,
         StoreError,
@@ -22,20 +21,17 @@ use flotsync_security::{
     PublicMemberKeys,
     ReliablePayloadContext,
     STORE_SECRET_CRYPTO_VERSION_V1,
+    STORE_SECRET_NONCE_LENGTH,
     SealedReliablePayload,
+    StoreSecretCiphertext,
     StoreSecretContext,
+    StoreSecretCryptoVersion,
     StoreSecretKey,
+    local_member_keys_from_jwks,
     open_reliable_payload,
+    open_store_secret,
     seal_reliable_payload_with_os_rng,
     seal_store_secret,
-};
-#[cfg(any(test, feature = "test-support"))]
-use flotsync_security::{
-    STORE_SECRET_NONCE_LENGTH,
-    StoreSecretCiphertext,
-    StoreSecretCryptoVersion,
-    local_member_keys_from_jwks,
-    open_store_secret,
 };
 use snafu::{Location, prelude::*};
 use std::sync::Arc;
@@ -45,9 +41,7 @@ pub(crate) const RELIABLE_RUNTIME_MESSAGE_FRAME_KIND: &str = "reliable-runtime-m
 
 const LOGICAL_GROUP_TABLE: &str = "replication_group";
 const LOGICAL_GROUP_SECRET_COLUMN: &str = "group_secret";
-#[cfg(any(test, feature = "test-support"))]
 const LOGICAL_LOCAL_MEMBER_TABLE: &str = "local_member";
-#[cfg(any(test, feature = "test-support"))]
 const LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN: &str = "private_keys";
 
 /// Security setup and delivery-envelope errors raised while wiring store records into crypto helpers.
@@ -60,7 +54,6 @@ pub(crate) enum DeliverySecurityError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Local private keys for member {member_id} are not provisioned."))]
     MissingLocalPrivateKeys { member_id: MemberIdentity },
     #[snafu(display("Trusted public keys for member {member_id} are not provisioned."))]
@@ -87,10 +80,8 @@ pub(crate) enum DeliverySecurityError {
     TrustedPublicKeysMismatch { member_id: MemberIdentity },
     #[snafu(display("Bootstrap public keys included non-member {member_id}."))]
     UnexpectedBootstrapPublicKeys { member_id: MemberIdentity },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Encrypted secret used unsupported crypto version {version}."))]
     UnsupportedStoreSecretVersion { version: u16 },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display(
         "Encrypted secret nonce had invalid length {actual}; expected {STORE_SECRET_NONCE_LENGTH}."
     ))]
@@ -103,10 +94,8 @@ pub(crate) enum DeliverySecurityError {
         expected: usize,
         actual: usize,
     },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Local private key payload was not valid UTF-8: {source}"))]
     InvalidLocalPrivateKeyUtf8 { source: std::string::FromUtf8Error },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Local private keys were invalid: {source}"))]
     InvalidLocalPrivateKeys { source: BoxError },
     #[snafu(display("Trusted public keys for member {member_id} were invalid: {source}"))]
@@ -123,7 +112,6 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Failed to open reliable payload: {source}"))]
     OpenReliablePayload { source: BoxError },
-    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Failed to open encrypted local private keys: {source}"))]
     OpenLocalPrivateKeys { source: BoxError },
     #[snafu(display("Failed to seal group secret for storage: {source}"))]
@@ -134,12 +122,12 @@ impl DeliverySecurityError {
     pub(crate) const fn is_retryable(&self) -> bool {
         #[allow(
             clippy::match_like_matches_macro,
+            clippy::match_same_arms,
             reason = "Each security error needs an explicit retryability decision."
         )]
         match self {
             // Store access may fail due to transient I/O or lock contention.
             Self::StoreAccess { .. } => true,
-            #[cfg(any(test, feature = "test-support"))]
             // Missing local provisioning is configuration state, not a retry condition.
             Self::MissingLocalPrivateKeys { .. } => false,
             // Missing trusted keys require provisioning or a trust update.
@@ -154,7 +142,6 @@ impl DeliverySecurityError {
             Self::MissingBootstrapPublicKeys { .. }
             | Self::TrustedPublicKeysMismatch { .. }
             | Self::UnexpectedBootstrapPublicKeys { .. } => false,
-            #[cfg(any(test, feature = "test-support"))]
             // Stored secret encoding/version problems need data repair or a code change.
             Self::UnsupportedStoreSecretVersion { .. } | Self::InvalidStoreSecretNonce { .. } => {
                 false
@@ -163,14 +150,12 @@ impl DeliverySecurityError {
             Self::InvalidTrustedPublicKeyLength { .. } | Self::InvalidTrustedPublicKeys { .. } => {
                 false
             }
-            #[cfg(any(test, feature = "test-support"))]
             // Invalid local private-key records need reprovisioning.
             Self::InvalidLocalPrivateKeyUtf8 { .. } | Self::InvalidLocalPrivateKeys { .. } => false,
             // Group-key generation depends on OS randomness and may recover on retry.
             Self::GenerateGroupKey { .. } => true,
             // Reliable-payload seal/open failures are crypto or key-consistency failures.
             Self::SealReliablePayload { .. } | Self::OpenReliablePayload { .. } => false,
-            #[cfg(any(test, feature = "test-support"))]
             // Local private-key opening failures are wrong-key/corrupt-record failures.
             Self::OpenLocalPrivateKeys { .. } => false,
             // Group-secret sealing also depends on OS randomness and may recover on retry.
@@ -190,7 +175,6 @@ pub(crate) struct DeliverySecurity {
 }
 
 impl DeliverySecurity {
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn load(
         store: Arc<dyn ReplicationStore>,
         local_member: &MemberIdentity,
@@ -429,7 +413,6 @@ pub(crate) fn public_keys_from_record(
     })
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn open_local_private_keys(
     record: &LocalMemberPrivateKeysRecord,
     store_secret_key: &StoreSecretKey,
@@ -453,7 +436,6 @@ fn open_local_private_keys(
         .context(InvalidLocalPrivateKeysSnafu)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 impl EncryptedStoreSecret {
     /// Convert this opaque encrypted-cell record into the fixed-width security ciphertext type.
     pub(crate) fn to_store_secret_ciphertext(

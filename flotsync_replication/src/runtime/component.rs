@@ -522,13 +522,6 @@ pub struct ReplicationRuntimeComponent {
 
 impl ReplicationRuntimeComponent {
     /// Construct one replication runtime component for one local member.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
-        )
-    )]
     pub(super) fn new(
         local_member: MemberIdentity,
         store: Arc<dyn ReplicationStore>,

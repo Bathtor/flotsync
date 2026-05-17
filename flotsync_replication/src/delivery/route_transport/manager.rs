@@ -1088,13 +1088,6 @@ enum UdpActivationPolicy {
 }
 
 impl UdpActivationPolicy {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "replication runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
-        )
-    )]
     const fn config_value(self) -> usize {
         match self {
             Self::OnBind => 0,
@@ -1108,13 +1101,6 @@ impl UdpActivationPolicy {
 /// The current replication runtime keeps per-socket `UDPour` children dormant
 /// until a concrete route is first used. That avoids unnecessary startup churn
 /// for sockets that may never carry delivery traffic.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "replication runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
-    )
-)]
 pub(crate) fn configure_replication_runtime(config: &mut KompactConfig) {
     config.set_config_value(
         &config_keys::UDP_ACTIVATION_POLICY,

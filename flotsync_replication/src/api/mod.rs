@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
+use flotsync_security::StoreSecretKey;
 use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec};
 use std::{
@@ -431,6 +432,43 @@ pub struct ReplicationConfig {
     pub group_migration_policy: GroupMigrationPolicy,
 }
 
+/// Device-local security input required while loading one replication runtime.
+///
+/// This value is intentionally separate from [`ReplicationConfig`]: it carries
+/// secret-bearing key material for the current process/device, while
+/// `ReplicationConfig` contains cloneable policy knobs that are safe to compare
+/// and log normally.
+#[derive(Clone, Debug)]
+pub struct ReplicationSecuritySecrets {
+    store_secret_key_id: StoreSecretKeyId,
+    store_secret_key: Arc<StoreSecretKey>,
+}
+
+impl ReplicationSecuritySecrets {
+    /// Build runtime security input from a shared store-secret key handle.
+    #[must_use]
+    pub fn new(
+        store_secret_key_id: StoreSecretKeyId,
+        store_secret_key: Arc<StoreSecretKey>,
+    ) -> Self {
+        Self {
+            store_secret_key_id,
+            store_secret_key,
+        }
+    }
+
+    /// Return the caller-defined store-secret key id expected by encrypted cells.
+    #[must_use]
+    pub fn store_secret_key_id(&self) -> &StoreSecretKeyId {
+        &self.store_secret_key_id
+    }
+
+    /// Return the shared store-secret key handle for internal runtime security loading.
+    pub(crate) fn store_secret_key(&self) -> &Arc<StoreSecretKey> {
+        &self.store_secret_key
+    }
+}
+
 /// Request to create a new replication group.
 pub struct CreateGroupRequest {
     pub members: Vec<MemberIdentity>,
@@ -711,6 +749,12 @@ impl StoreSecretKeyId {
     }
 }
 
+impl fmt::Display for StoreSecretKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One already-encrypted secret cell stored by replication storage.
 ///
 /// `key_id` identifies the device-local database secret used by the caller,
@@ -767,11 +811,27 @@ impl EncryptedStoreSecret {
 pub fn current_slice_placeholder_group_security_material(
     group_id: GroupId,
 ) -> EncryptedGroupSecurityMaterial {
+    current_slice_placeholder_group_security_material_with_key_id(
+        group_id,
+        StoreSecretKeyId::new("current-slice-placeholder-key"),
+    )
+}
+
+/// Build placeholder group-security material with a caller-selected key id.
+///
+/// This exists only so temporary static group setup can satisfy loader metadata
+/// validation until real group-secret provisioning lands.
+#[doc(hidden)]
+#[must_use]
+pub fn current_slice_placeholder_group_security_material_with_key_id(
+    group_id: GroupId,
+    key_id: StoreSecretKeyId,
+) -> EncryptedGroupSecurityMaterial {
     let seed = group_id.0.as_u128().to_le_bytes()[0];
     EncryptedGroupSecurityMaterial {
         encrypted_group_secret: EncryptedStoreSecret {
             crypto_version: STORE_SECRET_CRYPTO_V1,
-            key_id: StoreSecretKeyId::new("current-slice-placeholder-key"),
+            key_id,
             nonce: vec![seed; STORE_SECRET_CRYPTO_NONCE_LENGTH_V1].into_boxed_slice(),
             ciphertext: vec![seed, seed.wrapping_add(1), seed.wrapping_add(2)].into_boxed_slice(),
         },

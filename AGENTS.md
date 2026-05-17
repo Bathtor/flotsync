@@ -18,6 +18,7 @@
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical. Use `-W clippy::pedantic` before a change is considered ready for review.
 - Prefer readable control flow over chained iterator side effects.
+- Prefer `for` and `while`/`while let` over `loop` where possible; seeing the termination condition up front is usually clearer, even when the condition contains a fallible expression such as `while let Some(item) = next_item()?`.
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - Prefer `context(...)` / `with_context(...)` over manual `map_err(...)` when the target error still wraps the original source. Use `with_context(...)` when building the context captures clones, allocations, or other non-trivial work.
 - If the only reason to introduce a new error variant is to differentiate the use-site of an existing variant, prefer adding `location: Location` to the existing variant instead.

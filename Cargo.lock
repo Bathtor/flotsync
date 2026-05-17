@@ -1357,6 +1357,7 @@ dependencies = [
 name = "flotsync_io_examples"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "chrono",
  "clap",
@@ -1364,6 +1365,7 @@ dependencies = [
  "flotsync_data_types",
  "flotsync_io",
  "flotsync_replication",
+ "flotsync_security",
  "futures-util",
  "http",
  "httparse",

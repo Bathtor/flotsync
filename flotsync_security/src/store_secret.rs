@@ -34,6 +34,22 @@ impl StoreSecretKey {
         Self { bytes }
     }
 
+    /// Validate and build a store-secret key from already generated high-entropy bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError::StoreSecretKeyLength`] if `bytes` does not
+    /// contain exactly [`STORE_SECRET_KEY_LENGTH`] bytes.
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self> {
+        let bytes = <[u8; STORE_SECRET_KEY_LENGTH]>::try_from(bytes).map_err(|_| {
+            SecurityError::StoreSecretKeyLength {
+                expected: STORE_SECRET_KEY_LENGTH,
+                actual: bytes.len(),
+            }
+        })?;
+        Ok(Self::from_bytes(bytes))
+    }
+
     /// Generate a fresh store-secret key from operating system randomness.
     ///
     /// # Errors

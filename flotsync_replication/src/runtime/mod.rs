@@ -7,6 +7,7 @@ mod host;
 mod in_memory;
 pub(crate) mod messages;
 mod replay;
+mod store_security_validation;
 mod summary_request_manager;
 
 pub use component::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};

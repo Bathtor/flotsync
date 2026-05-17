@@ -73,6 +73,8 @@ pub enum SecurityError {
         expected: usize,
         actual: usize,
     },
+    #[snafu(display("Store secret key is {actual} bytes, expected {expected} bytes."))]
+    StoreSecretKeyLength { expected: usize, actual: usize },
     #[snafu(display("JWK key '{kid}' contains an invalid Ed25519 public key: {source}"))]
     InvalidEd25519PublicKey {
         kid: String,

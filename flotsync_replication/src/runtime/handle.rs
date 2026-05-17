@@ -1,34 +1,42 @@
-use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
-#[cfg(any(test, feature = "test-support"))]
-use crate::api::RuntimeSnafu;
-use crate::api::{
-    ApiError,
-    ApiResult,
-    ChangeGroupMembershipRequest,
-    CreateGroupRequest,
-    GroupId,
-    GroupMigration,
-    LoadError,
-    PublishChangesRequest,
-    PublishReceipt,
-    ReplicationApi,
-    ReplicationConfig,
-    ReplicationEventListener,
-    ReplicationStore,
-    SecurityUnavailableSnafu,
-    SnapshotRows,
-    SnapshotRowsRequest,
-    Summary,
-    SummaryRequest,
+use super::{
+    ReplicationRuntimeMessage,
+    host::DeliveryRuntimeHost,
+    store_security_validation::{
+        load_security_error_from_local_member,
+        load_security_error_from_runtime,
+        security_load_error,
+        validate_loaded_group_security,
+    },
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::delivery::security::DeliverySecurity;
+use crate::{
+    api::{
+        ApiError,
+        ApiResult,
+        ChangeGroupMembershipRequest,
+        CreateGroupRequest,
+        GroupId,
+        GroupMigration,
+        LoadError,
+        PublishChangesRequest,
+        PublishReceipt,
+        ReplicationApi,
+        ReplicationConfig,
+        ReplicationEventListener,
+        ReplicationSecuritySecrets,
+        ReplicationStore,
+        RuntimeSnafu,
+        SnapshotRows,
+        SnapshotRowsRequest,
+        Summary,
+        SummaryRequest,
+    },
+    delivery::security::DeliverySecurity,
+};
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
-#[cfg(any(test, feature = "test-support"))]
-use snafu::ResultExt;
+use snafu::prelude::*;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -37,7 +45,7 @@ use super::{
     messages::{UpdateBatchMessage, UpdateMessage},
 };
 #[cfg(test)]
-use crate::{GroupMembers, api::MemberIdentity};
+use crate::{GroupMembers, MemberIdentity};
 #[cfg(test)]
 use std::time::Duration;
 
@@ -64,12 +72,14 @@ pub async fn load_replication_runtime(
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
         application_id,
         store,
         listener,
         config,
+        security_secrets,
         None,
     )
     .await?;
@@ -90,6 +100,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
     runtime_config_toml: &str,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
@@ -97,30 +108,80 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
         store,
         listener,
         config,
+        security_secrets,
         Some(runtime_config_toml),
     )
     .await?;
     Ok(runtime)
 }
 
-#[allow(
-    clippy::unused_async,
-    reason = "temporary fail-fast loader keeps the async shape expected by public callers until runtime security provisioning lands"
-)]
 pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     application_id: Identifier,
-    _store: Arc<dyn ReplicationStore>,
-    _listener: Arc<dyn ReplicationEventListener>,
-    _config: ReplicationConfig,
-    _runtime_config_toml: Option<&str>,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
+    runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
-    // TODO(flotsync-uohh): Replace this fail-fast path with production key
-    // provisioning once runtime security setup leaves test support.
-    SecurityUnavailableSnafu { application_id }.fail()
+    let local_member = store
+        .local_member_identity()
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    let security_f = DeliverySecurity::load(
+        store.clone(),
+        &local_member,
+        security_secrets.store_secret_key().clone(),
+        security_secrets.store_secret_key_id().clone(),
+    );
+    let security = security_f
+        .await
+        .map_err(|source| load_security_error_from_local_member(&local_member, source))
+        .map_err(|source| security_load_error(application_id.clone(), source))?;
+    let validation_f = validate_loaded_group_security(
+        application_id.clone(),
+        store.clone(),
+        security_secrets.store_secret_key_id(),
+        &security,
+    );
+    validation_f
+        .await
+        .map_err(load_security_error_from_runtime)
+        .map_err(|source| security_load_error(application_id.clone(), source))?;
+    load_replication_runtime_typed_with_security(
+        application_id,
+        store,
+        listener,
+        config,
+        security,
+        runtime_config_toml,
+    )
+    .await
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    security: DeliverySecurity,
+    runtime_config_toml: Option<&str>,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    load_replication_runtime_typed_with_security(
+        application_id,
+        store,
+        listener,
+        config,
+        security,
+        runtime_config_toml,
+    )
+    .await
+}
+
+async fn load_replication_runtime_typed_with_security(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,

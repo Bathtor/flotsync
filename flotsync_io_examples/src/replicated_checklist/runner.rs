@@ -39,7 +39,7 @@ use flotsync_replication::{
     SqliteReplicationStore,
     StoreError,
     SummaryRequest,
-    current_slice_placeholder_group_security_material,
+    current_slice_placeholder_group_security_material_with_key_id,
     load_replication_runtime_with_runtime_config_toml,
 };
 use futures_util::{FutureExt, future::join_all};
@@ -100,6 +100,7 @@ pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError
         store,
         listener,
         ReplicationConfig::default(),
+        config.replication_security.clone(),
         &config.runtime_config_toml,
     ))
     .context(repl_error::LoadRuntimeSnafu)?;
@@ -679,8 +680,9 @@ async fn ensure_configured_group(
                 members: config.ordered_members.clone(),
                 local_member_index,
                 version_vector: VersionVector::initial(member_count),
-                security_material: current_slice_placeholder_group_security_material(
+                security_material: current_slice_placeholder_group_security_material_with_key_id(
                     config.group_id,
+                    config.replication_security.store_secret_key_id().clone(),
                 ),
             })
             .await
@@ -739,7 +741,10 @@ mod tests {
     use flotsync_io::test_support::{ReservedSocketKind, reserve_sockets};
     use flotsync_replication::{
         RowKey,
-        test_support::load_replication_runtime_with_test_security_toml,
+        test_support::{
+            load_replication_runtime_with_test_security_toml,
+            test_replication_security_secrets,
+        },
     };
     use uuid::Uuid;
 
@@ -749,6 +754,7 @@ mod tests {
             runtime_config_toml: String::new(),
             local_member: MemberIdentity::from_array(["alice"]),
             store_path,
+            replication_security: test_replication_security_secrets(),
             group_id,
             ordered_members: vec![MemberIdentity::from_array(["alice"])],
             local_endpoint_bind_addr: "127.0.0.1:45100".parse().unwrap(),

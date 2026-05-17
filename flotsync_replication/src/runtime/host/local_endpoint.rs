@@ -21,13 +21,6 @@ pub(super) struct LocalEndpointBinding {
 
 #[derive(Debug)]
 pub(super) enum LocalEndpointManagerMessage {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "runtime host local endpoint binding is temporarily unreachable while the public loader fails fast for security provisioning"
-        )
-    )]
     EnsureBound(Ask<(), Result<LocalEndpointBinding, RuntimeControlError>>),
 }
 
@@ -46,13 +39,6 @@ pub(super) struct LocalEndpointManager {
 }
 
 impl LocalEndpointManager {
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
-        )
-    )]
     pub(super) fn new(configured_bind_addr: SocketAddr) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -160,13 +146,6 @@ enum LocalEndpointManagerState {
 /// The caller must pass a live component whose actor ref can still be upgraded
 /// to a strong ref. `control_timeout` bounds the whole ask/response exchange,
 /// including the UDP bind indication that fulfils the manager promise.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "runtime host local endpoint binding is temporarily unreachable while the public loader fails fast for security provisioning"
-    )
-)]
 pub(super) async fn ensure_local_endpoint_bound(
     local_endpoint_manager: &Arc<Component<LocalEndpointManager>>,
     control_timeout: Duration,
@@ -184,13 +163,6 @@ pub(super) async fn ensure_local_endpoint_bound(
         .context(BindLocalEndpointSnafu)
 }
 
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "runtime host local endpoint binding is temporarily unreachable while the public loader fails fast for security provisioning"
-    )
-)]
 fn flatten_local_endpoint_ask_result<E>(
     result: Result<Result<LocalEndpointBinding, RuntimeControlError>, E>,
 ) -> Result<LocalEndpointBinding, RuntimeControlError>

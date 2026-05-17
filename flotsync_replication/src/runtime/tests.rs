@@ -15,6 +15,7 @@ use super::{
         validate_update_mapping,
     },
     load_replication_runtime,
+    load_replication_runtime_with_runtime_config_toml,
     messages::{
         BootstrapGroupKey,
         BootstrapGroupMessage,
@@ -36,10 +37,12 @@ use crate::{
         DatasetRowPatch,
         DatasetRowSlice,
         DatasetUpdateRecord,
+        EncryptedGroupSecurityMaterial,
         GroupId,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
+        LoadSecurityError,
         LocalMemberPrivateKeysRecord,
         MemberIdentity,
         MemberIndex,
@@ -52,6 +55,7 @@ use crate::{
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
+        ReplicationSecuritySecrets,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -68,9 +72,11 @@ use crate::{
         SnapshotRowsRequest,
         StoreError,
         StoreExternalSnafu,
+        StoreSecretCryptoVersion,
         SummaryRequest,
         TrustedMemberPublicKeysRecord,
         current_slice_placeholder_group_security_material,
+        current_slice_placeholder_group_security_material_with_key_id,
         process_batches,
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
@@ -78,6 +84,7 @@ use crate::{
         load_test_delivery_security,
         provision_test_security as provision_shared_test_security,
         test_public_member_keys,
+        test_replication_security_secrets,
     },
 };
 use flotsync_core::{
@@ -86,7 +93,7 @@ use flotsync_core::{
 };
 use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
-use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicMemberKeys};
+use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicMemberKeys, StoreSecretKey};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
@@ -802,6 +809,18 @@ fn static_peer_route_toml(peer: &MemberIdentity, remote_addr: SocketAddr) -> Str
     )
 }
 
+fn local_endpoint_toml(local_addr: SocketAddr) -> String {
+    format!(
+        r#"
+        [flotsync.io]
+        bind-reuse-address = true
+
+        [flotsync.replication.runtime]
+        local-endpoint-bind-addr = "{local_addr}"
+        "#,
+    )
+}
+
 fn persist_group_in_store<S>(store: &S, group: ReplicationGroupRecord)
 where
     S: ReplicationStore + ?Sized,
@@ -810,6 +829,39 @@ where
         wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
     wait_for_test_reply(transaction.insert_replication_group(group)).expect("group should persist");
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+}
+
+fn persist_alice_group_with_security_material(
+    store: &dyn ReplicationStore,
+    group_id: GroupId,
+    security_material: EncryptedGroupSecurityMaterial,
+) {
+    persist_group_in_store(
+        store,
+        ReplicationGroupRecord {
+            group_id,
+            members: vec![alice_member()],
+            local_member_index: MemberIndex::new(0),
+            version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
+            security_material,
+        },
+    );
+}
+
+fn security_load_error(
+    error: LoadError,
+    expected_application_id: &Identifier,
+) -> Box<LoadSecurityError> {
+    match error {
+        LoadError::Security {
+            application_id,
+            source,
+        } => {
+            assert_eq!(&application_id, expected_application_id);
+            source
+        }
+        other => panic!("unexpected load error: {other:?}"),
+    }
 }
 
 fn load_persisted_group<S>(store: &S, group_id: GroupId) -> ReplicationGroupRecord
@@ -1043,7 +1095,28 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 }
 
 #[test]
-fn load_replication_runtime_rejects_missing_security_provisioning() {
+fn load_replication_runtime_accepts_store_provisioned_security() {
+    let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let application_id = app_probe_id();
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
+
+    let _loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
+        application_id,
+        store,
+        listener,
+        ReplicationConfig::default(),
+        test_replication_security_secrets(),
+        &runtime_config_toml,
+    ))
+    .expect("public runtime loading should accept provisioned security");
+}
+
+#[test]
+fn load_replication_runtime_rejects_missing_local_private_keys() {
     let application_id = app_probe_id();
     let store =
         Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
@@ -1054,17 +1127,211 @@ fn load_replication_runtime_rejects_missing_security_provisioning() {
         store,
         listener,
         ReplicationConfig::default(),
+        test_replication_security_secrets(),
     ));
     let Err(error) = loaded_runtime else {
         panic!("public runtime loading should reject missing security provisioning");
     };
 
-    match error {
-        LoadError::SecurityUnavailable {
-            application_id: unavailable_application_id,
-        } => assert_eq!(unavailable_application_id, application_id),
-        other => panic!("unexpected load error: {other:?}"),
-    }
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::MissingLocalPrivateKeys { member_id }
+            if member_id == &alice_member()
+    ));
+}
+
+#[test]
+fn load_replication_runtime_rejects_wrong_store_secret_key() {
+    let application_id = app_probe_id();
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let test_security = test_replication_security_secrets();
+    let wrong_security = ReplicationSecuritySecrets::new(
+        test_security.store_secret_key_id().clone(),
+        Arc::new(StoreSecretKey::from_bytes([42; 32])),
+    );
+
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
+        store,
+        listener,
+        ReplicationConfig::default(),
+        wrong_security,
+    ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject wrong store-secret key");
+    };
+
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::InvalidLocalPrivateKeys { member_id, .. }
+            if member_id == &alice_member()
+    ));
+}
+
+#[test]
+fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
+    let application_id = app_probe_id();
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let group_id = GroupId(Uuid::from_u128(50_402));
+    persist_alice_group_with_security_material(
+        store.as_ref(),
+        group_id,
+        current_slice_placeholder_group_security_material(group_id),
+    );
+    let listener = Arc::new(ListenerStub::default());
+
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
+        store,
+        listener,
+        ReplicationConfig::default(),
+        test_replication_security_secrets(),
+    ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject group security key-id mismatch");
+    };
+
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::StoredGroupKeyIdMismatch {
+            group_id: error_group_id,
+            ..
+        } if error_group_id == &group_id
+    ));
+}
+
+#[test]
+fn load_replication_runtime_rejects_unsupported_stored_group_security_version() {
+    let application_id = app_probe_id();
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let group_id = GroupId(Uuid::from_u128(50_403));
+    let mut security_material = current_slice_placeholder_group_security_material_with_key_id(
+        group_id,
+        test_replication_security_secrets()
+            .store_secret_key_id()
+            .clone(),
+    );
+    security_material.encrypted_group_secret.crypto_version = StoreSecretCryptoVersion::new(999);
+    persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
+    let listener = Arc::new(ListenerStub::default());
+
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
+        store,
+        listener,
+        ReplicationConfig::default(),
+        test_replication_security_secrets(),
+    ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject unsupported group security version");
+    };
+
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::StoredGroupUnsupportedStoreSecretVersion {
+            group_id: error_group_id,
+            version: 999,
+            supported: _,
+        } if error_group_id == &group_id
+    ));
+}
+
+#[test]
+fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length() {
+    let application_id = app_probe_id();
+    let store =
+        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let group_id = GroupId(Uuid::from_u128(50_404));
+    let mut security_material = current_slice_placeholder_group_security_material_with_key_id(
+        group_id,
+        test_replication_security_secrets()
+            .store_secret_key_id()
+            .clone(),
+    );
+    security_material.encrypted_group_secret.nonce = vec![7].into_boxed_slice();
+    persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
+    let listener = Arc::new(ListenerStub::default());
+
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
+        store,
+        listener,
+        ReplicationConfig::default(),
+        test_replication_security_secrets(),
+    ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject invalid group security nonce length");
+    };
+
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::StoredGroupInvalidGroupSecretNonceLength {
+            group_id: error_group_id,
+            actual: 1,
+            ..
+        } if error_group_id == &group_id
+    ));
+}
+
+#[test]
+fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
+    let application_id = app_probe_id();
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let group_id = GroupId(Uuid::from_u128(50_401));
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            members: vec![alice_member.clone(), bob_member.clone()],
+            local_member_index: MemberIndex::new(0),
+            version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            security_material: current_slice_placeholder_group_security_material_with_key_id(
+                group_id,
+                test_replication_security_secrets()
+                    .store_secret_key_id()
+                    .clone(),
+            ),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
+        store,
+        listener,
+        ReplicationConfig::default(),
+        test_replication_security_secrets(),
+    ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject missing trusted keys for stored group");
+    };
+
+    let error = security_load_error(error, &application_id);
+    assert!(matches!(
+        error.as_ref(),
+        LoadSecurityError::StoredGroupMissingTrustedPublicKeys {
+            group_id: error_group_id,
+            member_id,
+        } if error_group_id == &group_id && member_id == &bob_member
+    ));
 }
 
 #[test]
