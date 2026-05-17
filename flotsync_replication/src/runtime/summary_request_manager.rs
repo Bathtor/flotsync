@@ -1,5 +1,5 @@
 use super::{
-    envelope::{encode_runtime_payload, placeholder_signed_footer},
+    envelope::encode_runtime_payload,
     errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary},
     messages::{RuntimeMessage, SummaryRequestMessage, WireRuntimeMessage, WireSummaryMessage},
 };
@@ -18,7 +18,7 @@ use crate::{
             ReliableMessageEnvelope,
             ReliableMessageHeader,
         },
-        shared::{EncryptedPayload, MessageId},
+        shared::{MessageId, PlaintextPayload},
     },
 };
 use flotsync_utils::{KClaimablePromise, OptionExt as _};
@@ -105,6 +105,13 @@ pub(super) struct SummaryRequestManagerComponent {
 }
 
 impl SummaryRequestManagerComponent {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     pub(super) fn new(
         local_member: MemberIdentity,
         group_memberships: SharedGroupMemberships,
@@ -160,16 +167,13 @@ impl SummaryRequestManagerComponent {
         self.reliable_delivery
             .trigger(ReliableDeliveryPortRequest::Submit(
                 ReliableDeliverySubmit {
-                    envelope: ReliableMessageEnvelope {
+                    envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                         header: ReliableMessageHeader {
                             sender: self.local_member.clone(),
                             recipient,
                             message_id: MessageId(Uuid::new_v4()),
                         },
-                        payload: EncryptedPayload {
-                            ciphertext: payload,
-                        },
-                        footer: placeholder_signed_footer(),
+                        payload: PlaintextPayload { bytes: payload },
                     },
                 },
             ));
@@ -298,17 +302,16 @@ impl SummaryRequestManagerComponent {
 
     fn handle_reliable_delivery(&mut self, deliver: ReliableDeliveryDeliver) -> HandlerResult {
         let context = SummaryInboundContext::reliable(&deliver.envelope.header);
-        let message =
-            match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => {
-                    let failure = SummaryInboundFailure::new(context, error);
-                    let action = self.record_inbound_failure(&failure);
-                    return handled_after_inbound_failure(action, &failure);
-                }
-            };
+        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
+            .context(inbound::DecodeMessageSnafu)
+        {
+            Ok(message) => message,
+            Err(error) => {
+                let failure = SummaryInboundFailure::new(context, error);
+                let action = self.record_inbound_failure(&failure);
+                return handled_after_inbound_failure(action, &failure);
+            }
+        };
         match message {
             WireRuntimeMessage::Summary(message) => {
                 let sender = deliver.envelope.header.sender.clone();

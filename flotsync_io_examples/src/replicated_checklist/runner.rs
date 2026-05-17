@@ -737,7 +737,10 @@ fn format_timestamp(timestamp: SystemTime) -> String {
 mod tests {
     use super::*;
     use flotsync_io::test_support::{ReservedSocketKind, reserve_sockets};
-    use flotsync_replication::RowKey;
+    use flotsync_replication::{
+        RowKey,
+        test_support::load_replication_runtime_with_test_security_toml,
+    };
     use uuid::Uuid;
 
     fn test_config(group_id: GroupId, store_path: PathBuf) -> ChecklistAppConfig {
@@ -799,7 +802,7 @@ mod tests {
         block_on(ensure_configured_group(store.as_ref(), &config))
             .expect("static group should be prepared");
         let (listener, _listener_receiver) = ChecklistListener::pair();
-        let replication = block_on(load_replication_runtime_with_runtime_config_toml(
+        let replication = block_on(load_replication_runtime_with_test_security_toml(
             Identifier::from_array(["flotsync", "examples", "replicated-checklist"]),
             store,
             listener,

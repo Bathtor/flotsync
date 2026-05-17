@@ -27,12 +27,24 @@ message RuntimeMessage {
 message BootstrapGroup {
   bytes group_id = 1;
 
-  // Canonical group-member order.
+  // Canonical group-member order and public identity keys.
   //
   // This repeated field is semantically ordered. The replication runtime uses
   // the preserved protobuf element order as the canonical member index order
   // for the group.
-  repeated flotsync.discovery.v1.Identifier members = 2;
+  repeated BootstrapMemberPublicKeys member_public_keys = 2;
+
+  // Symmetric group-message cipher suite identifier.
+  uint32 group_cipher_suite = 4;
+
+  // Raw symmetric group key sealed by reliable delivery in transit.
+  bytes group_key = 5;
+}
+
+message BootstrapMemberPublicKeys {
+  flotsync.discovery.v1.Identifier member_id = 1;
+  bytes signing_public_key = 2;
+  bytes encryption_public_key = 3;
 }
 
 // One causal replication update delivered through GroupBroadcast.

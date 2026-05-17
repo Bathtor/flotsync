@@ -21,6 +21,7 @@ use crate::{
             TransportRouteKey,
             manager::{RouteTransportManager, configure_replication_runtime},
         },
+        security::DeliverySecurity,
     },
 };
 #[cfg(test)]
@@ -61,8 +62,29 @@ use discovery::{
 };
 use local_endpoint::LocalEndpointManager;
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 type ReliableDeliveryInboundRoutePort = ReliableDeliveryInboundPort<TransportRouteKey>;
 
 mod config_keys {
@@ -72,6 +94,13 @@ mod config_keys {
     };
     use std::time::Duration;
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     fn default_local_endpoint_bind_addr() -> String {
         if cfg!(test) {
             String::from("127.0.0.1:0")
@@ -110,6 +139,13 @@ mod config_keys {
 
 /// Startup and shutdown failures for the internal delivery runtime host.
 #[derive(Debug, Snafu)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host startup is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 pub(crate) enum RuntimeHostError {
     #[snafu(display("Failed to build Kompact system for the replication runtime: {source}"))]
     BuildSystem {
@@ -204,12 +240,26 @@ impl From<TimeoutError> for RuntimeControlError {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 struct DeliveryRuntimeHostConfig {
     control_timeout: Duration,
     summary_request_timeout: Duration,
     local_endpoint_bind_addr: SocketAddr,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl DeliveryRuntimeHostConfig {
     fn from_system_config(system: &KompactSystem) -> Result<Self, RuntimeHostError> {
         let control_timeout = system
@@ -273,6 +323,13 @@ pub(crate) struct DeliveryRuntimeHost {
 
 /// Type-erased lifecycle operations for one concrete Kompact component.
 trait RuntimeLifecycleComponent: Send + Sync {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host topology startup is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     fn start<'a>(
         &'a self,
         system: &'a KompactSystem,
@@ -296,6 +353,13 @@ trait ComponentTopology {
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent>;
 
     /// Start every lifecycle node in the order exposed by `nodes`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host topology startup is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     async fn start_all(
         &self,
         system: &KompactSystem,
@@ -320,6 +384,13 @@ trait ComponentTopology {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 fn connect_components<P, C1, C2>(
     source: &Arc<Component<C1>>,
     target: &Arc<Component<C2>>,
@@ -339,6 +410,13 @@ where
     Ok(())
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 fn describe_component_connect_error(error: &TryDualLockError) -> &'static str {
     match error {
         TryDualLockError::LeftWouldBlock => "provider component lock would block",
@@ -348,6 +426,13 @@ fn describe_component_connect_error(error: &TryDualLockError) -> &'static str {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host UDP wiring is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 async fn connect_udp_component<C>(
     udp_connect_handle: &IoBridgeHandle,
     component: &Arc<Component<C>>,
@@ -408,6 +493,13 @@ where
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host startup is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 struct BuiltRuntimeSystem {
     system: KompactSystem,
     #[cfg(test)]
@@ -419,6 +511,13 @@ struct IoTopology {
     bridge: Arc<Component<IoBridge>>,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl IoTopology {
     fn build(system: &KompactSystem) -> Self {
         let driver = IoDriverComponent::new(DriverConfig::default());
@@ -452,6 +551,13 @@ struct TransportTopology {
     manager: Arc<Component<RouteTransportManager>>,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl TransportTopology {
     fn build(system: &KompactSystem, bridge: &Arc<Component<IoBridge>>) -> Self {
         let manager = RouteTransportManager::new(
@@ -487,12 +593,20 @@ struct DeliveryTopology {
     reliable_delivery: Arc<Component<ReliableDeliveryComponent>>,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl DeliveryTopology {
     fn build(
         system: &KompactSystem,
         group_memberships: SharedGroupMemberships,
         local_member: MemberIdentity,
         manager_ref: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+        security: DeliverySecurity,
     ) -> Self {
         let ingress = DeliveryIngressComponent::new(DeliveryInterestConfig {
             group_memberships: group_memberships.clone(),
@@ -502,7 +616,7 @@ impl DeliveryTopology {
         let ingress = system.create(move || ingress);
         let group_broadcast = GroupBroadcastComponent::new(group_memberships, manager_ref.clone());
         let group_broadcast = system.create(move || group_broadcast);
-        let reliable_delivery = ReliableDeliveryComponent::new(manager_ref);
+        let reliable_delivery = ReliableDeliveryComponent::new(manager_ref, security);
         let reliable_delivery = system.create(move || reliable_delivery);
         Self {
             ingress,
@@ -573,6 +687,13 @@ struct DiscoveryTopology {
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl DiscoveryTopology {
     fn build(
         system: &KompactSystem,
@@ -621,6 +742,13 @@ struct RuntimeLogicTopology {
     runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl RuntimeLogicTopology {
     fn build(
         system: &KompactSystem,
@@ -628,6 +756,7 @@ impl RuntimeLogicTopology {
         local_member: MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        security: DeliverySecurity,
         host_config: DeliveryRuntimeHostConfig,
     ) -> Self {
         let catch_up_manager = CatchUpManagerComponent::new(
@@ -654,6 +783,7 @@ impl RuntimeLogicTopology {
             local_member,
             store,
             listener,
+            security,
             group_memberships,
             summary_request_manager_ref,
             catch_up_manager_ref,
@@ -710,33 +840,53 @@ struct RuntimeTopology {
     runtime: RuntimeLogicTopology,
 }
 
+/// Inputs needed to assemble a full runtime topology.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
+struct RuntimeTopologyBuildInput {
+    group_memberships: SharedGroupMemberships,
+    local_member: MemberIdentity,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    security: DeliverySecurity,
+    host_config: DeliveryRuntimeHostConfig,
+    route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl RuntimeTopology {
-    fn build(
-        system: &KompactSystem,
-        group_memberships: SharedGroupMemberships,
-        local_member: MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-        host_config: DeliveryRuntimeHostConfig,
-        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
-    ) -> Self {
+    fn build(system: &KompactSystem, input: RuntimeTopologyBuildInput) -> Self {
         let io = IoTopology::build(system);
         let transport = TransportTopology::build(system, &io.bridge);
         let manager_ref = transport.manager_ref();
         let delivery = DeliveryTopology::build(
             system,
-            group_memberships.clone(),
-            local_member.clone(),
+            input.group_memberships.clone(),
+            input.local_member.clone(),
             manager_ref,
+            input.security.clone(),
         );
-        let discovery = DiscoveryTopology::build(system, host_config, route_publish_mode);
+        let discovery =
+            DiscoveryTopology::build(system, input.host_config, input.route_publish_mode);
         let runtime = RuntimeLogicTopology::build(
             system,
-            group_memberships,
-            local_member,
-            store,
-            listener,
-            host_config,
+            input.group_memberships,
+            input.local_member,
+            input.store,
+            input.listener,
+            input.security,
+            input.host_config,
         );
 
         Self {
@@ -796,6 +946,13 @@ impl ComponentTopology for RuntimeTopology {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host startup is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 impl DeliveryRuntimeHost {
     fn new(
         system: KompactSystem,
@@ -839,12 +996,14 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
     ) -> Result<Self, RuntimeHostError> {
         Self::start_with_options(
             local_member,
             store,
             listener,
+            security,
             runtime_config_toml,
             PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound,
         )
@@ -855,6 +1014,7 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Result<Self, RuntimeHostError> {
@@ -866,12 +1026,15 @@ impl DeliveryRuntimeHost {
         let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
         let topology = RuntimeTopology::build(
             &system,
-            group_memberships.clone(),
-            local_member.clone(),
-            store,
-            listener,
-            host_config,
-            route_publish_mode,
+            RuntimeTopologyBuildInput {
+                group_memberships: group_memberships.clone(),
+                local_member: local_member.clone(),
+                store,
+                listener,
+                security,
+                host_config,
+                route_publish_mode,
+            },
         );
         topology.connect_all()?;
         topology
@@ -909,6 +1072,7 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Result<Self, RuntimeHostError> {
@@ -916,6 +1080,7 @@ impl DeliveryRuntimeHost {
             local_member,
             store,
             listener,
+            security,
             runtime_config_toml,
             route_publish_mode,
         )
@@ -1030,6 +1195,10 @@ async fn build_runtime_system(
 }
 
 #[cfg(not(test))]
+#[allow(
+    dead_code,
+    reason = "runtime host startup is temporarily unreachable while the public loader fails fast for security provisioning"
+)]
 async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
@@ -1069,6 +1238,13 @@ fn rebind_reserved_runtime_local_endpoint_binding(local_endpoint_lease: &mut Res
     }
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "runtime host startup is temporarily unreachable while the public loader fails fast for security provisioning"
+    )
+)]
 fn annotate_local_endpoint_bind_error(
     system: &KompactSystem,
     configured_bind_addr: SocketAddr,

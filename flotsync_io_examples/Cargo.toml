@@ -25,6 +25,9 @@ slog-term = "2"
 snafu = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+flotsync_replication = { path = "../flotsync_replication", features = ["test-support"] }
+
 [[bin]]
 name = "netcat"
 path = "src/bin/netcat.rs"

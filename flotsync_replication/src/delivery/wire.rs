@@ -75,6 +75,20 @@ pub(crate) fn message_id_from_wire(
     Ok(MessageId(uuid_from_wire(raw, field)?))
 }
 
+/// Validate and copy a protobuf byte field into a fixed-width protocol array.
+pub(crate) fn fixed_bytes_field<const N: usize>(
+    field: &'static str,
+    bytes: &[u8],
+) -> Result<[u8; N], WireValueDecodeError> {
+    bytes
+        .try_into()
+        .map_err(|_| WireValueDecodeError::InvalidByteLength {
+            field,
+            expected: N,
+            actual: bytes.len(),
+        })
+}
+
 pub(crate) fn signature_to_wire_format(footer: &SignedEnvelopeFooter) -> proto::SignatureWire {
     proto::SignatureWire {
         scheme: flotsync_messages::buffa::EnumValue::from(match footer.signature.scheme {
@@ -632,6 +646,13 @@ pub(crate) enum WireValueDecodeError {
 
     #[snafu(display("Field '{field}' used the unspecified signature scheme"))]
     UnspecifiedSignatureScheme { field: &'static str },
+
+    #[snafu(display("Field '{field}' had invalid byte length {actual}; expected {expected}."))]
+    InvalidByteLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 fn uuid_from_wire(raw: &[u8], field: &'static str) -> Result<Uuid, WireValueDecodeError> {

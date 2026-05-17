@@ -1,4 +1,6 @@
 use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
+#[cfg(any(test, feature = "test-support"))]
+use crate::api::RuntimeSnafu;
 use crate::api::{
     ApiError,
     ApiResult,
@@ -13,17 +15,20 @@ use crate::api::{
     ReplicationConfig,
     ReplicationEventListener,
     ReplicationStore,
-    RuntimeSnafu,
+    SecurityUnavailableSnafu,
     SnapshotRows,
     SnapshotRowsRequest,
     Summary,
     SummaryRequest,
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::delivery::security::DeliverySecurity;
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
-use snafu::prelude::*;
+#[cfg(any(test, feature = "test-support"))]
+use snafu::ResultExt;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -98,28 +103,29 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
     Ok(runtime)
 }
 
-#[cfg(test)]
-pub(super) async fn load_replication_runtime_typed(
-    application_id: Identifier,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-) -> Result<Arc<ReplicationRuntime>, LoadError> {
-    load_replication_runtime_typed_with_runtime_config_toml(
-        application_id,
-        store,
-        listener,
-        config,
-        None,
-    )
-    .await
-}
-
+#[allow(
+    clippy::unused_async,
+    reason = "temporary fail-fast loader keeps the async shape expected by public callers until runtime security provisioning lands"
+)]
 pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     application_id: Identifier,
+    _store: Arc<dyn ReplicationStore>,
+    _listener: Arc<dyn ReplicationEventListener>,
+    _config: ReplicationConfig,
+    _runtime_config_toml: Option<&str>,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    // TODO(flotsync-uohh): Replace this fail-fast path with production key
+    // provisioning once runtime security setup leaves test support.
+    SecurityUnavailableSnafu { application_id }.fail()
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
+    application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security: DeliverySecurity,
     runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     let local_member = store
@@ -133,6 +139,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         &local_member,
         store,
         listener,
+        security,
         runtime_config_toml,
     )
     .await
@@ -155,7 +162,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
 }
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
-pub(super) struct ReplicationRuntime {
+pub(crate) struct ReplicationRuntime {
     _application_id: Identifier,
     runtime_ref: Option<ActorRefStrong<ReplicationRuntimeMessage>>,
     #[cfg_attr(not(test), allow(dead_code))]

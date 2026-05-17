@@ -1,5 +1,6 @@
 use crate::delivery::wire::{
     WireValueDecodeError,
+    fixed_bytes_field,
     member_identity_from_wire,
     member_identity_to_wire_format,
     message_id_from_wire,
@@ -15,6 +16,7 @@ use super::{
     ReliableMessageHeader,
 };
 use flotsync_messages::{buffa::MessageField, delivery as delivery_proto};
+use flotsync_security::{HPKE_ENCAPSULATED_KEY_LENGTH, SIGNATURE_LENGTH, SealedReliablePayload};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -30,7 +32,7 @@ pub(super) enum ReliableDeliveryWireError {
 }
 
 pub(super) fn reliable_envelope_to_wire_format(
-    envelope: &ReliableMessageEnvelope,
+    envelope: &ReliableMessageEnvelope<EncryptedPayload>,
 ) -> delivery_proto::DeliveryBoundaryFrame {
     let header = delivery_proto::ReliableEnvelopeHeader {
         sender: MessageField::some(member_identity_to_wire_format(&envelope.header.sender)),
@@ -38,10 +40,16 @@ pub(super) fn reliable_envelope_to_wire_format(
         message_id: envelope.header.message_id.0.as_bytes().to_vec(),
         ..delivery_proto::ReliableEnvelopeHeader::default()
     };
+    let sealed_payload = &envelope.payload.sealed;
+    let sealed_payload = delivery_proto::SealedReliablePayload {
+        hpke_encapsulated_key: sealed_payload.encapsulated_key.to_vec(),
+        hpke_ciphertext: sealed_payload.ciphertext.clone().into(),
+        sender_signature: sealed_payload.signature.to_vec(),
+        ..delivery_proto::SealedReliablePayload::default()
+    };
     let wire = delivery_proto::ReliableEnvelopeWire {
         public_header: MessageField::some(header),
-        encrypted_payload: envelope.payload.ciphertext.clone(),
-        footer: MessageField::some(signature_to_wire_format(&envelope.footer)),
+        sealed_payload: MessageField::some(sealed_payload),
         ..delivery_proto::ReliableEnvelopeWire::default()
     };
     let frame = delivery_proto::ReliableDeliveryFrame {
@@ -90,14 +98,14 @@ pub(super) fn recipient_ack_to_wire_format(
 
 pub(super) fn reliable_envelope_from_wire(
     mut envelope: delivery_proto::ReliableEnvelopeWire,
-) -> Result<ReliableMessageEnvelope, ReliableDeliveryWireError> {
+) -> Result<ReliableMessageEnvelope<EncryptedPayload>, ReliableDeliveryWireError> {
     let mut header = envelope.public_header.take().context(MissingFieldSnafu {
         message: "ReliableEnvelopeWire",
         field: "public_header",
     })?;
-    let footer = envelope.footer.take().context(MissingFieldSnafu {
+    let sealed_payload = envelope.sealed_payload.take().context(MissingFieldSnafu {
         message: "ReliableEnvelopeWire",
-        field: "footer",
+        field: "sealed_payload",
     })?;
 
     let sender = member_identity_from_wire(
@@ -116,16 +124,28 @@ pub(super) fn reliable_envelope_from_wire(
     )?;
     let message_id = message_id_from_wire(&header.message_id, "ReliableEnvelopeHeader.message_id")?;
 
-    Ok(ReliableMessageEnvelope {
+    let encapsulated_key = fixed_bytes_field::<HPKE_ENCAPSULATED_KEY_LENGTH>(
+        "SealedReliablePayload.hpke_encapsulated_key",
+        &sealed_payload.hpke_encapsulated_key,
+    )?;
+    let signature = fixed_bytes_field::<SIGNATURE_LENGTH>(
+        "SealedReliablePayload.sender_signature",
+        &sealed_payload.sender_signature,
+    )?;
+
+    Ok(ReliableMessageEnvelope::<EncryptedPayload> {
         header: ReliableMessageHeader {
             sender,
             recipient,
             message_id,
         },
         payload: EncryptedPayload {
-            ciphertext: envelope.encrypted_payload,
+            sealed: SealedReliablePayload {
+                encapsulated_key,
+                ciphertext: sealed_payload.hpke_ciphertext.to_vec(),
+                signature,
+            },
         },
-        footer: signature_from_wire(footer, "ReliableEnvelopeWire.footer")?,
     })
 }
 

@@ -1,4 +1,4 @@
-//! Recipient-addressed durable delivery types and the minimal direct-runtime slice.
+//! Recipient-addressed reliable delivery types and the minimal direct-runtime slice.
 
 mod wire;
 
@@ -20,14 +20,15 @@ use super::{
         SendRouteCandidate,
         TransportRouteKey,
     },
+    security::{DeliverySecurity, DeliverySecurityError},
     shared::{
         ActiveRouteRecord,
         DetachedSignature,
-        EncryptedPayload,
         LogicalRouteId,
         MailboxItemId,
         MessageId,
         PendingRouteReason,
+        PlaintextPayload,
         RelayIdentity,
         RouteActiveState,
         RouteSendId,
@@ -41,6 +42,7 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
+use flotsync_security::SealedReliablePayload;
 use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
 use std::{
@@ -65,16 +67,20 @@ pub struct ReliableMessageHeader {
     pub message_id: MessageId,
 }
 
-/// Immutable sender-signed envelope used for both direct recipient delivery and
-/// relay mailbox storage.
+/// HPKE-sealed and sender-signed reliable-delivery payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReliableMessageEnvelope {
-    pub header: ReliableMessageHeader,
-    pub payload: EncryptedPayload,
-    pub footer: SignedEnvelopeFooter,
+pub struct EncryptedPayload {
+    pub sealed: SealedReliablePayload,
 }
 
-impl ReliableMessageEnvelope {
+/// Recipient-addressed envelope queued or carried by reliable delivery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReliableMessageEnvelope<P> {
+    pub header: ReliableMessageHeader,
+    pub payload: P,
+}
+
+impl ReliableMessageEnvelope<EncryptedPayload> {
     fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
         reliable_envelope_to_wire_format(self)
     }
@@ -83,13 +89,13 @@ impl ReliableMessageEnvelope {
 /// Replication-to-delivery request for one recipient-addressed message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReliableDeliverySubmit {
-    pub envelope: ReliableMessageEnvelope,
+    pub envelope: ReliableMessageEnvelope<PlaintextPayload>,
 }
 
 /// Inbound reliable-delivery message delivered by the network-facing service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReliableDeliveryDeliver {
-    pub envelope: ReliableMessageEnvelope,
+    pub envelope: ReliableMessageEnvelope<PlaintextPayload>,
     /// Completing this handle confirms that the recipient processed the
     /// delivered item and may now emit a semantic recipient ack.
     pub processed: KClaimablePromise<()>,
@@ -130,7 +136,7 @@ pub struct ReliableDeliveryWorkItem {
     pub recipient_ack: RecipientAckStatus,
 }
 
-/// Sender-side completion tracking for recipient-addressed durable delivery.
+/// Sender-side completion tracking for recipient-addressed reliable delivery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipientAckStatus {
     Pending,
@@ -178,7 +184,7 @@ pub struct MailboxFetch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailboxItem {
     pub item_id: MailboxItemId,
-    pub envelope: ReliableMessageEnvelope,
+    pub envelope: ReliableMessageEnvelope<EncryptedPayload>,
 }
 
 /// One full fetch response from a relay mailbox.
@@ -220,6 +226,7 @@ pub struct ReliableDeliveryComponent {
     ingress_inbound_port: RequiredPort<TransportReliableDeliveryInboundPort>,
     discovery_port: RequiredPort<TransportRouteDiscoveryPort>,
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+    security: DeliverySecurity,
     direct_peer_routes: TrieMap<SendRouteCandidate<TransportRouteKey>>,
     sender_work_items: HashMap<MessageId, ReliableDeliveryWorkItem>,
     inbound_deliveries: HashMap<MessageId, PendingInboundDelivery>,
@@ -233,8 +240,9 @@ impl ReliableDeliveryComponent {
     /// Create one new reliable-delivery component around the shared
     /// route-transport actor.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+        security: DeliverySecurity,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -242,6 +250,7 @@ impl ReliableDeliveryComponent {
             ingress_inbound_port: RequiredPort::uninitialised(),
             discovery_port: RequiredPort::uninitialised(),
             route_transport,
+            security,
             direct_peer_routes: TrieMap::new(),
             sender_work_items: HashMap::new(),
             inbound_deliveries: HashMap::new(),
@@ -396,44 +405,63 @@ impl ReliableDeliveryComponent {
         &mut self,
         envelope: delivery_proto::ReliableEnvelopeWire,
     ) -> HandlerResult {
-        let envelope = reliable_envelope_from_wire(envelope)
+        let encrypted_envelope = reliable_envelope_from_wire(envelope)
             .whatever_benign("Reliable delivery dropped inbound envelope that failed to decode")?;
-        let message_id = envelope.header.message_id;
+        let message_id = encrypted_envelope.header.message_id;
         if self.handle_inbound_envelope_if_already_tracked(message_id) {
             return Handled::OK;
         }
 
-        let (processed, processed_future) = KClaimablePromise::create_pair();
-        self.inbound_deliveries.insert(
-            message_id,
-            PendingInboundDelivery {
-                envelope: envelope.clone(),
-                state: PendingInboundDeliveryState::AwaitingProcessed,
-                ack: None,
-            },
-        );
-        self.delivery_port
-            .trigger(ReliableDeliveryPortIndication::Deliver(
-                ReliableDeliveryDeliver {
-                    envelope,
-                    processed,
+        Handled::block_on(self, async move |mut async_self| {
+            let plaintext = async_self
+                .security
+                .open_reliable_payload(
+                    &encrypted_envelope.header,
+                    &encrypted_envelope.payload.sealed,
+                )
+                .await
+                .whatever_benign(
+                    "Reliable delivery dropped inbound envelope that failed to open",
+                )?;
+            let envelope = ReliableMessageEnvelope::<PlaintextPayload> {
+                header: encrypted_envelope.header,
+                payload: PlaintextPayload {
+                    bytes: Bytes::from(plaintext),
                 },
-            ));
-        debug!(
-            self.log(),
-            "Reliable delivery waiting for processed completion for {message_id}"
-        );
-        self.spawn_local(async move |mut async_self| {
+            };
+            let (processed, processed_future) = KClaimablePromise::create_pair();
+            async_self.inbound_deliveries.insert(
+                message_id,
+                PendingInboundDelivery {
+                    envelope: envelope.clone(),
+                    state: PendingInboundDeliveryState::AwaitingProcessed,
+                    ack: None,
+                },
+            );
+            async_self
+                .delivery_port
+                .trigger(ReliableDeliveryPortIndication::Deliver(
+                    ReliableDeliveryDeliver {
+                        envelope,
+                        processed,
+                    },
+                ));
+            debug!(
+                async_self.log(),
+                "Reliable delivery waiting for processed completion for {message_id}"
+            );
             debug!(
                 async_self.log(),
                 "Reliable delivery spawned processed wait task for {message_id}"
             );
-            async_self
-                .await_processed_delivery(message_id, processed_future)
-                .await;
+            async_self.spawn_local(async move |mut async_self| {
+                async_self
+                    .await_processed_delivery(message_id, processed_future)
+                    .await;
+                Handled::OK
+            });
             Handled::OK
-        });
-        Handled::OK
+        })
     }
 
     /// Return whether an inbound envelope matched existing receiver-side state
@@ -710,28 +738,42 @@ impl ReliableDeliveryComponent {
             return;
         };
 
-        let boundary = match self.sender_work_items.get(&message_id) {
-            Some(work_item) => work_item.submit.envelope.to_wire_format(),
-            None => {
-                return;
-            }
+        let Some(work_item) = self.sender_work_items.get(&message_id) else {
+            return;
         };
+        let envelope = work_item.submit.envelope.clone();
 
         self.cancel_retry(RetryKey::Sender(message_id));
         let send_id = RouteSendId(Uuid::new_v4());
-        if let Some(work_item) = self.sender_work_items.get_mut(&message_id) {
-            work_item.recipient_route.state = RouteActiveState::AttemptingDirect { send_id };
-        }
-
-        let route_transport = self.route_transport.clone();
         self.spawn_local(async move |mut async_self| {
+            let boundary = match async_self
+                .security
+                .seal_reliable_payload(&envelope.header, envelope.payload.bytes.as_ref())
+                .await
+            {
+                Ok(sealed) => {
+                    let envelope = ReliableMessageEnvelope::<EncryptedPayload> {
+                        header: envelope.header,
+                        payload: EncryptedPayload { sealed },
+                    };
+                    envelope.to_wire_format()
+                }
+                Err(error) => {
+                    async_self.handle_outbound_security_error(message_id, &error);
+                    return Handled::OK;
+                }
+            };
+            if let Some(work_item) = async_self.sender_work_items.get_mut(&message_id) {
+                work_item.recipient_route.state = RouteActiveState::AttemptingDirect { send_id };
+            }
             let payload: Arc<dyn FlotsyncSerializable> = Arc::new(boundary);
             let send = RouteTransportSend {
                 send_id,
                 route,
                 payload,
             };
-            let future = route_transport
+            let future = async_self
+                .route_transport
                 .ask_with(|promise| RouteTransportActorMessage::Submit(Ask::new(promise, send)));
             async_self
                 .finish_outbound_envelope_submit(message_id, future)
@@ -813,6 +855,32 @@ impl ReliableDeliveryComponent {
                 retry_after: None,
                 reason,
             };
+        }
+    }
+
+    fn handle_outbound_security_error(
+        &mut self,
+        message_id: MessageId,
+        error: &DeliverySecurityError,
+    ) {
+        if error.is_retryable() {
+            warn!(
+                self.log(),
+                "Reliable delivery failed to seal outbound envelope for {message_id}; scheduling retry after {:?}: {error}",
+                self.retry_delay
+            );
+            self.mark_sender_work_pending_retry(
+                message_id,
+                PendingRouteReason::LocalResourcePressure,
+            );
+            self.schedule_retry(RetryKey::Sender(message_id), self.retry_delay);
+        } else {
+            warn!(
+                self.log(),
+                "Reliable delivery failed to seal outbound envelope for {message_id}; dropping sender work because the error is permanent: {error}"
+            );
+            self.cancel_retry(RetryKey::Sender(message_id));
+            self.sender_work_items.remove(&message_id);
         }
     }
 
@@ -1026,7 +1094,7 @@ enum PendingInboundDeliveryState {
 }
 
 struct PendingInboundDelivery {
-    envelope: ReliableMessageEnvelope,
+    envelope: ReliableMessageEnvelope<PlaintextPayload>,
     state: PendingInboundDeliveryState,
     /// Cached semantic recipient ack reused for later retries after transient
     /// route-transport or discovery failures.
@@ -1156,6 +1224,7 @@ mod tests {
     use crate::{
         GroupMemberships,
         SharedGroupMemberships,
+        SqliteReplicationStore,
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
             route_transport::{
@@ -1174,6 +1243,7 @@ mod tests {
                 member_identity,
             },
         },
+        test_support::{load_test_delivery_security, provision_test_security},
     };
     use flotsync_io::{
         prelude::UdpLocalBind,
@@ -1291,6 +1361,29 @@ mod tests {
         }
 
         fn with_system(local_member: MemberIdentity, system: KompactSystem) -> Self {
+            let security = {
+                let store = Arc::new(
+                    SqliteReplicationStore::in_memory(local_member.clone())
+                        .expect("security store should build"),
+                );
+                let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
+                    .into_iter()
+                    .filter(|member| member != &local_member);
+                block_on(provision_test_security(
+                    local_member.clone(),
+                    store.as_ref(),
+                    &local_member,
+                    trusted_members,
+                ))
+                .expect("test security should provision");
+                let store: Arc<dyn crate::api::ReplicationStore> = store;
+                block_on(load_test_delivery_security(
+                    local_member.clone(),
+                    store,
+                    &local_member,
+                ))
+                .expect("test security should load")
+            };
             let core = TransportHarnessCore::with_socket_budgets(
                 system,
                 default_udpour_config(),
@@ -1308,9 +1401,9 @@ mod tests {
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
-            let reliable = core
-                .system()
-                .create(move || ReliableDeliveryComponent::new(manager_ref.clone()));
+            let reliable = core.system().create(move || {
+                ReliableDeliveryComponent::new(manager_ref.clone(), security.clone())
+            });
             let (ingress_probe_tx, ingress_probe_rx) = mpsc::channel();
             let ingress_probe = core
                 .system()
@@ -1527,8 +1620,7 @@ mod tests {
                     component
                         .sender_work_item(message_id)
                         .is_some_and(|work_item| {
-                            work_item.submit.envelope.payload.ciphertext.as_ref()
-                                == expected.as_ref()
+                            work_item.submit.envelope.payload.bytes.as_ref() == expected.as_ref()
                         })
                 },
                 format_args!(
@@ -1575,16 +1667,15 @@ mod tests {
         payload: &'static [u8],
     ) -> ReliableDeliverySubmit {
         ReliableDeliverySubmit {
-            envelope: ReliableMessageEnvelope {
+            envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                 header: ReliableMessageHeader {
                     sender,
                     recipient,
                     message_id,
                 },
-                payload: EncryptedPayload {
-                    ciphertext: Bytes::from_static(payload),
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(payload),
                 },
-                footer: placeholder_signed_footer(),
             },
         }
     }
@@ -1616,16 +1707,15 @@ mod tests {
 
         let message_id = MessageId(Uuid::from_u128(1));
         sender.submit(ReliableDeliverySubmit {
-            envelope: ReliableMessageEnvelope {
+            envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                 header: ReliableMessageHeader {
                     sender: alice,
                     recipient: bob,
                     message_id,
                 },
-                payload: EncryptedPayload {
-                    ciphertext: Bytes::from_static(b"bootstrap payload"),
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(b"bootstrap payload"),
                 },
-                footer: placeholder_signed_footer(),
             },
         });
 
@@ -1670,7 +1760,7 @@ mod tests {
         let redelivered = receiver.wait_for_delivery();
         assert_eq!(redelivered.envelope.header.message_id, message_id);
         assert_eq!(
-            redelivered.envelope.payload.ciphertext,
+            redelivered.envelope.payload.bytes,
             Bytes::from_static(b"retry bootstrap payload")
         );
     }
@@ -1817,29 +1907,27 @@ mod tests {
         let message_id = MessageId(Uuid::from_u128(7));
 
         sender.submit(ReliableDeliverySubmit {
-            envelope: ReliableMessageEnvelope {
+            envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                 header: ReliableMessageHeader {
                     sender: alice.clone(),
                     recipient: bob.clone(),
                     message_id,
                 },
-                payload: EncryptedPayload {
-                    ciphertext: Bytes::from_static(b"first payload"),
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(b"first payload"),
                 },
-                footer: placeholder_signed_footer(),
             },
         });
         sender.submit(ReliableDeliverySubmit {
-            envelope: ReliableMessageEnvelope {
+            envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                 header: ReliableMessageHeader {
                     sender: alice,
                     recipient: bob,
                     message_id,
                 },
-                payload: EncryptedPayload {
-                    ciphertext: Bytes::from_static(b"second payload"),
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(b"second payload"),
                 },
-                footer: placeholder_signed_footer(),
             },
         });
 

@@ -40,6 +40,13 @@ pub(super) enum PreconfiguredPeerRoutesMessage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::runtime) enum PreconfiguredPeerRoutesPublishMode {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host route publication is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     OnLocalEndpointBound,
     #[cfg(test)]
     ManualForTest,
@@ -59,6 +66,13 @@ pub(super) struct PreconfiguredPeerRoutesComponent {
 }
 
 impl PreconfiguredPeerRoutesComponent {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     pub(super) fn new(
         configured_local_endpoint: SocketAddr,
         publish_mode: PreconfiguredPeerRoutesPublishMode,
@@ -228,12 +242,20 @@ impl PreconfiguredPeerRoutesConfig {
         };
 
         for (index, route_entry_lookup) in route_entries {
-            routes.push(parse_peer_route(route_entry_lookup, index)?);
+            let route = parse_peer_route(route_entry_lookup, index)?;
+            routes.push(route);
         }
 
         Ok(Self { routes })
     }
 
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host configuration is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     pub(super) fn validate_local_endpoint_bind_addr(
         &self,
         bind_addr: SocketAddr,

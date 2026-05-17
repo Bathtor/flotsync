@@ -7,7 +7,7 @@ use super::{
         ObservedAvailable,
         subtract_available_ranges,
     },
-    envelope::{encode_runtime_payload, placeholder_signed_footer},
+    envelope::encode_runtime_payload,
     errors::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
@@ -21,6 +21,7 @@ use super::{
         LocalMemberMissingSnafu,
         PublishChangesError,
         RuntimeStartupError,
+        SecuritySnafu,
         SnapshotRowsError,
         StoreGroupSnafu,
         StoreStartupSnafu,
@@ -42,7 +43,9 @@ use super::{
         validate_update_mapping,
     },
     messages::{
+        BootstrapGroupKey,
         BootstrapGroupMessage,
+        BootstrapMemberPublicKeysMessage,
         RuntimeMessage,
         SummaryMessage,
         SummaryRequestMessage,
@@ -56,6 +59,8 @@ use super::{
     replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
+#[cfg(test)]
+use crate::api::current_slice_placeholder_group_security_material;
 use crate::{
     GroupMembers,
     GroupMemberships,
@@ -71,6 +76,7 @@ use crate::{
         DatasetRowPatch,
         DatasetRowWrite,
         DatasetUpdateRecord,
+        EncryptedGroupSecurityMaterial,
         GroupId,
         GroupMigration,
         MemberIdentity,
@@ -101,7 +107,6 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
-        current_slice_placeholder_group_security_material,
         providers::VecRowProvider,
     },
     delivery::{
@@ -120,11 +125,13 @@ use crate::{
             ReliableMessageEnvelope,
             ReliableMessageHeader,
         },
-        shared::{DeliveryClass, EncryptedPayload, MessageId},
+        security::DeliverySecurity,
+        shared::{DeliveryClass, MessageId, PlaintextPayload},
     },
 };
 use flotsync_core::versions::{UpdateId, VersionVector};
 use flotsync_data_types::OwnedRow;
+use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
 use flotsync_utils::{BoxFuture, KClaimablePromise, ResultExt as _};
 use futures_util::FutureExt;
 use itertools::Itertools;
@@ -144,6 +151,12 @@ struct PreparedLocalPublish {
     read_token: ReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
+}
+
+/// Security records and plaintext bootstrap message prepared for group creation.
+struct PreparedGroupBootstrap {
+    security_material: EncryptedGroupSecurityMaterial,
+    bootstrap_message: BootstrapGroupMessage,
 }
 
 /// Source-specific sender validation for an inbound update.
@@ -501,6 +514,7 @@ pub struct ReplicationRuntimeComponent {
     local_member: MemberIdentity,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
+    security: DeliverySecurity,
     group_memberships: SharedGroupMemberships,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
@@ -508,10 +522,18 @@ pub struct ReplicationRuntimeComponent {
 
 impl ReplicationRuntimeComponent {
     /// Construct one replication runtime component for one local member.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "runtime host topology construction is temporarily unreachable while the public loader fails fast for security provisioning"
+        )
+    )]
     pub(super) fn new(
         local_member: MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        security: DeliverySecurity,
         group_memberships: SharedGroupMemberships,
         summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
         catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
@@ -523,6 +545,7 @@ impl ReplicationRuntimeComponent {
             local_member,
             store,
             listener,
+            security,
             group_memberships,
             summary_request_manager,
             catch_up_manager,
@@ -655,6 +678,7 @@ impl ReplicationRuntimeComponent {
         &self,
         group_id: GroupId,
         members: &GroupMembers,
+        security_material: crate::api::EncryptedGroupSecurityMaterial,
     ) -> ReplicationGroupRecord {
         let member_count = NonZeroUsize::new(members.len())
             .expect("group installation must keep members non-empty");
@@ -666,7 +690,7 @@ impl ReplicationRuntimeComponent {
             members: members.ordered_members(),
             local_member_index,
             version_vector: VersionVector::initial(member_count),
-            security_material: current_slice_placeholder_group_security_material(group_id),
+            security_material,
         }
     }
 
@@ -762,6 +786,28 @@ impl ReplicationRuntimeComponent {
                 Ok(producer)
             }
         }
+    }
+
+    /// Validate that a bootstrap message authorises both the sender and local member.
+    fn validate_bootstrap_membership(
+        group_id: GroupId,
+        members: &GroupMembers,
+        local_member: &MemberIdentity,
+        sender: &MemberIdentity,
+    ) -> Result<(), InboundDeliveryError> {
+        if !members.contains(sender) {
+            return Err(InboundDeliveryError::BootstrapSenderNotInGroup {
+                group_id,
+                sender: sender.clone(),
+            });
+        }
+        if !members.contains(local_member) {
+            return Err(InboundDeliveryError::BootstrapMissingLocalMember {
+                group_id,
+                local_member: local_member.clone(),
+            });
+        }
+        Ok(())
     }
 
     fn notify_catch_up_needed(&self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {
@@ -962,33 +1008,28 @@ impl ReplicationRuntimeComponent {
         self.reliable_delivery
             .trigger(ReliableDeliveryPortRequest::Submit(
                 ReliableDeliverySubmit {
-                    envelope: ReliableMessageEnvelope {
+                    envelope: ReliableMessageEnvelope::<PlaintextPayload> {
                         header: ReliableMessageHeader {
                             sender: self.local_member.clone(),
                             recipient,
                             message_id: MessageId(Uuid::new_v4()),
                         },
-                        payload: EncryptedPayload {
-                            ciphertext: payload,
-                        },
-                        footer: placeholder_signed_footer(),
+                        payload: PlaintextPayload { bytes: payload },
                     },
                 },
             ));
     }
 
-    /// Submit the reliable bootstrap fan-out for one newly created group.
-    fn submit_group_bootstrap(&mut self, group_id: GroupId, members: &GroupMembers) {
-        let message = RuntimeMessage::BootstrapGroup(BootstrapGroupMessage {
-            group_id,
-            members: members.ordered_members(),
-        });
+    /// Submit reliable bootstrap messages after the group is locally installed.
+    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: &BootstrapGroupMessage) {
         let local_member = self.local_member.clone();
-        for recipient in members
-            .ordered_members()
-            .into_iter()
-            .filter(|member| member != &local_member)
+        for recipient in bootstrap_message
+            .members()
+            .iter()
+            .filter(|member| *member != &local_member)
+            .cloned()
         {
+            let message = RuntimeMessage::BootstrapGroup(bootstrap_message.clone());
             self.submit_reliable_runtime_message(recipient, &message);
         }
     }
@@ -998,7 +1039,7 @@ impl ReplicationRuntimeComponent {
     fn prepare_created_group(
         &self,
         req: CreateGroupRequest,
-    ) -> Result<(GroupId, GroupMembers, ReplicationGroupRecord), CreateGroupError> {
+    ) -> Result<(GroupId, GroupMembers), CreateGroupError> {
         if req.initial_state.is_some() {
             return InitialStateUnsupportedSnafu.fail();
         }
@@ -1013,8 +1054,41 @@ impl ReplicationRuntimeComponent {
         );
 
         let group_id = GroupId(Uuid::new_v4());
-        let record = self.build_replication_group_record(group_id, &members);
-        Ok((group_id, members, record))
+        Ok((group_id, members))
+    }
+
+    async fn prepare_group_bootstrap(
+        security: &DeliverySecurity,
+        group_id: GroupId,
+        members: &GroupMembers,
+    ) -> Result<PreparedGroupBootstrap, CreateGroupError> {
+        let group_key = DeliverySecurity::generate_group_key()
+            .boxed()
+            .context(SecuritySnafu)?;
+        let public_keys = security
+            .public_keys_for_members(members)
+            .await
+            .boxed()
+            .context(SecuritySnafu)?;
+        let bootstrap_member_keys =
+            public_keys.map_values(BootstrapMemberPublicKeysMessage::from_public_keys);
+        let security_material = security
+            .seal_group_secret(group_id.0, &group_key)
+            .boxed()
+            .context(SecuritySnafu)?;
+        let bootstrap_message = BootstrapGroupMessage::new(
+            group_id,
+            members.ordered_members(),
+            bootstrap_member_keys,
+            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+            BootstrapGroupKey::from_group_key(group_key),
+        )
+        .boxed()
+        .context(SecuritySnafu)?;
+        Ok(PreparedGroupBootstrap {
+            security_material,
+            bootstrap_message,
+        })
     }
 
     fn next_local_update_id(
@@ -1064,7 +1138,10 @@ impl ReplicationRuntimeComponent {
                 RowMutation::Upsert { row, .. } => {
                     dataset_state.apply_upsert(&row_id, row, update_id)?
                 }
-                RowMutation::Delete { .. } => Some(dataset_state.apply_delete(&row_id, update_id)?),
+                RowMutation::Delete { .. } => {
+                    let applied_delete = dataset_state.apply_delete(&row_id, update_id)?;
+                    Some(applied_delete)
+                }
             };
             let Some(applied_operation) = applied_operation else {
                 continue 'changes;
@@ -1302,64 +1379,74 @@ impl ReplicationRuntimeComponent {
         })
     }
 
+    /// Validate, persist, and install one reliable-delivery bootstrap message.
+    fn handle_bootstrap_group_delivery(
+        &mut self,
+        context: InboundDeliveryContext,
+        deliver: ReliableDeliveryDeliver,
+        message: BootstrapGroupMessage,
+    ) -> HandlerResult {
+        let sender = deliver.envelope.header.sender.clone();
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = async_self
+                .install_bootstrap_group_delivery(deliver, message, sender)
+                .await;
+            if let Err(error) = reply {
+                let failure = InboundDeliveryFailure::new(context, error);
+                let action = async_self.record_inbound_failure(&failure);
+                panic_if_fatal_inbound_failure(action, &failure);
+            }
+            Handled::OK
+        })
+    }
+
+    async fn install_bootstrap_group_delivery(
+        &mut self,
+        deliver: ReliableDeliveryDeliver,
+        message: BootstrapGroupMessage,
+        sender: MemberIdentity,
+    ) -> Result<(), InboundDeliveryError> {
+        let group_id = message.group_id();
+        let members = GroupMembers::from_ordered_members(message.members().to_vec())
+            .context(inbound::InvalidBootstrapMembersSnafu)?;
+        Self::validate_bootstrap_membership(group_id, &members, &self.local_member, &sender)?;
+        let security_material = self
+            .security
+            .prepare_security_material_from_bootstrap_msg(&message)
+            .await
+            .boxed()
+            .context(inbound::BootstrapSecuritySnafu)?;
+        let record = self.build_replication_group_record(group_id, &members, security_material);
+        let persisted_group = self
+            .store_new_replication_group(record)
+            .await
+            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
+        self.install_group_membership_view(persisted_group)
+            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
+        // Complete `processed` only after the bootstrap group is stored and the
+        // local membership view is installed. Failure paths intentionally withhold
+        // this completion, so the sender-side recipient-ack timeout can redeliver
+        // the same reliable message later.
+        deliver
+            .processed
+            .complete()
+            .context(inbound::CompleteProcessedPromiseSnafu { group_id })
+    }
+
     fn handle_reliable_delivery(
         &mut self,
         deliver: ReliableDeliveryDeliver,
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::reliable(&deliver.envelope.header);
-        let message =
-            match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-            };
+        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
+            .context(inbound::DecodeMessageSnafu)
+        {
+            Ok(message) => message,
+            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+        };
         match message {
             WireRuntimeMessage::BootstrapGroup(message) => {
-                let group_id = message.group_id;
-                let members = match GroupMembers::from_ordered_members(message.members)
-                    .context(inbound::InvalidBootstrapMembersSnafu)
-                {
-                    Ok(members) => members,
-                    Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-                };
-                if !members.contains(&self.local_member) {
-                    return Err(InboundDeliveryFailure::new(
-                        context,
-                        InboundDeliveryError::BootstrapMissingLocalMember {
-                            group_id,
-                            local_member: self.local_member.clone(),
-                        },
-                    ));
-                }
-                let record = self.build_replication_group_record(group_id, &members);
-                Ok(Handled::block_on(self, async move |mut async_self| {
-                    let reply = async {
-                        let persisted_group = async_self
-                            .store_new_replication_group(record)
-                            .await
-                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-                        async_self
-                            .install_group_membership_view(persisted_group)
-                            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-                        // Complete `processed` only after the bootstrap group is stored and the
-                        // local membership view is installed. Failure paths intentionally withhold
-                        // this completion, so the sender-side recipient-ack timeout can redeliver
-                        // the same reliable message later.
-                        deliver
-                            .processed
-                            .complete()
-                            .context(inbound::CompleteProcessedPromiseSnafu { group_id })?;
-                        Ok::<(), InboundDeliveryError>(())
-                    }
-                    .await;
-                    if let Err(error) = reply {
-                        let failure = InboundDeliveryFailure::new(context, error);
-                        let action = async_self.record_inbound_failure(&failure);
-                        panic_if_fatal_inbound_failure(action, &failure);
-                    }
-                    Handled::OK
-                }))
+                Ok(self.handle_bootstrap_group_delivery(context, deliver, message))
             }
             WireRuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
                 context,
@@ -1933,7 +2020,7 @@ impl ReplicationRuntimeComponent {
     ) -> HandlerResult {
         let (promise, req) = ask.take();
         let created_group = self.prepare_created_group(req);
-        let (group_id, members, record) = match created_group {
+        let (group_id, members) = match created_group {
             Ok(created_group) => created_group,
             Err(error) => {
                 let reply = Err(error).boxed().context(ApiExternalSnafu);
@@ -1942,15 +2029,35 @@ impl ReplicationRuntimeComponent {
             }
         };
         Handled::block_on(self, async move |mut async_self| {
+            let prepared_bootstrap =
+                Self::prepare_group_bootstrap(&async_self.security, group_id, &members).await;
+            let prepared_bootstrap = match prepared_bootstrap {
+                Ok(prepared_bootstrap) => prepared_bootstrap,
+                Err(error) => {
+                    let reply = Err(error).boxed().context(ApiExternalSnafu);
+                    async_self.reply_api(promise, "create_group", reply);
+                    return Handled::OK;
+                }
+            };
+            let record = async_self.build_replication_group_record(
+                group_id,
+                &members,
+                prepared_bootstrap.security_material,
+            );
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {
                 Ok(persisted_group) => {
-                    let install_result = async_self.install_group_membership_view(persisted_group);
-                    let reply = install_result.map(|()| {
-                        async_self.submit_group_bootstrap(group_id, &members);
-                        group_id
-                    });
-                    reply.boxed().context(ApiExternalSnafu)
+                    match async_self.install_group_membership_view(persisted_group) {
+                        Ok(()) => {
+                            async_self.submit_group_bootstrap_messages(
+                                &prepared_bootstrap.bootstrap_message,
+                            );
+                            Ok::<GroupId, GroupInstallError>(group_id)
+                                .boxed()
+                                .context(ApiExternalSnafu)
+                        }
+                        Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+                    }
                 }
                 Err(error) => Err(error).boxed().context(ApiExternalSnafu),
             };
@@ -1976,7 +2083,11 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
     ) -> HandlerResult {
         let (promise, (group_id, members)) = ask.take();
-        let record = self.build_replication_group_record(group_id, &members);
+        let record = self.build_replication_group_record(
+            group_id,
+            &members,
+            current_slice_placeholder_group_security_material(group_id),
+        );
         Handled::block_on(self, async move |mut async_self| {
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {
@@ -2192,6 +2303,14 @@ mod tests {
             InboundFailureAction::Drop
         );
         assert_eq!(
+            InboundDeliveryError::BootstrapSenderNotInGroup {
+                group_id,
+                sender: MemberIdentity::from_array(["runtime", "sender"]),
+            }
+            .failure_action(),
+            InboundFailureAction::Drop
+        );
+        assert_eq!(
             InboundDeliveryError::ConflictingPersistedUpdate {
                 group: group_id,
                 update: update_id,
@@ -2208,5 +2327,33 @@ mod tests {
             .failure_action(),
             InboundFailureAction::Fatal
         );
+    }
+
+    #[test]
+    fn bootstrap_membership_validation_rejects_sender_outside_group() {
+        let group_id = GroupId(Uuid::from_u128(92));
+        let local_member = MemberIdentity::from_array(["runtime", "local"]);
+        let sender = MemberIdentity::from_array(["runtime", "sender"]);
+        let members = GroupMembers::from_ordered_members(vec![local_member.clone()])
+            .expect("member set should build");
+
+        let error = ReplicationRuntimeComponent::validate_bootstrap_membership(
+            group_id,
+            &members,
+            &local_member,
+            &sender,
+        )
+        .expect_err("sender outside the group should be rejected");
+
+        match error {
+            InboundDeliveryError::BootstrapSenderNotInGroup {
+                group_id: rejected_group_id,
+                sender: rejected_sender,
+            } => {
+                assert_eq!(rejected_group_id, group_id);
+                assert_eq!(rejected_sender, sender);
+            }
+            other => panic!("unexpected bootstrap membership error: {other:?}"),
+        }
     }
 }

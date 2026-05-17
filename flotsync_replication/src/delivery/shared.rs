@@ -44,6 +44,20 @@ pub struct EncryptedPayload {
     pub ciphertext: Bytes,
 }
 
+/// Plaintext reliable-delivery payload held inside the local process.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlaintextPayload {
+    pub bytes: Bytes,
+}
+
+impl fmt::Debug for PlaintextPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlaintextPayload")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Detached signature scheme reference used in signed envelopes and control
 /// messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,7 +174,7 @@ pub enum RouteActiveState {
     },
 }
 
-/// Why a durable route remains pending instead of actively sending right now.
+/// Why a retained route remains pending instead of actively sending right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingRouteReason {
     ReachabilityUnknown,

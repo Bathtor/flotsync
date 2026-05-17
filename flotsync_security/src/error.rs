@@ -96,6 +96,10 @@ pub enum SecurityError {
     GroupSeal,
     #[snafu(display("Group message authentication failed."))]
     GroupOpen,
+    #[snafu(display("Store secret encryption failed."))]
+    StoreSecretSeal,
+    #[snafu(display("Store secret authentication failed."))]
+    StoreSecretOpen,
     #[snafu(display("HPKE key material could not be decoded: {source}"))]
     HpkeKeyDecode { source: hpke::HpkeError },
     #[snafu(display("JWK key '{kid}' contains invalid HPKE key material: {source}"))]

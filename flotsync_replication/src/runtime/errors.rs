@@ -9,6 +9,9 @@ use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;
 use snafu::{Location, prelude::*};
 
+/// Boxed source for errors that would otherwise make high-level runtime errors large.
+type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum CreateGroupError {
@@ -18,6 +21,8 @@ pub(super) enum CreateGroupError {
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group member list is invalid: {source}"))]
     InvalidMembers { source: GroupMembersError },
+    #[snafu(display("Failed to prepare secure group bootstrap material: {source}"))]
+    Security { source: BoxedError },
 }
 
 #[derive(Debug, Snafu)]
@@ -141,7 +146,7 @@ pub(crate) enum PublishChangesError {
         read_token_member_count: usize,
         persisted_member_count: usize,
     },
-    #[snafu(display("Read token for group {group_id} is ahead of the runtime's durable state."))]
+    #[snafu(display("Read token for group {group_id} is ahead of the runtime's stored state."))]
     ReadTokenAheadOfLocalState { group_id: GroupId },
     #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
@@ -225,6 +230,15 @@ pub(crate) enum ReplayError {
 pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to decode inbound runtime message: {source}"))]
     DecodeMessage { source: RuntimeMessageError },
+    #[snafu(display("Inbound bootstrap failed security checks: {source}"))]
+    BootstrapSecurity { source: BoxedError },
+    #[snafu(display(
+        "Inbound bootstrap wire group id {wire_group_id} did not match payload group id {payload_group_id}."
+    ))]
+    BootstrapGroupIdMismatch {
+        wire_group_id: GroupId,
+        payload_group_id: uuid::Uuid,
+    },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
     UnexpectedReliableMessage,
     #[snafu(display("Group broadcast unexpectedly carried a reliable bootstrap message."))]
@@ -237,6 +251,13 @@ pub(crate) enum InboundDeliveryError {
     BootstrapMissingLocalMember {
         group_id: GroupId,
         local_member: MemberIdentity,
+    },
+    #[snafu(display(
+        "Inbound bootstrap for group {group_id} was signed by {sender}, which is not a group member.",
+    ))]
+    BootstrapSenderNotInGroup {
+        group_id: GroupId,
+        sender: MemberIdentity,
     },
     #[snafu(display("Failed to install inbound bootstrap group {group_id} locally: {source}"))]
     InstallBootstrapGroup {
@@ -349,10 +370,13 @@ impl InboundDeliveryError {
             | Self::CompleteProcessedPromise { .. }
             | Self::NotifyListener { .. } => InboundFailureAction::Fatal,
             Self::DecodeMessage { .. }
+            | Self::BootstrapSecurity { .. }
+            | Self::BootstrapGroupIdMismatch { .. }
             | Self::UnexpectedReliableMessage
             | Self::UnexpectedGroupMessage
             | Self::InvalidBootstrapMembers { .. }
             | Self::BootstrapMissingLocalMember { .. }
+            | Self::BootstrapSenderNotInGroup { .. }
             | Self::UnknownHostedGroup { .. }
             | Self::MissingDatasetSchema { .. }
             | Self::UpdateSenderNotInGroup { .. }

@@ -5,15 +5,23 @@ use crate::{
     HpkeCiphertext,
     LocalMemberKeys,
     MemberIdentity,
+    ReliablePayloadContext,
     SecurityError,
     SignedFrameParts,
+    StoreSecretContext,
+    StoreSecretCryptoVersion,
+    StoreSecretKey,
     hpke_open,
     hpke_seal,
     identity::{MEMBER_KEY_SEED_LENGTH, generate_member_key_files_from_seed},
     local_member_keys_from_jwks,
     open_group_message,
+    open_reliable_payload,
+    open_store_secret,
     public_member_keys_from_jwks,
     seal_group_message,
+    seal_reliable_payload,
+    seal_store_secret_for_test,
     sign_frame,
     test_support::rng_from_seed,
     verify_frame_signature,
@@ -332,4 +340,104 @@ fn hpke_decrypt_fails_when_encapsulated_key_changes() {
         err,
         SecurityError::HpkeKeyDecode { .. } | SecurityError::HpkeOpen { .. }
     ));
+}
+
+#[test]
+fn store_secret_round_trips_with_logical_context() {
+    let key = StoreSecretKey::from_bytes([3_u8; 32]);
+    let context = StoreSecretContext {
+        table: "replication_group",
+        column: "group_secret",
+        row_id: b"group-1",
+        key_id: "local-test-key",
+        crypto_version: StoreSecretCryptoVersion::V1,
+    };
+    let sealed = seal_store_secret_for_test(&key, context, b"group key", [4_u8; 24]).unwrap();
+
+    let opened = open_store_secret(&key, context, &sealed).unwrap();
+
+    assert_eq!(opened, b"group key");
+}
+
+#[test]
+fn store_secret_open_fails_when_context_changes() {
+    let key = StoreSecretKey::from_bytes([3_u8; 32]);
+    let context = StoreSecretContext {
+        table: "replication_group",
+        column: "group_secret",
+        row_id: b"group-1",
+        key_id: "local-test-key",
+        crypto_version: StoreSecretCryptoVersion::V1,
+    };
+    let sealed = seal_store_secret_for_test(&key, context, b"group key", [4_u8; 24]).unwrap();
+    let tampered_context = StoreSecretContext {
+        row_id: b"group-2",
+        ..context
+    };
+
+    let err = open_store_secret(&key, tampered_context, &sealed).unwrap_err();
+
+    assert!(matches!(err, SecurityError::StoreSecretOpen));
+}
+
+#[test]
+fn reliable_payload_round_trips_to_recipient() {
+    let alice = local_member("alice", ALICE_SEED);
+    let bob = local_member("bob", BOB_SEED);
+    let context = ReliablePayloadContext {
+        frame_kind: "runtime-message",
+        sender: alice.member_id(),
+        recipient: bob.member_id(),
+        message_id: Uuid::from_u128(77),
+    };
+    let mut rng = rng_from_seed([9_u8; 32]);
+
+    let sealed =
+        seal_reliable_payload(&alice, bob.public_keys(), context, b"group key", &mut rng).unwrap();
+    let opened = open_reliable_payload(alice.public_keys(), &bob, context, &sealed).unwrap();
+
+    assert_eq!(opened, b"group key");
+}
+
+#[test]
+fn reliable_payload_open_fails_when_signature_changes() {
+    let alice = local_member("alice", ALICE_SEED);
+    let bob = local_member("bob", BOB_SEED);
+    let context = ReliablePayloadContext {
+        frame_kind: "runtime-message",
+        sender: alice.member_id(),
+        recipient: bob.member_id(),
+        message_id: Uuid::from_u128(77),
+    };
+    let mut rng = rng_from_seed([9_u8; 32]);
+    let mut sealed =
+        seal_reliable_payload(&alice, bob.public_keys(), context, b"group key", &mut rng).unwrap();
+    sealed.signature[0] ^= 0x01;
+
+    let err = open_reliable_payload(alice.public_keys(), &bob, context, &sealed).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::InvalidSignatureBytes { .. } | SecurityError::VerifySignature { .. }
+    ));
+}
+
+#[test]
+fn reliable_payload_open_fails_when_ciphertext_changes() {
+    let alice = local_member("alice", ALICE_SEED);
+    let bob = local_member("bob", BOB_SEED);
+    let context = ReliablePayloadContext {
+        frame_kind: "runtime-message",
+        sender: alice.member_id(),
+        recipient: bob.member_id(),
+        message_id: Uuid::from_u128(77),
+    };
+    let mut rng = rng_from_seed([9_u8; 32]);
+    let mut sealed =
+        seal_reliable_payload(&alice, bob.public_keys(), context, b"group key", &mut rng).unwrap();
+    sealed.ciphertext[0] ^= 0x01;
+
+    let err = open_reliable_payload(alice.public_keys(), &bob, context, &sealed).unwrap_err();
+
+    assert!(matches!(err, SecurityError::VerifySignature { .. }));
 }

@@ -146,10 +146,48 @@ pub struct PublicMemberKeys {
 }
 
 impl PublicMemberKeys {
+    /// Build public member keys from raw public key bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError`] if either public key cannot be decoded for the
+    /// selected cryptographic primitive.
+    pub fn from_key_bytes(
+        member_id: MemberIdentity,
+        signing_key: [u8; ED25519_KEY_LENGTH],
+        encryption_key: [u8; X25519_KEY_LENGTH],
+    ) -> Result<Self> {
+        let signing_key =
+            VerifyingKey::from_bytes(&signing_key).context(InvalidEd25519PublicKeySnafu {
+                kid: format!("{member_id}{KEY_ID_SIGNING_SUFFIX}"),
+            })?;
+        let hpke_public_key =
+            HpkePublicKey::from_bytes(&encryption_key).context(InvalidHpkeKeySnafu {
+                kid: format!("{member_id}{KEY_ID_ENCRYPTION_SUFFIX}"),
+            })?;
+        Ok(Self {
+            member_id,
+            signing_key,
+            hpke_public_key,
+        })
+    }
+
     /// Return the member identity associated with these public keys.
     #[must_use]
     pub fn member_id(&self) -> &MemberIdentity {
         &self.member_id
+    }
+
+    /// Return the raw Ed25519 verifying key bytes.
+    #[must_use]
+    pub fn signing_key_bytes(&self) -> [u8; ED25519_KEY_LENGTH] {
+        self.signing_key.to_bytes()
+    }
+
+    /// Return the raw X25519 HPKE public key bytes.
+    #[must_use]
+    pub fn encryption_key_bytes(&self) -> [u8; X25519_KEY_LENGTH] {
+        fixed_array(self.hpke_public_key.to_bytes().as_slice())
     }
 }
 
@@ -235,8 +273,10 @@ pub(crate) fn generate_member_key_files_from_seed(
 
 const KEY_ID_SIGNING_SUFFIX: &str = "#sign";
 const KEY_ID_ENCRYPTION_SUFFIX: &str = "#enc";
-const ED25519_KEY_LENGTH: usize = 32;
-const X25519_KEY_LENGTH: usize = 32;
+/// Byte length of Ed25519 public keys.
+pub const ED25519_KEY_LENGTH: usize = 32;
+/// Byte length of X25519 HPKE public keys.
+pub const X25519_KEY_LENGTH: usize = 32;
 
 /// Derive deterministic member key material from seed bytes.
 fn local_member_keys_from_seed(

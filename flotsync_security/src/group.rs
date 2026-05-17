@@ -24,6 +24,10 @@ pub const GROUP_KEY_LENGTH: usize = 32;
 /// Byte length of a ChaCha20-Poly1305 nonce.
 pub const GROUP_NONCE_LENGTH: usize = 12;
 
+/// Current symmetric group-message cipher suite identifier.
+pub const GROUP_CIPHER_SUITE_CHACHA20_POLY1305: GroupCipherSuite =
+    GroupCipherSuite::CHACHA20_POLY1305;
+
 /// Encrypt one group message with the group's symmetric key.
 ///
 /// The nonce is derived from the immutable group/message context. The public
@@ -84,7 +88,7 @@ pub fn open_group_message(
 /// The key bytes are zeroised on drop. This type deliberately does not
 /// implement `Clone`; share it via [`std::rc::Rc`] or [`std::sync::Arc`] when
 /// multiple owners need access.
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct GroupKey {
     bytes: [u8; GROUP_KEY_LENGTH],
 }
@@ -94,6 +98,24 @@ impl GroupKey {
     #[must_use]
     pub fn from_bytes(bytes: [u8; GROUP_KEY_LENGTH]) -> Self {
         Self { bytes }
+    }
+
+    /// Return a copy of the raw group key bytes for internal protocol wrapping.
+    #[must_use]
+    pub const fn to_bytes(&self) -> [u8; GROUP_KEY_LENGTH] {
+        self.bytes
+    }
+
+    /// Encode this key as the sensitive plaintext protected by store-secret AEAD.
+    ///
+    /// The returned buffer contains the current group cipher-suite id followed
+    /// by raw key bytes, and zeroises itself on drop.
+    #[must_use]
+    pub fn stored_secret_plaintext(&self) -> Zeroizing<Vec<u8>> {
+        let mut output = Zeroizing::new(Vec::with_capacity(2 + GROUP_KEY_LENGTH));
+        output.extend_from_slice(&GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16().to_be_bytes());
+        output.extend_from_slice(&self.bytes);
+        output
     }
 
     /// Generate a fresh symmetric group key from operating system randomness.
@@ -114,6 +136,27 @@ impl GroupKey {
 impl fmt::Debug for GroupKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("GroupKey").field(&"<redacted>").finish()
+    }
+}
+
+/// Symmetric group-message cipher suite identifier stored in protocol payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GroupCipherSuite(u16);
+
+impl GroupCipherSuite {
+    /// ChaCha20-Poly1305 with deterministic nonces derived from group context.
+    pub const CHACHA20_POLY1305: Self = Self(1);
+
+    /// Build a group cipher-suite id from its wire value.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Return the integer value carried in protocol payloads.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
     }
 }
 

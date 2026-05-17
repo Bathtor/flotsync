@@ -77,6 +77,10 @@ pub enum LoadError {
         application_id: Identifier,
         source: BoxError,
     },
+    #[snafu(display(
+        "Replication runtime security provisioning is unavailable for application '{application_id}'."
+    ))]
+    SecurityUnavailable { application_id: Identifier },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
     Unavailable { application_id: Identifier },
 }

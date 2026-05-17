@@ -54,12 +54,18 @@ message ReliableEnvelopeHeader {
   bytes message_id = 3;
 }
 
+// HPKE-sealed reliable-delivery payload authenticated by the sender.
+message SealedReliablePayload {
+  bytes hpke_encapsulated_key = 1;
+  bytes hpke_ciphertext = 2;
+  bytes sender_signature = 3;
+}
+
 // Recipient-addressed envelope with explicit separation between public routing
-// data and encrypted payload bytes.
+// data and sealed payload bytes.
 message ReliableEnvelopeWire {
   ReliableEnvelopeHeader public_header = 1;
-  bytes encrypted_payload = 16;
-  SignatureWire footer = 17;
+  SealedReliablePayload sealed_payload = 16;
 }
 
 // Public recipient-ack routing header.

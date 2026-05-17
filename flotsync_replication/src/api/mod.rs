@@ -740,6 +740,22 @@ impl fmt::Debug for EncryptedStoreSecret {
     }
 }
 
+impl EncryptedStoreSecret {
+    /// Convert security-crate sealed bytes into the store's opaque encrypted-cell record.
+    #[must_use]
+    pub(crate) fn from_store_secret_ciphertext(
+        key_id: StoreSecretKeyId,
+        sealed: flotsync_security::StoreSecretCiphertext,
+    ) -> Self {
+        Self {
+            crypto_version: STORE_SECRET_CRYPTO_V1,
+            key_id,
+            nonce: sealed.nonce.into(),
+            ciphertext: sealed.ciphertext.into_boxed_slice(),
+        }
+    }
+}
+
 /// Build placeholder group-security material for the current security-storage slice.
 ///
 /// This is a temporary bridge for `flotsync-sec.10`: group records need

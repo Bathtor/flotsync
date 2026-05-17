@@ -1405,6 +1405,7 @@ dependencies = [
  "flotsync_data_types",
  "flotsync_io",
  "flotsync_messages",
+ "flotsync_security",
  "flotsync_udpour",
  "flotsync_utils",
  "futures-util",

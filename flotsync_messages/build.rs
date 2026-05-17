@@ -31,7 +31,7 @@ fn main() {
         // churn without forcing wider API changes elsewhere.
         .use_bytes_type_in(&[
             ".flotsync.delivery.v1.GroupEnvelopeWire.encrypted_payload",
-            ".flotsync.delivery.v1.ReliableEnvelopeWire.encrypted_payload",
+            ".flotsync.delivery.v1.SealedReliablePayload.hpke_ciphertext",
             ".flotsync.delivery.v1.SignatureWire.signature_bytes",
         ])
         .include_file("flotsync_messages.rs")

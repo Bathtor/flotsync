@@ -1,9 +1,8 @@
 use super::{
-    errors::{InboundDeliveryError, PublishChangesError},
+    errors::{CreateGroupError, InboundDeliveryError, PublishChangesError},
     handle::{
         ReplicationRuntime,
-        load_replication_runtime_typed,
-        load_replication_runtime_typed_with_runtime_config_toml,
+        load_replication_runtime_typed_with_security_for_test,
         wait_for_test_reply,
     },
     host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt, PreconfiguredPeerRoutesPublishMode},
@@ -16,7 +15,14 @@ use super::{
         validate_update_mapping,
     },
     load_replication_runtime,
-    messages::{DatasetUpdateMessage, UpdateBatchMessage, UpdateMessage},
+    messages::{
+        BootstrapGroupKey,
+        BootstrapGroupMessage,
+        BootstrapMemberPublicKeysMessage,
+        DatasetUpdateMessage,
+        UpdateBatchMessage,
+        UpdateMessage,
+    },
 };
 use crate::{
     GroupMembers,
@@ -33,6 +39,7 @@ use crate::{
         GroupId,
         ListenerError,
         ListenerExternalSnafu,
+        LoadError,
         LocalMemberPrivateKeysRecord,
         MemberIdentity,
         MemberIndex,
@@ -60,18 +67,26 @@ use crate::{
         SnapshotRow,
         SnapshotRowsRequest,
         StoreError,
+        StoreExternalSnafu,
         SummaryRequest,
         TrustedMemberPublicKeysRecord,
         current_slice_placeholder_group_security_material,
         process_batches,
     },
+    delivery::security::{DeliverySecurity, DeliverySecurityError},
+    test_support::{
+        load_test_delivery_security,
+        provision_test_security as provision_shared_test_security,
+        test_public_member_keys,
+    },
 };
 use flotsync_core::{
-    member::Identifier,
+    member::{Identifier, TrieMap},
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
+use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
@@ -85,24 +100,24 @@ use std::{
 use uuid::Uuid;
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
-const ALICE_MEMBER_SEGMENTS: [&str; 1] = ["alice"];
-const BOB_MEMBER_SEGMENTS: [&str; 1] = ["bob"];
-const PROBE_MEMBER_SEGMENTS: [&str; 1] = ["probe"];
+const ALICE_MEMBER_SEGMENTS: [&str; 2] = ["alice", "laptop"];
+const BOB_MEMBER_SEGMENTS: [&str; 2] = ["bob", "laptop"];
+const PROBE_MEMBER_SEGMENTS: [&str; 2] = ["probe", "laptop"];
 const APP_ALICE_SEGMENTS: [&str; 2] = ["app", "alice"];
 const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
 const APP_PROBE_SEGMENTS: [&str; 2] = ["app", "probe"];
-
 static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
 
 struct RuntimeFixture<S> {
+    local_member: MemberIdentity,
     runtime: Arc<ReplicationRuntime>,
     listener: Arc<ListenerStub>,
     store: Arc<S>,
 }
 
 /// Test-only store wrapper that can fail one future row-patch write while
-/// delegating all durable state to the wrapped `SQLite` store.
+/// delegating all stored state to the wrapped `SQLite` store.
 struct FailingStore<S> {
     inner: Arc<S>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
@@ -292,12 +307,11 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                     .expect("failing store transaction must remain open during rollback")
                     .rollback()
                     .await?;
-                return Err(StoreError::StoreExternal {
-                    source: Box::new(std::io::Error::other(format!(
-                        "failing store intentionally failed dataset row patch apply for '{}'",
-                        patch.dataset_id
-                    ))),
-                });
+                let source = std::io::Error::other(format!(
+                    "failing store intentionally failed dataset row patch apply for '{}'",
+                    patch.dataset_id
+                ));
+                return Err::<(), _>(source).boxed().context(StoreExternalSnafu);
             }
             self.inner
                 .as_mut()
@@ -552,6 +566,58 @@ fn bob_member() -> Identifier {
     Identifier::from_array(BOB_MEMBER_SEGMENTS)
 }
 
+fn test_public_keys(member: &MemberIdentity) -> PublicMemberKeys {
+    test_public_member_keys(member)
+}
+
+fn bootstrap_public_keys(
+    entries: impl IntoIterator<Item = (MemberIdentity, BootstrapMemberPublicKeysMessage)>,
+) -> TrieMap<BootstrapMemberPublicKeysMessage> {
+    let mut public_keys = TrieMap::new();
+    for (member_id, entry) in entries {
+        public_keys.insert(member_id, entry);
+    }
+    public_keys
+}
+
+fn bootstrap_member_public_keys(
+    public_keys: &PublicMemberKeys,
+) -> (MemberIdentity, BootstrapMemberPublicKeysMessage) {
+    (
+        public_keys.member_id().clone(),
+        BootstrapMemberPublicKeysMessage::from_public_keys(public_keys),
+    )
+}
+
+fn provision_test_security<S>(
+    store: &S,
+    local_member: &MemberIdentity,
+    trusted_members: impl IntoIterator<Item = MemberIdentity>,
+) where
+    S: ReplicationStore,
+{
+    wait_for_test_reply(provision_shared_test_security(
+        app_probe_id(),
+        store,
+        local_member,
+        trusted_members,
+    ))
+    .expect("test security should provision");
+}
+
+fn load_test_runtime_security<S>(store: Arc<S>, local_member: &MemberIdentity) -> DeliverySecurity
+where
+    S: ReplicationStore + 'static,
+{
+    let store: Arc<dyn ReplicationStore> = store;
+    wait_for_test_reply(load_test_delivery_security(
+        app_probe_id(),
+        store,
+        local_member,
+    ))
+    .expect("runtime security state should load")
+}
+
 fn app_alice_id() -> Identifier {
     Identifier::from_array(APP_ALICE_SEGMENTS)
 }
@@ -587,16 +653,6 @@ fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
     }
 }
 
-fn load_runtime(
-    application_id: Identifier,
-    local_member: MemberIdentity,
-) -> Arc<ReplicationRuntime> {
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(local_member).expect("store should build"));
-    let listener = Arc::new(ListenerStub::default());
-    load_runtime_with_parts(application_id, store, listener)
-}
-
 fn sqlite_store_with_schemas<I, S>(
     local_member: MemberIdentity,
     schemas: I,
@@ -605,10 +661,14 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    Arc::new(
+    let store = Arc::new(
         SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
             .expect("store should build"),
-    )
+    );
+    let local_member = wait_for_test_reply(store.local_member_identity())
+        .expect("local member identity should load");
+    provision_test_security(store.as_ref(), &local_member, []);
+    store
 }
 
 fn load_runtime_fixture<I, S>(
@@ -622,23 +682,60 @@ where
 {
     let listener = Arc::new(ListenerStub::default());
     let store = sqlite_store_with_schemas(local_member, schemas);
+    let local_member = wait_for_test_reply(store.local_member_identity())
+        .expect("local member identity should load");
     let runtime = load_runtime_with_parts(application_id, store.clone(), listener.clone());
     RuntimeFixture {
+        local_member,
         runtime,
         listener,
         store,
     }
 }
 
+fn load_title_runtime_pair_with_trust(
+    dataset_id: &DatasetId,
+) -> (
+    RuntimeFixture<SqliteReplicationStore>,
+    RuntimeFixture<SqliteReplicationStore>,
+) {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    provision_test_security(
+        alice_fixture.store.as_ref(),
+        &alice_member,
+        [bob_member.clone()],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
+    );
+    (alice_fixture, bob_fixture)
+}
+
 fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
     let store = Arc::new(
         SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
     );
+    provision_test_security(store.as_ref(), local_member, []);
+    let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
     let host = kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
         local_member,
         store,
         listener,
+        security,
         None,
     ))
     .expect("host should start");
@@ -654,11 +751,16 @@ fn load_runtime_with_parts<S>(
 where
     S: ReplicationStore + 'static,
 {
-    wait_for_test_reply(load_replication_runtime_typed(
+    let local_member = wait_for_test_reply(store.local_member_identity())
+        .expect("local member identity should load");
+    let security = load_test_runtime_security(store.clone(), &local_member);
+    wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
         application_id,
         store,
         listener,
         ReplicationConfig::default(),
+        security,
+        None,
     ))
     .expect("runtime should load")
 }
@@ -672,11 +774,15 @@ fn load_runtime_with_parts_and_runtime_config_toml<S>(
 where
     S: ReplicationStore + 'static,
 {
-    wait_for_test_reply(load_replication_runtime_typed_with_runtime_config_toml(
+    let local_member = wait_for_test_reply(store.local_member_identity())
+        .expect("local member identity should load");
+    let security = load_test_runtime_security(store.clone(), &local_member);
+    wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
         application_id,
         store,
         listener,
         ReplicationConfig::default(),
+        security,
         Some(runtime_config_toml),
     ))
     .expect("runtime should load")
@@ -717,6 +823,18 @@ where
         .expect("group should exist");
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
     group
+}
+
+fn load_persisted_groups<S>(store: &S) -> Vec<ReplicationGroupRecord>
+where
+    S: ReplicationStore + ?Sized,
+{
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let groups =
+        wait_for_test_reply(transaction.load_replication_groups()).expect("groups should load");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    groups
 }
 
 fn load_persisted_update<S>(
@@ -925,21 +1043,27 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 }
 
 #[test]
-fn load_replication_runtime_returns_concrete_runtime() {
+fn load_replication_runtime_rejects_missing_security_provisioning() {
     let application_id = app_probe_id();
     let store =
         Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
     let listener = Arc::new(ListenerStub::default());
 
-    let runtime = wait_for_test_reply(load_replication_runtime(
-        application_id,
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
+        application_id.clone(),
         store,
         listener,
         ReplicationConfig::default(),
     ));
+    let Err(error) = loaded_runtime else {
+        panic!("public runtime loading should reject missing security provisioning");
+    };
 
-    if let Err(error) = runtime {
-        panic!("runtime load should succeed: {error}");
+    match error {
+        LoadError::SecurityUnavailable {
+            application_id: unavailable_application_id,
+        } => assert_eq!(unavailable_application_id, application_id),
+        other => panic!("unexpected load error: {other:?}"),
     }
 }
 
@@ -959,6 +1083,7 @@ fn runtime_host_publishes_static_peer_routes_after_local_endpoint_bind() {
     let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
     let store =
         Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
@@ -980,12 +1105,15 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let store = Arc::new(
         SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
     );
+    provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
+    let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
             store,
             listener,
+            security,
             Some(runtime_config_toml.as_str()),
             PreconfiguredPeerRoutesPublishMode::ManualForTest,
         ))
@@ -1003,12 +1131,15 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let store = Arc::new(
         SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
     );
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
     let mut host =
         kompact::prelude::block_on(DeliveryRuntimeHost::start_with_route_publish_mode_for_test(
             &alice_member,
             store,
             listener,
+            security,
             Some(
                 r"
             [flotsync.replication.runtime.catch-up]
@@ -1121,7 +1252,7 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
         vec![RowMutation::Upsert {
             row_id: row_id.clone(),
             row: crate::row_values! {
-                "title" => "durable publish",
+                "title" => "stored publish",
             },
         }],
     );
@@ -1644,8 +1775,21 @@ fn publish_changes_rejects_reserved_local_update_version() {
 fn create_group_bootstrap_installs_remote_membership() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let alice_runtime = load_runtime(app_alice_id(), alice_member.clone());
-    let bob_runtime = load_runtime(app_bob_id(), bob_member.clone());
+    let alice_store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
+    let alice_runtime = load_runtime_with_parts(
+        app_alice_id(),
+        alice_store,
+        Arc::new(ListenerStub::default()),
+    );
+    let bob_store = Arc::new(
+        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
+    );
+    provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
+    let bob_runtime =
+        load_runtime_with_parts(app_bob_id(), bob_store, Arc::new(ListenerStub::default()));
 
     assert!(
         alice_runtime
@@ -1706,6 +1850,85 @@ fn create_group_bootstrap_installs_remote_membership() {
 }
 
 #[test]
+fn create_group_rejects_missing_trusted_keys_without_storing_group() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let runtime = load_runtime_with_parts(
+        app_alice_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+
+    let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member, bob_member.clone()],
+        initial_state: None,
+    }))
+    .expect_err("missing trusted keys should reject group creation");
+
+    match error {
+        ApiError::ApiExternal { source } => match source.downcast_ref::<CreateGroupError>() {
+            Some(CreateGroupError::Security { source }) => {
+                assert!(
+                    matches!(
+                        source.downcast_ref::<DeliverySecurityError>(),
+                        Some(DeliverySecurityError::MissingTrustedPublicKeys { member_id })
+                            if member_id == &bob_member
+                    ),
+                    "unexpected security source: {source:?}"
+                );
+            }
+            other => panic!("unexpected create-group error source: {other:?}"),
+        },
+        other => panic!("unexpected API error: {other:?}"),
+    }
+    assert!(load_persisted_groups(store.as_ref()).is_empty());
+}
+
+#[test]
+fn bootstrap_payload_validation_rejects_trusted_public_key_mismatch() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = Arc::new(
+        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
+    );
+    provision_test_security(store.as_ref(), &bob_member, []);
+    provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
+    let security = load_test_runtime_security(store.clone(), &bob_member);
+    let alice_keys = test_public_keys(&alice_member);
+    let bob_keys = test_public_keys(&bob_member);
+    let probe_keys = test_public_keys(&Identifier::from_array(["probe", "laptop"]));
+    let mismatched_bob_keys = BootstrapMemberPublicKeysMessage {
+        signing_public_key: probe_keys.signing_key_bytes(),
+        encryption_public_key: bob_keys.encryption_key_bytes(),
+    };
+    let payload = BootstrapGroupMessage::new(
+        GroupId(Uuid::from_u128(70_001)),
+        vec![alice_member.clone(), bob_member.clone()],
+        bootstrap_public_keys([
+            bootstrap_member_public_keys(&alice_keys),
+            (bob_member.clone(), mismatched_bob_keys),
+        ]),
+        GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+        BootstrapGroupKey::from_bytes([70; 32]),
+    )
+    .expect("bootstrap payload should build");
+
+    let err = wait_for_test_reply(security.validate_bootstrap_payload_public_keys(&payload))
+        .expect_err("mismatched trusted keys should reject payload");
+
+    match err {
+        DeliverySecurityError::TrustedPublicKeysMismatch { member_id } => {
+            assert_eq!(member_id, bob_member);
+        }
+        other => panic!("unexpected bootstrap validation error: {other:?}"),
+    }
+}
+
+#[test]
 fn publish_changes_delivers_remote_data_changed_event() {
     // End-to-end happy path:
     // 1. start two runtimes with the same dataset schema,
@@ -1725,6 +1948,16 @@ fn publish_changes_delivers_remote_data_changed_event() {
         app_bob_id(),
         bob_member.clone(),
         [(dataset_id.clone(), title_schema_static())],
+    );
+    provision_test_security(
+        alice_fixture.store.as_ref(),
+        &alice_member,
+        [bob_member.clone()],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
     );
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
@@ -1790,19 +2023,10 @@ fn publish_changes_delivers_remote_data_changed_event() {
 fn update_gap_triggers_need_range_and_update_batch_catch_up() {
     let _runtime_endpoint_leases =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-    let alice_member = alice_member();
-    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let alice_fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
-    );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let alice_member = alice_fixture.local_member.clone();
+    let bob_member = bob_fixture.local_member.clone();
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(50_001));
@@ -1895,6 +2119,16 @@ fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
         bob_member.clone(),
         [(dataset_id.clone(), title_schema_static())],
     );
+    provision_test_security(
+        alice_fixture.store.as_ref(),
+        &alice_member,
+        [bob_member.clone()],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
+    );
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(50_101));
@@ -1953,19 +2187,10 @@ fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
 fn pending_apply_need_retries_after_route_appears() {
     let _runtime_endpoint_leases =
         reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-    let alice_member = alice_member();
-    let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let alice_fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
-    );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
+    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
+    let alice_member = alice_fixture.local_member.clone();
+    let bob_member = bob_fixture.local_member.clone();
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(50_201));
@@ -2065,6 +2290,7 @@ fn partial_update_batch_retry_narrows_remaining_need() {
         alice_member.clone(),
         [(dataset_id.clone(), title_schema_shared())],
     );
+    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
         alice_store,
@@ -2078,6 +2304,11 @@ fn partial_update_batch_retry_narrows_remaining_need() {
         app_bob_id(),
         bob_member.clone(),
         [(dataset_id.clone(), title_schema_static())],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
     );
     let bob_runtime = &bob_fixture.runtime;
     let group_id = GroupId(Uuid::from_u128(50_301));
@@ -2200,6 +2431,8 @@ fn update_batch_forwarded_by_non_producer_member_applies() {
 
 #[test]
 fn request_summary_returns_remote_current_version_vector() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
@@ -2212,6 +2445,16 @@ fn request_summary_returns_remote_current_version_vector() {
         app_bob_id(),
         bob_member.clone(),
         [(dataset_id.clone(), title_schema_static())],
+    );
+    provision_test_security(
+        alice_fixture.store.as_ref(),
+        &alice_member,
+        [bob_member.clone()],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
     );
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
@@ -2647,6 +2890,7 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
         runtime: bob_runtime,
         listener: bob_listener,
         store: bob_store,
+        ..
     } = load_runtime_fixture(
         app_bob_id(),
         bob_member.clone(),
