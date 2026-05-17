@@ -46,8 +46,15 @@ pub const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub const RESERVED_SOCKET_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Maximum time one test will wait for its full reserved-socket request before
-/// failing.
+/// failing as a last-resort safety fuse.
 pub const RESERVED_SOCKET_ACQUIRE_TIMEOUT: Duration = Duration::from_mins(3);
+
+/// Maximum time one reservation request may observe no broker-local progress
+/// before failing.
+///
+/// This is essentially the maximum time any individual test case is actually allowed to run,
+/// not considering waiting on its reservations.
+pub const RESERVED_SOCKET_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum attempts to acquire one hidden reservation socket directly from the
 /// OS while still validating that the broker never tracks the same
@@ -365,6 +372,7 @@ impl ReservedSocketBroker {
         while state.acquisition_in_progress_by != my_id_opt {
             if state.acquisition_in_progress_by.is_none() {
                 state.acquisition_in_progress_by = my_id_opt;
+                state.acquisition_in_progress_owner = Some(trace.owner_label.clone());
                 let snapshot = state.build_reservation_counters(trace, acquired, kinds);
                 trace.became_active(&snapshot);
             } else {
@@ -411,6 +419,7 @@ impl ReservedSocketBroker {
         state.trim_idle_to_waiting();
 
         state.acquisition_in_progress_by = None;
+        state.acquisition_in_progress_owner = None;
         drop(state);
         self.changed.notify_all();
     }
@@ -424,7 +433,7 @@ impl ReservedSocketBroker {
             .iter()
             .filter(|kind| matches!(kind, ReservedSocketKind::UdpSocket))
             .count();
-        let deadline = Instant::now() + RESERVED_SOCKET_ACQUIRE_TIMEOUT;
+        let absolute_deadline = Instant::now() + RESERVED_SOCKET_ACQUIRE_TIMEOUT;
         let trace = ReservationTrace::new(requested_tcp, requested_udp);
         let mut state = self.lock_state("socket reservation");
         state.waiting_tcp += requested_tcp;
@@ -433,14 +442,41 @@ impl ReservedSocketBroker {
         trace.request_started(&state.build_reservation_counters(&trace, &acquired, kinds));
 
         state = self.wait_to_be_allowed_to_reserve(state, &trace, &acquired, kinds);
+        let mut progress_watch = ReservationProgressWatch::new(&state, Instant::now());
 
         // Each caller declares its full socket requirement up front. That keeps
         // the process-local broker free of hold-and-wait deadlocks.
-        while Instant::now() < deadline {
+        loop {
+            let now = Instant::now();
+            if now >= absolute_deadline {
+                self.handle_reservation_failure(
+                    state,
+                    FailedReservation {
+                        reason: ReservationFailureReason::AbsoluteTimeout {
+                            timeout: RESERVED_SOCKET_ACQUIRE_TIMEOUT,
+                        },
+                        trace: &trace,
+                        kinds,
+                    },
+                    acquired,
+                );
+            }
+            if progress_watch.is_stalled(&state, now, RESERVED_SOCKET_NO_PROGRESS_TIMEOUT) {
+                self.handle_reservation_failure(
+                    state,
+                    FailedReservation {
+                        reason: ReservationFailureReason::NoProgress {
+                            stall_timeout: RESERVED_SOCKET_NO_PROGRESS_TIMEOUT,
+                        },
+                        trace: &trace,
+                        kinds,
+                    },
+                    acquired,
+                );
+            }
+
             if acquired.len() == kinds.len() {
-                trace.completed(&state.build_reservation_counters(&trace, &acquired, kinds));
-                self.complete_reservation_phase(state, requested_tcp, requested_udp);
-                return ReservedSocketLease { reserved: acquired };
+                return self.finish_successful_reservation(state, acquired, &trace, kinds);
             }
 
             // Try to acquire from idle.
@@ -460,9 +496,7 @@ impl ReservedSocketBroker {
             }
 
             if acquired.len() == kinds.len() {
-                trace.completed(&state.build_reservation_counters(&trace, &acquired, kinds));
-                self.complete_reservation_phase(state, requested_tcp, requested_udp);
-                return ReservedSocketLease { reserved: acquired };
+                return self.finish_successful_reservation(state, acquired, &trace, kinds);
             }
 
             // Not enough idle sockets, try to acquire a socket.
@@ -486,6 +520,7 @@ impl ReservedSocketBroker {
                     );
                 }
                 Err(error) => {
+                    state.record_bind_error(next_kind, &error);
                     trace.acquire_failed(
                         &state.build_reservation_failure_context(&trace, &acquired, kinds),
                         next_kind,
@@ -496,31 +531,55 @@ impl ReservedSocketBroker {
                 }
             }
         }
-        self.handle_reservation_timeout(state, requested_tcp, requested_udp, acquired);
     }
 
-    fn handle_reservation_timeout(
+    fn finish_successful_reservation(
         &self,
         mut state: MutexGuard<'_, ReservedSocketBrokerState>,
-        requested_tcp: usize,
-        requested_udp: usize,
+        acquired: Vec<ReservedSocket>,
+        trace: &ReservationTrace,
+        kinds: &[ReservedSocketKind],
+    ) -> ReservedSocketLease {
+        state.record_progress(
+            ReservedSocketProgressKind::ReservationFulfilled,
+            format!("request_id={}", trace.request_id),
+        );
+        trace.completed(&state.build_reservation_counters(trace, &acquired, kinds));
+        self.complete_reservation_phase(state, trace.requested.tcp, trace.requested.udp);
+        ReservedSocketLease { reserved: acquired }
+    }
+
+    fn handle_reservation_failure(
+        &self,
+        mut state: MutexGuard<'_, ReservedSocketBrokerState>,
+        failure: FailedReservation<'_>,
         acquired: Vec<ReservedSocket>,
     ) -> Never {
-        let diagnostics = state.build_diagnostics();
+        let diagnostics =
+            state.build_reservation_diagnostics(failure.trace, &acquired, failure.kinds);
 
         for reserved in acquired {
-            state.reclaim_idle(reserved);
+            state.reclaim_idle(
+                reserved,
+                ReservedSocketProgressKind::PartialAcquisitionReturned,
+            );
         }
-        self.complete_reservation_phase(state, requested_tcp, requested_udp);
+        self.complete_reservation_phase(
+            state,
+            failure.trace.requested.tcp,
+            failure.trace.requested.udp,
+        );
 
         let diagnostics_rendered = diagnostics.render();
         let has_socket_accounting_mismatch = diagnostics.has_socket_accounting_mismatch();
         assert!(
             !has_socket_accounting_mismatch,
-            "reserved-socket broker detected a socket-accounting mismatch while reserving {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {diagnostics_rendered}",
+            "reserved-socket broker detected a socket-accounting mismatch while reserving {} TCP and {} UDP sockets for one test: {diagnostics_rendered}",
+            failure.trace.requested.tcp, failure.trace.requested.udp,
         );
         panic!(
-            "timed out waiting to reserve {requested_tcp} TCP and {requested_udp} UDP sockets for one test: {diagnostics_rendered}",
+            "reserved-socket broker failed to reserve {} TCP and {} UDP sockets for one test after {}: {diagnostics_rendered}",
+            failure.trace.requested.tcp, failure.trace.requested.udp, failure.reason,
         );
     }
 
@@ -531,7 +590,7 @@ impl ReservedSocketBroker {
 
         let mut state = self.lock_state("socket release");
         for reserved in reserved {
-            state.reclaim_idle(reserved);
+            state.reclaim_idle(reserved, ReservedSocketProgressKind::LeaseReleased);
         }
         state.trim_idle_to_waiting();
         drop(state);
@@ -546,11 +605,25 @@ impl ReservedSocketBroker {
 /// does not keep more ports reserved than any current waiter still needs.
 #[derive(Debug, Default)]
 struct ReservedSocketBrokerState {
+    /// Hidden TCP sockets currently held for future test reservations.
     idle_tcp: Vec<ReservedSocket>,
+    /// Hidden UDP sockets currently held for future test reservations.
     idle_udp: Vec<ReservedSocket>,
+    /// Total TCP demand from waiters that has not yet received a lease.
     waiting_tcp: usize,
+    /// Total UDP demand from waiters that has not yet received a lease.
     waiting_udp: usize,
+    /// Thread currently allowed to acquire sockets from the OS.
     acquisition_in_progress_by: Option<ThreadId>,
+    /// Human-readable owner label for the thread currently acquiring sockets.
+    acquisition_in_progress_owner: Option<String>,
+    /// Monotonic broker-local progress counter used by reservation stall watches.
+    progress_epoch: u64,
+    /// Last event that advanced [`Self::progress_epoch`].
+    last_progress: Option<ReservedSocketProgress>,
+    /// Last OS bind error observed while acquiring a reservation socket.
+    last_bind_error: Option<String>,
+    /// Known broker-owned sockets keyed by slot id for diagnostics and invariants.
     slots: HashMap<usize, ReservedSocketSlotRecord>,
 }
 
@@ -562,28 +635,46 @@ impl ReservedSocketBrokerState {
         };
         if let Some(reserved) = reserved {
             self.transition_slot_state(reserved.slot_id, ReservedSocketSlotState::LeaseHiddenBound);
+            self.record_progress(
+                ReservedSocketProgressKind::IdleSocketConsumed,
+                format!(
+                    "slot_id={}, kind={kind:?}, addr={}",
+                    reserved.slot_id, reserved.addr
+                ),
+            );
             return Some(reserved);
         }
         None
     }
 
-    fn reclaim_idle(&mut self, reserved: ReservedSocket) {
+    fn reclaim_idle(
+        &mut self,
+        reserved: ReservedSocket,
+        progress_kind: ReservedSocketProgressKind,
+    ) {
+        let progress_detail = format!(
+            "slot_id={}, kind={:?}, addr={}",
+            reserved.slot_id, reserved.kind, reserved.addr
+        );
         self.transition_slot_state(reserved.slot_id, ReservedSocketSlotState::IdleHiddenBound);
         match reserved.kind {
             ReservedSocketKind::TcpListener => {
                 if self.idle_tcp.len() < self.waiting_tcp {
                     self.idle_tcp.push(reserved);
+                    self.record_progress(progress_kind, progress_detail);
                     return;
                 }
             }
             ReservedSocketKind::UdpSocket => {
                 if self.idle_udp.len() < self.waiting_udp {
                     self.idle_udp.push(reserved);
+                    self.record_progress(progress_kind, progress_detail);
                     return;
                 }
             }
         }
         self.remove_slot(reserved.slot_id);
+        self.record_progress(progress_kind, progress_detail);
     }
 
     fn trim_idle_to_waiting(&mut self) {
@@ -596,7 +687,12 @@ impl ReservedSocketBrokerState {
             let reserved = self
                 .take_idle_for_trim(kind)
                 .expect("idle pool length must stay consistent while trimming");
+            let detail = format!(
+                "slot_id={}, kind={kind:?}, addr={}",
+                reserved.slot_id, reserved.addr
+            );
             self.remove_slot(reserved.slot_id);
+            self.record_progress(ReservedSocketProgressKind::IdleTrimmed, detail);
         }
     }
 
@@ -635,6 +731,13 @@ impl ReservedSocketBrokerState {
             previous.is_none(),
             "reserved-socket broker slot ids must be unique"
         );
+        self.record_progress(
+            ReservedSocketProgressKind::OsSocketAcquired,
+            format!(
+                "slot_id={}, kind={:?}, addr={}",
+                reserved.slot_id, reserved.kind, reserved.addr
+            ),
+        );
     }
 
     fn assert_unique_slot_addr(&self, reserved: &ReservedSocket) {
@@ -669,6 +772,19 @@ impl ReservedSocketBrokerState {
             removed.is_some(),
             "reserved-socket broker must only remove known slot ids"
         );
+    }
+
+    fn record_bind_error(&mut self, kind: ReservedSocketKind, error: &io::Error) {
+        self.last_bind_error = Some(format!("kind={kind:?}, error={error}"));
+    }
+
+    fn record_progress(&mut self, kind: ReservedSocketProgressKind, detail: impl Into<String>) {
+        self.progress_epoch = self.progress_epoch.saturating_add(1);
+        self.last_progress = Some(ReservedSocketProgress {
+            epoch: self.progress_epoch,
+            kind,
+            detail: detail.into(),
+        });
     }
 
     fn expected_live_socket_counts(&self) -> SocketProtocolCounts {
@@ -745,8 +861,19 @@ impl ReservedSocketBrokerState {
         }
     }
 
-    fn build_diagnostics(&self) -> ReservedSocketBrokerDiagnostics {
+    fn build_reservation_diagnostics(
+        &self,
+        trace: &ReservationTrace,
+        acquired: &[ReservedSocket],
+        kinds: &[ReservedSocketKind],
+    ) -> ReservedSocketBrokerDiagnostics {
+        let counters = self.build_reservation_counters(trace, acquired, kinds);
         ReservedSocketBrokerDiagnostics {
+            request_id: trace.request_id,
+            owner_label: trace.owner_label.clone(),
+            requested: counters.requested,
+            acquired: counters.acquired,
+            next_kind: counters.next_kind,
             waiting: SocketProtocolCounts {
                 tcp: self.waiting_tcp,
                 udp: self.waiting_udp,
@@ -757,6 +884,10 @@ impl ReservedSocketBrokerState {
             },
             expected_live: self.expected_live_socket_counts(),
             actual_live: capture_process_socket_census(),
+            acquisition_in_progress_owner: self.acquisition_in_progress_owner.clone(),
+            progress_epoch: self.progress_epoch,
+            last_progress: self.last_progress.clone(),
+            last_bind_error: self.last_bind_error.clone(),
             slot_summary: self.slot_summary(),
         }
     }
@@ -783,6 +914,97 @@ impl SocketProtocolCounts {
         }
         counts
     }
+}
+
+/// Broker-local event category that proves a waiting reservation is not stuck.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservedSocketProgressKind {
+    /// A reservation request obtained all sockets it asked for.
+    ReservationFulfilled,
+    /// A test dropped a lease and returned at least one socket to the broker.
+    LeaseReleased,
+    /// The broker successfully acquired a hidden socket from the OS.
+    OsSocketAcquired,
+    /// A waiting reservation consumed one socket from an idle pool.
+    IdleSocketConsumed,
+    /// A failed reservation returned a partially acquired socket to the broker.
+    PartialAcquisitionReturned,
+    /// The broker closed an idle socket that no current local waiter needs.
+    IdleTrimmed,
+}
+
+/// Last broker-local progress event visible to reservation stall diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReservedSocketProgress {
+    /// Value of the broker progress counter after this event.
+    epoch: u64,
+    /// Category of progress that occurred.
+    kind: ReservedSocketProgressKind,
+    /// Human-readable event payload, usually including slot id, kind, and address.
+    detail: String,
+}
+
+/// Tracks whether one reservation request has observed broker-local progress.
+#[derive(Debug)]
+struct ReservationProgressWatch {
+    /// Most recent broker progress epoch observed by this request.
+    observed_epoch: u64,
+    /// Instant at which the request last observed a new progress epoch.
+    no_progress_since: Instant,
+}
+
+impl ReservationProgressWatch {
+    fn new(state: &ReservedSocketBrokerState, now: Instant) -> Self {
+        Self {
+            observed_epoch: state.progress_epoch,
+            no_progress_since: now,
+        }
+    }
+
+    fn is_stalled(
+        &mut self,
+        state: &ReservedSocketBrokerState,
+        now: Instant,
+        stall_timeout: Duration,
+    ) -> bool {
+        if state.progress_epoch != self.observed_epoch {
+            self.observed_epoch = state.progress_epoch;
+            self.no_progress_since = now;
+            return false;
+        }
+        now.duration_since(self.no_progress_since) >= stall_timeout
+    }
+}
+
+/// Reason a reservation request stopped waiting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationFailureReason {
+    /// The broker made no local progress for the configured stall timeout.
+    NoProgress { stall_timeout: Duration },
+    /// The last-resort absolute timeout fired before the reservation completed.
+    AbsoluteTimeout { timeout: Duration },
+}
+
+impl Display for ReservationFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProgress { stall_timeout } => {
+                write!(f, "no broker-local progress for {stall_timeout:?}")
+            }
+            Self::AbsoluteTimeout { timeout } => write!(f, "absolute timeout {timeout:?}"),
+        }
+    }
+}
+
+/// Failure context kept separate from partially acquired sockets during cleanup.
+#[derive(Clone, Copy, Debug)]
+struct FailedReservation<'a> {
+    /// Why the reservation request gave up.
+    reason: ReservationFailureReason,
+    /// Request trace used for diagnostics and panic messages.
+    trace: &'a ReservationTrace,
+    /// Full requested socket sequence.
+    kinds: &'a [ReservedSocketKind],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -812,10 +1034,33 @@ struct ReservedSocketSlotRecord {
 
 #[derive(Debug)]
 struct ReservedSocketBrokerDiagnostics {
+    /// Unique reservation request id.
+    request_id: usize,
+    /// Human-readable owner thread label for the failed request.
+    owner_label: String,
+    /// Total socket counts requested by the failed reservation.
+    requested: SocketProtocolCounts,
+    /// Socket counts acquired by the failed reservation before it gave up.
+    acquired: SocketProtocolCounts,
+    /// Next socket kind the failed reservation still needed.
+    next_kind: Option<ReservedSocketKind>,
+    /// Current unsatisfied demand across all broker waiters.
     waiting: SocketProtocolCounts,
+    /// Current hidden sockets available in broker idle pools.
     idle: SocketProtocolCounts,
+    /// Live sockets expected from the broker's internal slot records.
     expected_live: SocketProtocolCounts,
+    /// Live TCP/UDP socket census reported by the OS for this process.
     actual_live: Result<SocketProtocolCounts, String>,
+    /// Owner currently allowed to acquire sockets from the OS, if any.
+    acquisition_in_progress_owner: Option<String>,
+    /// Broker-local progress epoch captured at failure time.
+    progress_epoch: u64,
+    /// Last broker-local progress event captured at failure time.
+    last_progress: Option<ReservedSocketProgress>,
+    /// Last OS bind error captured at failure time.
+    last_bind_error: Option<String>,
+    /// Per-slot diagnostic summary of broker-owned sockets.
     slot_summary: String,
 }
 
@@ -978,6 +1223,9 @@ impl ReservedSocketBrokerDiagnostics {
     }
 
     fn render(&self) -> String {
+        let next_kind = self
+            .next_kind
+            .map_or_else(|| String::from("<complete>"), |kind| format!("{kind:?}"));
         let actual_live = match &self.actual_live {
             Ok(actual_live) => {
                 format!(
@@ -987,16 +1235,69 @@ impl ReservedSocketBrokerDiagnostics {
             }
             Err(error) => format!("actual_live_socket_census_failed={error}"),
         };
+        let active_owner = self
+            .acquisition_in_progress_owner
+            .as_deref()
+            .unwrap_or("<none>");
+        let last_progress = self.last_progress.as_ref().map_or_else(
+            || String::from("<none>"),
+            |progress| {
+                format!(
+                    "epoch={}, kind={:?}, detail={}",
+                    progress.epoch, progress.kind, progress.detail
+                )
+            },
+        );
+        let last_bind_error = self.last_bind_error.as_deref().unwrap_or("<none>");
+        let local_holder_hint = if self.expected_live == SocketProtocolCounts::default()
+            && self.last_bind_error.is_some()
+        {
+            "no local broker-owned sockets are live, so full cross-binary holder diagnosis is deferred to flotsync-7hp0"
+        } else {
+            "<none>"
+        };
         format!(
-            "waiting_tcp={}, waiting_udp={}, idle_tcp={}, idle_udp={}, expected_live_tcp={}, expected_live_udp={}, {}, slot_summary={}",
+            "\
+request_id={}
+owner={}
+requested_tcp={}
+requested_udp={}
+acquired_tcp={}
+acquired_udp={}
+next_kind={}
+waiting_tcp={}
+waiting_udp={}
+idle_tcp={}
+idle_udp={}
+active_acquisition_owner={}
+progress_epoch={}
+last_progress={}
+last_bind_error={}
+expected_live_tcp={}
+expected_live_udp={}
+{}
+slot_summary={}
+local_holder_hint={}",
+            self.request_id,
+            self.owner_label,
+            self.requested.tcp,
+            self.requested.udp,
+            self.acquired.tcp,
+            self.acquired.udp,
+            next_kind,
             self.waiting.tcp,
             self.waiting.udp,
             self.idle.tcp,
             self.idle.udp,
+            active_owner,
+            self.progress_epoch,
+            last_progress,
+            last_bind_error,
             self.expected_live.tcp,
             self.expected_live.udp,
             actual_live,
             self.slot_summary,
+            local_holder_hint,
         )
     }
 }
@@ -1299,6 +1600,120 @@ where
             deadline
                 .saturating_duration_since(now)
                 .min(EVENTUALLY_POLL_INTERVAL),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reserved_socket_for_test(
+        slot_id: usize,
+        kind: ReservedSocketKind,
+        port: u16,
+    ) -> ReservedSocket {
+        ReservedSocket {
+            slot_id,
+            kind,
+            addr: localhost(port),
+            socket: None,
+        }
+    }
+
+    fn last_progress_kind(state: &ReservedSocketBrokerState) -> ReservedSocketProgressKind {
+        state
+            .last_progress
+            .as_ref()
+            .expect("state should have recorded progress")
+            .kind
+    }
+
+    #[test]
+    fn reservation_progress_watch_resets_when_progress_advances() {
+        let mut state = ReservedSocketBrokerState::default();
+        let start = Instant::now();
+        let mut watch = ReservationProgressWatch::new(&state, start);
+        let stall_timeout = Duration::from_secs(10);
+
+        assert!(!watch.is_stalled(&state, start + Duration::from_secs(9), stall_timeout));
+
+        state.record_progress(
+            ReservedSocketProgressKind::OsSocketAcquired,
+            "test progress",
+        );
+        assert!(!watch.is_stalled(&state, start + Duration::from_secs(11), stall_timeout));
+        assert!(!watch.is_stalled(&state, start + Duration::from_secs(20), stall_timeout));
+        assert!(watch.is_stalled(&state, start + Duration::from_secs(21), stall_timeout));
+    }
+
+    #[test]
+    fn reservation_progress_watch_reports_no_progress_stall() {
+        let state = ReservedSocketBrokerState::default();
+        let start = Instant::now();
+        let mut watch = ReservationProgressWatch::new(&state, start);
+
+        assert!(watch.is_stalled(
+            &state,
+            start + Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn bind_failures_do_not_count_as_progress() {
+        let mut state = ReservedSocketBrokerState::default();
+        let start = Instant::now();
+        let mut watch = ReservationProgressWatch::new(&state, start);
+
+        state.record_bind_error(
+            ReservedSocketKind::UdpSocket,
+            &io::Error::new(io::ErrorKind::AddrNotAvailable, "no UDP slots"),
+        );
+
+        assert_eq!(state.progress_epoch, 0);
+        assert!(state.last_bind_error.is_some());
+        assert!(watch.is_stalled(
+            &state,
+            start + Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn lease_release_counts_as_progress() {
+        let mut state = ReservedSocketBrokerState::default();
+        let reserved = reserved_socket_for_test(1, ReservedSocketKind::UdpSocket, 41_001);
+        state.register_new_leased_slot(&reserved);
+        let epoch_after_acquire = state.progress_epoch;
+
+        state.reclaim_idle(reserved, ReservedSocketProgressKind::LeaseReleased);
+
+        assert!(state.progress_epoch > epoch_after_acquire);
+        assert_eq!(
+            last_progress_kind(&state),
+            ReservedSocketProgressKind::LeaseReleased
+        );
+    }
+
+    #[test]
+    fn idle_socket_consumption_counts_as_progress() {
+        let mut state = ReservedSocketBrokerState::default();
+        let reserved = reserved_socket_for_test(2, ReservedSocketKind::UdpSocket, 41_002);
+        state.register_new_leased_slot(&reserved);
+        state.waiting_udp = 1;
+        state.reclaim_idle(reserved, ReservedSocketProgressKind::LeaseReleased);
+        let epoch_before_take = state.progress_epoch;
+
+        let consumed = state
+            .take_idle(ReservedSocketKind::UdpSocket)
+            .expect("idle UDP reservation should be available");
+
+        assert_eq!(consumed.slot_id, 2);
+        assert!(state.progress_epoch > epoch_before_take);
+        assert_eq!(
+            last_progress_kind(&state),
+            ReservedSocketProgressKind::IdleSocketConsumed
         );
     }
 }
