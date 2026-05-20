@@ -30,7 +30,7 @@ fn main() {
         // `bytes::Bytes`, so generated types avoid avoidable `Bytes <-> Vec`
         // churn without forcing wider API changes elsewhere.
         .use_bytes_type_in(&[
-            ".flotsync.delivery.v1.GroupEnvelopeWire.encrypted_payload",
+            ".flotsync.delivery.v1.SealedGroupPayload.ciphertext",
             ".flotsync.delivery.v1.SealedReliablePayload.hpke_ciphertext",
             ".flotsync.delivery.v1.SignatureWire.signature_bytes",
         ])

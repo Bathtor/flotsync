@@ -1,9 +1,23 @@
 use crate::{
-    error::{RandomnessSnafu, Result, SecurityError},
-    identity::MemberIdentity,
+    error::{
+        RandomnessSnafu,
+        Result,
+        SecurityError,
+        StoredGroupSecretLengthSnafu,
+        UnsupportedGroupCipherSuiteSnafu,
+    },
+    identity::{LocalMemberKeys, MemberIdentity, PublicMemberKeys},
+    signature::{
+        FrameSignature,
+        SIGNATURE_LENGTH,
+        SignedFrameParts,
+        sign_frame,
+        verify_frame_signature,
+    },
+    store_secret::{StoreSecretCiphertext, StoreSecretContext, StoreSecretKey, open_store_secret},
     util::{append_len_prefixed, fixed_array, hash_len_prefixed, len_u64},
 };
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 use chacha20poly1305::{
     ChaCha20Poly1305,
     Key,
@@ -28,6 +42,63 @@ pub const GROUP_NONCE_LENGTH: usize = 12;
 pub const GROUP_CIPHER_SUITE_CHACHA20_POLY1305: GroupCipherSuite =
     GroupCipherSuite::CHACHA20_POLY1305;
 
+/// Encrypt and sign one group message with the group's symmetric key.
+///
+/// # Errors
+///
+/// Returns [`SecurityError`] if group AEAD sealing or sender signing fails.
+pub fn seal_group_payload(
+    sender_keys: &LocalMemberKeys,
+    group_key: &GroupKey,
+    context: GroupMessageContext<'_>,
+    public_header: &[u8],
+    plaintext: &[u8],
+) -> Result<SealedGroupPayload> {
+    let ciphertext = seal_group_message(group_key, context, public_header, plaintext)?;
+    let signature = sign_frame(
+        sender_keys,
+        SignedFrameParts {
+            frame_kind: context.frame_kind,
+            public_header,
+            ciphertext: ciphertext.as_ref(),
+        },
+    )?;
+    Ok(SealedGroupPayload {
+        ciphertext,
+        signature: *signature.as_bytes(),
+    })
+}
+
+/// Verify and decrypt one signed group message with the group's symmetric key.
+///
+/// # Errors
+///
+/// Returns [`SecurityError`] if sender signature verification or group AEAD
+/// opening fails.
+pub fn open_group_payload(
+    sender_keys: &PublicMemberKeys,
+    group_key: &GroupKey,
+    context: GroupMessageContext<'_>,
+    public_header: &[u8],
+    sealed: &SealedGroupPayload,
+) -> Result<Bytes> {
+    verify_frame_signature(
+        sender_keys,
+        SignedFrameParts {
+            frame_kind: context.frame_kind,
+            public_header,
+            ciphertext: sealed.ciphertext.as_ref(),
+        },
+        &FrameSignature::from_bytes(sealed.signature),
+    )?;
+    open_group_message(
+        group_key,
+        context,
+        public_header,
+        sealed.ciphertext.as_ref(),
+    )
+}
+
 /// Encrypt one group message with the group's symmetric key.
 ///
 /// The nonce is derived from the immutable group/message context. The public
@@ -42,11 +113,11 @@ pub fn seal_group_message(
     context: GroupMessageContext<'_>,
     public_header: &[u8],
     plaintext: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&group_key.bytes));
     let nonce = group_nonce(context);
     let aad = group_aad(context, public_header);
-    cipher
+    let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
             Payload {
@@ -54,7 +125,8 @@ pub fn seal_group_message(
                 aad: &aad,
             },
         )
-        .map_err(|_| SecurityError::GroupSeal)
+        .map_err(|_| SecurityError::GroupSeal)?;
+    Ok(Bytes::from(ciphertext))
 }
 
 /// Decrypt and authenticate one group message with the group's symmetric key.
@@ -68,11 +140,11 @@ pub fn open_group_message(
     context: GroupMessageContext<'_>,
     public_header: &[u8],
     ciphertext: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Bytes> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&group_key.bytes));
     let nonce = group_nonce(context);
     let aad = group_aad(context, public_header);
-    cipher
+    let plaintext = cipher
         .decrypt(
             Nonce::from_slice(&nonce),
             Payload {
@@ -80,7 +152,70 @@ pub fn open_group_message(
                 aad: &aad,
             },
         )
-        .map_err(|_| SecurityError::GroupOpen)
+        .map_err(|_| SecurityError::GroupOpen)?;
+    Ok(Bytes::from(plaintext))
+}
+
+/// Open and decode one encrypted group key from sensitive store-cell material.
+///
+/// The decrypted plaintext is kept inside this crate and zeroised before the
+/// function returns.
+///
+/// # Errors
+///
+/// Returns [`SecurityError::StoreSecretOpen`] when the encrypted store cell
+/// does not authenticate, or stored group-secret parsing errors when the
+/// decrypted plaintext is malformed.
+pub fn open_stored_group_key(
+    key: &StoreSecretKey,
+    context: StoreSecretContext<'_>,
+    sealed: &StoreSecretCiphertext,
+) -> Result<GroupKey> {
+    let plaintext = open_store_secret(key, context, sealed)?;
+    group_key_from_stored_secret_plaintext(plaintext.as_slice())
+}
+
+/// Decode stored group-secret plaintext into the active group cipher key.
+///
+/// # Errors
+///
+/// Returns [`SecurityError::StoredGroupSecretLength`] for malformed plaintext
+/// length and [`SecurityError::UnsupportedGroupCipherSuite`] for any cipher
+/// suite other than the currently supported ChaCha20-Poly1305 suite.
+pub fn group_key_from_stored_secret_plaintext(plaintext: &[u8]) -> Result<GroupKey> {
+    let expected = 2 + GROUP_KEY_LENGTH;
+    ensure!(
+        plaintext.len() == expected,
+        StoredGroupSecretLengthSnafu {
+            expected,
+            actual: plaintext.len(),
+        }
+    );
+    let (cipher_suite_bytes, key_bytes) = plaintext.split_at(2);
+    let cipher_suite_bytes: &[u8; 2] = cipher_suite_bytes
+        .as_array()
+        .expect("we just checked the length");
+    let cipher_suite = GroupCipherSuite::new(u16::from_be_bytes(*cipher_suite_bytes));
+    let expected_suite = GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
+    ensure!(
+        cipher_suite == expected_suite,
+        UnsupportedGroupCipherSuiteSnafu {
+            expected: expected_suite,
+            actual: cipher_suite,
+        }
+    );
+    let key_bytes: &[u8; GROUP_KEY_LENGTH] =
+        key_bytes.as_array().expect("we just checked the length");
+    Ok(GroupKey::from_bytes(*key_bytes))
+}
+
+/// HPKE-free group payload sealed by AEAD and authenticated by sender signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedGroupPayload {
+    /// Group AEAD ciphertext including its authentication tag.
+    pub ciphertext: Bytes,
+    /// Sender signature over the public header and sealed ciphertext.
+    pub signature: [u8; SIGNATURE_LENGTH],
 }
 
 /// Symmetric key used to encrypt replication messages within one group.
@@ -158,6 +293,24 @@ impl GroupCipherSuite {
     pub const fn as_u16(self) -> u16 {
         self.0
     }
+
+    /// Return the stable human-readable name for a known cipher suite.
+    #[must_use]
+    pub const fn name(self) -> Option<&'static str> {
+        match self {
+            Self::CHACHA20_POLY1305 => Some("ChaCha20-Poly1305"),
+            Self(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for GroupCipherSuite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "{name} ({})", self.0),
+            None => write!(f, "unknown suite {}", self.0),
+        }
+    }
 }
 
 /// Public context that binds a group ciphertext to its replication identity.
@@ -219,4 +372,15 @@ fn append_member_identity(output: &mut Vec<u8>, member: &MemberIdentity) {
     for segment in member.segments_iter() {
         append_len_prefixed(output, segment.as_ref().as_bytes());
     }
+}
+
+/// Build a deterministic group key for tests from a domain and group id.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn test_group_key_from_id(group_id: Uuid) -> GroupKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"flotsync/security/test-group-key/v1");
+    hasher.update(group_id.as_bytes());
+    let digest = hasher.finalize();
+    GroupKey::from_bytes(fixed_array(&digest[..GROUP_KEY_LENGTH]))
 }

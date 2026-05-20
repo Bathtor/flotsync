@@ -1,4 +1,7 @@
-use crate::identity::{KeyRole, MemberIdentity};
+use crate::{
+    group::GroupCipherSuite,
+    identity::{KeyRole, MemberIdentity},
+};
 use flotsync_core::member::IdentifierParseError;
 use rand_core::OsError;
 use snafu::prelude::*;
@@ -98,6 +101,15 @@ pub enum SecurityError {
     GroupSeal,
     #[snafu(display("Group message authentication failed."))]
     GroupOpen,
+    #[snafu(display("Stored group secret is {actual} bytes, expected {expected} bytes."))]
+    StoredGroupSecretLength { expected: usize, actual: usize },
+    #[snafu(display(
+        "Stored group secret uses unsupported cipher suite {actual}; expected {expected}."
+    ))]
+    UnsupportedGroupCipherSuite {
+        expected: GroupCipherSuite,
+        actual: GroupCipherSuite,
+    },
     #[snafu(display("Store secret encryption failed."))]
     StoreSecretSeal,
     #[snafu(display("Store secret authentication failed."))]

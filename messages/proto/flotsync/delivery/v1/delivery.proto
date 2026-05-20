@@ -39,12 +39,17 @@ message GroupEnvelopeHeader {
   bytes message_id = 3;
 }
 
+// AEAD-sealed group-broadcast payload authenticated by the sender.
+message SealedGroupPayload {
+  bytes ciphertext = 1;
+  bytes sender_signature = 2;
+}
+
 // Group fan-out envelope with explicit separation between public routing data
-// and encrypted payload bytes.
+// and sealed payload bytes.
 message GroupEnvelopeWire {
   GroupEnvelopeHeader public_header = 1;
-  bytes encrypted_payload = 16;
-  SignatureWire footer = 17;
+  SealedGroupPayload sealed_payload = 16;
 }
 
 // Public reliable-envelope routing header.

@@ -1,9 +1,11 @@
 use crate::{
     GroupMembers,
+    GroupMembersError,
     api::{
         BoxError,
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
+        GroupId,
         LocalMemberPrivateKeysRecord,
         MemberIdentity,
         ReplicationStore,
@@ -11,25 +13,31 @@ use crate::{
         StoreSecretKeyId,
         TrustedMemberPublicKeysRecord,
     },
-    delivery::reliable_delivery::ReliableMessageHeader,
+    delivery::{group_broadcast::GroupMessageHeader, reliable_delivery::ReliableMessageHeader},
     runtime::messages::{BootstrapGroupMessage, BootstrapMemberPublicKeysMessage},
 };
+use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_security::{
     GroupKey,
+    GroupMessageContext,
     LocalMemberKeys,
     PublicMemberKeys,
     ReliablePayloadContext,
     STORE_SECRET_CRYPTO_VERSION_V1,
     STORE_SECRET_NONCE_LENGTH,
+    SealedGroupPayload,
     SealedReliablePayload,
     StoreSecretCiphertext,
     StoreSecretContext,
     StoreSecretCryptoVersion,
     StoreSecretKey,
     local_member_keys_from_jwks,
+    open_group_payload,
     open_reliable_payload,
     open_store_secret,
+    open_stored_group_key,
+    seal_group_payload,
     seal_reliable_payload_with_os_rng,
     seal_store_secret,
 };
@@ -38,6 +46,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub(crate) const RELIABLE_RUNTIME_MESSAGE_FRAME_KIND: &str = "reliable-runtime-message";
+pub(crate) const GROUP_BROADCAST_RUNTIME_MESSAGE_FRAME_KIND: &str =
+    "group-broadcast-runtime-message";
 
 const LOGICAL_GROUP_TABLE: &str = "replication_group";
 const LOGICAL_GROUP_SECRET_COLUMN: &str = "group_secret";
@@ -58,6 +68,13 @@ pub(crate) enum DeliverySecurityError {
     MissingLocalPrivateKeys { member_id: MemberIdentity },
     #[snafu(display("Trusted public keys for member {member_id} are not provisioned."))]
     MissingTrustedPublicKeys { member_id: MemberIdentity },
+    #[snafu(display("Security material for group {group_id} is not provisioned."))]
+    MissingGroupSecurity { group_id: GroupId },
+    #[snafu(display("Stored group {group_id} has invalid members: {source}"))]
+    InvalidGroupMembers {
+        group_id: GroupId,
+        source: GroupMembersError,
+    },
     #[snafu(display("Reliable delivery cannot send a message from {member_id} to itself."))]
     ReliableSelfMessage { member_id: MemberIdentity },
     #[snafu(display(
@@ -73,6 +90,16 @@ pub(crate) enum DeliverySecurityError {
     UnexpectedReliableRecipient {
         recipient: MemberIdentity,
         local_member: MemberIdentity,
+    },
+    #[snafu(display("Group broadcast sender {sender} did not match local member {local_member}."))]
+    UnexpectedGroupSender {
+        sender: MemberIdentity,
+        local_member: MemberIdentity,
+    },
+    #[snafu(display("Group broadcast sender {sender} is not a member of group {group_id}."))]
+    GroupSenderNotInGroup {
+        group_id: GroupId,
+        sender: MemberIdentity,
     },
     #[snafu(display("Bootstrap payload is missing public keys for member {member_id}."))]
     MissingBootstrapPublicKeys { member_id: MemberIdentity },
@@ -94,6 +121,14 @@ pub(crate) enum DeliverySecurityError {
         expected: usize,
         actual: usize,
     },
+    #[snafu(display(
+        "Encrypted group secret for group {group_id} used key id {actual}; expected {expected}."
+    ))]
+    GroupSecretKeyIdMismatch {
+        group_id: GroupId,
+        expected: StoreSecretKeyId,
+        actual: StoreSecretKeyId,
+    },
     #[snafu(display("Local private key payload was not valid UTF-8: {source}"))]
     InvalidLocalPrivateKeyUtf8 { source: std::string::FromUtf8Error },
     #[snafu(display("Local private keys were invalid: {source}"))]
@@ -112,6 +147,12 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Failed to open reliable payload: {source}"))]
     OpenReliablePayload { source: BoxError },
+    #[snafu(display("Failed to open encrypted group secret for group {group_id}: {source}"))]
+    OpenGroupSecret { group_id: GroupId, source: BoxError },
+    #[snafu(display("Failed to seal group payload for group {group_id}: {source}"))]
+    SealGroupPayload { group_id: GroupId, source: BoxError },
+    #[snafu(display("Failed to open group payload for group {group_id}: {source}"))]
+    OpenGroupPayload { group_id: GroupId, source: BoxError },
     #[snafu(display("Failed to open encrypted local private keys: {source}"))]
     OpenLocalPrivateKeys { source: BoxError },
     #[snafu(display("Failed to seal group secret for storage: {source}"))]
@@ -132,12 +173,16 @@ impl DeliverySecurityError {
             Self::MissingLocalPrivateKeys { .. } => false,
             // Missing trusted keys require provisioning or a trust update.
             Self::MissingTrustedPublicKeys { .. } => false,
+            // Missing or malformed group-security state requires provisioning or data repair.
+            Self::MissingGroupSecurity { .. } | Self::InvalidGroupMembers { .. } => false,
             // Reliable self-send is a caller bug.
             Self::ReliableSelfMessage { .. } => false,
             // Sender/recipient mismatches are local routing or authenticity violations.
             Self::UnexpectedReliableSender { .. } | Self::UnexpectedReliableRecipient { .. } => {
                 false
             }
+            // Group sender mismatches are local routing or membership violations.
+            Self::UnexpectedGroupSender { .. } | Self::GroupSenderNotInGroup { .. } => false,
             // Bootstrap payload membership and key mismatches are permanent for this payload.
             Self::MissingBootstrapPublicKeys { .. }
             | Self::TrustedPublicKeysMismatch { .. }
@@ -150,12 +195,18 @@ impl DeliverySecurityError {
             Self::InvalidTrustedPublicKeyLength { .. } | Self::InvalidTrustedPublicKeys { .. } => {
                 false
             }
+            // Group-secret key id mismatches require loading with the matching local key id.
+            Self::GroupSecretKeyIdMismatch { .. } => false,
             // Invalid local private-key records need reprovisioning.
             Self::InvalidLocalPrivateKeyUtf8 { .. } | Self::InvalidLocalPrivateKeys { .. } => false,
             // Group-key generation depends on OS randomness and may recover on retry.
             Self::GenerateGroupKey { .. } => true,
             // Reliable-payload seal/open failures are crypto or key-consistency failures.
             Self::SealReliablePayload { .. } | Self::OpenReliablePayload { .. } => false,
+            // Group-secret and group-payload failures are crypto or key-consistency failures.
+            Self::OpenGroupSecret { .. }
+            | Self::SealGroupPayload { .. }
+            | Self::OpenGroupPayload { .. } => false,
             // Local private-key opening failures are wrong-key/corrupt-record failures.
             Self::OpenLocalPrivateKeys { .. } => false,
             // Group-secret sealing also depends on OS randomness and may recover on retry.
@@ -284,6 +335,74 @@ impl DeliverySecurity {
         .context(OpenReliablePayloadSnafu)
     }
 
+    /// Seal one group-broadcast payload for transport fan-out.
+    pub(crate) async fn seal_group_payload(
+        &self,
+        header: &GroupMessageHeader,
+        public_header: &[u8],
+        plaintext: &[u8],
+    ) -> Result<SealedGroupPayload, DeliverySecurityError> {
+        ensure!(
+            header.sender == self.local_member,
+            UnexpectedGroupSenderSnafu {
+                sender: header.sender.clone(),
+                local_member: self.local_member.clone(),
+            }
+        );
+        let group_security = self.load_group_security(&header.group_id).await?;
+        ensure!(
+            group_security.members.contains(&header.sender),
+            GroupSenderNotInGroupSnafu {
+                group_id: header.group_id,
+                sender: header.sender.clone(),
+            }
+        );
+        seal_group_payload(
+            self.local_keys(),
+            &group_security.group_key,
+            group_message_context(header),
+            public_header,
+            plaintext,
+        )
+        .boxed()
+        .context(SealGroupPayloadSnafu {
+            group_id: header.group_id,
+        })
+    }
+
+    /// Verify and open one group-broadcast payload received from transport.
+    pub(crate) async fn open_group_payload(
+        &self,
+        header: &GroupMessageHeader,
+        public_header: &[u8],
+        sealed: &SealedGroupPayload,
+    ) -> Result<Bytes, DeliverySecurityError> {
+        let group_security = self.load_group_security(&header.group_id).await?;
+        ensure!(
+            group_security.members.contains(&header.sender),
+            GroupSenderNotInGroupSnafu {
+                group_id: header.group_id,
+                sender: header.sender.clone(),
+            }
+        );
+        let sender_keys = if header.sender == self.local_member {
+            self.local_keys.public_keys().clone()
+        } else {
+            self.load_trusted_public_keys(&header.sender).await?
+        };
+        open_group_payload(
+            &sender_keys,
+            &group_security.group_key,
+            group_message_context(header),
+            public_header,
+            sealed,
+        )
+        .boxed()
+        .context(OpenGroupPayloadSnafu {
+            group_id: header.group_id,
+        })
+    }
+
     /// Validate bootstrap public keys and prepare encrypted group-security material.
     pub(crate) async fn prepare_security_material_from_bootstrap_msg(
         &self,
@@ -295,6 +414,59 @@ impl DeliverySecurity {
 
     fn local_public_bootstrap_keys(&self) -> BootstrapMemberPublicKeysMessage {
         BootstrapMemberPublicKeysMessage::from_public_keys(self.local_keys.public_keys())
+    }
+
+    async fn load_group_security(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<GroupSecurityMaterial, DeliverySecurityError> {
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(StoreAccessSnafu)?;
+        let record = transaction
+            .load_replication_group(group_id)
+            .await
+            .context(StoreAccessSnafu)?
+            .ok_or_else(|| DeliverySecurityError::MissingGroupSecurity {
+                group_id: *group_id,
+            })?;
+        transaction.release().await.context(StoreAccessSnafu)?;
+        let members = GroupMembers::from_ordered_members(record.members).context(
+            InvalidGroupMembersSnafu {
+                group_id: record.group_id,
+            },
+        )?;
+        let group_key = self.open_group_secret(record.group_id, &record.security_material)?;
+        Ok(GroupSecurityMaterial { members, group_key })
+    }
+
+    fn open_group_secret(
+        &self,
+        group_id: GroupId,
+        security_material: &EncryptedGroupSecurityMaterial,
+    ) -> Result<GroupKey, DeliverySecurityError> {
+        let secret = &security_material.encrypted_group_secret;
+        ensure!(
+            secret.key_id == self.store_secret_key_id,
+            GroupSecretKeyIdMismatchSnafu {
+                group_id,
+                expected: self.store_secret_key_id.clone(),
+                actual: secret.key_id.clone(),
+            }
+        );
+        let sealed = secret.to_store_secret_ciphertext()?;
+        let context = StoreSecretContext {
+            table: LOGICAL_GROUP_TABLE,
+            column: LOGICAL_GROUP_SECRET_COLUMN,
+            row_id: group_id.0.as_bytes(),
+            key_id: self.store_secret_key_id.as_str(),
+            crypto_version: StoreSecretCryptoVersion::new(secret.crypto_version.as_u16()),
+        };
+        open_stored_group_key(&self.store_secret_key, context, &sealed)
+            .boxed()
+            .context(OpenGroupSecretSnafu { group_id })
     }
 
     pub(crate) fn seal_group_secret(
@@ -411,6 +583,21 @@ pub(crate) fn public_keys_from_record(
     .context(InvalidTrustedPublicKeysSnafu {
         member_id: record.member_id,
     })
+}
+
+fn group_message_context(header: &GroupMessageHeader) -> GroupMessageContext<'_> {
+    GroupMessageContext {
+        group_id: header.group_id.0,
+        frame_kind: GROUP_BROADCAST_RUNTIME_MESSAGE_FRAME_KIND,
+        sender: &header.sender,
+        message_id: header.message_id.0,
+    }
+}
+
+/// Decrypted group security state needed for one group-broadcast frame.
+struct GroupSecurityMaterial {
+    members: GroupMembers,
+    group_key: GroupKey,
 }
 
 fn open_local_private_keys(

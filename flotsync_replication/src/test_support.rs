@@ -19,6 +19,8 @@ use crate::{
     runtime::handle::load_replication_runtime_with_runtime_config_toml,
 };
 use flotsync_core::member::Identifier;
+#[cfg(test)]
+use flotsync_security::{GroupKey, test_group_key_from_id};
 use flotsync_security::{
     PublicMemberKeys,
     STORE_SECRET_CRYPTO_VERSION_V1,
@@ -206,6 +208,13 @@ pub(crate) fn test_public_member_keys(member: &MemberIdentity) -> PublicMemberKe
         .expect("test member keys should generate");
     public_member_keys_from_jwks(&generated.public_jwks, Some(member))
         .expect("test public keys should parse")
+}
+
+/// Build a deterministic test group key from the full group id.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn test_group_key(group_id: crate::api::GroupId) -> GroupKey {
+    test_group_key_from_id(group_id.0)
 }
 
 /// Build the deterministic store-secret key used by test runtime support.

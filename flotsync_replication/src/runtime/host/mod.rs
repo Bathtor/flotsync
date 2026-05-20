@@ -502,7 +502,8 @@ impl DeliveryTopology {
             hosted_mailboxes: Arc::new(HashSet::new()),
         });
         let ingress = system.create(move || ingress);
-        let group_broadcast = GroupBroadcastComponent::new(group_memberships, manager_ref.clone());
+        let group_broadcast =
+            GroupBroadcastComponent::new(group_memberships, manager_ref.clone(), security.clone());
         let group_broadcast = system.create(move || group_broadcast);
         let reliable_delivery = ReliableDeliveryComponent::new(manager_ref, security);
         let reliable_delivery = system.create(move || reliable_delivery);

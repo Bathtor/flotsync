@@ -78,19 +78,6 @@ pub struct SignedEnvelopeFooter {
     pub signature: DetachedSignature,
 }
 
-/// Build the placeholder signature footer used until payload signing is wired in.
-#[must_use]
-pub(crate) fn placeholder_signed_footer() -> SignedEnvelopeFooter {
-    SignedEnvelopeFooter {
-        // TODO(flotsync-d8d): Replace this placeholder once the real delivery
-        // signing boundary is available.
-        signature: DetachedSignature {
-            scheme: SignatureScheme::Ed25519,
-            bytes: Bytes::from_static(b"placeholder-signature"),
-        },
-    }
-}
-
 /// Delivery semantics for group-scoped fan-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DeliveryClass {

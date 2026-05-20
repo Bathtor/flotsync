@@ -2,16 +2,19 @@
 
 use crate::delivery::wire::{
     WireValueDecodeError,
+    fixed_bytes_field,
     group_id_from_wire,
     member_identity_from_wire,
     member_identity_to_wire_format,
     message_id_from_wire,
-    signature_from_wire,
-    signature_to_wire_format,
 };
 
-use super::{EncryptedPayload, GroupMessageEnvelope, GroupMessageHeader};
-use flotsync_messages::{buffa::MessageField, delivery as delivery_proto};
+use super::{GroupMessageEnvelope, GroupMessageHeader};
+use flotsync_messages::{
+    buffa::{Message, MessageField},
+    delivery as delivery_proto,
+};
+use flotsync_security::{SIGNATURE_LENGTH, SealedGroupPayload};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -28,18 +31,17 @@ pub(super) enum GroupBroadcastWireError {
 
 /// Build one outbound delivery-boundary frame for a group envelope.
 pub(super) fn group_envelope_to_wire_format(
-    envelope: &GroupMessageEnvelope,
+    envelope: &GroupMessageEnvelope<SealedGroupPayload>,
 ) -> delivery_proto::DeliveryBoundaryFrame {
-    let header = delivery_proto::GroupEnvelopeHeader {
-        group_id: envelope.header.group_id.0.as_bytes().to_vec(),
-        sender: MessageField::some(member_identity_to_wire_format(&envelope.header.sender)),
-        message_id: envelope.header.message_id.0.as_bytes().to_vec(),
-        ..delivery_proto::GroupEnvelopeHeader::default()
+    let header = group_header_to_wire_format(&envelope.header);
+    let sealed_payload = delivery_proto::SealedGroupPayload {
+        ciphertext: envelope.payload.ciphertext.clone(),
+        sender_signature: envelope.payload.signature.to_vec(),
+        ..delivery_proto::SealedGroupPayload::default()
     };
     let wire = delivery_proto::GroupEnvelopeWire {
         public_header: MessageField::some(header),
-        encrypted_payload: envelope.payload.ciphertext.clone(),
-        footer: MessageField::some(signature_to_wire_format(&envelope.footer)),
+        sealed_payload: MessageField::some(sealed_payload),
         ..delivery_proto::GroupEnvelopeWire::default()
     };
     let frame = delivery_proto::GroupBroadcastFrame {
@@ -56,38 +58,60 @@ pub(super) fn group_envelope_to_wire_format(
     }
 }
 
+/// Build canonical public-header bytes for group AEAD AAD and signature input.
+///
+/// This authenticates the semantic header projection used by delivery, not the
+/// exact protobuf bytes received from transport; unknown fields and
+/// non-canonical encodings are discarded during decode.
+pub(super) fn group_public_header_bytes(header: &GroupMessageHeader) -> Vec<u8> {
+    group_header_to_wire_format(header)
+        .encode_to_bytes()
+        .to_vec()
+}
+
 /// Decode one inbound wire envelope into the owned semantic broadcast model.
 pub(super) fn group_envelope_from_wire(
     mut envelope: delivery_proto::GroupEnvelopeWire,
-) -> Result<GroupMessageEnvelope, GroupBroadcastWireError> {
+) -> Result<GroupMessageEnvelope<SealedGroupPayload>, GroupBroadcastWireError> {
     let mut header = envelope.public_header.take().context(MissingFieldSnafu {
         message: "GroupEnvelopeWire",
         field: "public_header",
     })?;
-    let footer = envelope.footer.take().context(MissingFieldSnafu {
+    let sealed_payload = envelope.sealed_payload.take().context(MissingFieldSnafu {
         message: "GroupEnvelopeWire",
-        field: "footer",
+        field: "sealed_payload",
     })?;
 
     let group_id = group_id_from_wire(&header.group_id, "GroupEnvelopeHeader.group_id")?;
-    let sender = member_identity_from_wire(
-        header.sender.take().context(MissingFieldSnafu {
-            message: "GroupEnvelopeHeader",
-            field: "sender",
-        })?,
-        "GroupEnvelopeHeader.sender",
-    )?;
+    let sender_wire = header.sender.take().context(MissingFieldSnafu {
+        message: "GroupEnvelopeHeader",
+        field: "sender",
+    })?;
+    let sender = member_identity_from_wire(sender_wire, "GroupEnvelopeHeader.sender")?;
     let message_id = message_id_from_wire(&header.message_id, "GroupEnvelopeHeader.message_id")?;
+    let signature = fixed_bytes_field::<SIGNATURE_LENGTH>(
+        "SealedGroupPayload.sender_signature",
+        &sealed_payload.sender_signature,
+    )?;
 
-    Ok(GroupMessageEnvelope {
+    Ok(GroupMessageEnvelope::<SealedGroupPayload> {
         header: GroupMessageHeader {
             group_id,
             sender,
             message_id,
         },
-        payload: EncryptedPayload {
-            ciphertext: envelope.encrypted_payload,
+        payload: SealedGroupPayload {
+            ciphertext: sealed_payload.ciphertext,
+            signature,
         },
-        footer: signature_from_wire(footer, "GroupEnvelopeWire.footer")?,
     })
+}
+
+fn group_header_to_wire_format(header: &GroupMessageHeader) -> delivery_proto::GroupEnvelopeHeader {
+    delivery_proto::GroupEnvelopeHeader {
+        group_id: header.group_id.0.as_bytes().to_vec(),
+        sender: MessageField::some(member_identity_to_wire_format(&header.sender)),
+        message_id: header.message_id.0.as_bytes().to_vec(),
+        ..delivery_proto::GroupEnvelopeHeader::default()
+    }
 }

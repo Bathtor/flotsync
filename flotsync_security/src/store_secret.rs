@@ -133,7 +133,7 @@ pub fn open_store_secret(
     key: &StoreSecretKey,
     context: StoreSecretContext<'_>,
     sealed: &StoreSecretCiphertext,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.bytes));
     let aad = store_secret_aad(context);
     cipher
@@ -144,6 +144,7 @@ pub fn open_store_secret(
                 aad: &aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| SecurityError::StoreSecretOpen)
 }
 

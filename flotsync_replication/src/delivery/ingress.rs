@@ -550,7 +550,11 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: Bytes::from_static(b"ciphertext"),
+            sealed_payload: MessageField::some(proto::SealedGroupPayload {
+                ciphertext: Bytes::from_static(b"ciphertext"),
+                sender_signature: vec![0; 64],
+                ..proto::SealedGroupPayload::default()
+            }),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {

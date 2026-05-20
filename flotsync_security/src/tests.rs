@@ -1,5 +1,7 @@
 use crate::{
     FrameSignature,
+    GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+    GROUP_KEY_LENGTH,
     GroupKey,
     GroupMessageContext,
     HpkeCiphertext,
@@ -11,21 +13,25 @@ use crate::{
     StoreSecretContext,
     StoreSecretCryptoVersion,
     StoreSecretKey,
+    group_key_from_stored_secret_plaintext,
     hpke_open,
     hpke_seal,
     identity::{MEMBER_KEY_SEED_LENGTH, generate_member_key_files_from_seed},
     local_member_keys_from_jwks,
     open_group_message,
+    open_group_payload,
     open_reliable_payload,
     open_store_secret,
     public_member_keys_from_jwks,
     seal_group_message,
+    seal_group_payload,
     seal_reliable_payload,
     seal_store_secret_for_test,
     sign_frame,
     test_support::rng_from_seed,
     verify_frame_signature,
 };
+use bytes::Bytes;
 use flotsync_core::member::Identifier;
 use jose_jwk::{JwkSet, Operations};
 use std::collections::BTreeSet;
@@ -194,7 +200,162 @@ fn group_message_round_trips() {
     let ciphertext = seal_group_message(&key, context, public_header, b"hello group").unwrap();
     let plaintext = open_group_message(&key, context, public_header, &ciphertext).unwrap();
 
-    assert_eq!(plaintext, b"hello group");
+    assert_eq!(plaintext.as_ref(), b"hello group");
+}
+
+#[test]
+fn signed_group_payload_round_trips() {
+    let alice = local_member("alice", ALICE_SEED);
+    let key = GroupKey::from_bytes([7u8; 32]);
+    let context = GroupMessageContext {
+        group_id: Uuid::from_u128(10),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+    let public_header = b"{\"group\":\"10\"}";
+
+    let sealed = seal_group_payload(&alice, &key, context, public_header, b"hello group").unwrap();
+    let plaintext =
+        open_group_payload(alice.public_keys(), &key, context, public_header, &sealed).unwrap();
+
+    assert_eq!(plaintext.as_ref(), b"hello group");
+}
+
+#[test]
+fn signed_group_payload_rejects_signature_tampering() {
+    let alice = local_member("alice", ALICE_SEED);
+    let key = GroupKey::from_bytes([7u8; 32]);
+    let context = GroupMessageContext {
+        group_id: Uuid::from_u128(10),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+    let public_header = b"{\"group\":\"10\"}";
+    let mut sealed =
+        seal_group_payload(&alice, &key, context, public_header, b"hello group").unwrap();
+    sealed.signature[0] ^= 0x01;
+
+    let err =
+        open_group_payload(alice.public_keys(), &key, context, public_header, &sealed).unwrap_err();
+
+    assert!(matches!(err, SecurityError::VerifySignature { .. }));
+}
+
+#[test]
+fn signed_group_payload_rejects_ciphertext_tampering() {
+    let alice = local_member("alice", ALICE_SEED);
+    let key = GroupKey::from_bytes([7u8; 32]);
+    let context = GroupMessageContext {
+        group_id: Uuid::from_u128(10),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+    let public_header = b"{\"group\":\"10\"}";
+    let mut sealed =
+        seal_group_payload(&alice, &key, context, public_header, b"hello group").unwrap();
+    let mut ciphertext = sealed.ciphertext.to_vec();
+    ciphertext[0] ^= 0x01;
+    sealed.ciphertext = Bytes::from(ciphertext);
+
+    let err =
+        open_group_payload(alice.public_keys(), &key, context, public_header, &sealed).unwrap_err();
+
+    assert!(matches!(err, SecurityError::VerifySignature { .. }));
+}
+
+#[test]
+fn signed_group_payload_rejects_public_header_tampering() {
+    let alice = local_member("alice", ALICE_SEED);
+    let key = GroupKey::from_bytes([7u8; 32]);
+    let context = GroupMessageContext {
+        group_id: Uuid::from_u128(10),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+    let sealed =
+        seal_group_payload(&alice, &key, context, b"{\"group\":\"10\"}", b"hello group").unwrap();
+
+    let err = open_group_payload(
+        alice.public_keys(),
+        &key,
+        context,
+        b"{\"group\":\"11\"}",
+        &sealed,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, SecurityError::VerifySignature { .. }));
+}
+
+#[test]
+fn signed_group_payload_rejects_group_context_tampering() {
+    let alice = local_member("alice", ALICE_SEED);
+    let key = GroupKey::from_bytes([7u8; 32]);
+    let context = GroupMessageContext {
+        group_id: Uuid::from_u128(10),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+    let public_header = b"{\"group\":\"10\"}";
+    let sealed = seal_group_payload(&alice, &key, context, public_header, b"hello group").unwrap();
+    let tampered_context = GroupMessageContext {
+        group_id: Uuid::from_u128(11),
+        frame_kind: "group-message",
+        sender: alice.member_id(),
+        message_id: Uuid::from_u128(20),
+    };
+
+    let err = open_group_payload(
+        alice.public_keys(),
+        &key,
+        tampered_context,
+        public_header,
+        &sealed,
+    )
+    .unwrap_err();
+
+    assert!(matches!(err, SecurityError::GroupOpen));
+}
+
+#[test]
+fn stored_group_secret_plaintext_decodes_current_suite() {
+    let key = GroupKey::from_bytes([9u8; GROUP_KEY_LENGTH]);
+    let plaintext = key.stored_secret_plaintext();
+
+    let decoded = group_key_from_stored_secret_plaintext(plaintext.as_slice()).unwrap();
+
+    assert_eq!(decoded, key);
+}
+
+#[test]
+fn stored_group_secret_plaintext_rejects_unsupported_suite() {
+    let mut plaintext = Vec::with_capacity(2 + GROUP_KEY_LENGTH);
+    let unsupported_suite = GROUP_CIPHER_SUITE_CHACHA20_POLY1305
+        .as_u16()
+        .wrapping_add(1);
+    plaintext.extend_from_slice(&unsupported_suite.to_be_bytes());
+    plaintext.extend_from_slice(&[9u8; GROUP_KEY_LENGTH]);
+
+    let err = group_key_from_stored_secret_plaintext(&plaintext).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::UnsupportedGroupCipherSuite { .. }
+    ));
+}
+
+#[test]
+fn stored_group_secret_plaintext_rejects_malformed_length() {
+    let plaintext = [9u8; GROUP_KEY_LENGTH];
+
+    let err = group_key_from_stored_secret_plaintext(&plaintext).unwrap_err();
+
+    assert!(matches!(err, SecurityError::StoredGroupSecretLength { .. }));
 }
 
 #[test]
@@ -233,7 +394,8 @@ fn group_ciphertext_tampering_fails_to_open() {
         message_id: Uuid::from_u128(20),
     };
     let public_header = b"{\"group\":\"10\"}";
-    let mut ciphertext = seal_group_message(&key, context, public_header, b"hello group").unwrap();
+    let ciphertext = seal_group_message(&key, context, public_header, b"hello group").unwrap();
+    let mut ciphertext = ciphertext.to_vec();
     ciphertext[0] ^= 0x01;
 
     let err = open_group_message(&key, context, public_header, &ciphertext).unwrap_err();
@@ -356,7 +518,7 @@ fn store_secret_round_trips_with_logical_context() {
 
     let opened = open_store_secret(&key, context, &sealed).unwrap();
 
-    assert_eq!(opened, b"group key");
+    assert_eq!(opened.as_slice(), b"group key");
 }
 
 #[test]

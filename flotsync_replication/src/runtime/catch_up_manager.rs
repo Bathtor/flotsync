@@ -527,13 +527,13 @@ impl CatchUpManagerComponent {
     }
 
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
-        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
+        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
             .with_whatever_benign(|_| {
-            format!(
-                "dropping inbound catch-up candidate from {} after decode error",
-                deliver.envelope.header.sender
-            )
-        })?;
+                format!(
+                    "dropping inbound catch-up candidate from {} after decode error",
+                    deliver.envelope.header.sender
+                )
+            })?;
         match message {
             WireRuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)

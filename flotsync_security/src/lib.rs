@@ -1,6 +1,8 @@
 //! Cryptographic building blocks for authenticated encrypted replication frames.
 
 pub use error::{Result, SecurityError};
+#[cfg(any(test, feature = "test-support"))]
+pub use group::test_group_key_from_id;
 pub use group::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     GROUP_KEY_LENGTH,
@@ -8,8 +10,13 @@ pub use group::{
     GroupCipherSuite,
     GroupKey,
     GroupMessageContext,
+    SealedGroupPayload,
+    group_key_from_stored_secret_plaintext,
     open_group_message,
+    open_group_payload,
+    open_stored_group_key,
     seal_group_message,
+    seal_group_payload,
 };
 pub use hpke::{HPKE_ENCAPSULATED_KEY_LENGTH, HpkeCiphertext, hpke_open, hpke_seal};
 pub use identity::{

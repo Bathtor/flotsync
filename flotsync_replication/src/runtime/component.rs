@@ -60,7 +60,7 @@ use super::{
     summary_request_manager::SummaryRequestManagerMessage,
 };
 #[cfg(test)]
-use crate::api::current_slice_placeholder_group_security_material;
+use crate::test_support::test_group_key;
 use crate::{
     GroupMembers,
     GroupMemberships,
@@ -1478,13 +1478,12 @@ impl ReplicationRuntimeComponent {
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::group(&deliver.envelope.header);
         let sender = deliver.envelope.header.sender.clone();
-        let message =
-            match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-            };
+        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
+            .context(inbound::DecodeMessageSnafu)
+        {
+            Ok(message) => message,
+            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+        };
         match message {
             WireRuntimeMessage::BootstrapGroup(_) => Err(InboundDeliveryFailure::new(
                 context,
@@ -2076,11 +2075,20 @@ impl ReplicationRuntimeComponent {
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
     ) -> HandlerResult {
         let (promise, (group_id, members)) = ask.take();
-        let record = self.build_replication_group_record(
-            group_id,
-            &members,
-            current_slice_placeholder_group_security_material(group_id),
-        );
+        // TODO(flotsync-sec.9): Remove this test-only message once production
+        // group creation installs real group secrets through the normal API.
+        let group_key = test_group_key(group_id);
+        let security_material = match self.security.seal_group_secret(group_id.0, &group_key) {
+            Ok(security_material) => security_material,
+            Err(source) => {
+                let _ = promise.fulfil(Err(GroupInstallError::TestGroupSecurity {
+                    group_id,
+                    source,
+                }));
+                return Handled::OK;
+            }
+        };
+        let record = self.build_replication_group_record(group_id, &members, security_material);
         Handled::block_on(self, async move |mut async_self| {
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {
