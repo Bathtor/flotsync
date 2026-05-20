@@ -24,7 +24,7 @@ use crate::{
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_security::SealedGroupPayload;
+use flotsync_security::SealedPSKPayload;
 use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::prelude::*;
 use std::{collections::HashSet, sync::Arc};
@@ -51,7 +51,7 @@ pub struct GroupMessageEnvelope<P> {
     pub payload: P,
 }
 
-impl GroupMessageEnvelope<SealedGroupPayload> {
+impl GroupMessageEnvelope<SealedPSKPayload> {
     fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
         group_envelope_to_wire_format(self)
     }
@@ -270,7 +270,7 @@ impl GroupBroadcastComponent {
     async fn seal_outbound_envelope(
         &mut self,
         envelope: GroupMessageEnvelope<PlaintextPayload>,
-    ) -> Result<GroupMessageEnvelope<SealedGroupPayload>, DeliverySecurityError> {
+    ) -> Result<GroupMessageEnvelope<SealedPSKPayload>, DeliverySecurityError> {
         let GroupMessageEnvelope { header, payload } = envelope;
         let public_header = group_public_header_bytes(&header);
         let sealed = self
@@ -440,7 +440,7 @@ impl GroupBroadcastComponent {
     /// Open one inbound sealed envelope before handing plaintext to semantic owners.
     async fn open_inbound_envelope(
         &mut self,
-        envelope: GroupMessageEnvelope<SealedGroupPayload>,
+        envelope: GroupMessageEnvelope<SealedPSKPayload>,
     ) -> Result<GroupMessageEnvelope<PlaintextPayload>, DeliverySecurityError> {
         let GroupMessageEnvelope { header, payload } = envelope;
         let public_header = group_public_header_bytes(&header);
@@ -1213,7 +1213,7 @@ mod tests {
                         .sealed_payload
                         .as_option_mut()
                         .expect("test sealed payload should be present");
-                    sealed_payload.sender_signature[0] ^= 0x01;
+                    sealed_payload.signature[0] ^= 0x01;
                 }
                 Self::Ciphertext => {
                     let sealed_payload = envelope

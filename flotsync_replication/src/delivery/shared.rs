@@ -65,7 +65,8 @@ pub enum SignatureScheme {
     Ed25519,
 }
 
-/// Detached signature bytes carried in plaintext footers.
+/// Signature-only authentication bytes carried by control frames without an
+/// encrypted body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetachedSignature {
     pub scheme: SignatureScheme,

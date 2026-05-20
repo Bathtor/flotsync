@@ -33,10 +33,16 @@ pub struct ReliablePayloadContext<'a> {
     pub message_id: Uuid,
 }
 
-/// HPKE-sealed and signed reliable payload fields.
+/// Payload encrypted to one recipient with HPKE and authenticated by a detached
+/// frame signature.
+///
+/// HPKE uses the recipient's public key and an encapsulated ephemeral key to
+/// derive a message-specific content-encryption key. The signature covers the
+/// public header plus the HPKE body, so receivers can authenticate the sender
+/// before opening the ciphertext.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealedReliablePayload {
-    /// HPKE encapsulated ephemeral public key bytes.
+pub struct SealedHPKEPayload {
+    /// Encapsulated ephemeral public key bytes needed by the recipient.
     pub encapsulated_key: [u8; HPKE_ENCAPSULATED_KEY_LENGTH],
     /// HPKE ciphertext including its AEAD authentication tag.
     pub ciphertext: Vec<u8>,
@@ -55,7 +61,7 @@ pub fn seal_reliable_payload<R>(
     context: ReliablePayloadContext<'_>,
     plaintext: &[u8],
     rng: &mut R,
-) -> Result<SealedReliablePayload>
+) -> Result<SealedHPKEPayload>
 where
     R: CryptoRng + RngCore,
 {
@@ -72,7 +78,7 @@ where
             ciphertext: &signed_body,
         },
     )?;
-    Ok(SealedReliablePayload {
+    Ok(SealedHPKEPayload {
         encapsulated_key,
         ciphertext,
         signature: *signature.as_bytes(),
@@ -96,7 +102,7 @@ pub fn seal_reliable_payload_with_os_rng(
     recipient_keys: &PublicMemberKeys,
     context: ReliablePayloadContext<'_>,
     plaintext: &[u8],
-) -> Result<SealedReliablePayload> {
+) -> Result<SealedHPKEPayload> {
     let mut rng = OsRng.unwrap_err();
     seal_reliable_payload(sender_keys, recipient_keys, context, plaintext, &mut rng)
 }
@@ -110,7 +116,7 @@ pub fn open_reliable_payload(
     sender_keys: &PublicMemberKeys,
     recipient_keys: &LocalMemberKeys,
     context: ReliablePayloadContext<'_>,
-    sealed: &SealedReliablePayload,
+    sealed: &SealedHPKEPayload,
 ) -> Result<Vec<u8>> {
     let public_header = reliable_payload_public_header(context);
     let signed_body = reliable_payload_signed_body(&sealed.encapsulated_key, &sealed.ciphertext);

@@ -10,7 +10,6 @@ pub use group::{
     GroupCipherSuite,
     GroupKey,
     GroupMessageContext,
-    SealedGroupPayload,
     group_key_from_stored_secret_plaintext,
     open_group_message,
     open_group_payload,
@@ -34,11 +33,12 @@ pub use identity::{
 };
 pub use reliable_payload::{
     ReliablePayloadContext,
-    SealedReliablePayload,
+    SealedHPKEPayload,
     open_reliable_payload,
     seal_reliable_payload,
     seal_reliable_payload_with_os_rng,
 };
+pub use sealed_psk_payload::SealedPSKPayload;
 pub use signature::{
     FrameSignature,
     SIGNATURE_LENGTH,
@@ -65,6 +65,7 @@ mod group;
 mod hpke;
 mod identity;
 mod reliable_payload;
+mod sealed_psk_payload;
 mod signature;
 mod store_secret;
 mod util;

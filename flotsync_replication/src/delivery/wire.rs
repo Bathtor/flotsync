@@ -17,7 +17,7 @@
 
 use super::{
     ingress::DeliveryTargetHint,
-    shared::{DetachedSignature, MessageId, SignatureScheme, SignedEnvelopeFooter},
+    shared::{DetachedSignature, MessageId, SignatureScheme},
 };
 use crate::{
     GroupMemberships,
@@ -89,20 +89,24 @@ pub(crate) fn fixed_bytes_field<const N: usize>(
         })
 }
 
-pub(crate) fn signature_to_wire_format(footer: &SignedEnvelopeFooter) -> proto::SignatureWire {
-    proto::SignatureWire {
-        scheme: flotsync_messages::buffa::EnumValue::from(match footer.signature.scheme {
+/// Encode a signature-only control-frame authenticator.
+pub(crate) fn detached_signature_to_wire_format(
+    signature: &DetachedSignature,
+) -> proto::DetachedSignature {
+    proto::DetachedSignature {
+        scheme: flotsync_messages::buffa::EnumValue::from(match signature.scheme {
             SignatureScheme::Ed25519 => proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
         }),
-        signature_bytes: footer.signature.bytes.clone(),
-        ..proto::SignatureWire::default()
+        signature_bytes: signature.bytes.clone(),
+        ..proto::DetachedSignature::default()
     }
 }
 
-pub(crate) fn signature_from_wire(
-    wire: proto::SignatureWire,
+/// Decode a signature-only control-frame authenticator.
+pub(crate) fn detached_signature_from_wire(
+    wire: proto::DetachedSignature,
     field: &'static str,
-) -> Result<SignedEnvelopeFooter, WireValueDecodeError> {
+) -> Result<DetachedSignature, WireValueDecodeError> {
     let scheme =
         wire.scheme
             .as_known()
@@ -116,11 +120,9 @@ pub(crate) fn signature_from_wire(
             return UnspecifiedSignatureSchemeSnafu { field }.fail();
         }
     };
-    Ok(SignedEnvelopeFooter {
-        signature: DetachedSignature {
-            scheme,
-            bytes: wire.signature_bytes,
-        },
+    Ok(DetachedSignature {
+        scheme,
+        bytes: wire.signature_bytes,
     })
 }
 
@@ -762,10 +764,10 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            sealed_payload: MessageField::some(proto::SealedGroupPayload {
+            sealed_payload: MessageField::some(proto::SealedPSKPayload {
                 ciphertext: Bytes::from(vec![0x5a; 32 * 1024]),
-                sender_signature: vec![0; 64],
-                ..proto::SealedGroupPayload::default()
+                signature: vec![0; 64],
+                ..proto::SealedPSKPayload::default()
             }),
             ..proto::GroupEnvelopeWire::default()
         };
@@ -811,10 +813,10 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            sealed_payload: MessageField::some(proto::SealedGroupPayload {
+            sealed_payload: MessageField::some(proto::SealedPSKPayload {
                 ciphertext: Bytes::from_static(b"ciphertext"),
-                sender_signature: vec![0; 64],
-                ..proto::SealedGroupPayload::default()
+                signature: vec![0; 64],
+                ..proto::SealedPSKPayload::default()
             }),
             ..proto::GroupEnvelopeWire::default()
         };

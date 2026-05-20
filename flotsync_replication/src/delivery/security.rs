@@ -13,21 +13,28 @@ use crate::{
         StoreSecretKeyId,
         TrustedMemberPublicKeysRecord,
     },
-    delivery::{group_broadcast::GroupMessageHeader, reliable_delivery::ReliableMessageHeader},
+    delivery::{
+        group_broadcast::GroupMessageHeader,
+        reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
+        shared::{DetachedSignature, MessageId, SignatureScheme},
+    },
     runtime::messages::{BootstrapGroupMessage, BootstrapMemberPublicKeysMessage},
 };
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_security::{
+    FrameSignature,
     GroupKey,
     GroupMessageContext,
     LocalMemberKeys,
     PublicMemberKeys,
     ReliablePayloadContext,
+    SIGNATURE_LENGTH,
     STORE_SECRET_CRYPTO_VERSION_V1,
     STORE_SECRET_NONCE_LENGTH,
-    SealedGroupPayload,
-    SealedReliablePayload,
+    SealedHPKEPayload,
+    SealedPSKPayload,
+    SignedFrameParts,
     StoreSecretCiphertext,
     StoreSecretContext,
     StoreSecretCryptoVersion,
@@ -40,12 +47,18 @@ use flotsync_security::{
     seal_group_payload,
     seal_reliable_payload_with_os_rng,
     seal_store_secret,
+    sign_frame,
+    verify_frame_signature,
 };
 use snafu::{Location, prelude::*};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Signature domain for sender-signed reliable runtime payloads.
 pub(crate) const RELIABLE_RUNTIME_MESSAGE_FRAME_KIND: &str = "reliable-runtime-message";
+/// Signature domain for recipient-signed semantic acknowledgements.
+pub(crate) const RELIABLE_RECIPIENT_ACK_FRAME_KIND: &str = "reliable-recipient-ack";
+/// Signature domain for sender-signed group-broadcast runtime payloads.
 pub(crate) const GROUP_BROADCAST_RUNTIME_MESSAGE_FRAME_KIND: &str =
     "group-broadcast-runtime-message";
 
@@ -91,6 +104,29 @@ pub(crate) enum DeliverySecurityError {
         recipient: MemberIdentity,
         local_member: MemberIdentity,
     },
+    #[snafu(display(
+        "Reliable recipient ack original sender {original_sender} did not match local member {local_member}."
+    ))]
+    UnexpectedRecipientAckOriginalSender {
+        original_sender: MemberIdentity,
+        local_member: MemberIdentity,
+    },
+    #[snafu(display(
+        "Reliable recipient ack recipient {recipient} did not match local member {local_member}."
+    ))]
+    UnexpectedRecipientAckRecipient {
+        recipient: MemberIdentity,
+        local_member: MemberIdentity,
+    },
+    #[snafu(display(
+        "Reliable recipient ack signature for message {message_id} recipient {recipient} had invalid length {actual}; expected {expected}."
+    ))]
+    InvalidRecipientAckSignatureLength {
+        message_id: MessageId,
+        recipient: MemberIdentity,
+        expected: usize,
+        actual: usize,
+    },
     #[snafu(display("Group broadcast sender {sender} did not match local member {local_member}."))]
     UnexpectedGroupSender {
         sender: MemberIdentity,
@@ -130,7 +166,7 @@ pub(crate) enum DeliverySecurityError {
         actual: StoreSecretKeyId,
     },
     #[snafu(display("Local private key payload was not valid UTF-8: {source}"))]
-    InvalidLocalPrivateKeyUtf8 { source: std::string::FromUtf8Error },
+    InvalidLocalPrivateKeyUtf8 { source: std::str::Utf8Error },
     #[snafu(display("Local private keys were invalid: {source}"))]
     InvalidLocalPrivateKeys { source: BoxError },
     #[snafu(display("Trusted public keys for member {member_id} were invalid: {source}"))]
@@ -147,6 +183,16 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Failed to open reliable payload: {source}"))]
     OpenReliablePayload { source: BoxError },
+    #[snafu(display("Failed to sign recipient ack for recipient {recipient}: {source}"))]
+    SignRecipientAck {
+        recipient: MemberIdentity,
+        source: BoxError,
+    },
+    #[snafu(display("Failed to verify recipient ack from recipient {recipient}: {source}"))]
+    VerifyRecipientAck {
+        recipient: MemberIdentity,
+        source: BoxError,
+    },
     #[snafu(display("Failed to open encrypted group secret for group {group_id}: {source}"))]
     OpenGroupSecret { group_id: GroupId, source: BoxError },
     #[snafu(display("Failed to seal group payload for group {group_id}: {source}"))]
@@ -181,6 +227,10 @@ impl DeliverySecurityError {
             Self::UnexpectedReliableSender { .. } | Self::UnexpectedReliableRecipient { .. } => {
                 false
             }
+            // Recipient-ack sender/recipient mismatches are authenticity violations.
+            Self::UnexpectedRecipientAckOriginalSender { .. }
+            | Self::UnexpectedRecipientAckRecipient { .. }
+            | Self::InvalidRecipientAckSignatureLength { .. } => false,
             // Group sender mismatches are local routing or membership violations.
             Self::UnexpectedGroupSender { .. } | Self::GroupSenderNotInGroup { .. } => false,
             // Bootstrap payload membership and key mismatches are permanent for this payload.
@@ -203,6 +253,8 @@ impl DeliverySecurityError {
             Self::GenerateGroupKey { .. } => true,
             // Reliable-payload seal/open failures are crypto or key-consistency failures.
             Self::SealReliablePayload { .. } | Self::OpenReliablePayload { .. } => false,
+            // Recipient-ack sign/verify failures are crypto or key-consistency failures.
+            Self::SignRecipientAck { .. } | Self::VerifyRecipientAck { .. } => false,
             // Group-secret and group-payload failures are crypto or key-consistency failures.
             Self::OpenGroupSecret { .. }
             | Self::SealGroupPayload { .. }
@@ -268,7 +320,7 @@ impl DeliverySecurity {
         &self,
         header: &ReliableMessageHeader,
         plaintext: &[u8],
-    ) -> Result<SealedReliablePayload, DeliverySecurityError> {
+    ) -> Result<SealedHPKEPayload, DeliverySecurityError> {
         ensure!(
             header.sender == self.local_member,
             UnexpectedReliableSenderSnafu {
@@ -304,7 +356,7 @@ impl DeliverySecurity {
     pub(crate) async fn open_reliable_payload(
         &self,
         header: &ReliableMessageHeader,
-        sealed: &SealedReliablePayload,
+        sealed: &SealedHPKEPayload,
     ) -> Result<Vec<u8>, DeliverySecurityError> {
         ensure!(
             header.recipient == self.local_member,
@@ -335,13 +387,81 @@ impl DeliverySecurity {
         .context(OpenReliablePayloadSnafu)
     }
 
+    /// Sign one semantic recipient ack for the original sender.
+    pub(crate) fn sign_recipient_ack(
+        &self,
+        header: &RecipientAckHeader,
+        public_header: &[u8],
+    ) -> Result<DetachedSignature, DeliverySecurityError> {
+        ensure!(
+            header.recipient == self.local_member,
+            UnexpectedRecipientAckRecipientSnafu {
+                recipient: header.recipient.clone(),
+                local_member: self.local_member.clone(),
+            }
+        );
+        let signature = sign_frame(
+            self.local_keys(),
+            SignedFrameParts {
+                frame_kind: RELIABLE_RECIPIENT_ACK_FRAME_KIND,
+                public_header,
+                ciphertext: &[],
+            },
+        )
+        .boxed()
+        .with_context(|_| SignRecipientAckSnafu {
+            recipient: header.recipient.clone(),
+        })?;
+        Ok(DetachedSignature {
+            scheme: SignatureScheme::Ed25519,
+            bytes: Bytes::copy_from_slice(signature.as_bytes()),
+        })
+    }
+
+    /// Verify one recipient ack against the expected recipient identity.
+    pub(crate) async fn verify_recipient_ack(
+        &self,
+        header: &RecipientAckHeader,
+        public_header: &[u8],
+        signature: &DetachedSignature,
+    ) -> Result<(), DeliverySecurityError> {
+        ensure!(
+            header.original_sender == self.local_member,
+            UnexpectedRecipientAckOriginalSenderSnafu {
+                original_sender: header.original_sender.clone(),
+                local_member: self.local_member.clone(),
+            }
+        );
+        ensure!(
+            header.recipient != self.local_member,
+            ReliableSelfMessageSnafu {
+                member_id: self.local_member.clone(),
+            }
+        );
+        let frame_signature = recipient_ack_frame_signature(header, signature)?;
+        let recipient_keys = self.load_trusted_public_keys(&header.recipient).await?;
+        verify_frame_signature(
+            &recipient_keys,
+            SignedFrameParts {
+                frame_kind: RELIABLE_RECIPIENT_ACK_FRAME_KIND,
+                public_header,
+                ciphertext: &[],
+            },
+            &frame_signature,
+        )
+        .boxed()
+        .with_context(|_| VerifyRecipientAckSnafu {
+            recipient: header.recipient.clone(),
+        })
+    }
+
     /// Seal one group-broadcast payload for transport fan-out.
     pub(crate) async fn seal_group_payload(
         &self,
         header: &GroupMessageHeader,
         public_header: &[u8],
         plaintext: &[u8],
-    ) -> Result<SealedGroupPayload, DeliverySecurityError> {
+    ) -> Result<SealedPSKPayload, DeliverySecurityError> {
         ensure!(
             header.sender == self.local_member,
             UnexpectedGroupSenderSnafu {
@@ -375,7 +495,7 @@ impl DeliverySecurity {
         &self,
         header: &GroupMessageHeader,
         public_header: &[u8],
-        sealed: &SealedGroupPayload,
+        sealed: &SealedPSKPayload,
     ) -> Result<Bytes, DeliverySecurityError> {
         let group_security = self.load_group_security(&header.group_id).await?;
         ensure!(
@@ -594,6 +714,26 @@ fn group_message_context(header: &GroupMessageHeader) -> GroupMessageContext<'_>
     }
 }
 
+/// Convert the transport-domain detached signature into the fixed-width
+/// security signature expected by the crypto helper.
+fn recipient_ack_frame_signature(
+    header: &RecipientAckHeader,
+    signature: &DetachedSignature,
+) -> Result<FrameSignature, DeliverySecurityError> {
+    match signature.scheme {
+        SignatureScheme::Ed25519 => {}
+    }
+    let bytes = signature.bytes.as_ref().try_into().map_err(|_| {
+        DeliverySecurityError::InvalidRecipientAckSignatureLength {
+            message_id: header.message_id,
+            recipient: header.recipient.clone(),
+            expected: SIGNATURE_LENGTH,
+            actual: signature.bytes.len(),
+        }
+    })?;
+    Ok(FrameSignature::from_bytes(bytes))
+}
+
 /// Decrypted group security state needed for one group-broadcast frame.
 struct GroupSecurityMaterial {
     members: GroupMembers,
@@ -617,8 +757,9 @@ fn open_local_private_keys(
     let plaintext = open_store_secret(store_secret_key, context, &sealed)
         .boxed()
         .context(OpenLocalPrivateKeysSnafu)?;
-    let jwks = String::from_utf8(plaintext).context(InvalidLocalPrivateKeyUtf8Snafu)?;
-    local_member_keys_from_jwks(&jwks, Some(&record.member_id))
+    let jwks =
+        std::str::from_utf8(plaintext.as_slice()).context(InvalidLocalPrivateKeyUtf8Snafu)?;
+    local_member_keys_from_jwks(jwks, Some(&record.member_id))
         .boxed()
         .context(InvalidLocalPrivateKeysSnafu)
 }

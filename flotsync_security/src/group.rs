@@ -7,13 +7,8 @@ use crate::{
         UnsupportedGroupCipherSuiteSnafu,
     },
     identity::{LocalMemberKeys, MemberIdentity, PublicMemberKeys},
-    signature::{
-        FrameSignature,
-        SIGNATURE_LENGTH,
-        SignedFrameParts,
-        sign_frame,
-        verify_frame_signature,
-    },
+    sealed_psk_payload::SealedPSKPayload,
+    signature::{FrameSignature, SignedFrameParts, sign_frame, verify_frame_signature},
     store_secret::{StoreSecretCiphertext, StoreSecretContext, StoreSecretKey, open_store_secret},
     util::{append_len_prefixed, fixed_array, hash_len_prefixed, len_u64},
 };
@@ -53,7 +48,7 @@ pub fn seal_group_payload(
     context: GroupMessageContext<'_>,
     public_header: &[u8],
     plaintext: &[u8],
-) -> Result<SealedGroupPayload> {
+) -> Result<SealedPSKPayload> {
     let ciphertext = seal_group_message(group_key, context, public_header, plaintext)?;
     let signature = sign_frame(
         sender_keys,
@@ -63,7 +58,7 @@ pub fn seal_group_payload(
             ciphertext: ciphertext.as_ref(),
         },
     )?;
-    Ok(SealedGroupPayload {
+    Ok(SealedPSKPayload {
         ciphertext,
         signature: *signature.as_bytes(),
     })
@@ -80,7 +75,7 @@ pub fn open_group_payload(
     group_key: &GroupKey,
     context: GroupMessageContext<'_>,
     public_header: &[u8],
-    sealed: &SealedGroupPayload,
+    sealed: &SealedPSKPayload,
 ) -> Result<Bytes> {
     verify_frame_signature(
         sender_keys,
@@ -192,10 +187,7 @@ pub fn group_key_from_stored_secret_plaintext(plaintext: &[u8]) -> Result<GroupK
         }
     );
     let (cipher_suite_bytes, key_bytes) = plaintext.split_at(2);
-    let cipher_suite_bytes: &[u8; 2] = cipher_suite_bytes
-        .as_array()
-        .expect("we just checked the length");
-    let cipher_suite = GroupCipherSuite::new(u16::from_be_bytes(*cipher_suite_bytes));
+    let cipher_suite = GroupCipherSuite::new(u16::from_be_bytes(fixed_array(cipher_suite_bytes)));
     let expected_suite = GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
     ensure!(
         cipher_suite == expected_suite,
@@ -204,18 +196,7 @@ pub fn group_key_from_stored_secret_plaintext(plaintext: &[u8]) -> Result<GroupK
             actual: cipher_suite,
         }
     );
-    let key_bytes: &[u8; GROUP_KEY_LENGTH] =
-        key_bytes.as_array().expect("we just checked the length");
-    Ok(GroupKey::from_bytes(*key_bytes))
-}
-
-/// HPKE-free group payload sealed by AEAD and authenticated by sender signature.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SealedGroupPayload {
-    /// Group AEAD ciphertext including its authentication tag.
-    pub ciphertext: Bytes,
-    /// Sender signature over the public header and sealed ciphertext.
-    pub signature: [u8; SIGNATURE_LENGTH],
+    Ok(GroupKey::from_bytes(fixed_array(key_bytes)))
 }
 
 /// Symmetric key used to encrypt replication messages within one group.

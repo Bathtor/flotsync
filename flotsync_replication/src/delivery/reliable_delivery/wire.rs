@@ -1,11 +1,11 @@
 use crate::delivery::wire::{
     WireValueDecodeError,
+    detached_signature_from_wire,
+    detached_signature_to_wire_format,
     fixed_bytes_field,
     member_identity_from_wire,
     member_identity_to_wire_format,
     message_id_from_wire,
-    signature_from_wire,
-    signature_to_wire_format,
 };
 
 use super::{
@@ -15,8 +15,11 @@ use super::{
     ReliableMessageEnvelope,
     ReliableMessageHeader,
 };
-use flotsync_messages::{buffa::MessageField, delivery as delivery_proto};
-use flotsync_security::{HPKE_ENCAPSULATED_KEY_LENGTH, SIGNATURE_LENGTH, SealedReliablePayload};
+use flotsync_messages::{
+    buffa::{Message, MessageField},
+    delivery as delivery_proto,
+};
+use flotsync_security::{HPKE_ENCAPSULATED_KEY_LENGTH, SIGNATURE_LENGTH, SealedHPKEPayload};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -41,11 +44,11 @@ pub(super) fn reliable_envelope_to_wire_format(
         ..delivery_proto::ReliableEnvelopeHeader::default()
     };
     let sealed_payload = &envelope.payload.sealed;
-    let sealed_payload = delivery_proto::SealedReliablePayload {
-        hpke_encapsulated_key: sealed_payload.encapsulated_key.to_vec(),
-        hpke_ciphertext: sealed_payload.ciphertext.clone().into(),
-        sender_signature: sealed_payload.signature.to_vec(),
-        ..delivery_proto::SealedReliablePayload::default()
+    let sealed_payload = delivery_proto::SealedHPKEPayload {
+        encapsulated_key: sealed_payload.encapsulated_key.to_vec(),
+        ciphertext: sealed_payload.ciphertext.clone().into(),
+        signature: sealed_payload.signature.to_vec(),
+        ..delivery_proto::SealedHPKEPayload::default()
     };
     let wire = delivery_proto::ReliableEnvelopeWire {
         public_header: MessageField::some(header),
@@ -69,17 +72,10 @@ pub(super) fn reliable_envelope_to_wire_format(
 pub(super) fn recipient_ack_to_wire_format(
     ack: &RecipientAck,
 ) -> delivery_proto::DeliveryBoundaryFrame {
-    let header = delivery_proto::RecipientAckHeader {
-        message_id: ack.header.message_id.0.as_bytes().to_vec(),
-        original_sender: MessageField::some(member_identity_to_wire_format(
-            &ack.header.original_sender,
-        )),
-        recipient: MessageField::some(member_identity_to_wire_format(&ack.header.recipient)),
-        ..delivery_proto::RecipientAckHeader::default()
-    };
+    let header = recipient_ack_header_to_wire_format(&ack.header);
     let wire = delivery_proto::RecipientAckWire {
         public_header: MessageField::some(header),
-        footer: MessageField::some(signature_to_wire_format(&ack.footer)),
+        signature: MessageField::some(detached_signature_to_wire_format(&ack.signature)),
         ..delivery_proto::RecipientAckWire::default()
     };
     let frame = delivery_proto::ReliableDeliveryFrame {
@@ -96,6 +92,16 @@ pub(super) fn recipient_ack_to_wire_format(
     }
 }
 
+/// Build canonical public-header bytes for recipient-ack signatures.
+///
+/// This authenticates the semantic ack header projection used by reliable
+/// delivery, not the exact protobuf bytes received from transport.
+pub(super) fn recipient_ack_public_header_bytes(header: &RecipientAckHeader) -> Vec<u8> {
+    recipient_ack_header_to_wire_format(header)
+        .encode_to_bytes()
+        .to_vec()
+}
+
 pub(super) fn reliable_envelope_from_wire(
     mut envelope: delivery_proto::ReliableEnvelopeWire,
 ) -> Result<ReliableMessageEnvelope<EncryptedPayload>, ReliableDeliveryWireError> {
@@ -108,29 +114,25 @@ pub(super) fn reliable_envelope_from_wire(
         field: "sealed_payload",
     })?;
 
-    let sender = member_identity_from_wire(
-        header.sender.take().context(MissingFieldSnafu {
-            message: "ReliableEnvelopeHeader",
-            field: "sender",
-        })?,
-        "ReliableEnvelopeHeader.sender",
-    )?;
-    let recipient = member_identity_from_wire(
-        header.recipient.take().context(MissingFieldSnafu {
-            message: "ReliableEnvelopeHeader",
-            field: "recipient",
-        })?,
-        "ReliableEnvelopeHeader.recipient",
-    )?;
+    let sender_wire = header.sender.take().context(MissingFieldSnafu {
+        message: "ReliableEnvelopeHeader",
+        field: "sender",
+    })?;
+    let sender = member_identity_from_wire(sender_wire, "ReliableEnvelopeHeader.sender")?;
+    let recipient_wire = header.recipient.take().context(MissingFieldSnafu {
+        message: "ReliableEnvelopeHeader",
+        field: "recipient",
+    })?;
+    let recipient = member_identity_from_wire(recipient_wire, "ReliableEnvelopeHeader.recipient")?;
     let message_id = message_id_from_wire(&header.message_id, "ReliableEnvelopeHeader.message_id")?;
 
     let encapsulated_key = fixed_bytes_field::<HPKE_ENCAPSULATED_KEY_LENGTH>(
-        "SealedReliablePayload.hpke_encapsulated_key",
-        &sealed_payload.hpke_encapsulated_key,
+        "SealedHPKEPayload.encapsulated_key",
+        &sealed_payload.encapsulated_key,
     )?;
     let signature = fixed_bytes_field::<SIGNATURE_LENGTH>(
-        "SealedReliablePayload.sender_signature",
-        &sealed_payload.sender_signature,
+        "SealedHPKEPayload.signature",
+        &sealed_payload.signature,
     )?;
 
     Ok(ReliableMessageEnvelope::<EncryptedPayload> {
@@ -140,9 +142,9 @@ pub(super) fn reliable_envelope_from_wire(
             message_id,
         },
         payload: EncryptedPayload {
-            sealed: SealedReliablePayload {
+            sealed: SealedHPKEPayload {
                 encapsulated_key,
-                ciphertext: sealed_payload.hpke_ciphertext.to_vec(),
+                ciphertext: sealed_payload.ciphertext.to_vec(),
                 signature,
             },
         },
@@ -156,26 +158,24 @@ pub(super) fn recipient_ack_from_wire(
         message: "RecipientAckWire",
         field: "public_header",
     })?;
-    let footer = ack.footer.take().context(MissingFieldSnafu {
+    let signature = ack.signature.take().context(MissingFieldSnafu {
         message: "RecipientAckWire",
-        field: "footer",
+        field: "signature",
     })?;
 
-    let original_sender = member_identity_from_wire(
-        header.original_sender.take().context(MissingFieldSnafu {
-            message: "RecipientAckHeader",
-            field: "original_sender",
-        })?,
-        "RecipientAckHeader.original_sender",
-    )?;
-    let recipient = member_identity_from_wire(
-        header.recipient.take().context(MissingFieldSnafu {
-            message: "RecipientAckHeader",
-            field: "recipient",
-        })?,
-        "RecipientAckHeader.recipient",
-    )?;
+    let original_sender_wire = header.original_sender.take().context(MissingFieldSnafu {
+        message: "RecipientAckHeader",
+        field: "original_sender",
+    })?;
+    let original_sender =
+        member_identity_from_wire(original_sender_wire, "RecipientAckHeader.original_sender")?;
+    let recipient_wire = header.recipient.take().context(MissingFieldSnafu {
+        message: "RecipientAckHeader",
+        field: "recipient",
+    })?;
+    let recipient = member_identity_from_wire(recipient_wire, "RecipientAckHeader.recipient")?;
     let message_id = message_id_from_wire(&header.message_id, "RecipientAckHeader.message_id")?;
+    let signature = detached_signature_from_wire(signature, "RecipientAckWire.signature")?;
 
     Ok(RecipientAck {
         header: RecipientAckHeader {
@@ -183,6 +183,21 @@ pub(super) fn recipient_ack_from_wire(
             original_sender,
             recipient,
         },
-        footer: signature_from_wire(footer, "RecipientAckWire.footer")?,
+        signature,
     })
+}
+
+/// Build the public recipient-ack header projection used on the wire and in
+/// signature transcripts.
+fn recipient_ack_header_to_wire_format(
+    header: &RecipientAckHeader,
+) -> delivery_proto::RecipientAckHeader {
+    delivery_proto::RecipientAckHeader {
+        message_id: header.message_id.0.as_bytes().to_vec(),
+        original_sender: MessageField::some(member_identity_to_wire_format(
+            &header.original_sender,
+        )),
+        recipient: MessageField::some(member_identity_to_wire_format(&header.recipient)),
+        ..delivery_proto::RecipientAckHeader::default()
+    }
 }

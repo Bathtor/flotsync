@@ -550,10 +550,10 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            sealed_payload: MessageField::some(proto::SealedGroupPayload {
+            sealed_payload: MessageField::some(proto::SealedPSKPayload {
                 ciphertext: Bytes::from_static(b"ciphertext"),
-                sender_signature: vec![0; 64],
-                ..proto::SealedGroupPayload::default()
+                signature: vec![0; 64],
+                ..proto::SealedPSKPayload::default()
             }),
             ..proto::GroupEnvelopeWire::default()
         };

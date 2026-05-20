@@ -14,7 +14,7 @@ use flotsync_messages::{
     buffa::{Message, MessageField},
     delivery as delivery_proto,
 };
-use flotsync_security::{SIGNATURE_LENGTH, SealedGroupPayload};
+use flotsync_security::{SIGNATURE_LENGTH, SealedPSKPayload};
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
@@ -31,13 +31,13 @@ pub(super) enum GroupBroadcastWireError {
 
 /// Build one outbound delivery-boundary frame for a group envelope.
 pub(super) fn group_envelope_to_wire_format(
-    envelope: &GroupMessageEnvelope<SealedGroupPayload>,
+    envelope: &GroupMessageEnvelope<SealedPSKPayload>,
 ) -> delivery_proto::DeliveryBoundaryFrame {
     let header = group_header_to_wire_format(&envelope.header);
-    let sealed_payload = delivery_proto::SealedGroupPayload {
+    let sealed_payload = delivery_proto::SealedPSKPayload {
         ciphertext: envelope.payload.ciphertext.clone(),
-        sender_signature: envelope.payload.signature.to_vec(),
-        ..delivery_proto::SealedGroupPayload::default()
+        signature: envelope.payload.signature.to_vec(),
+        ..delivery_proto::SealedPSKPayload::default()
     };
     let wire = delivery_proto::GroupEnvelopeWire {
         public_header: MessageField::some(header),
@@ -72,7 +72,7 @@ pub(super) fn group_public_header_bytes(header: &GroupMessageHeader) -> Vec<u8> 
 /// Decode one inbound wire envelope into the owned semantic broadcast model.
 pub(super) fn group_envelope_from_wire(
     mut envelope: delivery_proto::GroupEnvelopeWire,
-) -> Result<GroupMessageEnvelope<SealedGroupPayload>, GroupBroadcastWireError> {
+) -> Result<GroupMessageEnvelope<SealedPSKPayload>, GroupBroadcastWireError> {
     let mut header = envelope.public_header.take().context(MissingFieldSnafu {
         message: "GroupEnvelopeWire",
         field: "public_header",
@@ -90,17 +90,17 @@ pub(super) fn group_envelope_from_wire(
     let sender = member_identity_from_wire(sender_wire, "GroupEnvelopeHeader.sender")?;
     let message_id = message_id_from_wire(&header.message_id, "GroupEnvelopeHeader.message_id")?;
     let signature = fixed_bytes_field::<SIGNATURE_LENGTH>(
-        "SealedGroupPayload.sender_signature",
-        &sealed_payload.sender_signature,
+        "SealedPSKPayload.signature",
+        &sealed_payload.signature,
     )?;
 
-    Ok(GroupMessageEnvelope::<SealedGroupPayload> {
+    Ok(GroupMessageEnvelope::<SealedPSKPayload> {
         header: GroupMessageHeader {
             group_id,
             sender,
             message_id,
         },
-        payload: SealedGroupPayload {
+        payload: SealedPSKPayload {
             ciphertext: sealed_payload.ciphertext,
             signature,
         },

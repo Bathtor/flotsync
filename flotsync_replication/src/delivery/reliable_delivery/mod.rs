@@ -32,7 +32,6 @@ use super::{
         RelayIdentity,
         RouteActiveState,
         RouteSendId,
-        SignatureScheme,
         SignedEnvelopeFooter,
         StableRouteKey,
         WorkScopeKey,
@@ -42,7 +41,7 @@ use crate::api::MemberIdentity;
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_security::SealedReliablePayload;
+use flotsync_security::SealedHPKEPayload;
 use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
 use std::{
@@ -54,6 +53,7 @@ use std::{
 use uuid::Uuid;
 use wire::{
     recipient_ack_from_wire,
+    recipient_ack_public_header_bytes,
     recipient_ack_to_wire_format,
     reliable_envelope_from_wire,
     reliable_envelope_to_wire_format,
@@ -70,7 +70,7 @@ pub struct ReliableMessageHeader {
 /// HPKE-sealed and sender-signed reliable-delivery payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedPayload {
-    pub sealed: SealedReliablePayload,
+    pub sealed: SealedHPKEPayload,
 }
 
 /// Recipient-addressed envelope queued or carried by reliable delivery.
@@ -155,7 +155,7 @@ pub struct RecipientAckHeader {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecipientAck {
     pub header: RecipientAckHeader,
-    pub footer: SignedEnvelopeFooter,
+    pub signature: DetachedSignature,
 }
 
 impl RecipientAck {
@@ -507,26 +507,62 @@ impl ReliableDeliveryComponent {
             "Reliable delivery dropped inbound recipient ack that failed to decode",
         )?;
         let message_id = ack.header.message_id;
-        if !self.sender_work_items.contains_key(&message_id) {
+        let Some((expected_original_sender, expected_recipient)) =
+            self.sender_work_items.get(&message_id).map(|work_item| {
+                (
+                    work_item.submit.envelope.header.sender.clone(),
+                    work_item.submit.envelope.header.recipient.clone(),
+                )
+            })
+        else {
             debug!(
                 self.log(),
                 "Reliable delivery ignored recipient ack for unknown message_id={}", message_id
             );
             return Handled::OK;
+        };
+        if ack.header.original_sender != expected_original_sender {
+            warn!(
+                self.log(),
+                "Reliable delivery dropped recipient ack for message_id={} with wrong original_sender={} expected={}",
+                message_id,
+                ack.header.original_sender,
+                expected_original_sender
+            );
+            return Handled::OK;
         }
-        self.cancel_retry(RetryKey::Sender(message_id));
-        debug!(
-            self.log(),
-            "Reliable delivery observed recipient ack for message_id={} from recipient={} original_sender={}",
-            message_id,
-            ack.header.recipient,
-            ack.header.original_sender
-        );
-        let work_item = self
-            .sender_work_items
-            .get_mut(&message_id)
-            .expect("sender work item was checked above");
-        work_item.recipient_ack = RecipientAckStatus::Observed { ack };
+        if ack.header.recipient != expected_recipient {
+            warn!(
+                self.log(),
+                "Reliable delivery dropped recipient ack for message_id={} with wrong recipient={} expected={}",
+                message_id,
+                ack.header.recipient,
+                expected_recipient
+            );
+            return Handled::OK;
+        }
+        let public_header = recipient_ack_public_header_bytes(&ack.header);
+        self.spawn_local(async move |mut async_self| {
+            async_self
+                .security
+                .verify_recipient_ack(&ack.header, public_header.as_ref(), &ack.signature)
+                .await
+                .whatever_benign(
+                    "Reliable delivery dropped recipient ack that failed verification",
+                )?;
+            async_self.cancel_retry(RetryKey::Sender(message_id));
+            debug!(
+                async_self.log(),
+                "Reliable delivery observed recipient ack for message_id={} from recipient={} original_sender={}",
+                message_id,
+                ack.header.recipient,
+                ack.header.original_sender
+            );
+            if let Some(work_item) = async_self.sender_work_items.get_mut(&message_id) {
+                work_item.recipient_ack = RecipientAckStatus::Observed { ack };
+            }
+            Handled::OK
+        });
         Handled::OK
     }
 
@@ -583,14 +619,27 @@ impl ReliableDeliveryComponent {
             return;
         };
 
-        let ack = RecipientAck {
-            header: RecipientAckHeader {
-                message_id,
-                original_sender: original_sender.clone(),
-                recipient,
-            },
-            footer: placeholder_signed_footer(),
+        let header = RecipientAckHeader {
+            message_id,
+            original_sender: original_sender.clone(),
+            recipient,
         };
+        let public_header = recipient_ack_public_header_bytes(&header);
+        let signature = match self
+            .security
+            .sign_recipient_ack(&header, public_header.as_ref())
+        {
+            Ok(signature) => signature,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "Reliable delivery failed to sign recipient ack for {message_id}: {error}"
+                );
+                self.inbound_deliveries.remove(&message_id);
+                return;
+            }
+        };
+        let ack = RecipientAck { header, signature };
 
         let pending = self
             .inbound_deliveries
@@ -1192,17 +1241,6 @@ fn select_best_direct_route(
         .max_by_key(|route| route.preference_rank)
 }
 
-fn placeholder_signed_footer() -> SignedEnvelopeFooter {
-    SignedEnvelopeFooter {
-        // TODO(flotsync-d8d): Replace this placeholder once the real
-        // reliable-delivery signing boundary is available.
-        signature: DetachedSignature {
-            scheme: SignatureScheme::Ed25519,
-            bytes: Bytes::from_static(b"placeholder-signature"),
-        },
-    }
-}
-
 fn sender_retry_reason(reason: &RouteTransportNackReason) -> PendingRouteReason {
     match reason {
         RouteTransportNackReason::RouteUnknown | RouteTransportNackReason::RouteUnavailable => {
@@ -1247,7 +1285,13 @@ mod tests {
     };
     use flotsync_io::{
         prelude::UdpLocalBind,
-        test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
+        test_support::{
+            WAIT_TIMEOUT,
+            assert_never,
+            eventually_component_state,
+            localhost,
+            start_component,
+        },
     };
     use std::{
         collections::HashSet,
@@ -1257,6 +1301,9 @@ mod tests {
     };
 
     const TEST_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_millis(50);
+    /// Observation window used by negative ack tests to catch accidental async
+    /// state transitions without sleeping a fixed one-shot delay.
+    const REJECTED_ACK_OBSERVATION_WINDOW: Duration = Duration::from_millis(100);
 
     #[derive(ComponentDefinition)]
     struct ReliableDeliveryClientProbe {
@@ -1361,29 +1408,7 @@ mod tests {
         }
 
         fn with_system(local_member: MemberIdentity, system: KompactSystem) -> Self {
-            let security = {
-                let store = Arc::new(
-                    SqliteReplicationStore::in_memory(local_member.clone())
-                        .expect("security store should build"),
-                );
-                let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
-                    .into_iter()
-                    .filter(|member| member != &local_member);
-                block_on(provision_test_security(
-                    local_member.clone(),
-                    store.as_ref(),
-                    &local_member,
-                    trusted_members,
-                ))
-                .expect("test security should provision");
-                let store: Arc<dyn crate::api::ReplicationStore> = store;
-                block_on(load_test_delivery_security(
-                    local_member.clone(),
-                    store,
-                    &local_member,
-                ))
-                .expect("test security should load")
-            };
+            let security = test_delivery_security(local_member.clone());
             let core = TransportHarnessCore::with_socket_budgets(
                 system,
                 default_udpour_config(),
@@ -1401,8 +1426,9 @@ mod tests {
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
+            let reliable_security = security.clone();
             let reliable = core.system().create(move || {
-                ReliableDeliveryComponent::new(manager_ref.clone(), security.clone())
+                ReliableDeliveryComponent::new(manager_ref.clone(), reliable_security.clone())
             });
             let (ingress_probe_tx, ingress_probe_rx) = mpsc::channel();
             let ingress_probe = core
@@ -1558,6 +1584,12 @@ mod tests {
             });
         }
 
+        fn inject_recipient_ack_wire(&self, ack: delivery_proto::RecipientAckWire) {
+            self.reliable.on_definition(|component| {
+                let _ = component.handle_inbound_recipient_ack(ack);
+            });
+        }
+
         fn wait_for_sender_ack_observed(&self, message_id: MessageId) {
             eventually_component_state(
                 WAIT_TIMEOUT,
@@ -1573,6 +1605,31 @@ mod tests {
                     "timed out waiting for sender-side recipient ack observation for {message_id:?}"
                 ),
             );
+        }
+
+        fn expect_sender_ack_never_observed(&self, message_id: MessageId) {
+            assert_never(
+                REJECTED_ACK_OBSERVATION_WINDOW,
+                || {
+                    self.reliable.on_definition(|component| {
+                        component
+                            .sender_work_item(message_id)
+                            .is_some_and(|work_item| {
+                                matches!(
+                                    work_item.recipient_ack,
+                                    RecipientAckStatus::Observed { .. }
+                                )
+                            })
+                    })
+                },
+                format_args!("sender-side recipient ack should not be observed for {message_id:?}"),
+            );
+            self.reliable.on_definition(|component| {
+                let work_item = component
+                    .sender_work_item(message_id)
+                    .expect("sender work item should still exist");
+                assert_eq!(work_item.recipient_ack, RecipientAckStatus::Pending);
+            });
         }
 
         fn wait_for_sender_route_state(&self, message_id: MessageId, expected: &RouteActiveState) {
@@ -1660,6 +1717,79 @@ mod tests {
         }
     }
 
+    /// Shared fixture for sender-side recipient-ack tests that need the same
+    /// Alice/Bob pending work item plus Bob/Charlie signing contexts.
+    struct RecipientAckScenario {
+        alice: MemberIdentity,
+        bob: MemberIdentity,
+        charlie: MemberIdentity,
+        sender: FullStackHarness,
+        bob_security: DeliverySecurity,
+        charlie_security: DeliverySecurity,
+    }
+
+    impl RecipientAckScenario {
+        fn new() -> Self {
+            let alice = member_identity(&["alice"]);
+            let bob = member_identity(&["bob"]);
+            let charlie = member_identity(&["charlie"]);
+            let sender = FullStackHarness::new(alice.clone());
+            let bob_security = test_delivery_security(bob.clone());
+            let charlie_security = test_delivery_security(charlie.clone());
+            Self {
+                alice,
+                bob,
+                charlie,
+                sender,
+                bob_security,
+                charlie_security,
+            }
+        }
+
+        fn submit_pending(&self, message_id: MessageId, payload: &'static [u8]) {
+            self.sender.submit(reliable_submit(
+                self.alice.clone(),
+                self.bob.clone(),
+                message_id,
+                payload,
+            ));
+            self.sender.wait_for_sender_route_state(
+                message_id,
+                &RouteActiveState::PendingRoute {
+                    retry_after: None,
+                    reason: PendingRouteReason::PeerCurrentlyUnreachable,
+                },
+            );
+        }
+
+        fn bob_ack(&self, message_id: MessageId) -> RecipientAck {
+            self.bob_ack_for(self.alice.clone(), self.bob.clone(), message_id)
+        }
+
+        fn bob_ack_for(
+            &self,
+            original_sender: MemberIdentity,
+            recipient: MemberIdentity,
+            message_id: MessageId,
+        ) -> RecipientAck {
+            recipient_ack(&self.bob_security, original_sender, recipient, message_id)
+        }
+
+        fn charlie_ack_for(
+            &self,
+            original_sender: MemberIdentity,
+            recipient: MemberIdentity,
+            message_id: MessageId,
+        ) -> RecipientAck {
+            recipient_ack(
+                &self.charlie_security,
+                original_sender,
+                recipient,
+                message_id,
+            )
+        }
+    }
+
     fn reliable_submit(
         sender: MemberIdentity,
         recipient: MemberIdentity,
@@ -1680,18 +1810,76 @@ mod tests {
         }
     }
 
+    fn test_delivery_security(local_member: MemberIdentity) -> DeliverySecurity {
+        let store = Arc::new(
+            SqliteReplicationStore::in_memory(local_member.clone())
+                .expect("security store should build"),
+        );
+        let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
+            .into_iter()
+            .filter(|member| member != &local_member);
+        block_on(provision_test_security(
+            local_member.clone(),
+            store.as_ref(),
+            &local_member,
+            trusted_members,
+        ))
+        .expect("test security should provision");
+        let store: Arc<dyn crate::api::ReplicationStore> = store;
+        block_on(load_test_delivery_security(
+            local_member.clone(),
+            store,
+            &local_member,
+        ))
+        .expect("test security should load")
+    }
+
     fn recipient_ack(
+        security: &DeliverySecurity,
         original_sender: MemberIdentity,
         recipient: MemberIdentity,
         message_id: MessageId,
     ) -> RecipientAck {
-        RecipientAck {
-            header: RecipientAckHeader {
-                message_id,
-                original_sender,
-                recipient,
-            },
-            footer: placeholder_signed_footer(),
+        let header = RecipientAckHeader {
+            message_id,
+            original_sender,
+            recipient,
+        };
+        let public_header = recipient_ack_public_header_bytes(&header);
+        let signature = security
+            .sign_recipient_ack(&header, public_header.as_ref())
+            .expect("test recipient ack should sign");
+        RecipientAck { header, signature }
+    }
+
+    fn malformed_recipient_ack_wire(
+        original_sender: MemberIdentity,
+        recipient: MemberIdentity,
+        message_id: MessageId,
+    ) -> delivery_proto::RecipientAckWire {
+        delivery_proto::RecipientAckWire {
+            public_header: flotsync_messages::buffa::MessageField::some(
+                delivery_proto::RecipientAckHeader {
+                    message_id: message_id.0.as_bytes().to_vec(),
+                    original_sender: flotsync_messages::buffa::MessageField::some(
+                        crate::delivery::wire::member_identity_to_wire_format(&original_sender),
+                    ),
+                    recipient: flotsync_messages::buffa::MessageField::some(
+                        crate::delivery::wire::member_identity_to_wire_format(&recipient),
+                    ),
+                    ..delivery_proto::RecipientAckHeader::default()
+                },
+            ),
+            signature: flotsync_messages::buffa::MessageField::some(
+                delivery_proto::DetachedSignature {
+                    scheme: flotsync_messages::buffa::EnumValue::from(
+                        delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
+                    ),
+                    signature_bytes: Bytes::from_static(b"short"),
+                    ..delivery_proto::DetachedSignature::default()
+                },
+            ),
+            ..delivery_proto::RecipientAckWire::default()
         }
     }
 
@@ -1860,27 +2048,107 @@ mod tests {
 
     #[test]
     fn late_recipient_ack_is_accepted_for_pending_sender_work() {
-        let alice = member_identity(&["alice"]);
-        let bob = member_identity(&["bob"]);
-        let sender = FullStackHarness::new(alice.clone());
+        let scenario = RecipientAckScenario::new();
 
         let message_id = MessageId(Uuid::from_u128(45));
-        sender.submit(reliable_submit(
-            alice.clone(),
-            bob.clone(),
-            message_id,
-            b"pending route late ack",
-        ));
-        sender.wait_for_sender_route_state(
-            message_id,
-            &RouteActiveState::PendingRoute {
-                retry_after: None,
-                reason: PendingRouteReason::PeerCurrentlyUnreachable,
-            },
-        );
+        scenario.submit_pending(message_id, b"pending route late ack");
 
-        sender.inject_recipient_ack(&recipient_ack(alice, bob, message_id));
-        sender.wait_for_sender_ack_observed(message_id);
+        scenario
+            .sender
+            .inject_recipient_ack(&scenario.bob_ack(message_id));
+        scenario.sender.wait_for_sender_ack_observed(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_with_wrong_message_id_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let message_id = MessageId(Uuid::from_u128(46));
+        scenario.submit_pending(message_id, b"wrong message ack");
+
+        let wrong_message_id = MessageId(Uuid::from_u128(47));
+        scenario
+            .sender
+            .inject_recipient_ack(&scenario.bob_ack(wrong_message_id));
+        scenario.sender.expect_sender_ack_never_observed(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_with_wrong_original_sender_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let message_id = MessageId(Uuid::from_u128(48));
+        scenario.submit_pending(message_id, b"wrong original sender ack");
+
+        let ack = scenario.bob_ack_for(scenario.charlie.clone(), scenario.bob.clone(), message_id);
+        scenario.sender.inject_recipient_ack(&ack);
+        scenario.sender.expect_sender_ack_never_observed(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_with_wrong_recipient_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let message_id = MessageId(Uuid::from_u128(49));
+        scenario.submit_pending(message_id, b"wrong recipient ack");
+
+        let ack =
+            scenario.charlie_ack_for(scenario.alice.clone(), scenario.charlie.clone(), message_id);
+        scenario.sender.inject_recipient_ack(&ack);
+        scenario.sender.expect_sender_ack_never_observed(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_with_tampered_signature_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let message_id = MessageId(Uuid::from_u128(50));
+        scenario.submit_pending(message_id, b"tampered signature ack");
+
+        let mut ack = scenario.bob_ack(message_id);
+        let signature_bytes = ack.signature.bytes.as_ref();
+        let mut tampered_signature = signature_bytes.to_vec();
+        tampered_signature[0] ^= 0x01;
+        ack.signature.bytes = Bytes::from(tampered_signature);
+        scenario.sender.inject_recipient_ack(&ack);
+        scenario.sender.expect_sender_ack_never_observed(message_id);
+    }
+
+    #[test]
+    fn recipient_ack_with_tampered_public_header_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let signed_message_id = MessageId(Uuid::from_u128(53));
+        let tampered_message_id = MessageId(Uuid::from_u128(54));
+        scenario.submit_pending(signed_message_id, b"signed header ack");
+        scenario.submit_pending(tampered_message_id, b"tampered header ack");
+
+        let mut ack = scenario.bob_ack(signed_message_id);
+        ack.header.message_id = tampered_message_id;
+        scenario.sender.inject_recipient_ack(&ack);
+        scenario
+            .sender
+            .expect_sender_ack_never_observed(tampered_message_id);
+        scenario
+            .sender
+            .expect_sender_ack_never_observed(signed_message_id);
+    }
+
+    #[test]
+    fn malformed_recipient_ack_is_rejected() {
+        let scenario = RecipientAckScenario::new();
+
+        let message_id = MessageId(Uuid::from_u128(51));
+        scenario.submit_pending(message_id, b"malformed ack");
+
+        scenario
+            .sender
+            .inject_recipient_ack_wire(malformed_recipient_ack_wire(
+                scenario.alice.clone(),
+                scenario.bob.clone(),
+                message_id,
+            ));
+        scenario.sender.expect_sender_ack_never_observed(message_id);
     }
 
     #[test]
