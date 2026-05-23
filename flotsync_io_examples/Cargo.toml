@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-base64 = { workspace = true }
 bytes = "1"
 clap = { version = "4.5", features = ["derive"] }
 flotsync_core = { path = "../flotsync_core" }
@@ -24,6 +23,7 @@ slog = "2"
 slog-scope = "4"
 slog-stdlog = "4"
 slog-term = "2"
+sha2 = "0.10"
 snafu = { workspace = true }
 uuid = { workspace = true }
 

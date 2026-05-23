@@ -62,10 +62,10 @@ pub(crate) const RELIABLE_RECIPIENT_ACK_FRAME_KIND: &str = "reliable-recipient-a
 pub(crate) const GROUP_BROADCAST_RUNTIME_MESSAGE_FRAME_KIND: &str =
     "group-broadcast-runtime-message";
 
-const LOGICAL_GROUP_TABLE: &str = "replication_group";
-const LOGICAL_GROUP_SECRET_COLUMN: &str = "group_secret";
-const LOGICAL_LOCAL_MEMBER_TABLE: &str = "local_member";
-const LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN: &str = "private_keys";
+pub(crate) const LOGICAL_GROUP_TABLE: &str = "replication_group";
+pub(crate) const LOGICAL_GROUP_SECRET_COLUMN: &str = "group_secret";
+pub(crate) const LOGICAL_LOCAL_MEMBER_TABLE: &str = "local_member";
+pub(crate) const LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN: &str = "private_keys";
 
 /// Security setup and delivery-envelope errors raised while wiring store records into crypto helpers.
 #[derive(Debug, Snafu)]

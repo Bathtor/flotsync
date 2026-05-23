@@ -45,6 +45,11 @@ local database secret, a local private JWKS path, and trusted public JWKS paths.
 `ensure_configured_group` parses and validates those files, provisions the
 replication store, and then starts replication.
 
+The replicated-checklist store-secret key id is hardcoded by the example for
+now. The config supplies only the temporary plaintext password; the example
+hashes it with a domain separator to derive the local store-secret key. This is
+part of the temporary setup path pending the keyring-backed follow-up.
+
 Replication runtime reads provisioned security state from `ReplicationStore`
 with normal group metadata.
 
@@ -99,8 +104,9 @@ an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
 material is encrypted at rest with a device-local application database secret.
 
 For this MVP slice, replicated-checklist reads that database secret from
-plaintext application config during setup. Long term, the secret should come
-from OS-backed secure storage through the `keyring` crate.
+plaintext application config during setup and derives the store-secret key from
+that password with an example-local domain-separated hash. Long term, the
+secret should come from OS-backed secure storage through the `keyring` crate.
 
 The stored group-security material includes the group symmetric key, cipher
 suite metadata, and member public keys needed to verify and open group traffic
