@@ -25,6 +25,10 @@ use std::{
 };
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows loopback can buffer 4 MiB without write backpressure."
+)]
 #[allow(
     clippy::too_many_lines,
     clippy::match_wildcard_for_single_variants,
