@@ -67,6 +67,10 @@ fn listen_at(
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows can self-connect after probing a freed loopback port."
+)]
 fn tcp_driver_reports_connect_failure() {
     init_test_logger();
 
@@ -451,6 +455,10 @@ fn tcp_driver_listener_requires_adoption_rejects_pending_connections_and_keeps_a
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "Windows loopback can buffer 4 MiB without write backpressure."
+)]
 #[allow(
     clippy::too_many_lines,
     reason = "This driver integration test covers TCP read and write flow-control transitions end to end."

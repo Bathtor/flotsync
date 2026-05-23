@@ -1706,6 +1706,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows can self-connect after probing a freed loopback port."
+    )]
     fn tcp_connect_failure_is_reported() {
         init_test_logger();
 
@@ -1746,6 +1750,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows loopback can buffer 4 MiB without write backpressure."
+    )]
     fn tcp_send_while_another_send_is_pending_is_nacked() {
         init_test_logger();
 
@@ -1832,6 +1840,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows loopback can buffer 4 MiB without write backpressure."
+    )]
     fn tcp_write_resumes_after_pending_send_drains() {
         init_test_logger();
 
