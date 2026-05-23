@@ -39,19 +39,23 @@ use kompact::prelude::*;
 use snafu::prelude::*;
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
+use super::errors::GroupInstallError;
 #[cfg(test)]
 use super::{
-    errors::{GroupInstallError, InboundDeliveryError},
+    errors::InboundDeliveryError,
     messages::{UpdateBatchMessage, UpdateMessage},
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::GroupMembers;
 #[cfg(test)]
-use crate::{GroupMembers, MemberIdentity};
-#[cfg(test)]
+use crate::MemberIdentity;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
 type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create one concrete replication runtime for the given application identity.
@@ -161,7 +165,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     .await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
@@ -300,7 +304,7 @@ impl ReplicationApi for ReplicationRuntime {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -312,13 +316,13 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ReplicationRuntime {
-    pub(super) fn host(&self) -> &DeliveryRuntimeHost {
+    pub(crate) fn host(&self) -> &DeliveryRuntimeHost {
         self.host.as_ref()
     }
 
-    pub(super) fn install_group_for_test(
+    pub(crate) fn install_group_for_test(
         &self,
         group_id: GroupId,
         members: GroupMembers,
@@ -336,6 +340,7 @@ impl ReplicationRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_update_for_test(
         &self,
         sender: MemberIdentity,
@@ -354,6 +359,7 @@ impl ReplicationRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_update_batch_for_test(
         &self,
         sender: MemberIdentity,

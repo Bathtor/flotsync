@@ -24,7 +24,7 @@ use crate::{
         security::DeliverySecurity,
     },
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use flotsync_io::test_support::{
     ReservedSocketKind,
     ReservedSocketLease,
@@ -65,6 +65,9 @@ use local_endpoint::LocalEndpointManager;
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
 type ReliableDeliveryInboundRoutePort = ReliableDeliveryInboundPort<TransportRouteKey>;
+
+#[cfg(any(test, feature = "test-support"))]
+const TEST_DIRECT_PEER_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod config_keys {
     use kompact::{
@@ -266,9 +269,9 @@ pub(crate) struct DeliveryRuntimeHost {
     topology: Option<RuntimeTopology>,
     group_memberships: SharedGroupMemberships,
     control_timeout: Duration,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     external_udp_addr: SocketAddr,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     local_endpoint_lease: ReservedSocketLease,
 }
 
@@ -411,7 +414,7 @@ where
 
 struct BuiltRuntimeSystem {
     system: KompactSystem,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     local_endpoint_lease: ReservedSocketLease,
 }
 
@@ -571,7 +574,7 @@ impl ComponentTopology for DeliveryTopology {
 
 struct DiscoveryTopology {
     preconfigured_peer_routes: Arc<Component<PreconfiguredPeerRoutesComponent>>,
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
 }
@@ -814,7 +817,7 @@ impl DeliveryRuntimeHost {
         group_memberships: SharedGroupMemberships,
         control_timeout: Duration,
         external_udp_addr: SocketAddr,
-        #[cfg(test)] local_endpoint_lease: ReservedSocketLease,
+        #[cfg(any(test, feature = "test-support"))] local_endpoint_lease: ReservedSocketLease,
     ) -> Self {
         Self {
             system: Some(system),
@@ -822,7 +825,7 @@ impl DeliveryRuntimeHost {
             group_memberships,
             control_timeout,
             external_udp_addr,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             local_endpoint_lease,
         }
     }
@@ -902,9 +905,9 @@ impl DeliveryRuntimeHost {
         .map_err(|error| {
             annotate_local_endpoint_bind_error(&system, host_config.local_endpoint_bind_addr, error)
         })?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let mut local_endpoint_lease = built_system.local_endpoint_lease;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         release_reserved_runtime_local_endpoint_binding(
             &mut local_endpoint_lease,
             local_endpoint.local_addr,
@@ -916,7 +919,7 @@ impl DeliveryRuntimeHost {
             group_memberships,
             host_config.control_timeout,
             local_endpoint.local_addr,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             local_endpoint_lease,
         ))
     }
@@ -952,17 +955,17 @@ impl DeliveryRuntimeHost {
         drop(topology);
         if let Err(error) = stop_result {
             shutdown_system_bounded(system, self.control_timeout, true);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
             panic!("failed to stop delivery runtime host cleanly: {error}");
         }
         shutdown_system_bounded(system, self.control_timeout, false);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }
 
     /// Replace the authoritative shared group-membership snapshot.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn replace_group_memberships(&self, memberships: GroupMemberships) {
         self.group_memberships.replace(memberships);
     }
@@ -972,7 +975,7 @@ impl DeliveryRuntimeHost {
     /// This is temporary until the replication runtime is wired to the real
     /// discovery mechanism. Today it exists so tests and bring-up tooling can
     /// inject direct routes explicitly.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish_route_update(
         &self,
         update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
@@ -993,13 +996,13 @@ impl DeliveryRuntimeHost {
 
     /// Return the concrete local UDP socket address currently bound by this
     /// host for externally reachable delivery traffic.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn external_udp_bind_addr(&self) -> SocketAddr {
         self.external_udp_addr
     }
 
     /// Read the current authoritative membership snapshot.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     pub(crate) fn membership_snapshot(&self) -> Arc<GroupMemberships> {
         self.group_memberships.snapshot()
     }
@@ -1019,12 +1022,12 @@ impl Drop for DeliveryRuntimeHost {
             log::error!("delivery runtime host drop stop_all failed before forced kill: {error}");
         }
         shutdown_system_bounded(system, self.control_timeout, true);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
@@ -1048,7 +1051,7 @@ async fn build_runtime_system(
     })
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
@@ -1061,7 +1064,7 @@ async fn build_runtime_system(
     Ok(BuiltRuntimeSystem { system })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn release_reserved_runtime_local_endpoint_binding(
     local_endpoint_lease: &mut ReservedSocketLease,
     local_addr: SocketAddr,
@@ -1078,7 +1081,7 @@ fn release_reserved_runtime_local_endpoint_binding(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn rebind_reserved_runtime_local_endpoint_binding(local_endpoint_lease: &mut ReservedSocketLease) {
     let rebind_result = local_endpoint_lease.rebind_binding(0);
     if let Err(error) = rebind_result
@@ -1107,16 +1110,25 @@ fn annotate_local_endpoint_bind_error(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+/// Test-support accessors and route injection helpers for runtime fixtures.
 pub(crate) trait DeliveryRuntimeHostTestExt {
+    /// Return the address peers should use when this host bound an unspecified interface.
     fn advertised_loopback_udp_addr(&self) -> SocketAddr;
+    /// Publish a direct unicast peer route and wait until delivery components observe it.
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
+    /// Publish configured static routes after a test has explicitly requested them.
+    #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self);
+    /// Wait until both direct-delivery components have observed a peer route.
+    #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity);
+    /// Wait until the runtime component accepts one mailbox turn.
+    #[cfg(test)]
     fn wait_for_runtime_startup(&self);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     fn advertised_loopback_udp_addr(&self) -> SocketAddr {
         loopback_advertise_addr(self.external_udp_addr)
@@ -1153,14 +1165,17 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         wait_for_direct_peer_route(self.topology(), &peer);
     }
 
+    #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self) {
         self.publish_preconfigured_peer_routes_for_test();
     }
 
+    #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity) {
         wait_for_direct_peer_route(self.topology(), peer);
     }
 
+    #[cfg(test)]
     fn wait_for_runtime_startup(&self) {
         let future = self
             .runtime_component()
@@ -1175,7 +1190,7 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn loopback_advertise_addr(bind_addr: SocketAddr) -> SocketAddr {
     if !bind_addr.ip().is_unspecified() {
         return bind_addr;
@@ -1187,14 +1202,13 @@ fn loopback_advertise_addr(bind_addr: SocketAddr) -> SocketAddr {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity) {
-    use crate::delivery::test_support::FULL_STACK_WAIT_TIMEOUT;
     use flotsync_io::test_support::eventually_component_state;
 
     let broadcast_peer = peer.clone();
     eventually_component_state(
-        FULL_STACK_WAIT_TIMEOUT,
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
         &topology.delivery.group_broadcast,
         |component| component.knows_direct_route(&broadcast_peer),
         format_args!("timed out waiting for group-broadcast route publication for peer={peer}"),
@@ -1202,7 +1216,7 @@ fn wait_for_direct_peer_route(topology: &RuntimeTopology, peer: &MemberIdentity)
 
     let reliable_peer = peer.clone();
     eventually_component_state(
-        FULL_STACK_WAIT_TIMEOUT,
+        TEST_DIRECT_PEER_ROUTE_TIMEOUT,
         &topology.delivery.reliable_delivery,
         |component| component.knows_direct_route(&reliable_peer),
         format_args!("timed out waiting for reliable-delivery route publication for peer={peer}"),

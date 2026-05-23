@@ -566,7 +566,7 @@ impl ReliableDeliveryComponent {
         Handled::OK
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
         self.direct_peer_routes.get(peer).is_some()
     }
@@ -1408,7 +1408,7 @@ mod tests {
         }
 
         fn with_system(local_member: MemberIdentity, system: KompactSystem) -> Self {
-            let security = test_delivery_security(local_member.clone());
+            let security = test_delivery_security(&local_member);
             let core = TransportHarnessCore::with_socket_budgets(
                 system,
                 default_udpour_config(),
@@ -1734,8 +1734,8 @@ mod tests {
             let bob = member_identity(&["bob"]);
             let charlie = member_identity(&["charlie"]);
             let sender = FullStackHarness::new(alice.clone());
-            let bob_security = test_delivery_security(bob.clone());
-            let charlie_security = test_delivery_security(charlie.clone());
+            let bob_security = test_delivery_security(&bob);
+            let charlie_security = test_delivery_security(&charlie);
             Self {
                 alice,
                 bob,
@@ -1763,13 +1763,13 @@ mod tests {
         }
 
         fn bob_ack(&self, message_id: MessageId) -> RecipientAck {
-            self.bob_ack_for(self.alice.clone(), self.bob.clone(), message_id)
+            self.bob_ack_for(&self.alice, &self.bob, message_id)
         }
 
         fn bob_ack_for(
             &self,
-            original_sender: MemberIdentity,
-            recipient: MemberIdentity,
+            original_sender: &MemberIdentity,
+            recipient: &MemberIdentity,
             message_id: MessageId,
         ) -> RecipientAck {
             recipient_ack(&self.bob_security, original_sender, recipient, message_id)
@@ -1777,8 +1777,8 @@ mod tests {
 
         fn charlie_ack_for(
             &self,
-            original_sender: MemberIdentity,
-            recipient: MemberIdentity,
+            original_sender: &MemberIdentity,
+            recipient: &MemberIdentity,
             message_id: MessageId,
         ) -> RecipientAck {
             recipient_ack(
@@ -1810,18 +1810,18 @@ mod tests {
         }
     }
 
-    fn test_delivery_security(local_member: MemberIdentity) -> DeliverySecurity {
+    fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
         let store = Arc::new(
             SqliteReplicationStore::in_memory(local_member.clone())
                 .expect("security store should build"),
         );
         let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
             .into_iter()
-            .filter(|member| member != &local_member);
+            .filter(|member| member != local_member);
         block_on(provision_test_security(
             local_member.clone(),
             store.as_ref(),
-            &local_member,
+            local_member,
             trusted_members,
         ))
         .expect("test security should provision");
@@ -1829,21 +1829,21 @@ mod tests {
         block_on(load_test_delivery_security(
             local_member.clone(),
             store,
-            &local_member,
+            local_member,
         ))
         .expect("test security should load")
     }
 
     fn recipient_ack(
         security: &DeliverySecurity,
-        original_sender: MemberIdentity,
-        recipient: MemberIdentity,
+        original_sender: &MemberIdentity,
+        recipient: &MemberIdentity,
         message_id: MessageId,
     ) -> RecipientAck {
         let header = RecipientAckHeader {
             message_id,
-            original_sender,
-            recipient,
+            original_sender: original_sender.clone(),
+            recipient: recipient.clone(),
         };
         let public_header = recipient_ack_public_header_bytes(&header);
         let signature = security
@@ -1853,8 +1853,8 @@ mod tests {
     }
 
     fn malformed_recipient_ack_wire(
-        original_sender: MemberIdentity,
-        recipient: MemberIdentity,
+        original_sender: &MemberIdentity,
+        recipient: &MemberIdentity,
         message_id: MessageId,
     ) -> delivery_proto::RecipientAckWire {
         delivery_proto::RecipientAckWire {
@@ -1862,10 +1862,10 @@ mod tests {
                 delivery_proto::RecipientAckHeader {
                     message_id: message_id.0.as_bytes().to_vec(),
                     original_sender: flotsync_messages::buffa::MessageField::some(
-                        crate::delivery::wire::member_identity_to_wire_format(&original_sender),
+                        crate::delivery::wire::member_identity_to_wire_format(original_sender),
                     ),
                     recipient: flotsync_messages::buffa::MessageField::some(
-                        crate::delivery::wire::member_identity_to_wire_format(&recipient),
+                        crate::delivery::wire::member_identity_to_wire_format(recipient),
                     ),
                     ..delivery_proto::RecipientAckHeader::default()
                 },
@@ -2080,7 +2080,7 @@ mod tests {
         let message_id = MessageId(Uuid::from_u128(48));
         scenario.submit_pending(message_id, b"wrong original sender ack");
 
-        let ack = scenario.bob_ack_for(scenario.charlie.clone(), scenario.bob.clone(), message_id);
+        let ack = scenario.bob_ack_for(&scenario.charlie, &scenario.bob, message_id);
         scenario.sender.inject_recipient_ack(&ack);
         scenario.sender.expect_sender_ack_never_observed(message_id);
     }
@@ -2092,8 +2092,7 @@ mod tests {
         let message_id = MessageId(Uuid::from_u128(49));
         scenario.submit_pending(message_id, b"wrong recipient ack");
 
-        let ack =
-            scenario.charlie_ack_for(scenario.alice.clone(), scenario.charlie.clone(), message_id);
+        let ack = scenario.charlie_ack_for(&scenario.alice, &scenario.charlie, message_id);
         scenario.sender.inject_recipient_ack(&ack);
         scenario.sender.expect_sender_ack_never_observed(message_id);
     }
@@ -2144,8 +2143,8 @@ mod tests {
         scenario
             .sender
             .inject_recipient_ack_wire(malformed_recipient_ack_wire(
-                scenario.alice.clone(),
-                scenario.bob.clone(),
+                &scenario.alice,
+                &scenario.bob,
                 message_id,
             ));
         scenario.sender.expect_sender_ack_never_observed(message_id);

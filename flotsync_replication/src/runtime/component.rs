@@ -59,7 +59,7 @@ use super::{
     replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::test_support::test_group_key;
 use crate::{
     GroupMembers,
@@ -430,7 +430,8 @@ pub enum ReplicationRuntimeMessage {
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     /// Request one group-membership change through the component interface.
     ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>),
-    #[cfg(test)]
+    /// Test-support command channel for runtime fixture setup and assertions.
+    #[cfg(any(test, feature = "test-support"))]
     Test(ReplicationRuntimeTestMessage),
 }
 
@@ -446,7 +447,7 @@ enum SummaryReplyRoute {
     GroupBroadcast,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 #[allow(
     private_interfaces,
@@ -455,14 +456,22 @@ enum SummaryReplyRoute {
 pub enum ReplicationRuntimeTestMessage {
     /// Confirm that the runtime component is alive and able to process one
     /// mailbox turn after startup.
+    #[cfg(test)]
     Ping(Ask<(), ()>),
+    /// Install a group directly in runtime state for integration scenarios that
+    /// need pre-existing group membership until production group setup exists.
     InstallGroup(Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>),
+    /// Apply one inbound update directly to runtime logic tests.
+    #[cfg(test)]
     ApplyUpdate(Ask<(MemberIdentity, UpdateMessage), Result<(), InboundDeliveryError>>),
+    /// Apply one inbound update batch directly to runtime logic tests.
+    #[cfg(test)]
     ApplyUpdateBatch(Ask<(MemberIdentity, UpdateBatchMessage), Result<(), InboundDeliveryError>>),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ReplicationRuntimeMessage {
+    #[cfg(test)]
     pub(super) fn test_ping(promise: KPromise<()>) -> Self {
         Self::Test(ReplicationRuntimeTestMessage::Ping(Ask::new(promise, ())))
     }
@@ -478,6 +487,7 @@ impl ReplicationRuntimeMessage {
         )))
     }
 
+    #[cfg(test)]
     pub(super) fn test_apply_update(
         promise: KPromise<Result<(), InboundDeliveryError>>,
         sender: MemberIdentity,
@@ -489,6 +499,7 @@ impl ReplicationRuntimeMessage {
         )))
     }
 
+    #[cfg(test)]
     pub(super) fn test_apply_update_batch(
         promise: KPromise<Result<(), InboundDeliveryError>>,
         sender: MemberIdentity,
@@ -2069,7 +2080,7 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn handle_test_install_group(
         &mut self,
         ask: Ask<(GroupId, GroupMembers), Result<(), GroupInstallError>>,
@@ -2226,7 +2237,7 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::Ping(ask)) => {
                 self.handle_test_ping(ask)
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::InstallGroup(ask)) => {
                 self.handle_test_install_group(ask)
             }

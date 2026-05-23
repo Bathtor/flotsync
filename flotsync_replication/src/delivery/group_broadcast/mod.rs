@@ -459,7 +459,7 @@ impl GroupBroadcastComponent {
         self.accepted_submits.contains(&message_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
         self.direct_peer_routes.get(peer).is_some()
     }
@@ -975,7 +975,7 @@ mod tests {
             group_id,
             alice.clone(),
             message_id,
-            Bytes::from_static(b"group payload"),
+            b"group payload",
         );
 
         receiver_bob.inject_inbound_envelope(wire);
@@ -1016,7 +1016,7 @@ mod tests {
                 group_id,
                 alice.clone(),
                 message_id,
-                Bytes::from_static(b"group payload"),
+                b"group payload",
             );
             tamper.apply(&mut wire);
 
@@ -1143,7 +1143,7 @@ mod tests {
         group_id: GroupId,
         sender: MemberIdentity,
         message_id: MessageId,
-        bytes: Bytes,
+        bytes: &[u8],
     ) -> delivery_proto::GroupEnvelopeWire {
         let header = GroupMessageHeader {
             group_id,
@@ -1151,12 +1151,9 @@ mod tests {
             message_id,
         };
         let public_header = group_public_header_bytes(&header);
-        let sealed = block_on(sender_security.seal_group_payload(
-            &header,
-            public_header.as_ref(),
-            bytes.as_ref(),
-        ))
-        .expect("test inbound group payload should seal");
+        let sealed =
+            block_on(sender_security.seal_group_payload(&header, public_header.as_ref(), bytes))
+                .expect("test inbound group payload should seal");
         let envelope = GroupMessageEnvelope {
             header,
             payload: sealed,

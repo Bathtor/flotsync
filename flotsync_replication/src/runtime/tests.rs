@@ -477,20 +477,6 @@ impl ListenerStub {
         }
     }
 
-    fn wait_for_next_data_change(&self) -> CapturedDataChange {
-        let change = self
-            .buffered_events
-            .lock()
-            .expect("listener event receiver mutex must not be poisoned")
-            .recv_timeout(TEST_WAIT_TIMEOUT)
-            .expect("timed out waiting for listener data-change event");
-        self.data_changes
-            .lock()
-            .expect("listener capture mutex must not be poisoned")
-            .push(change.clone());
-        change
-    }
-
     fn wait_for_data_change_count(&self, count: usize) {
         eventually(
             TEST_WAIT_TIMEOUT,
@@ -851,14 +837,14 @@ fn persist_alice_group_with_security_material(
 fn security_load_error(
     error: LoadError,
     expected_application_id: &Identifier,
-) -> Box<LoadSecurityError> {
+) -> LoadSecurityError {
     match error {
         LoadError::Security {
             application_id,
             source,
         } => {
             assert_eq!(&application_id, expected_application_id);
-            source
+            *source
         }
         other => panic!("unexpected load error: {other:?}"),
     }
@@ -1135,7 +1121,7 @@ fn load_replication_runtime_rejects_missing_local_private_keys() {
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::MissingLocalPrivateKeys { member_id }
             if member_id == &alice_member()
     ));
@@ -1167,7 +1153,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::InvalidLocalPrivateKeys { member_id, .. }
             if member_id == &alice_member()
     ));
@@ -1200,7 +1186,7 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::StoredGroupKeyIdMismatch {
             group_id: error_group_id,
             ..
@@ -1238,7 +1224,7 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::StoredGroupUnsupportedStoreSecretVersion {
             group_id: error_group_id,
             version: 999,
@@ -1277,7 +1263,7 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::StoredGroupInvalidGroupSecretNonceLength {
             group_id: error_group_id,
             actual: 1,
@@ -1326,7 +1312,7 @@ fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
 
     let error = security_load_error(error, &application_id);
     assert!(matches!(
-        error.as_ref(),
+        &error,
         LoadSecurityError::StoredGroupMissingTrustedPublicKeys {
             group_id: error_group_id,
             member_id,
@@ -2039,84 +2025,6 @@ fn publish_changes_rejects_reserved_local_update_version() {
 }
 
 #[test]
-fn create_group_bootstrap_installs_remote_membership() {
-    let alice_member = alice_member();
-    let bob_member = bob_member();
-    let alice_store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
-    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
-    let alice_runtime = load_runtime_with_parts(
-        app_alice_id(),
-        alice_store,
-        Arc::new(ListenerStub::default()),
-    );
-    let bob_store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
-    provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
-    let bob_runtime =
-        load_runtime_with_parts(app_bob_id(), bob_store, Arc::new(ListenerStub::default()));
-
-    assert!(
-        alice_runtime
-            .host()
-            .external_udp_bind_addr()
-            .ip()
-            .is_loopback()
-    );
-    assert!(
-        bob_runtime
-            .host()
-            .external_udp_bind_addr()
-            .ip()
-            .is_loopback()
-    );
-
-    alice_runtime.host().publish_direct_peer_route(
-        bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
-    );
-    bob_runtime.host().publish_direct_peer_route(
-        alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
-    );
-
-    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member.clone(), bob_member.clone()],
-        initial_state: None,
-    }))
-    .expect("create_group should succeed");
-    wait_for_group_install(&bob_runtime, group_id);
-
-    let alice_snapshot = alice_runtime.host().membership_snapshot();
-    let bob_snapshot = bob_runtime.host().membership_snapshot();
-    let alice_members = alice_snapshot
-        .members(&group_id)
-        .expect("local runtime should host the created group");
-    let bob_members = bob_snapshot
-        .members(&group_id)
-        .expect("remote runtime should install the bootstrap group");
-
-    assert_eq!(
-        alice_members.member_index(&alice_member),
-        Some(MemberIndex::new(0))
-    );
-    assert_eq!(
-        alice_members.member_index(&bob_member),
-        Some(MemberIndex::new(1))
-    );
-    assert_eq!(
-        bob_members.member_index(&alice_member),
-        Some(MemberIndex::new(0))
-    );
-    assert_eq!(
-        bob_members.member_index(&bob_member),
-        Some(MemberIndex::new(1))
-    );
-}
-
-#[test]
 fn create_group_rejects_missing_trusted_keys_without_storing_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -2193,261 +2101,6 @@ fn bootstrap_payload_validation_rejects_trusted_public_key_mismatch() {
         }
         other => panic!("unexpected bootstrap validation error: {other:?}"),
     }
-}
-
-#[test]
-fn publish_changes_delivers_remote_data_changed_event() {
-    // End-to-end happy path:
-    // 1. start two runtimes with the same dataset schema,
-    // 2. connect them with direct peer routes,
-    // 3. create one fixed-membership group from Alice,
-    // 4. publish one upsert from Alice, and
-    // 5. assert that Bob observes the replicated row change.
-    let alice_member = alice_member();
-    let bob_member = bob_member();
-    let dataset_id = docs_dataset_id();
-    let alice_fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
-    );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
-    provision_test_security(
-        alice_fixture.store.as_ref(),
-        &alice_member,
-        [bob_member.clone()],
-    );
-    provision_test_security(
-        bob_fixture.store.as_ref(),
-        &bob_member,
-        [alice_member.clone()],
-    );
-    let alice_runtime = &alice_fixture.runtime;
-    let bob_runtime = &bob_fixture.runtime;
-
-    alice_runtime.host().publish_direct_peer_route(
-        bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
-    );
-    bob_runtime.host().publish_direct_peer_route(
-        alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
-    );
-
-    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member.clone(), bob_member.clone()],
-        initial_state: None,
-    }))
-    .expect("create_group should succeed");
-    wait_for_group_install(bob_runtime, group_id);
-    let row_id = test_row_id(group_id, dataset_id.clone(), 11);
-
-    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
-    let receipt = publish_changes(
-        alice_runtime.as_ref(),
-        read_token,
-        vec![RowMutation::Upsert {
-            row_id: row_id.clone(),
-            row: crate::row_values! {
-                "title" => "hello from alice",
-            },
-        }],
-    );
-
-    assert_eq!(
-        receipt.update_id,
-        UpdateId {
-            version: 1,
-            node_index: 0,
-        }
-    );
-
-    let delivered = bob_fixture.listener.wait_for_next_data_change();
-    assert_eq!(
-        delivered,
-        CapturedDataChange {
-            rows: vec![CapturedRowChange::Upsert {
-                row_id: row_id.clone(),
-                title: "hello from alice".to_owned(),
-            }],
-        }
-    );
-
-    assert!(
-        bob_runtime
-            .host()
-            .membership_snapshot()
-            .contains_group(&group_id),
-        "remote runtime should still host the replicated group"
-    );
-}
-
-#[test]
-fn update_gap_triggers_need_range_and_update_batch_catch_up() {
-    let _runtime_endpoint_leases =
-        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-    let dataset_id = docs_dataset_id();
-    let (alice_fixture, bob_fixture) = load_title_runtime_pair_with_trust(&dataset_id);
-    let alice_member = alice_fixture.local_member.clone();
-    let bob_member = bob_fixture.local_member.clone();
-    let alice_runtime = &alice_fixture.runtime;
-    let bob_runtime = &bob_fixture.runtime;
-    let group_id = GroupId(Uuid::from_u128(50_001));
-    let members =
-        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
-            .expect("group members should build");
-    alice_runtime
-        .install_group_for_test(group_id, members.clone())
-        .expect("alice group should install");
-    bob_runtime
-        .install_group_for_test(group_id, members)
-        .expect("bob group should install");
-
-    let first_row_id = test_row_id(group_id, dataset_id.clone(), 50_011);
-    let second_row_id = test_row_id(group_id, dataset_id.clone(), 50_012);
-    let first_read_token =
-        snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
-    let first_receipt = publish_changes(
-        alice_runtime.as_ref(),
-        first_read_token,
-        vec![RowMutation::Upsert {
-            row_id: first_row_id.clone(),
-            row: crate::row_values! {
-                "title" => "missed first",
-            },
-        }],
-    );
-
-    alice_runtime.host().publish_direct_peer_route(
-        bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
-    );
-    bob_runtime.host().publish_direct_peer_route(
-        alice_member,
-        alice_runtime.host().advertised_loopback_udp_addr(),
-    );
-
-    let second_receipt = publish_changes(
-        alice_runtime.as_ref(),
-        first_receipt.read_token,
-        vec![RowMutation::Upsert {
-            row_id: second_row_id.clone(),
-            row: crate::row_values! {
-                "title" => "live second",
-            },
-        }],
-    );
-
-    assert_eq!(
-        second_receipt.update_id,
-        UpdateId {
-            node_index: 0,
-            version: 2,
-        }
-    );
-    bob_fixture.listener.wait_for_data_change_count(2);
-    assert_eq!(
-        bob_fixture.listener.captured_data_changes(),
-        vec![
-            CapturedDataChange {
-                rows: vec![CapturedRowChange::Upsert {
-                    row_id: first_row_id,
-                    title: "missed first".to_owned(),
-                }],
-            },
-            CapturedDataChange {
-                rows: vec![CapturedRowChange::Upsert {
-                    row_id: second_row_id,
-                    title: "live second".to_owned(),
-                }],
-            },
-        ]
-    );
-}
-
-#[test]
-fn observed_summary_triggers_need_range_and_update_batch_catch_up() {
-    let _runtime_endpoint_leases =
-        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
-    let alice_member = alice_member();
-    let bob_member = bob_member();
-    let dataset_id = docs_dataset_id();
-    let alice_fixture = load_runtime_fixture(
-        app_alice_id(),
-        alice_member.clone(),
-        [(dataset_id.clone(), title_schema_shared())],
-    );
-    let bob_fixture = load_runtime_fixture(
-        app_bob_id(),
-        bob_member.clone(),
-        [(dataset_id.clone(), title_schema_static())],
-    );
-    provision_test_security(
-        alice_fixture.store.as_ref(),
-        &alice_member,
-        [bob_member.clone()],
-    );
-    provision_test_security(
-        bob_fixture.store.as_ref(),
-        &bob_member,
-        [alice_member.clone()],
-    );
-    let alice_runtime = &alice_fixture.runtime;
-    let bob_runtime = &bob_fixture.runtime;
-    let group_id = GroupId(Uuid::from_u128(50_101));
-    let members =
-        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
-            .expect("group members should build");
-    alice_runtime
-        .install_group_for_test(group_id, members.clone())
-        .expect("alice group should install");
-    bob_runtime
-        .install_group_for_test(group_id, members)
-        .expect("bob group should install");
-
-    let row_id = test_row_id(group_id, dataset_id.clone(), 50_111);
-    let read_token = snapshot_read_token(alice_runtime.as_ref(), group_id, dataset_id.clone());
-    publish_changes(
-        alice_runtime.as_ref(),
-        read_token,
-        vec![RowMutation::Upsert {
-            row_id: row_id.clone(),
-            row: crate::row_values! {
-                "title" => "summary catch-up",
-            },
-        }],
-    );
-    assert!(bob_fixture.listener.captured_data_changes().is_empty());
-
-    publish_direct_peer_routes(alice_runtime, &alice_member, bob_runtime, &bob_member);
-    let summary = wait_for_test_reply(bob_runtime.request_summary(SummaryRequest {
-        group_id,
-        target: alice_member,
-    }))
-    .expect("summary request should succeed");
-    assert_eq!(
-        summary.has_versions,
-        VersionVector::initial(NonZeroUsize::new(2).expect("group has two members"))
-            .with_update_applied(UpdateId {
-                node_index: 0,
-                version: 1,
-            })
-    );
-
-    bob_fixture.listener.wait_for_data_change_count(1);
-    assert_eq!(
-        bob_fixture.listener.captured_data_changes(),
-        vec![CapturedDataChange {
-            rows: vec![CapturedRowChange::Upsert {
-                row_id,
-                title: "summary catch-up".to_owned(),
-            }],
-        }]
-    );
 }
 
 #[test]

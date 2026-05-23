@@ -1,5 +1,5 @@
 use super::messages::RuntimeMessageError;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::delivery::security::DeliverySecurityError;
 use crate::{
     GroupMembersError,
@@ -100,7 +100,7 @@ pub(crate) enum GroupInstallError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[snafu(display("Test group {group_id} security material could not be prepared: {source}"))]
     TestGroupSecurity {
         group_id: GroupId,
