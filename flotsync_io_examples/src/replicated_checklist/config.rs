@@ -305,7 +305,7 @@ mod tests {
     fn parses_checklist_app_config_from_single_toml() {
         let temp_dir = std::env::temp_dir();
         let path = temp_dir.join("alice-checklist.toml");
-        let config = parse_config_str(&format!(
+        let config = parse_config_str(
             r#"
             [flotsync.examples.replicated-checklist]
             local-member = "alice"
@@ -325,7 +325,7 @@ mod tests {
             ip = "127.0.0.1"
             port = 45101
             "#,
-        ))
+        )
         .expect("config should parse");
 
         let local_member = read_member(&config, LOCAL_MEMBER_KEY).expect("member should parse");
