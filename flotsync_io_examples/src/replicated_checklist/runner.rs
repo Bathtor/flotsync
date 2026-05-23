@@ -43,8 +43,9 @@ use flotsync_replication::{
     load_replication_runtime_with_runtime_config_toml,
     prepare_initial_group_security_material,
     provision_replication_security,
+    validate_initial_group_security_material,
 };
-use flotsync_security::{GroupKey, SecurityError, generate_member_key_files};
+use flotsync_security::{SecurityError, generate_member_key_files};
 use futures_util::{FutureExt, future::join_all};
 use kompact::prelude::block_on;
 use snafu::prelude::*;
@@ -358,10 +359,15 @@ pub enum StaticGroupError {
     TrustedPublicKeysForLocalMember { member_id: MemberIdentity },
     #[snafu(display("Configured trusted public JWKS includes non-group member {member_id}."))]
     UnexpectedTrustedPublicKeys { member_id: MemberIdentity },
-    #[snafu(display("Failed to generate initial static group key: {source}"))]
-    GenerateGroupKey { source: SecurityError },
     #[snafu(display("Failed to prepare initial static group security material: {source}"))]
     InitialGroupSecurity { source: ProvisionSecurityError },
+    #[snafu(display(
+        "Stored static group {group_id} security material does not match checklist config: {source}"
+    ))]
+    ExistingGroupSecurity {
+        group_id: GroupId,
+        source: ProvisionSecurityError,
+    },
 }
 
 struct ChecklistListener {
@@ -826,6 +832,7 @@ async fn ensure_configured_group(
 
     if let Some(existing_group) = existing_group {
         validate_existing_static_group(existing_group, config, local_member_index)?;
+        validate_existing_static_group_security(existing_group, config)?;
         let provisioned = provision_configured_security(store, config).await?;
         validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
         return Ok(());
@@ -833,11 +840,10 @@ async fn ensure_configured_group(
 
     let provisioned = provision_configured_security(store, config).await?;
     validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
-    let group_key = GroupKey::generate().context(static_group_error::GenerateGroupKeySnafu)?;
     let security_material = prepare_initial_group_security_material(
         config.group_id,
         &config.replication_security,
-        &group_key,
+        config.group_key.as_ref(),
     )
     .context(static_group_error::InitialGroupSecuritySnafu)?;
     let mut transaction = store
@@ -859,6 +865,22 @@ async fn ensure_configured_group(
         .await
         .context(static_group_error::StoreSnafu)?;
     Ok(())
+}
+
+/// Validate an existing static group's encrypted key against current config.
+fn validate_existing_static_group_security(
+    existing_group: &ReplicationGroupRecord,
+    config: &ChecklistAppConfig,
+) -> Result<(), StaticGroupError> {
+    validate_initial_group_security_material(
+        existing_group.group_id,
+        &config.replication_security,
+        config.group_key.as_ref(),
+        &existing_group.security_material,
+    )
+    .context(static_group_error::ExistingGroupSecuritySnafu {
+        group_id: existing_group.group_id,
+    })
 }
 
 /// Load current static-group records before deciding whether setup can mutate security state.
@@ -1018,7 +1040,12 @@ mod tests {
     use super::*;
     use flotsync_io::test_support::{ReservedSocketKind, reserve_sockets};
     use flotsync_replication::{RowKey, test_support::test_replication_security_secrets};
-    use flotsync_security::{local_member_keys_from_jwks, public_member_keys_from_jwks};
+    use flotsync_security::{
+        GROUP_KEY_LENGTH,
+        GroupKey,
+        local_member_keys_from_jwks,
+        public_member_keys_from_jwks,
+    };
     use uuid::Uuid;
 
     fn test_config(group_id: GroupId, store_path: PathBuf) -> ChecklistAppConfig {
@@ -1063,12 +1090,17 @@ mod tests {
             local_member,
             store_path,
             replication_security: test_replication_security_secrets(),
+            group_key: test_group_key(1),
             local_private_jwks_path,
             trusted_public_jwks_paths,
             group_id,
             ordered_members,
             local_endpoint_bind_addr: "127.0.0.1:45100".parse().unwrap(),
         }
+    }
+
+    fn test_group_key(seed: u8) -> Arc<GroupKey> {
+        Arc::new(GroupKey::from_bytes([seed; GROUP_KEY_LENGTH]))
     }
 
     fn test_runtime_config_toml(local_endpoint: std::net::SocketAddr) -> String {
@@ -1173,6 +1205,13 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].group_id, group_id);
         assert_eq!(groups[0].members, config.ordered_members);
+        validate_initial_group_security_material(
+            group_id,
+            &config.replication_security,
+            config.group_key.as_ref(),
+            &groups[0].security_material,
+        )
+        .expect("stored group key should match config");
     }
 
     #[test]
@@ -1247,6 +1286,28 @@ mod tests {
         assert!(matches!(
             result,
             Err(StaticGroupError::MemberMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn ensure_configured_group_rejects_existing_group_secret_mismatch() {
+        let group_id = GroupId(Uuid::from_u128(104));
+        let insert_config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let store = SqliteReplicationStore::in_memory(insert_config.local_member.clone())
+            .expect("store should build");
+        block_on(ensure_configured_group(&store, &insert_config))
+            .expect("existing group should be inserted");
+        let mut mismatched_config = insert_config.clone();
+        mismatched_config.group_key = test_group_key(2);
+
+        let result = block_on(ensure_configured_group(&store, &mismatched_config));
+
+        assert!(matches!(
+            result,
+            Err(StaticGroupError::ExistingGroupSecurity {
+                source: ProvisionSecurityError::GroupSecretMismatch { .. },
+                ..
+            })
         ));
     }
 

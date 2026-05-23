@@ -103,10 +103,12 @@ Each local store keeps sensitive group-security material in encrypted columns or
 an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
 material is encrypted at rest with a device-local application database secret.
 
-For this MVP slice, replicated-checklist reads that database secret from
-plaintext application config during setup and derives the store-secret key from
-that password with an example-local domain-separated hash. Long term, the
-secret should come from OS-backed secure storage through the `keyring` crate.
+For this MVP slice, replicated-checklist reads that database secret and the
+shared static-group secret from plaintext application config during setup. It
+derives both concrete keys from those passwords with example-local
+domain-separated hashes. Long term, the device-local database secret should
+come from OS-backed secure storage through the `keyring` crate, and static
+group secret provisioning should be replaced by the next setup shape.
 
 The stored group-security material includes the group symmetric key, cipher
 suite metadata, and member public keys needed to verify and open group traffic

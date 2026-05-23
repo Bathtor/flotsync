@@ -25,6 +25,7 @@ pub use security_provisioning::{
     ProvisionedReplicationSecurity,
     prepare_initial_group_security_material,
     provision_replication_security,
+    validate_initial_group_security_material,
 };
 pub use store::SqliteReplicationStore;
 

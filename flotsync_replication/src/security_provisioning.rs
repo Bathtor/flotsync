@@ -11,6 +11,7 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupId,
         LocalMemberPrivateKeysRecord,
         MemberIdentity,
         ReplicationSecuritySecrets,
@@ -33,6 +34,7 @@ use flotsync_security::{
     StoreSecretContext,
     local_member_keys_from_jwks,
     open_store_secret,
+    open_stored_group_key,
     public_member_keys_from_jwks,
     seal_store_secret,
 };
@@ -96,6 +98,23 @@ pub enum ProvisionSecurityError {
     /// Initial group security material could not be encrypted for storage.
     #[snafu(display("Failed to encrypt initial group secret: {source}"))]
     SealGroupSecret { source: BoxError },
+    /// The stored initial group secret uses a different store-secret key id.
+    #[snafu(display(
+        "Stored initial group secret for group {group_id} uses store-secret key id {actual}; expected {expected}."
+    ))]
+    GroupSecretKeyIdMismatch {
+        group_id: GroupId,
+        expected: crate::api::StoreSecretKeyId,
+        actual: crate::api::StoreSecretKeyId,
+    },
+    /// Stored initial group security material could not be opened for comparison.
+    #[snafu(display("Failed to open stored initial group secret for group {group_id}: {source}"))]
+    OpenStoredGroupSecret { group_id: GroupId, source: BoxError },
+    /// The stored initial group secret does not match the configured group secret.
+    #[snafu(display(
+        "Stored initial group secret for group {group_id} differs from configured group-secret-password."
+    ))]
+    GroupSecretMismatch { group_id: GroupId },
 }
 
 /// Temporarily provision local private and trusted public member keys into a store.
@@ -187,6 +206,53 @@ pub fn prepare_initial_group_security_material(
             sealed,
         ),
     })
+}
+
+/// Confirm stored initial group-security material matches configured setup.
+///
+/// This helper is intentionally temporary and scoped to the replicated-checklist
+/// file-config setup. It lets the example fail early when a local store already
+/// contains a static group created under a different shared group password.
+///
+/// # Errors
+///
+/// Returns [`ProvisionSecurityError`] if the stored encrypted group secret
+/// cannot be opened with the configured store secret or does not match the
+/// configured group key.
+pub fn validate_initial_group_security_material(
+    group_id: crate::api::GroupId,
+    security: &ReplicationSecuritySecrets,
+    group_key: &GroupKey,
+    security_material: &EncryptedGroupSecurityMaterial,
+) -> Result<(), ProvisionSecurityError> {
+    let secret = &security_material.encrypted_group_secret;
+    ensure!(
+        &secret.key_id == security.store_secret_key_id(),
+        provision_security_error::GroupSecretKeyIdMismatchSnafu {
+            group_id,
+            expected: security.store_secret_key_id().clone(),
+            actual: secret.key_id.clone(),
+        }
+    );
+    let sealed = secret
+        .to_store_secret_ciphertext()
+        .boxed()
+        .context(provision_security_error::OpenStoredGroupSecretSnafu { group_id })?;
+    let context = StoreSecretContext {
+        table: LOGICAL_GROUP_TABLE,
+        column: LOGICAL_GROUP_SECRET_COLUMN,
+        row_id: group_id.0.as_bytes(),
+        key_id: security.store_secret_key_id().as_str(),
+        crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
+    };
+    let stored_group_key = open_stored_group_key(security.store_secret_key(), context, &sealed)
+        .boxed()
+        .context(provision_security_error::OpenStoredGroupSecretSnafu { group_id })?;
+    ensure!(
+        &stored_group_key == group_key,
+        provision_security_error::GroupSecretMismatchSnafu { group_id }
+    );
+    Ok(())
 }
 
 /// Parse all trusted public JWKS inputs and reject duplicate member identities.
