@@ -572,8 +572,8 @@ impl DeliverySecurity {
             secret.key_id == self.store_secret_key_id,
             GroupSecretKeyIdMismatchSnafu {
                 group_id,
-                expected: self.store_secret_key_id.clone(),
-                actual: secret.key_id.clone(),
+                expected: self.store_secret_key_id,
+                actual: secret.key_id,
             }
         );
         let sealed = secret.to_store_secret_ciphertext()?;
@@ -581,7 +581,7 @@ impl DeliverySecurity {
             table: LOGICAL_GROUP_TABLE,
             column: LOGICAL_GROUP_SECRET_COLUMN,
             row_id: group_id.0.as_bytes(),
-            key_id: self.store_secret_key_id.as_str(),
+            key_id: self.store_secret_key_id.as_bytes(),
             crypto_version: StoreSecretCryptoVersion::new(secret.crypto_version.as_u16()),
         };
         open_stored_group_key(&self.store_secret_key, context, &sealed)
@@ -599,7 +599,7 @@ impl DeliverySecurity {
             table: LOGICAL_GROUP_TABLE,
             column: LOGICAL_GROUP_SECRET_COLUMN,
             row_id,
-            key_id: self.store_secret_key_id.as_str(),
+            key_id: self.store_secret_key_id.as_bytes(),
             crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
         };
         let plaintext = group_key.stored_secret_plaintext();
@@ -608,7 +608,7 @@ impl DeliverySecurity {
             .context(SealGroupSecretSnafu)?;
         Ok(EncryptedGroupSecurityMaterial {
             encrypted_group_secret: EncryptedStoreSecret::from_store_secret_ciphertext(
-                self.store_secret_key_id.clone(),
+                self.store_secret_key_id,
                 sealed,
             ),
         })
@@ -751,7 +751,7 @@ fn open_local_private_keys(
         table: LOGICAL_LOCAL_MEMBER_TABLE,
         column: LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN,
         row_id: row_id.as_bytes(),
-        key_id: secret.key_id.as_str(),
+        key_id: secret.key_id.as_bytes(),
         crypto_version: StoreSecretCryptoVersion::new(secret.crypto_version.as_u16()),
     };
     let plaintext = open_store_secret(store_secret_key, context, &sealed)

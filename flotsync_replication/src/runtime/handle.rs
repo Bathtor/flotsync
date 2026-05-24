@@ -138,7 +138,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         store.clone(),
         &local_member,
         security_secrets.store_secret_key().clone(),
-        security_secrets.store_secret_key_id().clone(),
+        *security_secrets.store_secret_key_id(),
     );
     let security = security_f
         .await

@@ -846,7 +846,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             .security_material
             .encrypted_group_secret
             .key_id
-            .as_str(),
+            .to_string(),
     )
     .bind(
         group
@@ -947,7 +947,7 @@ VALUES (?1, ?2, ?3, ?4, ?5)
     )
     .bind(record.member_id.to_string())
     .bind(i64::from(secret.crypto_version.as_u16()))
-    .bind(secret.key_id.as_str())
+    .bind(secret.key_id.to_string())
     .bind(secret.nonce.as_ref())
     .bind(secret.ciphertext.as_ref())
     .execute(&mut *connection)
@@ -1756,6 +1756,10 @@ fn decode_update_version_sort_key(bytes: &[u8]) -> Result<u64, StoreError> {
 }
 
 /// Decode one encrypted secret cell from `SQLite` scalar column values.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Owned strings keep sqlx row.get call sites type-inference friendly."
+)]
 fn decode_encrypted_store_secret(
     raw_crypto_version: i64,
     key_id: String,
@@ -1765,9 +1769,13 @@ fn decode_encrypted_store_secret(
     let crypto_version = u16::try_from(raw_crypto_version)
         .context(SecretCryptoVersionOverflowSnafu)
         .map_err(StoreError::from)?;
+    let key_id: StoreSecretKeyId = key_id
+        .parse()
+        .context(InvalidStoreSecretKeyIdSnafu)
+        .map_err(StoreError::from)?;
     Ok(EncryptedStoreSecret {
         crypto_version: StoreSecretCryptoVersion::new(crypto_version),
-        key_id: StoreSecretKeyId::new(key_id),
+        key_id,
         nonce: nonce.into_boxed_slice(),
         ciphertext: ciphertext.into_boxed_slice(),
     })
@@ -1847,6 +1855,10 @@ enum SqliteStoreError {
     InvalidGroupId { source: uuid::Error },
     #[snafu(display("Stored row key was not a valid UUID: {source}"))]
     InvalidRowKey { source: uuid::Error },
+    #[snafu(display("Stored store-secret key id was invalid: {source}"))]
+    InvalidStoreSecretKeyId {
+        source: flotsync_security::StoreSecretKeyIdParseError,
+    },
     #[snafu(display("Stored member identity '{raw}' was invalid: {source}"))]
     InvalidMemberIdentity {
         raw: String,
@@ -1983,10 +1995,10 @@ mod tests {
         Arc::new(Schema::from_fields([Field::linear_string("title")]))
     }
 
-    fn sample_encrypted_secret(label: &str, seed: u8) -> EncryptedStoreSecret {
+    fn sample_encrypted_secret(seed: u8) -> EncryptedStoreSecret {
         EncryptedStoreSecret {
             crypto_version: StoreSecretCryptoVersion::new(1),
-            key_id: StoreSecretKeyId::new(format!("test-key-{label}")),
+            key_id: StoreSecretKeyId::from_u128_for_test(u128::from(seed)),
             nonce: Vec::from([seed, seed.wrapping_add(1)]).into_boxed_slice(),
             ciphertext: Box::from([seed, seed.wrapping_add(1), seed.wrapping_add(2)]),
         }
@@ -2307,7 +2319,7 @@ mod tests {
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
-                secret: sample_encrypted_secret("private", 42),
+                secret: sample_encrypted_secret(42),
             },
         };
 
@@ -2341,13 +2353,13 @@ mod tests {
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
-                secret: sample_encrypted_secret("private", 42),
+                secret: sample_encrypted_secret(42),
             },
         };
         let conflicting_record = LocalMemberPrivateKeysRecord {
             member_id: record.member_id.clone(),
             private_keys: EncryptedLocalMemberPrivateKeys {
-                secret: sample_encrypted_secret("private", 43),
+                secret: sample_encrypted_secret(43),
             },
         };
 

@@ -161,8 +161,8 @@ fn validate_stored_group_security_material(
         &secret.key_id == expected_store_secret_key_id,
         KeyIdMismatchSnafu {
             group_id,
-            expected: expected_store_secret_key_id.clone(),
-            actual: secret.key_id.clone(),
+            expected: *expected_store_secret_key_id,
+            actual: secret.key_id,
         }
     );
     let version = secret.crypto_version.as_u16();

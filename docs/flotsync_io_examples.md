@@ -156,11 +156,11 @@ cargo run -p flotsync_io_examples --bin replicated_checklist -- \
 
 Each command writes `private.jwks` and `public.jwks` in the selected directory.
 Copy each peer's `public.jwks` to the other peer and reference those copied
-public files from the peer config below. The plaintext `store-secret-password`
-and `group-secret-password` values are temporary MVP setup inputs; the example
-hashes them into the local store-secret key and the shared static-group key.
-They will be replaced by the keyring-backed setup tracked after this security
-slice.
+public files from the peer config below. `store-secret-profile` selects the
+device-local store secret for this application profile; the current
+implementation keeps that secret in OS-backed local storage and creates it on
+first run. `group-secret-password` remains a temporary shared static-group setup
+input and must match across peers in the same group.
 
 Start two checklist peers with node-specific configs:
 
@@ -169,7 +169,7 @@ Start two checklist peers with node-specific configs:
 [flotsync.examples.replicated-checklist]
 local-member = "alice"
 store-path = "alice.sqlite"
-store-secret-password = "temporary-dev-password"
+store-secret-profile = "alice-dev"
 group-secret-password = "temporary-shared-group-password"
 local-private-jwks-path = "alice-keys/private.jwks"
 trusted-public-jwks-paths = ["bob-keys/public.jwks"]
@@ -191,7 +191,7 @@ port = 45101
 [flotsync.examples.replicated-checklist]
 local-member = "bob"
 store-path = "bob.sqlite"
-store-secret-password = "temporary-dev-password"
+store-secret-profile = "bob-dev"
 group-secret-password = "temporary-shared-group-password"
 local-private-jwks-path = "bob-keys/private.jwks"
 trusted-public-jwks-paths = ["alice-keys/public.jwks"]

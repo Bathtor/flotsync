@@ -193,7 +193,7 @@ pub fn prepare_initial_group_security_material(
         table: LOGICAL_GROUP_TABLE,
         column: LOGICAL_GROUP_SECRET_COLUMN,
         row_id: group_id.0.as_bytes(),
-        key_id: security.store_secret_key_id().as_str(),
+        key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
     let plaintext = group_key.stored_secret_plaintext();
@@ -202,7 +202,7 @@ pub fn prepare_initial_group_security_material(
         .context(provision_security_error::SealGroupSecretSnafu)?;
     Ok(EncryptedGroupSecurityMaterial {
         encrypted_group_secret: EncryptedStoreSecret::from_store_secret_ciphertext(
-            security.store_secret_key_id().clone(),
+            *security.store_secret_key_id(),
             sealed,
         ),
     })
@@ -230,8 +230,8 @@ pub fn validate_initial_group_security_material(
         &secret.key_id == security.store_secret_key_id(),
         provision_security_error::GroupSecretKeyIdMismatchSnafu {
             group_id,
-            expected: security.store_secret_key_id().clone(),
-            actual: secret.key_id.clone(),
+            expected: *security.store_secret_key_id(),
+            actual: secret.key_id,
         }
     );
     let sealed = secret
@@ -242,7 +242,7 @@ pub fn validate_initial_group_security_material(
         table: LOGICAL_GROUP_TABLE,
         column: LOGICAL_GROUP_SECRET_COLUMN,
         row_id: group_id.0.as_bytes(),
-        key_id: security.store_secret_key_id().as_str(),
+        key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
     let stored_group_key = open_stored_group_key(security.store_secret_key(), context, &sealed)
@@ -314,8 +314,8 @@ fn confirm_existing_local_private_keys(
         &secret.key_id == security.store_secret_key_id(),
         provision_security_error::LocalPrivateKeysKeyIdMismatchSnafu {
             member_id: local_member.clone(),
-            expected: security.store_secret_key_id().clone(),
-            actual: secret.key_id.clone(),
+            expected: *security.store_secret_key_id(),
+            actual: secret.key_id,
         }
     );
     let sealed = secret.to_store_secret_ciphertext().boxed().context(
@@ -328,7 +328,7 @@ fn confirm_existing_local_private_keys(
         table: LOGICAL_LOCAL_MEMBER_TABLE,
         column: LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN,
         row_id: row_id.as_bytes(),
-        key_id: security.store_secret_key_id().as_str(),
+        key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
     let plaintext = open_store_secret(security.store_secret_key(), context, &sealed)
@@ -356,7 +356,7 @@ fn local_private_keys_record(
         table: LOGICAL_LOCAL_MEMBER_TABLE,
         column: LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN,
         row_id: row_id.as_bytes(),
-        key_id: security.store_secret_key_id().as_str(),
+        key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
     let sealed = seal_store_secret(
@@ -372,7 +372,7 @@ fn local_private_keys_record(
         member_id: local_member.clone(),
         private_keys: EncryptedLocalMemberPrivateKeys {
             secret: EncryptedStoreSecret::from_store_secret_ciphertext(
-                security.store_secret_key_id().clone(),
+                *security.store_secret_key_id(),
                 sealed,
             ),
         },

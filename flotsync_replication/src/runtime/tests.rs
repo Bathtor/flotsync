@@ -44,6 +44,7 @@ use crate::{
         LoadError,
         LoadSecurityError,
         LocalMemberPrivateKeysRecord,
+        LocalStoreSecretProfile,
         MemberIdentity,
         MemberIndex,
         ProviderExternalSnafu,
@@ -93,7 +94,12 @@ use flotsync_core::{
 };
 use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
-use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicMemberKeys, StoreSecretKey};
+use flotsync_security::{
+    GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+    PublicMemberKeys,
+    StoreSecretKey,
+    install_local_store_secret_test_store,
+};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::ResultExt;
@@ -1102,6 +1108,21 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
 }
 
 #[test]
+fn replication_security_secrets_load_or_create_reuses_local_profile() {
+    install_local_store_secret_test_store().expect("test local secret store should install");
+    let application_id = app_probe_id();
+    let profile = LocalStoreSecretProfile::new(format!("runtime-profile-{}", Uuid::new_v4()))
+        .expect("profile should build");
+
+    let created = ReplicationSecuritySecrets::load_or_create_local(&application_id, &profile)
+        .expect("first load should create local store secret");
+    let loaded = ReplicationSecuritySecrets::load_or_create_local(&application_id, &profile)
+        .expect("second load should reuse local store secret");
+
+    assert_eq!(created.store_secret_key_id(), loaded.store_secret_key_id());
+}
+
+#[test]
 fn load_replication_runtime_rejects_missing_local_private_keys() {
     let application_id = app_probe_id();
     let store =
@@ -1136,7 +1157,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
     let listener = Arc::new(ListenerStub::default());
     let test_security = test_replication_security_secrets();
     let wrong_security = ReplicationSecuritySecrets::new(
-        test_security.store_secret_key_id().clone(),
+        *test_security.store_secret_key_id(),
         Arc::new(StoreSecretKey::from_bytes([42; 32])),
     );
 
@@ -1201,11 +1222,10 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
         Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_403));
+    let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
     let mut security_material = current_slice_placeholder_group_security_material_with_key_id(
         group_id,
-        test_replication_security_secrets()
-            .store_secret_key_id()
-            .clone(),
+        store_secret_key_id,
     );
     security_material.encrypted_group_secret.crypto_version = StoreSecretCryptoVersion::new(999);
     persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
@@ -1240,11 +1260,10 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
         Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_404));
+    let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
     let mut security_material = current_slice_placeholder_group_security_material_with_key_id(
         group_id,
-        test_replication_security_secrets()
-            .store_secret_key_id()
-            .clone(),
+        store_secret_key_id,
     );
     security_material.encrypted_group_secret.nonce = vec![7].into_boxed_slice();
     persist_alice_group_with_security_material(store.as_ref(), group_id, security_material);
@@ -1282,6 +1301,7 @@ fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
     );
     provision_test_security(store.as_ref(), &alice_member, []);
     let group_id = GroupId(Uuid::from_u128(50_401));
+    let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
     persist_group_in_store(
         store.as_ref(),
         ReplicationGroupRecord {
@@ -1291,9 +1311,7 @@ fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material_with_key_id(
                 group_id,
-                test_replication_security_secrets()
-                    .store_secret_key_id()
-                    .clone(),
+                store_secret_key_id,
             ),
         },
     );

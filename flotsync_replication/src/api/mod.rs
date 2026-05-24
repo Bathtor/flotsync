@@ -1,9 +1,17 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_core::{
+    member::Identifier,
+    versions::{UpdateId, VersionVector},
+};
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
-use flotsync_security::StoreSecretKey;
+use flotsync_security::{
+    StoreSecretKey,
+    load_local_store_secret,
+    load_or_create_local_store_secret,
+};
 use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec};
+use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -24,6 +32,7 @@ pub use flotsync_data_types::{
     RowRead,
     schema::datamodel::SchemaSource,
 };
+pub use flotsync_security::{LocalStoreSecretProfile, StoreSecretKeyId};
 pub use ids::*;
 
 /// Write-only row payload submitted by applications.
@@ -445,8 +454,46 @@ pub struct ReplicationSecuritySecrets {
 }
 
 impl ReplicationSecuritySecrets {
+    /// Load the existing device-local store secret for an application/profile.
+    ///
+    /// The profile is scoped by application id, not by member identity. This
+    /// keeps the API ready for stores that host multiple local identities under
+    /// the same encrypted-store secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadSecurityError::LocalStoreSecret`] if the local secret slot
+    /// is missing, inaccessible, or malformed.
+    pub fn load_local(
+        application_id: &Identifier,
+        profile: &LocalStoreSecretProfile,
+    ) -> Result<Self, LoadSecurityError> {
+        let secret =
+            load_local_store_secret(application_id, profile).context(LocalStoreSecretSnafu)?;
+        Ok(Self::from_loaded_local_store_secret(secret))
+    }
+
+    /// Load or first-run initialise the device-local store secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadSecurityError::LocalStoreSecret`] if the local secret slot
+    /// cannot be loaded or created.
+    pub fn load_or_create_local(
+        application_id: &Identifier,
+        profile: &LocalStoreSecretProfile,
+    ) -> Result<Self, LoadSecurityError> {
+        let secret = load_or_create_local_store_secret(application_id, profile)
+            .context(LocalStoreSecretSnafu)?;
+        Ok(Self::from_loaded_local_store_secret(secret))
+    }
+
     /// Build runtime security input from a shared store-secret key handle.
+    ///
+    /// This is intentionally test-support only: some security validation tests
+    /// need to construct deliberately mismatched or malformed key inputs.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         store_secret_key_id: StoreSecretKeyId,
         store_secret_key: Arc<StoreSecretKey>,
@@ -457,7 +504,15 @@ impl ReplicationSecuritySecrets {
         }
     }
 
-    /// Return the caller-defined store-secret key id expected by encrypted cells.
+    fn from_loaded_local_store_secret(secret: flotsync_security::LoadedLocalStoreSecret) -> Self {
+        let (key_id, store_secret_key) = secret.into_parts();
+        Self {
+            store_secret_key_id: key_id,
+            store_secret_key: Arc::new(store_secret_key),
+        }
+    }
+
+    /// Return the generated store-secret key id expected by encrypted cells.
     #[must_use]
     pub fn store_secret_key_id(&self) -> &StoreSecretKeyId {
         &self.store_secret_key_id
@@ -731,30 +786,6 @@ impl StoreSecretCryptoVersion {
     }
 }
 
-/// Caller-defined id for the device-local database secret used to encrypt one store cell.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct StoreSecretKeyId(String);
-
-impl StoreSecretKeyId {
-    /// Build a store-secret key id from its storage value.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Return the key id string stored in backend metadata columns.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for StoreSecretKeyId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// One already-encrypted secret cell stored by replication storage.
 ///
 /// `key_id` identifies the device-local database secret used by the caller,
@@ -765,7 +796,7 @@ impl fmt::Display for StoreSecretKeyId {
 pub struct EncryptedStoreSecret {
     /// Cryptographic setup version for this encrypted cell.
     pub crypto_version: StoreSecretCryptoVersion,
-    /// Caller-defined id of the device-local database secret.
+    /// Generated id of the device-local database secret.
     pub key_id: StoreSecretKeyId,
     /// Opaque nonce bytes supplied by the encryption boundary.
     pub nonce: Box<[u8]>,
@@ -813,7 +844,7 @@ pub fn current_slice_placeholder_group_security_material(
 ) -> EncryptedGroupSecurityMaterial {
     current_slice_placeholder_group_security_material_with_key_id(
         group_id,
-        StoreSecretKeyId::new("current-slice-placeholder-key"),
+        StoreSecretKeyId::placeholder_for_current_slice(),
     )
 }
 

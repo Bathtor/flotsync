@@ -4,6 +4,7 @@ use super::{
 };
 use crate::GroupMembersError;
 use flotsync_core::member::Identifier;
+use flotsync_security::LocalStoreSecretError;
 use snafu::{Location, prelude::*};
 use std::error::Error;
 
@@ -77,6 +78,12 @@ pub enum StoreError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum LoadSecurityError {
+    /// Device-local store-secret profile loading failed before store records could be opened.
+    #[snafu(display("Failed to load local store secret: {source}"))]
+    LocalStoreSecret {
+        #[snafu(source(from(LocalStoreSecretError, Box::new)))]
+        source: Box<LocalStoreSecretError>,
+    },
     /// The store does not contain private keys for the local member.
     #[snafu(display("Local private keys for member {member_id} are not provisioned."))]
     MissingLocalPrivateKeys { member_id: MemberIdentity },

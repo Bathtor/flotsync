@@ -11,7 +11,8 @@ use chacha20poly1305::{
 };
 use rand_core::{OsRng, TryRngCore};
 use snafu::prelude::*;
-use std::fmt;
+use std::{error::Error, fmt, str::FromStr};
+use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Cryptographic setup version for encrypted store-secret cells.
@@ -41,13 +42,17 @@ impl StoreSecretKey {
     /// Returns [`SecurityError::StoreSecretKeyLength`] if `bytes` does not
     /// contain exactly [`STORE_SECRET_KEY_LENGTH`] bytes.
     pub fn try_from_slice(bytes: &[u8]) -> Result<Self> {
-        let bytes = <[u8; STORE_SECRET_KEY_LENGTH]>::try_from(bytes).map_err(|_| {
-            SecurityError::StoreSecretKeyLength {
+        if bytes.len() != STORE_SECRET_KEY_LENGTH {
+            return Err(SecurityError::StoreSecretKeyLength {
                 expected: STORE_SECRET_KEY_LENGTH,
                 actual: bytes.len(),
-            }
-        })?;
-        Ok(Self::from_bytes(bytes))
+            });
+        }
+        let mut key = Self {
+            bytes: [0u8; STORE_SECRET_KEY_LENGTH],
+        };
+        key.bytes.copy_from_slice(bytes);
+        Ok(key)
     }
 
     /// Generate a fresh store-secret key from operating system randomness.
@@ -57,11 +62,19 @@ impl StoreSecretKey {
     /// Returns [`SecurityError::Randomness`] if the operating system random
     /// source fails.
     pub fn generate() -> Result<Self> {
-        let mut bytes = Zeroizing::new([0u8; STORE_SECRET_KEY_LENGTH]);
+        let mut key = Self {
+            bytes: [0u8; STORE_SECRET_KEY_LENGTH],
+        };
         OsRng
-            .try_fill_bytes(bytes.as_mut())
+            .try_fill_bytes(&mut key.bytes)
             .context(RandomnessSnafu)?;
-        Ok(Self { bytes: *bytes })
+        Ok(key)
+    }
+
+    /// Return the secret key bytes for security-crate record encoding and AEAD setup.
+    #[must_use]
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -82,8 +95,8 @@ pub struct StoreSecretContext<'a> {
     pub column: &'static str,
     /// Logical row identifier for the encrypted value.
     pub row_id: &'a [u8],
-    /// Caller-defined id of the device-local key used for this cell.
-    pub key_id: &'a str,
+    /// Opaque id bytes of the device-local key used for this cell.
+    pub key_id: &'a [u8],
     /// Cryptographic setup version stored next to this encrypted cell.
     pub crypto_version: StoreSecretCryptoVersion,
 }
@@ -134,7 +147,7 @@ pub fn open_store_secret(
     context: StoreSecretContext<'_>,
     sealed: &StoreSecretCiphertext,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.bytes));
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
     let aad = store_secret_aad(context);
     cipher
         .decrypt(
@@ -176,7 +189,7 @@ fn seal_store_secret_with_nonce(
     plaintext: &[u8],
     nonce: [u8; STORE_SECRET_NONCE_LENGTH],
 ) -> Result<Vec<u8>> {
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key.bytes));
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key.as_bytes()));
     let aad = store_secret_aad(context);
     cipher
         .encrypt(
@@ -196,9 +209,85 @@ fn store_secret_aad(context: StoreSecretContext<'_>) -> Vec<u8> {
     append_len_prefixed(&mut aad, context.table.as_bytes());
     append_len_prefixed(&mut aad, context.column.as_bytes());
     append_len_prefixed(&mut aad, context.row_id);
-    append_len_prefixed(&mut aad, context.key_id.as_bytes());
+    append_len_prefixed(&mut aad, context.key_id);
     aad.extend_from_slice(&context.crypto_version.as_u16().to_be_bytes());
     aad
+}
+
+/// Generated id for the device-local database secret used to encrypt one store cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StoreSecretKeyId(Uuid);
+
+impl StoreSecretKeyId {
+    pub(crate) const BYTE_LENGTH: usize = 16;
+
+    /// Return opaque key-id bytes for authenticated store-secret context.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    #[must_use]
+    pub(crate) fn generate() -> Self {
+        Self(Uuid::new_v4())
+    }
+
+    #[must_use]
+    pub(crate) const fn from_bytes(value: [u8; Self::BYTE_LENGTH]) -> Self {
+        Self(Uuid::from_bytes(value))
+    }
+
+    /// Build the temporary key id used by current-slice placeholder records.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn placeholder_for_current_slice() -> Self {
+        Self(Uuid::nil())
+    }
+
+    /// Build a deterministic key id for tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn from_u128_for_test(value: u128) -> Self {
+        Self(Uuid::from_u128(value))
+    }
+}
+
+impl fmt::Display for StoreSecretKeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for StoreSecretKeyId {
+    type Err = StoreSecretKeyIdParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Uuid::parse_str(value)
+            .map(Self)
+            .map_err(|source| StoreSecretKeyIdParseError { source })
+    }
+}
+
+/// Error returned when a stored store-secret key id cannot be decoded.
+#[derive(Debug)]
+pub struct StoreSecretKeyIdParseError {
+    source: uuid::Error,
+}
+
+impl fmt::Display for StoreSecretKeyIdParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "store-secret key id storage value was invalid: {}",
+            self.source
+        )
+    }
+}
+
+impl Error for StoreSecretKeyIdParseError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Store-secret cryptographic setup identifier stored with encrypted cells.

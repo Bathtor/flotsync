@@ -29,10 +29,11 @@ target/release/replicated_checklist run bob.toml
 ```
 
 The generated `public.jwks` files must be copied or otherwise made available to
-the opposite peer before first run. Each config needs the temporary
-`store-secret-password`, `group-secret-password`, `local-private-jwks-path`,
-and `trusted-public-jwks-paths` values. The plaintext password config and this
-application-side provisioning step are temporary for the current security MVP.
+the opposite peer before first run. Each config needs `store-secret-profile`,
+the temporary `group-secret-password`, `local-private-jwks-path`, and
+`trusted-public-jwks-paths` values. The profile selects a device-local
+store-secret slot; the group password and this application-side provisioning
+step are temporary for the current security MVP.
 
 Use one terminal per peer. In each REPL, run:
 

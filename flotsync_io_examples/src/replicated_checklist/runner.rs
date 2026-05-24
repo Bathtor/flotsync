@@ -9,12 +9,12 @@ use super::{
     TagCommand,
     checklist_dataset_id,
     checklist_help,
-    config::{ChecklistAppConfig, ChecklistConfigError},
+    config::{ChecklistAppConfig, ChecklistConfigError, checklist_application_id},
     parse_checklist_command,
 };
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
-use flotsync_core::{member::Identifier, versions::VersionVector};
+use flotsync_core::versions::VersionVector;
 use flotsync_replication::{
     ApiError,
     GroupId,
@@ -22,6 +22,7 @@ use flotsync_replication::{
     GroupMembersError,
     ListenerError,
     LoadError,
+    LoadSecurityError,
     MemberIdentity,
     MemberIndex,
     ProvisionSecurityError,
@@ -33,6 +34,7 @@ use flotsync_replication::{
     ReplicationEvent,
     ReplicationEventListener,
     ReplicationGroupRecord,
+    ReplicationSecuritySecrets,
     ReplicationStore,
     RowChange,
     RowProviderError,
@@ -127,6 +129,8 @@ pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError
 
 fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
     let config = ChecklistAppConfig::load(config_path).context(repl_error::ConfigSnafu)?;
+    let replication_security =
+        load_checklist_replication_security(&config).context(repl_error::LocalStoreSecretSnafu)?;
     ensure_store_parent_exists(&config.store_path)?;
     let store = Arc::new(
         SqliteReplicationStore::file_with_schema_sources(
@@ -137,16 +141,20 @@ fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistErro
         .context(repl_error::StoreSnafu)?,
     );
 
-    block_on(ensure_configured_group(store.as_ref(), &config))
-        .context(repl_error::StaticGroupSnafu)?;
+    block_on(ensure_configured_group(
+        store.as_ref(),
+        &config,
+        &replication_security,
+    ))
+    .context(repl_error::StaticGroupSnafu)?;
 
     let (listener, listener_receiver) = ChecklistListener::pair();
     let replication = block_on(load_replication_runtime_with_runtime_config_toml(
-        Identifier::from_array(["flotsync", "examples", "replicated-checklist"]),
+        checklist_application_id(),
         store,
         listener,
         ReplicationConfig::default(),
-        config.replication_security.clone(),
+        replication_security,
         &config.runtime_config_toml,
     ))
     .context(repl_error::LoadRuntimeSnafu)?;
@@ -154,6 +162,16 @@ fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistErro
     let working_set = load_checklist_working_set(replication.as_ref(), config.group_id)?;
     let mut repl = ChecklistRepl::new(config, replication, listener_receiver, working_set);
     repl.run()
+}
+
+/// Resolve the local store-secret profile into runtime security input.
+fn load_checklist_replication_security(
+    config: &ChecklistAppConfig,
+) -> Result<ReplicationSecuritySecrets, LoadSecurityError> {
+    ReplicationSecuritySecrets::load_or_create_local(
+        &checklist_application_id(),
+        &config.store_secret_profile,
+    )
 }
 
 /// Generate the fixed key-file pair expected by replicated-checklist config.
@@ -265,6 +283,8 @@ fn promote_generated_key_file(
 pub enum ReplicatedChecklistError {
     #[snafu(display("{source}"))]
     Config { source: ChecklistConfigError },
+    #[snafu(display("Failed to load checklist local store secret: {source}"))]
+    LocalStoreSecret { source: LoadSecurityError },
     #[snafu(display("Failed to prepare checklist store directory {}: {source}", path.display()))]
     CreateStoreDirectory { path: PathBuf, source: io::Error },
     #[snafu(display("Failed to open checklist replication store: {source}"))]
@@ -804,6 +824,7 @@ async fn load_checklist_working_set_async(
 async fn ensure_configured_group(
     store: &dyn ReplicationStore,
     config: &ChecklistAppConfig,
+    replication_security: &ReplicationSecuritySecrets,
 ) -> Result<(), StaticGroupError> {
     let member_count =
         NonZeroUsize::new(config.ordered_members.len()).ok_or(StaticGroupError::EmptyMembers)?;
@@ -832,17 +853,18 @@ async fn ensure_configured_group(
 
     if let Some(existing_group) = existing_group {
         validate_existing_static_group(existing_group, config, local_member_index)?;
-        validate_existing_static_group_security(existing_group, config)?;
-        let provisioned = provision_configured_security(store, config).await?;
+        validate_existing_static_group_security(existing_group, config, replication_security)?;
+        let provisioned =
+            provision_configured_security(store, config, replication_security).await?;
         validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
         return Ok(());
     }
 
-    let provisioned = provision_configured_security(store, config).await?;
+    let provisioned = provision_configured_security(store, config, replication_security).await?;
     validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
     let security_material = prepare_initial_group_security_material(
         config.group_id,
-        &config.replication_security,
+        replication_security,
         config.group_key.as_ref(),
     )
     .context(static_group_error::InitialGroupSecuritySnafu)?;
@@ -871,10 +893,11 @@ async fn ensure_configured_group(
 fn validate_existing_static_group_security(
     existing_group: &ReplicationGroupRecord,
     config: &ChecklistAppConfig,
+    replication_security: &ReplicationSecuritySecrets,
 ) -> Result<(), StaticGroupError> {
     validate_initial_group_security_material(
         existing_group.group_id,
-        &config.replication_security,
+        replication_security,
         config.group_key.as_ref(),
         &existing_group.security_material,
     )
@@ -934,9 +957,11 @@ fn validate_existing_static_group(
     Ok(())
 }
 
+/// Provision temporary static-group identity records from configured JWKS files.
 async fn provision_configured_security(
     store: &dyn ReplicationStore,
     config: &ChecklistAppConfig,
+    replication_security: &ReplicationSecuritySecrets,
 ) -> Result<flotsync_replication::ProvisionedReplicationSecurity, StaticGroupError> {
     let local_private_jwks = read_security_file(&config.local_private_jwks_path)?;
     let mut trusted_public_jwks = Vec::new();
@@ -948,7 +973,7 @@ async fn provision_configured_security(
     provision_replication_security(
         store,
         &config.local_member,
-        &config.replication_security,
+        replication_security,
         &local_private_jwks,
         trusted_public_jwks,
     )
@@ -1089,7 +1114,10 @@ mod tests {
             runtime_config_toml: String::new(),
             local_member,
             store_path,
-            replication_security: test_replication_security_secrets(),
+            store_secret_profile: flotsync_replication::LocalStoreSecretProfile::new(
+                "test-profile",
+            )
+            .expect("test profile should build"),
             group_key: test_group_key(1),
             local_private_jwks_path,
             trusted_public_jwks_paths,
@@ -1155,6 +1183,7 @@ mod tests {
         let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
         let group_id = GroupId(Uuid::from_u128(0x45d0));
         let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let replication_security = test_replication_security_secrets();
         config.runtime_config_toml = test_runtime_config_toml(endpoint_lease.addr(0));
         let store = Arc::new(
             SqliteReplicationStore::in_memory_with_schema_sources(
@@ -1163,15 +1192,19 @@ mod tests {
             )
             .expect("store should build"),
         );
-        block_on(ensure_configured_group(store.as_ref(), &config))
-            .expect("static group should be prepared");
+        block_on(ensure_configured_group(
+            store.as_ref(),
+            &config,
+            &replication_security,
+        ))
+        .expect("static group should be prepared");
         let (listener, _listener_receiver) = ChecklistListener::pair();
         let replication = block_on(load_replication_runtime_with_runtime_config_toml(
-            Identifier::from_array(["flotsync", "examples", "replicated-checklist"]),
+            checklist_application_id(),
             store,
             listener,
             ReplicationConfig::default(),
-            config.replication_security.clone(),
+            replication_security,
             &config.runtime_config_toml,
         ))
         .expect("runtime should load");
@@ -1193,10 +1226,16 @@ mod tests {
     fn ensure_configured_group_inserts_missing_static_group() {
         let group_id = GroupId(Uuid::from_u128(100));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let replication_security = test_replication_security_secrets();
         let store = SqliteReplicationStore::in_memory(config.local_member.clone())
             .expect("store should build");
 
-        block_on(ensure_configured_group(&store, &config)).expect("group should be prepared");
+        block_on(ensure_configured_group(
+            &store,
+            &config,
+            &replication_security,
+        ))
+        .expect("group should be prepared");
         let mut transaction =
             block_on(store.begin_transaction()).expect("transaction should start");
         let groups = block_on(transaction.load_replication_groups()).expect("groups should load");
@@ -1207,7 +1246,7 @@ mod tests {
         assert_eq!(groups[0].members, config.ordered_members);
         validate_initial_group_security_material(
             group_id,
-            &config.replication_security,
+            &replication_security,
             config.group_key.as_ref(),
             &groups[0].security_material,
         )
@@ -1218,13 +1257,18 @@ mod tests {
     fn ensure_configured_group_rejects_missing_trusted_public_keys() {
         let group_id = GroupId(Uuid::from_u128(102));
         let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let replication_security = test_replication_security_secrets();
         config
             .ordered_members
             .push(MemberIdentity::from_array(["bob"]));
         let store = SqliteReplicationStore::in_memory(config.local_member.clone())
             .expect("store should build");
 
-        let result = block_on(ensure_configured_group(&store, &config));
+        let result = block_on(ensure_configured_group(
+            &store,
+            &config,
+            &replication_security,
+        ));
 
         assert!(matches!(
             result,
@@ -1244,21 +1288,26 @@ mod tests {
                 MemberIdentity::from_array(["bob"]),
             ],
         );
+        let replication_security = test_replication_security_secrets();
         config.runtime_config_toml = test_runtime_config_toml(endpoint_lease.addr(0));
         let store = Arc::new(
             SqliteReplicationStore::in_memory(config.local_member.clone())
                 .expect("store should build"),
         );
 
-        block_on(ensure_configured_group(store.as_ref(), &config))
-            .expect("group should be prepared");
+        block_on(ensure_configured_group(
+            store.as_ref(),
+            &config,
+            &replication_security,
+        ))
+        .expect("group should be prepared");
         let (listener, _listener_receiver) = ChecklistListener::pair();
         let runtime = block_on(load_replication_runtime_with_runtime_config_toml(
-            Identifier::from_array(["flotsync", "examples", "replicated-checklist"]),
+            checklist_application_id(),
             store,
             listener,
             ReplicationConfig::default(),
-            config.replication_security.clone(),
+            replication_security,
             &config.runtime_config_toml,
         ))
         .expect("runtime should load provisioned security");
@@ -1270,6 +1319,7 @@ mod tests {
     fn ensure_configured_group_rejects_member_mismatch() {
         let group_id = GroupId(Uuid::from_u128(101));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let replication_security = test_replication_security_secrets();
         let store = SqliteReplicationStore::in_memory(config.local_member.clone())
             .expect("store should build");
         let mut existing = config.clone();
@@ -1278,10 +1328,18 @@ mod tests {
             MemberIdentity::from_array(["carol"]),
         ];
         add_trusted_public_key(&mut existing, MemberIdentity::from_array(["carol"]));
-        block_on(ensure_configured_group(&store, &existing))
-            .expect("existing group should be inserted");
+        block_on(ensure_configured_group(
+            &store,
+            &existing,
+            &replication_security,
+        ))
+        .expect("existing group should be inserted");
 
-        let result = block_on(ensure_configured_group(&store, &config));
+        let result = block_on(ensure_configured_group(
+            &store,
+            &config,
+            &replication_security,
+        ));
 
         assert!(matches!(
             result,
@@ -1293,14 +1351,23 @@ mod tests {
     fn ensure_configured_group_rejects_existing_group_secret_mismatch() {
         let group_id = GroupId(Uuid::from_u128(104));
         let insert_config = test_config(group_id, PathBuf::from("unused.sqlite"));
+        let replication_security = test_replication_security_secrets();
         let store = SqliteReplicationStore::in_memory(insert_config.local_member.clone())
             .expect("store should build");
-        block_on(ensure_configured_group(&store, &insert_config))
-            .expect("existing group should be inserted");
+        block_on(ensure_configured_group(
+            &store,
+            &insert_config,
+            &replication_security,
+        ))
+        .expect("existing group should be inserted");
         let mut mismatched_config = insert_config.clone();
         mismatched_config.group_key = test_group_key(2);
 
-        let result = block_on(ensure_configured_group(&store, &mismatched_config));
+        let result = block_on(ensure_configured_group(
+            &store,
+            &mismatched_config,
+            &replication_security,
+        ));
 
         assert!(matches!(
             result,

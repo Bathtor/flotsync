@@ -65,7 +65,7 @@ use std::{
     time::Duration,
 };
 
-const TEST_STORE_SECRET_KEY_ID: &str = "replication-test-store-secret";
+const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -587,13 +587,12 @@ pub async fn provision_test_security(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
-    let key_id = StoreSecretKeyId::new(TEST_STORE_SECRET_KEY_ID);
     let row_id = local_member.to_string();
     let context = StoreSecretContext {
         table: "local_member",
         column: "private_keys",
         row_id: row_id.as_bytes(),
-        key_id: key_id.as_str(),
+        key_id: TEST_STORE_SECRET_KEY_ID.as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
     let sealed = seal_store_secret_for_test(
@@ -609,7 +608,10 @@ pub async fn provision_test_security(
     let record = LocalMemberPrivateKeysRecord {
         member_id: local_member.clone(),
         private_keys: EncryptedLocalMemberPrivateKeys {
-            secret: EncryptedStoreSecret::from_store_secret_ciphertext(key_id, sealed),
+            secret: EncryptedStoreSecret::from_store_secret_ciphertext(
+                TEST_STORE_SECRET_KEY_ID,
+                sealed,
+            ),
         },
     };
     let mut transaction = store
@@ -699,7 +701,7 @@ pub(crate) async fn load_test_delivery_security(
         store,
         local_member,
         Arc::new(test_store_secret_key()),
-        StoreSecretKeyId::new(TEST_STORE_SECRET_KEY_ID),
+        TEST_STORE_SECRET_KEY_ID,
     )
     .await
     .boxed()
@@ -709,10 +711,7 @@ pub(crate) async fn load_test_delivery_security(
 /// Build the deterministic runtime security input used by test runtime support.
 #[must_use]
 pub fn test_replication_security_secrets() -> ReplicationSecuritySecrets {
-    ReplicationSecuritySecrets::new(
-        StoreSecretKeyId::new(TEST_STORE_SECRET_KEY_ID),
-        Arc::new(test_store_secret_key()),
-    )
+    ReplicationSecuritySecrets::new(TEST_STORE_SECRET_KEY_ID, Arc::new(test_store_secret_key()))
 }
 
 /// Build deterministic seed material for one test member identity.

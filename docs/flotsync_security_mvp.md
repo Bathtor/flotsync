@@ -39,16 +39,17 @@ leaking into low-level security code.
 `flotsync_security` accepts typed key material and protocol inputs. It does not
 parse TOML or Kompact configuration.
 
-For this MVP slice, the replicated-checklist example reads local setup inputs
-from its application config before replication starts: a temporary plaintext
-local database secret, a local private JWKS path, and trusted public JWKS paths.
+For this MVP slice, the replicated-checklist example reads setup inputs from
+its application config before replication starts: a local store-secret profile,
+a local private JWKS path, and trusted public JWKS paths.
 `ensure_configured_group` parses and validates those files, provisions the
 replication store, and then starts replication.
 
-The replicated-checklist store-secret key id is hardcoded by the example for
-now. The config supplies only the temporary plaintext password; the example
-hashes it with a domain separator to derive the local store-secret key. This is
-part of the temporary setup path pending the keyring-backed follow-up.
+The replicated-checklist store-secret profile is scoped to the example
+application id and selects a device-local store-secret slot. The current
+implementation stores that secret through OS-backed local storage and creates it
+on first run. The profile is intentionally not tied to member identity, so later
+multi-identity stores can share the same encrypted-store secret.
 
 Replication runtime reads provisioned security state from `ReplicationStore`
 with normal group metadata.
@@ -103,11 +104,10 @@ Each local store keeps sensitive group-security material in encrypted columns or
 an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
 material is encrypted at rest with a device-local application database secret.
 
-For this MVP slice, replicated-checklist reads that database secret and the
-shared static-group secret from plaintext application config during setup. It
-derives both concrete keys from those passwords with example-local
-domain-separated hashes. Long term, the device-local database secret should
-come from OS-backed secure storage through the `keyring` crate, and static
+For this MVP slice, replicated-checklist loads or creates that database secret
+through OS-backed secure storage via the `keyring` crate. The shared
+static-group secret still comes from plaintext application config during setup
+and is derived with an example-local domain-separated hash. Long term, static
 group secret provisioning should be replaced by the next setup shape.
 
 The stored group-security material includes the group symmetric key, cipher

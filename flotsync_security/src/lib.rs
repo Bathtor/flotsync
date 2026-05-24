@@ -31,6 +31,16 @@ pub use identity::{
     local_member_keys_from_jwks,
     public_member_keys_from_jwks,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use local_store_secret::install_local_store_secret_test_store;
+pub use local_store_secret::{
+    LoadedLocalStoreSecret,
+    LocalStoreSecretError,
+    LocalStoreSecretProfile,
+    LocalStoreSecretResult,
+    load_local_store_secret,
+    load_or_create_local_store_secret,
+};
 pub use reliable_payload::{
     ReliablePayloadContext,
     SealedHPKEPayload,
@@ -56,6 +66,8 @@ pub use store_secret::{
     StoreSecretContext,
     StoreSecretCryptoVersion,
     StoreSecretKey,
+    StoreSecretKeyId,
+    StoreSecretKeyIdParseError,
     open_store_secret,
     seal_store_secret,
 };
@@ -64,6 +76,7 @@ mod error;
 mod group;
 mod hpke;
 mod identity;
+mod local_store_secret;
 mod reliable_payload;
 mod sealed_psk_payload;
 mod signature;

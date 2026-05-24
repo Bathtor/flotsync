@@ -1,5 +1,6 @@
-use flotsync_replication::{GroupId, MemberIdentity, ReplicationSecuritySecrets, StoreSecretKeyId};
-use flotsync_security::{GroupKey, StoreSecretKey};
+use flotsync_core::member::Identifier;
+use flotsync_replication::{GroupId, LocalStoreSecretProfile, MemberIdentity};
+use flotsync_security::GroupKey;
 use kompact::config::{Config, parse_config_str};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -13,8 +14,8 @@ use uuid::Uuid;
 
 const LOCAL_MEMBER_KEY: &str = "flotsync.examples.replicated-checklist.local-member";
 const STORE_PATH_KEY: &str = "flotsync.examples.replicated-checklist.store-path";
-const STORE_SECRET_PASSWORD_KEY: &str =
-    "flotsync.examples.replicated-checklist.store-secret-password";
+const STORE_SECRET_PROFILE_KEY: &str =
+    "flotsync.examples.replicated-checklist.store-secret-profile";
 const GROUP_SECRET_PASSWORD_KEY: &str =
     "flotsync.examples.replicated-checklist.group-secret-password";
 const LOCAL_PRIVATE_JWKS_PATH_KEY: &str =
@@ -25,9 +26,6 @@ const GROUP_ID_KEY: &str = "flotsync.examples.replicated-checklist.group-id";
 const ORDERED_MEMBERS_KEY: &str = "flotsync.examples.replicated-checklist.ordered-members";
 const LOCAL_ENDPOINT_KEY: &str = "flotsync.replication.runtime.local-endpoint-bind-addr";
 
-const CHECKLIST_STORE_SECRET_KEY_ID: &str = "replicated-checklist-store-secret-v1";
-const STORE_SECRET_PASSWORD_DOMAIN: &[u8] =
-    b"flotsync/examples/replicated-checklist/store-secret-password/v1";
 const GROUP_SECRET_PASSWORD_DOMAIN: &[u8] =
     b"flotsync/examples/replicated-checklist/group-secret-password/v1";
 
@@ -36,14 +34,15 @@ pub struct ChecklistAppConfig {
     pub source_path: PathBuf,
     /// Raw source TOML forwarded to the runtime config loader.
     ///
-    /// Contract until `flotsync-sec.9`: this string may still contain the
-    /// temporary example store-secret password config, so treat this whole config
-    /// value as secret-bearing and do not log it in production paths.
+    /// Contract until the remaining static-group setup work lands: this string
+    /// may still contain the temporary example group-secret password config, so
+    /// treat this whole config value as secret-bearing and do not log it in
+    /// production paths.
     pub runtime_config_toml: String,
     pub local_member: MemberIdentity,
     pub store_path: PathBuf,
-    /// Device-local security input passed to the replication runtime loader.
-    pub replication_security: ReplicationSecuritySecrets,
+    /// Device-local profile used to load or create the replication store-secret key.
+    pub store_secret_profile: LocalStoreSecretProfile,
     /// Shared static-group secret derived from temporary plaintext config.
     pub group_key: Arc<GroupKey>,
     /// Local-private member JWKS used by temporary setup provisioning.
@@ -58,12 +57,10 @@ pub struct ChecklistAppConfig {
 impl ChecklistAppConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ChecklistConfigError> {
         let source_path = path.as_ref().to_path_buf();
-        let runtime_config_toml = std::fs::read_to_string(&source_path).map_err(|source| {
-            ChecklistConfigError::ReadFile {
+        let runtime_config_toml =
+            std::fs::read_to_string(&source_path).with_context(|_| ReadFileSnafu {
                 path: source_path.clone(),
-                source,
-            }
-        })?;
+            })?;
         let config = parse_config_str(&runtime_config_toml).map_err(|source| {
             ChecklistConfigError::ParseFile {
                 path: source_path.clone(),
@@ -79,7 +76,7 @@ impl ChecklistAppConfig {
             read_path_list(&config, TRUSTED_PUBLIC_JWKS_PATHS_KEY, &source_path)?;
         let group_id = read_group_id(&config)?;
         let ordered_members = read_ordered_members(&config)?;
-        let replication_security = read_replication_security(&config)?;
+        let store_secret_profile = read_store_secret_profile(&config)?;
         let group_key = read_group_key(&config, group_id, &ordered_members)?;
         let local_endpoint_bind_addr = read_socket_addr(&config, LOCAL_ENDPOINT_KEY)?;
 
@@ -98,7 +95,7 @@ impl ChecklistAppConfig {
             runtime_config_toml,
             local_member,
             store_path,
-            replication_security,
+            store_secret_profile,
             group_key: Arc::new(group_key),
             local_private_jwks_path,
             trusted_public_jwks_paths,
@@ -120,6 +117,11 @@ pub enum ChecklistConfigError {
     ParseFile { path: PathBuf, message: String },
     #[snafu(display("Checklist config key {key} is invalid: {message}"))]
     InvalidConfig { key: &'static str, message: String },
+}
+
+/// Application id used to scope replicated-checklist local store-secret profiles.
+pub fn checklist_application_id() -> Identifier {
+    Identifier::from_array(["flotsync", "examples", "replicated-checklist"])
 }
 
 fn read_member(config: &Config, key: &'static str) -> Result<MemberIdentity, ChecklistConfigError> {
@@ -202,36 +204,15 @@ fn read_group_id(config: &Config) -> Result<GroupId, ChecklistConfigError> {
     Ok(GroupId(Uuid::from_u128(value)))
 }
 
-/// Build replication loader security input from the checklist application config.
-fn read_replication_security(
+/// Read the local profile used to look up this device's store-secret key.
+fn read_store_secret_profile(
     config: &Config,
-) -> Result<ReplicationSecuritySecrets, ChecklistConfigError> {
-    let key_id = StoreSecretKeyId::new(CHECKLIST_STORE_SECRET_KEY_ID);
-    let key = derive_store_secret_key_from_password(config)?;
-    Ok(ReplicationSecuritySecrets::new(key_id, Arc::new(key)))
-}
-
-/// Derive the temporary example store-secret key from the configured password.
-///
-/// This is deliberately MVP-only. The replicated-checklist example keeps this
-/// logic at the application edge until the follow-up keyring setup replaces
-/// plaintext password config.
-fn derive_store_secret_key_from_password(
-    config: &Config,
-) -> Result<StoreSecretKey, ChecklistConfigError> {
-    let password = read_string(config, STORE_SECRET_PASSWORD_KEY)?;
-    ensure!(
-        !password.is_empty(),
-        InvalidConfigSnafu {
-            key: STORE_SECRET_PASSWORD_KEY,
-            message: "must not be empty".to_owned(),
-        }
-    );
-    let mut hasher = Sha256::new();
-    hasher.update(STORE_SECRET_PASSWORD_DOMAIN);
-    hasher.update(password.as_bytes());
-    let key_bytes = hasher.finalize().into();
-    Ok(StoreSecretKey::from_bytes(key_bytes))
+) -> Result<LocalStoreSecretProfile, ChecklistConfigError> {
+    let value = read_string(config, STORE_SECRET_PROFILE_KEY)?;
+    LocalStoreSecretProfile::new(value).map_err(|source| ChecklistConfigError::InvalidConfig {
+        key: STORE_SECRET_PROFILE_KEY,
+        message: source.to_string(),
+    })
 }
 
 /// Build the temporary static-group key from shared checklist config.
@@ -366,7 +347,7 @@ mod tests {
             [flotsync.examples.replicated-checklist]
             local-member = "alice"
             store-path = "alice.sqlite"
-            store-secret-password = "temporary-dev-password"
+            store-secret-profile = "config-parse-profile"
             group-secret-password = "temporary-group-password"
             local-private-jwks-path = "alice-private.jwks"
             trusted-public-jwks-paths = ["bob-public.jwks", "/tmp/carol-public.jwks"]
@@ -387,8 +368,8 @@ mod tests {
 
         let local_member = read_member(&config, LOCAL_MEMBER_KEY).expect("member should parse");
         let store_path = read_store_path(&config, &path).expect("store path should parse");
-        let replication_security =
-            read_replication_security(&config).expect("security should parse");
+        let store_secret_profile =
+            read_store_secret_profile(&config).expect("profile should parse");
         let local_private_jwks_path = read_path(&config, LOCAL_PRIVATE_JWKS_PATH_KEY, &path)
             .expect("local private key path should parse");
         let trusted_public_jwks_paths =
@@ -403,10 +384,7 @@ mod tests {
 
         assert_eq!(local_member, MemberIdentity::from_array(["alice"]));
         assert_eq!(store_path, temp_dir.join("alice.sqlite"));
-        assert_eq!(
-            replication_security.store_secret_key_id().as_str(),
-            CHECKLIST_STORE_SECRET_KEY_ID
-        );
+        assert_eq!(store_secret_profile.as_str(), "config-parse-profile");
         assert_eq!(local_private_jwks_path, temp_dir.join("alice-private.jwks"));
         assert_eq!(
             trusted_public_jwks_paths,
@@ -437,7 +415,7 @@ mod tests {
             [flotsync.examples.replicated-checklist]
             local-member = "carol"
             store-path = "alice.sqlite"
-            store-secret-password = "temporary-dev-password"
+            store-secret-profile = "local-dev"
             group-secret-password = "temporary-group-password"
             local-private-jwks-path = "carol-private.jwks"
             trusted-public-jwks-paths = ["alice-public.jwks", "bob-public.jwks"]
@@ -469,21 +447,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_store_secret_password() {
+    fn rejects_empty_store_secret_profile() {
         let config = parse_config_str(
             r#"
             [flotsync.examples.replicated-checklist]
-            store-secret-password = ""
+            store-secret-profile = ""
             "#,
         )
         .expect("config should parse");
 
-        let result = derive_store_secret_key_from_password(&config);
+        let result = read_store_secret_profile(&config);
 
         assert!(matches!(
             result,
             Err(ChecklistConfigError::InvalidConfig { key, .. })
-                if key == STORE_SECRET_PASSWORD_KEY
+                if key == STORE_SECRET_PROFILE_KEY
         ));
     }
 
