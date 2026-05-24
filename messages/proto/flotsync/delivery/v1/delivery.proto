@@ -39,12 +39,20 @@ message GroupEnvelopeHeader {
   bytes message_id = 3;
 }
 
+// Payload encrypted under an already established symmetric/pre-shared-key
+// context and authenticated with a detached frame signature. The ciphertext is
+// required by every PSK frame; signature-only control frames use
+// DetachedSignature instead.
+message SealedPSKPayload {
+  bytes ciphertext = 1;
+  bytes signature = 2;
+}
+
 // Group fan-out envelope with explicit separation between public routing data
-// and encrypted payload bytes.
+// and sealed payload bytes.
 message GroupEnvelopeWire {
   GroupEnvelopeHeader public_header = 1;
-  bytes encrypted_payload = 16;
-  SignatureWire footer = 17;
+  SealedPSKPayload sealed_payload = 16;
 }
 
 // Public reliable-envelope routing header.
@@ -54,12 +62,20 @@ message ReliableEnvelopeHeader {
   bytes message_id = 3;
 }
 
+// Payload encrypted to one recipient with HPKE and authenticated with a
+// detached frame signature. The encapsulated key lets the recipient derive the
+// content-encryption key for this message.
+message SealedHPKEPayload {
+  bytes encapsulated_key = 1;
+  bytes ciphertext = 2;
+  bytes signature = 3;
+}
+
 // Recipient-addressed envelope with explicit separation between public routing
-// data and encrypted payload bytes.
+// data and sealed payload bytes.
 message ReliableEnvelopeWire {
   ReliableEnvelopeHeader public_header = 1;
-  bytes encrypted_payload = 16;
-  SignatureWire footer = 17;
+  SealedHPKEPayload sealed_payload = 16;
 }
 
 // Public recipient-ack routing header.
@@ -72,7 +88,7 @@ message RecipientAckHeader {
 // Recipient-owned completion acknowledgement.
 message RecipientAckWire {
   RecipientAckHeader public_header = 1;
-  SignatureWire footer = 17;
+  DetachedSignature signature = 16;
 }
 
 // Public identity-proof header.
@@ -84,7 +100,7 @@ message IdentityProofHeader {
 // Recipient or relay proof of identity.
 message IdentityProofWire {
   IdentityProofHeader public_header = 1;
-  SignatureWire footer = 17;
+  DetachedSignature footer = 17;
 }
 
 // Public mailbox-fetch routing header.
@@ -180,8 +196,9 @@ enum KnownSignatureScheme {
   KNOWN_SIGNATURE_SCHEME_ED25519 = 1;
 }
 
-// Detached signature bytes plus scheme reference.
-message SignatureWire {
+// Signature-only authentication bytes plus scheme reference. Use this when a
+// frame authenticates its public header but carries no encrypted body.
+message DetachedSignature {
   KnownSignatureScheme scheme = 1;
   bytes signature_bytes = 2;
 }

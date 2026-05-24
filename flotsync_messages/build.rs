@@ -27,12 +27,12 @@ fn main() {
         .descriptor_set(&descriptor_set)
         // Keep this list narrow: only add protobuf bytes fields whose
         // handwritten Rust transport/domain representation already uses
-        // `bytes::Bytes`, so generated types avoid avoidable `Bytes <-> Vec`
+        // `bytes::Bytes`, so generated types avoid `Bytes <-> Vec`
         // churn without forcing wider API changes elsewhere.
         .use_bytes_type_in(&[
-            ".flotsync.delivery.v1.GroupEnvelopeWire.encrypted_payload",
-            ".flotsync.delivery.v1.ReliableEnvelopeWire.encrypted_payload",
-            ".flotsync.delivery.v1.SignatureWire.signature_bytes",
+            ".flotsync.delivery.v1.SealedPSKPayload.ciphertext",
+            ".flotsync.delivery.v1.SealedHPKEPayload.ciphertext",
+            ".flotsync.delivery.v1.DetachedSignature.signature_bytes",
         ])
         .include_file("flotsync_messages.rs")
         .generate_json(false)

@@ -32,7 +32,7 @@ const SUPPORTED_STATIC_ROUTE_PROTOCOLS: &[StaticPeerRouteProtocol] =
 
 #[derive(Debug)]
 pub(super) enum PreconfiguredPeerRoutesMessage {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Publish(DiscoveryRouteUpdate<TransportRouteKey>),
     #[cfg(test)]
     PublishPreconfiguredRoutes,
@@ -198,7 +198,7 @@ impl Actor for PreconfiguredPeerRoutesComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             PreconfiguredPeerRoutesMessage::Publish(update) => {
                 self.discovery.trigger(update);
                 Handled::OK
@@ -228,7 +228,8 @@ impl PreconfiguredPeerRoutesConfig {
         };
 
         for (index, route_entry_lookup) in route_entries {
-            routes.push(parse_peer_route(route_entry_lookup, index)?);
+            let route = parse_peer_route(route_entry_lookup, index)?;
+            routes.push(route);
         }
 
         Ok(Self { routes })

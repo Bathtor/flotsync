@@ -17,7 +17,7 @@
 
 use super::{
     ingress::DeliveryTargetHint,
-    shared::{DetachedSignature, MessageId, SignatureScheme, SignedEnvelopeFooter},
+    shared::{DetachedSignature, MessageId, SignatureScheme},
 };
 use crate::{
     GroupMemberships,
@@ -75,20 +75,38 @@ pub(crate) fn message_id_from_wire(
     Ok(MessageId(uuid_from_wire(raw, field)?))
 }
 
-pub(crate) fn signature_to_wire_format(footer: &SignedEnvelopeFooter) -> proto::SignatureWire {
-    proto::SignatureWire {
-        scheme: flotsync_messages::buffa::EnumValue::from(match footer.signature.scheme {
+/// Validate and copy a protobuf byte field into a fixed-width protocol array.
+pub(crate) fn fixed_bytes_field<const N: usize>(
+    field: &'static str,
+    bytes: &[u8],
+) -> Result<[u8; N], WireValueDecodeError> {
+    bytes
+        .try_into()
+        .map_err(|_| WireValueDecodeError::InvalidByteLength {
+            field,
+            expected: N,
+            actual: bytes.len(),
+        })
+}
+
+/// Encode a signature-only control-frame authenticator.
+pub(crate) fn detached_signature_to_wire_format(
+    signature: &DetachedSignature,
+) -> proto::DetachedSignature {
+    proto::DetachedSignature {
+        scheme: flotsync_messages::buffa::EnumValue::from(match signature.scheme {
             SignatureScheme::Ed25519 => proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
         }),
-        signature_bytes: footer.signature.bytes.clone(),
-        ..proto::SignatureWire::default()
+        signature_bytes: signature.bytes.clone(),
+        ..proto::DetachedSignature::default()
     }
 }
 
-pub(crate) fn signature_from_wire(
-    wire: proto::SignatureWire,
+/// Decode a signature-only control-frame authenticator.
+pub(crate) fn detached_signature_from_wire(
+    wire: proto::DetachedSignature,
     field: &'static str,
-) -> Result<SignedEnvelopeFooter, WireValueDecodeError> {
+) -> Result<DetachedSignature, WireValueDecodeError> {
     let scheme =
         wire.scheme
             .as_known()
@@ -102,11 +120,9 @@ pub(crate) fn signature_from_wire(
             return UnspecifiedSignatureSchemeSnafu { field }.fail();
         }
     };
-    Ok(SignedEnvelopeFooter {
-        signature: DetachedSignature {
-            scheme,
-            bytes: wire.signature_bytes,
-        },
+    Ok(DetachedSignature {
+        scheme,
+        bytes: wire.signature_bytes,
     })
 }
 
@@ -632,6 +648,13 @@ pub(crate) enum WireValueDecodeError {
 
     #[snafu(display("Field '{field}' used the unspecified signature scheme"))]
     UnspecifiedSignatureScheme { field: &'static str },
+
+    #[snafu(display("Field '{field}' had invalid byte length {actual}; expected {expected}."))]
+    InvalidByteLength {
+        field: &'static str,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 fn uuid_from_wire(raw: &[u8], field: &'static str) -> Result<Uuid, WireValueDecodeError> {
@@ -741,7 +764,11 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: Bytes::from(vec![0x5a; 32 * 1024]),
+            sealed_payload: MessageField::some(proto::SealedPSKPayload {
+                ciphertext: Bytes::from(vec![0x5a; 32 * 1024]),
+                signature: vec![0; 64],
+                ..proto::SealedPSKPayload::default()
+            }),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {
@@ -786,7 +813,11 @@ mod tests {
         };
         let envelope = proto::GroupEnvelopeWire {
             public_header: MessageField::some(header),
-            encrypted_payload: Bytes::from_static(b"ciphertext"),
+            sealed_payload: MessageField::some(proto::SealedPSKPayload {
+                ciphertext: Bytes::from_static(b"ciphertext"),
+                signature: vec![0; 64],
+                ..proto::SealedPSKPayload::default()
+            }),
             ..proto::GroupEnvelopeWire::default()
         };
         let frame = proto::GroupBroadcastFrame {

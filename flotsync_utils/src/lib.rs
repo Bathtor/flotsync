@@ -318,6 +318,20 @@ impl IString {
     pub fn new(s: String) -> Self {
         Self(s.into_boxed_str())
     }
+
+    /// Returns the length of `self`.
+    ///
+    /// The length is in bytes, like `String`.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns whether `self` contains no bytes.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl From<String> for IString {

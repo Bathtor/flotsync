@@ -10,6 +10,7 @@ flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_replication = { path = "../flotsync_replication" }
+flotsync_security = { path = "../flotsync_security" }
 chrono = { workspace = true }
 futures-util = { workspace = true }
 http = "1"
@@ -22,8 +23,12 @@ slog = "2"
 slog-scope = "4"
 slog-stdlog = "4"
 slog-term = "2"
+sha2 = "0.10"
 snafu = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+flotsync_replication = { path = "../flotsync_replication", features = ["test-support"] }
 
 [[bin]]
 name = "netcat"

@@ -13,14 +13,8 @@ use super::{
         SendRouteCandidate,
         TransportRouteKey,
     },
-    shared::{
-        DeliveryClass,
-        EncryptedPayload,
-        MessageId,
-        RouteSendId,
-        SignedEnvelopeFooter,
-        placeholder_signed_footer,
-    },
+    security::{DeliverySecurity, DeliverySecurityError},
+    shared::{DeliveryClass, MessageId, PlaintextPayload, RouteSendId},
 };
 use crate::{
     GroupMembers,
@@ -30,13 +24,14 @@ use crate::{
 use bytes::Bytes;
 use flotsync_core::member::TrieMap;
 use flotsync_messages::delivery as delivery_proto;
-use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _, option_when};
+use flotsync_security::SealedPSKPayload;
+use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::prelude::*;
 use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
 mod wire;
-use wire::{group_envelope_from_wire, group_envelope_to_wire_format};
+use wire::{group_envelope_from_wire, group_envelope_to_wire_format, group_public_header_bytes};
 
 /// Plaintext group-scoped envelope header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,13 +46,12 @@ pub struct GroupMessageHeader {
 /// The delivery class is intentionally not part of the transmitted envelope. It
 /// is a local scheduling policy on the submit request, not payload content.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GroupMessageEnvelope {
+pub struct GroupMessageEnvelope<P> {
     pub header: GroupMessageHeader,
-    pub payload: EncryptedPayload,
-    pub footer: SignedEnvelopeFooter,
+    pub payload: P,
 }
 
-impl GroupMessageEnvelope {
+impl GroupMessageEnvelope<SealedPSKPayload> {
     fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
         group_envelope_to_wire_format(self)
     }
@@ -70,7 +64,7 @@ impl GroupMessageEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupBroadcastSubmit {
     pub delivery_class: DeliveryClass,
-    pub envelope: GroupMessageEnvelope,
+    pub envelope: GroupMessageEnvelope<PlaintextPayload>,
     /// Skip the immediate local echo that would otherwise be emitted when the
     /// submitter is a member of the target group.
     pub suppress_self_delivery: bool,
@@ -115,12 +109,12 @@ impl GroupBroadcastSubmitBuilder {
 }
 
 impl GroupBroadcastSubmitMemberBuilder {
-    /// Finish the submit with already-encrypted payload bytes.
+    /// Finish the submit with plaintext runtime payload bytes.
     ///
-    /// Group broadcast owns the generated envelope identity, current placeholder
-    /// footer, and default self-delivery suppression policy.
+    /// Group broadcast owns the generated envelope identity, delivery-boundary
+    /// sealing, and default self-delivery suppression policy.
     #[must_use]
-    pub fn with_payload(self, ciphertext: Bytes) -> GroupBroadcastPortRequest {
+    pub fn with_payload(self, bytes: Bytes) -> GroupBroadcastPortRequest {
         GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
             delivery_class: self.delivery_class,
             envelope: GroupMessageEnvelope {
@@ -129,8 +123,7 @@ impl GroupBroadcastSubmitMemberBuilder {
                     sender: self.sender,
                     message_id: MessageId(Uuid::new_v4()),
                 },
-                payload: EncryptedPayload { ciphertext },
-                footer: placeholder_signed_footer(),
+                payload: PlaintextPayload { bytes },
             },
             suppress_self_delivery: true,
         })
@@ -140,7 +133,7 @@ impl GroupBroadcastSubmitMemberBuilder {
 /// Inbound group message delivered by the network-facing broadcast service.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupBroadcastDeliver {
-    pub envelope: GroupMessageEnvelope,
+    pub envelope: GroupMessageEnvelope<PlaintextPayload>,
 }
 
 /// Inbound group-broadcast payload handed to the semantic owner from delivery
@@ -181,6 +174,8 @@ pub struct GroupBroadcastComponent {
     group_memberships: SharedGroupMemberships,
     /// Route-transport actor used for one-shot direct fan-out submissions.
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+    /// Security state used to seal outbound payloads and open inbound payloads.
+    security: DeliverySecurity,
     /// Best currently known direct route per remote peer.
     direct_peer_routes: TrieMap<SendRouteCandidate<TransportRouteKey>>,
     /// Deduplication set for submits already accepted into this component.
@@ -191,9 +186,10 @@ impl GroupBroadcastComponent {
     /// Create one new group-broadcast component around the shared
     /// group-membership view and route-transport actor.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         group_memberships: SharedGroupMemberships,
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+        security: DeliverySecurity,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
@@ -202,6 +198,7 @@ impl GroupBroadcastComponent {
             discovery_port: RequiredPort::uninitialised(),
             group_memberships,
             route_transport,
+            security,
             direct_peer_routes: TrieMap::new(),
             accepted_submits: HashSet::new(),
         }
@@ -236,12 +233,16 @@ impl GroupBroadcastComponent {
             return Handled::OK;
         }
 
-        let payload = option_when!(!recipients.is_empty(), {
-            let payload: Arc<dyn FlotsyncSerializable> = Arc::new(envelope.to_wire_format());
-            payload
-        });
-
         self.accepted_submits.insert(message_id);
+        if recipients.is_empty() {
+            if should_self_deliver {
+                self.delivery_port
+                    .trigger(GroupBroadcastPortIndication::Deliver(
+                        GroupBroadcastDeliver { envelope },
+                    ));
+            }
+            return Handled::OK;
+        }
 
         if should_self_deliver {
             self.delivery_port
@@ -252,12 +253,34 @@ impl GroupBroadcastComponent {
                 ));
         }
 
-        if let Some(payload) = payload {
+        Handled::block_on(self, async move |mut async_self| {
+            let sealed = async_self
+                .seal_outbound_envelope(envelope)
+                .await
+                .benign_err()?;
+            let payload: Arc<dyn FlotsyncSerializable> = Arc::new(sealed.to_wire_format());
             for (recipient, route) in recipients {
-                self.dispatch_direct_send(message_id, recipient, route, Arc::clone(&payload));
+                async_self.dispatch_direct_send(message_id, recipient, route, Arc::clone(&payload));
             }
-        }
-        Handled::OK
+            Handled::OK
+        })
+    }
+
+    /// Seal one accepted plaintext envelope for delivery across the transport boundary.
+    async fn seal_outbound_envelope(
+        &mut self,
+        envelope: GroupMessageEnvelope<PlaintextPayload>,
+    ) -> Result<GroupMessageEnvelope<SealedPSKPayload>, DeliverySecurityError> {
+        let GroupMessageEnvelope { header, payload } = envelope;
+        let public_header = group_public_header_bytes(&header);
+        let sealed = self
+            .security
+            .seal_group_payload(&header, public_header.as_ref(), payload.bytes.as_ref())
+            .await?;
+        Ok(GroupMessageEnvelope {
+            header,
+            payload: sealed,
+        })
     }
 
     /// Collect one currently reachable direct recipient route per remote group
@@ -301,14 +324,14 @@ impl GroupBroadcastComponent {
     ) {
         // Route-transport owns the actual IO lifecycle; broadcast only needs a
         // one-shot submission and observability for this direct-only slice.
-        let route_transport = self.route_transport.clone();
         self.spawn_local(move |async_self| async move {
             let send = RouteTransportSend {
                 send_id: RouteSendId(Uuid::new_v4()),
                 route,
                 payload,
             };
-            let future = route_transport
+            let future = async_self
+                .route_transport
                 .ask_with(|promise| RouteTransportActorMessage::Submit(Ask::new(promise, send)));
             match future.await {
                 Ok(RouteTransportSubmitResult::Sent { .. }) => {
@@ -395,10 +418,18 @@ impl GroupBroadcastComponent {
     ) -> HandlerResult {
         match group_envelope_from_wire(envelope) {
             Ok(envelope) => {
-                self.delivery_port
-                    .trigger(GroupBroadcastPortIndication::Deliver(
-                        GroupBroadcastDeliver { envelope },
-                    ));
+                self.spawn_local(async move |mut async_self| {
+                    let envelope = async_self
+                        .open_inbound_envelope(envelope)
+                        .await
+                        .benign_err()?;
+                    async_self
+                        .delivery_port
+                        .trigger(GroupBroadcastPortIndication::Deliver(
+                            GroupBroadcastDeliver { envelope },
+                        ));
+                    Handled::OK
+                });
                 Handled::OK
             }
             Err(error) => Err(error)
@@ -406,12 +437,29 @@ impl GroupBroadcastComponent {
         }
     }
 
+    /// Open one inbound sealed envelope before handing plaintext to semantic owners.
+    async fn open_inbound_envelope(
+        &mut self,
+        envelope: GroupMessageEnvelope<SealedPSKPayload>,
+    ) -> Result<GroupMessageEnvelope<PlaintextPayload>, DeliverySecurityError> {
+        let GroupMessageEnvelope { header, payload } = envelope;
+        let public_header = group_public_header_bytes(&header);
+        let plaintext = self
+            .security
+            .open_group_payload(&header, public_header.as_ref(), &payload)
+            .await?;
+        Ok(GroupMessageEnvelope {
+            header,
+            payload: PlaintextPayload { bytes: plaintext },
+        })
+    }
+
     #[cfg(test)]
     fn knows_submit(&self, message_id: MessageId) -> bool {
         self.accepted_submits.contains(&message_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_direct_route(&self, peer: &MemberIdentity) -> bool {
         self.direct_peer_routes.get(peer).is_some()
     }
@@ -470,10 +518,13 @@ mod tests {
     use super::*;
     use crate::{
         GroupMemberships,
+        SqliteReplicationStore,
+        api::{MemberIndex, ReplicationGroupRecord, ReplicationStore},
         delivery::{
-            ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
+            ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
             route_transport::{
                 DatagramRouteScope,
+                InboundTransportMeta,
                 RoutePreferenceRank,
                 RouteTransportPort,
                 UdpRouteKey,
@@ -481,20 +532,25 @@ mod tests {
             test_support::{
                 DiscoveryRouteSource,
                 FULL_STACK_WAIT_TIMEOUT,
+                PortMockComponent,
                 TransportHarnessCore,
                 build_delivery_test_system,
                 default_udpour_config,
                 member_identity,
             },
+            wire::{group_id_from_wire, message_id_from_wire},
         },
+        test_support::{load_test_delivery_security, provision_test_security, test_group_key},
     };
     use bytes::Bytes;
+    use flotsync_core::versions::VersionVector;
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
     };
     use std::{
         net::SocketAddr,
+        num::NonZeroUsize,
         sync::{Arc, mpsc},
         time::Duration,
     };
@@ -538,6 +594,7 @@ mod tests {
     struct FullStackHarness {
         core: TransportHarnessCore,
         ingress: Arc<Component<DeliveryIngressComponent>>,
+        inbound_source: Arc<Component<PortMockComponent<TransportGroupBroadcastInboundPort>>>,
         broadcast: Arc<Component<GroupBroadcastComponent>>,
         discovery_source: Arc<Component<DiscoveryRouteSource>>,
         client: Arc<Component<GroupBroadcastClientProbe>>,
@@ -560,6 +617,7 @@ mod tests {
                 &[],
                 manager_owned_udp_sockets,
             );
+            let security = test_group_security(&local_member, &group_memberships);
             let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
             let manager_ref = core.manager_ref();
             let ingress_group_memberships = shared_group_memberships.clone();
@@ -570,8 +628,9 @@ mod tests {
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
+            let inbound_source = core.system().create(PortMockComponent::new);
             let broadcast = core.system().create(move || {
-                GroupBroadcastComponent::new(shared_group_memberships, manager_ref)
+                GroupBroadcastComponent::new(shared_group_memberships, manager_ref, security)
             });
             let discovery_source = core.system().create(DiscoveryRouteSource::new);
             let (client_tx, client_rx) = mpsc::channel();
@@ -586,6 +645,11 @@ mod tests {
             .expect("route transport manager must connect to delivery ingress");
             biconnect_components::<TransportGroupBroadcastInboundPort, _, _>(&ingress, &broadcast)
                 .expect("delivery ingress must connect to group broadcast");
+            biconnect_components::<TransportGroupBroadcastInboundPort, _, _>(
+                &inbound_source,
+                &broadcast,
+            )
+            .expect("inbound test source must connect to group broadcast");
             biconnect_components::<TransportRouteDiscoveryPort, _, _>(
                 &discovery_source,
                 &broadcast,
@@ -596,6 +660,7 @@ mod tests {
 
             core.start();
             start_component(core.system(), &ingress);
+            start_component(core.system(), &inbound_source);
             start_component(core.system(), &broadcast);
             start_component(core.system(), &discovery_source);
             start_component(core.system(), &client);
@@ -618,6 +683,7 @@ mod tests {
             Self {
                 core,
                 ingress,
+                inbound_source,
                 broadcast,
                 discovery_source,
                 client,
@@ -694,6 +760,40 @@ mod tests {
                 "timed out waiting for group-broadcast submit admission",
             );
         }
+
+        /// Inject one group envelope through the inbound port with matching delivery metadata.
+        fn inject_inbound_envelope(&self, envelope: delivery_proto::GroupEnvelopeWire) {
+            let group_id = group_id_from_wire(
+                &envelope.public_header.group_id,
+                "GroupEnvelopeHeader.group_id",
+            )
+            .expect("test group header should contain a valid group id");
+            let message_id = message_id_from_wire(
+                &envelope.public_header.message_id,
+                "GroupEnvelopeHeader.message_id",
+            )
+            .expect("test group header should contain a valid message id");
+            let frame = delivery_proto::GroupBroadcastFrame {
+                body: Some(delivery_proto::group_broadcast_frame::Body::Envelope(
+                    Box::new(envelope),
+                )),
+                ..delivery_proto::GroupBroadcastFrame::default()
+            };
+            self.inbound_source.on_definition(|component| {
+                component.trigger(GroupBroadcastInboundDeliver {
+                    meta: InboundDeliveryMeta {
+                        transport: test_inbound_transport_meta(),
+                        target: DeliveryTargetHint::GroupBroadcast {
+                            group_id,
+                            delivery_message_id: message_id,
+                        },
+                        delivery_message_id: Some(message_id),
+                        verified_sender: None,
+                    },
+                    frame,
+                });
+            });
+        }
     }
 
     impl Drop for FullStackHarness {
@@ -702,6 +802,11 @@ mod tests {
                 .core
                 .system()
                 .kill_notify(self.client.clone())
+                .wait_timeout(WAIT_TIMEOUT);
+            let _ = self
+                .core
+                .system()
+                .kill_notify(self.inbound_source.clone())
                 .wait_timeout(WAIT_TIMEOUT);
             let _ = self
                 .core
@@ -856,6 +961,70 @@ mod tests {
         receiver_charlie.expect_no_delivery(Duration::from_millis(500));
     }
 
+    #[test]
+    fn inbound_sealed_group_wire_opens_to_plaintext_delivery() {
+        let group_id = GroupId(Uuid::from_u128(31));
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let receiver_bob = FullStackHarness::new(bob, memberships, false);
+        let message_id = MessageId(Uuid::from_u128(32));
+        let wire = sealed_inbound_wire(
+            &alice_security,
+            group_id,
+            alice.clone(),
+            message_id,
+            b"group payload",
+        );
+
+        receiver_bob.inject_inbound_envelope(wire);
+
+        let deliver = receiver_bob.wait_for_delivery();
+        assert_eq!(
+            deliver.envelope,
+            GroupMessageEnvelope {
+                header: GroupMessageHeader {
+                    group_id,
+                    sender: alice,
+                    message_id,
+                },
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(b"group payload"),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn inbound_tampered_group_wire_is_dropped_before_delivery() {
+        let group_id = GroupId(Uuid::from_u128(41));
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let receiver_bob = FullStackHarness::new(bob, memberships, false);
+
+        for tamper in [
+            InboundWireTamper::Signature,
+            InboundWireTamper::Ciphertext,
+            InboundWireTamper::PublicHeader,
+        ] {
+            let message_id = MessageId(Uuid::from_u128(42 + tamper.offset()));
+            let mut wire = sealed_inbound_wire(
+                &alice_security,
+                group_id,
+                alice.clone(),
+                message_id,
+                b"group payload",
+            );
+            tamper.apply(&mut wire);
+
+            receiver_bob.inject_inbound_envelope(wire);
+            receiver_bob.expect_no_delivery(Duration::from_millis(500));
+        }
+    }
+
     fn group_memberships(
         group_id: GroupId,
         members: impl IntoIterator<Item = MemberIdentity>,
@@ -865,11 +1034,93 @@ mod tests {
         GroupMemberships::from_groups([(group_id, group_members)])
     }
 
+    fn test_group_security(
+        local_member: &MemberIdentity,
+        group_memberships: &GroupMemberships,
+    ) -> DeliverySecurity {
+        let store = Arc::new(
+            SqliteReplicationStore::in_memory(local_member.clone())
+                .expect("security store should build"),
+        );
+        let trusted_members = trusted_members_for(local_member, group_memberships);
+        block_on(provision_test_security(
+            local_member.clone(),
+            store.as_ref(),
+            local_member,
+            trusted_members,
+        ))
+        .expect("test security should provision");
+        let security_store: Arc<dyn ReplicationStore> = store.clone();
+        let security = block_on(load_test_delivery_security(
+            local_member.clone(),
+            security_store,
+            local_member,
+        ))
+        .expect("test security should load");
+        persist_group_security(store.as_ref(), local_member, group_memberships, &security);
+        security
+    }
+
+    fn trusted_members_for(
+        local_member: &MemberIdentity,
+        group_memberships: &GroupMemberships,
+    ) -> HashSet<MemberIdentity> {
+        let mut trusted_members = HashSet::new();
+        for group_id in group_memberships.group_ids() {
+            let members = group_memberships
+                .members(group_id)
+                .expect("group id came from the same membership snapshot");
+            for member in members.iter() {
+                if &member != local_member {
+                    trusted_members.insert(member);
+                }
+            }
+        }
+        trusted_members
+    }
+
+    fn persist_group_security(
+        store: &dyn ReplicationStore,
+        local_member: &MemberIdentity,
+        group_memberships: &GroupMemberships,
+        security: &DeliverySecurity,
+    ) {
+        let mut transaction =
+            block_on(store.begin_transaction()).expect("security transaction should start");
+        for group_id in group_memberships.group_ids() {
+            let members = group_memberships
+                .members(group_id)
+                .expect("group id came from the same membership snapshot");
+            let ordered_members = members.ordered_members();
+            let local_member_index = ordered_members
+                .iter()
+                .position(|member| member == local_member)
+                .expect("test local member should belong to every hosted group");
+            let security_material = security
+                .seal_group_secret(group_id.0, &test_group_key(*group_id))
+                .expect("test group secret should seal");
+            let group = ReplicationGroupRecord {
+                group_id: *group_id,
+                members: ordered_members,
+                local_member_index: MemberIndex::new(
+                    u32::try_from(local_member_index).expect("test group index should fit u32"),
+                ),
+                version_vector: VersionVector::initial(
+                    NonZeroUsize::new(members.len()).expect("test group must have members"),
+                ),
+                security_material,
+            };
+            block_on(transaction.insert_replication_group(group))
+                .expect("test group security should persist");
+        }
+        block_on(transaction.commit()).expect("security transaction should commit");
+    }
+
     fn submit(
         group_id: GroupId,
         sender: MemberIdentity,
         message_id: MessageId,
-        ciphertext: Bytes,
+        bytes: Bytes,
         suppress_self_delivery: bool,
     ) -> GroupBroadcastSubmit {
         GroupBroadcastSubmit {
@@ -880,10 +1131,104 @@ mod tests {
                     sender,
                     message_id,
                 },
-                payload: EncryptedPayload { ciphertext },
-                footer: placeholder_signed_footer(),
+                payload: PlaintextPayload { bytes },
             },
             suppress_self_delivery,
+        }
+    }
+
+    /// Build one signed and sealed inbound wire envelope using sender-side security.
+    fn sealed_inbound_wire(
+        sender_security: &DeliverySecurity,
+        group_id: GroupId,
+        sender: MemberIdentity,
+        message_id: MessageId,
+        bytes: &[u8],
+    ) -> delivery_proto::GroupEnvelopeWire {
+        let header = GroupMessageHeader {
+            group_id,
+            sender,
+            message_id,
+        };
+        let public_header = group_public_header_bytes(&header);
+        let sealed =
+            block_on(sender_security.seal_group_payload(&header, public_header.as_ref(), bytes))
+                .expect("test inbound group payload should seal");
+        let envelope = GroupMessageEnvelope {
+            header,
+            payload: sealed,
+        };
+        let boundary = envelope.to_wire_format();
+        let Some(delivery_proto::delivery_boundary_frame::Boundary::GroupBroadcast(frame)) =
+            boundary.boundary
+        else {
+            panic!("sealed test envelope should encode as group broadcast boundary");
+        };
+        let Some(delivery_proto::group_broadcast_frame::Body::Envelope(envelope)) = frame.body
+        else {
+            panic!("sealed test envelope should encode as group envelope");
+        };
+        *envelope
+    }
+
+    /// Build deterministic transport metadata for direct inbound-port tests.
+    fn test_inbound_transport_meta() -> InboundTransportMeta<TransportRouteKey> {
+        let remote_addr: SocketAddr = "127.0.0.1:39000"
+            .parse()
+            .expect("test remote address should parse");
+        InboundTransportMeta {
+            route: TransportRouteKey::Udp(UdpRouteKey {
+                remote_addr,
+                scope: DatagramRouteScope::Unicast,
+                local_bind: None,
+            }),
+            remote_addr: Some(remote_addr),
+        }
+    }
+
+    /// Post-seal mutation proving inbound verification happens before delivery.
+    #[derive(Clone, Copy, Debug)]
+    enum InboundWireTamper {
+        Signature,
+        Ciphertext,
+        PublicHeader,
+    }
+
+    impl InboundWireTamper {
+        fn offset(self) -> u128 {
+            match self {
+                Self::Signature => 1,
+                Self::Ciphertext => 2,
+                Self::PublicHeader => 3,
+            }
+        }
+
+        fn apply(self, envelope: &mut delivery_proto::GroupEnvelopeWire) {
+            match self {
+                Self::Signature => {
+                    let sealed_payload = envelope
+                        .sealed_payload
+                        .as_option_mut()
+                        .expect("test sealed payload should be present");
+                    sealed_payload.signature[0] ^= 0x01;
+                }
+                Self::Ciphertext => {
+                    let sealed_payload = envelope
+                        .sealed_payload
+                        .as_option_mut()
+                        .expect("test sealed payload should be present");
+                    let mut ciphertext = sealed_payload.ciphertext.to_vec();
+                    ciphertext[0] ^= 0x01;
+                    sealed_payload.ciphertext = Bytes::from(ciphertext);
+                }
+                Self::PublicHeader => {
+                    let public_header = envelope
+                        .public_header
+                        .as_option_mut()
+                        .expect("test public header should be present");
+                    public_header.message_id = Uuid::from_u128(999).as_bytes().to_vec();
+                }
+            }
         }
     }
 }

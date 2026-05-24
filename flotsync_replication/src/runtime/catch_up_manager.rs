@@ -527,13 +527,13 @@ impl CatchUpManagerComponent {
     }
 
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
-        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.ciphertext)
+        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
             .with_whatever_benign(|_| {
-            format!(
-                "dropping inbound catch-up candidate from {} after decode error",
-                deliver.envelope.header.sender
-            )
-        })?;
+                format!(
+                    "dropping inbound catch-up candidate from {} after decode error",
+                    deliver.envelope.header.sender
+                )
+            })?;
         match message {
             WireRuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)
@@ -820,7 +820,13 @@ mod tests {
     use super::*;
     use crate::{
         SqliteReplicationStore,
-        api::{DatasetId, DatasetUpdateRecord, ReplicationGroupRecord, ReplicationUpdateRecord},
+        api::{
+            DatasetId,
+            DatasetUpdateRecord,
+            ReplicationGroupRecord,
+            ReplicationUpdateRecord,
+            current_slice_placeholder_group_security_material,
+        },
     };
     use flotsync_core::{member::Identifier, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
@@ -866,6 +872,7 @@ mod tests {
             members: vec![local_member(), remote_member()],
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
 

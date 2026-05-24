@@ -94,6 +94,60 @@ impl Actor for DiscoveryRouteSource {
     }
 }
 
+/// Test-only component that owns one provided indication port.
+///
+/// Kompact exposes `trigger` on the port itself, not as a system-level helper.
+/// Owning the port in a component lets tests inject indications through the
+/// same connected-port dispatch path that production sources use.
+#[derive(ComponentDefinition)]
+pub(crate) struct PortMockComponent<P>
+where
+    P: Port<Request = Never> + 'static,
+{
+    ctx: ComponentContext<Self>,
+    port: ProvidedPort<P>,
+}
+
+impl<P> PortMockComponent<P>
+where
+    P: Port<Request = Never> + 'static,
+{
+    /// Create one disconnected port mock for the specified port type.
+    pub(crate) fn new() -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            port: ProvidedPort::uninitialised(),
+        }
+    }
+
+    /// Trigger one indication through the connected provided port.
+    pub(crate) fn trigger(&mut self, indication: P::Indication) {
+        self.port.trigger(indication);
+    }
+}
+
+impl<P> ComponentLifecycle for PortMockComponent<P> where P: Port<Request = Never> + 'static {}
+
+impl<P> Provide<P> for PortMockComponent<P>
+where
+    P: Port<Request = Never> + 'static,
+{
+    fn handle(&mut self, _request: Never) -> HandlerResult {
+        unreachable!("port mock only supports indication injection")
+    }
+}
+
+impl<P> Actor for PortMockComponent<P>
+where
+    P: Port<Request = Never> + 'static,
+{
+    type Message = Never;
+
+    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
+        unreachable!("Never type is empty")
+    }
+}
+
 /// Shared transport-only harness core for delivery-domain tests.
 ///
 /// This owns the driver, bridge, manager, and observer stack. Semantic-owner

@@ -5,6 +5,7 @@ members = [
     "flotsync_discovery",
     "flotsync_discovery_cli",
     "flotsync_data_types",
+    "flotsync_security",
     "flotsync_udpour",
     "flotsync_utils",
     "flotsync_replication",
@@ -16,6 +17,7 @@ resolver = "3"
 [workspace.dependencies]
 arc-swap = "1"
 async-std = "1"
+base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 futures-util = "0.3"

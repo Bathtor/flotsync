@@ -11,16 +11,29 @@ The steps use the names `alice` and `bob`. If your local config uses different m
 Build or run the checklist binary from the repository root:
 
 ```bash
-cargo run -p flotsync_io_examples --bin replicated_checklist -- alice.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- bob.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  generate-keys alice ./alice-keys
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  generate-keys bob ./bob-keys
+cargo run -p flotsync_io_examples --bin replicated_checklist -- run alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
 ```
 
 For a release binary:
 
 ```bash
-target/release/replicated_checklist alice.toml
-target/release/replicated_checklist bob.toml
+target/release/replicated_checklist generate-keys alice ./alice-keys
+target/release/replicated_checklist generate-keys bob ./bob-keys
+target/release/replicated_checklist run alice.toml
+target/release/replicated_checklist run bob.toml
 ```
+
+The generated `public.jwks` files must be copied or otherwise made available to
+the opposite peer before first run. Each config needs `store-secret-profile`,
+the temporary `group-secret-password`, `local-private-jwks-path`, and
+`trusted-public-jwks-paths` values. The profile selects a device-local
+store-secret slot; the group password and this application-side provisioning
+step are temporary for the current security MVP.
 
 Use one terminal per peer. In each REPL, run:
 

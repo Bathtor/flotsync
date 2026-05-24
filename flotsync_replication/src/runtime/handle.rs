@@ -1,23 +1,36 @@
-use super::{ReplicationRuntimeMessage, host::DeliveryRuntimeHost};
-use crate::api::{
-    ApiError,
-    ApiResult,
-    ChangeGroupMembershipRequest,
-    CreateGroupRequest,
-    GroupId,
-    GroupMigration,
-    LoadError,
-    PublishChangesRequest,
-    PublishReceipt,
-    ReplicationApi,
-    ReplicationConfig,
-    ReplicationEventListener,
-    ReplicationStore,
-    RuntimeSnafu,
-    SnapshotRows,
-    SnapshotRowsRequest,
-    Summary,
-    SummaryRequest,
+use super::{
+    ReplicationRuntimeMessage,
+    host::DeliveryRuntimeHost,
+    store_security_validation::{
+        load_security_error_from_local_member,
+        load_security_error_from_runtime,
+        security_load_error,
+        validate_loaded_group_security,
+    },
+};
+use crate::{
+    api::{
+        ApiError,
+        ApiResult,
+        ChangeGroupMembershipRequest,
+        CreateGroupRequest,
+        GroupId,
+        GroupMigration,
+        LoadError,
+        PublishChangesRequest,
+        PublishReceipt,
+        ReplicationApi,
+        ReplicationConfig,
+        ReplicationEventListener,
+        ReplicationSecuritySecrets,
+        ReplicationStore,
+        RuntimeSnafu,
+        SnapshotRows,
+        SnapshotRowsRequest,
+        Summary,
+        SummaryRequest,
+    },
+    delivery::security::DeliverySecurity,
 };
 use flotsync_core::member::Identifier;
 use flotsync_utils::BoxFuture;
@@ -26,19 +39,23 @@ use kompact::prelude::*;
 use snafu::prelude::*;
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
+use super::errors::GroupInstallError;
 #[cfg(test)]
 use super::{
-    errors::{GroupInstallError, InboundDeliveryError},
+    errors::InboundDeliveryError,
     messages::{UpdateBatchMessage, UpdateMessage},
 };
+#[cfg(any(test, feature = "test-support"))]
+use crate::GroupMembers;
 #[cfg(test)]
-use crate::{GroupMembers, api::MemberIdentity};
-#[cfg(test)]
+use crate::MemberIdentity;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
 type ApiFuture<'a, T> = BoxFuture<'a, ApiResult<T>>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Create one concrete replication runtime for the given application identity.
@@ -59,12 +76,14 @@ pub async fn load_replication_runtime(
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
         application_id,
         store,
         listener,
         config,
+        security_secrets,
         None,
     )
     .await?;
@@ -85,6 +104,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
     runtime_config_toml: &str,
 ) -> Result<Arc<dyn ReplicationApi>, LoadError> {
     let runtime = load_replication_runtime_typed_with_runtime_config_toml(
@@ -92,27 +112,11 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
         store,
         listener,
         config,
+        security_secrets,
         Some(runtime_config_toml),
     )
     .await?;
     Ok(runtime)
-}
-
-#[cfg(test)]
-pub(super) async fn load_replication_runtime_typed(
-    application_id: Identifier,
-    store: Arc<dyn ReplicationStore>,
-    listener: Arc<dyn ReplicationEventListener>,
-    config: ReplicationConfig,
-) -> Result<Arc<ReplicationRuntime>, LoadError> {
-    load_replication_runtime_typed_with_runtime_config_toml(
-        application_id,
-        store,
-        listener,
-        config,
-        None,
-    )
-    .await
 }
 
 pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
@@ -120,6 +124,73 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
+    security_secrets: ReplicationSecuritySecrets,
+    runtime_config_toml: Option<&str>,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    let local_member = store
+        .local_member_identity()
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    let security_f = DeliverySecurity::load(
+        store.clone(),
+        &local_member,
+        security_secrets.store_secret_key().clone(),
+        *security_secrets.store_secret_key_id(),
+    );
+    let security = security_f
+        .await
+        .map_err(|source| load_security_error_from_local_member(&local_member, source))
+        .map_err(|source| security_load_error(application_id.clone(), source))?;
+    let validation_f = validate_loaded_group_security(
+        application_id.clone(),
+        store.clone(),
+        security_secrets.store_secret_key_id(),
+        &security,
+    );
+    validation_f
+        .await
+        .map_err(load_security_error_from_runtime)
+        .map_err(|source| security_load_error(application_id.clone(), source))?;
+    load_replication_runtime_typed_with_security(
+        application_id,
+        store,
+        listener,
+        config,
+        security,
+        runtime_config_toml,
+    )
+    .await
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    security: DeliverySecurity,
+    runtime_config_toml: Option<&str>,
+) -> Result<Arc<ReplicationRuntime>, LoadError> {
+    load_replication_runtime_typed_with_security(
+        application_id,
+        store,
+        listener,
+        config,
+        security,
+        runtime_config_toml,
+    )
+    .await
+}
+
+async fn load_replication_runtime_typed_with_security(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
+    security: DeliverySecurity,
     runtime_config_toml: Option<&str>,
 ) -> Result<Arc<ReplicationRuntime>, LoadError> {
     let local_member = store
@@ -133,6 +204,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         &local_member,
         store,
         listener,
+        security,
         runtime_config_toml,
     )
     .await
@@ -155,7 +227,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
 }
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
-pub(super) struct ReplicationRuntime {
+pub(crate) struct ReplicationRuntime {
     _application_id: Identifier,
     runtime_ref: Option<ActorRefStrong<ReplicationRuntimeMessage>>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -232,7 +304,7 @@ impl ReplicationApi for ReplicationRuntime {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn wait_for_test_reply<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -244,13 +316,13 @@ where
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ReplicationRuntime {
-    pub(super) fn host(&self) -> &DeliveryRuntimeHost {
+    pub(crate) fn host(&self) -> &DeliveryRuntimeHost {
         self.host.as_ref()
     }
 
-    pub(super) fn install_group_for_test(
+    pub(crate) fn install_group_for_test(
         &self,
         group_id: GroupId,
         members: GroupMembers,
@@ -268,6 +340,7 @@ impl ReplicationRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_update_for_test(
         &self,
         sender: MemberIdentity,
@@ -286,6 +359,7 @@ impl ReplicationRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn apply_update_batch_for_test(
         &self,
         sender: MemberIdentity,

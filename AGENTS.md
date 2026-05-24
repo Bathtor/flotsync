@@ -1,6 +1,15 @@
 # Agent Instructions
 
 - Use "durable" only for explicit persistence/crash-survival guarantees. Do not use it as a general synonym for local, stored, applied, persisted, observed, or current state.
+- Do not plan "migrations" of any kind at this point. We are still building up the project. There are no existing deployments or database state or any such thing we need to handle.
+
+## Local Agent Notes
+
+- Use `.agent_local_docs/tmp/` for temporary agent working notes that should survive ordinary machine uptime. Do not put this kind of state in `/tmp` or `/private/tmp` unless the user explicitly asks for OS-level temporary storage.
+- Review-feedback working notes are temporary coordination state, not project issue tracking. Keep them under `.agent_local_docs/tmp/`, not in `bd`.
+- When the user provides substantial review feedback, capture every comment in a working note before implementation. Include stable IDs, file context, the feedback, current status, and the intended direction.
+- After plan alignment, update the working note with the agreed direction before editing production files.
+- During and after implementation, use the working note as the checklist. Before final response, double-check every captured feedback item and report any item that remains unresolved or intentionally deferred.
 
 ## Rust Rules
 
@@ -9,6 +18,7 @@
 - Format Rust code according to `rustfmt.toml`.
 - Keep Rust changes clippy-clean where practical. Use `-W clippy::pedantic` before a change is considered ready for review.
 - Prefer readable control flow over chained iterator side effects.
+- Prefer `for` and `while`/`while let` over `loop` where possible; seeing the termination condition up front is usually clearer, even when the condition contains a fallible expression such as `while let Some(item) = next_item()?`.
 - Use Snafu-derived error types (`#[derive(Snafu)]`) for Rust error enums.
 - Prefer `context(...)` / `with_context(...)` over manual `map_err(...)` when the target error still wraps the original source. Use `with_context(...)` when building the context captures clones, allocations, or other non-trivial work.
 - If the only reason to introduce a new error variant is to differentiate the use-site of an existing variant, prefer adding `location: Location` to the existing variant instead.

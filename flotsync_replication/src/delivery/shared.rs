@@ -44,6 +44,20 @@ pub struct EncryptedPayload {
     pub ciphertext: Bytes,
 }
 
+/// Plaintext reliable-delivery payload held inside the local process.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlaintextPayload {
+    pub bytes: Bytes,
+}
+
+impl fmt::Debug for PlaintextPayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlaintextPayload")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Detached signature scheme reference used in signed envelopes and control
 /// messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,7 +65,8 @@ pub enum SignatureScheme {
     Ed25519,
 }
 
-/// Detached signature bytes carried in plaintext footers.
+/// Signature-only authentication bytes carried by control frames without an
+/// encrypted body.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DetachedSignature {
     pub scheme: SignatureScheme,
@@ -62,19 +77,6 @@ pub struct DetachedSignature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedEnvelopeFooter {
     pub signature: DetachedSignature,
-}
-
-/// Build the placeholder signature footer used until payload signing is wired in.
-#[must_use]
-pub(crate) fn placeholder_signed_footer() -> SignedEnvelopeFooter {
-    SignedEnvelopeFooter {
-        // TODO(flotsync-d8d): Replace this placeholder once the real delivery
-        // signing boundary is available.
-        signature: DetachedSignature {
-            scheme: SignatureScheme::Ed25519,
-            bytes: Bytes::from_static(b"placeholder-signature"),
-        },
-    }
 }
 
 /// Delivery semantics for group-scoped fan-out.
@@ -160,7 +162,7 @@ pub enum RouteActiveState {
     },
 }
 
-/// Why a durable route remains pending instead of actively sending right now.
+/// Why a retained route remains pending instead of actively sending right now.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingRouteReason {
     ReachabilityUnknown,

@@ -5,12 +5,12 @@
 use super::{Identifier, IdentifierSegment};
 use ahash::AHashMap;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrieMap<V> {
     root: TrieNode<V>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct TrieNode<V> {
     value: Option<V>,
     children: AHashMap<IdentifierSegment, TrieNode<V>>,
@@ -89,6 +89,16 @@ impl<V> TrieMap<V> {
     #[must_use]
     pub fn iter_keys(&self) -> TrieIdentifierIter<'_, V> {
         TrieIdentifierIter { inner: self.iter() }
+    }
+
+    /// Build a new trie with the same keys and mapped values.
+    #[must_use]
+    pub fn map_values<U>(&self, mut mapper: impl FnMut(&V) -> U) -> TrieMap<U> {
+        let mut output = TrieMap::new();
+        for (key, value) in self {
+            output.insert(key, mapper(value));
+        }
+        output
     }
 
     fn remove_from_node<'a>(
