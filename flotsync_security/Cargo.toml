@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-test-support = ["dep:rand_chacha"]
+test-support = ["dep:rand_chacha", "keyring-core/sample"]
 
 [dependencies]
 bytes = { workspace = true }
@@ -14,7 +14,6 @@ flotsync_core = { path = "../flotsync_core" }
 flotsync_utils = { path = "../flotsync_utils" }
 hpke = { version = "0.13.0", default-features = false, features = ["std", "x25519"] }
 jose-jwk = { version = "0.1.2", default-features = false }
-keyring = "4"
 keyring-core = "1"
 rand_chacha = { version = "0.9", optional = true }
 rand_core = { version = "0.9", features = ["os_rng", "std"] }
@@ -24,5 +23,21 @@ snafu = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["protected"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
 [dev-dependencies]
+keyring-core = { version = "1", features = ["sample"] }
 rand_chacha = "0.9"

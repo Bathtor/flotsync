@@ -2,7 +2,7 @@ use crate::{STORE_SECRET_KEY_LENGTH, SecurityError, StoreSecretKey, StoreSecretK
 use flotsync_core::member::Identifier;
 use keyring_core::{Entry, Error as KeyringError};
 use snafu::prelude::*;
-use std::{collections::HashMap, fmt};
+use std::fmt;
 use zeroize::Zeroizing;
 
 /// Result type for loading or creating the device-local store secret.
@@ -282,7 +282,7 @@ pub fn load_or_create_local_store_secret(
                     application_id: application_id.clone(),
                     profile: profile.clone(),
                 })?;
-            // Read the value back to increase the probablity that we get a consistent value when
+            // Read the value back to increase the probability that we get a consistent value when
             // racing with another process trying to install the same profile.
             load_local_store_secret(application_id, profile)
         }
@@ -339,46 +339,53 @@ fn ensure_default_local_secret_store() -> LocalStoreSecretResult<()> {
 }
 
 /*
- * We intentionally do not use `keyring::use_native_store`: it can select
- * Linux keyutils, which is not the cross-login local secret store we want, and
- * it silently falls back to the sample store on unsupported targets. Local
- * store-secret loading should either use a named persistent backend we chose
+ * We intentionally initialise the backing stores directly instead of depending on
+ * the `keyring` convenience crate. Upstream treats that crate as sample/glue
+ * code, and its dependency graph includes stores we do not use. Local
+ * store-secret loading should either use a persistent backend we chose
  * explicitly or fail with an actionable setup error.
  */
 
 /// Install the persistent OS-backed keyring store selected for this target.
 #[cfg(target_os = "macos")]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    let config = HashMap::<&str, &str>::new();
-    keyring::use_apple_keychain_store(&config).context(InitialiseStorageSnafu)
+    let store =
+        apple_native_keyring_store::keychain::Store::new().context(InitialiseStorageSnafu)?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Install the persistent OS-backed keyring store selected for this target.
 #[cfg(target_os = "ios")]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    let config = HashMap::<&str, &str>::new();
-    keyring::use_apple_protected_store(&config).context(InitialiseStorageSnafu)
+    let store =
+        apple_native_keyring_store::protected::Store::new().context(InitialiseStorageSnafu)?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Install the persistent OS-backed keyring store selected for this target.
 #[cfg(target_os = "android")]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    let config = HashMap::<&str, &str>::new();
-    keyring::use_android_native_store(&config).context(InitialiseStorageSnafu)
+    let store = android_native_keyring_store::Store::new().context(InitialiseStorageSnafu)?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Install the persistent OS-backed keyring store selected for this target.
 #[cfg(target_os = "windows")]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    let config = HashMap::<&str, &str>::new();
-    keyring::use_windows_native_store(&config).context(InitialiseStorageSnafu)
+    let store = windows_native_keyring_store::Store::new().context(InitialiseStorageSnafu)?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Install the persistent OS-backed keyring store selected for this target.
 #[cfg(target_os = "linux")]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    let config = HashMap::<&str, &str>::new();
-    keyring::use_dbus_secret_service_store(&config).context(InitialiseStorageSnafu)
+    let store = dbus_secret_service_keyring_store::Store::new().context(InitialiseStorageSnafu)?;
+    keyring_core::set_default_store(store);
+    Ok(())
 }
 
 /// Fail fast on targets without a chosen persistent OS-backed store.
@@ -453,17 +460,17 @@ fn local_store_secret_account(
 
 /// Validate one selector component against the portable keyring account subset.
 fn ensure_portable_selector(value: &str) -> Result<(), &'static str> {
+    fn is_portable_account_char(character: char) -> bool {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '.' | ':' | '_' | '-')
+    }
+
     if value.contains(ANDROID_NATIVE_STORE_DIVIDER) {
         return Err(PORTABLE_SELECTOR_ANDROID_DIVIDER_MESSAGE);
     }
     if value.contains(LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR) {
         return Err(PORTABLE_SELECTOR_ACCOUNT_SEPARATOR_MESSAGE);
-    }
-
-    fn is_portable_account_char(character: char) -> bool {
-        character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || matches!(character, '.' | ':' | '_' | '-')
     }
     if !value.chars().all(is_portable_account_char) {
         return Err(PORTABLE_SELECTOR_CHARACTER_SET_MESSAGE);
@@ -492,8 +499,11 @@ pub fn install_local_store_secret_test_store() -> LocalStoreSecretResult<()> {
     use std::{collections::HashMap, sync::LazyLock};
 
     static INSTALL: LazyLock<()> = LazyLock::new(|| {
-        keyring::use_sample_store(&HashMap::from([("persist", "false")]))
-            .expect("local store-secret sample store should install for tests");
+        let store = keyring_core::sample::Store::new_with_configuration(&HashMap::from([(
+            "persist", "false",
+        )]))
+        .expect("local store-secret sample store should install for tests");
+        keyring_core::set_default_store(store);
     });
     LazyLock::force(&INSTALL);
     let store = keyring_core::get_default_store()
