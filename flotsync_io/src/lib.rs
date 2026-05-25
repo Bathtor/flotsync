@@ -60,6 +60,8 @@ pub mod prelude {
             IoBridge,
             IoBridgeHandle,
             IoDriverComponent,
+            IoRuntime,
+            IoRuntimeError,
             OpenFailureReason,
             OpenTcpListener,
             OpenTcpSession,

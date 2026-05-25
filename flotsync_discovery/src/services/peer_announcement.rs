@@ -1,4 +1,3 @@
-use super::Snafu;
 use crate::{SocketPort, kompact::prelude::*};
 use flotsync_io::prelude::{
     ConfigureFailureReason,
@@ -17,6 +16,7 @@ use flotsync_io::prelude::{
 use flotsync_messages::{buffa::Message, discovery::Peer};
 use itertools::Itertools;
 use pnet_datalink::{self as datalink, MacAddr, NetworkInterface};
+use snafu::Snafu;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},

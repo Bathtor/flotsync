@@ -1,12 +1,15 @@
 use clap::Args;
-use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent};
+use flotsync_io::prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, IoRuntime};
 use kompact::prelude::{BlockingFutureExt, Component, KompactConfig, KompactSystem};
 use slog::{Drain, Level, Logger, o};
-use snafu::{FromString, Whatever, prelude::*};
+use snafu::{FromString, Snafu, Whatever, prelude::*};
 use std::{
     path::PathBuf,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Result type used by the example binaries.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -42,9 +45,7 @@ impl RuntimeConfigArgs {
 /// runtime and own the actual UDP/TCP interaction logic.
 pub struct ExampleRuntime {
     system: KompactSystem,
-    driver_component: Arc<Component<IoDriverComponent>>,
-    bridge_component: Arc<Component<IoBridge>>,
-    bridge_handle: IoBridgeHandle,
+    io_runtime: IoRuntime,
 }
 
 impl ExampleRuntime {
@@ -65,17 +66,9 @@ impl ExampleRuntime {
             Whatever::without_source(format!("failed to build Kompact system: {error}"))
         })?;
 
-        let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
-        let driver_for_bridge = driver_component.clone();
-        let bridge_component = system.create(move || IoBridge::new(&driver_for_bridge));
-        let bridge_handle = IoBridgeHandle::from_component(&bridge_component);
+        let io_runtime = IoRuntime::build(&system, DriverConfig::default());
 
-        Ok(Self {
-            system,
-            driver_component,
-            bridge_component,
-            bridge_handle,
-        })
+        Ok(Self { system, io_runtime })
     }
 
     /// Returns the shared Kompact system.
@@ -87,19 +80,35 @@ impl ExampleRuntime {
     /// Returns the shared bridge component.
     #[must_use]
     pub fn bridge_component(&self) -> &Arc<Component<IoBridge>> {
-        &self.bridge_component
+        self.io_runtime.bridge_component()
     }
 
     /// Returns the shared driver component.
     #[must_use]
     pub fn driver_component(&self) -> &Arc<Component<IoDriverComponent>> {
-        &self.driver_component
+        self.io_runtime.driver_component()
     }
 
     /// Returns the control handle for the shared bridge.
     #[must_use]
     pub fn bridge_handle(&self) -> &IoBridgeHandle {
-        &self.bridge_handle
+        self.io_runtime.bridge_handle()
+    }
+
+    /// Starts the shared `flotsync_io` runtime.
+    ///
+    /// # Errors
+    ///
+    /// See `Error` for failure conditions.
+    pub fn start_io(&self) -> Result<()> {
+        self.io_runtime
+            .start_notify(&self.system)
+            .wait_timeout(CONTROL_TIMEOUT)
+            .map_err(|_| ControlTimeout {
+                timeout: CONTROL_TIMEOUT,
+            })
+            .whatever_context("timed out waiting for the shared flotsync_io runtime to start")?
+            .whatever_context("failed to start shared flotsync_io runtime")
     }
 
     /// Shuts the example runtime down cleanly.
@@ -108,21 +117,25 @@ impl ExampleRuntime {
     ///
     /// See `Error` for failure conditions.
     pub fn shutdown(self) -> Result<()> {
-        let Self {
-            system,
-            driver_component,
-            bridge_component,
-            bridge_handle,
-        } = self;
-        drop(bridge_handle);
-        drop(bridge_component);
-        drop(driver_component);
+        let Self { system, io_runtime } = self;
+        io_runtime
+            .kill_notify(&system)
+            .wait()
+            .whatever_context("failed to stop shared flotsync_io runtime")?;
 
         match system.shutdown().wait() {
             Ok(()) => Ok(()),
             Err(message) => whatever!("failed to shut down Kompact system: {message}"),
         }
     }
+}
+
+/// Owned timeout source for waits whose timeout error contains a borrowed future.
+#[derive(Debug, Snafu)]
+#[snafu(display("control future did not complete within {timeout:?}"))]
+struct ControlTimeout {
+    /// Timeout used for the borrowed lifecycle wait that elapsed.
+    timeout: Duration,
 }
 
 /// Installs the `log` facade bridge once using a small stderr-only `slog` logger for the app.

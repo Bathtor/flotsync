@@ -85,17 +85,7 @@ fn start_component<C>(runtime: &ExampleRuntime, component: &Arc<Component<C>>) -
 where
     C: ComponentDefinition + Actor + Sized + 'static,
 {
-    let start_driver = runtime.system().start_notify(runtime.driver_component());
-    whatever!(
-        start_driver.wait_timeout(CONTROL_TIMEOUT),
-        "timed out waiting for the shared IoDriverComponent to start"
-    );
-
-    let start_bridge = runtime.system().start_notify(runtime.bridge_component());
-    whatever!(
-        start_bridge.wait_timeout(CONTROL_TIMEOUT),
-        "timed out waiting for the shared IoBridge to start"
-    );
+    runtime.start_io()?;
 
     let start_component = runtime.system().start_notify(component);
     whatever!(

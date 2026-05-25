@@ -1,5 +1,7 @@
+#[cfg(feature = "zeroconf-support")]
 #[allow(unused)]
 use crate::errors::{Result, ZeroconfSnafu};
+#[cfg(feature = "zeroconf-support")]
 #[allow(unused)]
 use snafu::prelude::*;
 

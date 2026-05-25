@@ -26,7 +26,7 @@ message IPAddress {
 }
 
 // Broadcast message to announce that a peer that speaks the flotsync protocol
-// is operating in this network and can be reached at the addresses listen in the listening_on field.
+// is operating in this network and can be reached at the addresses listed in the listening_on field.
 message Peer {
   // A 16 byte UUID of the current instance of this peer.
   bytes instance_uuid = 1;
