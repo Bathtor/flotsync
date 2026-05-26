@@ -44,6 +44,11 @@ group fan-out/storage, and replication semantics separate.
 
 ## 5. Sub-Protocol A: PeerDiscovery+Tracking
 
+Implementation detail:
+See [`custom_udp_peer_discovery.md`](./custom_udp_peer_discovery.md)
+for the concrete custom UDP discovery protocol currently targeted by the
+replicated-checklist first-release slice.
+
 ### 5.1 Purpose and Ownership
 
 This sub-protocol only answers:
@@ -52,59 +57,53 @@ This sub-protocol only answers:
 - how they can be reached (transport/address tuple)
 - whether reachability is fresh enough to attempt delivery
 
-It also authenticates that a reachable peer is actually the claimed identity.
+It also authenticates that a reachable route belongs to the claimed member
+identity before exposing the route to replication.
 
 ### 5.2 State Model (per remote peer endpoint)
 
-- `Unknown`: No information yet. (Can be implicit by simply missing from the state).
-- `Known`: Identity/Address known. May not be reachable. (Default state for relays, which have fixed addresses).
-- `Reachable`: Identity recently confirmed reachable on stored address.
-- `Stale`: Identity not reached within TTL on stored address.
+- `Unknown`: No active record; normally represented by absence from tracker state.
+- `Known`: A plaintext beacon was observed, but the endpoint has not been verified.
+- `Reachable`: A receiver-driven introduction probe verified at least one signed introduction claim.
+- `Stale`: A previously reachable endpoint expired, timed out, or failed refresh.
 
-### 5.3 Message Classes
+### 5.3 Current Custom UDP Message Classes
 
-#### `Hello`
-
-Purpose:
-Announce identity, reachable addresses/transports, and capability hints.
-
-Must convey:
-
-- peer identity
-- one or more reachable addresses
-- optional capabilities/version hints
-- freshness nonce
-- signature by peer private key over the signed fields
-
-#### `CheckIn`
+#### `Peer`
 
 Purpose:
-Actively test peer reachability.
+Plaintext beacon for one Flotsync-speaking instance and its advertised
+listening endpoints.
 
-Must convey:
+It must not carry member ids or group ids.
 
-- attempt id
-- sender return address
-- freshness nonce
-- signature by peer private key over the signed fields
-
-#### `StillHere`
+#### `IntroductionRequest`
 
 Purpose:
-Answer `CheckIn`.
+Receiver-driven route probe with a fresh nonce.
 
-Must convey:
+The request is plaintext. The nonce is signed by the responder in the
+`Introduction` claims.
 
-- `CheckIn` attempt id
-- echoed challenge material (or bound response nonce)
-- signature by peer private key over the signed fields
+#### `Introduction`
+
+Purpose:
+Return signed member/group claims for the probed route.
+
+Each introduction claim is signed by the claimed member identity and may list
+several group ids for that member. Only claims that intersect local group
+membership are published as replication routes.
 
 ### 5.4 Identity Verification Rules
 
-- Every identity has a public/private keypair.
-- For group-scoped discovery, public keys come from the replication-group creation message.
-- `Hello`, `CheckIn`, and `StillHere` signatures must verify against the claimed identity key.
-- Signature failure means the peer is treated as unauthenticated (`Unknown` or `Stale`) and not upgraded to `Reachable`.
+- Every member identity has a public/private signing keypair.
+- For group-scoped discovery, trusted public keys come from local provisioning
+  or stored replication group security material.
+- `Peer` and `IntroductionRequest` are plaintext hints/probes.
+- Each `Introduction` claim signature must verify against the claimed member
+  identity key over the encoded claim bytes exactly as received.
+- Signature failure means the route is not published to replication and any
+  previously reachable route for the affected member may become `Stale`.
 
 ## 6. Sub-Protocol B: SingleRecipientDurableDelivery
 

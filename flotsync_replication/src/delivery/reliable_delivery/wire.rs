@@ -18,6 +18,7 @@ use super::{
 use flotsync_messages::{
     buffa::{Message, MessageField},
     delivery as delivery_proto,
+    endpoint as endpoint_proto,
 };
 use flotsync_security::{HPKE_ENCAPSULATED_KEY_LENGTH, SIGNATURE_LENGTH, SealedHPKEPayload};
 use snafu::prelude::*;
@@ -36,7 +37,7 @@ pub(super) enum ReliableDeliveryWireError {
 
 pub(super) fn reliable_envelope_to_wire_format(
     envelope: &ReliableMessageEnvelope<EncryptedPayload>,
-) -> delivery_proto::DeliveryBoundaryFrame {
+) -> endpoint_proto::EndpointFrame {
     let header = delivery_proto::ReliableEnvelopeHeader {
         sender: MessageField::some(member_identity_to_wire_format(&envelope.header.sender)),
         recipient: MessageField::some(member_identity_to_wire_format(&envelope.header.recipient)),
@@ -61,17 +62,15 @@ pub(super) fn reliable_envelope_to_wire_format(
         )),
         ..delivery_proto::ReliableDeliveryFrame::default()
     };
-    delivery_proto::DeliveryBoundaryFrame {
-        boundary: Some(
-            delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(Box::new(frame)),
-        ),
-        ..delivery_proto::DeliveryBoundaryFrame::default()
+    endpoint_proto::EndpointFrame {
+        boundary: Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(
+            Box::new(frame),
+        )),
+        ..endpoint_proto::EndpointFrame::default()
     }
 }
 
-pub(super) fn recipient_ack_to_wire_format(
-    ack: &RecipientAck,
-) -> delivery_proto::DeliveryBoundaryFrame {
+pub(super) fn recipient_ack_to_wire_format(ack: &RecipientAck) -> endpoint_proto::EndpointFrame {
     let header = recipient_ack_header_to_wire_format(&ack.header);
     let wire = delivery_proto::RecipientAckWire {
         public_header: MessageField::some(header),
@@ -84,11 +83,11 @@ pub(super) fn recipient_ack_to_wire_format(
         )),
         ..delivery_proto::ReliableDeliveryFrame::default()
     };
-    delivery_proto::DeliveryBoundaryFrame {
-        boundary: Some(
-            delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(Box::new(frame)),
-        ),
-        ..delivery_proto::DeliveryBoundaryFrame::default()
+    endpoint_proto::EndpointFrame {
+        boundary: Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(
+            Box::new(frame),
+        )),
+        ..endpoint_proto::EndpointFrame::default()
     }
 }
 

@@ -4,15 +4,7 @@ package flotsync.delivery.v1;
 
 import "flotsync/discovery/v1/discovery.proto";
 
-// Top-level delivery wire frame split by semantic owner.
-message DeliveryBoundaryFrame {
-  oneof boundary {
-    GroupBroadcastFrame group_broadcast = 1;
-    ReliableDeliveryFrame reliable_delivery = 2;
-  }
-}
-
-// Group-broadcast-owned inbound boundary frames.
+// Group-broadcast-owned inbound endpoint branch.
 message GroupBroadcastFrame {
   oneof body {
     GroupEnvelopeWire envelope = 1;
@@ -20,7 +12,7 @@ message GroupBroadcastFrame {
   }
 }
 
-// Reliable-delivery-owned inbound boundary frames.
+// Reliable-delivery-owned inbound endpoint branch.
 message ReliableDeliveryFrame {
   oneof body {
     ReliableEnvelopeWire envelope = 1;

@@ -22,7 +22,7 @@
 
 pub mod manager;
 
-use super::shared::{ReachabilityClass, RelayIdentity, RouteSendId};
+use super::shared::{RelayIdentity, RouteSendId};
 use crate::api::MemberIdentity;
 use flotsync_io::prelude::{EgressAsyncWriter, Error as IoError, IoPayload};
 use flotsync_messages::buffa::Message as BuffaMessage;
@@ -168,16 +168,18 @@ pub struct SendRouteCandidate<R> {
 }
 
 /// Published discovery update for one peer or relay.
+///
+/// Each update fully replaces the previously published route set for that
+/// peer or relay. An empty `routes` list withdraws all currently usable routes
+/// for that identity.
 #[derive(Clone, Debug)]
 pub enum DiscoveryRouteUpdate<R> {
     PeerRoutes {
         peer: MemberIdentity,
-        classification: ReachabilityClass,
         routes: Vec<SendRouteCandidate<R>>,
     },
     RelayRoutes {
         relay: RelayIdentity,
-        classification: ReachabilityClass,
         routes: Vec<SendRouteCandidate<R>>,
     },
 }

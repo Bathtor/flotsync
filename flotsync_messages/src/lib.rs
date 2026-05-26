@@ -22,6 +22,7 @@ pub use generated::{
         datamodel::v1 as datamodel,
         delivery::v1 as delivery,
         discovery::v1 as discovery,
+        endpoint::v1 as endpoint,
         replication::v1 as replication,
         versions::v1 as versions,
     },

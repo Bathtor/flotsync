@@ -1135,15 +1135,12 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use crate::delivery::{
-            route_transport::{
-                DatagramRouteScope,
-                RoutePreferenceRank,
-                RouteSharingKind,
-                SendRouteCandidate,
-                UdpRouteKey,
-            },
-            shared::ReachabilityClass,
+        use crate::delivery::route_transport::{
+            DatagramRouteScope,
+            RoutePreferenceRank,
+            RouteSharingKind,
+            SendRouteCandidate,
+            UdpRouteKey,
         };
 
         let route = SendRouteCandidate {
@@ -1158,7 +1155,6 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         self.publish_route_update(
             crate::delivery::route_transport::DiscoveryRouteUpdate::PeerRoutes {
                 peer: peer.clone(),
-                classification: ReachabilityClass::Reachable,
                 routes: vec![route],
             },
         );

@@ -21,7 +21,11 @@ use super::{
         TransportRouteKey,
     },
     shared::{MessageId, RouteEndpoint},
-    wire::{DecodedDeliveryFrame, DeliveryInterestView, decode_boundary_frame_if_interested},
+    wire::{
+        DecodedDeliveryFrame,
+        DeliveryInterestView,
+        decode_endpoint_frame_if_delivery_relevant,
+    },
 };
 use crate::{
     SharedGroupMemberships,
@@ -163,7 +167,7 @@ impl DeliveryIngressComponent {
         // `Ok(None)` means the payload was syntactically valid enough to
         // classify, but the shallow public header showed it is irrelevant to
         // the current local-interest snapshot.
-        let decoded_frame = decode_boundary_frame_if_interested(
+        let decoded_frame = decode_endpoint_frame_if_delivery_relevant(
             &mut inbound.payload,
             DeliveryInterestView {
                 group_memberships: group_memberships.as_ref(),
@@ -255,6 +259,7 @@ mod tests {
         buffa::{Message, MessageField},
         delivery as proto,
         discovery as discovery_proto,
+        endpoint as endpoint_proto,
     };
     use std::{sync::mpsc, time::Duration};
     use uuid::Uuid;
@@ -415,7 +420,7 @@ mod tests {
 
         transport.on_definition(|component| {
             component.transport.trigger(RouteTransportInboundDeliver {
-                payload: encode_group_boundary_frame(active_group, MessageId(Uuid::from_u128(2))),
+                payload: encode_group_endpoint_frame(active_group, MessageId(Uuid::from_u128(2))),
                 transport: InboundTransportMeta {
                     route,
                     remote_addr: Some("127.0.0.1:30101".parse().expect("test remote address")),
@@ -482,7 +487,7 @@ mod tests {
 
         transport.on_definition(|component| {
             component.transport.trigger(RouteTransportInboundDeliver {
-                payload: encode_recipient_ack_boundary_frame(
+                payload: encode_recipient_ack_endpoint_frame(
                     MessageId(Uuid::from_u128(3)),
                     &original_sender,
                     &member(&["bob"]),
@@ -541,7 +546,7 @@ mod tests {
         }
     }
 
-    fn encode_group_boundary_frame(group_id: GroupId, delivery_message_id: MessageId) -> IoPayload {
+    fn encode_group_endpoint_frame(group_id: GroupId, delivery_message_id: MessageId) -> IoPayload {
         let header = proto::GroupEnvelopeHeader {
             group_id: group_id.0.as_bytes().to_vec(),
             sender: MessageField::some(proto_identifier(&member(&["alice"]))),
@@ -563,16 +568,16 @@ mod tests {
             ))),
             ..proto::GroupBroadcastFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::GroupBroadcast(
                 Box::new(frame),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
-        encode_boundary(&boundary)
+        encode_endpoint_frame(&boundary)
     }
 
-    fn encode_recipient_ack_boundary_frame(
+    fn encode_recipient_ack_endpoint_frame(
         delivery_message_id: MessageId,
         original_sender: &MemberIdentity,
         recipient: &MemberIdentity,
@@ -593,16 +598,16 @@ mod tests {
             )),
             ..proto::ReliableDeliveryFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(
                 Box::new(frame),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
-        encode_boundary(&boundary)
+        encode_endpoint_frame(&boundary)
     }
 
-    fn encode_boundary(boundary: &proto::DeliveryBoundaryFrame) -> IoPayload {
+    fn encode_endpoint_frame(boundary: &endpoint_proto::EndpointFrame) -> IoPayload {
         IoPayload::from(boundary.encode_to_bytes())
     }
 }

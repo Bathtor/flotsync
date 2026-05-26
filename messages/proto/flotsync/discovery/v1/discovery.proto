@@ -33,12 +33,20 @@ message Peer {
   repeated SocketAddress listening_on = 2;
 }
 
-// Request for a peer to identify themselves.
+// Discovery messages carried on the replication endpoint being verified.
+message DiscoveryFrame {
+  oneof body {
+    IntroductionRequest introduction_request = 1;
+    Introduction introduction = 2;
+  }
+}
+
+// Request for a peer to identify themselves on the probed route.
 //
 // Should be answered with an [[Introduction]].
 message IntroductionRequest {
-  // Any responses should be sent to this peer.
-  Peer respond_to = 1;
+  // Receiver-generated freshness challenge included in signed introduction claims.
+  bytes request_nonce = 1;
 }
 
 // An identification of a peer.
@@ -46,18 +54,54 @@ message Introduction {
   // A 16 byte UUID of the current instance of this peer.
   bytes instance_uuid = 1;
 
-  // List all the groups we are part of.
-  repeated GroupMemberId group_ids = 2;
-}
+  // Echo of the receiver-generated freshness challenge from the IntroductionRequest.
+  bytes request_nonce = 2;
 
-// A combination of a replication group and an identifier within that group.
-message GroupMemberId {
-  // A 16 byte UUID.
-  bytes group_id = 1;
-  Identifier member_id = 2;
+  // Signed identity and group-membership claims available through this route.
+  repeated SignedIntroductionClaim claims = 3;
 }
 
 // A hierarchical identifier equivalent to "a.b.c", given as individual segments "a", "b", "c".
 message Identifier {
   repeated string segments = 1;
+}
+
+// Signature schemes used by discovery identity proofs.
+message DiscoverySignature {
+  enum Scheme {
+    SCHEME_UNSPECIFIED = 0;
+    SCHEME_ED25519PH = 1;
+  }
+
+  Scheme scheme = 1;
+  bytes signature_bytes = 2;
+}
+
+// One introduction claim payload that a route is valid for one or more
+// replication groups.
+//
+// The encoded bytes of this message are signed exactly as transmitted inside
+// SignedIntroductionClaim.claim_payload.
+message IntroductionClaimPayload {
+  // A 16 byte UUID of the peer instance making this claim.
+  bytes instance_uuid = 1;
+
+  // Receiver-generated nonce from the IntroductionRequest being answered.
+  bytes request_nonce = 2;
+
+  // The exact route endpoint the receiver probed.
+  SocketAddress route = 3;
+
+  // A 16 byte UUID for each replication group in this route claim.
+  repeated bytes group_ids = 4;
+}
+
+// One signed introduction claim.
+message SignedIntroductionClaim {
+  // Claimed member identity and untrusted key selector for signature verification.
+  Identifier member_id = 1;
+
+  // Encoded IntroductionClaimPayload bytes. Signatures cover these exact bytes.
+  bytes claim_payload = 2;
+  DiscoverySignature signature = 3;
 }

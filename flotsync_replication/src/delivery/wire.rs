@@ -1,10 +1,10 @@
 //! Delivery-wire parsing and early local-interest classification.
 //!
-//! The shallow classifier intentionally parses only the semantic boundary and
-//! the relevant `public_header` sub-message before deciding whether the local
-//! node cares about the frame. Full protobuf decode is deferred until after
-//! that decision so large encrypted payloads and mailbox batches are skipped
-//! for irrelevant traffic.
+//! The shallow classifier intentionally parses only the semantic endpoint
+//! branch and the relevant `public_header` sub-message before deciding whether
+//! the local node cares about the frame. Full protobuf decode is deferred until
+//! after that decision so large encrypted payloads and mailbox batches are
+//! skipped for irrelevant traffic.
 //!
 //! The key result semantics in this module are:
 //!
@@ -23,14 +23,15 @@ use crate::{
     GroupMemberships,
     api::{GroupId, MemberIdentity},
 };
+use endpoint_proto::endpoint_frame::Boundary;
 use flotsync_core::member::{IdentifierBuf, IdentifierError};
 use flotsync_io::prelude::IoPayload;
 use flotsync_messages::{
     buffa::{DecodeError, Message, MessageView},
     delivery as proto,
     discovery as discovery_proto,
+    endpoint as endpoint_proto,
 };
-use proto::delivery_boundary_frame::Boundary;
 use snafu::prelude::*;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -65,14 +66,16 @@ pub(crate) fn group_id_from_wire(
     raw: &[u8],
     field: &'static str,
 ) -> Result<GroupId, WireValueDecodeError> {
-    Ok(GroupId(uuid_from_wire(raw, field)?))
+    let uuid = uuid_from_wire(raw, field)?;
+    Ok(GroupId(uuid))
 }
 
 pub(crate) fn message_id_from_wire(
     raw: &[u8],
     field: &'static str,
 ) -> Result<MessageId, WireValueDecodeError> {
-    Ok(MessageId(uuid_from_wire(raw, field)?))
+    let uuid = uuid_from_wire(raw, field)?;
+    Ok(MessageId(uuid))
 }
 
 /// Validate and copy a protobuf byte field into a fixed-width protocol array.
@@ -126,7 +129,7 @@ pub(crate) fn detached_signature_from_wire(
     })
 }
 
-/// Parse one delivery boundary frame, dropping it early if the shallow public
+/// Parse one endpoint frame, dropping it early if the shallow public
 /// header shows that the local node has no interest in it.
 ///
 /// This function performs the two-stage ingress strategy used by
@@ -137,17 +140,17 @@ pub(crate) fn detached_signature_from_wire(
 ///
 /// `Ok(None)` is therefore an expected fast-path outcome for valid but
 /// irrelevant traffic.
-pub(crate) fn decode_boundary_frame_if_interested(
+pub(crate) fn decode_endpoint_frame_if_delivery_relevant(
     payload: &mut IoPayload,
     interest: DeliveryInterestView<'_>,
 ) -> Result<Option<DecodedDeliveryFrame>, DeliveryWireError> {
     let payload_slice = payload.as_contiguous_slice();
 
-    let Some(classification) = classify_boundary_frame(payload_slice, interest)? else {
+    let Some(classification) = classify_endpoint_frame(payload_slice, interest)? else {
         return Ok(None);
     };
 
-    let decoded = decode_full_boundary_frame(payload_slice)?;
+    let decoded = decode_full_endpoint_boundary(payload_slice)?;
     match (classification.owner, decoded) {
         (SemanticOwner::GroupBroadcast, Boundary::GroupBroadcast(frame)) => {
             Ok(Some(DecodedDeliveryFrame::GroupBroadcast {
@@ -164,17 +167,22 @@ pub(crate) fn decode_boundary_frame_if_interested(
         (SemanticOwner::GroupBroadcast, Boundary::ReliableDelivery(_)) => {
             BoundaryOwnerMismatchSnafu {
                 shallow_owner: SemanticOwner::GroupBroadcast,
-                full_owner: SemanticOwner::ReliableDelivery,
+                full_owner: EndpointBoundaryOwner::ReliableDelivery,
             }
             .fail()
         }
         (SemanticOwner::ReliableDelivery, Boundary::GroupBroadcast(_)) => {
             BoundaryOwnerMismatchSnafu {
                 shallow_owner: SemanticOwner::ReliableDelivery,
-                full_owner: SemanticOwner::GroupBroadcast,
+                full_owner: EndpointBoundaryOwner::GroupBroadcast,
             }
             .fail()
         }
+        (shallow_owner, Boundary::Discovery(_)) => BoundaryOwnerMismatchSnafu {
+            shallow_owner,
+            full_owner: EndpointBoundaryOwner::Discovery,
+        }
+        .fail(),
     }
 }
 
@@ -254,11 +262,11 @@ pub(crate) enum DeliveryWireError {
     ))]
     BoundaryOwnerMismatch {
         shallow_owner: SemanticOwner,
-        full_owner: SemanticOwner,
+        full_owner: EndpointBoundaryOwner,
     },
 }
 
-/// Perform the shallow classification pass over one boundary frame.
+/// Perform the shallow classification pass over one endpoint frame.
 ///
 /// This pass never constructs the full generated protobuf frame. Instead it
 /// reads only enough structure to decide semantic ownership and local
@@ -266,21 +274,24 @@ pub(crate) enum DeliveryWireError {
 ///
 /// `Ok(None)` means the payload was classified successfully and deliberately
 /// dropped as irrelevant.
-fn classify_boundary_frame(
+fn classify_endpoint_frame(
     payload: &[u8],
     interest: DeliveryInterestView<'_>,
 ) -> Result<Option<RelevantShallowClassification>, DeliveryWireError> {
-    let frame = proto::DeliveryBoundaryFrameView::decode_view(payload).context(DecodeSnafu)?;
+    let frame = endpoint_proto::EndpointFrameView::decode_view(payload).context(DecodeSnafu)?;
     let boundary = frame.boundary.as_ref().context(MissingOneofSnafu {
-        name: "DeliveryBoundaryFrame.boundary",
+        name: "EndpointFrame.boundary",
     })?;
 
     let classification = match boundary {
-        proto::delivery_boundary_frame::BoundaryView::GroupBroadcast(frame) => {
+        endpoint_proto::endpoint_frame::BoundaryView::GroupBroadcast(frame) => {
             parse_group_broadcast_frame_hint(frame, interest)?
         }
-        proto::delivery_boundary_frame::BoundaryView::ReliableDelivery(frame) => {
+        endpoint_proto::endpoint_frame::BoundaryView::ReliableDelivery(frame) => {
             parse_reliable_delivery_frame_hint(frame, interest)?
+        }
+        endpoint_proto::endpoint_frame::BoundaryView::Discovery(_) => {
+            ShallowClassification::Irrelevant
         }
     };
 
@@ -292,7 +303,7 @@ fn classify_boundary_frame(
     }
 }
 
-/// Parse the top-level group-broadcast branch of the delivery boundary.
+/// Parse the top-level group-broadcast endpoint branch.
 fn parse_group_broadcast_frame_hint(
     frame: &proto::GroupBroadcastFrameView<'_>,
     interest: DeliveryInterestView<'_>,
@@ -310,7 +321,7 @@ fn parse_group_broadcast_frame_hint(
     }
 }
 
-/// Parse the top-level reliable-delivery branch of the delivery boundary.
+/// Parse the top-level reliable-delivery endpoint branch.
 fn parse_reliable_delivery_frame_hint(
     frame: &proto::ReliableDeliveryFrameView<'_>,
     interest: DeliveryInterestView<'_>,
@@ -432,14 +443,13 @@ fn parse_reliable_envelope_hint(
     if let Some(classification) = interest.check_local_member(&recipient) {
         return Ok(classification);
     }
+    let delivery_message_id =
+        message_id_from_wire(header.message_id, "ReliableEnvelopeHeader.message_id")?;
     Ok(ShallowClassification::Relevant {
         owner: SemanticOwner::ReliableDelivery,
         target: DeliveryTargetHint::ReliableRecipient {
             recipient,
-            delivery_message_id: Some(message_id_from_wire(
-                header.message_id,
-                "ReliableEnvelopeHeader.message_id",
-            )?),
+            delivery_message_id: Some(delivery_message_id),
         },
     })
 }
@@ -597,14 +607,15 @@ fn parse_reliable_relay_store_confirmation_hint(
     })
 }
 
-/// Decode the full boundary frame once shallow classification has already said
+/// Decode the full endpoint branch once shallow classification has already said
 /// the payload is locally relevant.
-fn decode_full_boundary_frame(
+fn decode_full_endpoint_boundary(
     payload: &[u8],
-) -> Result<proto::delivery_boundary_frame::Boundary, DeliveryWireError> {
-    let boundary = proto::DeliveryBoundaryFrame::decode_from_slice(payload).context(DecodeSnafu)?;
+) -> Result<endpoint_proto::endpoint_frame::Boundary, DeliveryWireError> {
+    let boundary =
+        endpoint_proto::EndpointFrame::decode_from_slice(payload).context(DecodeSnafu)?;
     boundary.boundary.context(MissingOneofSnafu {
-        name: "DeliveryBoundaryFrame.boundary",
+        name: "EndpointFrame.boundary",
     })
 }
 
@@ -661,7 +672,7 @@ fn uuid_from_wire(raw: &[u8], field: &'static str) -> Result<Uuid, WireValueDeco
     Uuid::from_slice(raw).context(InvalidUuidSnafu { field })
 }
 
-/// Semantic owner for one delivery boundary branch.
+/// Semantic owner for one delivery endpoint branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SemanticOwner {
     GroupBroadcast,
@@ -673,6 +684,27 @@ impl std::fmt::Display for SemanticOwner {
         match self {
             Self::GroupBroadcast => write!(f, "group_broadcast"),
             Self::ReliableDelivery => write!(f, "reliable_delivery"),
+        }
+    }
+}
+
+/// Endpoint-frame branch selected by full protobuf decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointBoundaryOwner {
+    /// Group-broadcast delivery branch.
+    GroupBroadcast,
+    /// Reliable-delivery branch.
+    ReliableDelivery,
+    /// Discovery branch, which delivery should have dropped during shallow classification.
+    Discovery,
+}
+
+impl std::fmt::Display for EndpointBoundaryOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GroupBroadcast => write!(f, "group_broadcast"),
+            Self::ReliableDelivery => write!(f, "reliable_delivery"),
+            Self::Discovery => write!(f, "discovery"),
         }
     }
 }
@@ -733,7 +765,7 @@ mod tests {
         }
     }
 
-    fn encode_boundary_frame(frame: &proto::DeliveryBoundaryFrame) -> IoPayload {
+    fn encode_endpoint_frame(frame: &endpoint_proto::EndpointFrame) -> IoPayload {
         IoPayload::from(frame.encode_to_bytes())
     }
 
@@ -750,6 +782,41 @@ mod tests {
 
     fn members(values: impl IntoIterator<Item = MemberIdentity>) -> HashSet<MemberIdentity> {
         values.into_iter().collect()
+    }
+
+    #[test]
+    fn endpoint_discovery_frame_is_ignored_by_delivery() {
+        let discovery = discovery_proto::DiscoveryFrame {
+            body: Some(discovery_proto::discovery_frame::Body::IntroductionRequest(
+                Box::new(discovery_proto::IntroductionRequest {
+                    request_nonce: vec![0x42; 32],
+                    ..discovery_proto::IntroductionRequest::default()
+                }),
+            )),
+            ..discovery_proto::DiscoveryFrame::default()
+        };
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::Discovery(
+                Box::new(discovery),
+            )),
+            ..endpoint_proto::EndpointFrame::default()
+        };
+
+        let group_memberships = group_memberships([]);
+        let local_members = members([]);
+        let hosted_mailboxes = members([]);
+        let mut payload = encode_endpoint_frame(&boundary);
+        let decoded = decode_endpoint_frame_if_delivery_relevant(
+            &mut payload,
+            DeliveryInterestView {
+                group_memberships: &group_memberships,
+                local_members: &local_members,
+                hosted_mailboxes: &hosted_mailboxes,
+            },
+        )
+        .expect("endpoint discovery frame should be ignored cleanly");
+
+        assert_eq!(decoded, None);
     }
 
     #[test]
@@ -777,18 +844,18 @@ mod tests {
             ))),
             ..proto::GroupBroadcastFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::GroupBroadcast(
                 Box::new(frame),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
 
         let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(&boundary);
-        let decoded = decode_boundary_frame_if_interested(
+        let mut payload = encode_endpoint_frame(&boundary);
+        let decoded = decode_endpoint_frame_if_delivery_relevant(
             &mut payload,
             DeliveryInterestView {
                 group_memberships: &group_memberships,
@@ -826,18 +893,18 @@ mod tests {
             ))),
             ..proto::GroupBroadcastFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::GroupBroadcast(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::GroupBroadcast(
                 Box::new(frame.clone()),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
 
         let group_memberships = group_memberships([group_id]);
         let local_members = members([]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(&boundary);
-        let decoded = decode_boundary_frame_if_interested(
+        let mut payload = encode_endpoint_frame(&boundary);
+        let decoded = decode_endpoint_frame_if_delivery_relevant(
             &mut payload,
             DeliveryInterestView {
                 group_memberships: &group_memberships,
@@ -879,18 +946,18 @@ mod tests {
             )),
             ..proto::ReliableDeliveryFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(
                 Box::new(frame),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
 
         let group_memberships = group_memberships([]);
         let local_members = members([member(&["charlie"])]);
         let hosted_mailboxes = members([]);
-        let mut payload = encode_boundary_frame(&boundary);
-        let decoded = decode_boundary_frame_if_interested(
+        let mut payload = encode_endpoint_frame(&boundary);
+        let decoded = decode_endpoint_frame_if_delivery_relevant(
             &mut payload,
             DeliveryInterestView {
                 group_memberships: &group_memberships,
@@ -921,18 +988,18 @@ mod tests {
             )),
             ..proto::ReliableDeliveryFrame::default()
         };
-        let boundary = proto::DeliveryBoundaryFrame {
-            boundary: Some(proto::delivery_boundary_frame::Boundary::ReliableDelivery(
+        let boundary = endpoint_proto::EndpointFrame {
+            boundary: Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(
                 Box::new(frame.clone()),
             )),
-            ..proto::DeliveryBoundaryFrame::default()
+            ..endpoint_proto::EndpointFrame::default()
         };
 
         let group_memberships = group_memberships([]);
         let local_members = members([]);
         let hosted_mailboxes = members([recipient.clone()]);
-        let mut payload = encode_boundary_frame(&boundary);
-        let decoded = decode_boundary_frame_if_interested(
+        let mut payload = encode_endpoint_frame(&boundary);
+        let decoded = decode_endpoint_frame_if_delivery_relevant(
             &mut payload,
             DeliveryInterestView {
                 group_memberships: &group_memberships,

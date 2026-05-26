@@ -1,18 +1,15 @@
 use super::{RuntimeHostError, config_keys};
 use crate::{
     api::MemberIdentity,
-    delivery::{
-        route_transport::{
-            DatagramRouteScope,
-            DiscoveryRouteUpdate,
-            RouteDiscoveryPort,
-            RoutePreferenceRank,
-            RouteSharingKind,
-            SendRouteCandidate,
-            TransportRouteKey,
-            UdpRouteKey,
-        },
-        shared::ReachabilityClass,
+    delivery::route_transport::{
+        DatagramRouteScope,
+        DiscoveryRouteUpdate,
+        RouteDiscoveryPort,
+        RoutePreferenceRank,
+        RouteSharingKind,
+        SendRouteCandidate,
+        TransportRouteKey,
+        UdpRouteKey,
     },
 };
 use flotsync_io::prelude::{UdpIndication, UdpPort};
@@ -264,7 +261,6 @@ impl PreconfiguredPeerRoute {
     ) -> DiscoveryRouteUpdate<TransportRouteKey> {
         DiscoveryRouteUpdate::PeerRoutes {
             peer: self.peer.clone(),
-            classification: ReachabilityClass::Reachable,
             routes: vec![SendRouteCandidate {
                 coverage_key: TransportRouteKey::Udp(UdpRouteKey {
                     remote_addr: self.remote_addr,

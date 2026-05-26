@@ -135,14 +135,6 @@ pub struct StableRouteKey {
     pub route_id: LogicalRouteId,
 }
 
-/// Discovery-owned reachability classes as consumed by the delivery domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReachabilityClass {
-    Known,
-    Reachable,
-    Stale,
-}
-
 /// Active route states from the queue model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteActiveState {

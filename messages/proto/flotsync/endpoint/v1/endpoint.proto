@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package flotsync.endpoint.v1;
+
+import "flotsync/delivery/v1/delivery.proto";
+import "flotsync/discovery/v1/discovery.proto";
+
+// Top-level runtime endpoint frame split by semantic owner.
+message EndpointFrame {
+  oneof boundary {
+    flotsync.delivery.v1.GroupBroadcastFrame group_broadcast = 1;
+    flotsync.delivery.v1.ReliableDeliveryFrame reliable_delivery = 2;
+    flotsync.discovery.v1.DiscoveryFrame discovery = 3;
+  }
+}
