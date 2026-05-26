@@ -278,9 +278,13 @@ impl PeerAnnouncementComponent {
         }
 
         for interface in active_interfaces {
-            let mac = interface
-                .mac
-                .expect("active broadcast interfaces are filtered to have a MAC address");
+            let Some(mac) = interface.mac else {
+                trace!(
+                    self.log(),
+                    "Skipping active interface {} because it has no MAC address", interface.name
+                );
+                continue;
+            };
             if let Some(broadcast_address) = self.get_broadcast_address_for_interface(&interface) {
                 if let Some(address) = self.broadcast_addresses.get_mut(&mac) {
                     if address != &broadcast_address {

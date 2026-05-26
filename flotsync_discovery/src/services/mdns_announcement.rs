@@ -168,9 +168,12 @@ mod kompact_implementation {
                             Ok(event_loop) => {
                                 while !shutdown_watcher.should_shutdown() {
                                     // A compromise between super hot polling and shutdown speed.
-                                    event_loop
-                                        .poll(Duration::from_secs(1))
-                                        .expect("should have been able to poll event loop");
+                                    if let Err(error) = event_loop.poll(Duration::from_secs(1)) {
+                                        actor_ref.tell(
+                                            MdnsAnnouncementMessages::registration_failed(error),
+                                        );
+                                        break;
+                                    }
                                     std::thread::yield_now();
                                 }
                             }
@@ -264,7 +267,7 @@ mod kompact_implementation {
 
         fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
             match msg {
-                MdnsAnnouncementMessages::Public(_) => unimplemented!("No public messages yet"),
+                MdnsAnnouncementMessages::Public(public) => match public {},
                 MdnsAnnouncementMessages::Internal(internal) => match internal {
                     InternalMdnsAnnouncementMessage::ServiceRegistered(registration) => {
                         transform_state_match!(self, state, {

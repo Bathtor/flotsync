@@ -19,25 +19,6 @@ impl<T> State<T> {
     pub fn set(&mut self, v: T) {
         self.0 = Some(v);
     }
-
-    // pub fn transform<F>(&mut self, transformer: F) -> HandlerResult
-    // where
-    //     F: FnOnce(T) -> StateUpdate<T>,
-    // {
-    //     let t = self.take();
-    //     let res = transformer(t);
-    //     match res {
-    //         StateUpdate::NoUpdate { old_state, result } => {
-    //             self.set(old_state);
-    //             result
-    //         }
-    //         StateUpdate::Update { new_state, result } => {
-    //             self.set(new_state);
-    //             result
-    //         }
-    //         StateUpdate::Invalid { msg } => Handled::SHUTDOWN,
-    //     }
-    // }
 }
 
 #[derive(Debug)]
@@ -108,17 +89,6 @@ impl StateHandled for HandlerResult {
         }
     }
 }
-
-// #[macro_export]
-// macro_rules! transform_state {
-//     ($state:expr, $func:expr) => {{
-//         // let tmp = $state.take();
-//         // let (res, new_state) = $func(tmp);
-//         // $state.set(new_state);
-//         // res
-//         $state.transform($func)
-//     }};
-// }
 
 #[macro_export]
 macro_rules! transform_state_match {

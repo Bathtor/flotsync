@@ -15,7 +15,7 @@ use flotsync_discovery::{
 };
 use flotsync_io::prelude::{DriverConfig, IoRuntime};
 use std::{
-    io::{BufRead, BufReader},
+    io::{self, BufRead, BufReader},
     sync::Arc,
     time::Duration,
 };
@@ -82,7 +82,13 @@ impl ActiveService {
 fn main() {
     let args = Args::parse();
 
-    let kompact_system = KompactConfig::default().build().wait().expect("system");
+    let kompact_system = match KompactConfig::default().build().wait() {
+        Ok(system) => system,
+        Err(error) => {
+            eprintln!("Could not start Kompact system: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let active_service = if args.active {
         let instance_id = Uuid::new_v4();
@@ -115,16 +121,17 @@ fn main() {
         None
     };
 
-    wait_for_enter();
+    if let Err(error) = wait_for_enter() {
+        log::warn!("Could not read shutdown prompt input: {error}");
+    }
 
     log::info!("Shutting down service...");
     if let Some(active_service) = active_service {
         active_service.stop(&kompact_system);
     }
-    kompact_system
-        .shutdown()
-        .wait()
-        .expect("Kompact System shutdown");
+    if let Err(error) = kompact_system.shutdown().wait() {
+        log::warn!("Could not shut down Kompact system: {error}");
+    }
 }
 
 fn start_peer_announcement(
@@ -177,12 +184,12 @@ fn shutdown_after_start_error(system: &KompactSystem, error: &str) -> ! {
     std::process::exit(1)
 }
 
-fn wait_for_enter() {
+fn wait_for_enter() -> io::Result<()> {
     let mut reader = BufReader::new(std::io::stdin());
     let mut line = String::new();
 
     println!("Press Enter to exit...");
 
-    // Wait for a line of input
-    reader.read_line(&mut line).unwrap();
+    reader.read_line(&mut line)?;
+    Ok(())
 }
