@@ -9,6 +9,8 @@ use flotsync_discovery::{
     services::{
         PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
         PeerAnnouncementComponent,
+        PeerAnnouncementMessage,
+        PeerAnnouncementRoute,
         peer_announcement_startup_signal,
     },
     uuid::Uuid,
@@ -16,6 +18,7 @@ use flotsync_discovery::{
 use flotsync_io::prelude::{DriverConfig, IoRuntime};
 use std::{
     io::{self, BufRead, BufReader},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -142,6 +145,10 @@ fn start_peer_announcement(
 
     let (startup_promise, startup_future) = peer_announcement_startup_signal();
     let options = PEER_ANNOUNCEMENT_DEFAULT_OPTIONS.with_instance_id(instance_id);
+    let placeholder_route = PeerAnnouncementRoute::Udp(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        *options.port,
+    ));
     let component = system.create(move || {
         PeerAnnouncementComponent::with_options_and_startup_promise(options, startup_promise)
     });
@@ -155,10 +162,17 @@ fn start_peer_announcement(
     system.start_notify(&component).wait();
 
     match startup_future.wait_timeout(Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok(ActiveService::PeerAnnouncement {
-            io_runtime,
-            component,
-        }),
+        Ok(Ok(())) => {
+            component
+                .actor_ref()
+                .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
+                    placeholder_route,
+                ]));
+            Ok(ActiveService::PeerAnnouncement {
+                io_runtime,
+                component,
+            })
+        }
         Ok(Err(error)) => Err(error.to_string()),
         Err(error) => Err(format!(
             "Timed out waiting for the UDP peer-announcement runtime to start: {error:?}"

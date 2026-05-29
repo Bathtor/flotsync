@@ -11,6 +11,8 @@ mod peer_announcement;
 pub use peer_announcement::{
     PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
     PeerAnnouncementComponent,
+    PeerAnnouncementMessage,
+    PeerAnnouncementRoute,
     PeerAnnouncementStartupError,
     PeerAnnouncementStartupResult,
     peer_announcement_startup_signal,
