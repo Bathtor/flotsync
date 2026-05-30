@@ -1,6 +1,7 @@
 use super::{BindLocalEndpointSnafu, ControlFutureSnafu, RuntimeControlError, RuntimeHostError};
 use flotsync_io::prelude::{
     SocketId,
+    UdpBindOptions,
     UdpIndication,
     UdpLocalBind,
     UdpOpenRequestId,
@@ -115,6 +116,7 @@ impl Actor for LocalEndpointManager {
                         self.udp.trigger(UdpRequest::Bind {
                             request_id,
                             bind: UdpLocalBind::Exact(self.configured_bind_addr),
+                            options: UdpBindOptions::default(),
                         });
                     }
                     LocalEndpointManagerState::Binding { .. } => {

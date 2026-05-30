@@ -9,6 +9,7 @@ use snafu::prelude::*;
 mod peer_announcement;
 #[cfg(feature = "peer-announcement-via-kompact")]
 pub use peer_announcement::{
+    DEFAULT_PEER_ANNOUNCEMENT_PORT,
     PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
     PeerAnnouncementComponent,
     PeerAnnouncementMessage,

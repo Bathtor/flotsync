@@ -38,6 +38,7 @@ pub mod prelude {
             TcpCommand,
             TcpEvent,
             TransmissionId,
+            UdpBindOptions,
             UdpCloseReason,
             UdpCommand,
             UdpEvent,

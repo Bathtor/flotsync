@@ -27,6 +27,7 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
         .dispatch(DriverCommand::Udp(UdpCommand::Bind {
             socket_id,
             bind: UdpLocalBind::Exact(local_addr),
+            options: UdpBindOptions::default(),
         }))
         .expect("dispatch UDP bind");
 
@@ -48,6 +49,89 @@ fn bind_socket_at(driver: &IoDriver, socket_id: SocketId, local_addr: SocketAddr
         }
         other => unreachable!("filtered to UDP Bound event, got {other:?}"),
     }
+}
+
+#[test]
+fn udp_bind_request_options_enable_reuse_without_driver_default() {
+    init_test_logger();
+
+    let socket_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+    let socket_id = reserve_socket(&driver);
+    let request_addr = socket_lease.addr(0);
+
+    driver
+        .dispatch(DriverCommand::Udp(UdpCommand::Bind {
+            socket_id,
+            bind: UdpLocalBind::Exact(request_addr),
+            options: UdpBindOptions::default().with_socket_reuse(true),
+        }))
+        .expect("dispatch UDP bind with request reuse");
+
+    match wait_for_driver_event(&driver, |event| {
+        matches!(
+            event,
+            DriverEvent::Udp(UdpEvent::Bound {
+                socket_id: observed_socket_id,
+                ..
+            }) if *observed_socket_id == socket_id
+        )
+    }) {
+        DriverEvent::Udp(UdpEvent::Bound {
+            socket_id: observed_socket_id,
+            local_addr,
+        }) => {
+            assert_eq!(observed_socket_id, socket_id);
+            assert_eq!(local_addr, request_addr);
+        }
+        other => unreachable!("filtered to UDP Bound event, got {other:?}"),
+    }
+
+    driver.shutdown().expect("driver shuts down");
+}
+
+#[test]
+fn udp_connect_request_options_enable_reuse_without_driver_default() {
+    init_test_logger();
+
+    let socket_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
+    let socket_id = reserve_socket(&driver);
+    let local_addr = socket_lease.addr(0);
+    let remote_addr = socket_lease.addr(1);
+
+    driver
+        .dispatch(DriverCommand::Udp(UdpCommand::Connect {
+            socket_id,
+            remote_addr,
+            bind: UdpLocalBind::Exact(local_addr),
+            options: UdpBindOptions::default().with_socket_reuse(true),
+        }))
+        .expect("dispatch UDP connect with request reuse");
+
+    match wait_for_driver_event(&driver, |event| {
+        matches!(
+            event,
+            DriverEvent::Udp(UdpEvent::Connected {
+                socket_id: observed_socket_id,
+                ..
+            }) if *observed_socket_id == socket_id
+        )
+    }) {
+        DriverEvent::Udp(UdpEvent::Connected {
+            socket_id: observed_socket_id,
+            local_addr: observed_local_addr,
+            remote_addr: observed_remote_addr,
+        }) => {
+            assert_eq!(observed_socket_id, socket_id);
+            assert_eq!(observed_local_addr, local_addr);
+            assert_eq!(observed_remote_addr, remote_addr);
+        }
+        other => unreachable!("filtered to UDP Connected event, got {other:?}"),
+    }
+
+    driver.shutdown().expect("driver shuts down");
 }
 
 #[test]
@@ -113,6 +197,7 @@ fn udp_driver_supports_unconnected_and_connected_send_paths_and_closed_nacks() {
             socket_id: connected_sender_id,
             remote_addr: receiver_addr,
             bind: UdpLocalBind::ForPeer(receiver_addr),
+            options: UdpBindOptions::default(),
         }))
         .expect("dispatch connected UDP open");
 
@@ -251,6 +336,7 @@ fn udp_driver_reports_bind_failures_and_socket_configuration_changes() {
         .dispatch(DriverCommand::Udp(UdpCommand::Bind {
             socket_id: failed_socket_id,
             bind: UdpLocalBind::Exact(occupied_addr),
+            options: UdpBindOptions::default(),
         }))
         .expect("dispatch UDP bind that should fail");
 

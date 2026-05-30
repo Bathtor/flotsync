@@ -10,6 +10,7 @@ use crate::{
         SendFailureReason,
         SocketId,
         TransmissionId,
+        UdpBindOptions,
         UdpCloseReason,
         UdpLocalBind,
         UdpSocketOption,
@@ -78,6 +79,7 @@ pub enum UdpRequest {
     Bind {
         request_id: UdpOpenRequestId,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     },
     /// Opens one new connected UDP socket.
     ///
@@ -88,6 +90,7 @@ pub enum UdpRequest {
         request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     },
     /// Sends one datagram through the identified UDP socket.
     ///

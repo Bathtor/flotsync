@@ -1,10 +1,11 @@
-use crate::{SocketPort, kompact::prelude::*};
+use crate::{SocketPort, config_keys, kompact::prelude::*};
 use flotsync_io::prelude::{
     ConfigureFailureReason,
     IoPayload,
     OpenFailureReason,
     SocketId,
     TransmissionId,
+    UdpBindOptions,
     UdpIndication,
     UdpLocalBind,
     UdpOpenRequestId,
@@ -27,20 +28,42 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Default custom UDP port for Flotsync peer announcements.
+pub const DEFAULT_PEER_ANNOUNCEMENT_PORT: SocketPort = SocketPort(52156);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
+    /// Local IP address for the UDP announcement socket bind.
     pub bind_addr: IpAddr,
+    /// Local UDP port for the announcement socket bind.
+    ///
+    /// Keep this equal to [`Self::port`] for the normal Flotsync discovery protocol. A different
+    /// value is mainly useful for tests, diagnostics, or transitional deployments where the sender
+    /// must use one local port while targeting receivers on another port.
+    ///
+    /// Defaults to [`DEFAULT_PEER_ANNOUNCEMENT_PORT`].
     pub bind_port: SocketPort,
+    /// UDP port used for broadcast announcement targets.
+    ///
+    /// Keep this equal to [`Self::bind_port`] for the normal Flotsync discovery protocol. A
+    /// different value targets listeners on another port while keeping the local socket bind
+    /// separate.
+    ///
+    /// Defaults to [`DEFAULT_PEER_ANNOUNCEMENT_PORT`].
     pub port: SocketPort,
+    /// Time between periodic announcement attempts after startup or a route update.
     pub announcement_interval: Duration,
+    /// Per-announcer instance identifier encoded into outgoing `Peer` messages.
+    ///
+    /// The default is nil; production callers should provide a real instance id.
     pub instance_id: Uuid,
 }
 
 impl Options {
     pub const DEFAULT: Self = Self {
         bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        bind_port: SocketPort(0),
-        port: SocketPort(52156),
+        bind_port: DEFAULT_PEER_ANNOUNCEMENT_PORT,
+        port: DEFAULT_PEER_ANNOUNCEMENT_PORT,
         announcement_interval: Duration::from_secs(5),
         instance_id: Uuid::nil(),
     };
@@ -71,8 +94,10 @@ pub const PEER_ANNOUNCEMENT_DEFAULT_OPTIONS: Options = Options::DEFAULT;
 pub type PeerAnnouncementStartupResult = std::result::Result<(), PeerAnnouncementStartupError>;
 
 /// Describes why the UDP announcer could not become ready for periodic broadcasts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub enum PeerAnnouncementStartupError {
+    #[snafu(display("Could not load peer-announcement configuration {key}: {reason}"))]
+    ConfigurationFailed { key: &'static str, reason: String },
     #[snafu(display("Could not bind the peer-announcement socket at {local_addr}: {reason:?}"))]
     BindFailed {
         local_addr: SocketAddr,
@@ -230,13 +255,35 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn begin_startup(&mut self) {
+    fn begin_startup(&mut self) -> HandlerResult {
+        let bind_options = match self.bind_options() {
+            Ok(bind_options) => bind_options,
+            Err(error) => {
+                error!(self.log(), "{error}");
+                self.notify_startup_failure(error);
+                return Handled::SHUTDOWN;
+            }
+        };
         let request_id = UdpOpenRequestId::new();
         self.state = SocketState::Opening { request_id };
         self.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(self.bind_address()),
+            options: bind_options,
         });
+        Handled::OK
+    }
+
+    fn bind_options(&self) -> std::result::Result<UdpBindOptions, PeerAnnouncementStartupError> {
+        let socket_reuse = self
+            .ctx
+            .config()
+            .read_or_default(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS)
+            .map_err(|error| PeerAnnouncementStartupError::ConfigurationFailed {
+                key: config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS.key,
+                reason: error.to_string(),
+            })?;
+        Ok(UdpBindOptions::default().with_socket_reuse(socket_reuse))
     }
 
     fn get_active_broadcast_interfaces() -> Vec<NetworkInterface> {
@@ -588,8 +635,7 @@ impl PeerAnnouncementComponent {
 
 impl ComponentLifecycle for PeerAnnouncementComponent {
     fn on_start(&mut self) -> HandlerResult {
-        self.begin_startup();
-        Handled::OK
+        self.begin_startup()
     }
 
     fn on_stop(&mut self) -> HandlerResult {
@@ -659,6 +705,7 @@ mod tests {
     use super::*;
     use flotsync_io::test_support::{
         build_test_kompact_system,
+        build_test_kompact_system_with,
         kill_component,
         recv_until,
         start_component,
@@ -719,11 +766,19 @@ mod tests {
         let request_id = match recv_until(&requests_rx, |request| {
             matches!(request, UdpRequest::Bind { .. })
         }) {
-            UdpRequest::Bind { request_id, bind } => {
+            UdpRequest::Bind {
+                request_id,
+                bind,
+                options,
+            } => {
                 assert_eq!(
                     bind,
-                    UdpLocalBind::Exact(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0,))
+                    UdpLocalBind::Exact(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        *DEFAULT_PEER_ANNOUNCEMENT_PORT,
+                    ))
                 );
+                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(true));
                 request_id
             }
             other => unreachable!("filtered to bind request, got {other:?}"),
@@ -745,6 +800,34 @@ mod tests {
                 assert_eq!(option, UdpSocketOption::Broadcast(true));
             }
             other => unreachable!("filtered to configure request, got {other:?}"),
+        }
+
+        kill_component(&system, component);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn peer_announcement_component_applies_bind_reuse_config_override() {
+        let system = build_test_kompact_system_with(|config| {
+            config.set_config_value(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS, false);
+        });
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let component =
+            system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
+
+        start_component(&system, &probe);
+        start_component(&system, &component);
+
+        match recv_until(&requests_rx, |request| {
+            matches!(request, UdpRequest::Bind { .. })
+        }) {
+            UdpRequest::Bind { options, .. } => {
+                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(false));
+            }
+            other => unreachable!("filtered to bind request, got {other:?}"),
         }
 
         kill_component(&system, component);

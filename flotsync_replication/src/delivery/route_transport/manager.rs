@@ -41,6 +41,7 @@ use flotsync_io::prelude::{
     OpenFailureReason,
     SendFailureReason,
     SocketId,
+    UdpBindOptions,
     UdpCloseReason,
     UdpIndication,
     UdpLocalBind,
@@ -391,8 +392,11 @@ impl RouteTransportManager {
             },
         );
         self.udp_open_requests.insert(request_id, socket_key);
-        self.udp_bridge_port
-            .trigger(UdpRequest::Bind { request_id, bind });
+        self.udp_bridge_port.trigger(UdpRequest::Bind {
+            request_id,
+            bind,
+            options: UdpBindOptions::default(),
+        });
     }
 
     fn handle_udp_bound(

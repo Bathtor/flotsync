@@ -59,6 +59,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
         component.udp.trigger(UdpRequest::Bind {
             request_id: receiver_request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(0)),
+            options: UdpBindOptions::default(),
         });
     });
     let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
@@ -106,6 +107,7 @@ fn udp_bridge_broadcasts_shared_indications_and_keeps_send_results_private() {
         component.udp.trigger(UdpRequest::Bind {
             request_id: sender_request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(1)),
+            options: UdpBindOptions::default(),
         });
     });
     let sender_id = match recv_until(&observer1_rx, |event| {
@@ -274,6 +276,7 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(0)),
+            options: UdpBindOptions::default(),
         });
     });
     let bound_addr = match recv_until(&observer1_rx, |event| {
@@ -311,6 +314,7 @@ fn udp_bridge_shutdown_releases_owned_socket_bindings() {
         component.udp.trigger(UdpRequest::Bind {
             request_id: rebound_request_id,
             bind: UdpLocalBind::Exact(bound_addr),
+            options: UdpBindOptions::default(),
         });
     });
     match recv_until(&observer2_rx, |event| {

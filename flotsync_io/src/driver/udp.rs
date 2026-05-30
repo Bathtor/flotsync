@@ -8,6 +8,7 @@ use crate::{
         SendFailureReason,
         SocketId,
         TransmissionId,
+        UdpBindOptions,
         UdpCloseReason,
         UdpEvent,
         UdpLocalBind,
@@ -168,6 +169,7 @@ impl UdpRuntimeState {
         &mut self,
         socket_id: SocketId,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
@@ -190,17 +192,18 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let socket = match bind_udp_socket(local_addr, self.bind_reuse_address) {
-            Ok(socket) => socket,
-            Err(error) => {
-                event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
-                    socket_id,
-                    local_addr,
-                    error_kind: error.kind(),
-                }))?;
-                return Ok(());
-            }
-        };
+        let socket =
+            match bind_udp_socket(local_addr, self.bind_reuse_address || options.socket_reuse) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    event_sink.publish(super::DriverEvent::Udp(UdpEvent::BindFailed {
+                        socket_id,
+                        local_addr,
+                        error_kind: error.kind(),
+                    }))?;
+                    return Ok(());
+                }
+            };
 
         let actual_local_addr = match socket.local_addr() {
             Ok(addr) => addr,
@@ -244,6 +247,7 @@ impl UdpRuntimeState {
         socket_id: SocketId,
         remote_addr: SocketAddr,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
         registry: &Registry,
         event_sink: &dyn DriverEventSink,
     ) -> Result<()> {
@@ -268,18 +272,19 @@ impl UdpRuntimeState {
             return Ok(());
         }
 
-        let socket = match bind_udp_socket(local_addr, self.bind_reuse_address) {
-            Ok(socket) => socket,
-            Err(error) => {
-                event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
-                    socket_id,
-                    local_addr,
-                    remote_addr,
-                    error_kind: error.kind(),
-                }))?;
-                return Ok(());
-            }
-        };
+        let socket =
+            match bind_udp_socket(local_addr, self.bind_reuse_address || options.socket_reuse) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    event_sink.publish(super::DriverEvent::Udp(UdpEvent::ConnectFailed {
+                        socket_id,
+                        local_addr,
+                        remote_addr,
+                        error_kind: error.kind(),
+                    }))?;
+                    return Ok(());
+                }
+            };
 
         let connect_result = socket.connect(remote_addr);
         if let Err(error) = connect_result {
@@ -984,6 +989,7 @@ mod tests {
             .dispatch(DriverCommand::Udp(UdpCommand::Bind {
                 socket_id,
                 bind: UdpLocalBind::Exact(local_addr),
+                options: UdpBindOptions::default(),
             }))
             .expect("dispatch UDP bind");
 
@@ -1108,6 +1114,7 @@ mod tests {
                 socket_id: sender_id,
                 remote_addr: receiver_addr,
                 bind: UdpLocalBind::ForPeer(receiver_addr),
+                options: UdpBindOptions::default(),
             }))
             .expect("dispatch UDP connect");
 
@@ -1232,6 +1239,7 @@ mod tests {
                 socket_id: sender_id,
                 remote_addr: receiver_addr,
                 bind: UdpLocalBind::ForPeer(receiver_addr),
+                options: UdpBindOptions::default(),
             }))
             .expect("dispatch UDP connect");
 
@@ -1576,6 +1584,7 @@ mod tests {
             .handle_bind(
                 socket_id,
                 UdpLocalBind::Exact(socket_lease.addr(1)),
+                UdpBindOptions::default(),
                 poll.registry(),
                 &event_sink,
             )

@@ -20,6 +20,7 @@ use flotsync_io::{
         IoBridgeHandle,
         IoDriverComponent,
         SocketId,
+        UdpBindOptions,
         UdpIndication,
         UdpLocalBind,
         UdpOpenRequestId,
@@ -411,7 +412,11 @@ impl TransportHarnessCore {
         };
         let request_id = UdpOpenRequestId::new();
         self.observer.on_definition(|component| {
-            component.udp.trigger(UdpRequest::Bind { request_id, bind });
+            component.udp.trigger(UdpRequest::Bind {
+                request_id,
+                bind,
+                options: UdpBindOptions::default(),
+            });
         });
         match self.observer_rx.recv_matching_or_fail(
             timeout,

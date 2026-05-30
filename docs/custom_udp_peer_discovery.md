@@ -59,7 +59,8 @@ Delivery frames and discovery introduction frames share this envelope because
 introduction verifies the same endpoint that later carries delivery traffic.
 
 `Peer` beacons are not carried inside `EndpointFrame`; they arrive on the
-custom discovery beacon port.
+custom discovery beacon port. The default Flotsync custom UDP discovery port is
+`52156` for both listening and broadcast targets.
 
 ## 3. Messages
 
