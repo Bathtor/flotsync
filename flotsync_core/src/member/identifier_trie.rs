@@ -191,7 +191,7 @@ impl<V> Iterator for TrieIdentifierIter<'_, V> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrieSet(TrieMap<()>);
 impl TrieSet {
     #[must_use]

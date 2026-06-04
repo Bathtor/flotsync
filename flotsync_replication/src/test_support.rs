@@ -1,5 +1,4 @@
 use crate::{
-    GroupMembers,
     SqliteReplicationStore,
     api::{
         DatasetId,
@@ -9,7 +8,6 @@ use crate::{
         ListenerExternalSnafu,
         LoadError,
         LocalMemberPrivateKeysRecord,
-        MemberIdentity,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -42,7 +40,7 @@ use crate::{
         host::DeliveryRuntimeHostTestExt,
     },
 };
-use flotsync_core::member::Identifier;
+use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
 use flotsync_data_types::RowOperations;
 use flotsync_security::{
     GroupKey,
@@ -57,6 +55,7 @@ use flotsync_security::{
     test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_files_from_seed},
 };
 use flotsync_utils::BoxFuture;
+use futures_util::FutureExt;
 use snafu::prelude::*;
 use std::{
     collections::HashSet,
@@ -152,7 +151,7 @@ pub fn publish_changes(
 /// does not reply within the test timeout.
 pub fn snapshot_read_token(
     runtime: &dyn ReplicationApi,
-    group_id: crate::api::GroupId,
+    group_id: GroupId,
     dataset_id: DatasetId,
 ) -> ReadToken {
     let mut snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
@@ -358,7 +357,7 @@ impl TestEventListener {
 
 impl ReplicationEventListener for TestEventListener {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
-        Box::pin(async move {
+        async move {
             match event {
                 ReplicationEvent::DataChanged {
                     read_token,
@@ -390,7 +389,8 @@ impl ReplicationEventListener for TestEventListener {
                 ReplicationEvent::GroupInvitation { .. } => {}
             }
             Ok(())
-        })
+        }
+        .boxed()
     }
 }
 
@@ -503,7 +503,7 @@ impl RuntimeTestFixture {
     }
 
     /// Wait until this runtime has installed one group.
-    pub fn wait_for_group_install(&self, group_id: crate::api::GroupId) {
+    pub fn wait_for_group_install(&self, group_id: GroupId) {
         flotsync_io::test_support::eventually(
             TEST_WAIT_TIMEOUT,
             || self.contains_group(group_id),
@@ -512,7 +512,7 @@ impl RuntimeTestFixture {
     }
 
     /// Assert this runtime does not install one group during the observation window.
-    pub fn assert_group_never_installed(&self, group_id: crate::api::GroupId) {
+    pub fn assert_group_never_installed(&self, group_id: GroupId) {
         flotsync_io::test_support::assert_never(
             TEST_WAIT_TIMEOUT,
             || self.contains_group(group_id),
@@ -522,7 +522,7 @@ impl RuntimeTestFixture {
 
     /// Return whether this runtime's delivery view contains one group.
     #[must_use]
-    pub fn contains_group(&self, group_id: crate::api::GroupId) -> bool {
+    pub fn contains_group(&self, group_id: GroupId) -> bool {
         self.runtime
             .host()
             .membership_snapshot()
@@ -531,7 +531,7 @@ impl RuntimeTestFixture {
 
     /// Return a cloned member set for one installed group.
     #[must_use]
-    pub fn group_members(&self, group_id: crate::api::GroupId) -> Option<GroupMembers> {
+    pub fn group_members(&self, group_id: GroupId) -> Option<GroupMembers> {
         self.runtime
             .host()
             .membership_snapshot()
@@ -548,7 +548,7 @@ impl RuntimeTestFixture {
     ///
     /// Panics if the runtime rejects the test group installation or does not
     /// reply within the test timeout.
-    pub fn install_group_for_test(&self, group_id: crate::api::GroupId, members: GroupMembers) {
+    pub fn install_group_for_test(&self, group_id: GroupId, members: GroupMembers) {
         self.runtime
             .install_group_for_test(group_id, members)
             .expect("test group should install");
@@ -743,7 +743,7 @@ pub fn test_public_member_keys(member: &MemberIdentity) -> PublicMemberKeys {
 /// Build a deterministic test group key from the full group id.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
-pub(crate) fn test_group_key(group_id: crate::api::GroupId) -> GroupKey {
+pub(crate) fn test_group_key(group_id: GroupId) -> GroupKey {
     test_group_key_from_id(group_id.0)
 }
 

@@ -5,7 +5,9 @@ pub use buffa;
 pub use uuid::Uuid;
 
 pub mod codecs;
+pub mod serialisation;
 pub mod snapshots;
+pub mod wire;
 
 mod generated {
     #![allow(

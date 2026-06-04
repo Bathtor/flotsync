@@ -9,10 +9,7 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
-        GroupId,
         LocalMemberPrivateKeysRecord,
-        MemberIdentity,
-        MemberIndex,
         ReplicationGroupRecord,
         ReplicationRowRecord,
         ReplicationRowSnapshot,
@@ -39,6 +36,9 @@ use crate::{
     },
 };
 use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
     member::IdentifierParseError,
     versions::{UpdateId, VersionVector},
 };

@@ -2,12 +2,13 @@
 
 ## 1. Scope
 
-This document defines the replication communication model as four distinct sub-protocols:
+This document defines the replication communication model as distinct sub-protocols:
 
-1. `PeerDiscovery+Tracking`
-2. `SingleRecipientDurableDelivery`
-3. `GroupBroadcast`
-4. `Replication`
+1. `PeerAnnouncement`
+2. `RouteEstablishment`
+3. `SingleRecipientDurableDelivery`
+4. `GroupBroadcast`
+5. `Replication`
 
 The goal is to keep reachability tracking, recipient-addressed durable delivery,
 group fan-out/storage, and replication semantics separate.
@@ -42,14 +43,41 @@ group fan-out/storage, and replication semantics separate.
 - **G6 Tombstone safety**: Deletes use tombstones so replay/reconstruction remain correct.
 - **G7 Ack promise**: When node `n` sends `Ack(A)`, it promises future updates produced by `n` will not produce versions below `max(A)`, that is an `Ack(A)` is a no-op update for all versions between `A[n]` and `max(A)`.
 
-## 5. Sub-Protocol A: PeerDiscovery+Tracking
+## 5. Sub-Protocol A: PeerAnnouncement
 
 Implementation detail:
-See [`custom_udp_peer_discovery.md`](./custom_udp_peer_discovery.md)
-for the concrete custom UDP discovery protocol currently targeted by the
-replicated-checklist first-release slice.
+See [`route_establishment.md`](./route_establishment.md)
+for how peer-announcement observations feed the concrete route establishment
+protocol currently targeted by the replicated-checklist first-release slice.
 
 ### 5.1 Purpose and Ownership
+
+This sub-protocol only answers:
+
+- which Flotsync-speaking runtime instances are advertising candidate endpoints
+- which endpoint routes those instances claim are worth probing
+
+It does not authenticate member identity, prove reachability, or publish
+replication routes.
+
+### 5.2 Current Message Class
+
+#### `Peer`
+
+Purpose:
+Plaintext peer announcement for one Flotsync-speaking instance and its advertised
+listening endpoints.
+
+It must not carry member ids or group ids.
+
+## 6. Sub-Protocol B: RouteEstablishment
+
+Implementation detail:
+See [`route_establishment.md`](./route_establishment.md)
+for the concrete route establishment protocol currently targeted by the
+replicated-checklist first-release slice.
+
+### 6.1 Purpose and Ownership
 
 This sub-protocol only answers:
 
@@ -60,22 +88,27 @@ This sub-protocol only answers:
 It also authenticates that a reachable route belongs to the claimed member
 identity before exposing the route to replication.
 
-### 5.2 State Model (per remote peer endpoint)
+Route establishment consumes decoded peer-announcement observations, but it is
+not the peer-announcement protocol and does not own the peer-announcement UDP
+port.
+
+Route establishment uses the runtime endpoint port, the same endpoint later used
+by replication transport. The setup layer that initiated the endpoint bind
+reports each new endpoint binding to route establishment. Route establishment
+observes closure itself from the shared UDP indication stream.
+
+There is no central endpoint demultiplexer. Components classify their own
+messages from the shared UDP indications and ignore well-formed endpoint traffic
+for other sub-protocols.
+
+### 6.2 State Model (per remote peer endpoint)
 
 - `Unknown`: No active record; normally represented by absence from tracker state.
-- `Known`: A plaintext beacon was observed, but the endpoint has not been verified.
+- `Known`: A plaintext peer announcement was observed, but the endpoint has not been verified.
 - `Reachable`: A receiver-driven introduction probe verified at least one signed introduction claim.
 - `Stale`: A previously reachable endpoint expired, timed out, or failed refresh.
 
-### 5.3 Current Custom UDP Message Classes
-
-#### `Peer`
-
-Purpose:
-Plaintext beacon for one Flotsync-speaking instance and its advertised
-listening endpoints.
-
-It must not carry member ids or group ids.
+### 6.3 Current Route Establishment Message Classes
 
 #### `IntroductionRequest`
 
@@ -91,10 +124,11 @@ Purpose:
 Return signed member/group claims for the probed route.
 
 Each introduction claim is signed by the claimed member identity and may list
-several group ids for that member. Only claims that intersect local group
-membership are published as replication routes.
+several group ids for that member. Route establishment checks verified claims
+against the shared group membership snapshot and publishes only claims that
+intersect local group membership.
 
-### 5.4 Identity Verification Rules
+### 6.4 Identity Verification Rules
 
 - Every member identity has a public/private signing keypair.
 - For group-scoped discovery, trusted public keys come from local provisioning
@@ -105,14 +139,14 @@ membership are published as replication routes.
 - Signature failure means the route is not published to replication and any
   previously reachable route for the affected member may become `Stale`.
 
-## 6. Sub-Protocol B: SingleRecipientDurableDelivery
+## 7. Sub-Protocol C: SingleRecipientDurableDelivery
 
 Implementation detail:
 See [`single_recipient_durable_delivery.md`](./single_recipient_durable_delivery.md)
 for the concrete sender-side route model and relay mailbox flow that refine this
 section.
 
-### 6.1 Purpose and Ownership
+### 7.1 Purpose and Ownership
 
 This sub-protocol delivers one opaque message durably to one specific
 recipient.
@@ -126,7 +160,7 @@ It is used when:
 It does not interpret payload semantics.
 It does enforce durable-delivery behavior.
 
-### 6.2 Sender-Side Route Model
+### 7.2 Sender-Side Route Model
 
 - one recipient route for the intended recipient
 - zero or more relay mailbox routes
@@ -139,7 +173,7 @@ Unlike `GroupBroadcast`, accepted direct delivery or relay mailbox storage does
 not complete the work item. The sender-side work item completes only when a
 valid `RecipientAck` from the intended recipient is observed.
 
-### 6.3 Message Classes
+### 7.3 Message Classes
 
 #### `DirectMessageEnvelope`
 
@@ -222,7 +256,7 @@ Notes:
 - `MailboxAck` is for relay cleanup only
 - it does not replace `RecipientAck`
 
-### 6.4 Delivery Semantics
+### 7.4 Delivery Semantics
 
 - durable only; there is no `BestEffort` mode
 - sender should attempt direct delivery and relay mailbox storage before giving
@@ -232,13 +266,13 @@ Notes:
 - sender remains aggressive until `RecipientAck` is observed
 - recipient mailbox retrieval is at-least-once until `MailboxAck`
 
-## 7. Sub-Protocol C: GroupBroadcast
+## 8. Sub-Protocol D: GroupBroadcast
 
 Implementation detail:
 See [`group_broadcast_queue_model.md`](./group_broadcast_queue_model.md) for the
 concrete queue/state-machine and ownership model that refines this section.
 
-### 7.1 Purpose and Ownership
+### 8.1 Purpose and Ownership
 
 This sub-protocol fans messages to:
 
@@ -251,7 +285,7 @@ currently unreachable routes.
 It does not interpret replication payload semantics.
 It does enforce delivery-class behavior (`Durable` vs `BestEffort`).
 
-### 7.2 State Model (per group message, per route)
+### 8.2 State Model (per group message, per route)
 
 - `Queued`: accepted for fan-out.
 - `AttemptingDirect`: direct delivery in progress.
@@ -261,7 +295,7 @@ It does enforce delivery-class behavior (`Durable` vs `BestEffort`).
   not explicit active states; reaching one cleans up the active local route
   state.
 
-### 7.3 Message Classes
+### 8.3 Message Classes
 
 #### `GroupMessageEnvelope`
 
@@ -296,7 +330,7 @@ Must convey:
 - message id
 - route identity
 
-### 7.4 Delivery Class Semantics
+### 8.4 Delivery Class Semantics
 
 - `Durable`:
     - for messages that carry important group state and should remain retrievable
@@ -308,9 +342,9 @@ Must convey:
     - broadcast once, no persistence guarantee required
     - unreachable or failed routes expire instead of remaining pending
 
-## 8. Sub-Protocol D: Replication
+## 9. Sub-Protocol E: Replication
 
-### 8.1 Purpose and Ownership
+### 9.1 Purpose and Ownership
 
 This sub-protocol handles:
 
@@ -319,10 +353,10 @@ This sub-protocol handles:
 - pending updates blocked by causality
 - migration initiation/handling
 
-It assumes recipient-addressed bootstrap delivery is handled by sub-protocol B
-and group-scoped delivery is handled by sub-protocol C.
+It assumes recipient-addressed bootstrap delivery is handled by sub-protocol C
+and group-scoped delivery is handled by sub-protocol D.
 
-### 8.2 State Model (per local node, per replication group)
+### 9.2 State Model (per local node, per replication group)
 
 - `Active`: normal update production/application.
 - `CatchUp`: local node is behind known frontier and is requesting data.
@@ -330,7 +364,7 @@ and group-scoped delivery is handled by sub-protocol C.
 - `Migrating`: migration has been proposed/accepted and new-group transition is in progress.
 - `Closed`: old group locally closed for writes by policy.
 
-### 8.3 Message Classes
+### 9.3 Message Classes
 
 #### `Summary`
 
@@ -452,9 +486,9 @@ Must convey:
 - old group id
 - close mode/policy marker
 
-## 9. Cross-Protocol Flows
+## 10. Cross-Protocol Flows
 
-### 9.1 Bootstrap / Invitation
+### 10.1 Bootstrap / Invitation
 
 1. higher-layer logic prepares recipient-addressed bootstrap material (for
    example a migration invitation or key package).
@@ -469,33 +503,34 @@ Must convey:
 7. once the invitation or bootstrap material is accepted, the recipient can
    join the new group.
 
-### 9.2 Initial Sync
+### 10.2 Initial Sync
 
-1. `PeerDiscovery+Tracking`: determine reachable peers/relays.
-2. `Replication`: exchange `Summary`; lagging node sends `NeedRange(hasVV, needsVV)`.
-3. `GroupBroadcast`: deliver envelopes to peers/relays (`NeedRange` usually `BestEffort`; state-bearing responses typically `Durable`).
-4. `Replication`: fulfill with `UpdateBatch` or `Snapshot` + trailing updates.
-5. `Replication`: apply under G3, emit `Ack`.
+1. `PeerAnnouncement` observes candidate endpoints.
+2. `RouteEstablishment` verifies reachable peer routes.
+3. `Replication`: exchange `Summary`; lagging node sends `NeedRange(hasVV, needsVV)`.
+4. `GroupBroadcast`: deliver envelopes to peers/relays (`NeedRange` usually `BestEffort`; state-bearing responses typically `Durable`).
+5. `Replication`: fulfil with `UpdateBatch` or `Snapshot` + trailing updates.
+6. `Replication`: apply under G3, emit `Ack`.
 
-### 9.3 Reconnect/Resume
+### 10.3 Reconnect/Resume
 
 Same wire behavior as initial sync: VV is the cursor.
 
-### 9.4 Concurrent Bidirectional Sync
+### 10.4 Concurrent Bidirectional Sync
 
 1. both nodes emit `Update` for local writes.
 2. both nodes may issue `NeedRange`.
 3. broadcast handles fan-out/retry independently from replication logic.
 4. each node advances local VV as causality permits.
 
-### 9.5 Causality-Blocked Replay
+### 10.5 Causality-Blocked Replay
 
 1. receive update with unsatisfied `ReadVV`.
 2. enter `CausalityBlocked` for that group.
 3. request missing range via `NeedRange`.
 4. apply buffered update once dependencies arrive.
 
-### 9.6 Migration
+### 10.6 Migration
 
 1. `Replication`: emit `MigrationInit` or equivalent recipient-addressed
    invitation material.
@@ -508,14 +543,14 @@ Same wire behavior as initial sync: VV is the cursor.
 6. optional `GroupClose` updates old-group write/read policy.
 7. ignoring migration can intentionally split old/new group activity.
 
-## 10. Error Handling and Compatibility
+## 11. Error Handling and Compatibility
 
 - Unknown message kinds are ignored.
 - No mandatory negative response is required.
 - Integrity/authentication failures cause drop.
 - Temporary feature mismatch can be tolerated by ignoring unsupported messages.
 
-## 11. Security / Trust Assumptions
+## 12. Security / Trust Assumptions
 
 - Group payloads are end-to-end encrypted/authenticated.
 - Recipient-addressed bootstrap payloads are encrypted/authenticated for the
@@ -524,7 +559,7 @@ Same wire behavior as initial sync: VV is the cursor.
 - Migration key rollout must exclude removed members.
 - Migration acceptance is a user/policy safety boundary.
 
-## 12. Wire-Format Notes (Deferred)
+## 13. Wire-Format Notes (Deferred)
 
 - Keep a common outer envelope for all sub-protocol messages.
 - Include message id, sender id, group id or recipient id (as applicable),

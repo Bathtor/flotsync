@@ -28,16 +28,17 @@ This document does not yet specify:
 
 ## 2. Relationship to Other Sub-Protocols
 
-### 2.1 PeerDiscovery+Tracking
+### 2.1 Discovery Route Publication
 
-Discovery still owns:
+Peer announcement and route establishment together feed discovery route
+publication. That discovery side owns:
 
 - whether the recipient is currently reachable directly
 - how relays are reached
 - identity verification for peers and relays
 
-Single-recipient delivery consumes that information. It does not probe or
-authenticate peers on its own.
+Single-recipient delivery consumes verified route information. It does not
+listen for peer announcements, probe routes, or authenticate peers on its own.
 
 ### 2.2 GroupBroadcast
 

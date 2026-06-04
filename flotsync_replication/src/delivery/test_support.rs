@@ -10,8 +10,7 @@ use super::route_transport::{
     TransportRouteKey,
     manager::{RouteTransportManager, configure_replication_runtime},
 };
-use crate::api::MemberIdentity;
-use flotsync_core::member::IdentifierBuf;
+use flotsync_core::{MemberIdentity, member::IdentifierBuf};
 use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{
@@ -81,11 +80,7 @@ impl DiscoveryRouteSource {
 
 ignore_lifecycle!(DiscoveryRouteSource);
 
-impl Provide<RouteDiscoveryPort<TransportRouteKey>> for DiscoveryRouteSource {
-    fn handle(&mut self, _request: Never) -> HandlerResult {
-        unreachable!("route discovery test source is indication-only")
-    }
-}
+ignore_requests!(RouteDiscoveryPort<TransportRouteKey>, DiscoveryRouteSource);
 
 impl Actor for DiscoveryRouteSource {
     type Message = Never;

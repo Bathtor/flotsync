@@ -9,13 +9,15 @@ use snafu::prelude::*;
 mod peer_announcement;
 #[cfg(feature = "peer-announcement-via-kompact")]
 pub use peer_announcement::{
-    DEFAULT_PEER_ANNOUNCEMENT_PORT,
+    Options as PeerAnnouncementOptions,
     PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
     PeerAnnouncementComponent,
     PeerAnnouncementMessage,
     PeerAnnouncementRoute,
+    PeerAnnouncementSocketMaintenance,
     PeerAnnouncementStartupError,
     PeerAnnouncementStartupResult,
+    peer_announcement_bind_options_from_config,
     peer_announcement_startup_signal,
 };
 

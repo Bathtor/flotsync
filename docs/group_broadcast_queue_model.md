@@ -41,17 +41,18 @@ Replication does not own:
 - relay-store confirmation tracking
 - recovery of in-flight `Durable` fan-out work after restart
 
-### 2.2 PeerDiscovery+Tracking
+### 2.2 Discovery Route Publication
 
-Discovery owns:
+Peer announcement and route establishment together feed discovery route
+publication. That discovery side owns:
 
 - identity verification
 - current reachability classification
 - address freshness
 - the distinction between `Known`, `Reachable`, and `Stale`
 
-Broadcast consumes discovery output as input. It must not probe or authenticate
-peers on its own.
+Broadcast consumes verified discovery route output as input. It must not listen
+for peer announcements, probe routes, or authenticate peers on its own.
 
 ### 2.3 GroupBroadcast
 

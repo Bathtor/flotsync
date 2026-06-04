@@ -14,17 +14,18 @@ use super::{
 };
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
-use flotsync_core::versions::VersionVector;
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    membership::{GroupMembers, GroupMembersError},
+    versions::VersionVector,
+};
 use flotsync_replication::{
     ApiError,
-    GroupId,
-    GroupMembers,
-    GroupMembersError,
     ListenerError,
     LoadError,
     LoadSecurityError,
-    MemberIdentity,
-    MemberIndex,
     ProvisionSecurityError,
     PublishChangesRequest,
     ReadToken,

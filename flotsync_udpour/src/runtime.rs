@@ -1102,11 +1102,7 @@ impl ComponentLifecycle for UDPourComponent {
     }
 }
 
-impl Provide<UDPourPort> for UDPourComponent {
-    fn handle(&mut self, _request: Never) -> HandlerResult {
-        unreachable!("Never cannot be triggered");
-    }
-}
+ignore_requests!(UDPourPort, UDPourComponent);
 
 impl Require<UdpPort> for UDPourComponent {
     fn handle(&mut self, indication: UdpIndication) -> HandlerResult {

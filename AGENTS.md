@@ -24,6 +24,8 @@
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
 - Add loop labels when control flow spans non-trivial nested loops or retries.
+- Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep.
+- Prefer `async move {}.boxed()` over `Box::pin(async move {})`.
 - Prefer the following top-level grouping within Rust files unless there is a strong local reason not to:
     1. public items (`pub`)
     2. restricted-visibility items (`pub(<qualifier>)`)
@@ -52,10 +54,13 @@
 
 - In Kompact components, the `async_self` argument in `spawn_local` and `Handled::block_on` has access to all of the component's `&mut self` state. Do not clone fields just to pass them into the closure!
 - Do not hang on the result of `biconnect_components` unless the use-case strictly requires manual disconnection of ports. This is only the case for components that are dynamically created and destroyed during the normal operation of a Kompact system. For all other connections, just drop the handle returned `biconnect_components` immediately (e.g. by assigning to a `let _connection = biconnect_components(...)`.
+- Component structs should have names ending in `*Component` and ports in `*Port`. Port fields `*_port` or if the same port is both required and provided, then one is `*_provided` and the other `*_required`.
+- Kompact timeouts are identified by a `Uuid` (the `ScheduledTimer` field of the timeout handler closure), so there is typically no need for explicit "timer generation" or similar tracking to identify late-firing timeouts. They can simply be compared to a locally stored "expected" timer.
 
 ### Flotsync
 
 - Any test that binds TCP or UDP sockets must declare its full socket requirement up front via `flotsync_io::test_support::reserve_sockets(...)` or a harness built on top of that broker. Do not bind ad hoc sockets or rely on unmanaged ephemeral ports in parallel tests.
+- Prefer the `option_when` macro over `<cond>.then_some(...)`.
 
 <!-- BEGIN BEADS INTEGRATION -->
 

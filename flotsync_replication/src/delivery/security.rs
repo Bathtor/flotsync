@@ -1,13 +1,9 @@
 use crate::{
-    GroupMembers,
-    GroupMembersError,
     api::{
         BoxError,
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
-        GroupId,
         LocalMemberPrivateKeysRecord,
-        MemberIdentity,
         ReplicationStore,
         StoreError,
         StoreSecretKeyId,
@@ -21,7 +17,12 @@ use crate::{
     runtime::messages::{BootstrapGroupMessage, BootstrapMemberPublicKeysMessage},
 };
 use bytes::Bytes;
-use flotsync_core::member::TrieMap;
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    member::TrieMap,
+    membership::{GroupMembers, GroupMembersError},
+};
 use flotsync_security::{
     FrameSignature,
     GroupKey,
@@ -47,7 +48,9 @@ use flotsync_security::{
     seal_group_payload,
     seal_reliable_payload_with_os_rng,
     seal_store_secret,
+    sign_discovery_payload,
     sign_frame,
+    verify_discovery_payload_signature,
     verify_frame_signature,
 };
 use snafu::{Location, prelude::*};
@@ -188,9 +191,24 @@ pub(crate) enum DeliverySecurityError {
         recipient: MemberIdentity,
         source: BoxError,
     },
+    #[snafu(display("Failed to sign discovery claim payload: {source}"))]
+    #[allow(
+        dead_code,
+        reason = "used by the route establishment adapter once host wiring lands"
+    )]
+    SignDiscoveryClaim { source: BoxError },
     #[snafu(display("Failed to verify recipient ack from recipient {recipient}: {source}"))]
     VerifyRecipientAck {
         recipient: MemberIdentity,
+        source: BoxError,
+    },
+    #[snafu(display("Failed to verify discovery claim for member {member_id}: {source}"))]
+    #[allow(
+        dead_code,
+        reason = "used by the route establishment adapter once host wiring lands"
+    )]
+    VerifyDiscoveryClaim {
+        member_id: MemberIdentity,
         source: BoxError,
     },
     #[snafu(display("Failed to open encrypted group secret for group {group_id}: {source}"))]
@@ -254,7 +272,10 @@ impl DeliverySecurityError {
             // Reliable-payload seal/open failures are crypto or key-consistency failures.
             Self::SealReliablePayload { .. } | Self::OpenReliablePayload { .. } => false,
             // Recipient-ack sign/verify failures are crypto or key-consistency failures.
-            Self::SignRecipientAck { .. } | Self::VerifyRecipientAck { .. } => false,
+            Self::SignRecipientAck { .. }
+            | Self::SignDiscoveryClaim { .. }
+            | Self::VerifyRecipientAck { .. }
+            | Self::VerifyDiscoveryClaim { .. } => false,
             // Group-secret and group-payload failures are crypto or key-consistency failures.
             Self::OpenGroupSecret { .. }
             | Self::SealGroupPayload { .. }
@@ -418,6 +439,20 @@ impl DeliverySecurity {
         })
     }
 
+    /// Sign one exact encoded discovery claim payload with the local member key.
+    #[allow(
+        dead_code,
+        reason = "used by the route establishment adapter once host wiring lands"
+    )]
+    pub(crate) fn sign_discovery_claim_payload(
+        &self,
+        payload: &[u8],
+    ) -> Result<FrameSignature, DeliverySecurityError> {
+        sign_discovery_payload(self.local_keys(), payload)
+            .boxed()
+            .context(SignDiscoveryClaimSnafu)
+    }
+
     /// Verify one recipient ack against the expected recipient identity.
     pub(crate) async fn verify_recipient_ack(
         &self,
@@ -453,6 +488,29 @@ impl DeliverySecurity {
         .with_context(|_| VerifyRecipientAckSnafu {
             recipient: header.recipient.clone(),
         })
+    }
+
+    /// Verify one exact encoded discovery claim payload against a trusted member key.
+    #[allow(
+        dead_code,
+        reason = "used by the route establishment adapter once host wiring lands"
+    )]
+    pub(crate) async fn verify_discovery_claim_payload(
+        &self,
+        member_id: &MemberIdentity,
+        payload: &[u8],
+        signature: &FrameSignature,
+    ) -> Result<(), DeliverySecurityError> {
+        let public_keys = if member_id == &self.local_member {
+            self.local_keys.public_keys().clone()
+        } else {
+            self.load_trusted_public_keys(member_id).await?
+        };
+        verify_discovery_payload_signature(&public_keys, payload, signature)
+            .boxed()
+            .with_context(|_| VerifyDiscoveryClaimSnafu {
+                member_id: member_id.clone(),
+            })
     }
 
     /// Seal one group-broadcast payload for transport fan-out.

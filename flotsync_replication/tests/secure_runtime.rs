@@ -1,16 +1,17 @@
 #![cfg(feature = "test-support")]
 
 use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
     member::Identifier,
+    membership::GroupMembers,
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, Schema};
 use flotsync_replication::{
     CreateGroupRequest,
     DatasetId,
-    GroupId,
-    GroupMembers,
-    MemberIdentity,
     RowId,
     RowKey,
     RowMutation,
@@ -67,19 +68,19 @@ fn create_group_bootstrap_installs_remote_membership() {
 
     assert_eq!(
         alice_members.member_index(&alice_member),
-        Some(flotsync_replication::MemberIndex::new(0))
+        Some(MemberIndex::new(0))
     );
     assert_eq!(
         alice_members.member_index(&bob_member),
-        Some(flotsync_replication::MemberIndex::new(1))
+        Some(MemberIndex::new(1))
     );
     assert_eq!(
         bob_members.member_index(&alice_member),
-        Some(flotsync_replication::MemberIndex::new(0))
+        Some(MemberIndex::new(0))
     );
     assert_eq!(
         bob_members.member_index(&bob_member),
-        Some(flotsync_replication::MemberIndex::new(1))
+        Some(MemberIndex::new(1))
     );
 }
 

@@ -4,7 +4,6 @@ use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
     route_transport::{
-        FlotsyncSerializable,
         RouteDiscoveryPort,
         RouteSharingKind,
         RouteTransportActorMessage,
@@ -16,14 +15,18 @@ use super::{
     security::{DeliverySecurity, DeliverySecurityError},
     shared::{DeliveryClass, MessageId, PlaintextPayload, RouteSendId},
 };
-use crate::{
-    GroupMembers,
-    SharedGroupMemberships,
-    api::{GroupId, MemberIdentity},
-};
 use bytes::Bytes;
-use flotsync_core::member::TrieMap;
-use flotsync_messages::{delivery as delivery_proto, endpoint as endpoint_proto};
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    member::TrieMap,
+    membership::{GroupMembers, SharedGroupMemberships},
+};
+use flotsync_messages::{
+    delivery as delivery_proto,
+    endpoint as endpoint_proto,
+    serialisation::FlotsyncSerializable,
+};
 use flotsync_security::SealedPSKPayload;
 use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::prelude::*;
@@ -517,9 +520,8 @@ fn select_best_direct_route(
 mod tests {
     use super::*;
     use crate::{
-        GroupMemberships,
         SqliteReplicationStore,
-        api::{MemberIndex, ReplicationGroupRecord, ReplicationStore},
+        api::{ReplicationGroupRecord, ReplicationStore},
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
             route_transport::{
@@ -543,7 +545,7 @@ mod tests {
         test_support::{load_test_delivery_security, provision_test_security, test_group_key},
     };
     use bytes::Bytes;
-    use flotsync_core::versions::VersionVector;
+    use flotsync_core::{MemberIndex, membership::GroupMemberships, versions::VersionVector};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},

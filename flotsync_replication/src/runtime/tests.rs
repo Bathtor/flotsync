@@ -26,8 +26,6 @@ use super::{
     },
 };
 use crate::{
-    GroupMembers,
-    GroupMemberships,
     MAX_VERSION_VALUE,
     SqliteReplicationStore,
     api::{
@@ -38,15 +36,12 @@ use crate::{
         DatasetRowSlice,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
-        GroupId,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
         LoadSecurityError,
         LocalMemberPrivateKeysRecord,
         LocalStoreSecretProfile,
-        MemberIdentity,
-        MemberIndex,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -89,7 +84,11 @@ use crate::{
     },
 };
 use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
     member::{Identifier, TrieMap},
+    membership::{GroupMembers, GroupMemberships},
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
@@ -517,7 +516,7 @@ impl ListenerStub {
 
 impl ReplicationEventListener for ListenerStub {
     fn on_event(&self, event: ReplicationEvent) -> BoxFuture<'_, Result<(), ListenerError>> {
-        Box::pin(async move {
+        async move {
             match event {
                 ReplicationEvent::DataChanged {
                     read_token,
@@ -549,7 +548,8 @@ impl ReplicationEventListener for ListenerStub {
                 ReplicationEvent::GroupInvitation { .. } => {}
             }
             Ok(())
-        })
+        }
+        .boxed()
     }
 }
 

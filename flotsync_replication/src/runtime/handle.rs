@@ -14,7 +14,6 @@ use crate::{
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
-        GroupId,
         GroupMigration,
         LoadError,
         PublishChangesRequest,
@@ -32,7 +31,11 @@ use crate::{
     },
     delivery::security::DeliverySecurity,
 };
-use flotsync_core::member::Identifier;
+#[cfg(test)]
+use flotsync_core::MemberIdentity;
+#[cfg(any(test, feature = "test-support"))]
+use flotsync_core::membership::GroupMembers;
+use flotsync_core::{GroupId, member::Identifier};
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
@@ -46,10 +49,6 @@ use super::{
     errors::InboundDeliveryError,
     messages::{UpdateBatchMessage, UpdateMessage},
 };
-#[cfg(any(test, feature = "test-support"))]
-use crate::GroupMembers;
-#[cfg(test)]
-use crate::MemberIdentity;
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 

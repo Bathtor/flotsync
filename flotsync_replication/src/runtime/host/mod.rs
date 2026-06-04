@@ -6,9 +6,7 @@ use super::{
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
-    GroupMemberships,
-    SharedGroupMemberships,
-    api::{BoxError, MemberIdentity, ReplicationEventListener, ReplicationStore},
+    api::{BoxError, ReplicationEventListener, ReplicationStore},
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
@@ -23,6 +21,10 @@ use crate::{
         },
         security::DeliverySecurity,
     },
+};
+use flotsync_core::{
+    MemberIdentity,
+    membership::{GroupMemberships, SharedGroupMemberships},
 };
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_io::test_support::{

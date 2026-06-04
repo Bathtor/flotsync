@@ -19,19 +19,17 @@ use super::{
     ingress::DeliveryTargetHint,
     shared::{DetachedSignature, MessageId, SignatureScheme},
 };
-use crate::{
-    GroupMemberships,
-    api::{GroupId, MemberIdentity},
-};
 use endpoint_proto::endpoint_frame::Boundary;
-use flotsync_core::member::{IdentifierBuf, IdentifierError};
+use flotsync_core::{GroupId, MemberIdentity, membership::GroupMemberships};
 use flotsync_io::prelude::IoPayload;
 use flotsync_messages::{
     buffa::{DecodeError, Message, MessageView},
     delivery as proto,
     discovery as discovery_proto,
     endpoint as endpoint_proto,
+    wire as message_wire,
 };
+use flotsync_utils::option_when;
 use snafu::prelude::*;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -39,35 +37,23 @@ use uuid::Uuid;
 pub(crate) fn member_identity_to_wire_format(
     member: &MemberIdentity,
 ) -> discovery_proto::Identifier {
-    let segments = member
-        .segments_iter()
-        .map(|segment| segment.as_ref().to_owned())
-        .collect();
-    discovery_proto::Identifier {
-        segments,
-        ..discovery_proto::Identifier::default()
-    }
+    message_wire::member_identity_to_wire_format(member)
 }
 
 pub(crate) fn member_identity_from_wire(
     identifier: discovery_proto::Identifier,
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
-    let mut buffer = IdentifierBuf::new();
-    for segment in identifier.segments {
-        buffer
-            .push_checked(segment.clone())
-            .context(InvalidIdentifierSegmentSnafu { field, segment })?;
-    }
-    Ok(buffer.into_identifier())
+    let member = message_wire::member_identity_from_wire_format(identifier, field)?;
+    Ok(member)
 }
 
 pub(crate) fn group_id_from_wire(
     raw: &[u8],
     field: &'static str,
 ) -> Result<GroupId, WireValueDecodeError> {
-    let uuid = uuid_from_wire(raw, field)?;
-    Ok(GroupId(uuid))
+    let group_id = message_wire::group_id_from_wire_bytes(raw, field)?;
+    Ok(group_id)
 }
 
 pub(crate) fn message_id_from_wire(
@@ -83,13 +69,8 @@ pub(crate) fn fixed_bytes_field<const N: usize>(
     field: &'static str,
     bytes: &[u8],
 ) -> Result<[u8; N], WireValueDecodeError> {
-    bytes
-        .try_into()
-        .map_err(|_| WireValueDecodeError::InvalidByteLength {
-            field,
-            expected: N,
-            actual: bytes.len(),
-        })
+    let bytes = message_wire::fixed_bytes_field(field, bytes)?;
+    Ok(bytes)
 }
 
 /// Encode a signature-only control-frame authenticator.
@@ -221,21 +202,29 @@ impl DeliveryInterestView<'_> {
     /// Keep the classification flowing only when the given group currently
     /// exists in the local membership snapshot.
     fn check_group(self, group_id: &GroupId) -> Option<ShallowClassification> {
-        (!self.group_memberships.contains_group(group_id))
-            .then_some(ShallowClassification::Irrelevant)
+        option_when!(
+            !self.group_memberships.contains_group(group_id),
+            ShallowClassification::Irrelevant
+        )
     }
 
     /// Keep the classification flowing only when the given member identity is
     /// hosted locally and should therefore receive recipient-scoped delivery
     /// traffic.
     fn check_local_member(self, member: &MemberIdentity) -> Option<ShallowClassification> {
-        (!self.local_members.contains(member)).then_some(ShallowClassification::Irrelevant)
+        option_when!(
+            !self.local_members.contains(member),
+            ShallowClassification::Irrelevant
+        )
     }
 
     /// Keep the classification flowing only when this node currently hosts the
     /// relay mailbox addressed by the given recipient identity.
     fn check_hosted_mailbox(self, recipient: &MemberIdentity) -> Option<ShallowClassification> {
-        (!self.hosted_mailboxes.contains(recipient)).then_some(ShallowClassification::Irrelevant)
+        option_when!(
+            !self.hosted_mailboxes.contains(recipient),
+            ShallowClassification::Irrelevant
+        )
     }
 }
 
@@ -625,33 +614,22 @@ fn member_identity_from_wire_view(
     identifier: &discovery_proto::IdentifierView<'_>,
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
-    let mut buffer = IdentifierBuf::new();
-    for segment in &identifier.segments {
-        let segment = segment.to_owned();
-        buffer
-            .push_checked(segment.to_owned())
-            .context(InvalidIdentifierSegmentSnafu { field, segment })?;
-    }
-    Ok(buffer.into_identifier())
+    let member = message_wire::member_identity_from_wire_view(identifier, field)?;
+    Ok(member)
 }
 
 /// Shared field-level decode failures reused across semantic delivery wire
 /// adapters and the shallow ingress classifier.
 #[derive(Debug, Snafu)]
 pub(crate) enum WireValueDecodeError {
-    #[snafu(display("Field '{field}' did not contain a valid UUID: {source}"))]
+    #[snafu(transparent)]
     InvalidUuid {
-        field: &'static str,
-        source: uuid::Error,
+        source: message_wire::InvalidUuidWireValue,
     },
 
-    #[snafu(display(
-        "Field '{field}' contains an invalid identifier segment '{segment}': {source}"
-    ))]
+    #[snafu(transparent)]
     InvalidIdentifierSegment {
-        field: &'static str,
-        segment: String,
-        source: IdentifierError,
+        source: message_wire::InvalidIdentifierSegmentWireValue,
     },
 
     #[snafu(display("Field '{field}' used an unknown signature scheme value {value}"))]
@@ -660,16 +638,31 @@ pub(crate) enum WireValueDecodeError {
     #[snafu(display("Field '{field}' used the unspecified signature scheme"))]
     UnspecifiedSignatureScheme { field: &'static str },
 
-    #[snafu(display("Field '{field}' had invalid byte length {actual}; expected {expected}."))]
+    #[snafu(transparent)]
     InvalidByteLength {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
+        source: message_wire::InvalidByteLengthWireValue,
     },
 }
 
 fn uuid_from_wire(raw: &[u8], field: &'static str) -> Result<Uuid, WireValueDecodeError> {
-    Uuid::from_slice(raw).context(InvalidUuidSnafu { field })
+    let uuid = message_wire::uuid_from_wire_bytes(raw, field)?;
+    Ok(uuid)
+}
+
+impl From<message_wire::WireValueDecodeError> for WireValueDecodeError {
+    fn from(source: message_wire::WireValueDecodeError) -> Self {
+        match source {
+            message_wire::WireValueDecodeError::InvalidUuid { source } => {
+                Self::InvalidUuid { source }
+            }
+            message_wire::WireValueDecodeError::InvalidByteLength { source } => {
+                Self::InvalidByteLength { source }
+            }
+            message_wire::WireValueDecodeError::InvalidIdentifierSegment { source } => {
+                Self::InvalidIdentifierSegment { source }
+            }
+        }
+    }
 }
 
 /// Semantic owner for one delivery endpoint branch.
@@ -734,6 +727,7 @@ struct RelevantShallowClassification {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use flotsync_core::member::IdentifierBuf;
     use flotsync_messages::buffa::{Message, MessageField};
 
     fn group_id(value: u128) -> GroupId {
@@ -773,7 +767,7 @@ mod tests {
         let groups = groups.into_iter().map(|group_id| {
             (
                 group_id,
-                crate::GroupMembers::from_ordered_members([member(&["probe"])])
+                flotsync_core::membership::GroupMembers::from_ordered_members([member(&["probe"])])
                     .expect("probe group members should build"),
             )
         });

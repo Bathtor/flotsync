@@ -27,7 +27,7 @@ This repository uses `bd` (beads) as the source of truth for tasks and dependenc
 - `flotsync_core/`: Version vectors, group membership identifiers, and happened-before logic.
 - `flotsync_messages/`: Generated protobuf message bindings.
 - `messages/proto/`: Source `.proto` definitions organised by package and version.
-- `flotsync_discovery/`: Discovery services (mDNS and custom UDP announcement building blocks).
+- `flotsync_discovery/`: Discovery services (mDNS, peer announcements, and route establishment building blocks).
 - `flotsync_discovery_cli/`: CLI entrypoint for discovery components.
 - `flotsync_data_types/`: Replicated data structures (text and latest-value-wins register).
 - `flotsync_utils/`: Shared utility helpers/macros used by other crates.

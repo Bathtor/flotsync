@@ -23,79 +23,15 @@
 pub mod manager;
 
 use super::shared::{RelayIdentity, RouteSendId};
-use crate::api::MemberIdentity;
-use flotsync_io::prelude::{EgressAsyncWriter, Error as IoError, IoPayload};
-use flotsync_messages::buffa::Message as BuffaMessage;
-use flotsync_utils::{BoxFuture, IString, NonOwningPhantomData};
+use flotsync_core::MemberIdentity;
+use flotsync_io::prelude::IoPayload;
+use flotsync_messages::serialisation::FlotsyncSerializable;
+use flotsync_utils::{IString, NonOwningPhantomData};
 use kompact::{
     Never,
     prelude::{Ask, Port},
 };
-use snafu::prelude::*;
 use std::{fmt::Debug, hash::Hash, net::SocketAddr, sync::Arc};
-
-/// Size hint returned by one serializable network message.
-///
-/// Route transport can use this to choose between bounded sync reservation and
-/// fully async/growable encoding paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SizeHint {
-    /// Absolutely no idea about the required size.
-    Unknown,
-    /// Given value is the exact size required.
-    Exact(usize),
-    /// Given value is an upper bound on the size required.
-    UpperBound(usize),
-    /// Given value is an estimate that may be too large or too small.
-    Estimate(usize),
-}
-
-/// Dyn-safe payload contract for flotsync network messages.
-pub trait FlotsyncSerializable: Send + Sync + 'static {
-    /// Best-effort size information used by route transport before allocating
-    /// pooled egress buffers.
-    fn serialized_size_hint(&self) -> SizeHint;
-
-    /// Encode the logical network message into one pooled writer owned by the
-    /// concrete transport backend.
-    fn serialize_into<'a>(
-        &'a self,
-        writer: &'a mut EgressAsyncWriter,
-    ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>>;
-}
-
-impl<M> FlotsyncSerializable for M
-where
-    M: BuffaMessage + Send + Sync + 'static,
-{
-    fn serialized_size_hint(&self) -> SizeHint {
-        SizeHint::Exact(self.compute_size() as usize)
-    }
-
-    fn serialize_into<'a>(
-        &'a self,
-        writer: &'a mut EgressAsyncWriter,
-    ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
-        Box::pin(async move {
-            let reserved_bytes = self.compute_size() as usize;
-            let mut reserved = writer
-                .write_with_reserved(reserved_bytes)
-                .await
-                .map_err(|source| FlotsyncSerializeError::Io { source })?;
-            self.encode(&mut reserved);
-            Ok(())
-        })
-    }
-}
-
-/// Serialization failure at the route-transport boundary.
-#[derive(Debug, Snafu)]
-pub enum FlotsyncSerializeError {
-    #[snafu(display("writer failure while serializing flotsync message"))]
-    Io { source: IoError },
-    #[snafu(display("message serialization failed: {message}"))]
-    Encoding { message: IString },
-}
 
 /// Whether semantic delivery may collapse equal candidates into one shared send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

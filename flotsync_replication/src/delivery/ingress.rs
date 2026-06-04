@@ -27,10 +27,7 @@ use super::{
         decode_endpoint_frame_if_delivery_relevant,
     },
 };
-use crate::{
-    SharedGroupMemberships,
-    api::{GroupId, MemberIdentity},
-};
+use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
 use flotsync_utils::ResultExt as _;
 use kompact::{Never, prelude::*};
 use std::{collections::HashSet, sync::Arc};
@@ -248,9 +245,8 @@ type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<Transpor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GroupMemberships;
     use bytes::Bytes;
-    use flotsync_core::member::IdentifierBuf;
+    use flotsync_core::{member::IdentifierBuf, membership::GroupMemberships};
     use flotsync_io::{
         prelude::IoPayload,
         test_support::{build_test_kompact_system, kill_component, start_component},
@@ -283,11 +279,7 @@ mod tests {
 
     ignore_lifecycle!(TransportInboundProbe);
 
-    impl Provide<TransportInboundPort> for TransportInboundProbe {
-        fn handle(&mut self, _request: Never) -> HandlerResult {
-            unreachable!()
-        }
-    }
+    ignore_requests!(TransportInboundPort, TransportInboundProbe);
 
     impl Actor for TransportInboundProbe {
         type Message = Never;
@@ -386,8 +378,10 @@ mod tests {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
                 group_memberships: SharedGroupMemberships::new(GroupMemberships::from_groups([(
                     active_group,
-                    crate::GroupMembers::from_ordered_members([member(&["probe"])])
-                        .expect("probe group members should build"),
+                    flotsync_core::membership::GroupMembers::from_ordered_members([member(&[
+                        "probe",
+                    ])])
+                    .expect("probe group members should build"),
                 )])),
                 local_members: Arc::new(HashSet::new()),
                 hosted_mailboxes: Arc::new(HashSet::new()),

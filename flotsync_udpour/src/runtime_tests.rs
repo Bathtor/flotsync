@@ -39,6 +39,7 @@ use flotsync_io::{
         IoPayload,
         SendFailureReason,
         SocketId,
+        UdpBindOptions,
         UdpIndication,
         UdpLocalBind,
         UdpOpenRequestId,
@@ -919,6 +920,7 @@ fn bind_socket(
         component.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(local_addr),
+            options: UdpBindOptions::default(),
         });
     });
     match observer_rx.recv_matching_or_fail(

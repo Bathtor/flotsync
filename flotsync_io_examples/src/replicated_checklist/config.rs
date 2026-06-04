@@ -1,5 +1,5 @@
-use flotsync_core::member::Identifier;
-use flotsync_replication::{GroupId, LocalStoreSecretProfile, MemberIdentity};
+use flotsync_core::{GroupId, MemberIdentity, member::Identifier};
+use flotsync_replication::LocalStoreSecretProfile;
 use flotsync_security::GroupKey;
 use kompact::config::{Config, parse_config_str};
 use sha2::{Digest, Sha256};

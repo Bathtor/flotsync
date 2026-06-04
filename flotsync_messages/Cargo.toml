@@ -8,6 +8,9 @@ buffa = "0.3"
 bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
+flotsync_io = { path = "../flotsync_io", default-features = false }
+flotsync_utils = { path = "../flotsync_utils" }
+futures-util = { workspace = true }
 ordered-float = { workspace = true }
 snafu = { workspace = true }
 uuid = { workspace = true }

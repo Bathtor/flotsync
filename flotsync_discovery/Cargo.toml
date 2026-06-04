@@ -15,8 +15,11 @@ zeroconf-via-kompact = [
 ]
 
 [dependencies]
+flotsync_core = { path = "../flotsync_core" }
 flotsync_io = { path = "../flotsync_io", default-features = false, optional = true }
 flotsync_messages = { path = "../flotsync_messages" }
+flotsync_security = { path = "../flotsync_security" }
+flotsync_utils = { path = "../flotsync_utils" }
 # socket2 = "0.5"
 derive_more = { version = "2", features = ["deref", "display", "from"] }
 snafu = { workspace = true }
@@ -25,6 +28,7 @@ pnet_datalink = "0.35"
 itertools = "0.14"
 hostname = "0.4"
 base64 = { workspace = true }
+smallvec = { workspace = true }
 blocking = "1"
 uuid = { version = "1", features = ["v4"] }
 

@@ -13,7 +13,7 @@ use crate::{
     util::fixed_array,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use flotsync_core::member::Identifier;
+pub use flotsync_core::MemberIdentity;
 use flotsync_utils::option_when;
 use hpke::{Deserializable, Kem, Serializable};
 use jose_jwk::{
@@ -31,8 +31,6 @@ use rand_core::{OsRng, TryRngCore};
 use snafu::prelude::*;
 use std::{collections::BTreeSet, fmt, str::FromStr};
 use zeroize::{Zeroize, Zeroizing};
-
-pub type MemberIdentity = Identifier;
 
 /// Generate a fresh pair of local-private and public member JWKS documents.
 ///

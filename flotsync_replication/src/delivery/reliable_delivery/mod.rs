@@ -10,7 +10,6 @@ use super::{
     },
     ingress::InboundDeliveryMeta,
     route_transport::{
-        FlotsyncSerializable,
         RouteDiscoveryPort,
         RouteSharingKind,
         RouteTransportActorMessage,
@@ -37,10 +36,13 @@ use super::{
         WorkScopeKey,
     },
 };
-use crate::api::MemberIdentity;
 use bytes::Bytes;
-use flotsync_core::member::TrieMap;
-use flotsync_messages::{delivery as delivery_proto, endpoint as endpoint_proto};
+use flotsync_core::{MemberIdentity, member::TrieMap};
+use flotsync_messages::{
+    delivery as delivery_proto,
+    endpoint as endpoint_proto,
+    serialisation::FlotsyncSerializable,
+};
 use flotsync_security::SealedHPKEPayload;
 use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
@@ -1260,8 +1262,6 @@ fn sender_retry_reason(reason: &RouteTransportNackReason) -> PendingRouteReason 
 mod tests {
     use super::*;
     use crate::{
-        GroupMemberships,
-        SharedGroupMemberships,
         SqliteReplicationStore,
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
@@ -1283,6 +1283,7 @@ mod tests {
         },
         test_support::{load_test_delivery_security, provision_test_security},
     };
+    use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{

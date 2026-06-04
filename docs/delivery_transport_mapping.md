@@ -17,13 +17,14 @@ This note defines:
 - the terminology split between semantic delivery and route transport
 - what discovery publishes to the route-transport layer
 - who owns live route/session lifecycle
+- how shared endpoint UDP indications are consumed
 - current route-preference rules
 - current framing, ack, and backpressure decisions
 
 This note does not define:
 
 - the UDPour protocol for oversized logical payloads
-- inbound decode and demux ownership
+- transport-internal decode details beyond endpoint frame classification
 - the exact code shape for route-candidate descriptors
 
 Those remain separate follow-up items.
@@ -83,6 +84,7 @@ Discovery does not own:
 - long-lived route/session management for delivery traffic
 - delivery retries
 - delivery keepalive policy
+- binding the runtime endpoint socket used by replication delivery
 
 ## 3. Settled Decisions
 
@@ -246,7 +248,27 @@ That matches the current `flotsync_io` reality that shared UDP socket options
 are bridge-wide mutable state and do not have built-in membership reference
 counting.
 
-### 3.12 Relay Confirmation Correlates by `message_id + relay_id`
+Peer-announcement sockets are discovery-owned paths with a single maintaining
+peer-announcement component per runtime process. The runtime endpoint socket is
+not discovery-owned: route establishment uses that endpoint only after the setup
+layer reports the current endpoint binding.
+
+### 3.12 Shared Endpoint Indications Are Filtered By Consumers
+
+There is no central endpoint demultiplexer for the runtime endpoint UDP
+indication stream.
+
+Components connected to the shared `UdpPort` classify the messages they
+understand and ignore well-formed endpoint traffic for other sub-protocols.
+Route establishment picks out discovery introduction frames. Route transport
+picks out delivery frames.
+
+The setup layer reports new runtime endpoint bindings because only the component
+that initiated a bind knows what a fresh `UdpIndication::Bound` event is for.
+Closure does not need a separate setup notification; endpoint users can observe
+socket closure from the UDP indication stream.
+
+### 3.13 Relay Confirmation Correlates by `message_id + relay_id`
 
 Relay-store confirmation should correlate semantically by:
 
@@ -289,4 +311,5 @@ candidate currently maps to.
 The main deferred items are:
 
 - `flotsync-p9u` for UDPour design and protocol survey
-- `flotsync-zup` for inbound transport decode and demux ownership
+- transport-internal inbound decode details after each endpoint consumer has
+  selected the frame family it owns

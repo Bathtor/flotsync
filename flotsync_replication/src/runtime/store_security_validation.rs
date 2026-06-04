@@ -1,14 +1,10 @@
 use crate::{
-    GroupMembers,
-    GroupMembersError,
     api::{
         BoxError,
         EncryptedGroupSecurityMaterial,
-        GroupId,
         InvalidLocalPrivateKeysSnafu,
         LoadError,
         LoadSecurityError,
-        MemberIdentity,
         OtherSnafu,
         ReplicationGroupRecord,
         ReplicationStore,
@@ -20,7 +16,12 @@ use crate::{
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
 };
-use flotsync_core::member::Identifier;
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    member::Identifier,
+    membership::{GroupMembers, GroupMembersError},
+};
 use flotsync_security::STORE_SECRET_NONCE_LENGTH;
 use snafu::{IntoError, prelude::*};
 use std::sync::Arc;

@@ -1,17 +1,15 @@
 use super::{RuntimeHostError, config_keys};
-use crate::{
-    api::MemberIdentity,
-    delivery::route_transport::{
-        DatagramRouteScope,
-        DiscoveryRouteUpdate,
-        RouteDiscoveryPort,
-        RoutePreferenceRank,
-        RouteSharingKind,
-        SendRouteCandidate,
-        TransportRouteKey,
-        UdpRouteKey,
-    },
+use crate::delivery::route_transport::{
+    DatagramRouteScope,
+    DiscoveryRouteUpdate,
+    RouteDiscoveryPort,
+    RoutePreferenceRank,
+    RouteSharingKind,
+    SendRouteCandidate,
+    TransportRouteKey,
+    UdpRouteKey,
 };
+use flotsync_core::MemberIdentity;
 use flotsync_io::prelude::{UdpIndication, UdpPort};
 use kompact::{
     config::{Config, ConfigError, ConfigLookup},
@@ -22,6 +20,8 @@ use std::{
     net::{IpAddr, SocketAddr},
     str::FromStr,
 };
+
+pub(in crate::runtime::host) mod route_establishment;
 
 pub(super) const STATIC_PEER_ROUTES_KEY: &str = "flotsync.replication.runtime.static-peer-routes";
 const SUPPORTED_STATIC_ROUTE_PROTOCOLS: &[StaticPeerRouteProtocol] =
@@ -122,6 +122,8 @@ impl PreconfiguredPeerRoutesComponent {
             );
             return;
         }
+        // TODO(flotsync-562u): Route static peer routes through route establishment before
+        // publishing them to replication transport.
         let Some(local_endpoint) = self.local_endpoint else {
             warn!(
                 self.log(),

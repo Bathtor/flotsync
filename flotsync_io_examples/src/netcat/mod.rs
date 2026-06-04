@@ -115,15 +115,6 @@ enum NetcatInput {
     Closed,
 }
 
-/// One scheduled scripted-shutdown timer together with the generation that armed it.
-///
-/// The generation lets components ignore stale timeout callbacks that were already queued when the
-/// timer got cleared or replaced.
-struct ShutdownTimerState {
-    generation: usize,
-    timer: ScheduledTimer,
-}
-
 /// Runs the netcat-style example according to `args`.
 ///
 /// # Errors

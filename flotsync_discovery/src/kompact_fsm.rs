@@ -1,4 +1,23 @@
 use crate::kompact::prelude::*;
+use snafu::Snafu;
+
+/// Recoverable component fault emitted for invalid FSM transition tables.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "The component signalled an invalid state transition: {msg}\nMarking the component as recoverably faulty so it can be re-initialised into a legal state."
+))]
+pub struct InvalidStateTransition {
+    /// Description of the illegal state transition.
+    msg: String,
+}
+
+impl InvalidStateTransition {
+    /// Build one invalid transition error.
+    #[must_use]
+    pub fn new(msg: String) -> Self {
+        Self { msg }
+    }
+}
 
 #[derive(Debug)]
 #[repr(transparent)]
@@ -14,6 +33,15 @@ impl<T> State<T> {
     /// Panics if the state was already taken.
     pub fn take(&mut self) -> T {
         self.0.take().expect("Illegal take on dangling state.")
+    }
+
+    /// Borrow the current state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state was already taken.
+    pub fn get(&self) -> &T {
+        self.0.as_ref().expect("Illegal borrow on dangling state.")
     }
 
     pub fn set(&mut self, v: T) {
@@ -105,9 +133,128 @@ macro_rules! transform_state_match {
                 result
             }
             StateUpdate::Invalid {msg} => {
-                error!($comp.log(), "The component signalled an invalid state transition: {msg}\nKilling the component so it can be re-initialised into a legal state.");
-                Handled::SHUTDOWN
+                Err($crate::kompact::prelude::HandlerError::recoverable(
+                    $crate::kompact_fsm::InvalidStateTransition::new(msg)
+                ))
             }
         }
     }};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{State, StateUpdate};
+    use crate::kompact::prelude::*;
+    use flotsync_io::test_support::{
+        WAIT_TIMEOUT,
+        build_test_kompact_system,
+        eventually,
+        eventually_component_state,
+        start_component,
+    };
+    use std::{sync::mpsc, time::Duration};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestState {
+        Initial,
+        Dirty,
+    }
+
+    #[derive(Debug)]
+    enum TestMessage {
+        MarkDirty,
+        TriggerInvalidTransition,
+    }
+
+    #[derive(ComponentDefinition)]
+    struct TestComponent {
+        ctx: ComponentContext<Self>,
+        state: State<TestState>,
+    }
+
+    impl TestComponent {
+        fn new() -> Self {
+            Self {
+                ctx: ComponentContext::uninitialised(),
+                state: State::new(TestState::Initial),
+            }
+        }
+    }
+
+    ignore_lifecycle!(TestComponent);
+
+    impl Actor for TestComponent {
+        type Message = TestMessage;
+
+        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
+            transform_state_match!(self, state, {
+                TestState::Initial => match msg {
+                    TestMessage::MarkDirty => StateUpdate::transition(TestState::Dirty),
+                    TestMessage::TriggerInvalidTransition => {
+                        StateUpdate::invalid("invalid transition from initial")
+                    }
+                },
+                TestState::Dirty => match msg {
+                    TestMessage::MarkDirty => StateUpdate::ok(TestState::Dirty),
+                    TestMessage::TriggerInvalidTransition => {
+                        StateUpdate::invalid("test transition failed")
+                    }
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn invalid_state_update_recovers_component_to_initial_state() {
+        let system = build_test_kompact_system();
+        let component = system.create(TestComponent::new);
+        let component_ref = component.actor_ref();
+        let (recovered_tx, recovered_rx) = mpsc::channel();
+
+        component.set_recovery_function(move |fault| {
+            fault.recover_with(move |_context, system, _log| {
+                let recovered = system.create(TestComponent::new);
+                system.start(&recovered);
+                recovered_tx
+                    .send(recovered)
+                    .expect("recovered component should be sent");
+            })
+        });
+
+        start_component(&system, &component);
+        component_ref.tell(TestMessage::MarkDirty);
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &component,
+            |component| component.state.get() == &TestState::Dirty,
+            "component should enter dirty state before the invalid transition",
+        );
+
+        component_ref.tell(TestMessage::TriggerInvalidTransition);
+        let recovered = recovered_rx
+            .recv_timeout(WAIT_TIMEOUT)
+            .expect("recovered component should be created");
+
+        eventually(
+            Duration::from_secs(1),
+            || component.is_faulty(),
+            "original component should be marked faulty",
+        );
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &recovered,
+            |component| component.state.get() == &TestState::Initial,
+            "recovered component should start in the initial state",
+        );
+
+        recovered.actor_ref().tell(TestMessage::MarkDirty);
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &recovered,
+            |component| component.state.get() == &TestState::Dirty,
+            "recovered component should handle messages after recovery",
+        );
+
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
 }

@@ -15,8 +15,6 @@ use super::{
     ConnectionInfoPort,
     DatagramRouteScope,
     Debug,
-    FlotsyncSerializable,
-    FlotsyncSerializeError,
     Hash,
     IString,
     InboundTransportMeta,
@@ -26,7 +24,6 @@ use super::{
     RouteTransportPort,
     RouteTransportSend,
     RouteTransportSubmitResult,
-    SizeHint,
     TcpRouteKey,
     TransportRouteKey,
     UdpRouteKey,
@@ -34,7 +31,6 @@ use super::{
 use crate::delivery::shared::RouteSendId;
 #[cfg(test)]
 use crate::delivery::test_support::ManagerOwnedUdpBindBudget;
-use bytes::Bytes;
 use flotsync_io::prelude::{
     IoBridgeHandle,
     IoPayload,
@@ -50,6 +46,7 @@ use flotsync_io::prelude::{
     UdpRequest,
     UdpSocketOption,
 };
+use flotsync_messages::serialisation::{FlotsyncSerializeError, encode_message_payload};
 use flotsync_udpour::{
     UDPourComponent,
     UDPourComponentMessage,
@@ -61,7 +58,7 @@ use flotsync_udpour::{
     UDPourSubmitResult,
 };
 use flotsync_utils::OptionExt as _;
-use kompact::{Never, config::UsizeValue, kompact_config, prelude::*};
+use kompact::{config::UsizeValue, kompact_config, prelude::*};
 #[cfg(test)]
 use std::sync::Mutex;
 use std::{
@@ -709,7 +706,12 @@ impl RouteTransportManager {
             return;
         };
         let runtime_ref = handle.runtime_ref.clone();
-        let payload = match serialize_payload(self.bridge.egress_pool(), payload_source).await {
+        let payload = match encode_message_payload(
+            self.bridge.egress_pool(),
+            payload_source.as_ref(),
+        )
+        .await
+        {
             Ok(payload) => payload,
             Err(error) => {
                 self.fail_pending_send(
@@ -990,17 +992,8 @@ impl ComponentLifecycle for RouteTransportManager {
     }
 }
 
-impl Provide<TransportRouteTransportPort> for RouteTransportManager {
-    fn handle(&mut self, request: Never) -> HandlerResult {
-        match request {}
-    }
-}
-
-impl Provide<TransportConnectionInfoPort> for RouteTransportManager {
-    fn handle(&mut self, request: Never) -> HandlerResult {
-        match request {}
-    }
-}
+ignore_requests!(TransportRouteTransportPort, RouteTransportManager);
+ignore_requests!(TransportConnectionInfoPort, RouteTransportManager);
 
 impl Require<UDPourPort> for RouteTransportManager {
     fn handle(&mut self, indication: UDPourDeliver) -> HandlerResult {
@@ -1233,24 +1226,6 @@ impl UdpSocketKey {
     }
 }
 
-async fn serialize_payload(
-    egress_pool: &flotsync_io::prelude::EgressPool,
-    payload: Arc<dyn FlotsyncSerializable>,
-) -> Result<IoPayload, FlotsyncSerializeError> {
-    let hint = match payload.serialized_size_hint() {
-        SizeHint::Unknown => None,
-        SizeHint::Exact(bytes) | SizeHint::UpperBound(bytes) | SizeHint::Estimate(bytes) => {
-            Some(bytes)
-        }
-    };
-    let mut writer = egress_pool.writer(hint);
-    payload.serialize_into(&mut writer).await?;
-    let payload = writer
-        .finish()
-        .map_err(|source| FlotsyncSerializeError::Io { source })?;
-    Ok(payload.unwrap_or_else(|| IoPayload::from(Bytes::new())))
-}
-
 fn classify_serialization_failure(error: &FlotsyncSerializeError) -> RouteTransportNackReason {
     match error {
         FlotsyncSerializeError::Io { .. } => RouteTransportNackReason::LocalResourcePressure,
@@ -1344,6 +1319,11 @@ mod tests {
             set_test_system_label,
         },
     };
+    use flotsync_messages::serialisation::{
+        FlotsyncSerializable,
+        FlotsyncSerializeError,
+        SizeHint,
+    };
     use flotsync_udpour::{
         MessageId,
         ReceiverConfig,
@@ -1351,6 +1331,7 @@ mod tests {
         config_keys as udpour_config_keys,
     };
     use flotsync_utils::BoxFuture;
+    use futures_util::FutureExt;
     use std::{
         cell::Cell,
         fmt::{self, Display},
@@ -1394,13 +1375,14 @@ mod tests {
             &'a self,
             writer: &'a mut flotsync_io::prelude::EgressAsyncWriter,
         ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
-            Box::pin(async move {
+            async move {
                 writer
                     .write_slice(&self.0)
                     .await
                     .map_err(|source| FlotsyncSerializeError::Io { source })?;
                 Ok(())
-            })
+            }
+            .boxed()
         }
     }
 

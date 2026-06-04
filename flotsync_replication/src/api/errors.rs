@@ -1,14 +1,9 @@
-use super::{
-    StoreSecretKeyId,
-    ids::{GroupId, MemberIdentity},
-};
-use crate::GroupMembersError;
-use flotsync_core::member::Identifier;
+use super::StoreSecretKeyId;
+use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembersError};
 use flotsync_security::LocalStoreSecretError;
+pub use flotsync_utils::BoxError;
 use snafu::{Location, prelude::*};
-use std::error::Error;
 
-pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 pub type ApiResult<T> = Result<T, ApiError>;
 
 #[derive(Debug, Snafu)]

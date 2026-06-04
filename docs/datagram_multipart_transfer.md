@@ -20,7 +20,7 @@ This note defines:
 
 This note does not define:
 
-- inbound transport decode and demux ownership
+- transport-internal inbound classification for UDPour frames
 - how discovery exposes datagram-route candidates
 - any stream framing
 - transport security

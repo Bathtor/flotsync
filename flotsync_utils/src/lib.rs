@@ -1,4 +1,4 @@
-use std::{fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
+use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
 
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
@@ -13,6 +13,9 @@ pub use claimable_promise::KClaimablePromise;
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Heap-allocated, `Send + Sync` error used by dyn-friendly public APIs.
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 /// Stable timeout extension for futures.
 ///

@@ -3,8 +3,8 @@
 //! These are the protocol-facing and scheduler-facing types that both
 //! `GroupBroadcast` and `ReliableDelivery` build on top of.
 
-use crate::api::{GroupId, MemberIdentity};
 use bytes::Bytes;
+use flotsync_core::{GroupId, MemberIdentity};
 use std::{fmt, time::SystemTime};
 use uuid::Uuid;
 

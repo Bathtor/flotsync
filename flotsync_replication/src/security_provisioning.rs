@@ -11,9 +11,7 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
-        GroupId,
         LocalMemberPrivateKeysRecord,
-        MemberIdentity,
         ReplicationSecuritySecrets,
         ReplicationStore,
         ReplicationStoreTransaction,
@@ -27,6 +25,7 @@ use crate::{
         LOGICAL_LOCAL_PRIVATE_KEYS_COLUMN,
     },
 };
+use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_security::{
     GroupKey,
     PublicMemberKeys,
@@ -185,7 +184,7 @@ pub async fn provision_replication_security<'a>(
 /// Returns [`ProvisionSecurityError::SealGroupSecret`] if encrypting the group
 /// secret fails.
 pub fn prepare_initial_group_security_material(
-    group_id: crate::api::GroupId,
+    group_id: GroupId,
     security: &ReplicationSecuritySecrets,
     group_key: &GroupKey,
 ) -> Result<EncryptedGroupSecurityMaterial, ProvisionSecurityError> {
@@ -220,7 +219,7 @@ pub fn prepare_initial_group_security_material(
 /// cannot be opened with the configured store secret or does not match the
 /// configured group key.
 pub fn validate_initial_group_security_material(
-    group_id: crate::api::GroupId,
+    group_id: GroupId,
     security: &ReplicationSecuritySecrets,
     group_key: &GroupKey,
     security_material: &EncryptedGroupSecurityMaterial,

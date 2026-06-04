@@ -1,11 +1,14 @@
 use super::messages::RuntimeMessageError;
+use crate::api::{DatasetId, ListenerError, RowId, StoreError};
 #[cfg(any(test, feature = "test-support"))]
 use crate::delivery::security::DeliverySecurityError;
-use crate::{
-    GroupMembersError,
-    api::{DatasetId, GroupId, ListenerError, MemberIdentity, MemberIndex, RowId, StoreError},
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    membership::GroupMembersError,
+    versions::UpdateId,
 };
-use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
 use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;

@@ -49,6 +49,45 @@ pub fn verify_frame_signature(
         .context(VerifySignatureSnafu)
 }
 
+/// Sign one discovery claim payload exactly as encoded on the wire.
+///
+/// # Errors
+///
+/// Returns [`crate::SecurityError::SignSignature`] if the Ed25519ph signing
+/// operation rejects the prehashed payload.
+pub fn sign_discovery_payload(
+    local_keys: &LocalMemberKeys,
+    payload: &[u8],
+) -> Result<FrameSignature> {
+    let signature: Signature = local_keys
+        .signing_key
+        .sign_prehashed(discovery_payload_transcript(payload), None)
+        .context(SignSignatureSnafu)?;
+    Ok(FrameSignature {
+        bytes: signature.to_bytes(),
+    })
+}
+
+/// Verify one discovery claim payload signature against the exact encoded bytes.
+///
+/// # Errors
+///
+/// Returns [`crate::SecurityError::InvalidSignatureBytes`] when the signature
+/// bytes are malformed, or [`crate::SecurityError::VerifySignature`] when the
+/// signature does not verify for `payload`.
+pub fn verify_discovery_payload_signature(
+    public_keys: &PublicMemberKeys,
+    payload: &[u8],
+    signature: &FrameSignature,
+) -> Result<()> {
+    let signature =
+        Signature::try_from(signature.as_bytes().as_slice()).context(InvalidSignatureBytesSnafu)?;
+    public_keys
+        .signing_key
+        .verify_prehashed(discovery_payload_transcript(payload), None, &signature)
+        .context(VerifySignatureSnafu)
+}
+
 /// Replication frame components covered by a detached signature.
 #[derive(Clone, Copy, Debug)]
 pub struct SignedFrameParts<'a> {
@@ -81,6 +120,8 @@ impl FrameSignature {
 }
 
 const DOMAIN_SIGNATURE: &[u8] = b"flotsync/security/signature/v1";
+const DOMAIN_DISCOVERY_CLAIM_PAYLOAD_SIGNATURE: &[u8] =
+    b"flotsync/security/discovery-claim-payload-signature/v1";
 
 /// Build the domain-separated prehash transcript that is signed or verified.
 fn signature_transcript(parts: SignedFrameParts<'_>) -> Sha512 {
@@ -89,5 +130,13 @@ fn signature_transcript(parts: SignedFrameParts<'_>) -> Sha512 {
     hash_len_prefixed(&mut transcript, parts.frame_kind.as_bytes());
     hash_len_prefixed(&mut transcript, parts.public_header);
     hash_len_prefixed(&mut transcript, parts.ciphertext);
+    transcript
+}
+
+/// Build the domain-separated transcript for exact discovery claim payload bytes.
+fn discovery_payload_transcript(payload: &[u8]) -> Sha512 {
+    let mut transcript = Sha512::new();
+    hash_len_prefixed(&mut transcript, DOMAIN_DISCOVERY_CLAIM_PAYLOAD_SIGNATURE);
+    hash_len_prefixed(&mut transcript, payload);
     transcript
 }

@@ -33,7 +33,7 @@ struct Args {
     active: bool,
 
     #[cfg(feature = "zeroconf")]
-    /// Use zeroconf mDNS instead of a custom UDP broadcast.
+    /// Use zeroconf mDNS instead of a peer-announcement broadcast.
     #[arg(short, long)]
     mdns: bool,
     // Kompact's logger can't currently dynamically reconfigure the logging level.
@@ -147,7 +147,7 @@ fn start_peer_announcement(
     let options = PEER_ANNOUNCEMENT_DEFAULT_OPTIONS.with_instance_id(instance_id);
     let placeholder_route = PeerAnnouncementRoute::Udp(SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
-        *options.port,
+        options.socket_bind_addr().port(),
     ));
     let component = system.create(move || {
         PeerAnnouncementComponent::with_options_and_startup_promise(options, startup_promise)

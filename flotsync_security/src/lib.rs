@@ -53,7 +53,9 @@ pub use signature::{
     FrameSignature,
     SIGNATURE_LENGTH,
     SignedFrameParts,
+    sign_discovery_payload,
     sign_frame,
+    verify_discovery_payload_signature,
     verify_frame_signature,
 };
 #[cfg(any(test, feature = "test-support"))]
