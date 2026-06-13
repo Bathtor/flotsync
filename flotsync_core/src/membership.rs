@@ -1,4 +1,9 @@
-use crate::{GroupId, MemberIdentity, MemberIndex, member::TrieMap};
+use crate::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    member::{IdentifierRef, TrieMap},
+};
 use arc_swap::ArcSwap;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
@@ -168,12 +173,18 @@ impl GroupMembers {
         self.member_indices.get(member).copied()
     }
 
+    /// Return the fixed producer index for a member view borrowed from trie traversal.
+    fn member_index_ref(&self, member: IdentifierRef<'_>) -> Option<MemberIndex> {
+        self.member_indices.get(&member).copied()
+    }
+
     /// Return the member assigned to one canonical group index.
     #[must_use]
     pub fn member_at_index(&self, index: MemberIndex) -> Option<MemberIdentity> {
-        for (member, member_index) in &self.member_indices {
+        let mut entries = self.member_indices.entries();
+        while let Some((member, member_index)) = entries.next() {
             if *member_index == index {
-                return Some(member.clone());
+                return Some(member.to_owned());
             }
         }
         None
@@ -181,7 +192,7 @@ impl GroupMembers {
 
     /// Iterate all members currently in this group.
     pub fn iter(&self) -> impl Iterator<Item = MemberIdentity> + '_ {
-        self.member_indices.iter_keys()
+        self.member_indices.owned_keys()
     }
 
     /// Return the canonical bootstrap order for this group.
@@ -189,8 +200,8 @@ impl GroupMembers {
     pub fn ordered_members(&self) -> Vec<MemberIdentity> {
         let mut ordered_members: Vec<_> = self
             .member_indices
-            .iter()
-            .map(|(member, index)| (*index, member.clone()))
+            .owned_entries()
+            .map(|(member, index)| (*index, member))
             .collect();
         ordered_members.sort_by_key(|(index, _)| *index);
         ordered_members
@@ -217,9 +228,13 @@ impl PartialEq for GroupMembers {
         if self.len() != other.len() {
             return false;
         }
-        self.member_indices
-            .iter()
-            .all(|(member, index)| other.member_index(&member) == Some(*index))
+        let mut entries = self.member_indices.entries();
+        while let Some((member, index)) = entries.next() {
+            if other.member_index_ref(member) != Some(*index) {
+                return false;
+            }
+        }
+        true
     }
 }
 

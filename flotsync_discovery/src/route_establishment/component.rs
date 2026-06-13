@@ -818,18 +818,20 @@ impl RouteEstablishmentComponent {
             return;
         }
         let mut changed_members = TrieSet::new();
-        for (member, routes) in &self.member_route_snapshots {
+        let mut existing_routes = self.member_route_snapshots.entries();
+        while let Some((member, routes)) = existing_routes.next() {
             if new_member_routes.get(&member) != Some(routes) {
-                changed_members.insert(member);
+                changed_members.insert(member.to_owned());
             }
         }
-        for (member, routes) in &new_member_routes {
+        let mut new_routes = new_member_routes.entries();
+        while let Some((member, routes)) = new_routes.next() {
             if self.member_route_snapshots.get(&member) != Some(routes) {
-                changed_members.insert(member);
+                changed_members.insert(member.to_owned());
             }
         }
         self.member_route_snapshots = new_member_routes;
-        for member in &changed_members {
+        for member in changed_members.owned_keys() {
             self.publish_member_routes(member);
         }
     }
@@ -840,7 +842,7 @@ impl RouteEstablishmentComponent {
         for (route, route_state) in &self.route_state {
             let DiscoveryRoute::Udp(route) = route;
             if let Some(members) = route_state.reachable_members() {
-                for member in members {
+                for member in members.owned_keys() {
                     let mut routes = member_routes.remove(&member).unwrap_or_default();
                     routes.insert(*route);
                     member_routes.insert(member, routes);

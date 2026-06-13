@@ -1,19 +1,13 @@
-//! [[`TrieMap`]] and [[`TrieSet`]] offer more compressed memory layout for larger groups by re-using parent identifiers,
-//! but they cannot implement [[`GroupMembership`]] as the full identifiers cannot be pointed to
-//! (need to be owned).
-//! They do offer efficient iteration, however.
-use super::{Identifier, IdentifierSegment};
+//! [[`TrieMap`]] and [[`TrieSet`]] offer more compressed memory layout for larger groups by re-using parent identifiers.
+//! Their primary traversal API lends identifier views from the traversal path instead of
+//! materialising an owned identifier for every key.
+
+use crate::member::{Identifier, IdentifierLike, IdentifierRef, IdentifierSegment};
 use ahash::AHashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrieMap<V> {
     root: TrieNode<V>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TrieNode<V> {
-    value: Option<V>,
-    children: AHashMap<IdentifierSegment, TrieNode<V>>,
 }
 
 impl<V> TrieMap<V> {
@@ -39,7 +33,7 @@ impl<V> TrieMap<V> {
 
     pub fn insert(&mut self, key: Identifier, value: V) -> Option<V> {
         let mut node = &mut self.root;
-        for segment in key.segments() {
+        for segment in key.into_segments() {
             node = node.children.entry(segment).or_insert_with(|| TrieNode {
                 value: None,
                 children: AHashMap::new(),
@@ -49,16 +43,16 @@ impl<V> TrieMap<V> {
     }
 
     #[must_use]
-    pub fn get(&self, key: &Identifier) -> Option<&V> {
+    pub fn get<I: IdentifierLike>(&self, key: &I) -> Option<&V> {
         let mut node = &self.root;
-        for segment in key.segments_iter() {
+        for segment in key.segments() {
             node = node.children.get(segment)?;
         }
         node.value.as_ref()
     }
 
-    pub fn remove(&mut self, key: &Identifier) -> Option<V> {
-        let removed = Self::remove_from_node(&mut self.root, key.segments_iter());
+    pub fn remove<I: IdentifierLike>(&mut self, key: &I) -> Option<V> {
+        let removed = Self::remove_from_node(&mut self.root, key.segments());
         debug_assert!(
             self.root.value.is_none(),
             "trie root must stay valueless after keyed removal"
@@ -68,17 +62,23 @@ impl<V> TrieMap<V> {
 
     #[allow(dead_code)] // for later
     #[must_use]
-    pub fn get_mut(&mut self, key: &Identifier) -> Option<&mut V> {
+    pub fn get_mut<I: IdentifierLike>(&mut self, key: &I) -> Option<&mut V> {
         let mut node = &mut self.root;
-        for segment in key.segments_iter() {
+        for segment in key.segments() {
             node = node.children.get_mut(segment)?;
         }
         node.value.as_mut()
     }
 
+    /// Traverse all entries with keys borrowed from the iterator's reusable path buffer.
+    ///
+    /// This is a lending iterator: each [`IdentifierRef`] returned by [`TrieEntries::next`]
+    /// borrows from the iterator itself and must not outlive that call's mutable borrow. Use
+    /// [`Self::owned_entries`] when standard [`Iterator`] combinators are more important than
+    /// avoiding per-entry key materialisation.
     #[must_use]
-    pub fn iter(&self) -> TrieIter<'_, V> {
-        TrieIter {
+    pub fn entries(&self) -> TrieEntries<'_, V> {
+        TrieEntries {
             stack: vec![(&self.root, self.root.children.iter())],
             path: Vec::new(),
             yield_self: true,
@@ -86,17 +86,44 @@ impl<V> TrieMap<V> {
         }
     }
 
+    /// Traverse all keys with key views borrowed from the iterator's reusable path buffer.
+    ///
+    /// This has the same lending lifetime constraints as [`Self::entries`].
     #[must_use]
-    pub fn iter_keys(&self) -> TrieIdentifierIter<'_, V> {
-        TrieIdentifierIter { inner: self.iter() }
+    pub fn keys(&self) -> TrieKeys<'_, V> {
+        TrieKeys {
+            entries: self.entries(),
+        }
+    }
+
+    /// Traverse all entries as a standard [`Iterator`] by materialising an owned key per entry.
+    ///
+    /// This adapter exists for call sites that benefit from ordinary iterator combinators. Prefer
+    /// [`Self::entries`] when the key only needs to be inspected during traversal.
+    #[must_use]
+    pub fn owned_entries(&self) -> TrieOwnedEntries<'_, V> {
+        TrieOwnedEntries {
+            entries: self.entries(),
+        }
+    }
+
+    /// Traverse all keys as a standard [`Iterator`] by materialising an owned key per entry.
+    ///
+    /// Prefer [`Self::keys`] when the key only needs to be inspected during traversal.
+    #[must_use]
+    pub fn owned_keys(&self) -> TrieOwnedKeys<'_, V> {
+        TrieOwnedKeys {
+            entries: self.owned_entries(),
+        }
     }
 
     /// Build a new trie with the same keys and mapped values.
     #[must_use]
     pub fn map_values<U>(&self, mut mapper: impl FnMut(&V) -> U) -> TrieMap<U> {
         let mut output = TrieMap::new();
-        for (key, value) in self {
-            output.insert(key, mapper(value));
+        let mut entries = self.entries();
+        while let Some((key, value)) = entries.next() {
+            output.insert(key.to_owned(), mapper(value));
         }
         output
     }
@@ -123,39 +150,43 @@ impl<V> Default for TrieMap<V> {
     }
 }
 
-impl<V> TrieNode<V> {
-    fn count(&self) -> usize {
-        let mut total = usize::from(self.value.is_some());
-        for child in self.children.values() {
-            total += child.count();
+impl<V> FromIterator<(Identifier, V)> for TrieMap<V> {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (Identifier, V)>,
+    {
+        let mut map = TrieMap::new();
+        for (id, value) in iter {
+            map.insert(id, value);
         }
-        total
+        map
     }
 }
 
-type ChildrenIterator<'a, V> = std::collections::hash_map::Iter<'a, IdentifierSegment, TrieNode<V>>;
-
-pub struct TrieIter<'a, V> {
+pub struct TrieEntries<'a, V> {
+    /// DFS stack of nodes and their partially consumed child iterators.
     stack: Vec<(&'a TrieNode<V>, ChildrenIterator<'a, V>)>,
-    path: Vec<IdentifierSegment>,
+    /// Reusable root-to-current-node path lent as [`IdentifierRef`] values.
+    path: Vec<&'a IdentifierSegment>,
+    /// Whether `current` should be yielded before descending further.
     yield_self: bool,
+    /// Node corresponding to `path` while `yield_self` is set.
     current: Option<&'a TrieNode<V>>,
 }
 
-impl<'a, V> Iterator for TrieIter<'a, V> {
-    type Item = (Identifier, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a, V> TrieEntries<'a, V> {
+    /// Advance to the next entry.
+    ///
+    /// The returned key view borrows the iterator's internal path buffer. Materialise it with
+    /// [`IdentifierRef::to_owned`] if it needs to be kept after the next call to this method.
+    pub fn next<'next>(&'next mut self) -> Option<(IdentifierRef<'next>, &'a V)> {
         loop {
             if self.yield_self {
                 self.yield_self = false;
                 if let Some(node) = self.current
                     && let Some(ref value) = node.value
                 {
-                    return Some((
-                        Identifier::from_segments_unchecked(self.path.clone().into_boxed_slice()),
-                        value,
-                    ));
+                    return Some((IdentifierRef::from_segments_unchecked(&self.path), value));
                 }
             }
 
@@ -164,7 +195,7 @@ impl<'a, V> Iterator for TrieIter<'a, V> {
                     Some((seg, child)) => {
                         // Put the updated children back before recursing
                         self.stack.push((node, children));
-                        self.path.push(seg.clone());
+                        self.path.push(seg);
                         self.current = Some(child);
                         self.stack.push((child, child.children.iter()));
                         self.yield_self = true;
@@ -180,14 +211,45 @@ impl<'a, V> Iterator for TrieIter<'a, V> {
     }
 }
 
-pub struct TrieIdentifierIter<'a, V> {
-    inner: TrieIter<'a, V>,
+pub struct TrieKeys<'a, V> {
+    /// Entry traversal reused to expose only the key part.
+    entries: TrieEntries<'a, V>,
 }
-impl<V> Iterator for TrieIdentifierIter<'_, V> {
+
+impl<V> TrieKeys<'_, V> {
+    /// Advance to the next key.
+    ///
+    /// The returned key view has the same borrowing constraints as [`TrieEntries::next`].
+    pub fn next(&mut self) -> Option<IdentifierRef<'_>> {
+        let (key, _) = self.entries.next()?;
+        Some(key)
+    }
+}
+
+pub struct TrieOwnedEntries<'a, V> {
+    /// Lending traversal whose keys are materialised before yielding.
+    entries: TrieEntries<'a, V>,
+}
+
+impl<'a, V> Iterator for TrieOwnedEntries<'a, V> {
+    type Item = (Identifier, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, value) = self.entries.next()?;
+        Some((key.to_owned(), value))
+    }
+}
+
+pub struct TrieOwnedKeys<'a, V> {
+    /// Owned-entry traversal reused to expose only the materialised key.
+    entries: TrieOwnedEntries<'a, V>,
+}
+
+impl<V> Iterator for TrieOwnedKeys<'_, V> {
     type Item = Identifier;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|t| t.0)
+        self.entries.next().map(|(key, _)| key)
     }
 }
 
@@ -218,24 +280,22 @@ impl TrieSet {
         self.0.get(key).is_some()
     }
 
+    /// Traverse all keys with key views borrowed from the iterator's reusable path buffer.
     #[must_use]
-    pub fn iter(&self) -> TrieIdentifierIter<'_, ()> {
-        self.0.iter_keys()
+    pub fn keys(&self) -> TrieKeys<'_, ()> {
+        self.0.keys()
+    }
+
+    /// Traverse all keys as a standard [`Iterator`] by materialising an owned key per entry.
+    #[must_use]
+    pub fn owned_keys(&self) -> TrieOwnedKeys<'_, ()> {
+        self.0.owned_keys()
     }
 }
 
 impl Default for TrieSet {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl<'a> IntoIterator for &'a TrieSet {
-    type Item = Identifier;
-    type IntoIter = TrieIdentifierIter<'a, ()>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
     }
 }
 
@@ -252,25 +312,22 @@ impl FromIterator<Identifier> for TrieSet {
     }
 }
 
-impl<'a, V> IntoIterator for &'a TrieMap<V> {
-    type Item = (Identifier, &'a V);
-    type IntoIter = TrieIter<'a, V>;
+/// Iterator over one node's child segment map.
+type ChildrenIterator<'a, V> = std::collections::hash_map::Iter<'a, IdentifierSegment, TrieNode<V>>;
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.iter()
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrieNode<V> {
+    value: Option<V>,
+    children: AHashMap<IdentifierSegment, TrieNode<V>>,
 }
 
-impl<V> FromIterator<(Identifier, V)> for TrieMap<V> {
-    fn from_iter<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = (Identifier, V)>,
-    {
-        let mut map = TrieMap::new();
-        for (id, value) in iter {
-            map.insert(id, value);
+impl<V> TrieNode<V> {
+    fn count(&self) -> usize {
+        let mut total = usize::from(self.value.is_some());
+        for child in self.children.values() {
+            total += child.count();
         }
-        map
+        total
     }
 }
 
@@ -331,7 +388,7 @@ mod tests {
     }
 
     #[test]
-    fn test_iter_and_into_iter() {
+    fn test_entries_and_owned_iterators() {
         let mut trie_map = TrieMap::new();
         let mut trie_set = TrieSet::new();
         let keys = [id(["a"]), id(["a", "b"]), id(["x", "y"])];
@@ -341,10 +398,11 @@ mod tests {
             trie_set.insert(k.clone());
         }
 
-        let mut seen = trie_map
-            .iter()
-            .map(|(id, value)| (id, *value))
-            .collect_vec();
+        let mut entries = trie_map.entries();
+        let mut seen = Vec::new();
+        while let Some((id, value)) = entries.next() {
+            seen.push((id.to_owned(), *value));
+        }
         seen.sort_by_key(|id| id.0.clone());
         let mut expected = keys
             .iter()
@@ -355,6 +413,31 @@ mod tests {
         expected.sort_by_key(|id| id.0.clone());
 
         assert_eq!(seen, expected);
+
+        let mut seen = trie_map
+            .owned_entries()
+            .map(|(id, value)| (id, *value))
+            .collect_vec();
+        seen.sort_by_key(|id| id.0.clone());
+
+        assert_eq!(seen, expected);
+
+        let mut set_keys = trie_set.keys();
+        let mut seen_set_keys = Vec::new();
+        while let Some(id) = set_keys.next() {
+            seen_set_keys.push(id.to_owned());
+        }
+        seen_set_keys.sort();
+
+        let mut expected_keys = keys.to_vec();
+        expected_keys.sort();
+
+        assert_eq!(seen_set_keys, expected_keys);
+
+        let mut seen_owned_set_keys = trie_set.owned_keys().collect_vec();
+        seen_owned_set_keys.sort();
+
+        assert_eq!(seen_owned_set_keys, expected_keys);
     }
 
     #[test]

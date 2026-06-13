@@ -226,14 +226,14 @@ fn permitted_reachable_members<'a>(
     members: &'a TrieSet,
 ) -> Cow<'a, TrieSet> {
     let all_members_permitted = members
-        .iter()
+        .owned_keys()
         .all(|member| interest.permits_member(&member));
     if all_members_permitted {
         return Cow::Borrowed(members);
     }
 
     let permitted = members
-        .iter()
+        .owned_keys()
         .filter(|member| interest.permits_member(member))
         .collect();
     Cow::Owned(permitted)

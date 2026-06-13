@@ -20,6 +20,7 @@ use chacha20poly1305::{
     Nonce,
     aead::{Aead, Payload},
 };
+use flotsync_core::member::IdentifierLike;
 use rand_core::{OsRng, TryRngCore};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
@@ -342,7 +343,7 @@ fn group_aad(context: GroupMessageContext<'_>, public_header: &[u8]) -> Vec<u8> 
 /// Hash a member identity as a segment count followed by length-prefixed segments.
 fn hash_member_identity(hasher: &mut Sha256, member: &MemberIdentity) {
     hasher.update(len_u64(member.len()).to_be_bytes());
-    for segment in member.segments_iter() {
+    for segment in member.segments() {
         hash_len_prefixed(hasher, segment.as_ref().as_bytes());
     }
 }
@@ -350,7 +351,7 @@ fn hash_member_identity(hasher: &mut Sha256, member: &MemberIdentity) {
 /// Append a member identity as a segment count followed by length-prefixed segments.
 fn append_member_identity(output: &mut Vec<u8>, member: &MemberIdentity) {
     output.put_u64(len_u64(member.len()));
-    for segment in member.segments_iter() {
+    for segment in member.segments() {
         append_len_prefixed(output, segment.as_ref().as_bytes());
     }
 }

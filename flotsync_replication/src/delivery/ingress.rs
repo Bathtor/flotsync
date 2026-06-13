@@ -246,7 +246,10 @@ type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<Transpor
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use flotsync_core::{member::IdentifierBuf, membership::GroupMemberships};
+    use flotsync_core::{
+        member::{IdentifierBuf, IdentifierLike},
+        membership::GroupMemberships,
+    };
     use flotsync_io::{
         prelude::IoPayload,
         test_support::{build_test_kompact_system, kill_component, start_component},
@@ -531,7 +534,7 @@ mod tests {
 
     fn proto_identifier(member: &MemberIdentity) -> discovery_proto::Identifier {
         let segments = member
-            .segments_iter()
+            .segments()
             .map(|segment| segment.as_ref().to_owned())
             .collect();
         discovery_proto::Identifier {

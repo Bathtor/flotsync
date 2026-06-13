@@ -2,7 +2,7 @@ use crate::discovery;
 use flotsync_core::{
     GroupId,
     MemberIdentity,
-    member::{IdentifierBuf, IdentifierError},
+    member::{IdentifierBuf, IdentifierError, IdentifierLike},
 };
 use snafu::prelude::*;
 use uuid::Uuid;
@@ -109,7 +109,7 @@ pub fn fixed_bytes_field<const N: usize>(
 #[must_use]
 pub fn member_identity_to_wire_format(member: &MemberIdentity) -> discovery::Identifier {
     let segments = member
-        .segments_iter()
+        .segments()
         .map(|segment| segment.as_ref().to_owned())
         .collect();
     discovery::Identifier {

@@ -14,9 +14,32 @@ use std::{
 };
 use uuid::Uuid;
 
+/// One segment of a hierarchical [[Identifier]].
 pub type IdentifierSegment = IString;
 
-const SEGMENT_SEPARATOR: &str = ".";
+/// Common trait for types that are kind of an [[Identifier]] and differ only in ownership.
+pub trait IdentifierLike: fmt::Debug + fmt::Display {
+    /// Go through all segments of the identifier in order.
+    fn segments(&self) -> impl Iterator<Item = &IdentifierSegment>;
+
+    /// The number of segments in `self`.
+    #[must_use]
+    fn len(&self) -> usize;
+
+    /// Returns whether `self` contains no segments.
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number of bytes in the identifier.
+    ///
+    /// This does *not* include any separators.
+    #[must_use]
+    fn num_bytes(&self) -> usize {
+        self.segments().map(IdentifierSegment::len).sum()
+    }
+}
 
 #[derive(Debug, Snafu)]
 pub enum IdentifierError {
@@ -71,32 +94,8 @@ pub struct Identifier {
 }
 
 impl Identifier {
-    /// The number of segments in `self`.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.segments.len()
-    }
-
-    /// Returns whether `self` contains no segments.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
-    }
-
-    /// The number of bytes in the identifier.
-    ///
-    /// This does *not* include any separators.
-    #[must_use]
-    pub fn num_bytes(&self) -> usize {
-        self.segments.iter().map(IdentifierSegment::len).sum()
-    }
-
-    pub fn segments(self) -> impl Iterator<Item = IdentifierSegment> {
+    pub fn into_segments(self) -> impl Iterator<Item = IdentifierSegment> {
         self.segments.into_iter()
-    }
-
-    pub fn segments_iter(&self) -> impl Iterator<Item = &IdentifierSegment> {
-        self.segments.iter()
     }
 
     #[must_use]
@@ -175,7 +174,7 @@ impl Identifier {
     ///
     /// See `IdentifierUuidDecodeError` for failure conditions.
     pub fn decode_uuid_segments(&self) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
-        decode_uuid_segments(self.segments_iter().map(AsRef::as_ref))
+        decode_uuid_segments(self.segments().map(AsRef::as_ref))
     }
 
     /// Decode all identifier segments as UUIDs using the provided encoding.
@@ -187,7 +186,7 @@ impl Identifier {
         &self,
         encoding: UuidEncoding,
     ) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
-        decode_uuid_segments_with_encoding(self.segments_iter().map(AsRef::as_ref), encoding)
+        decode_uuid_segments_with_encoding(self.segments().map(AsRef::as_ref), encoding)
     }
 
     /// Parse a textual identifier and decode all segments as UUIDs, inferring one shared encoding.
@@ -230,6 +229,20 @@ impl Identifier {
     }
 }
 
+impl IdentifierLike for Identifier {
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn segments(&self) -> impl Iterator<Item = &IdentifierSegment> {
+        self.segments.iter()
+    }
+}
+
 impl From<IdentifierBuf> for Identifier {
     fn from(value: IdentifierBuf) -> Self {
         value.into_identifier()
@@ -245,6 +258,7 @@ impl fmt::Debug for Identifier {
         )
     }
 }
+
 impl fmt::Display for Identifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.segments.iter().join(SEGMENT_SEPARATOR))
@@ -256,6 +270,64 @@ impl FromStr for Identifier {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         IdentifierBuf::from_str(input).map(IdentifierBuf::into_identifier)
+    }
+}
+
+/// Borrowed view of an identifier split into ordered segments.
+///
+/// This is primarily useful for trie traversal: the view can borrow a reusable traversal path
+/// instead of materialising an owned [`Identifier`] for every visited key. Call [`Self::to_owned`]
+/// when an owned identifier is required beyond the current traversal step.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IdentifierRef<'a> {
+    segments: &'a [&'a IdentifierSegment],
+}
+
+impl<'a> IdentifierRef<'a> {
+    #[must_use]
+    pub(crate) fn from_segments_unchecked(segments: &'a [&'a IdentifierSegment]) -> Self {
+        Self { segments }
+    }
+
+    /// Materialise this borrowed view as an owned identifier.
+    #[must_use]
+    pub fn to_owned(&self) -> Identifier {
+        let segments = self.segments.iter().copied().cloned().collect_vec();
+        Identifier::from_segments_unchecked(segments.into_boxed_slice())
+    }
+}
+
+impl IdentifierLike for IdentifierRef<'_> {
+    fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    fn segments(&self) -> impl Iterator<Item = &IdentifierSegment> {
+        self.segments.iter().copied()
+    }
+}
+
+impl fmt::Debug for IdentifierRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "IdentifierRef({})",
+            self.segments
+                .iter()
+                .copied()
+                .map(|s| format!("{s:?}"))
+                .join(", ")
+        )
+    }
+}
+
+impl fmt::Display for IdentifierRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.segments.iter().copied().join(SEGMENT_SEPARATOR))
     }
 }
 
@@ -620,6 +692,8 @@ fn split_identifier_text(input: &str) -> Result<Vec<&str>, IdentifierUuidDecodeE
     }
     Ok(segments)
 }
+
+const SEGMENT_SEPARATOR: &str = ".";
 
 static LEGAL_CHARS_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9:_-]+$").unwrap());

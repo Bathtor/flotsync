@@ -723,13 +723,13 @@ impl DeliverySecurity {
             }
         }
         if payload.member_public_keys().len() != payload.members().len() {
-            for (member_id, _) in payload.member_public_keys() {
+            for (member_id, _) in payload.member_public_keys().owned_entries() {
                 if !payload.members().contains(&member_id) {
                     return Err(DeliverySecurityError::UnexpectedBootstrapPublicKeys { member_id });
                 }
             }
         }
-        for (member_id, member_keys) in payload.member_public_keys() {
+        for (member_id, member_keys) in payload.member_public_keys().owned_entries() {
             let trusted_keys = if member_id == self.local_member {
                 self.local_public_bootstrap_keys()
             } else {
