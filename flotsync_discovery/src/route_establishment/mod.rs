@@ -24,7 +24,7 @@ mod wire;
 pub use component::{RouteEstablishmentComponent, RouteEstablishmentMessage};
 pub use config::{RouteEstablishmentConfig, RouteEstablishmentConfigError};
 pub use observation::PeerAnnouncementObservationComponent;
-pub use state::RouteProbeKey;
+pub use state::{ManualRouteWatchError, WatchedRoute};
 pub use wire::{RouteEstablishmentError, frame_signature_from_wire};
 
 /// Future returned by asynchronous discovery credential verification.

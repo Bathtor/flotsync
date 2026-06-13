@@ -1,4 +1,3 @@
-use super::state::RouteProbeKey;
 use crate::protocol::{
     DiscoveryProtocolError,
     DiscoveryRoute,
@@ -13,6 +12,7 @@ use flotsync_messages::{
 };
 use flotsync_security::{FrameSignature, SIGNATURE_LENGTH};
 use snafu::prelude::*;
+use uuid::Uuid;
 
 /// Decode and validation errors for route establishment frames.
 #[derive(Debug, Snafu)]
@@ -51,7 +51,8 @@ pub enum RouteEstablishmentError {
 /// Returns [`RouteEstablishmentError`] when required fields are absent, values cannot be decoded,
 /// the payload does not match the active probe, or the discovery signature wrapper is unsupported.
 pub fn prepare_claim_for_verification(
-    key: &RouteProbeKey,
+    expected_route: DiscoveryRoute,
+    expected_instance_id: Uuid,
     expected_nonce: &[u8],
     local_member: &MemberIdentity,
     claim: discovery_proto::SignedIntroductionClaim,
@@ -69,7 +70,12 @@ pub fn prepare_claim_for_verification(
     {
         let payload = decode_introduction_claim_payload_view(&claim.claim_payload)
             .context(DecodeClaimPayloadSnafu)?;
-        validate_claim_payload(key, expected_nonce, &payload)?;
+        validate_claim_payload(
+            expected_route,
+            expected_instance_id,
+            expected_nonce,
+            &payload,
+        )?;
     }
     let signature = claim.signature.as_option().context(MissingFieldSnafu {
         message: "SignedIntroductionClaim",
@@ -85,12 +91,13 @@ pub fn prepare_claim_for_verification(
 
 /// Validate claim fields that must match the receiver's active route probe.
 pub fn validate_claim_payload(
-    key: &RouteProbeKey,
+    expected_route: DiscoveryRoute,
+    expected_instance_id: Uuid,
     expected_nonce: &[u8],
     payload: &IntroductionClaimPayloadView<'_>,
 ) -> Result<(), RouteEstablishmentError> {
     ensure!(
-        payload.instance_uuid == key.instance_id.as_bytes().as_slice(),
+        payload.instance_uuid == expected_instance_id.as_bytes().as_slice(),
         ClaimMismatchSnafu {
             field: "instance_uuid"
         }
@@ -112,10 +119,10 @@ pub fn validate_claim_payload(
         message: "IntroductionClaimPayload",
         field: "route",
     })?;
-    let route = discovery_route_from_wire_view(route, "IntroductionClaimPayload.route")
+    let claimed_route = discovery_route_from_wire_view(route, "IntroductionClaimPayload.route")
         .context(DecodeClaimPayloadSnafu)?;
     ensure!(
-        route == DiscoveryRoute::Udp(key.route),
+        claimed_route == expected_route,
         ClaimMismatchSnafu { field: "route" }
     );
     Ok(())

@@ -54,7 +54,14 @@ use std::{
 use uuid::Uuid;
 
 use super::{
-    state::{PeerRouteState, PendingClaimVerification, PendingProbe, RouteProbeKey},
+    state::{
+        ManualMemberFilter,
+        ManualRouteWatchError,
+        PendingClaimVerification,
+        PendingProbe,
+        WatchedRoute,
+        WatchedRouteState,
+    },
     wire::{discovery_signature_to_wire, prepare_claim_for_verification},
 };
 
@@ -68,15 +75,15 @@ pub enum RouteEstablishmentMessage {
         /// Concrete local address for the runtime endpoint bind.
         local_addr: SocketAddr,
     },
+    /// Replace all manual route watches currently configured on this component.
+    ReplaceManualRouteWatches(Ask<Vec<WatchedRoute>, Result<(), ManualRouteWatchError>>),
     /// Private result for one UDP send request.
     SendResult(UdpSendResult),
     /// Test hook that withdraws one route without waiting for a wall-clock timer.
     #[cfg(test)]
     ExpireRouteForTest {
-        /// Peer process instance whose route should be withdrawn.
-        instance_id: Uuid,
         /// Exact route endpoint to withdraw.
-        route: SocketAddr,
+        route: DiscoveryRoute,
     },
 }
 
@@ -120,9 +127,11 @@ pub struct RouteEstablishmentComponent {
     local_endpoint: LocalUdpEndpointState,
     /// Monotonic transmission id source for UDP sends.
     next_transmission_id: TransmissionId,
-    /// Per advertised peer-instance route verification state.
-    route_state: HashMap<RouteProbeKey, PeerRouteState>,
-    /// Last published route snapshot, rebuilt from `routes` after verification state changes.
+    /// Per route interest and verification state.
+    route_state: HashMap<DiscoveryRoute, WatchedRouteState>,
+    /// Routes with active manual watch interest, used to avoid scanning all route state on replace.
+    manual_route_watch_routes: HashSet<DiscoveryRoute>,
+    /// Last published route snapshot, rebuilt from route verification state.
     member_route_snapshots: TrieMap<BTreeSet<SocketAddr>>,
 }
 
@@ -150,6 +159,7 @@ impl RouteEstablishmentComponent {
             local_endpoint: LocalUdpEndpointState::Unbound,
             next_transmission_id: TransmissionId::ONE,
             route_state: HashMap::new(),
+            manual_route_watch_routes: HashSet::new(),
             member_route_snapshots: TrieMap::new(),
         }
     }
@@ -262,24 +272,101 @@ impl RouteEstablishmentComponent {
         self.send_introduction_requests(probes).await;
     }
 
+    /// Replace manual route watches and probe newly active routes when an endpoint is available.
+    async fn replace_manual_route_watches_async(
+        &mut self,
+        watches: Vec<WatchedRoute>,
+    ) -> Result<(), ManualRouteWatchError> {
+        let probes = self.replace_manual_route_watches(watches)?;
+        if self.local_endpoint.binding().is_some() {
+            self.send_introduction_requests(probes).await;
+        }
+        Ok(())
+    }
+
     /// Record advertised routes and return routes that should be probed.
     pub(super) fn record_peer_announcement(
         &mut self,
         peer: PeerAnnouncementObserved,
-    ) -> Vec<RouteProbeKey> {
-        let mut probes = Vec::new();
+    ) -> Vec<DiscoveryRoute> {
+        let mut probes = Vec::with_capacity(peer.routes.len());
         for route in peer.routes {
-            let DiscoveryRoute::Udp(route) = route;
-            let key = RouteProbeKey {
-                instance_id: peer.instance_id,
-                route,
-            };
-            let route = self.route_state.entry(key).or_insert(PeerRouteState::KNOWN);
-            if !route.has_active_timeout() {
-                probes.push(key);
+            let route_state = self
+                .route_state
+                .entry(route)
+                .or_insert(WatchedRouteState::NEW);
+            route_state.interest.peer_announced = true;
+            if !route_state.has_active_timeout() {
+                probes.push(route);
             }
         }
         probes
+    }
+
+    /// Replace the manual route watches and return routes that should be probed.
+    fn replace_manual_route_watches(
+        &mut self,
+        watches: Vec<WatchedRoute>,
+    ) -> Result<Vec<DiscoveryRoute>, ManualRouteWatchError> {
+        let mut manual_filters = manual_filters_from_watches(watches)?;
+
+        let new_manual_route_watch_routes = manual_filters.keys().copied().collect::<HashSet<_>>();
+        let old_and_new_routes: HashSet<DiscoveryRoute> = self
+            .manual_route_watch_routes
+            .union(&new_manual_route_watch_routes)
+            .copied()
+            .collect();
+
+        self.manual_route_watch_routes = new_manual_route_watch_routes;
+
+        let mut timers_to_cancel = Vec::new();
+        let mut should_rebuild_published_routes = false;
+        let mut probes = Vec::new();
+        for route in old_and_new_routes {
+            // The default is `None`, so for old routes not present in the new watches,
+            // this effectively removes the manual filter.
+            let new_manual_filter = manual_filters.remove(&route).unwrap_or_default();
+            let route_state = self
+                .route_state
+                .entry(route)
+                .or_insert(WatchedRouteState::NEW);
+            let manual_filter_changed = route_state.interest.manual != new_manual_filter;
+            route_state.interest.manual = new_manual_filter;
+
+            if route_state.should_watch() {
+                if manual_filter_changed {
+                    let reconciliation = route_state.reconcile_reachable_members_with_interest();
+                    if let Some(timer) = reconciliation.timer_to_cancel {
+                        timers_to_cancel.push(timer);
+                    }
+                    if reconciliation.requires_snapshot_changes {
+                        should_rebuild_published_routes = true;
+                    }
+                    debug_assert!(
+                        route_state.should_watch(),
+                        "reconciling reachable members must not remove route interest"
+                    );
+                }
+
+                if !route_state.has_active_timeout() {
+                    probes.push(route);
+                }
+            } else {
+                // Nothing requires us to keep probing this route, so just remove the timers and
+                // move on with the next route.
+                if let Some(timer) = route_state.verification.mark_stale() {
+                    timers_to_cancel.push(timer);
+                    should_rebuild_published_routes = true;
+                }
+            }
+        }
+        for timer in timers_to_cancel {
+            self.cancel_timer(timer);
+        }
+        if should_rebuild_published_routes {
+            self.rebuild_published_member_routes();
+        }
+        Ok(probes)
     }
 
     /// Probe all known routes that are not already probing or published.
@@ -287,36 +374,49 @@ impl RouteEstablishmentComponent {
         let routes = self
             .route_state
             .iter()
-            .filter_map(|(key, route)| option_when!(!route.has_active_timeout(), *key))
+            .filter_map(|(route, state)| {
+                option_when!(state.should_watch() && !state.has_active_timeout(), *route)
+            })
             .collect::<Vec<_>>();
+        trace!(
+            self.log(),
+            "route establishment probing {} inactive watched route(s)",
+            routes.len()
+        );
         self.send_introduction_requests(routes).await;
     }
 
-    /// Send introduction probes for the provided route keys in order.
-    async fn send_introduction_requests(&mut self, keys: impl IntoIterator<Item = RouteProbeKey>) {
-        for key in keys {
-            self.send_introduction_request(key).await;
+    /// Send introduction probes for the provided routes in order.
+    async fn send_introduction_requests(
+        &mut self,
+        routes: impl IntoIterator<Item = DiscoveryRoute>,
+    ) {
+        for route in routes {
+            self.send_introduction_request(route).await;
         }
     }
 
     /// Send one introduction request and start the matching probe timeout.
-    async fn send_introduction_request(&mut self, key: RouteProbeKey) {
+    async fn send_introduction_request(&mut self, route: DiscoveryRoute) {
         if self
             .route_state
-            .get(&key)
-            .is_none_or(PeerRouteState::has_active_timeout)
+            .get(&route)
+            .is_none_or(|state| !state.should_watch() || state.has_active_timeout())
         {
+            trace!(
+                self.log(),
+                "route establishment skipped inactive probe for {:?}", route
+            );
             return;
         }
         let Some(endpoint) = self.local_endpoint.binding() else {
             debug!(
                 self.log(),
-                "route establishment recorded route {} for instance {} while local endpoint was not bound",
-                key.route,
-                key.instance_id
+                "route establishment recorded route {:?} while local endpoint was not bound", route
             );
             return;
         };
+        let DiscoveryRoute::Udp(target) = route;
 
         let nonce = Uuid::new_v4();
         let frame = introduction_request_endpoint_frame(uuid_to_wire_bytes(nonce));
@@ -325,8 +425,8 @@ impl RouteEstablishmentComponent {
             Err(error) => {
                 debug!(
                     self.log(),
-                    "failed to encode route establishment introduction request for {}: {}",
-                    key.route,
+                    "failed to encode route establishment introduction request for {:?}: {}",
+                    route,
                     error
                 );
                 return;
@@ -340,18 +440,23 @@ impl RouteEstablishmentComponent {
             socket_id: endpoint.socket_id,
             transmission_id,
             payload,
-            target: Some(key.route),
+            target: Some(target),
             reply_to,
         });
+        trace!(
+            self.log(),
+            "route establishment sent introduction request to {}", target
+        );
 
         let timeout = self.timing.probe_timeout;
         let timer = self.schedule_once(timeout, move |component, timeout| {
-            component.handle_probe_timeout(key, nonce, &timeout)
+            component.handle_probe_timeout(route, nonce, &timeout)
         });
         let timer_to_cancel = self
             .route_state
-            .get_mut(&key)
+            .get_mut(&route)
             .expect("probe route was checked before scheduling")
+            .verification
             .mark_probing(PendingProbe { nonce, timer });
         if let Some(timer) = timer_to_cancel {
             self.cancel_timer(timer);
@@ -361,14 +466,16 @@ impl RouteEstablishmentComponent {
     /// Expire one active introduction probe if the nonce and timer still match.
     fn handle_probe_timeout(
         &mut self,
-        key: RouteProbeKey,
+        route: DiscoveryRoute,
         nonce: Uuid,
         actual_timer: &ScheduledTimer,
     ) -> HandlerResult {
-        if let Some(route) = self.route_state.get_mut(&key)
-            && route.expire_probe_if_matches(nonce, actual_timer)
+        if let Some(state) = self.route_state.get_mut(&route)
+            && state
+                .verification
+                .expire_probe_if_matches(nonce, actual_timer)
         {
-            self.mark_route_stale(key);
+            self.mark_route_stale(route);
         }
         Handled::OK
     }
@@ -530,7 +637,7 @@ impl RouteEstablishmentComponent {
                 self.log(),
                 "ignored introduction from {} because it contained no verifiable claims", source
             );
-            self.mark_route_stale(prepared.key);
+            self.mark_route_stale(prepared.route);
             return;
         }
         let memberships = self.group_memberships.snapshot();
@@ -542,7 +649,9 @@ impl RouteEstablishmentComponent {
                         memberships.as_ref(),
                         &verified_claim.member,
                         &verified_claim.group_ids,
-                    ) {
+                    ) && self
+                        .route_interest_permits_member(prepared.route, &verified_claim.member)
+                    {
                         accepted_members.insert(verified_claim.member);
                     }
                 }
@@ -560,10 +669,10 @@ impl RouteEstablishmentComponent {
                 "ignored introduction from {} because no verified claim matched local group memberships",
                 source
             );
-            self.mark_route_stale(prepared.key);
+            self.mark_route_stale(prepared.route);
             return;
         }
-        self.mark_route_reachable(prepared.key, accepted_members);
+        self.mark_route_reachable(prepared.route, accepted_members);
     }
 
     /// Collect introduction claims that match the currently active probe.
@@ -572,30 +681,27 @@ impl RouteEstablishmentComponent {
         source: SocketAddr,
         introduction: discovery_proto::Introduction,
     ) -> Option<super::state::PartiallyVerifiedIntroduction> {
+        let route = DiscoveryRoute::Udp(source);
+        let Some(route_state) = self.route_state.get(&route) else {
+            trace!(
+                self.log(),
+                "ignored unsolicited introduction from {} for unwatched route", source
+            );
+            return None;
+        };
+        let Some(probe) = route_state.pending_probe() else {
+            trace!(
+                self.log(),
+                "ignored introduction from {} without an active probe", source
+            );
+            return None;
+        };
         let Ok(instance_id) =
             uuid_from_wire_bytes(&introduction.instance_uuid, "Introduction.instance_uuid")
         else {
             trace!(
                 self.log(),
                 "ignored introduction from {} with malformed instance id", source
-            );
-            return None;
-        };
-        let key = RouteProbeKey {
-            instance_id,
-            route: source,
-        };
-        let Some(route) = self.route_state.get(&key) else {
-            trace!(
-                self.log(),
-                "ignored unsolicited introduction from {} for instance {}", source, instance_id
-            );
-            return None;
-        };
-        let Some(probe) = route.pending_probe() else {
-            trace!(
-                self.log(),
-                "ignored introduction from {} without an active probe", source
             );
             return None;
         };
@@ -612,8 +718,13 @@ impl RouteEstablishmentComponent {
             .claims
             .into_iter()
             .filter_map(|claim| {
-                match prepare_claim_for_verification(&key, &probe_nonce, &self.local_member, claim)
-                {
+                match prepare_claim_for_verification(
+                    route,
+                    instance_id,
+                    &probe_nonce,
+                    &self.local_member,
+                    claim,
+                ) {
                     Ok(claim) => claim,
                     Err(error) => {
                         debug!(
@@ -625,21 +736,26 @@ impl RouteEstablishmentComponent {
                 }
             })
             .collect();
-        Some(super::state::PartiallyVerifiedIntroduction { key, claims })
+        Some(super::state::PartiallyVerifiedIntroduction { route, claims })
     }
 
     /// Publish one route for the verified members until the reachable lease expires.
-    pub(super) fn mark_route_reachable(&mut self, key: RouteProbeKey, accepted_members: TrieSet) {
-        if !self.route_state.contains_key(&key) {
+    pub(super) fn mark_route_reachable(
+        &mut self,
+        route: DiscoveryRoute,
+        accepted_members: TrieSet,
+    ) {
+        if !self.route_state.contains_key(&route) {
             return;
         }
         let timer = self.schedule_once(self.timing.reachable_lease, move |component, timeout| {
-            component.handle_reachable_lease_expired(key, &timeout)
+            component.handle_reachable_lease_expired(route, &timeout)
         });
         let timer_to_cancel = self
             .route_state
-            .get_mut(&key)
+            .get_mut(&route)
             .expect("reachable route was checked before scheduling")
+            .verification
             .mark_reachable(timer, accepted_members);
         if let Some(timer) = timer_to_cancel {
             self.cancel_timer(timer);
@@ -650,28 +766,31 @@ impl RouteEstablishmentComponent {
     /// Expire one reachable lease if it still owns the active timer, then schedule a refresh probe.
     fn handle_reachable_lease_expired(
         &mut self,
-        key: RouteProbeKey,
+        route: DiscoveryRoute,
         actual_timer: &ScheduledTimer,
     ) -> HandlerResult {
-        let Some(route) = self.route_state.get_mut(&key) else {
+        let Some(route_state) = self.route_state.get_mut(&route) else {
             return Handled::OK;
         };
-        if !route.expire_reachable_lease_if_matches(actual_timer) {
+        if !route_state
+            .verification
+            .expire_reachable_lease_if_matches(actual_timer)
+        {
             return Handled::OK;
         }
         self.rebuild_published_member_routes();
         Handled::block_on(self, async move |mut async_self| {
-            async_self.send_introduction_request(key).await;
+            async_self.send_introduction_request(route).await;
             Handled::OK
         })
     }
 
     /// Withdraw one route and cancel any probe or reachable-lease timer attached to it.
-    pub(super) fn mark_route_stale(&mut self, key: RouteProbeKey) {
+    pub(super) fn mark_route_stale(&mut self, route: DiscoveryRoute) {
         let timer_to_cancel = self
             .route_state
-            .get_mut(&key)
-            .and_then(PeerRouteState::mark_stale);
+            .get_mut(&route)
+            .and_then(|state| state.verification.mark_stale());
         if let Some(timer) = timer_to_cancel {
             self.cancel_timer(timer);
         }
@@ -680,9 +799,9 @@ impl RouteEstablishmentComponent {
 
     /// Withdraw all verified routes because the local endpoint changed.
     fn invalidate_route_verification_for_endpoint_change(&mut self) {
-        let mut timers_to_cancel = Vec::new();
-        for route in self.route_state.values_mut() {
-            if let Some(timer) = route.mark_stale() {
+        let mut timers_to_cancel = Vec::with_capacity(self.route_state.len());
+        for route_state in self.route_state.values_mut() {
+            if let Some(timer) = route_state.verification.mark_stale() {
                 timers_to_cancel.push(timer);
             }
         }
@@ -718,16 +837,28 @@ impl RouteEstablishmentComponent {
     /// Build the currently publishable member route map from reachable route state.
     fn published_member_routes_from_state(&self) -> TrieMap<BTreeSet<SocketAddr>> {
         let mut member_routes: TrieMap<BTreeSet<SocketAddr>> = TrieMap::new();
-        for (key, route) in &self.route_state {
-            if let Some(members) = route.reachable_members() {
+        for (route, route_state) in &self.route_state {
+            let DiscoveryRoute::Udp(route) = route;
+            if let Some(members) = route_state.reachable_members() {
                 for member in members {
                     let mut routes = member_routes.remove(&member).unwrap_or_default();
-                    routes.insert(key.route);
+                    routes.insert(*route);
                     member_routes.insert(member, routes);
                 }
             }
         }
         member_routes
+    }
+
+    /// Return whether current route interest allows publishing `member`.
+    fn route_interest_permits_member(
+        &self,
+        route: DiscoveryRoute,
+        member: &MemberIdentity,
+    ) -> bool {
+        self.route_state
+            .get(&route)
+            .is_some_and(|state| state.interest.permits_member(member))
     }
 
     /// Publish the latest route set for one member.
@@ -824,14 +955,44 @@ impl Actor for RouteEstablishmentComponent {
                     Handled::OK
                 })
             }
+            RouteEstablishmentMessage::ReplaceManualRouteWatches(watches) => {
+                Handled::block_on(self, async move |mut async_self| {
+                    let (promise, watches) = watches.take();
+                    let result = async_self.replace_manual_route_watches_async(watches).await;
+                    if promise.fulfil(result).is_err() {
+                        debug!(
+                            async_self.log(),
+                            "manual route watch replacement promise was dropped before reply"
+                        );
+                    }
+                    Handled::OK
+                })
+            }
             RouteEstablishmentMessage::SendResult(result) => self.handle_send_result(&result),
             #[cfg(test)]
-            RouteEstablishmentMessage::ExpireRouteForTest { instance_id, route } => {
-                self.mark_route_stale(RouteProbeKey { instance_id, route });
+            RouteEstablishmentMessage::ExpireRouteForTest { route } => {
+                self.mark_route_stale(route);
                 Handled::OK
             }
         }
     }
+}
+
+/// Collapse caller-provided watches into one manual filter per route.
+///
+/// Multiple constrained watches union their expected members. Mixing constrained and
+/// unconstrained watches for one route is rejected.
+fn manual_filters_from_watches(
+    watches: Vec<WatchedRoute>,
+) -> Result<HashMap<DiscoveryRoute, ManualMemberFilter>, ManualRouteWatchError> {
+    let mut filters = HashMap::with_capacity(watches.len());
+    for watch in watches {
+        filters
+            .entry(watch.route)
+            .or_insert_with(ManualMemberFilter::default)
+            .try_add_expected_member(watch.route, watch.expected_member)?;
+    }
+    Ok(filters)
 }
 
 /// Verify the signature on a prepared claim and keep its group ids with its member.

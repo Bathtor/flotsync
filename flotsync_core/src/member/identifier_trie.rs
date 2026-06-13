@@ -239,12 +239,38 @@ impl<'a> IntoIterator for &'a TrieSet {
     }
 }
 
+impl FromIterator<Identifier> for TrieSet {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = Identifier>,
+    {
+        let mut set = TrieSet::new();
+        for id in iter {
+            set.insert(id);
+        }
+        set
+    }
+}
+
 impl<'a, V> IntoIterator for &'a TrieMap<V> {
     type Item = (Identifier, &'a V);
     type IntoIter = TrieIter<'a, V>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<V> FromIterator<(Identifier, V)> for TrieMap<V> {
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = (Identifier, V)>,
+    {
+        let mut map = TrieMap::new();
+        for (id, value) in iter {
+            map.insert(id, value);
+        }
+        map
     }
 }
 
