@@ -356,12 +356,6 @@ mod tests {
 
             [flotsync.replication.runtime]
             local-endpoint-bind-addr = "127.0.0.1:45100"
-
-            [[flotsync.replication.runtime.static-peer-routes]]
-            name = "bob"
-            protocol = "udp"
-            ip = "127.0.0.1"
-            port = 45101
             "#,
         )
         .expect("config should parse");

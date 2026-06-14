@@ -13,6 +13,12 @@ The steps use the names `alice` and `bob`. If your local config uses different m
 `alice` to the first terminal/machine and `bob` to the second. The checked-in examples in
 `testing/` are currently named for the machines they target, but the flow is the same.
 
+The normal custom UDP discovery path does not require
+`flotsync.replication.runtime.static-peer-routes`. Use concrete local endpoint addresses that the
+other peer can reach; wildcard bind addresses such as `0.0.0.0:45100` are bind instructions, not
+signed advertised routes. The no-static route scenarios require a network that forwards the
+peer-announcement UDP traffic between the peers.
+
 ## Setup
 
 Build or run the checklist binary from the repository root:
@@ -287,7 +293,66 @@ Expected result:
   state and continued replication, not automatic UI rehydration of previously visible checklist
   rows.
 
-## Scenario 5: Static Route Hints
+## Scenario 5: Custom UDP Discovery Without Static Routes
+
+Goal: two peers discover usable direct UDP routes through peer announcements and route
+establishment, without preconfigured peer endpoints.
+
+Before starting the peers, inspect both TOML files and confirm neither file contains
+`flotsync.replication.runtime.static-peer-routes`.
+
+Alice config:
+
+```toml
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "ALICE_LAN_IP:45100"
+```
+
+Bob config:
+
+```toml
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "BOB_LAN_IP:45101"
+```
+
+Start both peers and verify local runtime state.
+
+Alice:
+
+```text
+me
+members
+add custom discovery check from alice
+sync
+```
+
+Bob:
+
+```text
+me
+members
+sync
+list
+add custom discovery check from bob
+sync
+```
+
+Alice:
+
+```text
+sync
+list
+```
+
+Expected result:
+
+- Each peer prints its configured local endpoint from `me`.
+- Each peer lists the same static ordered members from `members`.
+- Alice-to-Bob and Bob-to-Alice item exchange works without any static peer route entries.
+- Routes become usable only after route establishment verifies a discovered peer-announcement route
+  with a signed introduction.
+
+## Scenario 6: Static Route Hints
 
 Goal: route hints are explicit, visible in the config files, and verified before they become usable
 replication routes.
@@ -355,5 +420,5 @@ Expected result:
 - Each peer lists the same static ordered members from `members`.
 - Alice-to-Bob and Bob-to-Alice item exchange works only after route establishment verifies the
   hinted remote IP and port with a signed introduction.
-- Static peer routes are hints, not direct always-available routes. Removing them means this
-  scenario depends on peer-announcement discovery to provide equivalent candidate routes.
+- Static peer routes are hints, not direct always-available routes. They are useful as a fallback or
+  diagnostic input when the local network does not forward peer-announcement traffic reliably.
