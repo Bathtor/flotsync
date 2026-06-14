@@ -1,3 +1,10 @@
+---
+type: Wire Format
+title: Protobuf Datamodel Transport
+description: Describes the protobuf transport for schema and datamodel snapshots and operations.
+status: implemented
+---
+
 # Protobuf Datamodel Transport
 
 This document describes the current protobuf transport used by

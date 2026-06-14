@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: Flotsync Security MVP
+description: Defines the initial Flotsync security model for identities, group secrets, encryption, and signatures.
+status: draft
+---
+
 # Flotsync Security MVP
 
 This document records the high-level design decisions for the first

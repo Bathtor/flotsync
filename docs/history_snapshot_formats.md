@@ -1,3 +1,10 @@
+---
+type: Benchmark
+title: HistorySnapshot Benchmark Baseline
+description: Records benchmark baselines for the canonical HistorySnapshot protobuf representation.
+status: implemented
+---
+
 # HistorySnapshot Benchmark Baseline
 
 This document records the current benchmark baseline for the canonical protobuf

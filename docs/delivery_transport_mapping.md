@@ -1,3 +1,10 @@
+---
+type: Decision
+title: Semantic Delivery to Route Transport Mapping
+description: Captures settled mapping decisions between semantic delivery and route transport.
+status: settled
+---
+
 # Semantic Delivery to Route Transport Mapping
 
 This note captures the currently settled design decisions for `flotsync-187`.

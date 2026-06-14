@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: Route Establishment Protocol
+description: Specifies non-mDNS route establishment for verified replication route candidates.
+status: draft
+---
+
 # Route Establishment Protocol
 
 This document specifies the non-mDNS route establishment protocol used by the

@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: UDPour
+description: Specifies the multipart datagram protocol for carrying oversized logical payloads over one UDP route.
+status: draft
+---
+
 # UDPour
 
 This note captures the current protocol draft for `flotsync-p9u`.

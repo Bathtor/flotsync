@@ -1,3 +1,10 @@
+---
+type: API Contract
+title: FlotSync Freeform I/O API
+description: Defines the raw and Kompact-facing freeform network I/O API model.
+status: settled
+---
+
 # FlotSync Freeform I/O API
 
 ## Scope

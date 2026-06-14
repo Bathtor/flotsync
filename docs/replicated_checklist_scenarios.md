@@ -1,3 +1,10 @@
+---
+type: Scenario
+title: Replicated Checklist Manual Scenarios
+description: Captures manual replicated-checklist scenarios for exercising multi-peer behaviour.
+status: draft
+---
+
 # Replicated Checklist Manual Scenarios
 
 This runbook covers the manual acceptance scenarios for `flotsync-5j0.9`.

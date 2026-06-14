@@ -52,6 +52,14 @@ jobs:
                   version: 1.67.0
                   github_token: ${{ secrets.GITHUB_TOKEN }}
 
+            - name: Cache Coursier artifacts
+              uses: coursier/cache-action@v8
+
+            - name: Install Ammonite
+              uses: coursier/setup-action@v3
+              with:
+                  apps: ammonite
+
             - name: Cache Rust build artifacts
               uses: Swatinem/rust-cache@v2
 
@@ -60,6 +68,9 @@ jobs:
 
             - name: Lint proto schema
               run: buf lint
+
+            - name: Check OKF design docs
+              run: amm scripts/okf-docs.sc check
 
             - name: Check formatting
               run: cargo fmt --all --check

@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: Single-Recipient Durable Delivery
+description: Specifies sender, recipient, and relay rules for single-recipient delivery with crash-survival expectations.
+status: draft
+---
+
 # Single-Recipient Durable Delivery
 
 This document defines a top-level protocol abstraction for durable delivery to

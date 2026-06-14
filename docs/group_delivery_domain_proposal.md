@@ -1,3 +1,10 @@
+---
+type: Decision
+title: Group Delivery Domain Proposal
+description: Proposes shared group delivery domain boundaries and crate placement decisions.
+status: draft
+---
+
 # Group Delivery Domain Proposal
 
 This document is the review companion for `flotsync-biq`.

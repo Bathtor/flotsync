@@ -49,6 +49,15 @@ Run the full workspace tests:
 cargo test --workspace
 ```
 
+Check the OKF-style design documentation index and metadata:
+
+```bash
+amm scripts/okf-docs.sc check
+```
+
+The OKF docs check requires Ammonite (`amm`). GitHub Actions installs it with
+Coursier before running the check.
+
 ### Codex Web on Ubuntu
 
 If you want to reproduce the Linux CI environment from Codex web on Ubuntu, bootstrap the host with:
@@ -61,12 +70,14 @@ That setup pins the toolchain to `nightly-2026-04-11`, matching the local fmt/cl
 this repo, and it also runs `cargo fetch --locked` so the workspace dependencies are cached before
 the Codex web environment loses internet access.
 
-After the script finishes, run the same checks as `pr-linux`:
+After the script finishes, install Ammonite if it is not already available, then
+run the same checks as `pr-linux`:
 
 ```bash
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 buf format --diff --exit-code
 buf lint
+amm scripts/okf-docs.sc check
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 cargo test --workspace --locked

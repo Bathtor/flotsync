@@ -6,6 +6,7 @@
 
 ## Local Agent Notes
 
+- For OKF-style design documentation work, use the project-local skill at `.codex/skills/flotsync-okf/SKILL.md` and its `references/doc-conventions.md` before editing `docs/`, `docs/index.md`, or `scripts/okf-docs.sc`.
 - Use `.agent_local_docs/tmp/` for temporary agent working notes that should survive ordinary machine uptime. Do not put this kind of state in `/tmp` or `/private/tmp` unless the user explicitly asks for OS-level temporary storage.
 - Review-feedback working notes are temporary coordination state, not project issue tracking. Keep them under `.agent_local_docs/tmp/`, not in `bd`.
 - When the user provides substantial review feedback, capture every comment in a working note before implementation. Include stable IDs, file context, the feedback, current status, and the intended direction.

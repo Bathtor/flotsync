@@ -1,3 +1,10 @@
+---
+type: State Machine
+title: GroupBroadcast Queue Model
+description: Specifies GroupBroadcast queue ownership, route states, transitions, and completion rules.
+status: draft
+---
+
 # GroupBroadcast Queue Model
 
 This document refines the high-level `GroupBroadcast` draft in

@@ -1,3 +1,10 @@
+---
+type: Scenario
+title: flotsync_io Example Applications
+description: Describes example applications used to exercise and demonstrate the flotsync_io API.
+status: draft
+---
+
 # flotsync_io Example Applications
 
 ## Scope

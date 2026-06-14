@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: FlotSync Communication Protocol
+description: Defines the high-level Flotsync replication communication model and its sub-protocol boundaries.
+status: draft
+---
+
 # FlotSync Communication Protocol (High-Level Spec, Draft)
 
 ## 1. Scope
