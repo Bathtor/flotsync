@@ -19,7 +19,11 @@ pub enum RouteEstablishmentConfigError {
 /// Runtime configuration for route establishment components.
 #[derive(Clone, Debug)]
 pub struct RouteEstablishmentConfig {
-    /// Local socket address used to receive plaintext `Peer` announcement messages.
+    /// Local UDP socket address used to receive plaintext `Peer` announcement messages.
+    ///
+    /// This is the peer-announcement discovery socket. It does not control the delivery endpoint
+    /// address, the advertised delivery routes signed in introductions, or the peer-announcement
+    /// broadcast destination port.
     pub peer_announcement_bind_addr: SocketAddr,
     /// Local runtime endpoint bind configured for follow-up discovery and replication traffic.
     pub configured_local_endpoint: SocketAddr,

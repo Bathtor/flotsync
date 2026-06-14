@@ -823,6 +823,29 @@ where
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
 }
 
+fn persist_group_membership_for_member<S>(
+    store: &S,
+    group_id: GroupId,
+    members: Vec<MemberIdentity>,
+    local_member_index: u32,
+) where
+    S: ReplicationStore + ?Sized,
+{
+    let member_count = members.len();
+    persist_group_in_store(
+        store,
+        ReplicationGroupRecord {
+            group_id,
+            members,
+            local_member_index: MemberIndex::new(local_member_index),
+            version_vector: VersionVector::initial(
+                NonZeroUsize::new(member_count).expect("group should not be empty"),
+            ),
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        },
+    );
+}
+
 fn persist_alice_group_with_security_material(
     store: &dyn ReplicationStore,
     group_id: GroupId,
@@ -1347,7 +1370,7 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
 }
 
 #[test]
-fn runtime_host_publishes_static_peer_routes_after_local_endpoint_bind() {
+fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let remote_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let remote_addr = remote_endpoint_lease.addr(0);
     let bob_member = bob_member();
@@ -1363,7 +1386,46 @@ fn runtime_host_publishes_static_peer_routes_after_local_endpoint_bind() {
         runtime_config_toml.as_str(),
     );
 
-    runtime.host().wait_for_direct_peer_route(&bob_member);
+    assert!(
+        !runtime.host().knows_direct_peer_route(&bob_member),
+        "static route hints must not publish before route establishment verifies them"
+    );
+}
+
+#[test]
+fn runtime_host_verifies_static_route_hint_through_route_establishment() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let group_id = GroupId(Uuid::from_u128(35));
+    let members = vec![alice_member.clone(), bob_member.clone()];
+    let bob_store = Arc::new(
+        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
+    );
+    provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
+    persist_group_membership_for_member(bob_store.as_ref(), group_id, members.clone(), 1);
+    let bob_listener = Arc::new(ListenerStub::default());
+    let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store, bob_listener);
+    wait_for_group_install(&bob_runtime, group_id);
+
+    let alice_store = Arc::new(
+        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
+    );
+    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
+    persist_group_membership_for_member(alice_store.as_ref(), group_id, members, 0);
+    let alice_listener = Arc::new(ListenerStub::default());
+    let runtime_config_toml = static_peer_route_toml(
+        &bob_member,
+        bob_runtime.host().advertised_loopback_udp_addr(),
+    );
+    let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
+        app_alice_id(),
+        alice_store,
+        alice_listener,
+        runtime_config_toml.as_str(),
+    );
+    wait_for_group_install(&alice_runtime, group_id);
+
+    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
 }
 
 #[test]

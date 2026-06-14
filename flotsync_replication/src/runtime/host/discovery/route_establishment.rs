@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "route establishment adapter is wired into the host in flotsync-ol4e"
-)]
-
 use crate::delivery::{
     route_transport::{
         DatagramRouteScope,
@@ -25,6 +20,14 @@ use flotsync_discovery::{
 use flotsync_utils::BoxError;
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
+
+/// Actor messages accepted by [`DiscoveryRouteAdapterComponent`].
+#[derive(Debug)]
+pub enum DiscoveryRouteAdapterMessage {
+    /// Test-support route update injected directly into delivery owners.
+    #[cfg(any(test, feature = "test-support"))]
+    Publish(TransportDiscoveryRouteUpdate<TransportRouteKey>),
+}
 
 impl DiscoveryCredentials for DeliverySecurity {
     fn sign_discovery_claim_payload(
@@ -109,9 +112,15 @@ impl Require<DiscoveryRoutePort> for DiscoveryRouteAdapterComponent {
 }
 
 impl Actor for DiscoveryRouteAdapterComponent {
-    type Message = Never;
+    type Message = DiscoveryRouteAdapterMessage;
 
-    fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-        unreachable!("Never type is empty")
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
+        match msg {
+            #[cfg(any(test, feature = "test-support"))]
+            DiscoveryRouteAdapterMessage::Publish(update) => {
+                self.discovery_provided.trigger(update);
+                Handled::OK
+            }
+        }
     }
 }

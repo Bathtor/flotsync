@@ -3,14 +3,28 @@ use derive_more::{Deref, Display, From};
 #[cfg(feature = "kompact-runtime")]
 pub use kompact;
 pub use uuid;
-/// Kompact configuration keys consumed by route establishment components.
+/// Kompact configuration keys consumed by peer-announcement and route-establishment components.
 #[cfg(feature = "peer-announcement-via-kompact")]
 pub mod config_keys {
+    use crate::DEFAULT_DISCOVERY_PORT;
     use kompact::{
-        config::{BooleanValue, DurationValue},
+        config::{BooleanValue, DurationValue, StringValue},
         kompact_config,
     };
     use std::time::Duration;
+
+    fn default_peer_announcement_bind_addr() -> String {
+        format!("0.0.0.0:{DEFAULT_DISCOVERY_PORT}")
+    }
+
+    kompact_config! {
+        PEER_ANNOUNCEMENT_BIND_ADDR,
+        key = "flotsync.discovery.peer-announcement.bind-addr",
+        type = StringValue,
+        default = default_peer_announcement_bind_addr(),
+        doc = "Local UDP socket address used by peer-announcement senders and observers. This controls where peer-announcement components bind or match an observed socket; it does not control advertised delivery routes or the broadcast target port.",
+        version = "0.1.0"
+    }
 
     kompact_config! {
         PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS,

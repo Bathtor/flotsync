@@ -169,7 +169,9 @@ implementation keeps that secret in OS-backed local storage and creates it on
 first run. `group-secret-password` remains a temporary shared static-group setup
 input and must match across peers in the same group.
 
-Start two checklist peers with node-specific configs:
+Start two checklist peers with node-specific configs. The `static-peer-routes` entries are optional
+route hints: the runtime probes them through route establishment and only publishes routes after a
+signed introduction verifies the expected peer.
 
 ```toml
 # alice.toml

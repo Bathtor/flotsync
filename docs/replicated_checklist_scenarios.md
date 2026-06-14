@@ -287,10 +287,10 @@ Expected result:
   state and continued replication, not automatic UI rehydration of previously visible checklist
   rows.
 
-## Scenario 5: Manual Route Configuration
+## Scenario 5: Static Route Hints
 
-Goal: route configuration is explicit, visible in the config files, and testable without claiming
-automatic discovery exists.
+Goal: route hints are explicit, visible in the config files, and verified before they become usable
+replication routes.
 
 Before starting the peers, inspect both TOML files.
 
@@ -353,7 +353,7 @@ Expected result:
 
 - Each peer prints its configured local endpoint from `me`.
 - Each peer lists the same static ordered members from `members`.
-- Alice-to-Bob and Bob-to-Alice item exchange works only because the static peer routes point at
-  the correct remote IP and port.
-- There is no discovery command, no discovered peer list, and no expectation that peers find each
-  other without the static routes.
+- Alice-to-Bob and Bob-to-Alice item exchange works only after route establishment verifies the
+  hinted remote IP and port with a signed introduction.
+- Static peer routes are hints, not direct always-available routes. Removing them means this
+  scenario depends on peer-announcement discovery to provide equivalent candidate routes.
