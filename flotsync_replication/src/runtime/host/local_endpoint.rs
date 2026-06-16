@@ -1,4 +1,22 @@
-use super::{BindLocalEndpointSnafu, ControlFutureSnafu, RuntimeControlError, RuntimeHostError};
+use super::{
+    BindLocalEndpointSnafu,
+    ControlFutureSnafu,
+    RuntimeControlError,
+    RuntimeHostError,
+    config_keys,
+};
+use flotsync_discovery::{
+    endpoint_selection::{
+        EndpointSelection,
+        EndpointSelectionPolicy,
+        EndpointSelectionPort,
+        InterfaceSnapshot,
+        InterfaceSnapshotProvider,
+        PnetInterfaceSnapshotProvider,
+    },
+    kompact_fsm::{State, StateUpdate},
+    transform_state_match,
+};
 use flotsync_io::prelude::{
     SocketId,
     UdpBindOptions,
@@ -22,6 +40,10 @@ pub(super) struct LocalEndpointBinding {
 
 #[derive(Debug)]
 pub(super) enum LocalEndpointManagerMessage {
+    /// Ensure the configured UDP endpoint is bound, returning the current binding.
+    ///
+    /// On a successful new bind, the manager also publishes the selected discovery endpoints and
+    /// starts wildcard endpoint-selection polling before completing the bind transition.
     EnsureBound(Ask<(), Result<LocalEndpointBinding, RuntimeControlError>>),
 }
 
@@ -33,69 +55,253 @@ pub(super) enum LocalEndpointManagerMessage {
 /// grow rather than scattering bind handling across the host.
 #[derive(ComponentDefinition)]
 pub(super) struct LocalEndpointManager {
+    /// Kompact component context.
     ctx: ComponentContext<Self>,
-    udp: RequiredPort<UdpPort>,
+    /// UDP transport port used to request the runtime endpoint bind.
+    udp_port: RequiredPort<UdpPort>,
+    /// Output port for concrete local endpoints selected for discovery advertisements.
+    endpoint_selection_port: ProvidedPort<EndpointSelectionPort>,
+    /// Configured bind address requested from the UDP transport.
     configured_bind_addr: SocketAddr,
-    state: LocalEndpointManagerState,
+    /// Policy that maps endpoint binds and interface snapshots to selected endpoints.
+    endpoint_selection_policy: EndpointSelectionPolicy,
+    /// Source of local interface snapshots for wildcard endpoint-selection refreshes.
+    interface_snapshot_provider: Arc<dyn InterfaceSnapshotProvider + Send + Sync>,
+    /// Poll interval for wildcard bind endpoint selection.
+    endpoint_selection_refresh_interval: Duration,
+    /// Currently scheduled wildcard endpoint-selection refresh, if any.
+    endpoint_selection_timer: Option<ScheduledTimer>,
+    /// Last endpoint selection, used to suppress unchanged publications.
+    last_endpoint_selection: Option<EndpointSelection>,
+    /// Current endpoint bind lifecycle state.
+    state: State<LocalEndpointManagerState>,
 }
 
 impl LocalEndpointManager {
     pub(super) fn new(configured_bind_addr: SocketAddr) -> Self {
+        Self::with_interface_snapshot_provider(
+            configured_bind_addr,
+            Arc::new(PnetInterfaceSnapshotProvider),
+        )
+    }
+
+    /// Build a manager with an explicit interface provider for deterministic tests.
+    fn with_interface_snapshot_provider(
+        configured_bind_addr: SocketAddr,
+        interface_snapshot_provider: Arc<dyn InterfaceSnapshotProvider + Send + Sync>,
+    ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
-            udp: RequiredPort::uninitialised(),
+            udp_port: RequiredPort::uninitialised(),
+            endpoint_selection_port: ProvidedPort::uninitialised(),
             configured_bind_addr,
-            state: LocalEndpointManagerState::Unbound,
+            endpoint_selection_policy: EndpointSelectionPolicy::default(),
+            interface_snapshot_provider,
+            endpoint_selection_refresh_interval: Duration::ZERO,
+            endpoint_selection_timer: None,
+            last_endpoint_selection: None,
+            state: State::new(LocalEndpointManagerState::Unbound),
         }
+    }
+
+    /// Refresh selected endpoints for a bound endpoint and schedule future wildcard polls.
+    fn begin_endpoint_selection_updates(&mut self, local_addr: SocketAddr) {
+        self.clear_endpoint_selection_timer();
+        self.refresh_endpoint_selection(local_addr);
+        if local_addr.ip().is_unspecified() {
+            self.schedule_endpoint_selection_refresh();
+        }
+    }
+
+    /// Return the current endpoint binding if the manager is bound.
+    fn current_binding(&self) -> Option<LocalEndpointBinding> {
+        match self.state.get() {
+            LocalEndpointManagerState::Bound(binding) => Some(*binding),
+            LocalEndpointManagerState::Unbound | LocalEndpointManagerState::Binding { .. } => None,
+        }
+    }
+
+    /// Load endpoint-selection refresh timing from Kompact config.
+    fn load_endpoint_selection_refresh_interval(&self) -> Result<Duration, RuntimeHostError> {
+        self.ctx
+            .config()
+            .read_or_default(&config_keys::LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL)
+            .map_err(|error| RuntimeHostError::InvalidConfig {
+                key: config_keys::LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL.key,
+                message: error.to_string(),
+            })
+    }
+
+    /// Recompute and publish endpoint-selection changes for one bound local endpoint.
+    fn refresh_endpoint_selection(&mut self, local_addr: SocketAddr) {
+        let snapshot = if local_addr.ip().is_unspecified() {
+            self.interface_snapshot_provider.snapshot()
+        } else {
+            InterfaceSnapshot::default()
+        };
+        let selection = self
+            .endpoint_selection_policy
+            .select_endpoints(local_addr, &snapshot);
+        let Some(previous_selection) = &self.last_endpoint_selection else {
+            self.log_selected_endpoints(local_addr, &selection);
+            self.last_endpoint_selection = Some(selection.clone());
+            self.endpoint_selection_port.trigger(selection);
+            return;
+        };
+        if selection == *previous_selection {
+            trace!(
+                self.log(),
+                "local endpoint selection unchanged for local endpoint {}: {:?}",
+                local_addr,
+                selection.endpoints
+            );
+            return;
+        }
+        debug!(
+            self.log(),
+            "local endpoint selection changed for local endpoint {} from {:?} to {:?}",
+            local_addr,
+            previous_selection.endpoints,
+            selection.endpoints
+        );
+        self.last_endpoint_selection = Some(selection.clone());
+        self.endpoint_selection_port.trigger(selection);
+    }
+
+    /// Log the first endpoint selection for a bound endpoint.
+    fn log_selected_endpoints(&self, local_addr: SocketAddr, selection: &EndpointSelection) {
+        if selection.is_empty() {
+            debug!(
+                self.log(),
+                "local endpoint {} has no selected discovery endpoints", local_addr
+            );
+        } else {
+            debug!(
+                self.log(),
+                "local endpoint {} selected discovery endpoints {:?}",
+                local_addr,
+                selection.endpoints
+            );
+        }
+    }
+
+    /// Set periodic endpoint-selection polling for wildcard endpoint binds.
+    fn schedule_endpoint_selection_refresh(&mut self) {
+        let timer = self.schedule_periodic(
+            self.endpoint_selection_refresh_interval,
+            self.endpoint_selection_refresh_interval,
+            move |component, timeout| component.handle_endpoint_selection_refresh_timeout(&timeout),
+        );
+        self.endpoint_selection_timer = Some(timer);
+    }
+
+    /// Cancel any pending endpoint-selection polling timer.
+    fn clear_endpoint_selection_timer(&mut self) {
+        if let Some(timer) = self.endpoint_selection_timer.take() {
+            self.cancel_timer(timer);
+        }
+    }
+
+    /// Refresh wildcard-selected discovery endpoints if the expected timer fired.
+    fn handle_endpoint_selection_refresh_timeout(
+        &mut self,
+        actual_timer: &ScheduledTimer,
+    ) -> HandlerResult {
+        let Some(expected_timer) = self.endpoint_selection_timer.as_ref() else {
+            return Handled::OK;
+        };
+        if expected_timer != actual_timer {
+            return Handled::OK;
+        }
+        let Some(binding) = self.current_binding() else {
+            self.clear_endpoint_selection_timer();
+            self.publish_empty_endpoint_selection();
+            return Handled::OK;
+        };
+        self.refresh_endpoint_selection(binding.local_addr);
+        Handled::OK
+    }
+
+    /// Publish an empty endpoint selection if the last published selection was non-empty.
+    fn publish_empty_endpoint_selection(&mut self) {
+        if self
+            .last_endpoint_selection
+            .as_ref()
+            .is_some_and(EndpointSelection::is_empty)
+        {
+            return;
+        }
+        debug!(
+            self.log(),
+            "local endpoint is not bound; clearing selected discovery endpoints"
+        );
+        self.last_endpoint_selection = Some(EndpointSelection::default());
+        self.endpoint_selection_port
+            .trigger(EndpointSelection::default());
     }
 }
 
-ignore_lifecycle!(LocalEndpointManager);
+impl ComponentLifecycle for LocalEndpointManager {
+    fn on_start(&mut self) -> HandlerResult {
+        self.endpoint_selection_refresh_interval = self
+            .load_endpoint_selection_refresh_interval()
+            .map_err(HandlerError::unrecoverable)?;
+        Handled::OK
+    }
+
+    fn on_stop(&mut self) -> HandlerResult {
+        self.clear_endpoint_selection_timer();
+        Handled::OK
+    }
+
+    fn on_kill(&mut self) -> HandlerResult {
+        self.clear_endpoint_selection_timer();
+        Handled::OK
+    }
+}
+
+ignore_requests!(EndpointSelectionPort, LocalEndpointManager);
 
 impl Require<UdpPort> for LocalEndpointManager {
     fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
-        let current_state = std::mem::replace(&mut self.state, LocalEndpointManagerState::Unbound);
-        self.state = match (current_state, indication) {
-            (
-                LocalEndpointManagerState::Binding {
-                    request_id,
-                    promise,
-                },
+        transform_state_match!(self, state, {
+            LocalEndpointManagerState::Binding {
+                request_id: current_request_id,
+                promise,
+            } => match indication {
                 UdpIndication::Bound {
-                    request_id: indicated_request_id,
-                    socket_id,
-                    local_addr,
-                },
-            ) if request_id == indicated_request_id => {
-                let binding = LocalEndpointBinding {
-                    socket_id,
-                    local_addr,
-                };
-                if promise.fulfil(Ok(binding)).is_ok() {
-                    LocalEndpointManagerState::Bound(binding)
-                } else {
-                    LocalEndpointManagerState::Unbound
-                }
-            }
-            (
-                LocalEndpointManagerState::Binding {
                     request_id,
-                    promise,
-                },
+                    socket_id,
+                    local_addr,
+                } if current_request_id == request_id => {
+                    let binding = LocalEndpointBinding {
+                        socket_id,
+                        local_addr,
+                    };
+                    if promise.fulfil(Ok(binding)).is_ok() {
+                        self.begin_endpoint_selection_updates(binding.local_addr);
+                        StateUpdate::transition(LocalEndpointManagerState::Bound(binding))
+                    } else {
+                        StateUpdate::transition(LocalEndpointManagerState::Unbound)
+                    }
+                }
                 UdpIndication::BindFailed {
-                    request_id: indicated_request_id,
+                    request_id,
                     local_addr,
                     reason,
-                },
-            ) if request_id == indicated_request_id => {
-                let _ = promise.fulfil(Err(RuntimeControlError::failed(format!(
-                    "bind at {local_addr} failed: {reason:?}"
-                ))));
-                LocalEndpointManagerState::Unbound
-            }
-            (state, _) => state,
-        };
-        Handled::OK
+                } if current_request_id == request_id => {
+                    let _ = promise.fulfil(Err(RuntimeControlError::failed(format!(
+                        "bind at {local_addr} failed: {reason:?}"
+                    ))));
+                    StateUpdate::transition(LocalEndpointManagerState::Unbound)
+                }
+                _ => StateUpdate::ok(LocalEndpointManagerState::Binding {
+                    request_id: current_request_id,
+                    promise,
+                }),
+            },
+            state => StateUpdate::ok(state),
+        })
     }
 }
 
@@ -106,40 +312,51 @@ impl Actor for LocalEndpointManager {
         match msg {
             LocalEndpointManagerMessage::EnsureBound(ask) => {
                 let (promise, ()) = ask.take();
-                match &self.state {
+                transform_state_match!(self, state, {
                     LocalEndpointManagerState::Unbound => {
                         let request_id = UdpOpenRequestId::new();
-                        self.state = LocalEndpointManagerState::Binding {
-                            request_id,
-                            promise,
-                        };
-                        self.udp.trigger(UdpRequest::Bind {
+                        self.udp_port.trigger(UdpRequest::Bind {
                             request_id,
                             bind: UdpLocalBind::Exact(self.configured_bind_addr),
                             options: UdpBindOptions::default(),
                         });
+                        StateUpdate::transition(LocalEndpointManagerState::Binding {
+                            request_id,
+                            promise,
+                        })
                     }
-                    LocalEndpointManagerState::Binding { .. } => {
+                    LocalEndpointManagerState::Binding {
+                        request_id,
+                        promise: pending_promise,
+                    } => {
                         let _ = promise.fulfil(Err(RuntimeControlError::failed(
                             "local endpoint bind already in progress",
                         )));
+                        StateUpdate::ok(LocalEndpointManagerState::Binding {
+                            request_id,
+                            promise: pending_promise,
+                        })
                     }
                     LocalEndpointManagerState::Bound(binding) => {
-                        let _ = promise.fulfil(Ok(*binding));
+                        let _ = promise.fulfil(Ok(binding));
+                        StateUpdate::ok(LocalEndpointManagerState::Bound(binding))
                     }
-                }
-                Handled::OK
+                })
             }
         }
     }
 }
 
+/// Local endpoint bind lifecycle owned by [`LocalEndpointManager`].
 enum LocalEndpointManagerState {
+    /// No endpoint bind is active or in progress.
     Unbound,
+    /// A UDP bind request is in flight and will fulfil `promise`.
     Binding {
         request_id: UdpOpenRequestId,
         promise: KPromise<Result<LocalEndpointBinding, RuntimeControlError>>,
     },
+    /// The endpoint is bound and ready for runtime traffic.
     Bound(LocalEndpointBinding),
 }
 
@@ -172,4 +389,193 @@ where
     E: StdError + Send + Sync + 'static,
 {
     result.boxed().context(ControlFutureSnafu)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flotsync_discovery::endpoint_selection::{
+        EndpointSelection,
+        EndpointSelectionPort,
+        InterfaceAddress,
+        InterfaceFlags,
+        InterfaceSnapshotEntry,
+    };
+    use flotsync_io::test_support::{
+        PortIndicationProbeComponent,
+        build_test_kompact_system,
+        build_test_kompact_system_with,
+        kill_component,
+        start_component,
+    };
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        sync::{Arc, Mutex, mpsc},
+    };
+
+    /// Test interface provider whose snapshot can be replaced between refreshes.
+    #[derive(Debug)]
+    struct MutableInterfaceSnapshotProvider {
+        snapshot: Mutex<InterfaceSnapshot>,
+    }
+
+    impl MutableInterfaceSnapshotProvider {
+        fn new(snapshot: InterfaceSnapshot) -> Self {
+            Self {
+                snapshot: Mutex::new(snapshot),
+            }
+        }
+
+        fn replace(&self, snapshot: InterfaceSnapshot) {
+            *self
+                .snapshot
+                .lock()
+                .expect("snapshot lock should not poison") = snapshot;
+        }
+    }
+
+    impl InterfaceSnapshotProvider for MutableInterfaceSnapshotProvider {
+        fn snapshot(&self) -> InterfaceSnapshot {
+            self.snapshot
+                .lock()
+                .expect("snapshot lock should not poison")
+                .clone()
+        }
+    }
+
+    #[test]
+    fn endpoint_manager_publishes_selected_routes_for_wildcard_bound_endpoint() {
+        let provider = Arc::new(MutableInterfaceSnapshotProvider::new(
+            snapshot_with_lan_addr(Ipv4Addr::new(192, 168, 1, 20)),
+        ));
+        let system = build_test_kompact_system();
+        let (updates_tx, updates_rx) = mpsc::channel();
+        let manager_provider = provider.clone();
+        let manager = system.create(move || {
+            LocalEndpointManager::with_interface_snapshot_provider(
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+                manager_provider,
+            )
+        });
+        let probe = system
+            .create(move || PortIndicationProbeComponent::<EndpointSelectionPort>::new(updates_tx));
+        biconnect_components::<EndpointSelectionPort, _, _>(&manager, &probe)
+            .expect("connect endpoint selection probe");
+
+        start_component(&system, &probe);
+        start_component(&system, &manager);
+
+        manager.on_definition(|manager| {
+            let local_addr = SocketAddr::from(([0, 0, 0, 0], 45_100));
+            manager
+                .state
+                .set(LocalEndpointManagerState::Bound(LocalEndpointBinding {
+                    socket_id: SocketId(5),
+                    local_addr,
+                }));
+            manager.begin_endpoint_selection_updates(local_addr);
+        });
+
+        let update = updates_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint selection update should arrive");
+        assert_eq!(
+            update.endpoints,
+            EndpointSelection::from_endpoints([SocketAddr::from(([192, 168, 1, 20], 45_100))])
+                .endpoints
+        );
+
+        kill_component(&system, manager);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn endpoint_manager_publishes_empty_routes_when_wildcard_routes_disappear() {
+        let provider = Arc::new(MutableInterfaceSnapshotProvider::new(
+            snapshot_with_lan_addr(Ipv4Addr::new(192, 168, 1, 20)),
+        ));
+        let system = build_test_kompact_system();
+        let (updates_tx, updates_rx) = mpsc::channel();
+        let manager_provider = provider.clone();
+        let manager = system.create(move || {
+            LocalEndpointManager::with_interface_snapshot_provider(
+                SocketAddr::from(([0, 0, 0, 0], 0)),
+                manager_provider,
+            )
+        });
+        let probe = system
+            .create(move || PortIndicationProbeComponent::<EndpointSelectionPort>::new(updates_tx));
+        biconnect_components::<EndpointSelectionPort, _, _>(&manager, &probe)
+            .expect("connect endpoint selection probe");
+
+        start_component(&system, &probe);
+        start_component(&system, &manager);
+
+        manager.on_definition(|manager| {
+            let local_addr = SocketAddr::from(([0, 0, 0, 0], 45_101));
+            manager
+                .state
+                .set(LocalEndpointManagerState::Bound(LocalEndpointBinding {
+                    socket_id: SocketId(6),
+                    local_addr,
+                }));
+            manager.begin_endpoint_selection_updates(local_addr);
+        });
+        updates_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial endpoint selection update should arrive");
+
+        provider.replace(InterfaceSnapshot::default());
+        manager.on_definition(|manager| {
+            manager.begin_endpoint_selection_updates(SocketAddr::from(([0, 0, 0, 0], 45_101)));
+        });
+        let update = updates_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("empty endpoint selection update should arrive");
+        assert!(update.endpoints.is_empty());
+
+        kill_component(&system, manager);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn endpoint_manager_loads_endpoint_selection_refresh_interval_from_config() {
+        let configured_interval = Duration::from_millis(25);
+        let system = build_test_kompact_system_with(|config| {
+            config.set_config_value(
+                &config_keys::LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL,
+                configured_interval,
+            );
+        });
+        let manager = system.create(|| {
+            LocalEndpointManager::with_interface_snapshot_provider(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                Arc::new(MutableInterfaceSnapshotProvider::new(
+                    InterfaceSnapshot::default(),
+                )),
+            )
+        });
+
+        start_component(&system, &manager);
+
+        manager.on_definition(|manager| {
+            assert_eq!(
+                manager.endpoint_selection_refresh_interval,
+                configured_interval
+            );
+        });
+
+        kill_component(&system, manager);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    fn snapshot_with_lan_addr(address: Ipv4Addr) -> InterfaceSnapshot {
+        InterfaceSnapshot::new([InterfaceSnapshotEntry::new(
+            "en0",
+            InterfaceFlags::UP | InterfaceFlags::RUNNING,
+            [InterfaceAddress::new(IpAddr::V4(address), 24)],
+        )])
+    }
 }

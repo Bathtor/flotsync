@@ -2,6 +2,7 @@ use crate::{
     DEFAULT_DISCOVERY_PORT,
     SocketPort,
     config_keys,
+    endpoint_selection::{EndpointSelection, EndpointSelectionPort},
     kompact::{config::Config, prelude::*},
     protocol::udp_socket_address_to_wire_format,
 };
@@ -221,6 +222,7 @@ impl PeerAnnouncementRoute {
 pub struct PeerAnnouncementComponent {
     ctx: ComponentContext<Self>,
     udp_port: RequiredPort<UdpPort>,
+    endpoint_selection_port: RequiredPort<EndpointSelectionPort>,
     options: Options,
     startup_promise: Option<KPromise<PeerAnnouncementStartupResult>>,
     state: SocketState,
@@ -272,12 +274,6 @@ impl SocketState {
 /// Actor messages accepted by [`PeerAnnouncementComponent`].
 #[derive(Debug)]
 pub enum PeerAnnouncementMessage {
-    /// Replace all routes placed into future `Peer.listening_on` announcements.
-    ///
-    /// An empty route set suppresses announcement sends. When the component is running, every
-    /// replacement triggers an immediate announcement attempt and restarts the periodic
-    /// announcement timer, even if the replacement contains the same routes as before.
-    ReplaceAdvertisedRoutes(Vec<PeerAnnouncementRoute>),
     /// Delivery result sent by `flotsync_io` for one UDP announcement send.
     SendResult(UdpSendResult),
 }
@@ -303,6 +299,7 @@ impl PeerAnnouncementComponent {
         Self {
             ctx: ComponentContext::uninitialised(),
             udp_port: RequiredPort::uninitialised(),
+            endpoint_selection_port: RequiredPort::uninitialised(),
             options,
             startup_promise,
             state: SocketState::Closed,
@@ -533,7 +530,7 @@ impl PeerAnnouncementComponent {
 
     fn announce_to_known_targets_and_set_timer(&mut self) -> HandlerResult {
         let handled = self.send_announcement_to_known_targets();
-        if matches!(handled, Ok(Handled::Ok)) {
+        if matches!(handled.as_ref(), Ok(Handled::Ok)) && !self.advertised_routes.is_empty() {
             self.set_announcement_timer();
         }
         handled
@@ -546,6 +543,17 @@ impl PeerAnnouncementComponent {
 
     fn replace_advertised_routes(&mut self, routes: Vec<PeerAnnouncementRoute>) -> HandlerResult {
         self.advertised_routes = routes;
+        if self.advertised_routes.is_empty() {
+            trace!(
+                self.log(),
+                "stopping peer announcements because no advertised routes are available"
+            );
+            self.clear_announcement_timer();
+            return Handled::OK;
+        }
+        if self.broadcast_addresses.is_empty() {
+            self.refresh_broadcast_addresses();
+        }
         self.announce_to_known_targets_and_set_timer()
     }
 
@@ -807,14 +815,22 @@ impl Require<UdpPort> for PeerAnnouncementComponent {
     }
 }
 
+impl Require<EndpointSelectionPort> for PeerAnnouncementComponent {
+    fn handle(&mut self, indication: EndpointSelection) -> HandlerResult {
+        let routes = indication
+            .endpoints
+            .into_iter()
+            .map(PeerAnnouncementRoute::Udp)
+            .collect();
+        self.replace_advertised_routes(routes)
+    }
+}
+
 impl Actor for PeerAnnouncementComponent {
     type Message = PeerAnnouncementMessage;
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
-            PeerAnnouncementMessage::ReplaceAdvertisedRoutes(routes) => {
-                self.replace_advertised_routes(routes)
-            }
             PeerAnnouncementMessage::SendResult(result) => self.handle_send_result(&result),
         }
     }
@@ -832,8 +848,8 @@ mod tests {
     };
     use flotsync_messages::discovery::{ip_address, socket_address};
     use std::{
-        net::{Ipv4Addr, SocketAddrV4},
-        sync::mpsc,
+        net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+        sync::{Arc, mpsc},
     };
 
     #[derive(ComponentDefinition)]
@@ -867,9 +883,23 @@ mod tests {
     impl Actor for UdpRequestProbe {
         type Message = Never;
 
-        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-            unreachable!("Never type is empty")
+        fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
+            match message {}
         }
+    }
+
+    /// Publish selected discovery endpoints through the component's endpoint-selection port.
+    fn trigger_endpoint_selection(
+        system: &KompactSystem,
+        component: &Arc<Component<PeerAnnouncementComponent>>,
+        endpoints: impl IntoIterator<Item = SocketAddr>,
+    ) {
+        let endpoint_selection_port =
+            component.on_definition(|component| component.endpoint_selection_port.share());
+        system.trigger_i(
+            EndpointSelection::from_endpoints(endpoints),
+            &endpoint_selection_port,
+        );
     }
 
     fn ipv4_interface(cidr: &str) -> NetworkInterface {
@@ -1044,14 +1074,14 @@ mod tests {
             );
         });
 
-        component
-            .actor_ref()
-            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
-                PeerAnnouncementRoute::Udp(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(10, 0, 0, 42),
-                    52157,
-                ))),
-            ]));
+        trigger_endpoint_selection(
+            &system,
+            &component,
+            [SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(10, 0, 0, 42),
+                52157,
+            ))],
+        );
         let send = recv_until(&requests_rx, |request| {
             matches!(request, UdpRequest::Send { .. })
         });
@@ -1120,15 +1150,19 @@ mod tests {
             matches!(request, UdpRequest::Bind { .. })
         });
         assert!(matches!(bind, UdpRequest::Bind { .. }));
-        component
-            .actor_ref()
-            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(Vec::new()));
+        trigger_endpoint_selection(&system, &component, []);
         assert!(
             requests_rx
                 .recv_timeout(Duration::from_millis(100))
                 .is_err(),
             "empty route sets should not emit UDP send requests"
         );
+        component.on_definition(|component| {
+            assert!(
+                component.announcement_timer.is_none(),
+                "empty route sets should stop the announcement timer"
+            );
+        });
 
         kill_component(&system, component);
         kill_component(&system, probe);
@@ -1160,19 +1194,14 @@ mod tests {
             );
         });
 
-        let routes = vec![PeerAnnouncementRoute::Udp(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 43), 52158),
+        let routes = [SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(10, 0, 0, 43),
+            52158,
         ))];
-        component
-            .actor_ref()
-            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(
-                routes.clone(),
-            ));
+        trigger_endpoint_selection(&system, &component, routes);
         assert_peer_send(&requests_rx, SocketId(13));
 
-        component
-            .actor_ref()
-            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(routes));
+        trigger_endpoint_selection(&system, &component, routes);
         assert_peer_send(&requests_rx, SocketId(13));
 
         kill_component(&system, component);

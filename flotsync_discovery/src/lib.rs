@@ -53,6 +53,7 @@ pub mod config_keys {
         version = "0.1.0"
     }
 }
+pub mod endpoint_selection;
 pub mod errors;
 #[cfg(feature = "kompact-runtime")]
 pub mod kompact_fsm;

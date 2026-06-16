@@ -6,7 +6,13 @@ use super::{
 use crate::{
     DEFAULT_DISCOVERY_PORT,
     config_keys,
-    protocol::{decode_endpoint_discovery_frame_from_buf, introduction_endpoint_frame},
+    endpoint_selection::EndpointSelection,
+    protocol::{
+        decode_endpoint_discovery_frame_from_buf,
+        discovery_route_from_wire,
+        introduction_endpoint_frame,
+        introduction_request_endpoint_frame,
+    },
     route_publication::{DiscoveryRoutePort, DiscoveryRouteUpdate},
 };
 use flotsync_core::{
@@ -32,6 +38,7 @@ use flotsync_io::{
     test_support::{
         build_test_kompact_system,
         build_test_kompact_system_with,
+        eventually_component_state,
         kill_component,
         recv_until,
         start_component,
@@ -45,6 +52,7 @@ use flotsync_messages::{
 };
 use flotsync_security::{FrameSignature, SIGNATURE_LENGTH};
 use flotsync_utils::BoxError;
+use futures_util::FutureExt as _;
 use kompact::prelude::*;
 use std::{
     collections::HashSet,
@@ -160,7 +168,7 @@ impl DiscoveryCredentials for NoopDiscoveryCredentials {
         _payload: &'a [u8],
         _signature: &'a FrameSignature,
     ) -> DiscoveryCredentialFuture<'a> {
-        Box::pin(std::future::ready(Ok(())))
+        std::future::ready(Ok(())).boxed()
     }
 }
 
@@ -177,9 +185,10 @@ impl DiscoveryCredentials for RejectingDiscoveryCredentials {
         _payload: &'a [u8],
         _signature: &'a FrameSignature,
     ) -> DiscoveryCredentialFuture<'a> {
-        Box::pin(std::future::ready(Err(
-            Box::new(io::Error::other("signature rejected")) as BoxError,
-        )))
+        std::future::ready(Err(
+            Box::new(io::Error::other("signature rejected")) as BoxError
+        ))
+        .boxed()
     }
 }
 
@@ -427,6 +436,52 @@ fn assert_peer_route_update(
     }
 }
 
+/// Assert that one UDP send carries an introduction claim for `expected_route`.
+fn assert_introduction_claims_route(
+    request: UdpRequest,
+    expected_socket_id: SocketId,
+    expected_target: SocketAddr,
+    expected_nonce: &[u8],
+    expected_route: SocketAddr,
+) {
+    match request {
+        UdpRequest::Send {
+            socket_id,
+            target,
+            payload,
+            ..
+        } => {
+            assert_eq!(socket_id, expected_socket_id);
+            assert_eq!(target, Some(expected_target));
+            let mut cursor = payload.cursor();
+            let discovery_frame = decode_endpoint_discovery_frame_from_buf(&mut cursor)
+                .expect("introduction response should decode")
+                .expect("introduction response should be a discovery frame");
+            let Some(discovery_proto::discovery_frame::Body::Introduction(introduction)) =
+                discovery_frame.body
+            else {
+                panic!("expected introduction response");
+            };
+            assert_eq!(introduction.request_nonce, expected_nonce);
+            assert_eq!(introduction.claims.len(), 1);
+            let claim_payload = discovery_proto::IntroductionClaimPayload::decode_from_slice(
+                &introduction.claims[0].claim_payload,
+            )
+            .expect("claim payload should decode");
+            let route = claim_payload
+                .route
+                .as_option()
+                .expect("claim payload route should be present");
+            assert_eq!(
+                discovery_route_from_wire(route, "IntroductionClaimPayload.route")
+                    .expect("claim route should decode"),
+                DiscoveryRoute::Udp(expected_route)
+            );
+        }
+        other => unreachable!("filtered to send request, got {other:?}"),
+    }
+}
+
 /// Owns the three-component route-establishment test topology.
 struct RouteEstablishmentHarness {
     system: KompactSystem,
@@ -532,6 +587,25 @@ impl RouteEstablishmentHarness {
                 socket_id,
                 local_addr,
             });
+    }
+
+    /// Publish selected local endpoints and wait until they replace introduction claim routes.
+    fn publish_endpoint_selection_and_wait_until_applied(
+        &self,
+        endpoints: impl IntoIterator<Item = SocketAddr>,
+    ) {
+        let selection = EndpointSelection::from_endpoints(endpoints);
+        let expected_endpoints = selection.endpoints.clone();
+        let endpoint_selection_port = self
+            .component
+            .on_definition(RouteEstablishmentComponent::endpoint_selection_port);
+        self.system.trigger_i(selection, &endpoint_selection_port);
+        eventually_component_state(
+            Duration::from_secs(1),
+            &self.component,
+            |component| component.advertised_routes() == &expected_endpoints,
+            "endpoint selection should replace route-establishment claim routes",
+        );
     }
 
     fn probe_manual_route(
@@ -643,6 +717,7 @@ fn config_accepts_concrete_advertised_route() {
     assert_eq!(
         config
             .advertised_routes()
+            .routes()
             .iter()
             .copied()
             .collect::<Vec<_>>(),
@@ -688,6 +763,37 @@ fn local_claim_groups_only_include_groups_hosted_by_local_member() {
     let advertised_groups = local_claim_group_ids(&memberships, &local_member);
 
     assert_eq!(advertised_groups, vec![local_group]);
+}
+
+#[test]
+fn endpoint_selection_port_updates_introduction_claim_routes() {
+    let local_member = member(["alice"]);
+    let remote_member = member(["bob"]);
+    let memberships = shared_memberships(&local_member, &remote_member);
+    let local_endpoint = SocketAddr::from(([0, 0, 0, 0], 45_100));
+    let selected_endpoint = SocketAddr::from(([192, 168, 1, 20], 45_100));
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_100));
+    let request_nonce = uuid_to_wire_bytes(Uuid::from_u128(42_100));
+    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+
+    harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
+    harness.bind_endpoint(SocketId(42), local_endpoint);
+    let frame = introduction_request_endpoint_frame(request_nonce.clone());
+    let payload = block_on(encode_message_payload(&test_egress_pool(), &frame))
+        .expect("introduction request payload should encode");
+    harness.receive_udp(SocketId(42), remote_route, payload);
+    let response = recv_until(&harness.requests_rx, |request| {
+        matches!(request, UdpRequest::Send { .. })
+    });
+
+    assert_introduction_claims_route(
+        response,
+        SocketId(42),
+        remote_route,
+        &request_nonce,
+        selected_endpoint,
+    );
+    harness.shutdown();
 }
 
 #[test]

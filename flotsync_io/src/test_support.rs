@@ -8,6 +8,7 @@ use crate::{
     prelude::*,
     socket_support::{configure_bind_reuse, socket_domain},
 };
+use flotsync_utils::option_when;
 use futures_util::FutureExt;
 use kompact::{config_keys::system, default_components::install_manual_timer, prelude::*};
 use socket2::{Protocol, SockAddr, Socket, Type};
@@ -1547,7 +1548,7 @@ pub fn eventually<M>(timeout: Duration, mut predicate: impl FnMut() -> bool, fai
 where
     M: Display,
 {
-    eventually_value(timeout, || predicate().then_some(()), failure_message);
+    eventually_value(timeout, || option_when!(predicate(), ()), failure_message);
 }
 
 /// Waits for one future to resolve within `timeout`.
@@ -2076,6 +2077,69 @@ impl Actor for UdpSendResultProbe {
             .send(msg)
             .expect("UDP send result receiver must stay live during integration tests");
         Handled::OK
+    }
+}
+
+/// Test component that forwards indications from any Kompact port to an `mpsc` channel.
+#[derive(ComponentDefinition)]
+pub struct PortIndicationProbeComponent<P>
+where
+    P: Port + 'static,
+    P::Indication: Send + 'static,
+{
+    /// Kompact component context.
+    ctx: ComponentContext<Self>,
+    /// Required port whose indications are forwarded into `indications`.
+    input_port: RequiredPort<P>,
+    /// Channel used by tests to observe received port indications.
+    indications: mpsc::Sender<P::Indication>,
+}
+
+impl<P> PortIndicationProbeComponent<P>
+where
+    P: Port + 'static,
+    P::Indication: Send + 'static,
+{
+    /// Create a new port indication probe.
+    #[must_use]
+    pub fn new(indications: mpsc::Sender<P::Indication>) -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            input_port: RequiredPort::uninitialised(),
+            indications,
+        }
+    }
+}
+
+impl<P> ComponentLifecycle for PortIndicationProbeComponent<P>
+where
+    P: Port + 'static,
+    P::Indication: Send + 'static,
+{
+}
+
+impl<P> Require<P> for PortIndicationProbeComponent<P>
+where
+    P: Port + 'static,
+    P::Indication: Send + 'static,
+{
+    fn handle(&mut self, indication: P::Indication) -> HandlerResult {
+        self.indications
+            .send(indication)
+            .expect("port indication receiver must stay live during integration tests");
+        Handled::OK
+    }
+}
+
+impl<P> Actor for PortIndicationProbeComponent<P>
+where
+    P: Port + 'static,
+    P::Indication: Send + 'static,
+{
+    type Message = Never;
+
+    fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
+        match message {}
     }
 }
 

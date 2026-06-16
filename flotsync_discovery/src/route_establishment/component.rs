@@ -1,6 +1,7 @@
 use super::{DiscoveryCredentials, PeerAnnouncementObserved};
 use crate::{
     config_keys,
+    endpoint_selection::{EndpointSelection, EndpointSelectionPort},
     protocol::{
         DiscoveryRoute,
         decode_endpoint_discovery_frame_from_buf,
@@ -54,6 +55,7 @@ use std::{
 use uuid::Uuid;
 
 use super::{
+    config::ConcreteRoutes,
     state::{
         ManualMemberFilter,
         ManualRouteWatchError,
@@ -111,10 +113,14 @@ pub struct RouteEstablishmentComponent {
     announcement_port: RequiredPort<super::PeerAnnouncementObservationPort>,
     /// UDP transport port shared with the replication endpoint.
     udp_port: RequiredPort<UdpPort>,
+    /// Receives selected local endpoints used for signed introduction claims.
+    endpoint_selection_port: RequiredPort<EndpointSelectionPort>,
     /// Pool used to encode outgoing discovery frames into lease-backed payloads.
     egress_pool: EgressPool,
-    /// Static runtime settings and advertised routes for this discovery source.
+    /// Static runtime settings for this discovery source.
     config: super::RouteEstablishmentConfig,
+    /// Concrete local routes that this component may sign in introduction claims.
+    claim_routes: ConcreteRoutes,
     /// Local member identity whose keys sign outgoing introduction claims.
     local_member: MemberIdentity,
     /// Discovery claim signing and verification provider.
@@ -145,13 +151,16 @@ impl RouteEstablishmentComponent {
         group_memberships: SharedGroupMemberships,
         egress_pool: EgressPool,
     ) -> Self {
+        let claim_routes = config.advertised_routes().clone();
         Self {
             ctx: ComponentContext::uninitialised(),
             discovery_port: ProvidedPort::uninitialised(),
             announcement_port: RequiredPort::uninitialised(),
             udp_port: RequiredPort::uninitialised(),
+            endpoint_selection_port: RequiredPort::uninitialised(),
             egress_pool,
             config,
+            claim_routes,
             local_member,
             credentials,
             group_memberships,
@@ -168,6 +177,18 @@ impl RouteEstablishmentComponent {
     #[cfg(test)]
     pub(super) fn local_endpoint(&self) -> LocalUdpEndpointState {
         self.local_endpoint
+    }
+
+    /// Return the currently configured local routes that may be signed in introduction claims.
+    #[cfg(test)]
+    pub(super) fn advertised_routes(&self) -> &BTreeSet<SocketAddr> {
+        self.claim_routes.routes()
+    }
+
+    /// Return the endpoint-selection port reference used by tests to inject selected endpoints.
+    #[cfg(test)]
+    pub(super) fn endpoint_selection_port(&mut self) -> RequiredRef<EndpointSelectionPort> {
+        self.endpoint_selection_port.share()
     }
 
     /// Load route-establishment timing from Kompact config.
@@ -551,7 +572,7 @@ impl RouteEstablishmentComponent {
             );
             return Handled::OK;
         }
-        if self.config.advertised_routes().is_empty() {
+        if self.claim_routes.is_empty() {
             trace!(
                 self.log(),
                 "ignored introduction request from {} because there are no routes to advertise",
@@ -568,8 +589,8 @@ impl RouteEstablishmentComponent {
             .map(group_id_to_wire_bytes)
             .collect::<Vec<_>>();
         let member_id = member_identity_to_wire_format(&self.local_member);
-        let mut claims = Vec::with_capacity(self.config.advertised_routes().len());
-        for route in self.config.advertised_routes() {
+        let mut claims = Vec::with_capacity(self.claim_routes.len());
+        for route in self.claim_routes.iter() {
             let route = DiscoveryRoute::Udp(*route).to_wire_format();
             let claim_payload = discovery_proto::IntroductionClaimPayload {
                 instance_uuid: instance_uuid.clone(),
@@ -943,6 +964,20 @@ impl Require<super::PeerAnnouncementObservationPort> for RouteEstablishmentCompo
             async_self.handle_peer_announcement_async(indication).await;
             Handled::OK
         })
+    }
+}
+
+impl Require<EndpointSelectionPort> for RouteEstablishmentComponent {
+    fn handle(&mut self, indication: EndpointSelection) -> HandlerResult {
+        match ConcreteRoutes::from_routes(indication.endpoints) {
+            Ok(routes) => {
+                self.claim_routes = routes;
+                Handled::OK
+            }
+            // Endpoint selection is produced by local runtime code. A non-concrete endpoint here is
+            // a producer bug, so fail noisily and recoverably instead of silently dropping it.
+            Err(error) => Err(HandlerError::recoverable(error)),
+        }
     }
 }
 
