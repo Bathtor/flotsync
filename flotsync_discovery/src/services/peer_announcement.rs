@@ -292,6 +292,12 @@ impl PeerAnnouncementComponent {
         Self::with_optional_startup_promise(options, Some(startup_promise))
     }
 
+    /// Return a shared reference to the endpoint-selection input port.
+    #[must_use]
+    pub fn endpoint_selection_port(&mut self) -> RequiredRef<EndpointSelectionPort> {
+        self.endpoint_selection_port.share()
+    }
+
     fn with_optional_startup_promise(
         options: Options,
         startup_promise: Option<KPromise<PeerAnnouncementStartupResult>>,

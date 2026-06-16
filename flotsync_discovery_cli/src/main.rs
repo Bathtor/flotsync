@@ -5,12 +5,11 @@ use flotsync_discovery::services::{
     MdnsAnnouncementComponent,
 };
 use flotsync_discovery::{
+    endpoint_selection::EndpointSelection,
     kompact::prelude::*,
     services::{
         PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
         PeerAnnouncementComponent,
-        PeerAnnouncementMessage,
-        PeerAnnouncementRoute,
         peer_announcement_startup_signal,
     },
     uuid::Uuid,
@@ -145,10 +144,10 @@ fn start_peer_announcement(
 
     let (startup_promise, startup_future) = peer_announcement_startup_signal();
     let options = PEER_ANNOUNCEMENT_DEFAULT_OPTIONS.with_instance_id(instance_id);
-    let placeholder_route = PeerAnnouncementRoute::Udp(SocketAddr::new(
+    let placeholder_endpoint = SocketAddr::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         options.socket_bind_addr().port(),
-    ));
+    );
     let component = system.create(move || {
         PeerAnnouncementComponent::with_options_and_startup_promise(options, startup_promise)
     });
@@ -163,11 +162,12 @@ fn start_peer_announcement(
 
     match startup_future.wait_timeout(Duration::from_secs(5)) {
         Ok(Ok(())) => {
-            component
-                .actor_ref()
-                .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
-                    placeholder_route,
-                ]));
+            let endpoint_selection_port =
+                component.on_definition(PeerAnnouncementComponent::endpoint_selection_port);
+            system.trigger_i(
+                EndpointSelection::from_endpoints([placeholder_endpoint]),
+                &endpoint_selection_port,
+            );
             Ok(ActiveService::PeerAnnouncement {
                 io_runtime,
                 component,
