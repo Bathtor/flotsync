@@ -25,12 +25,6 @@ where
 }
 
 pub type SVec16<T> = SmallVec<T, 16>;
-// pub const fn svec16<T, const M: usize>(input: [T; M]) -> SVec16<T>
-// where
-//     T: Copy,
-// {
-//     SVec16::from_array(input)
-// }
 #[macro_export]
 macro_rules! svec16 {
     ($($elem:expr),* $(,)?) => {{
@@ -38,6 +32,8 @@ macro_rules! svec16 {
     }};
 }
 
+/// A simpler variant of the actual smallvec crate, that allows easier const creation
+/// from arrays of mismatching sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmallVec<T, const N: usize> {
     data: [Option<T>; N],

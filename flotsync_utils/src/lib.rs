@@ -1,11 +1,11 @@
-use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
-
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
+use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
 
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
+pub mod kompact_testing;
 pub mod testing;
 
 pub use async_std::future::TimeoutError;
