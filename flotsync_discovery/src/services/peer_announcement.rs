@@ -849,49 +849,84 @@ mod tests {
         build_test_kompact_system,
         build_test_kompact_system_with,
         kill_component,
-        recv_until,
         start_component,
     };
     use flotsync_messages::discovery::{ip_address, socket_address};
+    use flotsync_utils::kompact_testing::{
+        ObservedRequest,
+        PortTesterComponent,
+        PortTestingExt,
+        PortTestingRefExt,
+    };
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        sync::{Arc, mpsc},
+        sync::Arc,
     };
 
-    #[derive(ComponentDefinition)]
-    struct UdpRequestProbe {
-        ctx: ComponentContext<Self>,
-        udp: ProvidedPort<UdpPort>,
-        requests: mpsc::Sender<UdpRequest>,
+    type UdpTesterComponent = PortTesterComponent<UdpPort>;
+
+    fn observe_udp_request<F>(
+        probe: &Arc<Component<UdpTesterComponent>>,
+        predicate: F,
+        context: &'static str,
+    ) -> ObservedRequest<UdpPort>
+    where
+        F: Fn(&UdpRequest) -> bool + Send + 'static,
+    {
+        probe
+            .actor_ref()
+            .observe_request(predicate)
+            .wait_timeout(Duration::from_secs(1))
+            .expect(context)
+            .expect("UDP probe should stay live")
     }
 
-    impl UdpRequestProbe {
-        fn new(requests: mpsc::Sender<UdpRequest>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                udp: ProvidedPort::uninitialised(),
-                requests,
-            }
-        }
+    fn observe_udp_request_from<F>(
+        probe: &Arc<Component<UdpTesterComponent>>,
+        start_index: usize,
+        predicate: F,
+        context: &'static str,
+    ) -> ObservedRequest<UdpPort>
+    where
+        F: Fn(&UdpRequest) -> bool + Send + 'static,
+    {
+        probe
+            .actor_ref()
+            .observe_request_from(start_index, predicate)
+            .wait_timeout(Duration::from_secs(1))
+            .expect(context)
+            .expect("UDP probe should stay live")
     }
 
-    ignore_lifecycle!(UdpRequestProbe);
-
-    impl Provide<UdpPort> for UdpRequestProbe {
-        fn handle(&mut self, request: UdpRequest) -> HandlerResult {
-            self.requests
-                .send(request)
-                .expect("UDP request receiver must stay live during tests");
-            Handled::OK
-        }
+    fn expect_no_udp_request(probe: &Arc<Component<UdpTesterComponent>>, reason: &'static str) {
+        probe
+            .actor_ref()
+            .fail_if_request_observed_from(0, Duration::from_millis(100), |_| true)
+            .wait_timeout(Duration::from_secs(1))
+            .expect("UDP request absence check should complete")
+            .expect("UDP probe should stay live")
+            .expect(reason);
     }
 
-    impl Actor for UdpRequestProbe {
-        type Message = Never;
+    fn expect_no_udp_request_from(
+        probe: &Arc<Component<UdpTesterComponent>>,
+        start_index: usize,
+        reason: &'static str,
+    ) {
+        probe
+            .actor_ref()
+            .fail_if_request_observed_from(start_index, Duration::from_millis(100), |_| true)
+            .wait_timeout(Duration::from_secs(1))
+            .expect("UDP request absence check should complete")
+            .expect("UDP probe should stay live")
+            .expect(reason);
+    }
 
-        fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
-            match message {}
-        }
+    fn inject_udp_indication(
+        probe: &Arc<Component<UdpTesterComponent>>,
+        indication: UdpIndication,
+    ) {
+        probe.actor_ref().inject_indication(indication);
     }
 
     /// Publish selected discovery endpoints through the component's endpoint-selection port.
@@ -922,8 +957,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_binds_and_enables_broadcast() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -931,41 +965,48 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        let request_id = match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
+        let bind_request = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        let request_id = match bind_request.request() {
             UdpRequest::Bind {
                 request_id,
                 bind,
                 options,
             } => {
                 assert_eq!(
-                    bind,
+                    *bind,
                     UdpLocalBind::Exact(SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                         *DEFAULT_DISCOVERY_PORT,
                     ))
                 );
-                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(true));
-                request_id
+                assert_eq!(*options, UdpBindOptions::default().with_socket_reuse(true));
+                *request_id
             }
             other => unreachable!("filtered to bind request, got {other:?}"),
         };
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Bound {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Bound {
                 request_id,
                 socket_id: SocketId(7),
                 local_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41000)),
-            });
-        });
+            },
+        );
 
-        match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Configure { .. })
-        }) {
+        let configure_request = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Configure { .. }),
+            "UDP configure request should be observed",
+        );
+        match configure_request.request() {
             UdpRequest::Configure { socket_id, option } => {
-                assert_eq!(socket_id, SocketId(7));
-                assert_eq!(option, UdpSocketOption::Broadcast(true));
+                assert_eq!(*socket_id, SocketId(7));
+                assert_eq!(*option, UdpSocketOption::Broadcast(true));
             }
             other => unreachable!("filtered to configure request, got {other:?}"),
         }
@@ -1023,8 +1064,7 @@ mod tests {
         let system = build_test_kompact_system_with(|config| {
             config.set_config_value(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS, false);
         });
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -1032,11 +1072,14 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
+        let bind_request = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        match bind_request.request() {
             UdpRequest::Bind { options, .. } => {
-                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(false));
+                assert_eq!(*options, UdpBindOptions::default().with_socket_reuse(false));
             }
             other => unreachable!("filtered to bind request, got {other:?}"),
         }
@@ -1056,8 +1099,7 @@ mod tests {
         let expected_instance_id = options.instance_id;
 
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -1088,19 +1130,21 @@ mod tests {
                 52157,
             ))],
         );
-        let send = recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Send { .. })
-        });
-        match send {
+        let send = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Send { .. }),
+            "UDP send request should be observed",
+        );
+        match send.request() {
             UdpRequest::Send {
                 socket_id,
                 payload,
                 target,
                 ..
             } => {
-                assert_eq!(socket_id, SocketId(11));
+                assert_eq!(*socket_id, SocketId(11));
                 assert_eq!(
-                    target,
+                    *target,
                     Some(SocketAddr::V4(SocketAddrV4::new(
                         Ipv4Addr::new(192, 168, 1, 255),
                         52156
@@ -1115,11 +1159,10 @@ mod tests {
             }
             other => unreachable!("filtered to send request, got {other:?}"),
         }
-        assert!(
-            requests_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "duplicate broadcast targets should collapse to one send request"
+        expect_no_udp_request_from(
+            &probe,
+            send.index() + 1,
+            "duplicate broadcast targets should collapse to one send request",
         );
 
         kill_component(&system, component);
@@ -1132,8 +1175,7 @@ mod tests {
         let options = Options::DEFAULT.with_announcement_interval(Duration::from_mins(1));
 
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -1152,16 +1194,17 @@ mod tests {
             );
         });
 
-        let bind = recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        });
-        assert!(matches!(bind, UdpRequest::Bind { .. }));
+        let bind = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        assert!(matches!(bind.request(), UdpRequest::Bind { .. }));
         trigger_endpoint_selection(&system, &component, []);
-        assert!(
-            requests_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "empty route sets should not emit UDP send requests"
+        expect_no_udp_request_from(
+            &probe,
+            bind.index() + 1,
+            "empty route sets should not emit UDP send requests",
         );
         component.on_definition(|component| {
             assert!(
@@ -1180,8 +1223,7 @@ mod tests {
         let options = Options::DEFAULT.with_announcement_interval(Duration::from_mins(1));
 
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -1205,10 +1247,10 @@ mod tests {
             52158,
         ))];
         trigger_endpoint_selection(&system, &component, routes);
-        assert_peer_send(&requests_rx, SocketId(13));
+        let cursor = assert_peer_send(&probe, 0, SocketId(13));
 
         trigger_endpoint_selection(&system, &component, routes);
-        assert_peer_send(&requests_rx, SocketId(13));
+        assert_peer_send(&probe, cursor, SocketId(13));
 
         kill_component(&system, component);
         kill_component(&system, probe);
@@ -1218,8 +1260,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_closes_socket_on_kill() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let component =
             system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
         biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
@@ -1236,11 +1277,14 @@ mod tests {
 
         kill_component(&system, component);
 
-        match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Close { .. })
-        }) {
+        let close = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Close { .. }),
+            "UDP close request should be observed",
+        );
+        match close.request() {
             UdpRequest::Close { socket_id } => {
-                assert_eq!(socket_id, SocketId(21));
+                assert_eq!(*socket_id, SocketId(21));
             }
             other => unreachable!("filtered to close request, got {other:?}"),
         }
@@ -1266,8 +1310,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_interrupts_startup_waiter_on_kill() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let (startup_promise, startup_future) = peer_announcement_startup_signal();
         let component = system.create(move || {
             PeerAnnouncementComponent::with_options_and_startup_promise(
@@ -1280,12 +1323,15 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        let _request_id = match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
-            UdpRequest::Bind { request_id, .. } => request_id,
+        let bind = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        match bind.request() {
+            UdpRequest::Bind { .. } => {}
             other => unreachable!("filtered to bind request, got {other:?}"),
-        };
+        }
 
         kill_component(&system, component);
 
@@ -1297,11 +1343,10 @@ mod tests {
             Err(PeerAnnouncementStartupError::Interrupted)
         );
 
-        assert!(
-            requests_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "stopping during Opening should not emit extra UDP requests"
+        expect_no_udp_request_from(
+            &probe,
+            bind.index() + 1,
+            "stopping during Opening should not emit extra UDP requests",
         );
 
         kill_component(&system, probe);
@@ -1311,8 +1356,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_reports_startup_success_after_broadcast_is_enabled() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let (startup_promise, startup_future) = peer_announcement_startup_signal();
         let component = system.create(move || {
             PeerAnnouncementComponent::with_options_and_startup_promise(
@@ -1325,37 +1369,45 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        let request_id = match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
-            UdpRequest::Bind { request_id, .. } => request_id,
+        let bind = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        let request_id = match bind.request() {
+            UdpRequest::Bind { request_id, .. } => *request_id,
             other => unreachable!("filtered to bind request, got {other:?}"),
         };
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Bound {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Bound {
                 request_id,
                 socket_id: SocketId(31),
                 local_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41001)),
-            });
-        });
+            },
+        );
 
-        match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Configure { .. })
-        }) {
+        let configure = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Configure { .. }),
+            "UDP configure request should be observed",
+        );
+        match configure.request() {
             UdpRequest::Configure { socket_id, option } => {
-                assert_eq!(socket_id, SocketId(31));
-                assert_eq!(option, UdpSocketOption::Broadcast(true));
+                assert_eq!(*socket_id, SocketId(31));
+                assert_eq!(*option, UdpSocketOption::Broadcast(true));
             }
             other => unreachable!("filtered to configure request, got {other:?}"),
         }
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Configured {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Configured {
                 socket_id: SocketId(31),
                 option: UdpSocketOption::Broadcast(true),
-            });
-        });
+            },
+        );
 
         let startup_result = startup_future
             .wait_timeout(Duration::from_millis(100))
@@ -1370,8 +1422,7 @@ mod tests {
     #[test]
     fn peer_announcement_observe_startup_waits_for_matching_socket() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let (startup_promise, startup_future) = peer_announcement_startup_signal();
         let options =
             Options::DEFAULT.with_socket_maintenance(PeerAnnouncementSocketMaintenance::Observe);
@@ -1393,23 +1444,19 @@ mod tests {
                 "observe startup should wait for a matching socket"
             );
         });
-        assert!(
-            requests_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "observe mode should not bind its own UDP socket"
-        );
+        expect_no_udp_request(&probe, "observe mode should not bind its own UDP socket");
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Bound {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Bound {
                 request_id: UdpOpenRequestId::new(),
                 socket_id: SocketId(33),
                 local_addr: SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::LOCALHOST,
                     *DEFAULT_DISCOVERY_PORT + 1,
                 )),
-            });
-        });
+            },
+        );
         component.on_definition(|component| {
             assert_eq!(component.state, SocketState::WaitingForSocket);
             assert!(
@@ -1418,16 +1465,17 @@ mod tests {
             );
         });
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Bound {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Bound {
                 request_id: UdpOpenRequestId::new(),
                 socket_id: SocketId(34),
                 local_addr: SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::LOCALHOST,
                     *DEFAULT_DISCOVERY_PORT,
                 )),
-            });
-        });
+            },
+        );
 
         let startup_result = startup_future
             .wait_timeout(Duration::from_millis(100))
@@ -1442,8 +1490,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_reports_bind_failure_to_startup_waiter() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let (startup_promise, startup_future) = peer_announcement_startup_signal();
         let component = system.create(move || {
             PeerAnnouncementComponent::with_options_and_startup_promise(
@@ -1456,21 +1503,25 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        let request_id = match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
-            UdpRequest::Bind { request_id, .. } => request_id,
+        let bind = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        let request_id = match bind.request() {
+            UdpRequest::Bind { request_id, .. } => *request_id,
             other => unreachable!("filtered to bind request, got {other:?}"),
         };
 
         let failed_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41002));
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::BindFailed {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::BindFailed {
                 request_id,
                 local_addr: failed_addr,
                 reason: OpenFailureReason::Io(std::io::ErrorKind::AddrInUse),
-            });
-        });
+            },
+        );
 
         let startup_result = startup_future
             .wait_timeout(Duration::from_millis(100))
@@ -1490,8 +1541,7 @@ mod tests {
     #[test]
     fn peer_announcement_component_reports_configure_failure_to_startup_waiter() {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let probe = system.create(UdpPort::tester_component_sidecar);
         let (startup_promise, startup_future) = peer_announcement_startup_signal();
         let component = system.create(move || {
             PeerAnnouncementComponent::with_options_and_startup_promise(
@@ -1504,31 +1554,38 @@ mod tests {
         start_component(&system, &probe);
         start_component(&system, &component);
 
-        let request_id = match recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Bind { .. })
-        }) {
-            UdpRequest::Bind { request_id, .. } => request_id,
+        let bind = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Bind { .. }),
+            "UDP bind request should be observed",
+        );
+        let request_id = match bind.request() {
+            UdpRequest::Bind { request_id, .. } => *request_id,
             other => unreachable!("filtered to bind request, got {other:?}"),
         };
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::Bound {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::Bound {
                 request_id,
                 socket_id: SocketId(32),
                 local_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41003)),
-            });
-        });
-        let _ = recv_until(&requests_rx, |request| {
-            matches!(request, UdpRequest::Configure { .. })
-        });
+            },
+        );
+        let _configure = observe_udp_request(
+            &probe,
+            |request| matches!(request, UdpRequest::Configure { .. }),
+            "UDP configure request should be observed",
+        );
 
-        probe.on_definition(|probe| {
-            probe.udp.trigger(UdpIndication::ConfigureFailed {
+        inject_udp_indication(
+            &probe,
+            UdpIndication::ConfigureFailed {
                 socket_id: SocketId(32),
                 option: UdpSocketOption::Broadcast(true),
                 reason: ConfigureFailureReason::Io(std::io::ErrorKind::PermissionDenied),
-            });
-        });
+            },
+        );
 
         let startup_result = startup_future
             .wait_timeout(Duration::from_millis(100))
@@ -1545,16 +1602,24 @@ mod tests {
         system.shutdown().wait().expect("Kompact shutdown");
     }
 
-    fn assert_peer_send(requests_rx: &mpsc::Receiver<UdpRequest>, expected_socket_id: SocketId) {
-        let send = recv_until(requests_rx, |request| {
-            matches!(request, UdpRequest::Send { .. })
-        });
-        match send {
+    fn assert_peer_send(
+        probe: &Arc<Component<UdpTesterComponent>>,
+        start_index: usize,
+        expected_socket_id: SocketId,
+    ) -> usize {
+        let send = observe_udp_request_from(
+            probe,
+            start_index,
+            |request| matches!(request, UdpRequest::Send { .. }),
+            "UDP send request should be observed",
+        );
+        match send.request() {
             UdpRequest::Send { socket_id, .. } => {
-                assert_eq!(socket_id, expected_socket_id);
+                assert_eq!(*socket_id, expected_socket_id);
             }
             other => unreachable!("filtered to send request, got {other:?}"),
         }
+        send.index() + 1
     }
 
     fn assert_udp_route(route: &SocketAddress, expected_ip: &[u8], expected_port: u32) {

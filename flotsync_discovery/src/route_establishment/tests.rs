@@ -40,7 +40,6 @@ use flotsync_io::{
         build_test_kompact_system_with,
         eventually_component_state,
         kill_component,
-        recv_until,
         start_component,
     },
 };
@@ -51,14 +50,18 @@ use flotsync_messages::{
     wire::{group_id_to_wire_bytes, member_identity_to_wire_format, uuid_to_wire_bytes},
 };
 use flotsync_security::{FrameSignature, SIGNATURE_LENGTH};
-use flotsync_utils::BoxError;
+use flotsync_utils::{
+    BoxError,
+    kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt},
+};
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
 use std::{
+    cell::Cell,
     collections::HashSet,
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, mpsc},
+    sync::Arc,
     time::Duration,
 };
 use uuid::Uuid;
@@ -81,78 +84,6 @@ fn member_set(members: impl IntoIterator<Item = MemberIdentity>) -> TrieSet {
         set.insert(member);
     }
     set
-}
-
-#[derive(ComponentDefinition)]
-struct UdpRequestProbe {
-    ctx: ComponentContext<Self>,
-    udp: ProvidedPort<UdpPort>,
-    requests: mpsc::Sender<UdpRequest>,
-}
-
-impl UdpRequestProbe {
-    fn new(requests: mpsc::Sender<UdpRequest>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            udp: ProvidedPort::uninitialised(),
-            requests,
-        }
-    }
-}
-
-ignore_lifecycle!(UdpRequestProbe);
-
-impl Provide<UdpPort> for UdpRequestProbe {
-    fn handle(&mut self, request: UdpRequest) -> HandlerResult {
-        self.requests
-            .send(request)
-            .expect("UDP request receiver must stay live during tests");
-        Handled::OK
-    }
-}
-
-impl Actor for UdpRequestProbe {
-    type Message = Never;
-
-    fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
-        match message {}
-    }
-}
-
-#[derive(ComponentDefinition)]
-struct DiscoveryRouteUpdateProbe {
-    ctx: ComponentContext<Self>,
-    discovery: RequiredPort<DiscoveryRoutePort>,
-    updates: mpsc::Sender<DiscoveryRouteUpdate>,
-}
-
-impl DiscoveryRouteUpdateProbe {
-    fn new(updates: mpsc::Sender<DiscoveryRouteUpdate>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            discovery: RequiredPort::uninitialised(),
-            updates,
-        }
-    }
-}
-
-ignore_lifecycle!(DiscoveryRouteUpdateProbe);
-
-impl Require<DiscoveryRoutePort> for DiscoveryRouteUpdateProbe {
-    fn handle(&mut self, update: DiscoveryRouteUpdate) -> HandlerResult {
-        self.updates
-            .send(update)
-            .expect("route update receiver must stay live during tests");
-        Handled::OK
-    }
-}
-
-impl Actor for DiscoveryRouteUpdateProbe {
-    type Message = Never;
-
-    fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
-        match message {}
-    }
 }
 
 struct NoopDiscoveryCredentials;
@@ -253,39 +184,54 @@ fn watched_udp_route(route: SocketAddr, expected_member: Option<MemberIdentity>)
 }
 
 fn assert_probe_send(
-    requests_rx: &mpsc::Receiver<UdpRequest>,
+    udp_probe: &Arc<Component<PortTesterComponent<UdpPort>>>,
+    start_index: usize,
     expected_socket_id: SocketId,
     expected_target: SocketAddr,
-) {
-    match recv_until(requests_rx, |request| {
-        matches!(request, UdpRequest::Send { .. })
-    }) {
+) -> usize {
+    let observed = udp_probe
+        .actor_ref()
+        .observe_request_from(start_index, |request| {
+            matches!(request, UdpRequest::Send { .. })
+        })
+        .wait_timeout(Duration::from_secs(1))
+        .expect("UDP send request should be observed")
+        .expect("UDP probe should stay live");
+    match observed.request() {
         UdpRequest::Send {
             socket_id, target, ..
         } => {
-            assert_eq!(socket_id, expected_socket_id);
-            assert_eq!(target, Some(expected_target));
+            assert_eq!(*socket_id, expected_socket_id);
+            assert_eq!(*target, Some(expected_target));
         }
         other => unreachable!("filtered to send request, got {other:?}"),
     }
+    observed.index() + 1
 }
 
 fn assert_probe_send_and_nonce(
-    requests_rx: &mpsc::Receiver<UdpRequest>,
+    udp_probe: &Arc<Component<PortTesterComponent<UdpPort>>>,
+    start_index: usize,
     expected_socket_id: SocketId,
     expected_target: SocketAddr,
-) -> Vec<u8> {
-    match recv_until(requests_rx, |request| {
-        matches!(request, UdpRequest::Send { .. })
-    }) {
+) -> (usize, Vec<u8>) {
+    let observed = udp_probe
+        .actor_ref()
+        .observe_request_from(start_index, |request| {
+            matches!(request, UdpRequest::Send { .. })
+        })
+        .wait_timeout(Duration::from_secs(1))
+        .expect("UDP send request should be observed")
+        .expect("UDP probe should stay live");
+    let nonce = match observed.request() {
         UdpRequest::Send {
             socket_id,
             target,
             payload,
             ..
         } => {
-            assert_eq!(socket_id, expected_socket_id);
-            assert_eq!(target, Some(expected_target));
+            assert_eq!(*socket_id, expected_socket_id);
+            assert_eq!(*target, Some(expected_target));
             let mut cursor = payload.cursor();
             let discovery_frame = decode_endpoint_discovery_frame_from_buf(&mut cursor)
                 .expect("probe payload should decode")
@@ -298,22 +244,23 @@ fn assert_probe_send_and_nonce(
             }
         }
         other => unreachable!("filtered to send request, got {other:?}"),
-    }
+    };
+    (observed.index() + 1, nonce)
 }
 
 fn trigger_udp_received(
-    udp_probe: &Arc<Component<UdpRequestProbe>>,
+    udp_probe: &Arc<Component<PortTesterComponent<UdpPort>>>,
     socket_id: SocketId,
     source: SocketAddr,
     payload: IoPayload,
 ) {
-    udp_probe.on_definition(move |probe| {
-        probe.udp.trigger(UdpIndication::Received {
+    udp_probe
+        .actor_ref()
+        .inject_indication(UdpIndication::Received {
             socket_id,
             source,
             payload,
         });
-    });
 }
 
 fn test_egress_pool() -> EgressPool {
@@ -414,20 +361,20 @@ impl<'a> IntroductionSpec<'a> {
 }
 
 fn assert_peer_route_update(
-    update: DiscoveryRouteUpdate,
+    update: &DiscoveryRouteUpdate,
     expected_peer: &MemberIdentity,
     expected_routes: &[SocketAddr],
     expected_local_bind: Option<SocketAddr>,
 ) {
     match update {
         DiscoveryRouteUpdate::PeerRoutes { peer, routes } => {
-            assert_eq!(&peer, expected_peer);
+            assert_eq!(peer, expected_peer);
             let actual_routes = routes
-                .into_iter()
+                .iter()
                 .map(|candidate| {
                     assert_eq!(candidate.local_bind, expected_local_bind);
-                    match candidate.route {
-                        DiscoveryRoute::Udp(route) => route,
+                    match &candidate.route {
+                        DiscoveryRoute::Udp(route) => *route,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -438,7 +385,7 @@ fn assert_peer_route_update(
 
 /// Assert that one UDP send carries an introduction claim for `expected_route`.
 fn assert_introduction_claims_route(
-    request: UdpRequest,
+    request: &UdpRequest,
     expected_socket_id: SocketId,
     expected_target: SocketAddr,
     expected_nonce: &[u8],
@@ -451,8 +398,8 @@ fn assert_introduction_claims_route(
             payload,
             ..
         } => {
-            assert_eq!(socket_id, expected_socket_id);
-            assert_eq!(target, Some(expected_target));
+            assert_eq!(*socket_id, expected_socket_id);
+            assert_eq!(*target, Some(expected_target));
             let mut cursor = payload.cursor();
             let discovery_frame = decode_endpoint_discovery_frame_from_buf(&mut cursor)
                 .expect("introduction response should decode")
@@ -485,11 +432,11 @@ fn assert_introduction_claims_route(
 /// Owns the three-component route-establishment test topology.
 struct RouteEstablishmentHarness {
     system: KompactSystem,
-    udp_probe: Arc<Component<UdpRequestProbe>>,
-    update_probe: Arc<Component<DiscoveryRouteUpdateProbe>>,
+    udp_probe: Arc<Component<PortTesterComponent<UdpPort>>>,
+    update_probe: Arc<Component<PortTesterComponent<DiscoveryRoutePort>>>,
     component: Arc<Component<RouteEstablishmentComponent>>,
-    requests_rx: mpsc::Receiver<UdpRequest>,
-    updates_rx: mpsc::Receiver<DiscoveryRouteUpdate>,
+    udp_cursor: Cell<usize>,
+    update_cursor: Cell<usize>,
 }
 
 impl RouteEstablishmentHarness {
@@ -507,10 +454,8 @@ impl RouteEstablishmentHarness {
         credentials: Arc<dyn DiscoveryCredentials>,
     ) -> Self {
         let system = build_test_kompact_system();
-        let (requests_tx, requests_rx) = mpsc::channel();
-        let udp_probe = system.create(move || UdpRequestProbe::new(requests_tx));
-        let (updates_tx, updates_rx) = mpsc::channel();
-        let update_probe = system.create(move || DiscoveryRouteUpdateProbe::new(updates_tx));
+        let udp_probe = system.create(UdpPort::tester_component_sidecar);
+        let update_probe = system.create(DiscoveryRoutePort::tester_component_sidecar);
         let component = system.create(move || {
             route_establishment_component_with_credentials(
                 local_member,
@@ -531,8 +476,8 @@ impl RouteEstablishmentHarness {
             udp_probe,
             update_probe,
             component,
-            requests_rx,
-            updates_rx,
+            udp_cursor: Cell::new(0),
+            update_cursor: Cell::new(0),
         }
     }
 
@@ -622,7 +567,13 @@ impl RouteEstablishmentHarness {
     }
 
     fn expect_udp_probe(&self, socket_id: SocketId, remote_route: SocketAddr) {
-        assert_probe_send(&self.requests_rx, socket_id, remote_route);
+        let next_cursor = assert_probe_send(
+            &self.udp_probe,
+            self.udp_cursor.get(),
+            socket_id,
+            remote_route,
+        );
+        self.udp_cursor.set(next_cursor);
     }
 
     fn expect_udp_probe_with_nonce(
@@ -630,16 +581,28 @@ impl RouteEstablishmentHarness {
         socket_id: SocketId,
         remote_route: SocketAddr,
     ) -> Vec<u8> {
-        assert_probe_send_and_nonce(&self.requests_rx, socket_id, remote_route)
+        let (next_cursor, nonce) = assert_probe_send_and_nonce(
+            &self.udp_probe,
+            self.udp_cursor.get(),
+            socket_id,
+            remote_route,
+        );
+        self.udp_cursor.set(next_cursor);
+        nonce
     }
 
     fn expect_no_udp_request(&self, reason: &'static str) {
-        assert!(
-            self.requests_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "{reason}"
-        );
+        self.udp_probe
+            .actor_ref()
+            .fail_if_request_observed_from(
+                self.udp_cursor.get(),
+                Duration::from_millis(100),
+                |_| true,
+            )
+            .wait_timeout(Duration::from_secs(1))
+            .expect("UDP request absence check should complete")
+            .expect("UDP probe should stay live")
+            .expect(reason);
     }
 
     fn receive_udp(&self, socket_id: SocketId, source: SocketAddr, payload: IoPayload) {
@@ -652,8 +615,16 @@ impl RouteEstablishmentHarness {
         expected_routes: &[SocketAddr],
         expected_local_bind: Option<SocketAddr>,
     ) {
+        let observed = self
+            .update_probe
+            .actor_ref()
+            .observe_indication_from(self.update_cursor.get(), |_| true)
+            .wait_timeout(Duration::from_secs(1))
+            .expect("route update should be observed")
+            .expect("route update probe should stay live");
+        self.update_cursor.set(observed.index() + 1);
         assert_peer_route_update(
-            recv_until(&self.updates_rx, |_| true),
+            observed.indication(),
             expected_peer,
             expected_routes,
             expected_local_bind,
@@ -661,12 +632,17 @@ impl RouteEstablishmentHarness {
     }
 
     fn expect_no_route_update(&self, reason: &'static str) {
-        assert!(
-            self.updates_rx
-                .recv_timeout(Duration::from_millis(100))
-                .is_err(),
-            "{reason}"
-        );
+        self.update_probe
+            .actor_ref()
+            .fail_if_indication_observed_from(
+                self.update_cursor.get(),
+                Duration::from_millis(100),
+                |_| true,
+            )
+            .wait_timeout(Duration::from_secs(1))
+            .expect("route update absence check should complete")
+            .expect("route update probe should stay live")
+            .expect(reason);
     }
 
     fn shutdown(self) {
@@ -675,8 +651,8 @@ impl RouteEstablishmentHarness {
             udp_probe,
             update_probe,
             component,
-            requests_rx: _,
-            updates_rx: _,
+            udp_cursor: _,
+            update_cursor: _,
         } = self;
         kill_component(&system, component);
         kill_component(&system, update_probe);
@@ -782,12 +758,16 @@ fn endpoint_selection_port_updates_introduction_claim_routes() {
     let payload = block_on(encode_message_payload(&test_egress_pool(), &frame))
         .expect("introduction request payload should encode");
     harness.receive_udp(SocketId(42), remote_route, payload);
-    let response = recv_until(&harness.requests_rx, |request| {
-        matches!(request, UdpRequest::Send { .. })
-    });
+    let response = harness
+        .udp_probe
+        .actor_ref()
+        .observe_request(|request| matches!(request, UdpRequest::Send { .. }))
+        .wait_timeout(Duration::from_secs(1))
+        .expect("introduction response should be observed")
+        .expect("UDP probe should stay live");
 
     assert_introduction_claims_route(
-        response,
+        response.request(),
         SocketId(42),
         remote_route,
         &request_nonce,
@@ -920,8 +900,8 @@ fn observing_peer_announcement_maintainer_uses_shared_bind_reuse_config() {
     let system = build_test_kompact_system_with(|config| {
         config.set_config_value(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS, false);
     });
-    let (requests_tx, requests_rx) = mpsc::channel();
-    let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+    let probe = system.create(UdpPort::tester_component_sidecar);
+    let probe_ref = probe.actor_ref();
     let component = system.create(move || {
         PeerAnnouncementObservationComponent::with_socket_maintenance(
             config,
@@ -933,18 +913,21 @@ fn observing_peer_announcement_maintainer_uses_shared_bind_reuse_config() {
     start_component(&system, &probe);
     start_component(&system, &component);
 
-    match recv_until(&requests_rx, |request| {
-        matches!(request, UdpRequest::Bind { .. })
-    }) {
+    let bind = probe_ref
+        .observe_request(|request| matches!(request, UdpRequest::Bind { .. }))
+        .wait_timeout(Duration::from_secs(1))
+        .expect("UDP bind request should be observed")
+        .expect("UDP probe should stay live");
+    match bind.request() {
         UdpRequest::Bind { bind, options, .. } => {
             assert_eq!(
-                bind,
+                *bind,
                 UdpLocalBind::Exact(SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     peer_port
                 ))
             );
-            assert_eq!(options, UdpBindOptions::default().with_socket_reuse(false));
+            assert_eq!(*options, UdpBindOptions::default().with_socket_reuse(false));
         }
         other => unreachable!("filtered to bind request, got {other:?}"),
     }

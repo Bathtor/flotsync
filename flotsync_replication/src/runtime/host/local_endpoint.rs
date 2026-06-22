@@ -402,15 +402,15 @@ mod tests {
         InterfaceSnapshotEntry,
     };
     use flotsync_io::test_support::{
-        PortIndicationProbeComponent,
         build_test_kompact_system,
         build_test_kompact_system_with,
         kill_component,
         start_component,
     };
+    use flotsync_utils::kompact_testing::{PortTestingExt, PortTestingRefExt};
     use std::{
         net::{IpAddr, Ipv4Addr},
-        sync::{Arc, Mutex, mpsc},
+        sync::{Arc, Mutex},
     };
 
     /// Test interface provider whose snapshot can be replaced between refreshes.
@@ -449,7 +449,6 @@ mod tests {
             snapshot_with_lan_addr(Ipv4Addr::new(192, 168, 1, 20)),
         ));
         let system = build_test_kompact_system();
-        let (updates_tx, updates_rx) = mpsc::channel();
         let manager_provider = provider.clone();
         let manager = system.create(move || {
             LocalEndpointManager::with_interface_snapshot_provider(
@@ -457,14 +456,15 @@ mod tests {
                 manager_provider,
             )
         });
-        let probe = system
-            .create(move || PortIndicationProbeComponent::<EndpointSelectionPort>::new(updates_tx));
+        let probe = system.create(EndpointSelectionPort::tester_component_sidecar);
+        let probe_ref = probe.actor_ref();
         biconnect_components::<EndpointSelectionPort, _, _>(&manager, &probe)
             .expect("connect endpoint selection probe");
 
         start_component(&system, &probe);
         start_component(&system, &manager);
 
+        let update_future = probe_ref.observe_indication(|_| true);
         manager.on_definition(|manager| {
             let local_addr = SocketAddr::from(([0, 0, 0, 0], 45_100));
             manager
@@ -476,11 +476,12 @@ mod tests {
             manager.begin_endpoint_selection_updates(local_addr);
         });
 
-        let update = updates_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("endpoint selection update should arrive");
+        let update = update_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("endpoint selection update should arrive")
+            .expect("endpoint selection probe should stay live");
         assert_eq!(
-            update.endpoints,
+            update.indication().endpoints,
             EndpointSelection::from_endpoints([SocketAddr::from(([192, 168, 1, 20], 45_100))])
                 .endpoints
         );
@@ -496,7 +497,6 @@ mod tests {
             snapshot_with_lan_addr(Ipv4Addr::new(192, 168, 1, 20)),
         ));
         let system = build_test_kompact_system();
-        let (updates_tx, updates_rx) = mpsc::channel();
         let manager_provider = provider.clone();
         let manager = system.create(move || {
             LocalEndpointManager::with_interface_snapshot_provider(
@@ -504,14 +504,15 @@ mod tests {
                 manager_provider,
             )
         });
-        let probe = system
-            .create(move || PortIndicationProbeComponent::<EndpointSelectionPort>::new(updates_tx));
+        let probe = system.create(EndpointSelectionPort::tester_component_sidecar);
+        let probe_ref = probe.actor_ref();
         biconnect_components::<EndpointSelectionPort, _, _>(&manager, &probe)
             .expect("connect endpoint selection probe");
 
         start_component(&system, &probe);
         start_component(&system, &manager);
 
+        let initial_update_future = probe_ref.observe_indication(|_| true);
         manager.on_definition(|manager| {
             let local_addr = SocketAddr::from(([0, 0, 0, 0], 45_101));
             manager
@@ -522,18 +523,23 @@ mod tests {
                 }));
             manager.begin_endpoint_selection_updates(local_addr);
         });
-        updates_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("initial endpoint selection update should arrive");
+        let initial_update = initial_update_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("initial endpoint selection update should arrive")
+            .expect("endpoint selection probe should stay live");
 
         provider.replace(InterfaceSnapshot::default());
+        let empty_update_future = probe_ref
+            .observe_indication_from(initial_update.index() + 1, |update| {
+                update.endpoints.is_empty()
+            });
         manager.on_definition(|manager| {
             manager.begin_endpoint_selection_updates(SocketAddr::from(([0, 0, 0, 0], 45_101)));
         });
-        let update = updates_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("empty endpoint selection update should arrive");
-        assert!(update.endpoints.is_empty());
+        empty_update_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("empty endpoint selection update should arrive")
+            .expect("endpoint selection probe should stay live");
 
         kill_component(&system, manager);
         kill_component(&system, probe);

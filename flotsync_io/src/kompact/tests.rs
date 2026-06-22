@@ -141,6 +141,7 @@ fn hold_reusable_udp_reservation() -> (Socket, SocketAddr) {
     (socket, local_addr)
 }
 
+// TODO(flotsync-h1z0): Replace with a generic tagged actor-message probe.
 #[derive(ComponentDefinition)]
 struct TaggedSessionEventProbe {
     ctx: ComponentContext<Self>,

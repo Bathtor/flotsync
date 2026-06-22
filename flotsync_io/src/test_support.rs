@@ -1997,6 +1997,8 @@ impl<T> BufferedReceiver<T> {
 }
 
 /// Test observer that forwards UDP indications to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace this observer/barrier fixture once generic
+// actor-message testing support covers barrier-style test commands.
 #[derive(ComponentDefinition)]
 pub struct UdpObserver {
     ctx: ComponentContext<Self>,
@@ -2050,6 +2052,7 @@ impl Actor for UdpObserver {
 }
 
 /// Test actor that forwards UDP send results to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct UdpSendResultProbe {
     ctx: ComponentContext<Self>,
@@ -2080,70 +2083,8 @@ impl Actor for UdpSendResultProbe {
     }
 }
 
-/// Test component that forwards indications from any Kompact port to an `mpsc` channel.
-#[derive(ComponentDefinition)]
-pub struct PortIndicationProbeComponent<P>
-where
-    P: Port + 'static,
-    P::Indication: Send + 'static,
-{
-    /// Kompact component context.
-    ctx: ComponentContext<Self>,
-    /// Required port whose indications are forwarded into `indications`.
-    input_port: RequiredPort<P>,
-    /// Channel used by tests to observe received port indications.
-    indications: mpsc::Sender<P::Indication>,
-}
-
-impl<P> PortIndicationProbeComponent<P>
-where
-    P: Port + 'static,
-    P::Indication: Send + 'static,
-{
-    /// Create a new port indication probe.
-    #[must_use]
-    pub fn new(indications: mpsc::Sender<P::Indication>) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            input_port: RequiredPort::uninitialised(),
-            indications,
-        }
-    }
-}
-
-impl<P> ComponentLifecycle for PortIndicationProbeComponent<P>
-where
-    P: Port + 'static,
-    P::Indication: Send + 'static,
-{
-}
-
-impl<P> Require<P> for PortIndicationProbeComponent<P>
-where
-    P: Port + 'static,
-    P::Indication: Send + 'static,
-{
-    fn handle(&mut self, indication: P::Indication) -> HandlerResult {
-        self.indications
-            .send(indication)
-            .expect("port indication receiver must stay live during integration tests");
-        Handled::OK
-    }
-}
-
-impl<P> Actor for PortIndicationProbeComponent<P>
-where
-    P: Port + 'static,
-    P::Indication: Send + 'static,
-{
-    type Message = Never;
-
-    fn receive_local(&mut self, message: Self::Message) -> HandlerResult {
-        match message {}
-    }
-}
-
 /// Test actor that forwards TCP session events to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct TcpSessionEventProbe {
     ctx: ComponentContext<Self>,
@@ -2175,6 +2116,7 @@ impl Actor for TcpSessionEventProbe {
 }
 
 /// Test actor that forwards TCP listener events to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct TcpListenerEventProbe {
     ctx: ComponentContext<Self>,
