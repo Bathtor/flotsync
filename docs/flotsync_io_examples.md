@@ -1,3 +1,10 @@
+---
+type: Scenario
+title: flotsync_io Example Applications
+description: Describes example applications used to exercise and demonstrate the flotsync_io API.
+status: draft
+---
+
 # flotsync_io Example Applications
 
 ## Scope
@@ -54,7 +61,7 @@ That broader HTTP behavior is outside the scope of this example.
 
 For `replicated_checklist`, the current example intentionally does not cover:
 
-- automatic discovery
+- mDNS discovery or automatic membership provisioning
 - group creation or membership changes from the REPL
 - automatic synchronisation after every edit
 - offline catch-up or replay after extended disconnection
@@ -162,7 +169,10 @@ implementation keeps that secret in OS-backed local storage and creates it on
 first run. `group-secret-password` remains a temporary shared static-group setup
 input and must match across peers in the same group.
 
-Start two checklist peers with node-specific configs:
+Start two checklist peers with node-specific configs. The normal custom UDP discovery path does not
+need `static-peer-routes`: each peer announces its local delivery endpoint on the peer-announcement
+UDP socket, and route establishment verifies discovered endpoints with a signed introduction before
+replication routes become usable.
 
 ```toml
 # alice.toml
@@ -177,13 +187,7 @@ group-id = 123
 ordered-members = ["alice", "bob"]
 
 [flotsync.replication.runtime]
-local-endpoint-bind-addr = "127.0.0.1:45100"
-
-[[flotsync.replication.runtime.static-peer-routes]]
-name = "bob"
-protocol = "udp"
-ip = "127.0.0.1"
-port = 45101
+local-endpoint-bind-addr = "ALICE_LAN_IP:45100"
 ```
 
 ```toml
@@ -199,14 +203,13 @@ group-id = 123
 ordered-members = ["alice", "bob"]
 
 [flotsync.replication.runtime]
-local-endpoint-bind-addr = "127.0.0.1:45101"
-
-[[flotsync.replication.runtime.static-peer-routes]]
-name = "alice"
-protocol = "udp"
-ip = "127.0.0.1"
-port = 45100
+local-endpoint-bind-addr = "BOB_LAN_IP:45101"
 ```
+
+Use concrete local endpoint addresses that the other peer can reach. Wildcard bind addresses such
+as `0.0.0.0:45100` are bind instructions, not signed advertised routes. Static peer routes remain
+available as optional route hints for fallback or diagnostics; see
+[`replicated_checklist_scenarios.md`](replicated_checklist_scenarios.md#scenario-6-static-route-hints).
 
 Run each peer in a separate terminal:
 

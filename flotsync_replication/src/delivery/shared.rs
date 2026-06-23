@@ -3,8 +3,8 @@
 //! These are the protocol-facing and scheduler-facing types that both
 //! `GroupBroadcast` and `ReliableDelivery` build on top of.
 
-use crate::api::{GroupId, MemberIdentity};
 use bytes::Bytes;
+use flotsync_core::{GroupId, MemberIdentity};
 use std::{fmt, time::SystemTime};
 use uuid::Uuid;
 
@@ -133,14 +133,6 @@ pub enum WorkScopeKey {
 pub struct StableRouteKey {
     pub scope: WorkScopeKey,
     pub route_id: LogicalRouteId,
-}
-
-/// Discovery-owned reachability classes as consumed by the delivery domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ReachabilityClass {
-    Known,
-    Reachable,
-    Stale,
 }
 
 /// Active route states from the queue model.

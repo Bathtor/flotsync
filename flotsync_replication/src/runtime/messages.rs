@@ -1,14 +1,6 @@
 use crate::{
     MAX_VERSION_VALUE,
-    api::{
-        DatasetId,
-        DatasetIdError,
-        DatasetUpdateRecord,
-        GroupId,
-        MemberIdentity,
-        ReplicationUpdateRecord,
-        Summary,
-    },
+    api::{DatasetId, DatasetIdError, DatasetUpdateRecord, ReplicationUpdateRecord, Summary},
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -17,6 +9,8 @@ use crate::{
     },
 };
 use flotsync_core::{
+    GroupId,
+    MemberIdentity,
     member::TrieMap,
     versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector, VersionVectorGap},
 };
@@ -35,6 +29,7 @@ use flotsync_security::{
     GroupKey,
     X25519_KEY_LENGTH,
 };
+use flotsync_utils::option_when;
 use snafu::prelude::*;
 use std::{fmt, num::NonZeroUsize, sync::Arc};
 use uuid::Uuid;
@@ -653,7 +648,7 @@ impl UpdateRangeMessage {
         replication_proto::UpdateRange {
             producer_index: self.producer_index,
             start_version: self.start_version,
-            end_version: (self.end_version != self.start_version).then_some(self.end_version),
+            end_version: option_when!(self.end_version != self.start_version, self.end_version),
             ..replication_proto::UpdateRange::default()
         }
     }
@@ -1229,8 +1224,10 @@ mod tests {
         member_identity_from_wire,
         member_identity_to_wire_format,
     };
-    use crate::api::{DatasetId, GroupId, MemberIdentity};
+    use crate::api::DatasetId;
     use flotsync_core::{
+        GroupId,
+        MemberIdentity,
         member::TrieMap,
         versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector},
     };

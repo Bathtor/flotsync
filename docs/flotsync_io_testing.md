@@ -1,3 +1,10 @@
+---
+type: Testing Guide
+title: flotsync_io Testing
+description: Describes the flotsync_io testing scope, exclusions, and local execution expectations.
+status: settled
+---
+
 # flotsync_io Testing
 
 ## Scope

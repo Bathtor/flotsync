@@ -10,7 +10,6 @@ use super::{
     },
     ingress::InboundDeliveryMeta,
     route_transport::{
-        FlotsyncSerializable,
         RouteDiscoveryPort,
         RouteSharingKind,
         RouteTransportActorMessage,
@@ -37,10 +36,13 @@ use super::{
         WorkScopeKey,
     },
 };
-use crate::api::MemberIdentity;
 use bytes::Bytes;
-use flotsync_core::member::TrieMap;
-use flotsync_messages::delivery as delivery_proto;
+use flotsync_core::{MemberIdentity, member::TrieMap};
+use flotsync_messages::{
+    delivery as delivery_proto,
+    endpoint as endpoint_proto,
+    serialisation::FlotsyncSerializable,
+};
 use flotsync_security::SealedHPKEPayload;
 use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::{kompact_config, prelude::*};
@@ -81,7 +83,7 @@ pub struct ReliableMessageEnvelope<P> {
 }
 
 impl ReliableMessageEnvelope<EncryptedPayload> {
-    fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
+    fn to_wire_format(&self) -> endpoint_proto::EndpointFrame {
         reliable_envelope_to_wire_format(self)
     }
 }
@@ -107,12 +109,12 @@ pub struct ReliableDeliveryDeliver {
 pub struct ReliableDeliveryInboundDeliver<R> {
     /// Shared ingress metadata derived before the semantic handoff.
     pub meta: InboundDeliveryMeta<R>,
-    /// Fully decoded reliable-delivery boundary frame owned by the generated
+    /// Fully decoded reliable-delivery endpoint branch owned by the generated
     /// protobuf types.
     pub frame: delivery_proto::ReliableDeliveryFrame,
 }
 
-/// Internal ingress port that feeds decoded reliable-delivery boundary frames
+/// Internal ingress port that feeds decoded reliable-delivery endpoint branches
 /// into the reliable-delivery service.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReliableDeliveryInboundPort<R>(NonOwningPhantomData<R>);
@@ -159,7 +161,7 @@ pub struct RecipientAck {
 }
 
 impl RecipientAck {
-    fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
+    fn to_wire_format(&self) -> endpoint_proto::EndpointFrame {
         recipient_ack_to_wire_format(self)
     }
 }
@@ -1260,8 +1262,6 @@ fn sender_retry_reason(reason: &RouteTransportNackReason) -> PendingRouteReason 
 mod tests {
     use super::*;
     use crate::{
-        GroupMemberships,
-        SharedGroupMemberships,
         SqliteReplicationStore,
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
@@ -1283,6 +1283,7 @@ mod tests {
         },
         test_support::{load_test_delivery_security, provision_test_security},
     };
+    use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{
@@ -1501,7 +1502,6 @@ mod tests {
                     .discovery
                     .trigger(TransportDiscoveryRouteUpdate::PeerRoutes {
                         peer,
-                        classification: super::super::shared::ReachabilityClass::Reachable,
                         routes: vec![route],
                     });
             });
@@ -1569,11 +1569,10 @@ mod tests {
         fn inject_recipient_ack(&self, ack: &RecipientAck) {
             self.reliable.on_definition(|component| {
                 let frame = ack.to_wire_format();
-                let Some(delivery_proto::delivery_boundary_frame::Boundary::ReliableDelivery(
-                    frame,
-                )) = frame.boundary
+                let Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(frame)) =
+                    frame.boundary
                 else {
-                    panic!("recipient ack must encode as reliable delivery boundary");
+                    panic!("recipient ack must encode as reliable delivery endpoint branch");
                 };
                 let Some(delivery_proto::reliable_delivery_frame::Body::RecipientAck(ack)) =
                     frame.body

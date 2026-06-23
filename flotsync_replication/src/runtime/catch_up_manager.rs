@@ -10,22 +10,20 @@ use super::{
     },
 };
 use crate::{
-    SharedGroupMemberships,
-    api::{
-        GroupId,
-        MemberIdentity,
-        MemberIndex,
-        ReplicationStore,
-        ReplicationUpdateFilter,
-        StoreError,
-    },
+    api::{ReplicationStore, ReplicationUpdateFilter, StoreError},
     delivery::{
         contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
         group_broadcast::GroupBroadcastDeliver,
         shared::DeliveryClass,
     },
 };
-use flotsync_core::versions::UpdateId;
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    membership::SharedGroupMemberships,
+    versions::UpdateId,
+};
 use flotsync_utils::{OptionExt as _, ResultExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;

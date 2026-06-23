@@ -13,6 +13,7 @@ use super::{GroupMessageEnvelope, GroupMessageHeader};
 use flotsync_messages::{
     buffa::{Message, MessageField},
     delivery as delivery_proto,
+    endpoint as endpoint_proto,
 };
 use flotsync_security::{SIGNATURE_LENGTH, SealedPSKPayload};
 use snafu::prelude::*;
@@ -29,10 +30,10 @@ pub(super) enum GroupBroadcastWireError {
     WireValueDecode { source: WireValueDecodeError },
 }
 
-/// Build one outbound delivery-boundary frame for a group envelope.
+/// Build one outbound endpoint frame for a group envelope.
 pub(super) fn group_envelope_to_wire_format(
     envelope: &GroupMessageEnvelope<SealedPSKPayload>,
-) -> delivery_proto::DeliveryBoundaryFrame {
+) -> endpoint_proto::EndpointFrame {
     let header = group_header_to_wire_format(&envelope.header);
     let sealed_payload = delivery_proto::SealedPSKPayload {
         ciphertext: envelope.payload.ciphertext.clone(),
@@ -50,11 +51,11 @@ pub(super) fn group_envelope_to_wire_format(
         )),
         ..delivery_proto::GroupBroadcastFrame::default()
     };
-    delivery_proto::DeliveryBoundaryFrame {
-        boundary: Some(
-            delivery_proto::delivery_boundary_frame::Boundary::GroupBroadcast(Box::new(frame)),
-        ),
-        ..delivery_proto::DeliveryBoundaryFrame::default()
+    endpoint_proto::EndpointFrame {
+        boundary: Some(endpoint_proto::endpoint_frame::Boundary::GroupBroadcast(
+            Box::new(frame),
+        )),
+        ..endpoint_proto::EndpointFrame::default()
     }
 }
 

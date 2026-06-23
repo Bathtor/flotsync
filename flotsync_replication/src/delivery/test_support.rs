@@ -5,13 +5,13 @@
 //! small: semantic-owner probes still live next to the tests that use them.
 
 use super::route_transport::{
+    ExternalUdpSocketRegistration,
     RouteDiscoveryPort,
     RouteTransportActorMessage,
     TransportRouteKey,
     manager::{RouteTransportManager, configure_replication_runtime},
 };
-use crate::api::MemberIdentity;
-use flotsync_core::member::IdentifierBuf;
+use flotsync_core::{MemberIdentity, member::IdentifierBuf};
 use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{
@@ -20,6 +20,7 @@ use flotsync_io::{
         IoBridgeHandle,
         IoDriverComponent,
         SocketId,
+        UdpBindOptions,
         UdpIndication,
         UdpLocalBind,
         UdpOpenRequestId,
@@ -80,11 +81,7 @@ impl DiscoveryRouteSource {
 
 ignore_lifecycle!(DiscoveryRouteSource);
 
-impl Provide<RouteDiscoveryPort<TransportRouteKey>> for DiscoveryRouteSource {
-    fn handle(&mut self, _request: Never) -> HandlerResult {
-        unreachable!("route discovery test source is indication-only")
-    }
-}
+ignore_requests!(RouteDiscoveryPort<TransportRouteKey>, DiscoveryRouteSource);
 
 impl Actor for DiscoveryRouteSource {
     type Message = Never;
@@ -411,7 +408,11 @@ impl TransportHarnessCore {
         };
         let request_id = UdpOpenRequestId::new();
         self.observer.on_definition(|component| {
-            component.udp.trigger(UdpRequest::Bind { request_id, bind });
+            component.udp.trigger(UdpRequest::Bind {
+                request_id,
+                bind,
+                options: UdpBindOptions::default(),
+            });
         });
         match self.observer_rx.recv_matching_or_fail(
             timeout,
@@ -524,14 +525,31 @@ impl TransportHarnessCore {
             .store(false, Ordering::Relaxed);
     }
 
-    /// Wait for the route-transport manager to record one externally bound
-    /// socket before tests publish routes that rely on reusing it.
+    /// Register one externally bound socket with the route-transport manager
+    /// before tests publish routes that rely on reusing it.
     pub(crate) fn wait_for_manager_external_socket_binding(
         &self,
         socket_id: SocketId,
         local_addr: SocketAddr,
         timeout: Duration,
     ) {
+        let registration = ExternalUdpSocketRegistration {
+            socket_id,
+            local_addr,
+        };
+        let registration_result = self
+            .manager_ref
+            .ask_with(|promise| {
+                RouteTransportActorMessage::RegisterExternalUdpSocket(Ask::new(
+                    promise,
+                    registration,
+                ))
+            })
+            .wait_timeout(timeout)
+            .expect("timed out registering external UDP socket with route transport manager");
+        if let Err(error) = registration_result {
+            panic!("external UDP socket registration failed: {error}");
+        }
         eventually_component_state(
             timeout,
             &self.manager,

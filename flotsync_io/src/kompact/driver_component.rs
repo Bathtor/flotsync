@@ -547,7 +547,11 @@ impl IoDriverComponent {
         }
 
         match command {
-            UdpCommand::Bind { socket_id, bind } => {
+            UdpCommand::Bind {
+                socket_id,
+                bind,
+                options: _,
+            } => {
                 self.route_udp_event(
                     socket_id,
                     UdpBridgeEvent::BindFailed {
@@ -563,6 +567,7 @@ impl IoDriverComponent {
                 socket_id,
                 remote_addr,
                 bind,
+                options: _,
             } => {
                 self.route_udp_event(
                     socket_id,

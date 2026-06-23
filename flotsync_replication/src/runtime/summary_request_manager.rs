@@ -4,8 +4,7 @@ use super::{
     messages::{RuntimeMessage, SummaryRequestMessage, WireRuntimeMessage, WireSummaryMessage},
 };
 use crate::{
-    SharedGroupMemberships,
-    api::{ApiError, ApiExternalSnafu, GroupId, MemberIdentity, Summary, SummaryRequest},
+    api::{ApiError, ApiExternalSnafu, Summary, SummaryRequest},
     delivery::{
         contracts::{
             ReliableDeliveryPort,
@@ -21,6 +20,7 @@ use crate::{
         shared::{MessageId, PlaintextPayload},
     },
 };
+use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
 use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;

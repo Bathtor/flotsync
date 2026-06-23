@@ -1,3 +1,10 @@
+---
+type: Scenario
+title: Replicated Checklist Manual Scenarios
+description: Captures manual replicated-checklist scenarios for exercising multi-peer behaviour.
+status: draft
+---
+
 # Replicated Checklist Manual Scenarios
 
 This runbook covers the manual acceptance scenarios for `flotsync-5j0.9`.
@@ -5,6 +12,12 @@ This runbook covers the manual acceptance scenarios for `flotsync-5j0.9`.
 The steps use the names `alice` and `bob`. If your local config uses different member names, map
 `alice` to the first terminal/machine and `bob` to the second. The checked-in examples in
 `testing/` are currently named for the machines they target, but the flow is the same.
+
+The normal custom UDP discovery path does not require
+`flotsync.replication.runtime.static-peer-routes`. Use concrete local endpoint addresses that the
+other peer can reach; wildcard bind addresses such as `0.0.0.0:45100` are bind instructions, not
+signed advertised routes. The no-static route scenarios require a network that forwards the
+peer-announcement UDP traffic between the peers.
 
 ## Setup
 
@@ -34,6 +47,14 @@ the temporary `group-secret-password`, `local-private-jwks-path`, and
 `trusted-public-jwks-paths` values. The profile selects a device-local
 store-secret slot; the group password and this application-side provisioning
 step are temporary for the current security MVP.
+
+<!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
+proper local store-secret backend exists. -->
+On headless Linux machines without a working Secret Service keyring, use an
+explicitly unsafe profile such as `unsafe:raspberrypi`. This skips OS keyring
+storage and derives the local store secret from the profile string. Changing
+that profile later makes existing local security material unreadable; delete the
+example store and start fresh if you change it.
 
 Use one terminal per peer. In each REPL, run:
 
@@ -280,10 +301,69 @@ Expected result:
   state and continued replication, not automatic UI rehydration of previously visible checklist
   rows.
 
-## Scenario 5: Manual Route Configuration
+## Scenario 5: Custom UDP Discovery Without Static Routes
 
-Goal: route configuration is explicit, visible in the config files, and testable without claiming
-automatic discovery exists.
+Goal: two peers discover usable direct UDP routes through peer announcements and route
+establishment, without preconfigured peer endpoints.
+
+Before starting the peers, inspect both TOML files and confirm neither file contains
+`flotsync.replication.runtime.static-peer-routes`.
+
+Alice config:
+
+```toml
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "ALICE_LAN_IP:45100"
+```
+
+Bob config:
+
+```toml
+[flotsync.replication.runtime]
+local-endpoint-bind-addr = "BOB_LAN_IP:45101"
+```
+
+Start both peers and verify local runtime state.
+
+Alice:
+
+```text
+me
+members
+add custom discovery check from alice
+sync
+```
+
+Bob:
+
+```text
+me
+members
+sync
+list
+add custom discovery check from bob
+sync
+```
+
+Alice:
+
+```text
+sync
+list
+```
+
+Expected result:
+
+- Each peer prints its configured local endpoint from `me`.
+- Each peer lists the same static ordered members from `members`.
+- Alice-to-Bob and Bob-to-Alice item exchange works without any static peer route entries.
+- Routes become usable only after route establishment verifies a discovered peer-announcement route
+  with a signed introduction.
+
+## Scenario 6: Static Route Hints
+
+Goal: route hints are explicit, visible in the config files, and verified before they become usable
+replication routes.
 
 Before starting the peers, inspect both TOML files.
 
@@ -346,7 +426,7 @@ Expected result:
 
 - Each peer prints its configured local endpoint from `me`.
 - Each peer lists the same static ordered members from `members`.
-- Alice-to-Bob and Bob-to-Alice item exchange works only because the static peer routes point at
-  the correct remote IP and port.
-- There is no discovery command, no discovered peer list, and no expectation that peers find each
-  other without the static routes.
+- Alice-to-Bob and Bob-to-Alice item exchange works only after route establishment verifies the
+  hinted remote IP and port with a signed introduction.
+- Static peer routes are hints, not direct always-available routes. They are useful as a fallback or
+  diagnostic input when the local network does not forward peer-announcement traffic reliably.

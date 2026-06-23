@@ -2,6 +2,7 @@ use super::{
     IoBridge,
     IoBridgeHandle,
     IoDriverComponent,
+    IoRuntime,
     OpenTcpListener,
     OpenTcpSession,
     TcpListenerEvent,
@@ -14,7 +15,7 @@ use super::{
     UdpSendResult,
 };
 use crate::{
-    api::{CloseReason, IoPayload, TransmissionId, UdpLocalBind, UdpSocketOption},
+    api::{CloseReason, IoPayload, TransmissionId, UdpBindOptions, UdpLocalBind, UdpSocketOption},
     driver::DriverConfig,
     socket_support::configure_bind_reuse,
     test_support::{
@@ -28,6 +29,7 @@ use crate::{
         build_test_kompact_system,
         build_test_kompact_system_with,
         enable_bind_reuse_address,
+        eventually,
         kill_component,
         localhost,
         recv_until,
@@ -54,6 +56,51 @@ struct TaggedSessionEvent {
 
 fn wrap_tagged_session_event(tag: usize, event: TcpSessionEvent) -> TaggedSessionEvent {
     TaggedSessionEvent { tag, event }
+}
+
+#[test]
+fn io_runtime_kill_notify_issues_bridge_shutdown_before_future_is_polled() {
+    let system = build_test_kompact_system();
+    let runtime = IoRuntime::build(&system, DriverConfig::default());
+
+    runtime
+        .start_notify(&system)
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("runtime start timeout")
+        .expect("runtime start");
+    let bridge = runtime.bridge_component().clone();
+
+    let shutdown = runtime.kill_notify(&system);
+    eventually(
+        WAIT_TIMEOUT,
+        || bridge.is_destroyed(),
+        "runtime kill_notify should enqueue bridge shutdown before its future is polled",
+    );
+    shutdown
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("runtime kill timeout")
+        .expect("runtime kill");
+
+    system.shutdown().wait().expect("Kompact shutdown");
+}
+
+#[test]
+fn io_runtime_starts_and_kills_shared_driver_bridge_pair() {
+    let system = build_test_kompact_system();
+    let runtime = IoRuntime::build(&system, DriverConfig::default());
+
+    runtime
+        .start_notify(&system)
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("runtime start timeout")
+        .expect("runtime start");
+    runtime
+        .kill_notify(&system)
+        .wait_timeout(WAIT_TIMEOUT)
+        .expect("runtime kill timeout")
+        .expect("runtime kill");
+
+    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 fn hold_reusable_tcp_reservation() -> (Socket, SocketAddr) {
@@ -144,6 +191,7 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(reserved_addr),
+            options: UdpBindOptions::default(),
         });
     });
     match recv_until(&observer_rx, |event| {
@@ -188,6 +236,7 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(reserved_addr),
+            options: UdpBindOptions::default(),
         });
     });
     match recv_until(&observer_rx, |event| {
@@ -207,6 +256,55 @@ fn udp_bind_reuse_config_allows_binding_to_a_reserved_port() {
             assert_eq!(local_addr, reserved_addr);
         }
         other => panic!("reserved UDP bind with reuse config unexpectedly produced {other:?}"),
+    }
+
+    kill_component(&system, observer);
+    kill_component(&system, bridge);
+    kill_component(&system, driver_component);
+    system.shutdown().wait().expect("Kompact shutdown");
+}
+
+#[test]
+fn udp_bind_request_options_allow_binding_to_a_reserved_port() {
+    let (_reservation, reserved_addr) = hold_reusable_udp_reservation();
+
+    let system = build_test_kompact_system();
+    let driver_component = system.create(|| IoDriverComponent::new(DriverConfig::default()));
+    let driver_for_bridge = driver_component.clone();
+    let bridge = system.create(move || IoBridge::new(&driver_for_bridge));
+    let (observer_tx, observer_rx) = mpsc::channel();
+    let observer = system.create(move || UdpObserver::new(observer_tx));
+    biconnect_components::<UdpPort, _, _>(&bridge, &observer).expect("bridge/observer");
+
+    start_component(&system, &driver_component);
+    start_component(&system, &bridge);
+    start_component(&system, &observer);
+
+    let request_id = UdpOpenRequestId::new();
+    observer.on_definition(|component| {
+        component.udp.trigger(UdpRequest::Bind {
+            request_id,
+            bind: UdpLocalBind::Exact(reserved_addr),
+            options: UdpBindOptions::default().with_socket_reuse(true),
+        });
+    });
+    match recv_until(&observer_rx, |event| {
+        matches!(
+            event,
+            UdpIndication::Bound { request_id: event_request_id, .. }
+                | UdpIndication::BindFailed { request_id: event_request_id, .. }
+                if *event_request_id == request_id
+        )
+    }) {
+        UdpIndication::Bound {
+            request_id: bound_request_id,
+            local_addr,
+            ..
+        } => {
+            assert_eq!(bound_request_id, request_id);
+            assert_eq!(local_addr, reserved_addr);
+        }
+        other => panic!("reserved UDP bind with request reuse unexpectedly produced {other:?}"),
     }
 
     kill_component(&system, observer);
@@ -306,6 +404,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
         component.udp.trigger(UdpRequest::Bind {
             request_id: receiver_request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(0)),
+            options: UdpBindOptions::default(),
         });
     });
     let (receiver_id, receiver_addr) = match recv_until(&observer1_rx, |event| {
@@ -353,6 +452,7 @@ fn udp_bridge_broadcasts_socket_activity_but_send_results_stay_private() {
         component.udp.trigger(UdpRequest::Bind {
             request_id: sender_request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(1)),
+            options: UdpBindOptions::default(),
         });
     });
     let sender_id = match recv_until(&observer1_rx, |event| {
@@ -506,6 +606,7 @@ fn udp_bridge_broadcasts_socket_configuration_indications() {
         component.udp.trigger(UdpRequest::Bind {
             request_id,
             bind: UdpLocalBind::Exact(socket_lease.addr(0)),
+            options: UdpBindOptions::default(),
         });
     });
     let socket_id = match recv_until(&observer1_rx, |event| {

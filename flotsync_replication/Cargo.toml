@@ -12,6 +12,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
+flotsync_discovery = { path = "../flotsync_discovery", default-features = false, features = ["peer-announcement-via-kompact"] }
 flotsync_messages = { path = "../flotsync_messages" }
 flotsync_security = { path = "../flotsync_security" }
 flotsync_udpour = { path = "../flotsync_udpour" }

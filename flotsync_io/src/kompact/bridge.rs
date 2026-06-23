@@ -19,7 +19,15 @@ use super::{
     },
 };
 use crate::{
-    api::{SendFailureReason, SocketId, TransmissionId, UdpCommand, UdpLocalBind, UdpSocketOption},
+    api::{
+        SendFailureReason,
+        SocketId,
+        TransmissionId,
+        UdpBindOptions,
+        UdpCommand,
+        UdpLocalBind,
+        UdpSocketOption,
+    },
     errors::Error,
     pool::EgressPool,
 };
@@ -360,12 +368,17 @@ impl IoBridge {
 
     fn handle_udp_request(&mut self, request: UdpRequest) -> HandlerResult {
         match request {
-            UdpRequest::Bind { request_id, bind } => self.handle_udp_bind_request(request_id, bind),
+            UdpRequest::Bind {
+                request_id,
+                bind,
+                options,
+            } => self.handle_udp_bind_request(request_id, bind, options),
             UdpRequest::Connect {
                 request_id,
                 remote_addr,
                 bind,
-            } => self.handle_udp_connect_request(request_id, remote_addr, bind),
+                options,
+            } => self.handle_udp_connect_request(request_id, remote_addr, bind, options),
             UdpRequest::Send {
                 socket_id,
                 transmission_id,
@@ -391,6 +404,7 @@ impl IoBridge {
         &mut self,
         request_id: UdpOpenRequestId,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     ) -> HandlerResult {
         let owner = self
             .actor_ref()
@@ -412,9 +426,11 @@ impl IoBridge {
             };
             async_self.owned_sockets.insert(socket_id);
             async_self.udp_open_requests.insert(socket_id, request_id);
-            async_self
-                .driver
-                .dispatch_udp(UdpCommand::Bind { socket_id, bind });
+            async_self.driver.dispatch_udp(UdpCommand::Bind {
+                socket_id,
+                bind,
+                options,
+            });
             Handled::OK
         })
     }
@@ -424,6 +440,7 @@ impl IoBridge {
         request_id: UdpOpenRequestId,
         remote_addr: SocketAddr,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     ) -> HandlerResult {
         let owner = self
             .actor_ref()
@@ -450,6 +467,7 @@ impl IoBridge {
                 socket_id,
                 remote_addr,
                 bind,
+                options,
             });
             Handled::OK
         })

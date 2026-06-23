@@ -4,7 +4,6 @@ use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
     route_transport::{
-        FlotsyncSerializable,
         RouteDiscoveryPort,
         RouteSharingKind,
         RouteTransportActorMessage,
@@ -16,14 +15,18 @@ use super::{
     security::{DeliverySecurity, DeliverySecurityError},
     shared::{DeliveryClass, MessageId, PlaintextPayload, RouteSendId},
 };
-use crate::{
-    GroupMembers,
-    SharedGroupMemberships,
-    api::{GroupId, MemberIdentity},
-};
 use bytes::Bytes;
-use flotsync_core::member::TrieMap;
-use flotsync_messages::delivery as delivery_proto;
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    member::TrieMap,
+    membership::{GroupMembers, SharedGroupMemberships},
+};
+use flotsync_messages::{
+    delivery as delivery_proto,
+    endpoint as endpoint_proto,
+    serialisation::FlotsyncSerializable,
+};
 use flotsync_security::SealedPSKPayload;
 use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
 use kompact::prelude::*;
@@ -52,7 +55,7 @@ pub struct GroupMessageEnvelope<P> {
 }
 
 impl GroupMessageEnvelope<SealedPSKPayload> {
-    fn to_wire_format(&self) -> delivery_proto::DeliveryBoundaryFrame {
+    fn to_wire_format(&self) -> endpoint_proto::EndpointFrame {
         group_envelope_to_wire_format(self)
     }
 }
@@ -111,8 +114,8 @@ impl GroupBroadcastSubmitBuilder {
 impl GroupBroadcastSubmitMemberBuilder {
     /// Finish the submit with plaintext runtime payload bytes.
     ///
-    /// Group broadcast owns the generated envelope identity, delivery-boundary
-    /// sealing, and default self-delivery suppression policy.
+    /// Group broadcast owns the generated envelope identity, endpoint-frame
+    /// wrapping, sealing, and default self-delivery suppression policy.
     #[must_use]
     pub fn with_payload(self, bytes: Bytes) -> GroupBroadcastPortRequest {
         GroupBroadcastPortRequest::Submit(GroupBroadcastSubmit {
@@ -142,12 +145,12 @@ pub struct GroupBroadcastDeliver {
 pub struct GroupBroadcastInboundDeliver<R> {
     /// Shared ingress metadata derived before the semantic handoff.
     pub meta: InboundDeliveryMeta<R>,
-    /// Fully decoded group-broadcast boundary frame owned by the generated
+    /// Fully decoded group-broadcast endpoint branch owned by the generated
     /// protobuf types.
     pub frame: delivery_proto::GroupBroadcastFrame,
 }
 
-/// Internal ingress port that feeds decoded group-broadcast boundary frames
+/// Internal ingress port that feeds decoded group-broadcast endpoint branches
 /// into the group-broadcast service.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GroupBroadcastInboundPort<R>(NonOwningPhantomData<R>);
@@ -517,9 +520,8 @@ fn select_best_direct_route(
 mod tests {
     use super::*;
     use crate::{
-        GroupMemberships,
         SqliteReplicationStore,
-        api::{MemberIndex, ReplicationGroupRecord, ReplicationStore},
+        api::{ReplicationGroupRecord, ReplicationStore},
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
             route_transport::{
@@ -543,7 +545,7 @@ mod tests {
         test_support::{load_test_delivery_security, provision_test_security, test_group_key},
     };
     use bytes::Bytes;
-    use flotsync_core::versions::VersionVector;
+    use flotsync_core::{MemberIndex, membership::GroupMemberships, versions::VersionVector};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
@@ -708,7 +710,6 @@ mod tests {
                     .discovery
                     .trigger(TransportDiscoveryRouteUpdate::PeerRoutes {
                         peer,
-                        classification: super::super::shared::ReachabilityClass::Reachable,
                         routes: vec![route],
                     });
             });
@@ -1159,10 +1160,10 @@ mod tests {
             payload: sealed,
         };
         let boundary = envelope.to_wire_format();
-        let Some(delivery_proto::delivery_boundary_frame::Boundary::GroupBroadcast(frame)) =
+        let Some(endpoint_proto::endpoint_frame::Boundary::GroupBroadcast(frame)) =
             boundary.boundary
         else {
-            panic!("sealed test envelope should encode as group broadcast boundary");
+            panic!("sealed test envelope should encode as group broadcast endpoint branch");
         };
         let Some(delivery_proto::group_broadcast_frame::Body::Envelope(envelope)) = frame.body
         else {

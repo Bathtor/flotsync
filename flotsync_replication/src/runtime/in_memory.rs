@@ -9,29 +9,29 @@ use super::errors::{
     inbound,
     publish,
 };
-use crate::{
-    GroupMembers,
-    api::{
-        DatasetId,
-        DatasetRowPatch,
-        DatasetRowSlice,
-        DatasetRowWrite,
-        DatasetUpdateRecord,
-        GroupId,
-        MemberIdentity,
-        MemberIndex,
-        MutableRow,
-        ReplicationGroupRecord,
-        ReplicationRowSnapshot,
-        ReplicationUpdateRecord,
-        RowChange,
-        RowId,
-        RowKey,
-        RowMutation,
-        SchemaSource,
-    },
+use crate::api::{
+    DatasetId,
+    DatasetRowPatch,
+    DatasetRowSlice,
+    DatasetRowWrite,
+    DatasetUpdateRecord,
+    MutableRow,
+    ReplicationGroupRecord,
+    ReplicationRowSnapshot,
+    ReplicationUpdateRecord,
+    RowChange,
+    RowId,
+    RowKey,
+    RowMutation,
+    SchemaSource,
 };
-use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    membership::GroupMembers,
+    versions::{UpdateId, VersionVector},
+};
 use flotsync_data_types::{
     InitialFieldValue,
     OperationOutcome,
@@ -42,6 +42,7 @@ use flotsync_data_types::{
     schema::datamodel::{RowOperation, RowRecord},
 };
 use flotsync_messages::codecs::datamodel::{decode_schema_operation, encode_schema_operation};
+use flotsync_utils::option_when;
 use snafu::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -201,7 +202,7 @@ impl PendingUpdateSet {
             }
 
             let ready_update_id = self.updates.iter().find_map(|(update_id, update)| {
-                simulated_group.can_apply(update).then_some(*update_id)
+                option_when!(simulated_group.can_apply(update), *update_id)
             });
             let Some(ready_update_id) = ready_update_id else {
                 break 'drain;

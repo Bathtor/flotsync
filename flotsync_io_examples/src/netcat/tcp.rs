@@ -3,7 +3,6 @@ use super::{
     OutcomePromise,
     Result,
     SCRIPTED_EXIT_GRACE,
-    ShutdownTimerState,
     TcpMode,
     complete_outcome,
     install_input_source,
@@ -200,8 +199,7 @@ struct TcpConnectNetcat {
     shutdown_after_input: bool,
     pending_send: bool,
     next_transmission_id: TransmissionId,
-    shutdown_timer: Option<ShutdownTimerState>,
-    next_shutdown_timer_generation: usize,
+    shutdown_timer: Option<ScheduledTimer>,
     outcome: Option<OutcomePromise>,
 }
 
@@ -223,7 +221,6 @@ impl TcpConnectNetcat {
             pending_send: false,
             next_transmission_id: TransmissionId::ONE,
             shutdown_timer: None,
-            next_shutdown_timer_generation: 1,
             outcome: Some(outcome),
         }
     }
@@ -320,13 +317,10 @@ impl TcpConnectNetcat {
     fn set_shutdown_timer_if_idle(&mut self) {
         if self.should_set_shutdown_timer() {
             if self.shutdown_timer.is_none() {
-                let generation = self.next_shutdown_timer_generation;
-                self.next_shutdown_timer_generation =
-                    self.next_shutdown_timer_generation.wrapping_add(1);
-                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, _| {
-                    component.handle_shutdown_timeout(generation)
+                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, timeout| {
+                    component.handle_shutdown_timeout(&timeout)
                 });
-                self.shutdown_timer = Some(ShutdownTimerState { generation, timer });
+                self.shutdown_timer = Some(timer);
             }
             return;
         }
@@ -343,16 +337,16 @@ impl TcpConnectNetcat {
 
     fn clear_shutdown_timer(&mut self) {
         if let Some(timer) = self.shutdown_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
-        let Some(timer) = self.shutdown_timer.take() else {
+    fn handle_shutdown_timeout(&mut self, actual_timer: &ScheduledTimer) -> HandlerResult {
+        let Some(expected_timer) = self.shutdown_timer.take() else {
             return Handled::OK;
         };
-        if timer.generation != generation {
-            self.shutdown_timer = Some(timer);
+        if &expected_timer != actual_timer {
+            self.shutdown_timer = Some(expected_timer);
             return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {
@@ -456,8 +450,7 @@ struct TcpListenNetcat {
     shutdown_after_input: bool,
     pending_send: bool,
     next_transmission_id: TransmissionId,
-    shutdown_timer: Option<ShutdownTimerState>,
-    next_shutdown_timer_generation: usize,
+    shutdown_timer: Option<ScheduledTimer>,
     outcome: Option<OutcomePromise>,
 }
 
@@ -481,7 +474,6 @@ impl TcpListenNetcat {
             pending_send: false,
             next_transmission_id: TransmissionId::ONE,
             shutdown_timer: None,
-            next_shutdown_timer_generation: 1,
             outcome: Some(outcome),
         }
     }
@@ -646,13 +638,10 @@ impl TcpListenNetcat {
     fn set_shutdown_timer_if_idle(&mut self) {
         if self.should_set_shutdown_timer() {
             if self.shutdown_timer.is_none() {
-                let generation = self.next_shutdown_timer_generation;
-                self.next_shutdown_timer_generation =
-                    self.next_shutdown_timer_generation.wrapping_add(1);
-                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, _| {
-                    component.handle_shutdown_timeout(generation)
+                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, timeout| {
+                    component.handle_shutdown_timeout(&timeout)
                 });
-                self.shutdown_timer = Some(ShutdownTimerState { generation, timer });
+                self.shutdown_timer = Some(timer);
             }
             return;
         }
@@ -674,16 +663,16 @@ impl TcpListenNetcat {
 
     fn clear_shutdown_timer(&mut self) {
         if let Some(timer) = self.shutdown_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
-        let Some(timer) = self.shutdown_timer.take() else {
+    fn handle_shutdown_timeout(&mut self, actual_timer: &ScheduledTimer) -> HandlerResult {
+        let Some(expected_timer) = self.shutdown_timer.take() else {
             return Handled::OK;
         };
-        if timer.generation != generation {
-            self.shutdown_timer = Some(timer);
+        if &expected_timer != actual_timer {
+            self.shutdown_timer = Some(expected_timer);
             return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {

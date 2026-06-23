@@ -62,10 +62,7 @@ use super::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::test_support::test_group_key;
 use crate::{
-    GroupMembers,
-    GroupMemberships,
     MAX_VERSION_VALUE,
-    SharedGroupMemberships,
     api::{
         ApiError,
         ApiExternalSnafu,
@@ -77,10 +74,7 @@ use crate::{
         DatasetRowWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
-        GroupId,
         GroupMigration,
-        MemberIdentity,
-        MemberIndex,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -129,7 +123,13 @@ use crate::{
         shared::{DeliveryClass, MessageId, PlaintextPayload},
     },
 };
-use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
+    membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
+    versions::{UpdateId, VersionVector},
+};
 use flotsync_data_types::OwnedRow;
 use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
 use flotsync_utils::{BoxFuture, KClaimablePromise, ResultExt as _};

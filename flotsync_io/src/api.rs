@@ -521,6 +521,32 @@ impl UdpLocalBind {
     }
 }
 
+/// Bind-time options for one UDP open request.
+///
+/// Defaults to no request-local overrides, so socket re-use is disabled unless
+/// this request or the driver-wide configuration enables it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UdpBindOptions {
+    /// Whether the driver should enable platform socket re-use options before binding.
+    ///
+    /// On Unix this currently includes both `SO_REUSEADDR` and `SO_REUSEPORT`.
+    /// This only affects this one UDP open request. The driver-wide bind reuse configuration still
+    /// acts as an override for all bind paths owned by that driver.
+    ///
+    /// Defaults to `false`.
+    pub socket_reuse: bool,
+}
+
+impl UdpBindOptions {
+    /// Returns options with the per-request socket re-use setting replaced.
+    #[must_use]
+    pub const fn with_socket_reuse(mut self, socket_reuse: bool) -> Self {
+        self.socket_reuse = socket_reuse;
+        self
+    }
+}
+
 /// Commands issued against the TCP freeform I/O surface.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -702,6 +728,7 @@ pub enum UdpCommand {
     Bind {
         socket_id: SocketId,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     },
     /// Creates a connected UDP socket, optionally binding it first, and associates it with the
     /// provided local socket handle.
@@ -709,6 +736,7 @@ pub enum UdpCommand {
         socket_id: SocketId,
         remote_addr: SocketAddr,
         bind: UdpLocalBind,
+        options: UdpBindOptions,
     },
     /// Requests transmission of a UDP datagram, optionally to an explicit target for unconnected sockets.
     Send {

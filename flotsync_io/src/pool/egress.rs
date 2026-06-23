@@ -685,7 +685,7 @@ impl EgressAsyncWriter {
         }
 
         let mut written = 0;
-        loop {
+        while written < bytes.len() {
             let available = self.current_chunk_remaining();
             if available > 0 {
                 let to_copy = available.min(bytes.len() - written);
@@ -699,9 +699,7 @@ impl EgressAsyncWriter {
                     self.chunk_index += 1;
                     self.chunk_offset = 0;
                 }
-                if written == bytes.len() {
-                    return Poll::Ready(Ok(written));
-                }
+                continue;
             }
 
             match self.poll_acquire_more(cx) {
@@ -713,6 +711,7 @@ impl EgressAsyncWriter {
                 Poll::Pending => return Poll::Pending,
             }
         }
+        Poll::Ready(Ok(written))
     }
 
     fn poll_reserve_for_sync(
@@ -840,15 +839,15 @@ impl PayloadWriter for EgressAsyncWriter {
     }
 
     async fn adopt_payload(&mut self, payload: IoPayload) -> Result<()> {
-        self.adopt_payload_part(payload)
+        std::future::ready(self.adopt_payload_part(payload)).await
     }
 
     async fn adopt_payload_slice(&mut self, payload: IoPayload, range: Range<usize>) -> Result<()> {
         let payload_len = payload.len();
         let Some(slice) = payload.try_slice(range.clone()) else {
-            return Err(invalid_payload_slice_range(payload_len, range));
+            return std::future::ready(Err(invalid_payload_slice_range(payload_len, range))).await;
         };
-        self.adopt_payload_part(slice)
+        std::future::ready(self.adopt_payload_part(slice)).await
     }
 }
 

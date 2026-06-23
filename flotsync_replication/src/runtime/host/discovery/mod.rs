@@ -1,215 +1,34 @@
-use super::{RuntimeHostError, config_keys};
-use crate::{
-    api::MemberIdentity,
-    delivery::{
-        route_transport::{
-            DatagramRouteScope,
-            DiscoveryRouteUpdate,
-            RouteDiscoveryPort,
-            RoutePreferenceRank,
-            RouteSharingKind,
-            SendRouteCandidate,
-            TransportRouteKey,
-            UdpRouteKey,
-        },
-        shared::ReachabilityClass,
-    },
+use super::RuntimeHostError;
+#[cfg(test)]
+use crate::delivery::route_transport::{
+    DatagramRouteScope,
+    DiscoveryRouteUpdate,
+    RoutePreferenceRank,
+    RouteSharingKind,
+    SendRouteCandidate,
+    TransportRouteKey,
+    UdpRouteKey,
 };
-use flotsync_io::prelude::{UdpIndication, UdpPort};
-use kompact::{
-    config::{Config, ConfigError, ConfigLookup},
-    prelude::*,
-};
+use flotsync_core::MemberIdentity;
+use flotsync_discovery::{protocol::DiscoveryRoute, route_establishment::WatchedRoute};
+use kompact::config::{Config, ConfigError, ConfigLookup};
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
 };
 
+pub(in crate::runtime::host) mod route_establishment;
+
 pub(super) const STATIC_PEER_ROUTES_KEY: &str = "flotsync.replication.runtime.static-peer-routes";
 const SUPPORTED_STATIC_ROUTE_PROTOCOLS: &[StaticPeerRouteProtocol] =
     &[StaticPeerRouteProtocol::Udp];
 
-#[derive(Debug)]
-pub(super) enum PreconfiguredPeerRoutesMessage {
-    #[cfg(any(test, feature = "test-support"))]
-    Publish(DiscoveryRouteUpdate<TransportRouteKey>),
-    #[cfg(test)]
-    PublishPreconfiguredRoutes,
-}
-
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::runtime) enum PreconfiguredPeerRoutesPublishMode {
     OnLocalEndpointBound,
-    #[cfg(test)]
     ManualForTest,
-}
-
-/// Route-discovery source backed only by explicitly configured peer endpoints.
-#[derive(ComponentDefinition)]
-pub(super) struct PreconfiguredPeerRoutesComponent {
-    ctx: ComponentContext<Self>,
-    discovery: ProvidedPort<RouteDiscoveryPort<TransportRouteKey>>,
-    udp: RequiredPort<UdpPort>,
-    configured_local_endpoint: SocketAddr,
-    routes: Vec<PreconfiguredPeerRoute>,
-    local_endpoint: Option<SocketAddr>,
-    published: bool,
-    publish_mode: PreconfiguredPeerRoutesPublishMode,
-}
-
-impl PreconfiguredPeerRoutesComponent {
-    pub(super) fn new(
-        configured_local_endpoint: SocketAddr,
-        publish_mode: PreconfiguredPeerRoutesPublishMode,
-    ) -> Self {
-        Self {
-            ctx: ComponentContext::uninitialised(),
-            discovery: ProvidedPort::uninitialised(),
-            udp: RequiredPort::uninitialised(),
-            configured_local_endpoint,
-            routes: Vec::new(),
-            local_endpoint: None,
-            published: false,
-            publish_mode,
-        }
-    }
-
-    fn record_local_endpoint_bound(&mut self, local_addr: SocketAddr) {
-        if self.configured_local_endpoint.port() != 0
-            && local_addr != self.configured_local_endpoint
-        {
-            debug!(
-                self.log(),
-                "ignored UDP bind announcement for local_addr={} while waiting for configured local endpoint {}",
-                local_addr,
-                self.configured_local_endpoint
-            );
-            return;
-        }
-        if self.configured_local_endpoint.port() == 0
-            && local_addr.ip() != self.configured_local_endpoint.ip()
-        {
-            debug!(
-                self.log(),
-                "ignored UDP bind announcement for local_addr={} while waiting for configured local endpoint {}",
-                local_addr,
-                self.configured_local_endpoint
-            );
-            return;
-        }
-
-        info!(
-            self.log(),
-            "observed runtime local endpoint bind local_addr={} configured_local_endpoint={} static_peer_route_count={} publish_mode={:?}",
-            local_addr,
-            self.configured_local_endpoint,
-            self.routes.len(),
-            self.publish_mode
-        );
-        self.local_endpoint = Some(local_addr);
-        match self.publish_mode {
-            PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound => {
-                self.publish_preconfigured_routes();
-            }
-            #[cfg(test)]
-            PreconfiguredPeerRoutesPublishMode::ManualForTest => {}
-        }
-    }
-
-    fn publish_preconfigured_routes(&mut self) {
-        if self.published {
-            debug!(
-                self.log(),
-                "ignored duplicate preconfigured peer route publication request"
-            );
-            return;
-        }
-        let Some(local_endpoint) = self.local_endpoint else {
-            warn!(
-                self.log(),
-                "cannot publish preconfigured peer routes before the local endpoint is bound"
-            );
-            return;
-        };
-
-        info!(
-            self.log(),
-            "publishing {} preconfigured peer route(s) from local_endpoint={}",
-            self.routes.len(),
-            local_endpoint
-        );
-        for route in &self.routes {
-            debug!(
-                self.log(),
-                "publishing preconfigured peer route peer={} remote_addr={} local_endpoint={}",
-                route.peer,
-                route.remote_addr,
-                local_endpoint
-            );
-            self.discovery
-                .trigger(route.to_discovery_update(local_endpoint));
-        }
-        self.published = true;
-    }
-}
-
-impl ComponentLifecycle for PreconfiguredPeerRoutesComponent {
-    fn on_start(&mut self) -> HandlerResult {
-        match PreconfiguredPeerRoutesConfig::from_config(self.ctx.config()) {
-            Ok(config) => {
-                info!(
-                    self.log(),
-                    "loaded {} preconfigured peer route(s) for configured_local_endpoint={} publish_mode={:?}",
-                    config.routes.len(),
-                    self.configured_local_endpoint,
-                    self.publish_mode
-                );
-                self.routes = config.routes;
-                Handled::OK
-            }
-            Err(error) => {
-                error!(
-                    self.log(),
-                    "preconfigured peer route startup failed: {error}"
-                );
-                panic!("preconfigured peer route startup failed: {error}");
-            }
-        }
-    }
-}
-
-impl Require<UdpPort> for PreconfiguredPeerRoutesComponent {
-    fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
-        if let UdpIndication::Bound { local_addr, .. } = indication {
-            self.record_local_endpoint_bound(local_addr);
-        }
-        Handled::OK
-    }
-}
-
-ignore_requests!(
-    RouteDiscoveryPort<TransportRouteKey>,
-    PreconfiguredPeerRoutesComponent
-);
-
-impl Actor for PreconfiguredPeerRoutesComponent {
-    type Message = PreconfiguredPeerRoutesMessage;
-
-    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
-        match msg {
-            #[cfg(any(test, feature = "test-support"))]
-            PreconfiguredPeerRoutesMessage::Publish(update) => {
-                self.discovery.trigger(update);
-                Handled::OK
-            }
-            #[cfg(test)]
-            PreconfiguredPeerRoutesMessage::PublishPreconfiguredRoutes => {
-                self.publish_preconfigured_routes();
-                Handled::OK
-            }
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,19 +54,22 @@ impl PreconfiguredPeerRoutesConfig {
         Ok(Self { routes })
     }
 
-    pub(super) fn validate_local_endpoint_bind_addr(
+    pub(super) fn watched_routes(&self) -> Vec<WatchedRoute> {
+        self.routes
+            .iter()
+            .map(PreconfiguredPeerRoute::to_watched_route)
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn direct_route_updates(
         &self,
-        bind_addr: SocketAddr,
-    ) -> Result<(), RuntimeHostError> {
-        if !self.routes.is_empty() && bind_addr.port() == 0 {
-            return Err(RuntimeHostError::InvalidConfig {
-                key: config_keys::LOCAL_ENDPOINT_BIND_ADDR.key,
-                message: format!(
-                    "static peer routes require a fixed local endpoint port, but configured bind address is {bind_addr}"
-                ),
-            });
-        }
-        Ok(())
+        local_endpoint: SocketAddr,
+    ) -> Vec<DiscoveryRouteUpdate<TransportRouteKey>> {
+        self.routes
+            .iter()
+            .map(|route| route.to_discovery_update(local_endpoint))
+            .collect()
     }
 }
 
@@ -258,13 +80,20 @@ struct PreconfiguredPeerRoute {
 }
 
 impl PreconfiguredPeerRoute {
+    fn to_watched_route(&self) -> WatchedRoute {
+        WatchedRoute {
+            route: DiscoveryRoute::Udp(self.remote_addr),
+            expected_member: Some(self.peer.clone()),
+        }
+    }
+
+    #[cfg(test)]
     fn to_discovery_update(
         &self,
         local_endpoint: SocketAddr,
     ) -> DiscoveryRouteUpdate<TransportRouteKey> {
         DiscoveryRouteUpdate::PeerRoutes {
             peer: self.peer.clone(),
-            classification: ReachabilityClass::Reachable,
             routes: vec![SendRouteCandidate {
                 coverage_key: TransportRouteKey::Udp(UdpRouteKey {
                     remote_addr: self.remote_addr,
@@ -422,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_static_peer_routes_with_ephemeral_local_endpoint() {
+    fn static_peer_routes_convert_to_expected_member_watches() {
         let config = parse_config_str(
             r#"
             [[flotsync.replication.runtime.static-peer-routes]]
@@ -436,14 +265,17 @@ mod tests {
         let routes =
             PreconfiguredPeerRoutesConfig::from_config(&config).expect("routes should parse");
 
-        let result = routes.validate_local_endpoint_bind_addr(
-            "127.0.0.1:0".parse().expect("address should parse"),
-        );
+        let watches = routes.watched_routes();
 
-        assert!(matches!(
-            result,
-            Err(RuntimeHostError::InvalidConfig { .. })
-        ));
+        assert_eq!(watches.len(), 1);
+        assert_eq!(
+            watches[0].route,
+            DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 45100)))
+        );
+        assert_eq!(
+            watches[0].expected_member,
+            Some(MemberIdentity::from_array(["bob"]))
+        );
     }
 
     #[test]

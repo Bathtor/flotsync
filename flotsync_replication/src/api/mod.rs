@@ -1,5 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use flotsync_core::{
+    GroupId,
+    MemberIdentity,
+    MemberIndex,
     member::Identifier,
     versions::{UpdateId, VersionVector},
 };
@@ -486,6 +489,26 @@ impl ReplicationSecuritySecrets {
         let secret = load_or_create_local_store_secret(application_id, profile)
             .context(LocalStoreSecretSnafu)?;
         Ok(Self::from_loaded_local_store_secret(secret))
+    }
+
+    /// Build runtime security input from caller-managed store-secret material.
+    ///
+    /// This bypasses the platform local-secret store. Prefer
+    /// [`Self::load_or_create_local`] unless the caller intentionally manages
+    /// the local store secret through another mechanism.
+    ///
+    /// TODO(flotsync-lsi8): Re-evaluate or remove this escape hatch once
+    /// headless local store-secret backends can provide managed secrets.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn from_unmanaged_store_secret(
+        store_secret_key_id: StoreSecretKeyId,
+        store_secret_key: StoreSecretKey,
+    ) -> Self {
+        Self {
+            store_secret_key_id,
+            store_secret_key: Arc::new(store_secret_key),
+        }
     }
 
     /// Build runtime security input from a shared store-secret key handle.

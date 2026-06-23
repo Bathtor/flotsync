@@ -22,80 +22,17 @@
 
 pub mod manager;
 
-use super::shared::{ReachabilityClass, RelayIdentity, RouteSendId};
-use crate::api::MemberIdentity;
-use flotsync_io::prelude::{EgressAsyncWriter, Error as IoError, IoPayload};
-use flotsync_messages::buffa::Message as BuffaMessage;
-use flotsync_utils::{BoxFuture, IString, NonOwningPhantomData};
+use super::shared::{RelayIdentity, RouteSendId};
+use flotsync_core::MemberIdentity;
+use flotsync_io::prelude::{IoPayload, SocketId};
+use flotsync_messages::serialisation::FlotsyncSerializable;
+use flotsync_utils::{IString, NonOwningPhantomData};
 use kompact::{
     Never,
     prelude::{Ask, Port},
 };
-use snafu::prelude::*;
+use snafu::Snafu;
 use std::{fmt::Debug, hash::Hash, net::SocketAddr, sync::Arc};
-
-/// Size hint returned by one serializable network message.
-///
-/// Route transport can use this to choose between bounded sync reservation and
-/// fully async/growable encoding paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SizeHint {
-    /// Absolutely no idea about the required size.
-    Unknown,
-    /// Given value is the exact size required.
-    Exact(usize),
-    /// Given value is an upper bound on the size required.
-    UpperBound(usize),
-    /// Given value is an estimate that may be too large or too small.
-    Estimate(usize),
-}
-
-/// Dyn-safe payload contract for flotsync network messages.
-pub trait FlotsyncSerializable: Send + Sync + 'static {
-    /// Best-effort size information used by route transport before allocating
-    /// pooled egress buffers.
-    fn serialized_size_hint(&self) -> SizeHint;
-
-    /// Encode the logical network message into one pooled writer owned by the
-    /// concrete transport backend.
-    fn serialize_into<'a>(
-        &'a self,
-        writer: &'a mut EgressAsyncWriter,
-    ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>>;
-}
-
-impl<M> FlotsyncSerializable for M
-where
-    M: BuffaMessage + Send + Sync + 'static,
-{
-    fn serialized_size_hint(&self) -> SizeHint {
-        SizeHint::Exact(self.compute_size() as usize)
-    }
-
-    fn serialize_into<'a>(
-        &'a self,
-        writer: &'a mut EgressAsyncWriter,
-    ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
-        Box::pin(async move {
-            let reserved_bytes = self.compute_size() as usize;
-            let mut reserved = writer
-                .write_with_reserved(reserved_bytes)
-                .await
-                .map_err(|source| FlotsyncSerializeError::Io { source })?;
-            self.encode(&mut reserved);
-            Ok(())
-        })
-    }
-}
-
-/// Serialization failure at the route-transport boundary.
-#[derive(Debug, Snafu)]
-pub enum FlotsyncSerializeError {
-    #[snafu(display("writer failure while serializing flotsync message"))]
-    Io { source: IoError },
-    #[snafu(display("message serialization failed: {message}"))]
-    Encoding { message: IString },
-}
 
 /// Whether semantic delivery may collapse equal candidates into one shared send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -168,16 +105,18 @@ pub struct SendRouteCandidate<R> {
 }
 
 /// Published discovery update for one peer or relay.
+///
+/// Each update fully replaces the previously published route set for that
+/// peer or relay. An empty `routes` list withdraws all currently usable routes
+/// for that identity.
 #[derive(Clone, Debug)]
 pub enum DiscoveryRouteUpdate<R> {
     PeerRoutes {
         peer: MemberIdentity,
-        classification: ReachabilityClass,
         routes: Vec<SendRouteCandidate<R>>,
     },
     RelayRoutes {
         relay: RelayIdentity,
-        classification: ReachabilityClass,
         routes: Vec<SendRouteCandidate<R>>,
     },
 }
@@ -282,6 +221,30 @@ where
     },
 }
 
+/// Externally owned UDP socket that should carry route-transport traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalUdpSocketRegistration {
+    /// Driver-local socket id assigned by `flotsync_io`.
+    pub socket_id: SocketId,
+    /// Concrete local address bound for this socket.
+    pub local_addr: SocketAddr,
+}
+
+/// Reason why an externally owned UDP socket could not be registered.
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+pub enum ExternalUdpSocketRegistrationError {
+    #[snafu(display("socket id {socket_id:?} is already registered"))]
+    SocketIdAlreadyRegistered {
+        /// Socket id already associated with another route-transport endpoint.
+        socket_id: SocketId,
+    },
+    #[snafu(display("local address {local_addr} is already registered"))]
+    LocalAddrAlreadyRegistered {
+        /// Local address already associated with another route-transport endpoint.
+        local_addr: SocketAddr,
+    },
+}
+
 /// Directed actor messages accepted by the route-transport manager.
 ///
 /// Outbound route-transport submission is intentionally actor-based rather than
@@ -294,6 +257,10 @@ where
     /// Submit one logical outbound route-transport send and resolve the
     /// attached `Ask` exactly once with the transport-layer outcome.
     Submit(Ask<RouteTransportSend<R>, RouteTransportSubmitResult<R>>),
+    /// Register one externally bound UDP socket as a route-transport endpoint.
+    RegisterExternalUdpSocket(
+        Ask<ExternalUdpSocketRegistration, Result<(), ExternalUdpSocketRegistrationError>>,
+    ),
 }
 
 /// Transport-local metadata attached to one fully reassembled inbound payload.

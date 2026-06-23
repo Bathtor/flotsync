@@ -404,19 +404,25 @@ impl DriverRuntimeState {
                             }
                         },
                         DriverCommand::Udp(command) => match command {
-                            UdpCommand::Bind { socket_id, bind } => {
+                            UdpCommand::Bind {
+                                socket_id,
+                                bind,
+                                options,
+                            } => {
                                 self.udp
-                                    .handle_bind(socket_id, bind, registry, event_sink)?;
+                                    .handle_bind(socket_id, bind, options, registry, event_sink)?;
                             }
                             UdpCommand::Connect {
                                 socket_id,
                                 remote_addr,
                                 bind,
+                                options,
                             } => {
                                 self.udp.handle_connect(
                                     socket_id,
                                     remote_addr,
                                     bind,
+                                    options,
                                     registry,
                                     event_sink,
                                 )?;

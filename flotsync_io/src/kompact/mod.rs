@@ -11,11 +11,13 @@ use std::{thread, time::Duration};
 mod bridge;
 mod driver_component;
 mod listener;
+mod runtime;
 mod session;
 mod types;
 
 pub use bridge::{IoBridge, IoBridgeHandle};
 pub use driver_component::IoDriverComponent;
+pub use runtime::{IoRuntime, IoRuntimeError};
 pub use types::{
     ConfigureFailureReason,
     OpenFailureReason,

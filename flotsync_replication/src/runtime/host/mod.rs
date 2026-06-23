@@ -6,15 +6,15 @@ use super::{
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
-    GroupMemberships,
-    SharedGroupMemberships,
-    api::{BoxError, MemberIdentity, ReplicationEventListener, ReplicationStore},
+    api::{BoxError, ReplicationEventListener, ReplicationStore},
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
         ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},
         route_transport::{
+            ExternalUdpSocketRegistration,
+            ExternalUdpSocketRegistrationError,
             RouteDiscoveryPort,
             RouteTransportActorMessage,
             RouteTransportPort,
@@ -22,6 +22,30 @@ use crate::{
             manager::{RouteTransportManager, configure_replication_runtime},
         },
         security::DeliverySecurity,
+    },
+};
+use flotsync_core::{
+    MemberIdentity,
+    membership::{GroupMemberships, SharedGroupMemberships},
+};
+use flotsync_discovery::{
+    config_keys as discovery_config_keys,
+    route_establishment::{
+        ManualRouteWatchError,
+        PeerAnnouncementObservationComponent,
+        PeerAnnouncementObservationPort,
+        RouteEstablishmentComponent,
+        RouteEstablishmentConfig,
+        RouteEstablishmentConfigError,
+        RouteEstablishmentMessage,
+    },
+    route_publication::DiscoveryRoutePort,
+    services::{
+        PeerAnnouncementComponent,
+        PeerAnnouncementMessage,
+        PeerAnnouncementOptions,
+        PeerAnnouncementRoute,
+        PeerAnnouncementSocketMaintenance,
     },
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -46,19 +70,24 @@ use kompact::{
     runtime::KompactError,
 };
 use snafu::prelude::*;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    error::Error as StdError,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 mod discovery;
 mod local_endpoint;
 
-#[cfg(not(test))]
-use discovery::PreconfiguredPeerRoutesPublishMode;
 #[cfg(test)]
 pub(super) use discovery::PreconfiguredPeerRoutesPublishMode;
+#[cfg(any(test, feature = "test-support"))]
+use discovery::route_establishment::DiscoveryRouteAdapterMessage;
 use discovery::{
-    PreconfiguredPeerRoutesComponent,
     PreconfiguredPeerRoutesConfig,
-    PreconfiguredPeerRoutesMessage,
+    route_establishment::DiscoveryRouteAdapterComponent,
 };
 use local_endpoint::LocalEndpointManager;
 
@@ -139,6 +168,8 @@ pub(crate) enum RuntimeHostError {
     },
     #[snafu(display("Failed to bind the runtime local delivery endpoint: {source}"))]
     BindLocalEndpoint { source: RuntimeControlError },
+    #[snafu(display("Failed to register the runtime local delivery endpoint: {source}"))]
+    RegisterRouteTransportEndpoint { source: RuntimeControlError },
     #[snafu(display(
         "Failed to bind the runtime local delivery endpoint: {source}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
     ))]
@@ -147,6 +178,14 @@ pub(crate) enum RuntimeHostError {
         configured_bind_addr: SocketAddr,
         system_label: String,
     },
+    #[snafu(display("Invalid route-establishment config: {source}"))]
+    InvalidRouteEstablishmentConfig {
+        source: RouteEstablishmentConfigError,
+    },
+    #[snafu(display("Failed to configure route-establishment manual watches: {source}"))]
+    ConfigureRouteEstablishmentWatches { source: RuntimeControlError },
+    #[snafu(display("Invalid route-establishment manual watches: {source}"))]
+    InvalidRouteEstablishmentManualWatches { source: ManualRouteWatchError },
     #[snafu(display("Failed to connect runtime components for {link}: {message}"))]
     ConnectComponents { link: &'static str, message: String },
 }
@@ -212,6 +251,7 @@ struct DeliveryRuntimeHostConfig {
     control_timeout: Duration,
     summary_request_timeout: Duration,
     local_endpoint_bind_addr: SocketAddr,
+    peer_announcement_bind_addr: SocketAddr,
 }
 
 impl DeliveryRuntimeHostConfig {
@@ -246,10 +286,27 @@ impl DeliveryRuntimeHostConfig {
                         message: error.to_string(),
                     },
                 )?;
+        let peer_announcement_bind_addr = system
+            .config()
+            .read_or_default(&discovery_config_keys::PEER_ANNOUNCEMENT_BIND_ADDR)
+            .map_err(|error| RuntimeHostError::InvalidConfig {
+                key: discovery_config_keys::PEER_ANNOUNCEMENT_BIND_ADDR.key,
+                message: error.to_string(),
+            })?;
+        let peer_announcement_bind_addr =
+            peer_announcement_bind_addr
+                .parse()
+                .map_err(
+                    |error: std::net::AddrParseError| RuntimeHostError::InvalidConfig {
+                        key: discovery_config_keys::PEER_ANNOUNCEMENT_BIND_ADDR.key,
+                        message: error.to_string(),
+                    },
+                )?;
         Ok(Self {
             control_timeout,
             summary_request_timeout,
             local_endpoint_bind_addr,
+            peer_announcement_bind_addr,
         })
     }
 }
@@ -440,7 +497,13 @@ impl IoTopology {
         let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
         connect_udp_component(&udp_connect_handle, transport.route_transport_manager()).await?;
         connect_udp_component(&udp_connect_handle, discovery.local_endpoint_manager()).await?;
-        connect_udp_component(&udp_connect_handle, discovery.route_discovery_provider()).await
+        connect_udp_component(&udp_connect_handle, &discovery.peer_announcement).await?;
+        connect_udp_component(
+            &udp_connect_handle,
+            &discovery.peer_announcement_observation,
+        )
+        .await?;
+        connect_udp_component(&udp_connect_handle, &discovery.route_establishment).await
     }
 }
 
@@ -477,6 +540,44 @@ impl TransportTopology {
     fn route_transport_manager(&self) -> &Arc<Component<RouteTransportManager>> {
         &self.manager
     }
+
+    /// Register the endpoint-manager-owned runtime endpoint with route transport.
+    ///
+    /// This keeps route transport from inferring ownership from unrelated UDP
+    /// bind events on the shared bridge.
+    async fn register_external_udp_socket(
+        &self,
+        local_endpoint: local_endpoint::LocalEndpointBinding,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        let manager_ref = self.manager_ref();
+        let registration = ExternalUdpSocketRegistration {
+            socket_id: local_endpoint.socket_id,
+            local_addr: local_endpoint.local_addr,
+        };
+        let future = manager_ref.ask_with(|promise| {
+            RouteTransportActorMessage::RegisterExternalUdpSocket(Ask::new(promise, registration))
+        });
+        future
+            .map(flatten_external_udp_socket_registration_result)
+            .timeout_fold_err(control_timeout)
+            .await
+            .context(RegisterRouteTransportEndpointSnafu)
+    }
+}
+
+fn flatten_external_udp_socket_registration_result<E>(
+    result: Result<Result<(), ExternalUdpSocketRegistrationError>, E>,
+) -> Result<(), RuntimeControlError>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    let registration_result = result.boxed().context(ControlFutureSnafu)?;
+    registration_result.map_err(|error| {
+        RuntimeControlError::failed(format!(
+            "route transport rejected endpoint registration: {error}"
+        ))
+    })
 }
 
 impl ComponentTopology for TransportTopology {
@@ -542,12 +643,12 @@ impl DeliveryTopology {
         connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             discovery.route_discovery_provider(),
             &self.group_broadcast,
-            "preconfigured peer routes -> group broadcast",
+            "route establishment adapter -> group broadcast",
         )?;
         connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             discovery.route_discovery_provider(),
             &self.reliable_delivery,
-            "preconfigured peer routes -> reliable delivery",
+            "route establishment adapter -> reliable delivery",
         )
     }
 
@@ -573,51 +674,186 @@ impl ComponentTopology for DeliveryTopology {
 }
 
 struct DiscoveryTopology {
-    preconfigured_peer_routes: Arc<Component<PreconfiguredPeerRoutesComponent>>,
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-    preconfigured_peer_routes_ref: ActorRefStrong<PreconfiguredPeerRoutesMessage>,
+    peer_announcement: Arc<Component<PeerAnnouncementComponent>>,
+    peer_announcement_observation: Arc<Component<PeerAnnouncementObservationComponent>>,
+    route_establishment: Arc<Component<RouteEstablishmentComponent>>,
+    route_adapter: Arc<Component<DiscoveryRouteAdapterComponent>>,
+    #[cfg(any(test, feature = "test-support"))]
+    route_adapter_ref: ActorRefStrong<DiscoveryRouteAdapterMessage>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
+    static_route_hints: PreconfiguredPeerRoutesConfig,
 }
 
 impl DiscoveryTopology {
     fn build(
         system: &KompactSystem,
         host_config: DeliveryRuntimeHostConfig,
-        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
-    ) -> Self {
-        let preconfigured_peer_routes = PreconfiguredPeerRoutesComponent::new(
+        group_memberships: SharedGroupMemberships,
+        local_member: MemberIdentity,
+        security: DeliverySecurity,
+        egress_pool: flotsync_io::prelude::EgressPool,
+        static_route_hints: PreconfiguredPeerRoutesConfig,
+    ) -> Result<Self, RuntimeHostError> {
+        let route_config = route_establishment_config(
             host_config.local_endpoint_bind_addr,
-            route_publish_mode,
-        );
-        let preconfigured_peer_routes = system.create(move || preconfigured_peer_routes);
-        let preconfigured_peer_routes_ref = preconfigured_peer_routes
+            host_config.peer_announcement_bind_addr,
+        )?;
+        let peer_options = PeerAnnouncementOptions::DEFAULT
+            .with_socket_bind_addr(route_config.peer_announcement_bind_addr)
+            .with_instance_id(route_config.instance_id)
+            .with_socket_maintenance(PeerAnnouncementSocketMaintenance::Maintain);
+        let peer_announcement =
+            system.create(move || PeerAnnouncementComponent::with_options(peer_options));
+        let peer_observation_config = route_config.clone();
+        let peer_announcement_observation = system.create(move || {
+            PeerAnnouncementObservationComponent::with_socket_maintenance(
+                peer_observation_config,
+                PeerAnnouncementSocketMaintenance::Observe,
+            )
+        });
+        let route_establishment = system.create(move || {
+            RouteEstablishmentComponent::new(
+                route_config,
+                local_member,
+                Arc::new(security),
+                group_memberships,
+                egress_pool,
+            )
+        });
+        let route_adapter = system.create(DiscoveryRouteAdapterComponent::new);
+        #[cfg(any(test, feature = "test-support"))]
+        let route_adapter_ref = route_adapter
             .actor_ref()
             .hold()
-            .expect("preconfigured peer routes must expose a strong actor ref");
+            .expect("route adapter must expose a strong actor ref");
         let local_endpoint_manager =
             LocalEndpointManager::new(host_config.local_endpoint_bind_addr);
         let local_endpoint_manager = system.create(move || local_endpoint_manager);
-        Self {
-            preconfigured_peer_routes,
-            preconfigured_peer_routes_ref,
+        Ok(Self {
+            peer_announcement,
+            peer_announcement_observation,
+            route_establishment,
+            route_adapter,
+            #[cfg(any(test, feature = "test-support"))]
+            route_adapter_ref,
             local_endpoint_manager,
-        }
+            static_route_hints,
+        })
     }
 
-    fn route_discovery_provider(&self) -> &Arc<Component<PreconfiguredPeerRoutesComponent>> {
-        &self.preconfigured_peer_routes
+    fn route_discovery_provider(&self) -> &Arc<Component<DiscoveryRouteAdapterComponent>> {
+        &self.route_adapter
     }
 
     fn local_endpoint_manager(&self) -> &Arc<Component<LocalEndpointManager>> {
         &self.local_endpoint_manager
     }
+
+    fn connect_internal_routes(&self) -> Result<(), RuntimeHostError> {
+        connect_components::<PeerAnnouncementObservationPort, _, _>(
+            &self.peer_announcement_observation,
+            &self.route_establishment,
+            "peer announcement observation -> route establishment",
+        )?;
+        connect_components::<DiscoveryRoutePort, _, _>(
+            &self.route_establishment,
+            &self.route_adapter,
+            "route establishment -> route adapter",
+        )
+    }
+
+    async fn configure_bound_endpoint(
+        &self,
+        local_endpoint: local_endpoint::LocalEndpointBinding,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        self.route_establishment
+            .actor_ref()
+            .tell(RouteEstablishmentMessage::LocalEndpointBound {
+                socket_id: local_endpoint.socket_id,
+                local_addr: local_endpoint.local_addr,
+            });
+        self.peer_announcement
+            .actor_ref()
+            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
+                PeerAnnouncementRoute::Udp(local_endpoint.local_addr),
+            ]));
+        self.replace_manual_route_watches(control_timeout).await
+    }
+
+    async fn replace_manual_route_watches(
+        &self,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        let watches = self.static_route_hints.watched_routes();
+        let route_establishment_ref = self
+            .route_establishment
+            .actor_ref()
+            .hold()
+            .expect("route establishment must expose a strong actor ref");
+        let future = route_establishment_ref.ask_with(|promise| {
+            RouteEstablishmentMessage::ReplaceManualRouteWatches(Ask::new(promise, watches))
+        });
+        let result = future
+            .map(flatten_manual_route_watch_ask_result)
+            .timeout_fold_err(control_timeout)
+            .await
+            .context(ConfigureRouteEstablishmentWatchesSnafu)?;
+        result.context(InvalidRouteEstablishmentManualWatchesSnafu)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn publish_route_update(
+        &self,
+        update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
+    ) {
+        self.route_adapter_ref
+            .tell(DiscoveryRouteAdapterMessage::Publish(update));
+    }
+
+    #[cfg(test)]
+    fn publish_preconfigured_peer_routes(&self, local_endpoint: SocketAddr) {
+        for update in self.static_route_hints.direct_route_updates(local_endpoint) {
+            self.publish_route_update(update);
+        }
+    }
+}
+
+fn route_establishment_config(
+    local_endpoint_bind_addr: SocketAddr,
+    peer_announcement_bind_addr: SocketAddr,
+) -> Result<RouteEstablishmentConfig, RuntimeHostError> {
+    let mut config = RouteEstablishmentConfig::new(local_endpoint_bind_addr);
+    config.peer_announcement_bind_addr = peer_announcement_bind_addr;
+    config
+        .with_advertised_routes([local_endpoint_bind_addr])
+        .context(InvalidRouteEstablishmentConfigSnafu)
+}
+
+fn flatten_manual_route_watch_ask_result<E>(
+    result: Result<Result<(), ManualRouteWatchError>, E>,
+) -> Result<Result<(), ManualRouteWatchError>, RuntimeControlError>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    result.boxed().context(ControlFutureSnafu)
 }
 
 impl ComponentTopology for DiscoveryTopology {
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
-        std::iter::once(&self.preconfigured_peer_routes as &dyn RuntimeLifecycleComponent).chain(
-            std::iter::once(&self.local_endpoint_manager as &dyn RuntimeLifecycleComponent),
-        )
+        std::iter::once(&self.peer_announcement as &dyn RuntimeLifecycleComponent)
+            .chain(std::iter::once(
+                &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
+            ))
+            .chain(std::iter::once(
+                &self.route_establishment as &dyn RuntimeLifecycleComponent,
+            ))
+            .chain(std::iter::once(
+                &self.route_adapter as &dyn RuntimeLifecycleComponent,
+            ))
+            .chain(std::iter::once(
+                &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
+            ))
     }
 }
 
@@ -726,14 +962,20 @@ struct RuntimeTopologyBuildInput {
     listener: Arc<dyn ReplicationEventListener>,
     security: DeliverySecurity,
     host_config: DeliveryRuntimeHostConfig,
-    route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+    static_route_hints: PreconfiguredPeerRoutesConfig,
 }
 
 impl RuntimeTopology {
-    fn build(system: &KompactSystem, input: RuntimeTopologyBuildInput) -> Self {
+    fn build(
+        system: &KompactSystem,
+        input: RuntimeTopologyBuildInput,
+    ) -> Result<Self, RuntimeHostError> {
         let io = IoTopology::build(system);
         let transport = TransportTopology::build(system, &io.bridge);
         let manager_ref = transport.manager_ref();
+        let egress_pool = IoBridgeHandle::from_component(&io.bridge)
+            .egress_pool()
+            .clone();
         let delivery = DeliveryTopology::build(
             system,
             input.group_memberships.clone(),
@@ -741,8 +983,15 @@ impl RuntimeTopology {
             manager_ref,
             input.security.clone(),
         );
-        let discovery =
-            DiscoveryTopology::build(system, input.host_config, input.route_publish_mode);
+        let discovery = DiscoveryTopology::build(
+            system,
+            input.host_config,
+            input.group_memberships.clone(),
+            input.local_member.clone(),
+            input.security.clone(),
+            egress_pool,
+            input.static_route_hints,
+        )?;
         let runtime = RuntimeLogicTopology::build(
             system,
             input.group_memberships,
@@ -753,18 +1002,19 @@ impl RuntimeTopology {
             input.host_config,
         );
 
-        Self {
+        Ok(Self {
             io,
             transport,
             delivery,
             discovery,
             runtime,
-        }
+        })
     }
 
     fn connect_all(&self) -> Result<(), RuntimeHostError> {
         self.delivery.connect_transport(&self.transport)?;
         self.delivery.connect_internal_routes()?;
+        self.discovery.connect_internal_routes()?;
         self.delivery.connect_discovery(&self.discovery)?;
         self.runtime.connect_delivery(&self.delivery)
     }
@@ -862,7 +1112,8 @@ impl DeliveryRuntimeHost {
             listener,
             security,
             runtime_config_toml,
-            PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound,
+            #[cfg(test)]
+            PreconfiguredPeerRoutesPublishMode::ManualForTest,
         )
         .await
     }
@@ -873,13 +1124,12 @@ impl DeliveryRuntimeHost {
         listener: Arc<dyn ReplicationEventListener>,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
-        route_publish_mode: PreconfiguredPeerRoutesPublishMode,
+        #[cfg(test)] route_publish_mode: PreconfiguredPeerRoutesPublishMode,
     ) -> Result<Self, RuntimeHostError> {
         let built_system = build_runtime_system(runtime_config_toml).await?;
         let system = built_system.system.clone();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
-        routes_config.validate_local_endpoint_bind_addr(host_config.local_endpoint_bind_addr)?;
         let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
         let topology = RuntimeTopology::build(
             &system,
@@ -890,9 +1140,9 @@ impl DeliveryRuntimeHost {
                 listener,
                 security,
                 host_config,
-                route_publish_mode,
+                static_route_hints: routes_config,
             },
-        );
+        )?;
         topology.connect_all()?;
         topology
             .start_all(&system, host_config.control_timeout)
@@ -908,10 +1158,25 @@ impl DeliveryRuntimeHost {
         #[cfg(any(test, feature = "test-support"))]
         let mut local_endpoint_lease = built_system.local_endpoint_lease;
         #[cfg(any(test, feature = "test-support"))]
-        release_reserved_runtime_local_endpoint_binding(
+        release_reserved_runtime_bindings(
             &mut local_endpoint_lease,
             local_endpoint.local_addr,
+            host_config.peer_announcement_bind_addr,
         )?;
+        topology
+            .transport
+            .register_external_udp_socket(local_endpoint, host_config.control_timeout)
+            .await?;
+        topology
+            .discovery
+            .configure_bound_endpoint(local_endpoint, host_config.control_timeout)
+            .await?;
+        #[cfg(test)]
+        if route_publish_mode == PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound {
+            topology
+                .discovery
+                .publish_preconfigured_peer_routes(local_endpoint.local_addr);
+        }
 
         Ok(Self::new(
             system,
@@ -980,18 +1245,14 @@ impl DeliveryRuntimeHost {
         &self,
         update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
-        self.topology()
-            .discovery
-            .preconfigured_peer_routes_ref
-            .tell(PreconfiguredPeerRoutesMessage::Publish(update));
+        self.topology().discovery.publish_route_update(update);
     }
 
     #[cfg(test)]
     pub(crate) fn publish_preconfigured_peer_routes_for_test(&self) {
         self.topology()
             .discovery
-            .preconfigured_peer_routes_ref
-            .tell(PreconfiguredPeerRoutesMessage::PublishPreconfiguredRoutes);
+            .publish_preconfigured_peer_routes(self.external_udp_addr);
     }
 
     /// Return the concrete local UDP socket address currently bound by this
@@ -1031,8 +1292,10 @@ impl Drop for DeliveryRuntimeHost {
 async fn build_runtime_system(
     runtime_config_toml: Option<&str>,
 ) -> Result<BuiltRuntimeSystem, RuntimeHostError> {
-    let local_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
+    let local_endpoint_lease =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
     let local_endpoint_bind_addr = local_endpoint_lease.addr(0).to_string();
+    let peer_announcement_bind_addr = local_endpoint_lease.addr(1).to_string();
     let mut config = kompact::test_support::test_kompact_config();
     set_test_system_label(&mut config, "replication-runtime-host-test-system");
     enable_bind_reuse_address(&mut config);
@@ -1043,6 +1306,10 @@ async fn build_runtime_system(
     config.set_config_value(
         &config_keys::LOCAL_ENDPOINT_BIND_ADDR,
         local_endpoint_bind_addr,
+    );
+    config.set_config_value(
+        &discovery_config_keys::PEER_ANNOUNCEMENT_BIND_ADDR,
+        peer_announcement_bind_addr,
     );
     let system = config.build().await.context(BuildSystemSnafu)?;
     Ok(BuiltRuntimeSystem {
@@ -1065,9 +1332,10 @@ async fn build_runtime_system(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn release_reserved_runtime_local_endpoint_binding(
+fn release_reserved_runtime_bindings(
     local_endpoint_lease: &mut ReservedSocketLease,
     local_addr: SocketAddr,
+    peer_announcement_addr: SocketAddr,
 ) -> Result<(), RuntimeHostError> {
     let reserved_addr = local_endpoint_lease.addr(0);
     if reserved_addr != local_addr {
@@ -1078,16 +1346,27 @@ fn release_reserved_runtime_local_endpoint_binding(
         });
     }
     local_endpoint_lease.activate_live_binding(0);
+    let reserved_peer_announcement_addr = local_endpoint_lease.addr(1);
+    if reserved_peer_announcement_addr != peer_announcement_addr {
+        return Err(RuntimeHostError::BindLocalEndpoint {
+            source: RuntimeControlError::failed(format!(
+                "runtime host peer announcement configured at {peer_announcement_addr}, but the reserved test socket expected {reserved_peer_announcement_addr}"
+            )),
+        });
+    }
+    local_endpoint_lease.activate_live_binding(1);
     Ok(())
 }
 
 #[cfg(any(test, feature = "test-support"))]
 fn rebind_reserved_runtime_local_endpoint_binding(local_endpoint_lease: &mut ReservedSocketLease) {
-    let rebind_result = local_endpoint_lease.rebind_binding(0);
-    if let Err(error) = rebind_result
-        && !std::thread::panicking()
-    {
-        panic!("rebind reserved runtime-host local endpoint socket: {error}");
+    for index in 0..local_endpoint_lease.len() {
+        let rebind_result = local_endpoint_lease.rebind_binding(index);
+        if let Err(error) = rebind_result
+            && !std::thread::panicking()
+        {
+            panic!("rebind reserved runtime-host socket {index}: {error}");
+        }
     }
 }
 
@@ -1120,6 +1399,9 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     /// Publish configured static routes after a test has explicitly requested them.
     #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self);
+    /// Return whether both direct-delivery components currently know a peer route.
+    #[cfg(test)]
+    fn knows_direct_peer_route(&self, peer: &MemberIdentity) -> bool;
     /// Wait until both direct-delivery components have observed a peer route.
     #[cfg(test)]
     fn wait_for_direct_peer_route(&self, peer: &MemberIdentity);
@@ -1135,15 +1417,12 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use crate::delivery::{
-            route_transport::{
-                DatagramRouteScope,
-                RoutePreferenceRank,
-                RouteSharingKind,
-                SendRouteCandidate,
-                UdpRouteKey,
-            },
-            shared::ReachabilityClass,
+        use crate::delivery::route_transport::{
+            DatagramRouteScope,
+            RoutePreferenceRank,
+            RouteSharingKind,
+            SendRouteCandidate,
+            UdpRouteKey,
         };
 
         let route = SendRouteCandidate {
@@ -1158,7 +1437,6 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
         self.publish_route_update(
             crate::delivery::route_transport::DiscoveryRouteUpdate::PeerRoutes {
                 peer: peer.clone(),
-                classification: ReachabilityClass::Reachable,
                 routes: vec![route],
             },
         );
@@ -1168,6 +1446,23 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self) {
         self.publish_preconfigured_peer_routes_for_test();
+    }
+
+    #[cfg(test)]
+    fn knows_direct_peer_route(&self, peer: &MemberIdentity) -> bool {
+        let broadcast_peer = peer.clone();
+        let broadcast_knows = self
+            .topology()
+            .delivery
+            .group_broadcast
+            .on_definition(|component| component.knows_direct_route(&broadcast_peer));
+        let reliable_peer = peer.clone();
+        let reliable_knows = self
+            .topology()
+            .delivery
+            .reliable_delivery
+            .on_definition(|component| component.knows_direct_route(&reliable_peer));
+        broadcast_knows && reliable_knows
     }
 
     #[cfg(test)]

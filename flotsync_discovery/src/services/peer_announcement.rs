@@ -1,11 +1,17 @@
-use super::Snafu;
-use crate::{SocketPort, kompact::prelude::*};
+use crate::{
+    DEFAULT_DISCOVERY_PORT,
+    SocketPort,
+    config_keys,
+    kompact::{config::Config, prelude::*},
+    protocol::udp_socket_address_to_wire_format,
+};
 use flotsync_io::prelude::{
     ConfigureFailureReason,
     IoPayload,
     OpenFailureReason,
     SocketId,
     TransmissionId,
+    UdpBindOptions,
     UdpIndication,
     UdpLocalBind,
     UdpOpenRequestId,
@@ -14,9 +20,13 @@ use flotsync_io::prelude::{
     UdpSendResult,
     UdpSocketOption,
 };
-use flotsync_messages::{buffa::Message, discovery::Peer};
+use flotsync_messages::{
+    buffa::Message,
+    discovery::{Peer, SocketAddress},
+};
 use itertools::Itertools;
 use pnet_datalink::{self as datalink, MacAddr, NetworkInterface};
+use snafu::Snafu;
 use std::{
     collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -24,33 +34,106 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Peer-announcement UDP socket lifecycle responsibility for a local component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerAnnouncementSocketMaintenance {
+    /// This component binds, configures, closes, and rebinds the peer-announcement socket.
+    Maintain,
+    /// Another local component maintains the peer-announcement socket.
+    Observe,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Options {
-    pub bind_addr: IpAddr,
-    pub bind_port: SocketPort,
-    pub port: SocketPort,
+    /// Local UDP socket address used by the peer-announcement sender or observer.
+    ///
+    /// In maintain mode this is the address used for the `UdpRequest::Bind`. In observe mode its
+    /// port identifies which shared UDP socket belongs to peer announcements when this component
+    /// sees `UdpIndication::Bound`. It does not affect the `Peer` payload's advertised routes.
+    ///
+    /// Defaults to the unspecified IPv4 address on [`DEFAULT_DISCOVERY_PORT`].
+    pub socket_bind_addr: SocketAddr,
+    /// Optional UDP port used for broadcast announcement destinations.
+    ///
+    /// This only controls the destination port placed onto per-interface broadcast addresses. It
+    /// does not affect local socket binding, observe-mode socket matching, or the advertised routes
+    /// encoded in outgoing `Peer` payloads. `None` is the normal mode and targets
+    /// [`Self::socket_bind_addr`]'s port, so the local socket and broadcast destination use the same
+    /// discovery port. `Some` is an explicit split-port override for tests, diagnostics, or
+    /// transitional deployments.
+    ///
+    /// Defaults to `None`.
+    pub broadcast_target_port: Option<SocketPort>,
+    /// Time between periodic announcement attempts after startup or a route update.
     pub announcement_interval: Duration,
+    /// Per-announcer instance identifier encoded into outgoing `Peer` messages.
+    ///
+    /// The default is nil; production callers should provide a real instance id.
     pub instance_id: Uuid,
+    /// Whether this component maintains the peer-announcement UDP socket.
+    pub socket_maintenance: PeerAnnouncementSocketMaintenance,
 }
 
 impl Options {
     pub const DEFAULT: Self = Self {
-        bind_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        bind_port: SocketPort(0),
-        port: SocketPort(52156),
+        socket_bind_addr: SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            DEFAULT_DISCOVERY_PORT.0,
+        ),
+        broadcast_target_port: None,
         announcement_interval: Duration::from_secs(5),
         instance_id: Uuid::nil(),
+        socket_maintenance: PeerAnnouncementSocketMaintenance::Maintain,
     };
 
+    /// Return the local peer-announcement UDP socket address.
+    #[must_use]
+    pub const fn socket_bind_addr(&self) -> SocketAddr {
+        self.socket_bind_addr
+    }
+
+    /// Return the destination port used for peer-announcement broadcasts.
+    #[must_use]
+    pub fn broadcast_target_port(&self) -> SocketPort {
+        self.broadcast_target_port
+            .unwrap_or_else(|| SocketPort(self.socket_bind_addr.port()))
+    }
+
+    /// Replaces the local peer-announcement UDP socket address.
+    #[must_use]
+    pub fn with_socket_bind_addr(mut self, socket_bind_addr: SocketAddr) -> Self {
+        self.socket_bind_addr = socket_bind_addr;
+        self
+    }
+
+    /// Replaces the broadcast destination port override.
+    #[must_use]
+    pub fn with_broadcast_target_port(mut self, broadcast_target_port: Option<SocketPort>) -> Self {
+        self.broadcast_target_port = broadcast_target_port;
+        self
+    }
+
     /// Replaces the current instance id with `instance_id`.
+    #[must_use]
     pub fn with_instance_id(mut self, instance_id: Uuid) -> Self {
         self.instance_id = instance_id;
         self
     }
 
     /// Replaces the current announcement interval with `announcement_interval`.
+    #[must_use]
     pub fn with_announcement_interval(mut self, announcement_interval: Duration) -> Self {
         self.announcement_interval = announcement_interval;
+        self
+    }
+
+    /// Replaces the peer-announcement socket lifecycle responsibility.
+    #[must_use]
+    pub fn with_socket_maintenance(
+        mut self,
+        socket_maintenance: PeerAnnouncementSocketMaintenance,
+    ) -> Self {
+        self.socket_maintenance = socket_maintenance;
         self
     }
 }
@@ -68,8 +151,10 @@ pub const PEER_ANNOUNCEMENT_DEFAULT_OPTIONS: Options = Options::DEFAULT;
 pub type PeerAnnouncementStartupResult = std::result::Result<(), PeerAnnouncementStartupError>;
 
 /// Describes why the UDP announcer could not become ready for periodic broadcasts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Snafu)]
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub enum PeerAnnouncementStartupError {
+    #[snafu(display("Could not load peer-announcement configuration {key}: {reason}"))]
+    ConfigurationFailed { key: &'static str, reason: String },
     #[snafu(display("Could not bind the peer-announcement socket at {local_addr}: {reason:?}"))]
     BindFailed {
         local_addr: SocketAddr,
@@ -96,27 +181,81 @@ pub fn peer_announcement_startup_signal() -> (
     promise::<PeerAnnouncementStartupResult>()
 }
 
+/// Load UDP bind options for a peer-announcement socket from Kompact config.
+///
+/// Both peer-announcement senders and observers use this helper when they are
+/// configured as the local socket maintainer.
+///
+/// # Errors
+///
+/// Returns [`PeerAnnouncementStartupError`] when the socket configuration cannot be read.
+pub fn peer_announcement_bind_options_from_config(
+    config: &Config,
+) -> std::result::Result<UdpBindOptions, PeerAnnouncementStartupError> {
+    let socket_reuse = config
+        .read_or_default(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS)
+        .map_err(|error| PeerAnnouncementStartupError::ConfigurationFailed {
+            key: config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS.key,
+            reason: error.to_string(),
+        })?;
+    Ok(UdpBindOptions::default().with_socket_reuse(socket_reuse))
+}
+
+/// A route advertised in outgoing peer-announcement messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PeerAnnouncementRoute {
+    /// A UDP socket address that should accept follow-up discovery messages.
+    Udp(SocketAddr),
+}
+
+impl PeerAnnouncementRoute {
+    fn to_wire_format(self) -> SocketAddress {
+        match self {
+            Self::Udp(address) => udp_socket_address_to_wire_format(address),
+        }
+    }
+}
+
 /// Kompact component that periodically broadcasts one `Peer` announcement over UDP.
 #[derive(ComponentDefinition)]
 pub struct PeerAnnouncementComponent {
     ctx: ComponentContext<Self>,
-    udp: RequiredPort<UdpPort>,
+    udp_port: RequiredPort<UdpPort>,
     options: Options,
     startup_promise: Option<KPromise<PeerAnnouncementStartupResult>>,
     state: SocketState,
     broadcast_addresses: HashMap<MacAddr, SocketAddr>,
+    advertised_routes: Vec<PeerAnnouncementRoute>,
     next_transmission_id: TransmissionId,
-    announcement_timer: Option<AnnouncementTimerState>,
-    next_timer_generation: usize,
+    announcement_timer: Option<ScheduledTimer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SocketState {
+    /// No peer-announcement socket is currently known to this component.
     Closed,
-    Opening { request_id: UdpOpenRequestId },
-    EnablingBroadcast { socket_id: SocketId },
-    Running { socket_id: SocketId },
-    Closing { socket_id: SocketId },
+    /// This component requested a maintained socket bind and is waiting for the matching result.
+    Opening {
+        /// Request id that must match the eventual bind result.
+        request_id: UdpOpenRequestId,
+    },
+    /// The maintained socket is bound and waiting for broadcast sends to be enabled.
+    EnablingBroadcast {
+        /// Socket that should become the peer-announcement sender.
+        socket_id: SocketId,
+    },
+    /// Another component maintains the socket and this component is waiting to observe its bind.
+    WaitingForSocket,
+    /// The peer-announcement socket is known and can be used for announcement sends.
+    Running {
+        /// Active peer-announcement socket id.
+        socket_id: SocketId,
+    },
+    /// This component requested close for a maintained socket and is waiting for confirmation.
+    Closing {
+        /// Socket id being closed.
+        socket_id: SocketId,
+    },
 }
 
 impl SocketState {
@@ -125,19 +264,21 @@ impl SocketState {
             Self::EnablingBroadcast { socket_id }
             | Self::Running { socket_id }
             | Self::Closing { socket_id } => Some(socket_id),
-            Self::Closed | Self::Opening { .. } => None,
+            Self::Closed | Self::Opening { .. } | Self::WaitingForSocket => None,
         }
     }
 }
 
-#[derive(Debug)]
-struct AnnouncementTimerState {
-    generation: usize,
-    timer: ScheduledTimer,
-}
-
+/// Actor messages accepted by [`PeerAnnouncementComponent`].
 #[derive(Debug)]
 pub enum PeerAnnouncementMessage {
+    /// Replace all routes placed into future `Peer.listening_on` announcements.
+    ///
+    /// An empty route set suppresses announcement sends. When the component is running, every
+    /// replacement triggers an immediate announcement attempt and restarts the periodic
+    /// announcement timer, even if the replacement contains the same routes as before.
+    ReplaceAdvertisedRoutes(Vec<PeerAnnouncementRoute>),
+    /// Delivery result sent by `flotsync_io` for one UDP announcement send.
     SendResult(UdpSendResult),
 }
 
@@ -161,19 +302,23 @@ impl PeerAnnouncementComponent {
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
-            udp: RequiredPort::uninitialised(),
+            udp_port: RequiredPort::uninitialised(),
             options,
             startup_promise,
             state: SocketState::Closed,
             broadcast_addresses: HashMap::new(),
+            advertised_routes: Vec::new(),
             next_transmission_id: TransmissionId::ONE,
             announcement_timer: None,
-            next_timer_generation: 1,
         }
     }
 
-    fn bind_address(&self) -> SocketAddr {
-        SocketAddr::new(self.options.bind_addr, *self.options.bind_port)
+    fn socket_bind_addr(&self) -> SocketAddr {
+        self.options.socket_bind_addr()
+    }
+
+    fn matches_peer_announcement_bind_port(&self, local_addr: SocketAddr) -> bool {
+        local_addr.port() == self.options.socket_bind_addr().port()
     }
 
     fn notify_startup_success(&mut self) {
@@ -202,13 +347,32 @@ impl PeerAnnouncementComponent {
         }
     }
 
-    fn begin_startup(&mut self) {
+    fn begin_startup(&mut self) -> HandlerResult {
+        if self.options.socket_maintenance == PeerAnnouncementSocketMaintenance::Observe {
+            self.state = SocketState::WaitingForSocket;
+            return Handled::OK;
+        }
+
+        let bind_options = match self.bind_options() {
+            Ok(bind_options) => bind_options,
+            Err(error) => {
+                error!(self.log(), "{error}");
+                self.notify_startup_failure(error);
+                return Handled::SHUTDOWN;
+            }
+        };
         let request_id = UdpOpenRequestId::new();
         self.state = SocketState::Opening { request_id };
-        self.udp.trigger(UdpRequest::Bind {
+        self.udp_port.trigger(UdpRequest::Bind {
             request_id,
-            bind: UdpLocalBind::Exact(self.bind_address()),
+            bind: UdpLocalBind::Exact(self.socket_bind_addr()),
+            options: bind_options,
         });
+        Handled::OK
+    }
+
+    fn bind_options(&self) -> std::result::Result<UdpBindOptions, PeerAnnouncementStartupError> {
+        peer_announcement_bind_options_from_config(self.ctx.config())
     }
 
     fn get_active_broadcast_interfaces() -> Vec<NetworkInterface> {
@@ -242,7 +406,7 @@ impl PeerAnnouncementComponent {
             .find(|network| network.is_ipv4())
             .map(|network| {
                 let broadcast_addr = network.broadcast();
-                SocketAddr::new(broadcast_addr, *self.options.port)
+                SocketAddr::new(broadcast_addr, *self.options.broadcast_target_port())
             })
     }
 
@@ -278,9 +442,13 @@ impl PeerAnnouncementComponent {
         }
 
         for interface in active_interfaces {
-            let mac = interface
-                .mac
-                .expect("active broadcast interfaces are filtered to have a MAC address");
+            let Some(mac) = interface.mac else {
+                trace!(
+                    self.log(),
+                    "Skipping active interface {} because it has no MAC address", interface.name
+                );
+                continue;
+            };
             if let Some(broadcast_address) = self.get_broadcast_address_for_interface(&interface) {
                 if let Some(address) = self.broadcast_addresses.get_mut(&mac) {
                     if address != &broadcast_address {
@@ -309,6 +477,12 @@ impl PeerAnnouncementComponent {
     fn broadcast_message(&self) -> Peer {
         Peer {
             instance_uuid: self.options.instance_id.as_bytes().to_vec(),
+            listening_on: self
+                .advertised_routes
+                .iter()
+                .copied()
+                .map(PeerAnnouncementRoute::to_wire_format)
+                .collect(),
             ..Default::default()
         }
     }
@@ -321,6 +495,14 @@ impl PeerAnnouncementComponent {
         let SocketState::Running { socket_id } = self.state else {
             return Handled::OK;
         };
+
+        if self.advertised_routes.is_empty() {
+            trace!(
+                self.log(),
+                "No advertised peer routes available for peer announcement"
+            );
+            return Handled::OK;
+        }
 
         let targets: HashSet<SocketAddr> = self.broadcast_addresses.values().copied().collect();
         if targets.is_empty() {
@@ -338,7 +520,7 @@ impl PeerAnnouncementComponent {
 
         for target in targets {
             let transmission_id = self.next_transmission_id.take_next();
-            self.udp.trigger(UdpRequest::Send {
+            self.udp_port.trigger(UdpRequest::Send {
                 socket_id,
                 transmission_id,
                 payload: IoPayload::Bytes(payload.clone().into()),
@@ -349,42 +531,50 @@ impl PeerAnnouncementComponent {
         Handled::OK
     }
 
-    fn run_announcement_cycle(&mut self) -> HandlerResult {
-        self.refresh_broadcast_addresses();
+    fn announce_to_known_targets_and_set_timer(&mut self) -> HandlerResult {
         let handled = self.send_announcement_to_known_targets();
         if matches!(handled, Ok(Handled::Ok)) {
-            self.arm_announcement_timer();
+            self.set_announcement_timer();
         }
         handled
     }
 
-    fn arm_announcement_timer(&mut self) {
+    fn run_announcement_cycle(&mut self) -> HandlerResult {
+        self.refresh_broadcast_addresses();
+        self.announce_to_known_targets_and_set_timer()
+    }
+
+    fn replace_advertised_routes(&mut self, routes: Vec<PeerAnnouncementRoute>) -> HandlerResult {
+        self.advertised_routes = routes;
+        self.announce_to_known_targets_and_set_timer()
+    }
+
+    fn set_announcement_timer(&mut self) {
         self.clear_announcement_timer();
 
         if !matches!(self.state, SocketState::Running { .. }) {
             return;
         }
 
-        let generation = self.next_timer_generation;
-        self.next_timer_generation = self.next_timer_generation.wrapping_add(1);
-        let timer = self.schedule_once(self.options.announcement_interval, move |component, _| {
-            component.handle_announcement_timeout(generation)
-        });
-        self.announcement_timer = Some(AnnouncementTimerState { generation, timer });
+        let timer = self.schedule_once(
+            self.options.announcement_interval,
+            move |component, timeout| component.handle_announcement_timeout(&timeout),
+        );
+        self.announcement_timer = Some(timer);
     }
 
     fn clear_announcement_timer(&mut self) {
         if let Some(timer) = self.announcement_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_announcement_timeout(&mut self, generation: usize) -> HandlerResult {
-        let Some(timer) = self.announcement_timer.take() else {
+    fn handle_announcement_timeout(&mut self, actual_timer: &ScheduledTimer) -> HandlerResult {
+        let Some(expected_timer) = self.announcement_timer.take() else {
             return Handled::OK;
         };
-        if timer.generation != generation {
-            self.announcement_timer = Some(timer);
+        if &expected_timer != actual_timer {
+            self.announcement_timer = Some(expected_timer);
             return Handled::OK;
         }
 
@@ -393,8 +583,14 @@ impl PeerAnnouncementComponent {
 
     fn request_close(&mut self) {
         self.clear_announcement_timer();
+        if self.options.socket_maintenance == PeerAnnouncementSocketMaintenance::Observe {
+            // Observe mode does not own the socket, so stopping only discards the observed socket
+            // id and returns to the initial state used when waiting for its maintainer.
+            self.state = SocketState::WaitingForSocket;
+            return;
+        }
         match self.state {
-            SocketState::Closed | SocketState::Closing { .. } => {}
+            SocketState::Closed | SocketState::WaitingForSocket | SocketState::Closing { .. } => {}
             SocketState::Opening { .. } => {
                 // The bridge may already have reserved a socket for this open request, but we keep
                 // the shared UDP protocol simple and accept that the orphaned socket will persist
@@ -410,10 +606,100 @@ impl PeerAnnouncementComponent {
                     self.log(),
                     "UDP close requested for peer announcement socket"
                 );
-                self.udp.trigger(UdpRequest::Close { socket_id });
+                self.udp_port.trigger(UdpRequest::Close { socket_id });
                 self.state = SocketState::Closing { socket_id };
             }
         }
+    }
+
+    fn handle_opened_socket(
+        &mut self,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) -> HandlerResult {
+        info!(self.log(), "Sending peer announcements from {local_addr}");
+        self.state = SocketState::EnablingBroadcast { socket_id };
+        self.udp_port.trigger(UdpRequest::Configure {
+            socket_id,
+            option: UdpSocketOption::Broadcast(true),
+        });
+        Handled::OK
+    }
+
+    fn handle_bind_failed(
+        &mut self,
+        local_addr: SocketAddr,
+        reason: OpenFailureReason,
+    ) -> HandlerResult {
+        self.notify_startup_failure(PeerAnnouncementStartupError::BindFailed {
+            local_addr,
+            reason,
+        });
+        error!(
+            self.log(),
+            "Could not bind peer announcement socket at {local_addr}: {reason:?}"
+        );
+        self.state = SocketState::Closed;
+        Handled::SHUTDOWN
+    }
+
+    fn handle_observed_bound_socket(
+        &mut self,
+        socket_id: SocketId,
+        local_addr: SocketAddr,
+    ) -> HandlerResult {
+        info!(
+            self.log(),
+            "Observed peer announcement socket {socket_id} bound at {local_addr}"
+        );
+        self.state = SocketState::Running { socket_id };
+        self.notify_startup_success();
+        self.run_announcement_cycle()
+    }
+
+    fn handle_broadcast_configured(&mut self, socket_id: SocketId) -> HandlerResult {
+        self.state = SocketState::Running { socket_id };
+        self.notify_startup_success();
+        self.run_announcement_cycle()
+    }
+
+    fn handle_broadcast_configure_failed(
+        &mut self,
+        socket_id: SocketId,
+        reason: ConfigureFailureReason,
+    ) -> HandlerResult {
+        self.notify_startup_failure(PeerAnnouncementStartupError::ConfigureBroadcastFailed {
+            socket_id,
+            reason,
+        });
+        error!(
+            self.log(),
+            "Could not enable broadcast on peer announcement socket {socket_id}: {reason:?}"
+        );
+        self.request_close();
+        Handled::SHUTDOWN
+    }
+
+    fn handle_socket_closed(
+        &mut self,
+        socket_id: SocketId,
+        reason: flotsync_io::prelude::UdpCloseReason,
+    ) -> HandlerResult {
+        if self.state.socket_id() != Some(socket_id) {
+            return Handled::OK;
+        }
+        info!(
+            self.log(),
+            "Peer announcement UDP socket closed ({reason:?})"
+        );
+        self.clear_announcement_timer();
+        self.state =
+            if self.options.socket_maintenance == PeerAnnouncementSocketMaintenance::Observe {
+                SocketState::WaitingForSocket
+            } else {
+                SocketState::Closed
+            };
+        Handled::OK
     }
 
     fn handle_udp_indication(&mut self, indication: &UdpIndication) -> HandlerResult {
@@ -422,44 +708,31 @@ impl PeerAnnouncementComponent {
                 request_id,
                 socket_id,
                 local_addr,
-            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) =>
-            {
-                info!(self.log(), "Sending peer announcements from {local_addr}");
-                self.state = SocketState::EnablingBroadcast {
-                    socket_id: *socket_id,
-                };
-                self.udp.trigger(UdpRequest::Configure {
-                    socket_id: *socket_id,
-                    option: UdpSocketOption::Broadcast(true),
-                });
-                Handled::OK
+            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) => {
+                self.handle_opened_socket(*socket_id, *local_addr)
             }
             UdpIndication::BindFailed {
                 request_id,
                 local_addr,
                 reason,
-            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) =>
+            } if matches!(self.state, SocketState::Opening { request_id: current } if current == *request_id) => {
+                self.handle_bind_failed(*local_addr, *reason)
+            }
+            UdpIndication::Bound {
+                socket_id,
+                local_addr,
+                ..
+            } if self.options.socket_maintenance == PeerAnnouncementSocketMaintenance::Observe
+                && matches!(self.state, SocketState::WaitingForSocket)
+                && self.matches_peer_announcement_bind_port(*local_addr) =>
             {
-                self.notify_startup_failure(PeerAnnouncementStartupError::BindFailed {
-                    local_addr: *local_addr,
-                    reason: *reason,
-                });
-                error!(
-                    self.log(),
-                    "Could not bind peer announcement socket at {local_addr}: {reason:?}"
-                );
-                self.state = SocketState::Closed;
-                Handled::SHUTDOWN
+                self.handle_observed_bound_socket(*socket_id, *local_addr)
             }
             UdpIndication::Configured { socket_id, option }
                 if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == *socket_id)
                     && *option == UdpSocketOption::Broadcast(true) =>
             {
-                self.state = SocketState::Running {
-                    socket_id: *socket_id,
-                };
-                self.notify_startup_success();
-                self.run_announcement_cycle()
+                self.handle_broadcast_configured(*socket_id)
             }
             UdpIndication::ConfigureFailed {
                 socket_id,
@@ -468,32 +741,13 @@ impl PeerAnnouncementComponent {
             } if matches!(self.state, SocketState::EnablingBroadcast { socket_id: current } if current == *socket_id)
                 && *option == UdpSocketOption::Broadcast(true) =>
             {
-                self.notify_startup_failure(
-                    PeerAnnouncementStartupError::ConfigureBroadcastFailed {
-                        socket_id: *socket_id,
-                        reason: *reason,
-                    },
-                );
-                error!(
-                    self.log(),
-                    "Could not enable broadcast on peer announcement socket {socket_id}: {reason:?}"
-                );
-                self.request_close();
-                Handled::SHUTDOWN
+                self.handle_broadcast_configure_failed(*socket_id, *reason)
             }
             UdpIndication::Closed {
                 socket_id,
                 remote_addr: _,
                 reason,
-            } if self.state.socket_id() == Some(*socket_id) => {
-                info!(
-                    self.log(),
-                    "Peer announcement UDP socket closed ({reason:?})"
-                );
-                self.clear_announcement_timer();
-                self.state = SocketState::Closed;
-                Handled::OK
-            }
+            } => self.handle_socket_closed(*socket_id, *reason),
             _ => Handled::OK,
         }
     }
@@ -531,8 +785,7 @@ impl PeerAnnouncementComponent {
 
 impl ComponentLifecycle for PeerAnnouncementComponent {
     fn on_start(&mut self) -> HandlerResult {
-        self.begin_startup();
-        Handled::OK
+        self.begin_startup()
     }
 
     fn on_stop(&mut self) -> HandlerResult {
@@ -559,6 +812,9 @@ impl Actor for PeerAnnouncementComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
+            PeerAnnouncementMessage::ReplaceAdvertisedRoutes(routes) => {
+                self.replace_advertised_routes(routes)
+            }
             PeerAnnouncementMessage::SendResult(result) => self.handle_send_result(&result),
         }
     }
@@ -569,10 +825,12 @@ mod tests {
     use super::*;
     use flotsync_io::test_support::{
         build_test_kompact_system,
+        build_test_kompact_system_with,
         kill_component,
         recv_until,
         start_component,
     };
+    use flotsync_messages::discovery::{ip_address, socket_address};
     use std::{
         net::{Ipv4Addr, SocketAddrV4},
         sync::mpsc,
@@ -614,6 +872,17 @@ mod tests {
         }
     }
 
+    fn ipv4_interface(cidr: &str) -> NetworkInterface {
+        NetworkInterface {
+            name: "test0".to_string(),
+            description: "test interface".to_string(),
+            index: 0,
+            mac: Some(MacAddr(0, 1, 2, 3, 4, 5)),
+            ips: vec![cidr.parse().expect("valid IPv4 network")],
+            flags: 0,
+        }
+    }
+
     #[test]
     fn peer_announcement_component_binds_and_enables_broadcast() {
         let system = build_test_kompact_system();
@@ -621,8 +890,7 @@ mod tests {
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
         let component =
             system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -630,11 +898,19 @@ mod tests {
         let request_id = match recv_until(&requests_rx, |request| {
             matches!(request, UdpRequest::Bind { .. })
         }) {
-            UdpRequest::Bind { request_id, bind } => {
+            UdpRequest::Bind {
+                request_id,
+                bind,
+                options,
+            } => {
                 assert_eq!(
                     bind,
-                    UdpLocalBind::Exact(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0,))
+                    UdpLocalBind::Exact(SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        *DEFAULT_DISCOVERY_PORT,
+                    ))
                 );
+                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(true));
                 request_id
             }
             other => unreachable!("filtered to bind request, got {other:?}"),
@@ -658,7 +934,77 @@ mod tests {
             other => unreachable!("filtered to configure request, got {other:?}"),
         }
 
-        drop(connection);
+        kill_component(&system, component);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn peer_announcement_broadcast_targets_default_to_socket_bind_port() {
+        let options = Options::DEFAULT.with_socket_bind_addr(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            53_000,
+        )));
+        let component = PeerAnnouncementComponent::with_options(options);
+        let interface = ipv4_interface("192.168.5.10/24");
+
+        assert_eq!(
+            component.get_broadcast_address_for_interface(&interface),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 5, 255),
+                53_000,
+            )))
+        );
+    }
+
+    #[test]
+    fn peer_announcement_broadcast_target_override_changes_only_target_port() {
+        let options = Options::DEFAULT
+            .with_socket_bind_addr(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                53_000,
+            )))
+            .with_broadcast_target_port(Some(SocketPort(53_001)));
+        let component = PeerAnnouncementComponent::with_options(options);
+        let interface = ipv4_interface("192.168.6.10/24");
+
+        assert_eq!(
+            component.socket_bind_addr().port(),
+            53_000,
+            "broadcast target override must not change the local socket bind address"
+        );
+        assert_eq!(
+            component.get_broadcast_address_for_interface(&interface),
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 6, 255),
+                53_001,
+            )))
+        );
+    }
+
+    #[test]
+    fn peer_announcement_component_applies_bind_reuse_config_override() {
+        let system = build_test_kompact_system_with(|config| {
+            config.set_config_value(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS, false);
+        });
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let component =
+            system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
+
+        start_component(&system, &probe);
+        start_component(&system, &component);
+
+        match recv_until(&requests_rx, |request| {
+            matches!(request, UdpRequest::Bind { .. })
+        }) {
+            UdpRequest::Bind { options, .. } => {
+                assert_eq!(options, UdpBindOptions::default().with_socket_reuse(false));
+            }
+            other => unreachable!("filtered to bind request, got {other:?}"),
+        }
+
         kill_component(&system, component);
         kill_component(&system, probe);
         system.shutdown().wait().expect("Kompact shutdown");
@@ -678,8 +1024,7 @@ mod tests {
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
         let component =
             system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -697,11 +1042,16 @@ mod tests {
                 MacAddr(0, 1, 2, 3, 4, 6),
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 255), 52156)),
             );
-
-            let handled = component.send_announcement_to_known_targets();
-            assert!(matches!(handled, Ok(Handled::Ok)));
         });
 
+        component
+            .actor_ref()
+            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
+                PeerAnnouncementRoute::Udp(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::new(10, 0, 0, 42),
+                    52157,
+                ))),
+            ]));
         let send = recv_until(&requests_rx, |request| {
             matches!(request, UdpRequest::Send { .. })
         });
@@ -724,6 +1074,8 @@ mod tests {
                 let payload = payload.to_vec();
                 let message = Peer::decode_from_slice(&payload).expect("decode peer announcement");
                 assert_eq!(message.instance_uuid, expected_instance_id.as_bytes());
+                assert_eq!(message.listening_on.len(), 1);
+                assert_udp_route(&message.listening_on[0], &[10, 0, 0, 42], 52157);
             }
             other => unreachable!("filtered to send request, got {other:?}"),
         }
@@ -734,7 +1086,95 @@ mod tests {
             "duplicate broadcast targets should collapse to one send request"
         );
 
-        drop(connection);
+        kill_component(&system, component);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn peer_announcement_component_suppresses_empty_route_announcements() {
+        let options = Options::DEFAULT.with_announcement_interval(Duration::from_mins(1));
+
+        let system = build_test_kompact_system();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let component =
+            system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
+
+        start_component(&system, &probe);
+        start_component(&system, &component);
+
+        component.on_definition(|component| {
+            component.clear_announcement_timer();
+            component.state = SocketState::Running {
+                socket_id: SocketId(12),
+            };
+            component.broadcast_addresses.insert(
+                MacAddr(0, 1, 2, 3, 4, 7),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 2, 255), 52156)),
+            );
+        });
+
+        let bind = recv_until(&requests_rx, |request| {
+            matches!(request, UdpRequest::Bind { .. })
+        });
+        assert!(matches!(bind, UdpRequest::Bind { .. }));
+        component
+            .actor_ref()
+            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(Vec::new()));
+        assert!(
+            requests_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "empty route sets should not emit UDP send requests"
+        );
+
+        kill_component(&system, component);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn peer_announcement_component_announces_after_every_route_update() {
+        let options = Options::DEFAULT.with_announcement_interval(Duration::from_mins(1));
+
+        let system = build_test_kompact_system();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let component =
+            system.create(move || PeerAnnouncementComponent::with_options(options.clone()));
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
+
+        start_component(&system, &probe);
+        start_component(&system, &component);
+
+        component.on_definition(|component| {
+            component.clear_announcement_timer();
+            component.state = SocketState::Running {
+                socket_id: SocketId(13),
+            };
+            component.broadcast_addresses.insert(
+                MacAddr(0, 1, 2, 3, 4, 8),
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 3, 255), 52156)),
+            );
+        });
+
+        let routes = vec![PeerAnnouncementRoute::Udp(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 43), 52158),
+        ))];
+        component
+            .actor_ref()
+            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(
+                routes.clone(),
+            ));
+        assert_peer_send(&requests_rx, SocketId(13));
+
+        component
+            .actor_ref()
+            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(routes));
+        assert_peer_send(&requests_rx, SocketId(13));
+
         kill_component(&system, component);
         kill_component(&system, probe);
         system.shutdown().wait().expect("Kompact shutdown");
@@ -747,8 +1187,7 @@ mod tests {
         let probe = system.create(move || UdpRequestProbe::new(requests_tx));
         let component =
             system.create(|| PeerAnnouncementComponent::with_options(Options::default()));
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -760,7 +1199,6 @@ mod tests {
             };
         });
 
-        drop(connection);
         kill_component(&system, component);
 
         match recv_until(&requests_rx, |request| {
@@ -777,6 +1215,20 @@ mod tests {
     }
 
     #[test]
+    fn peer_announcement_observe_close_returns_to_waiting_for_socket() {
+        let mut component = PeerAnnouncementComponent::with_options(
+            Options::DEFAULT.with_socket_maintenance(PeerAnnouncementSocketMaintenance::Observe),
+        );
+        component.state = SocketState::Running {
+            socket_id: SocketId(22),
+        };
+
+        component.request_close();
+
+        assert_eq!(component.state, SocketState::WaitingForSocket);
+    }
+
+    #[test]
     fn peer_announcement_component_interrupts_startup_waiter_on_kill() {
         let system = build_test_kompact_system();
         let (requests_tx, requests_rx) = mpsc::channel();
@@ -788,8 +1240,7 @@ mod tests {
                 startup_promise,
             )
         });
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -801,7 +1252,6 @@ mod tests {
             other => unreachable!("filtered to bind request, got {other:?}"),
         };
 
-        drop(connection);
         kill_component(&system, component);
 
         let startup_result = startup_future
@@ -835,8 +1285,7 @@ mod tests {
                 startup_promise,
             )
         });
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -878,7 +1327,78 @@ mod tests {
             .expect("startup result should complete");
         assert_eq!(startup_result, Ok(()));
 
-        drop(connection);
+        kill_component(&system, component);
+        kill_component(&system, probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn peer_announcement_observe_startup_waits_for_matching_socket() {
+        let system = build_test_kompact_system();
+        let (requests_tx, requests_rx) = mpsc::channel();
+        let probe = system.create(move || UdpRequestProbe::new(requests_tx));
+        let (startup_promise, startup_future) = peer_announcement_startup_signal();
+        let options =
+            Options::DEFAULT.with_socket_maintenance(PeerAnnouncementSocketMaintenance::Observe);
+        let component = system.create(move || {
+            PeerAnnouncementComponent::with_options_and_startup_promise(
+                options.clone(),
+                startup_promise,
+            )
+        });
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
+
+        start_component(&system, &probe);
+        start_component(&system, &component);
+
+        component.on_definition(|component| {
+            assert_eq!(component.state, SocketState::WaitingForSocket);
+            assert!(
+                component.startup_promise.is_some(),
+                "observe startup should wait for a matching socket"
+            );
+        });
+        assert!(
+            requests_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "observe mode should not bind its own UDP socket"
+        );
+
+        probe.on_definition(|probe| {
+            probe.udp.trigger(UdpIndication::Bound {
+                request_id: UdpOpenRequestId::new(),
+                socket_id: SocketId(33),
+                local_addr: SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    *DEFAULT_DISCOVERY_PORT + 1,
+                )),
+            });
+        });
+        component.on_definition(|component| {
+            assert_eq!(component.state, SocketState::WaitingForSocket);
+            assert!(
+                component.startup_promise.is_some(),
+                "observe startup should ignore other UDP ports"
+            );
+        });
+
+        probe.on_definition(|probe| {
+            probe.udp.trigger(UdpIndication::Bound {
+                request_id: UdpOpenRequestId::new(),
+                socket_id: SocketId(34),
+                local_addr: SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::LOCALHOST,
+                    *DEFAULT_DISCOVERY_PORT,
+                )),
+            });
+        });
+
+        let startup_result = startup_future
+            .wait_timeout(Duration::from_millis(100))
+            .expect("startup result should complete");
+        assert_eq!(startup_result, Ok(()));
+
         kill_component(&system, component);
         kill_component(&system, probe);
         system.shutdown().wait().expect("Kompact shutdown");
@@ -896,8 +1416,7 @@ mod tests {
                 startup_promise,
             )
         });
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -929,7 +1448,6 @@ mod tests {
             })
         );
 
-        drop(connection);
         kill_component(&system, probe);
         system.shutdown().wait().expect("Kompact shutdown");
     }
@@ -946,8 +1464,7 @@ mod tests {
                 startup_promise,
             )
         });
-        let connection = biconnect_components::<UdpPort, _, _>(&probe, &component)
-            .expect("connect probe/component");
+        biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
 
         start_component(&system, &probe);
         start_component(&system, &component);
@@ -989,8 +1506,37 @@ mod tests {
             })
         );
 
-        drop(connection);
         kill_component(&system, probe);
         system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    fn assert_peer_send(requests_rx: &mpsc::Receiver<UdpRequest>, expected_socket_id: SocketId) {
+        let send = recv_until(requests_rx, |request| {
+            matches!(request, UdpRequest::Send { .. })
+        });
+        match send {
+            UdpRequest::Send { socket_id, .. } => {
+                assert_eq!(socket_id, expected_socket_id);
+            }
+            other => unreachable!("filtered to send request, got {other:?}"),
+        }
+    }
+
+    fn assert_udp_route(route: &SocketAddress, expected_ip: &[u8], expected_port: u32) {
+        assert_eq!(
+            route.protocol.as_known(),
+            Some(socket_address::Protocol::PROTOCOL_UDP)
+        );
+        assert_eq!(route.port, expected_port);
+
+        let address = route.address.as_option().expect("route address is set");
+        assert!(
+            matches!(
+                address.address.as_ref(),
+                Some(ip_address::Address::Ipv4Bytes(bytes)) if bytes.as_slice() == expected_ip
+            ),
+            "expected IPv4 route address {expected_ip:?}, got {:?}",
+            address.address
+        );
     }
 }

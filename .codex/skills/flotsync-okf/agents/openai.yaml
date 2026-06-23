@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flotsync OKF"
+  short_description: "Maintain Flotsync OKF design docs"
+  default_prompt: "Use $flotsync-okf to update the Flotsync OKF design documentation."

@@ -11,6 +11,7 @@ pub use config::ChecklistConfigError;
 pub use runner::{ReplicatedChecklistArgs, ReplicatedChecklistError, run};
 
 use clap::{CommandFactory, Parser, Subcommand};
+use flotsync_core::GroupId;
 use flotsync_data_types::{
     Decode,
     DecodeValueError,
@@ -23,7 +24,6 @@ use flotsync_data_types::{
 };
 use flotsync_replication::{
     DatasetId,
-    GroupId,
     MutableRow,
     ReadToken,
     RowChange,

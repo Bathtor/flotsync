@@ -12,7 +12,6 @@ use super::{
 use crate::api::{
     DatasetId,
     DatasetRowSlice,
-    GroupId,
     MutableRow,
     ReplicationStoreTransaction,
     ReplicationUpdateFilter,
@@ -21,8 +20,12 @@ use crate::api::{
     RowKey,
     SchemaSource,
 };
-use flotsync_core::versions::{UpdateId, VersionVector};
+use flotsync_core::{
+    GroupId,
+    versions::{UpdateId, VersionVector},
+};
 use flotsync_messages::codecs::datamodel::decode_schema_operation;
+use flotsync_utils::option_when;
 use snafu::prelude::*;
 use std::{
     cmp,
@@ -134,7 +137,10 @@ pub(super) async fn load_publish_dataset_state(
     let dataset_ids_that_require_replay = latest_slices
         .iter()
         .filter_map(|(dataset_id, slice)| {
-            row_slice_needs_replay(slice, read_versions).then_some(dataset_id.clone())
+            option_when!(
+                row_slice_needs_replay(slice, read_versions),
+                dataset_id.clone()
+            )
         })
         .collect::<HashSet<_>>();
 
@@ -306,10 +312,10 @@ fn replay_one_update(
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowWrite, DatasetUpdateRecord, MemberIdentity, ReplicationRowRecord},
+        api::{DatasetRowWrite, DatasetUpdateRecord, ReplicationRowRecord},
         row_values,
     };
-    use flotsync_core::{member::Identifier, versions::PureVersionVector};
+    use flotsync_core::{MemberIdentity, member::Identifier, versions::PureVersionVector};
     use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
     use std::sync::Arc;
     use uuid::Uuid;

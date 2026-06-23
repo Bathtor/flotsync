@@ -1,5 +1,5 @@
-use flotsync_core::member::Identifier;
-use flotsync_replication::{GroupId, LocalStoreSecretProfile, MemberIdentity};
+use flotsync_core::{GroupId, MemberIdentity, member::Identifier};
+use flotsync_replication::LocalStoreSecretProfile;
 use flotsync_security::GroupKey;
 use kompact::config::{Config, parse_config_str};
 use sha2::{Digest, Sha256};
@@ -356,12 +356,6 @@ mod tests {
 
             [flotsync.replication.runtime]
             local-endpoint-bind-addr = "127.0.0.1:45100"
-
-            [[flotsync.replication.runtime.static-peer-routes]]
-            name = "bob"
-            protocol = "udp"
-            ip = "127.0.0.1"
-            port = 45101
             "#,
         )
         .expect("config should parse");

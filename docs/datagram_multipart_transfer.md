@@ -1,3 +1,10 @@
+---
+type: Protocol
+title: UDPour
+description: Specifies the multipart datagram protocol for carrying oversized logical payloads over one UDP route.
+status: draft
+---
+
 # UDPour
 
 This note captures the current protocol draft for `flotsync-p9u`.
@@ -20,7 +27,7 @@ This note defines:
 
 This note does not define:
 
-- inbound transport decode and demux ownership
+- transport-internal inbound classification for UDPour frames
 - how discovery exposes datagram-route candidates
 - any stream framing
 - transport security

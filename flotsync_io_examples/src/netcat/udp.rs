@@ -3,7 +3,6 @@ use super::{
     OutcomePromise,
     Result,
     SCRIPTED_EXIT_GRACE,
-    ShutdownTimerState,
     UdpMode,
     complete_outcome,
     encode_line_payload,
@@ -128,8 +127,7 @@ struct UdpNetcat {
     shutdown_after_input: bool,
     next_transmission_id: TransmissionId,
     send_pending: bool,
-    shutdown_timer: Option<ShutdownTimerState>,
-    next_shutdown_timer_generation: usize,
+    shutdown_timer: Option<ScheduledTimer>,
     outcome: Option<OutcomePromise>,
 }
 
@@ -153,7 +151,6 @@ impl UdpNetcat {
             next_transmission_id: TransmissionId::ONE,
             send_pending: false,
             shutdown_timer: None,
-            next_shutdown_timer_generation: 1,
             outcome: Some(outcome),
         }
     }
@@ -316,10 +313,15 @@ impl UdpNetcat {
                     request_id,
                     remote_addr: remote,
                     bind,
+                    options: UdpBindOptions::default(),
                 });
             }
             UdpNetcatMode::Unconnected { bind, .. } => {
-                self.udp.trigger(UdpRequest::Bind { request_id, bind });
+                self.udp.trigger(UdpRequest::Bind {
+                    request_id,
+                    bind,
+                    options: UdpBindOptions::default(),
+                });
             }
         }
     }
@@ -377,13 +379,10 @@ impl UdpNetcat {
     fn set_shutdown_timer_if_idle(&mut self) {
         if self.should_set_shutdown_timer() {
             if self.shutdown_timer.is_none() {
-                let generation = self.next_shutdown_timer_generation;
-                self.next_shutdown_timer_generation =
-                    self.next_shutdown_timer_generation.wrapping_add(1);
-                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, _| {
-                    component.handle_shutdown_timeout(generation)
+                let timer = self.schedule_once(SCRIPTED_EXIT_GRACE, move |component, timeout| {
+                    component.handle_shutdown_timeout(&timeout)
                 });
-                self.shutdown_timer = Some(ShutdownTimerState { generation, timer });
+                self.shutdown_timer = Some(timer);
             }
             return;
         }
@@ -400,16 +399,16 @@ impl UdpNetcat {
 
     fn clear_shutdown_timer(&mut self) {
         if let Some(timer) = self.shutdown_timer.take() {
-            self.cancel_timer(timer.timer);
+            self.cancel_timer(timer);
         }
     }
 
-    fn handle_shutdown_timeout(&mut self, generation: usize) -> HandlerResult {
-        let Some(timer) = self.shutdown_timer.take() else {
+    fn handle_shutdown_timeout(&mut self, actual_timer: &ScheduledTimer) -> HandlerResult {
+        let Some(expected_timer) = self.shutdown_timer.take() else {
             return Handled::OK;
         };
-        if timer.generation != generation {
-            self.shutdown_timer = Some(timer);
+        if &expected_timer != actual_timer {
+            self.shutdown_timer = Some(expected_timer);
             return Handled::OK;
         }
         if !self.should_set_shutdown_timer() {
