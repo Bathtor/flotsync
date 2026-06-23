@@ -24,13 +24,14 @@ pub mod manager;
 
 use super::shared::{RelayIdentity, RouteSendId};
 use flotsync_core::MemberIdentity;
-use flotsync_io::prelude::IoPayload;
+use flotsync_io::prelude::{IoPayload, SocketId};
 use flotsync_messages::serialisation::FlotsyncSerializable;
 use flotsync_utils::{IString, NonOwningPhantomData};
 use kompact::{
     Never,
     prelude::{Ask, Port},
 };
+use snafu::Snafu;
 use std::{fmt::Debug, hash::Hash, net::SocketAddr, sync::Arc};
 
 /// Whether semantic delivery may collapse equal candidates into one shared send.
@@ -220,6 +221,30 @@ where
     },
 }
 
+/// Externally owned UDP socket that should carry route-transport traffic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExternalUdpSocketRegistration {
+    /// Driver-local socket id assigned by `flotsync_io`.
+    pub socket_id: SocketId,
+    /// Concrete local address bound for this socket.
+    pub local_addr: SocketAddr,
+}
+
+/// Reason why an externally owned UDP socket could not be registered.
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+pub enum ExternalUdpSocketRegistrationError {
+    #[snafu(display("socket id {socket_id:?} is already registered"))]
+    SocketIdAlreadyRegistered {
+        /// Socket id already associated with another route-transport endpoint.
+        socket_id: SocketId,
+    },
+    #[snafu(display("local address {local_addr} is already registered"))]
+    LocalAddrAlreadyRegistered {
+        /// Local address already associated with another route-transport endpoint.
+        local_addr: SocketAddr,
+    },
+}
+
 /// Directed actor messages accepted by the route-transport manager.
 ///
 /// Outbound route-transport submission is intentionally actor-based rather than
@@ -232,6 +257,10 @@ where
     /// Submit one logical outbound route-transport send and resolve the
     /// attached `Ask` exactly once with the transport-layer outcome.
     Submit(Ask<RouteTransportSend<R>, RouteTransportSubmitResult<R>>),
+    /// Register one externally bound UDP socket as a route-transport endpoint.
+    RegisterExternalUdpSocket(
+        Ask<ExternalUdpSocketRegistration, Result<(), ExternalUdpSocketRegistrationError>>,
+    ),
 }
 
 /// Transport-local metadata attached to one fully reassembled inbound payload.

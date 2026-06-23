@@ -15,6 +15,8 @@ use super::{
     ConnectionInfoPort,
     DatagramRouteScope,
     Debug,
+    ExternalUdpSocketRegistration,
+    ExternalUdpSocketRegistrationError,
     Hash,
     IString,
     InboundTransportMeta,
@@ -403,7 +405,10 @@ impl RouteTransportManager {
         local_addr: SocketAddr,
     ) {
         let Some(socket_key) = self.udp_open_requests.remove(&request_id) else {
-            self.handle_external_udp_bound(socket_id, local_addr);
+            trace!(
+                self.log(),
+                "route transport ignored externally bound UDP socket {socket_id:?} at {local_addr}"
+            );
             return;
         };
         self.complete_test_manager_owned_udp_bind(request_id, socket_id, local_addr);
@@ -418,22 +423,70 @@ impl RouteTransportManager {
         );
     }
 
-    fn handle_external_udp_bound(&mut self, socket_id: SocketId, local_addr: SocketAddr) {
-        if self.udp_activation_policy != UdpActivationPolicy::OnFirstUse {
-            return;
+    fn handle_register_external_udp_socket(
+        &mut self,
+        ask: Ask<ExternalUdpSocketRegistration, Result<(), ExternalUdpSocketRegistrationError>>,
+    ) -> HandlerResult {
+        let (promise, registration) = ask.take();
+        let result = self.register_external_udp_socket(registration);
+        let _ = promise.fulfil(result);
+        Handled::OK
+    }
+
+    /// Register one socket that another runtime component owns but route transport may use.
+    ///
+    /// Unknown UDP bind events are ignored, so this is the only path that may
+    /// attach transport state to externally owned sockets.
+    fn register_external_udp_socket(
+        &mut self,
+        registration: ExternalUdpSocketRegistration,
+    ) -> Result<(), ExternalUdpSocketRegistrationError> {
+        let socket_key = UdpSocketKey {
+            local_addr: registration.local_addr,
+        };
+        if let Some(registered_socket_key) = self.udp_socket_ids.get(&registration.socket_id) {
+            if *registered_socket_key == socket_key {
+                return Ok(());
+            }
+            return Err(
+                ExternalUdpSocketRegistrationError::SocketIdAlreadyRegistered {
+                    socket_id: registration.socket_id,
+                },
+            );
         }
-        let socket_key = UdpSocketKey { local_addr };
-        if self.udp_socket_ids.contains_key(&socket_id)
-            || self.udp_sockets.contains_key(&socket_key)
+        if self.udp_sockets.contains_key(&socket_key)
             || self.udp_starting_sockets.contains_key(&socket_key)
             || self.udp_open_sockets.contains_key(&socket_key)
             || self.udp_dormant_sockets.contains_key(&socket_key)
         {
-            return;
+            return Err(
+                ExternalUdpSocketRegistrationError::LocalAddrAlreadyRegistered {
+                    local_addr: registration.local_addr,
+                },
+            );
         }
-        self.udp_socket_ids.insert(socket_id, socket_key);
-        self.udp_dormant_sockets
-            .insert(socket_key, DormantUdpSocketHandle { socket_id });
+
+        self.udp_socket_ids
+            .insert(registration.socket_id, socket_key);
+        match self.udp_activation_policy {
+            UdpActivationPolicy::OnBind => {
+                self.begin_starting_udp_socket(
+                    socket_key,
+                    registration.socket_id,
+                    UdpSocketStartOrigin::ExternalDormant,
+                    Vec::new(),
+                );
+            }
+            UdpActivationPolicy::OnFirstUse => {
+                self.udp_dormant_sockets.insert(
+                    socket_key,
+                    DormantUdpSocketHandle {
+                        socket_id: registration.socket_id,
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     fn begin_starting_udp_socket(
@@ -1041,6 +1094,9 @@ impl Actor for RouteTransportManager {
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
             RouteTransportActorMessage::Submit(ask) => self.handle_submit(ask),
+            RouteTransportActorMessage::RegisterExternalUdpSocket(ask) => {
+                self.handle_register_external_udp_socket(ask)
+            }
         }
     }
 }
@@ -1504,6 +1560,26 @@ mod tests {
                 .ask_with(|promise| RouteTransportActorMessage::Submit(Ask::new(promise, send)))
         }
 
+        fn register_external_socket(&self, socket_id: SocketId, local_addr: SocketAddr) {
+            let registration = ExternalUdpSocketRegistration {
+                socket_id,
+                local_addr,
+            };
+            let result = self
+                .manager_ref
+                .ask_with(|promise| {
+                    RouteTransportActorMessage::RegisterExternalUdpSocket(Ask::new(
+                        promise,
+                        registration,
+                    ))
+                })
+                .wait_timeout(WAIT_TIMEOUT)
+                .expect("timed out waiting for external UDP socket registration");
+            if let Err(error) = result {
+                panic!("external UDP socket registration failed: {error}");
+            }
+        }
+
         fn wait_for_send_ack(&self, send: TransportRouteTransportSend) -> TransportRouteKey {
             match self.send(send) {
                 RouteTransportSubmitResult::Sent { coverage_key } => coverage_key,
@@ -1873,6 +1949,7 @@ mod tests {
         let receiver_socket_key = UdpSocketKey {
             local_addr: receiver_addr,
         };
+        receiver_harness.register_external_socket(receiver_socket_id, receiver_addr);
         receiver_harness.wait_for_dormant_socket(receiver_socket_key);
         assert_eq!(receiver_harness.dormant_udp_socket_count(), 1);
         assert_eq!(receiver_harness.live_udp_socket_count(), 0);
@@ -1909,6 +1986,27 @@ mod tests {
             TransportRouteKey::Udp(route)
         );
         sender_harness.wait_for_bridge_frame_type(sender_socket_id, 0x81);
+    }
+
+    #[test]
+    fn udp_manager_ignores_unregistered_external_udp_bind() {
+        let harness = UdpManagerHarness::with_config(
+            UdpActivationPolicy::OnFirstUse,
+            TestSendRateControl::default(),
+            udpour_config(),
+        );
+        let socket_id = SocketId(77);
+        let local_addr = localhost(34568);
+        let socket_key = UdpSocketKey { local_addr };
+
+        harness.manager.on_definition(|component| {
+            component.handle_udp_bound(UdpOpenRequestId::new(), socket_id, local_addr);
+
+            assert!(!component.udp_socket_ids.contains_key(&socket_id));
+            assert!(!component.udp_dormant_sockets.contains_key(&socket_key));
+            assert!(!component.udp_starting_sockets.contains_key(&socket_key));
+            assert!(!component.udp_sockets.contains_key(&socket_key));
+        });
     }
 
     #[test]

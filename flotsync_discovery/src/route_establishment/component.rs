@@ -289,6 +289,10 @@ impl RouteEstablishmentComponent {
         &mut self,
         peer: PeerAnnouncementObserved,
     ) -> Vec<DiscoveryRoute> {
+        if peer.instance_id == self.config.instance_id {
+            return Vec::new();
+        }
+
         let mut probes = Vec::with_capacity(peer.routes.len());
         for route in peer.routes {
             let route_state = self

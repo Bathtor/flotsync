@@ -13,6 +13,8 @@ use crate::{
         ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},
         route_transport::{
+            ExternalUdpSocketRegistration,
+            ExternalUdpSocketRegistrationError,
             RouteDiscoveryPort,
             RouteTransportActorMessage,
             RouteTransportPort,
@@ -166,6 +168,8 @@ pub(crate) enum RuntimeHostError {
     },
     #[snafu(display("Failed to bind the runtime local delivery endpoint: {source}"))]
     BindLocalEndpoint { source: RuntimeControlError },
+    #[snafu(display("Failed to register the runtime local delivery endpoint: {source}"))]
+    RegisterRouteTransportEndpoint { source: RuntimeControlError },
     #[snafu(display(
         "Failed to bind the runtime local delivery endpoint: {source}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
     ))]
@@ -536,6 +540,44 @@ impl TransportTopology {
     fn route_transport_manager(&self) -> &Arc<Component<RouteTransportManager>> {
         &self.manager
     }
+
+    /// Register the endpoint-manager-owned runtime endpoint with route transport.
+    ///
+    /// This keeps route transport from inferring ownership from unrelated UDP
+    /// bind events on the shared bridge.
+    async fn register_external_udp_socket(
+        &self,
+        local_endpoint: local_endpoint::LocalEndpointBinding,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        let manager_ref = self.manager_ref();
+        let registration = ExternalUdpSocketRegistration {
+            socket_id: local_endpoint.socket_id,
+            local_addr: local_endpoint.local_addr,
+        };
+        let future = manager_ref.ask_with(|promise| {
+            RouteTransportActorMessage::RegisterExternalUdpSocket(Ask::new(promise, registration))
+        });
+        future
+            .map(flatten_external_udp_socket_registration_result)
+            .timeout_fold_err(control_timeout)
+            .await
+            .context(RegisterRouteTransportEndpointSnafu)
+    }
+}
+
+fn flatten_external_udp_socket_registration_result<E>(
+    result: Result<Result<(), ExternalUdpSocketRegistrationError>, E>,
+) -> Result<(), RuntimeControlError>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    let registration_result = result.boxed().context(ControlFutureSnafu)?;
+    registration_result.map_err(|error| {
+        RuntimeControlError::failed(format!(
+            "route transport rejected endpoint registration: {error}"
+        ))
+    })
 }
 
 impl ComponentTopology for TransportTopology {
@@ -1121,6 +1163,10 @@ impl DeliveryRuntimeHost {
             local_endpoint.local_addr,
             host_config.peer_announcement_bind_addr,
         )?;
+        topology
+            .transport
+            .register_external_udp_socket(local_endpoint, host_config.control_timeout)
+            .await?;
         topology
             .discovery
             .configure_bound_endpoint(local_endpoint, host_config.control_timeout)

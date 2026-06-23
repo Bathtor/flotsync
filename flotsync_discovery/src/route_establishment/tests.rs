@@ -888,6 +888,22 @@ fn endpoint_binding_report_probes_inactive_routes() {
 }
 
 #[test]
+fn endpoint_binding_does_not_probe_local_peer_announcement() {
+    let local_member = member(["alice"]);
+    let remote_member = member(["bob"]);
+    let memberships = shared_memberships(&local_member, &remote_member);
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62158));
+    let local_instance_id = Uuid::from_u128(11);
+    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+
+    harness.observe_peer_route(local_instance_id, remote_route);
+    harness.bind_endpoint(SocketId(83), SocketAddr::from(([127, 0, 0, 1], 49102)));
+
+    harness.expect_no_udp_request("local peer announcements must not produce probes");
+    harness.shutdown();
+}
+
+#[test]
 fn manual_route_watch_verifies_and_publishes_expected_member() {
     let local_member = member(["alice"]);
     let remote_member = member(["bob"]);
