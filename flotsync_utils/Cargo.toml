@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 async-std = { workspace = true }
+futures-util = { workspace = true }
 kompact = { workspace = true }
 snafu = { workspace = true }
 

@@ -97,6 +97,8 @@ impl Default for TestSendRateControl {
     }
 }
 
+// TODO(flotsync-h1z0): Replace this observer/barrier fixture once generic
+// actor-message testing support covers barrier-style test commands.
 #[derive(ComponentDefinition)]
 struct TransferProbe {
     ctx: ComponentContext<Self>,
@@ -178,6 +180,8 @@ enum ProxyIndicationBehavior {
     },
 }
 
+// TODO(flotsync-wpvk): Replace with a generic scripted port proxy once the
+// event-pattern/action API exists.
 #[derive(ComponentDefinition)]
 struct ScriptedUdpProxy {
     ctx: ComponentContext<Self>,

@@ -29,8 +29,8 @@ pub struct RouteEstablishmentConfig {
     pub configured_local_endpoint: SocketAddr,
     /// Local process instance id used in outgoing peer announcements and introductions.
     pub instance_id: Uuid,
-    /// Concrete routes this endpoint is allowed to claim in signed introductions.
-    advertised_routes: BTreeSet<SocketAddr>,
+    /// Initial concrete routes this endpoint is allowed to claim in signed introductions.
+    advertised_routes: ConcreteRoutes,
 }
 
 impl RouteEstablishmentConfig {
@@ -44,7 +44,7 @@ impl RouteEstablishmentConfig {
             ),
             configured_local_endpoint,
             instance_id: Uuid::new_v4(),
-            advertised_routes: BTreeSet::new(),
+            advertised_routes: ConcreteRoutes::default(),
         }
     }
 
@@ -58,20 +58,13 @@ impl RouteEstablishmentConfig {
         mut self,
         routes: impl IntoIterator<Item = SocketAddr>,
     ) -> Result<Self, RouteEstablishmentConfigError> {
-        let mut advertised_routes = BTreeSet::new();
-        for route in routes {
-            if !is_concrete_advertised_route(route) {
-                return Err(RouteEstablishmentConfigError::InvalidAdvertisedRoute { route });
-            }
-            advertised_routes.insert(route);
-        }
-        self.advertised_routes = advertised_routes;
+        self.advertised_routes = ConcreteRoutes::from_routes(routes)?;
         Ok(self)
     }
 
     /// Return concrete routes this endpoint may claim in signed introductions.
     #[must_use]
-    pub fn advertised_routes(&self) -> &BTreeSet<SocketAddr> {
+    pub fn advertised_routes(&self) -> &ConcreteRoutes {
         &self.advertised_routes
     }
 
@@ -81,6 +74,59 @@ impl RouteEstablishmentConfig {
     pub fn with_instance_id(mut self, instance_id: Uuid) -> Self {
         self.instance_id = instance_id;
         self
+    }
+}
+
+/// Concrete UDP routes that can be claimed in signed route-establishment introductions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConcreteRoutes {
+    /// Validated concrete UDP socket addresses.
+    routes: BTreeSet<SocketAddr>,
+}
+
+impl ConcreteRoutes {
+    /// Build a validated concrete route set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouteEstablishmentConfigError`] when any route uses a wildcard address or port
+    /// `0`, because those are bind instructions rather than remotely reachable routes.
+    pub fn from_routes(
+        routes: impl IntoIterator<Item = SocketAddr>,
+    ) -> Result<Self, RouteEstablishmentConfigError> {
+        let mut concrete_routes = BTreeSet::new();
+        for route in routes {
+            if !is_concrete_advertised_route(route) {
+                return Err(RouteEstablishmentConfigError::InvalidAdvertisedRoute { route });
+            }
+            concrete_routes.insert(route);
+        }
+        Ok(Self {
+            routes: concrete_routes,
+        })
+    }
+
+    /// Return whether the set contains no concrete routes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Return how many concrete routes are currently in the set.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Iterate over the concrete routes in stable address order.
+    pub fn iter(&self) -> impl Iterator<Item = &SocketAddr> {
+        self.routes.iter()
+    }
+
+    /// Return the underlying concrete route set.
+    #[must_use]
+    pub fn routes(&self) -> &BTreeSet<SocketAddr> {
+        &self.routes
     }
 }
 

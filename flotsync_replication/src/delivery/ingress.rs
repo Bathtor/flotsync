@@ -260,115 +260,11 @@ mod tests {
         discovery as discovery_proto,
         endpoint as endpoint_proto,
     };
-    use std::{sync::mpsc, time::Duration};
+    use flotsync_utils::kompact_testing::{PortTestingExt, PortTestingRefExt};
+    use std::time::Duration;
     use uuid::Uuid;
 
     const WAIT_TIMEOUT: Duration = Duration::from_secs(3);
-
-    #[derive(ComponentDefinition)]
-    struct TransportInboundProbe {
-        ctx: ComponentContext<Self>,
-        transport: ProvidedPort<TransportInboundPort>,
-    }
-
-    impl TransportInboundProbe {
-        fn new() -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                transport: ProvidedPort::uninitialised(),
-            }
-        }
-    }
-
-    ignore_lifecycle!(TransportInboundProbe);
-
-    ignore_requests!(TransportInboundPort, TransportInboundProbe);
-
-    impl Actor for TransportInboundProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-            unreachable!()
-        }
-    }
-
-    #[derive(ComponentDefinition)]
-    struct GroupBroadcastProbe {
-        ctx: ComponentContext<Self>,
-        inbound: RequiredPort<TransportGroupBroadcastInboundPort>,
-        events: mpsc::Sender<GroupBroadcastInboundDeliver<TransportRouteKey>>,
-    }
-
-    impl GroupBroadcastProbe {
-        fn new(events: mpsc::Sender<GroupBroadcastInboundDeliver<TransportRouteKey>>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                inbound: RequiredPort::uninitialised(),
-                events,
-            }
-        }
-    }
-
-    ignore_lifecycle!(GroupBroadcastProbe);
-
-    impl Require<TransportGroupBroadcastInboundPort> for GroupBroadcastProbe {
-        fn handle(
-            &mut self,
-            indication: GroupBroadcastInboundDeliver<TransportRouteKey>,
-        ) -> HandlerResult {
-            self.events
-                .send(indication)
-                .expect("group-broadcast ingress test receiver must stay live");
-            Handled::OK
-        }
-    }
-
-    impl Actor for GroupBroadcastProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
-            match msg {}
-        }
-    }
-
-    #[derive(ComponentDefinition)]
-    struct ReliableDeliveryProbe {
-        ctx: ComponentContext<Self>,
-        inbound: RequiredPort<TransportReliableDeliveryInboundPort>,
-        events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>,
-    }
-
-    impl ReliableDeliveryProbe {
-        fn new(events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                inbound: RequiredPort::uninitialised(),
-                events,
-            }
-        }
-    }
-
-    ignore_lifecycle!(ReliableDeliveryProbe);
-
-    impl Require<TransportReliableDeliveryInboundPort> for ReliableDeliveryProbe {
-        fn handle(
-            &mut self,
-            indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
-        ) -> HandlerResult {
-            self.events
-                .send(indication)
-                .expect("reliable-delivery ingress test receiver must stay live");
-            Handled::OK
-        }
-    }
-
-    impl Actor for ReliableDeliveryProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-            unreachable!()
-        }
-    }
 
     #[test]
     fn ingress_routes_active_group_frame_to_group_broadcast_port() {
@@ -376,7 +272,8 @@ mod tests {
         let active_group = GroupId(Uuid::from_u128(1));
         let route = test_route();
 
-        let transport = system.create(TransportInboundProbe::new);
+        let transport = system.create(TransportInboundPort::tester_component_sidecar);
+        let transport_ref = transport.actor_ref();
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
                 group_memberships: SharedGroupMemberships::new(GroupMemberships::from_groups([(
@@ -390,10 +287,12 @@ mod tests {
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })
         });
-        let (group_tx, group_rx) = mpsc::channel();
-        let group_probe = system.create(move || GroupBroadcastProbe::new(group_tx));
-        let (reliable_tx, reliable_rx) = mpsc::channel();
-        let reliable_probe = system.create(move || ReliableDeliveryProbe::new(reliable_tx));
+        let group_probe =
+            system.create(TransportGroupBroadcastInboundPort::tester_component_sidecar);
+        let group_probe_ref = group_probe.actor_ref();
+        let reliable_probe =
+            system.create(TransportReliableDeliveryInboundPort::tester_component_sidecar);
+        let reliable_probe_ref = reliable_probe.actor_ref();
 
         let _transport_to_ingress =
             biconnect_components::<TransportInboundPort, _, _>(&transport, &ingress)
@@ -415,27 +314,33 @@ mod tests {
         start_component(&system, &group_probe);
         start_component(&system, &reliable_probe);
 
-        transport.on_definition(|component| {
-            component.transport.trigger(RouteTransportInboundDeliver {
-                payload: encode_group_endpoint_frame(active_group, MessageId(Uuid::from_u128(2))),
-                transport: InboundTransportMeta {
-                    route,
-                    remote_addr: Some("127.0.0.1:30101".parse().expect("test remote address")),
-                },
-            });
+        let group_event = group_probe_ref.observe_indication(|_| true);
+        let reliable_absence =
+            reliable_probe_ref.fail_if_indication_observed(Duration::from_millis(50), |_| true);
+        transport_ref.inject_indication(RouteTransportInboundDeliver {
+            payload: encode_group_endpoint_frame(active_group, MessageId(Uuid::from_u128(2))),
+            transport: InboundTransportMeta {
+                route,
+                remote_addr: Some("127.0.0.1:30101".parse().expect("test remote address")),
+            },
         });
 
-        let event = group_rx
-            .recv_timeout(WAIT_TIMEOUT)
-            .expect("group-broadcast ingress event");
+        let event = group_event
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("group-broadcast ingress event")
+            .expect("group-broadcast probe should stay live");
         assert_eq!(
-            event.meta.target,
-            DeliveryTargetHint::GroupBroadcast {
+            &event.indication().meta.target,
+            &DeliveryTargetHint::GroupBroadcast {
                 group_id: active_group,
                 delivery_message_id: MessageId(Uuid::from_u128(2)),
             }
         );
-        assert!(reliable_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        reliable_absence
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("reliable-delivery absence check should complete")
+            .expect("reliable-delivery probe should stay live")
+            .expect("reliable-delivery ingress should stay silent");
 
         kill_component(&system, reliable_probe);
         kill_component(&system, group_probe);
@@ -449,7 +354,8 @@ mod tests {
         let original_sender = member(&["alice"]);
         let route = test_route();
 
-        let transport = system.create(TransportInboundProbe::new);
+        let transport = system.create(TransportInboundPort::tester_component_sidecar);
+        let transport_ref = transport.actor_ref();
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
                 group_memberships: SharedGroupMemberships::default(),
@@ -457,10 +363,12 @@ mod tests {
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })
         });
-        let (group_tx, group_rx) = mpsc::channel();
-        let group_probe = system.create(move || GroupBroadcastProbe::new(group_tx));
-        let (reliable_tx, reliable_rx) = mpsc::channel();
-        let reliable_probe = system.create(move || ReliableDeliveryProbe::new(reliable_tx));
+        let group_probe =
+            system.create(TransportGroupBroadcastInboundPort::tester_component_sidecar);
+        let group_probe_ref = group_probe.actor_ref();
+        let reliable_probe =
+            system.create(TransportReliableDeliveryInboundPort::tester_component_sidecar);
+        let reliable_probe_ref = reliable_probe.actor_ref();
 
         let _transport_to_ingress =
             biconnect_components::<TransportInboundPort, _, _>(&transport, &ingress)
@@ -482,31 +390,37 @@ mod tests {
         start_component(&system, &group_probe);
         start_component(&system, &reliable_probe);
 
-        transport.on_definition(|component| {
-            component.transport.trigger(RouteTransportInboundDeliver {
-                payload: encode_recipient_ack_endpoint_frame(
-                    MessageId(Uuid::from_u128(3)),
-                    &original_sender,
-                    &member(&["bob"]),
-                ),
-                transport: InboundTransportMeta {
-                    route,
-                    remote_addr: Some("127.0.0.1:30102".parse().expect("test remote address")),
-                },
-            });
+        let reliable_event = reliable_probe_ref.observe_indication(|_| true);
+        let group_absence =
+            group_probe_ref.fail_if_indication_observed(Duration::from_millis(50), |_| true);
+        transport_ref.inject_indication(RouteTransportInboundDeliver {
+            payload: encode_recipient_ack_endpoint_frame(
+                MessageId(Uuid::from_u128(3)),
+                &original_sender,
+                &member(&["bob"]),
+            ),
+            transport: InboundTransportMeta {
+                route,
+                remote_addr: Some("127.0.0.1:30102".parse().expect("test remote address")),
+            },
         });
 
-        let event = reliable_rx
-            .recv_timeout(WAIT_TIMEOUT)
-            .expect("reliable-delivery ingress event");
+        let event = reliable_event
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("reliable-delivery ingress event")
+            .expect("reliable-delivery probe should stay live");
         assert_eq!(
-            event.meta.target,
-            DeliveryTargetHint::OriginalSender {
+            &event.indication().meta.target,
+            &DeliveryTargetHint::OriginalSender {
                 original_sender,
                 delivery_message_id: MessageId(Uuid::from_u128(3)),
             }
         );
-        assert!(group_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        group_absence
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("group-broadcast absence check should complete")
+            .expect("group-broadcast probe should stay live")
+            .expect("group-broadcast ingress should stay silent");
 
         kill_component(&system, reliable_probe);
         kill_component(&system, group_probe);

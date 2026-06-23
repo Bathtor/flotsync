@@ -1437,6 +1437,7 @@ name = "flotsync_discovery"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "bitflags",
  "blocking",
  "bytes",
  "derive_more",
@@ -1445,6 +1446,7 @@ dependencies = [
  "flotsync_messages",
  "flotsync_security",
  "flotsync_utils",
+ "futures-util",
  "hostname",
  "itertools 0.14.0",
  "kompact",
@@ -1604,6 +1606,7 @@ name = "flotsync_utils"
 version = "0.1.0"
 dependencies = [
  "async-std",
+ "futures-util",
  "kompact",
  "proptest",
  "snafu",

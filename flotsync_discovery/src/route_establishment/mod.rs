@@ -22,7 +22,7 @@ mod state;
 mod wire;
 
 pub use component::{RouteEstablishmentComponent, RouteEstablishmentMessage};
-pub use config::{RouteEstablishmentConfig, RouteEstablishmentConfigError};
+pub use config::{ConcreteRoutes, RouteEstablishmentConfig, RouteEstablishmentConfigError};
 pub use observation::PeerAnnouncementObservationComponent;
 pub use state::{ManualRouteWatchError, WatchedRoute};
 pub use wire::{RouteEstablishmentError, frame_signature_from_wire};

@@ -1272,7 +1272,6 @@ mod tests {
                 UdpRouteKey,
             },
             test_support::{
-                DiscoveryRouteSource,
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
                 build_delivery_test_system,
@@ -1294,7 +1293,9 @@ mod tests {
             start_component,
         },
     };
+    use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{
+        cell::Cell,
         collections::HashSet,
         net::SocketAddr,
         sync::mpsc,
@@ -1306,10 +1307,16 @@ mod tests {
     /// state transitions without sleeping a fixed one-shot delay.
     const REJECTED_ACK_OBSERVATION_WINDOW: Duration = Duration::from_millis(100);
 
+    // TODO(flotsync-h1z0): Replace this custom probe once generic testing
+    // helpers can hand owned indication payloads such as processed handles to
+    // tests.
     #[derive(ComponentDefinition)]
     struct ReliableDeliveryClientProbe {
+        /// Component context for Kompact lifecycle integration.
         ctx: ComponentContext<Self>,
+        /// Required external reliable-delivery port observed by the probe.
         delivery: RequiredPort<ReliableDeliveryPort>,
+        /// Channel receiving owned client indications for assertions.
         indications: mpsc::Sender<ReliableDeliveryPortIndication>,
     }
 
@@ -1342,53 +1349,14 @@ mod tests {
         }
     }
 
-    #[derive(ComponentDefinition)]
-    struct ReliableDeliveryIngressProbe {
-        ctx: ComponentContext<Self>,
-        inbound: RequiredPort<TransportReliableDeliveryInboundPort>,
-        events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>,
-    }
-
-    impl ReliableDeliveryIngressProbe {
-        fn new(events: mpsc::Sender<ReliableDeliveryInboundDeliver<TransportRouteKey>>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                inbound: RequiredPort::uninitialised(),
-                events,
-            }
-        }
-    }
-
-    ignore_lifecycle!(ReliableDeliveryIngressProbe);
-
-    impl Require<TransportReliableDeliveryInboundPort> for ReliableDeliveryIngressProbe {
-        fn handle(
-            &mut self,
-            indication: ReliableDeliveryInboundDeliver<TransportRouteKey>,
-        ) -> HandlerResult {
-            self.events
-                .send(indication)
-                .expect("reliable delivery ingress probe receiver must stay live");
-            Handled::OK
-        }
-    }
-
-    impl Actor for ReliableDeliveryIngressProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-            unreachable!("Never type is empty")
-        }
-    }
-
     struct FullStackHarness {
         core: TransportHarnessCore,
         ingress: Arc<Component<DeliveryIngressComponent>>,
         reliable: Arc<Component<ReliableDeliveryComponent>>,
-        ingress_probe: Arc<Component<ReliableDeliveryIngressProbe>>,
-        discovery_source: Arc<Component<DiscoveryRouteSource>>,
+        ingress_probe: Arc<Component<PortTesterComponent<TransportReliableDeliveryInboundPort>>>,
+        discovery_source: Arc<Component<PortTesterComponent<TransportRouteDiscoveryPort>>>,
         client: Arc<Component<ReliableDeliveryClientProbe>>,
-        ingress_probe_rx: mpsc::Receiver<ReliableDeliveryInboundDeliver<TransportRouteKey>>,
+        ingress_cursor: Cell<usize>,
         client_rx: mpsc::Receiver<ReliableDeliveryPortIndication>,
         local_addr: SocketAddr,
     }
@@ -1431,11 +1399,12 @@ mod tests {
             let reliable = core.system().create(move || {
                 ReliableDeliveryComponent::new(manager_ref.clone(), reliable_security.clone())
             });
-            let (ingress_probe_tx, ingress_probe_rx) = mpsc::channel();
             let ingress_probe = core
                 .system()
-                .create(move || ReliableDeliveryIngressProbe::new(ingress_probe_tx));
-            let discovery_source = core.system().create(DiscoveryRouteSource::new);
+                .create(TransportReliableDeliveryInboundPort::tester_component_sidecar);
+            let discovery_source = core
+                .system()
+                .create(TransportRouteDiscoveryPort::tester_component_sidecar);
             let (client_tx, client_rx) = mpsc::channel();
             let client = core
                 .system()
@@ -1480,7 +1449,7 @@ mod tests {
                 ingress_probe,
                 discovery_source,
                 client,
-                ingress_probe_rx,
+                ingress_cursor: Cell::new(0),
                 client_rx,
                 local_addr,
             }
@@ -1497,14 +1466,12 @@ mod tests {
                 preference_rank: RoutePreferenceRank::new(1),
             };
             let expected_peer = peer.clone();
-            self.discovery_source.on_definition(|component| {
-                component
-                    .discovery
-                    .trigger(TransportDiscoveryRouteUpdate::PeerRoutes {
-                        peer,
-                        routes: vec![route],
-                    });
-            });
+            self.discovery_source.actor_ref().inject_indication(
+                TransportDiscoveryRouteUpdate::PeerRoutes {
+                    peer,
+                    routes: vec![route],
+                },
+            );
             eventually_component_state(
                 WAIT_TIMEOUT,
                 &self.reliable,
@@ -1549,16 +1516,20 @@ mod tests {
             let mut observed_count = 0;
             while observed_count < expected_count {
                 let timeout = deadline.saturating_duration_since(Instant::now());
-                let indication = self
-                    .ingress_probe_rx
-                    .recv_timeout(timeout)
-                    .expect("timed out waiting for reliable delivery ingress envelope");
+                let observed = self
+                    .ingress_probe
+                    .actor_ref()
+                    .observe_indication_from(self.ingress_cursor.get(), |_| true)
+                    .wait_timeout(timeout)
+                    .expect("timed out waiting for reliable delivery ingress envelope")
+                    .expect("reliable delivery ingress probe should stay live");
+                self.ingress_cursor.set(observed.index() + 1);
                 let Some(delivery_proto::reliable_delivery_frame::Body::Envelope(envelope)) =
-                    indication.frame.body
+                    observed.indication().frame.body.as_ref()
                 else {
                     continue;
                 };
-                let envelope = reliable_envelope_from_wire(*envelope)
+                let envelope = reliable_envelope_from_wire((**envelope).clone())
                     .expect("ingress probe should observe decodable reliable envelopes");
                 if envelope.header.message_id == message_id {
                     observed_count += 1;

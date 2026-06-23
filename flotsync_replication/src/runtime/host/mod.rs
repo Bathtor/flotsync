@@ -30,21 +30,19 @@ use flotsync_core::{
 };
 use flotsync_discovery::{
     config_keys as discovery_config_keys,
+    endpoint_selection::EndpointSelectionPort,
     route_establishment::{
         ManualRouteWatchError,
         PeerAnnouncementObservationComponent,
         PeerAnnouncementObservationPort,
         RouteEstablishmentComponent,
         RouteEstablishmentConfig,
-        RouteEstablishmentConfigError,
         RouteEstablishmentMessage,
     },
     route_publication::DiscoveryRoutePort,
     services::{
         PeerAnnouncementComponent,
-        PeerAnnouncementMessage,
         PeerAnnouncementOptions,
-        PeerAnnouncementRoute,
         PeerAnnouncementSocketMaintenance,
     },
 };
@@ -105,6 +103,9 @@ mod config_keys {
     };
     use std::time::Duration;
 
+    /// Default poll cadence for refreshing selected discovery endpoints from wildcard binds.
+    const DEFAULT_LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
     fn default_local_endpoint_bind_addr() -> String {
         if cfg!(test) {
             String::from("127.0.0.1:0")
@@ -137,6 +138,15 @@ mod config_keys {
         type = DurationValue,
         default = Duration::from_secs(2),
         doc = "Maximum wait for a summary response from a peer.",
+        version = "0.1.0"
+    }
+
+    kompact_config! {
+        LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL,
+        key = "flotsync.replication.runtime.local-endpoint-selection-refresh-interval",
+        type = DurationValue,
+        default = DEFAULT_LOCAL_ENDPOINT_SELECTION_REFRESH_INTERVAL,
+        doc = "Poll cadence for refreshing selected discovery endpoints while the local runtime endpoint is bound to a wildcard address.",
         version = "0.1.0"
     }
 }
@@ -177,10 +187,6 @@ pub(crate) enum RuntimeHostError {
         source: RuntimeControlError,
         configured_bind_addr: SocketAddr,
         system_label: String,
-    },
-    #[snafu(display("Invalid route-establishment config: {source}"))]
-    InvalidRouteEstablishmentConfig {
-        source: RouteEstablishmentConfigError,
     },
     #[snafu(display("Failed to configure route-establishment manual watches: {source}"))]
     ConfigureRouteEstablishmentWatches { source: RuntimeControlError },
@@ -693,11 +699,11 @@ impl DiscoveryTopology {
         security: DeliverySecurity,
         egress_pool: flotsync_io::prelude::EgressPool,
         static_route_hints: PreconfiguredPeerRoutesConfig,
-    ) -> Result<Self, RuntimeHostError> {
+    ) -> Self {
         let route_config = route_establishment_config(
             host_config.local_endpoint_bind_addr,
             host_config.peer_announcement_bind_addr,
-        )?;
+        );
         let peer_options = PeerAnnouncementOptions::DEFAULT
             .with_socket_bind_addr(route_config.peer_announcement_bind_addr)
             .with_instance_id(route_config.instance_id)
@@ -729,7 +735,7 @@ impl DiscoveryTopology {
         let local_endpoint_manager =
             LocalEndpointManager::new(host_config.local_endpoint_bind_addr);
         let local_endpoint_manager = system.create(move || local_endpoint_manager);
-        Ok(Self {
+        Self {
             peer_announcement,
             peer_announcement_observation,
             route_establishment,
@@ -738,7 +744,7 @@ impl DiscoveryTopology {
             route_adapter_ref,
             local_endpoint_manager,
             static_route_hints,
-        })
+        }
     }
 
     fn route_discovery_provider(&self) -> &Arc<Component<DiscoveryRouteAdapterComponent>> {
@@ -754,6 +760,16 @@ impl DiscoveryTopology {
             &self.peer_announcement_observation,
             &self.route_establishment,
             "peer announcement observation -> route establishment",
+        )?;
+        connect_components::<EndpointSelectionPort, _, _>(
+            &self.local_endpoint_manager,
+            &self.peer_announcement,
+            "local endpoint selection -> peer announcement",
+        )?;
+        connect_components::<EndpointSelectionPort, _, _>(
+            &self.local_endpoint_manager,
+            &self.route_establishment,
+            "local endpoint selection -> route establishment",
         )?;
         connect_components::<DiscoveryRoutePort, _, _>(
             &self.route_establishment,
@@ -773,11 +789,6 @@ impl DiscoveryTopology {
                 socket_id: local_endpoint.socket_id,
                 local_addr: local_endpoint.local_addr,
             });
-        self.peer_announcement
-            .actor_ref()
-            .tell(PeerAnnouncementMessage::ReplaceAdvertisedRoutes(vec![
-                PeerAnnouncementRoute::Udp(local_endpoint.local_addr),
-            ]));
         self.replace_manual_route_watches(control_timeout).await
     }
 
@@ -822,12 +833,10 @@ impl DiscoveryTopology {
 fn route_establishment_config(
     local_endpoint_bind_addr: SocketAddr,
     peer_announcement_bind_addr: SocketAddr,
-) -> Result<RouteEstablishmentConfig, RuntimeHostError> {
+) -> RouteEstablishmentConfig {
     let mut config = RouteEstablishmentConfig::new(local_endpoint_bind_addr);
     config.peer_announcement_bind_addr = peer_announcement_bind_addr;
     config
-        .with_advertised_routes([local_endpoint_bind_addr])
-        .context(InvalidRouteEstablishmentConfigSnafu)
 }
 
 fn flatten_manual_route_watch_ask_result<E>(
@@ -966,10 +975,7 @@ struct RuntimeTopologyBuildInput {
 }
 
 impl RuntimeTopology {
-    fn build(
-        system: &KompactSystem,
-        input: RuntimeTopologyBuildInput,
-    ) -> Result<Self, RuntimeHostError> {
+    fn build(system: &KompactSystem, input: RuntimeTopologyBuildInput) -> Self {
         let io = IoTopology::build(system);
         let transport = TransportTopology::build(system, &io.bridge);
         let manager_ref = transport.manager_ref();
@@ -991,7 +997,7 @@ impl RuntimeTopology {
             input.security.clone(),
             egress_pool,
             input.static_route_hints,
-        )?;
+        );
         let runtime = RuntimeLogicTopology::build(
             system,
             input.group_memberships,
@@ -1002,13 +1008,13 @@ impl RuntimeTopology {
             input.host_config,
         );
 
-        Ok(Self {
+        Self {
             io,
             transport,
             delivery,
             discovery,
             runtime,
-        })
+        }
     }
 
     fn connect_all(&self) -> Result<(), RuntimeHostError> {
@@ -1142,7 +1148,7 @@ impl DeliveryRuntimeHost {
                 host_config,
                 static_route_hints: routes_config,
             },
-        )?;
+        );
         topology.connect_all()?;
         topology
             .start_all(&system, host_config.control_timeout)

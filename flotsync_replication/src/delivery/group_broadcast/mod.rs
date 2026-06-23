@@ -532,9 +532,7 @@ mod tests {
                 UdpRouteKey,
             },
             test_support::{
-                DiscoveryRouteSource,
                 FULL_STACK_WAIT_TIMEOUT,
-                PortMockComponent,
                 TransportHarnessCore,
                 build_delivery_test_system,
                 default_udpour_config,
@@ -550,57 +548,17 @@ mod tests {
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
     };
-    use std::{
-        net::SocketAddr,
-        num::NonZeroUsize,
-        sync::{Arc, mpsc},
-        time::Duration,
-    };
-
-    #[derive(ComponentDefinition)]
-    struct GroupBroadcastClientProbe {
-        ctx: ComponentContext<Self>,
-        delivery: RequiredPort<GroupBroadcastPort>,
-        indications: mpsc::Sender<GroupBroadcastPortIndication>,
-    }
-
-    impl GroupBroadcastClientProbe {
-        fn new(indications: mpsc::Sender<GroupBroadcastPortIndication>) -> Self {
-            Self {
-                ctx: ComponentContext::uninitialised(),
-                delivery: RequiredPort::uninitialised(),
-                indications,
-            }
-        }
-    }
-
-    ignore_lifecycle!(GroupBroadcastClientProbe);
-
-    impl Require<GroupBroadcastPort> for GroupBroadcastClientProbe {
-        fn handle(&mut self, indication: GroupBroadcastPortIndication) -> HandlerResult {
-            self.indications
-                .send(indication)
-                .expect("group-broadcast indication receiver must stay live");
-            Handled::OK
-        }
-    }
-
-    impl Actor for GroupBroadcastClientProbe {
-        type Message = Never;
-
-        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
-            unreachable!("Never type is empty")
-        }
-    }
+    use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
+    use std::{cell::Cell, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
     struct FullStackHarness {
         core: TransportHarnessCore,
         ingress: Arc<Component<DeliveryIngressComponent>>,
-        inbound_source: Arc<Component<PortMockComponent<TransportGroupBroadcastInboundPort>>>,
+        inbound_source: Arc<Component<PortTesterComponent<TransportGroupBroadcastInboundPort>>>,
         broadcast: Arc<Component<GroupBroadcastComponent>>,
-        discovery_source: Arc<Component<DiscoveryRouteSource>>,
-        client: Arc<Component<GroupBroadcastClientProbe>>,
-        client_rx: mpsc::Receiver<GroupBroadcastPortIndication>,
+        discovery_source: Arc<Component<PortTesterComponent<TransportRouteDiscoveryPort>>>,
+        client: Arc<Component<PortTesterComponent<GroupBroadcastPort>>>,
+        client_cursor: Cell<usize>,
         local_addr: Option<SocketAddr>,
     }
 
@@ -630,15 +588,18 @@ mod tests {
                     hosted_mailboxes: Arc::new(HashSet::new()),
                 })
             });
-            let inbound_source = core.system().create(PortMockComponent::new);
+            let inbound_source = core
+                .system()
+                .create(TransportGroupBroadcastInboundPort::tester_component_sidecar);
             let broadcast = core.system().create(move || {
                 GroupBroadcastComponent::new(shared_group_memberships, manager_ref, security)
             });
-            let discovery_source = core.system().create(DiscoveryRouteSource::new);
-            let (client_tx, client_rx) = mpsc::channel();
             let client = core
                 .system()
-                .create(move || GroupBroadcastClientProbe::new(client_tx));
+                .create(GroupBroadcastPort::tester_component_sidecar);
+            let discovery_source = core
+                .system()
+                .create(TransportRouteDiscoveryPort::tester_component_sidecar);
 
             biconnect_components::<RouteTransportPort<TransportRouteKey>, _, _>(
                 core.manager(),
@@ -689,7 +650,7 @@ mod tests {
                 broadcast,
                 discovery_source,
                 client,
-                client_rx,
+                client_cursor: Cell::new(0),
                 local_addr,
             }
         }
@@ -705,14 +666,12 @@ mod tests {
                 preference_rank: RoutePreferenceRank::new(1),
             };
             let expected_peer = peer.clone();
-            self.discovery_source.on_definition(|component| {
-                component
-                    .discovery
-                    .trigger(TransportDiscoveryRouteUpdate::PeerRoutes {
-                        peer,
-                        routes: vec![route],
-                    });
-            });
+            self.discovery_source.actor_ref().inject_indication(
+                TransportDiscoveryRouteUpdate::PeerRoutes {
+                    peer,
+                    routes: vec![route],
+                },
+            );
             eventually_component_state(
                 FULL_STACK_WAIT_TIMEOUT,
                 &self.broadcast,
@@ -722,35 +681,33 @@ mod tests {
         }
 
         fn submit(&self, submit: GroupBroadcastSubmit) {
-            self.client.on_definition(|component| {
-                component
-                    .delivery
-                    .trigger(GroupBroadcastPortRequest::Submit(submit));
-            });
+            self.client
+                .actor_ref()
+                .inject_request(GroupBroadcastPortRequest::Submit(submit));
         }
 
         fn wait_for_delivery(&self) -> GroupBroadcastDeliver {
-            match self
-                .client_rx
-                .recv_timeout(FULL_STACK_WAIT_TIMEOUT)
+            let observed = self
+                .client
+                .actor_ref()
+                .observe_indication_from(self.client_cursor.get(), |_| true)
+                .wait_timeout(FULL_STACK_WAIT_TIMEOUT)
                 .expect("timed out waiting for group-broadcast indication")
-            {
-                GroupBroadcastPortIndication::Deliver(deliver) => deliver,
+                .expect("group-broadcast client probe should stay live");
+            self.client_cursor.set(observed.index() + 1);
+            match observed.indication() {
+                GroupBroadcastPortIndication::Deliver(deliver) => deliver.clone(),
             }
         }
 
         fn expect_no_delivery(&self, timeout: Duration) {
-            match self.client_rx.recv_timeout(timeout) {
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("group-broadcast test client disconnected while expecting silence")
-                }
-                Ok(indication) => {
-                    panic!(
-                        "unexpected group-broadcast indication while expecting silence: {indication:?}"
-                    )
-                }
-            }
+            self.client
+                .actor_ref()
+                .fail_if_indication_observed_from(self.client_cursor.get(), timeout, |_| true)
+                .wait_timeout(FULL_STACK_WAIT_TIMEOUT)
+                .expect("group-broadcast absence check should complete")
+                .expect("group-broadcast client probe should stay live")
+                .expect("group-broadcast client should stay silent");
         }
 
         fn wait_for_known_submit(&self, message_id: MessageId) {
@@ -780,8 +737,9 @@ mod tests {
                 )),
                 ..delivery_proto::GroupBroadcastFrame::default()
             };
-            self.inbound_source.on_definition(|component| {
-                component.trigger(GroupBroadcastInboundDeliver {
+            self.inbound_source
+                .actor_ref()
+                .inject_indication(GroupBroadcastInboundDeliver {
                     meta: InboundDeliveryMeta {
                         transport: test_inbound_transport_meta(),
                         target: DeliveryTargetHint::GroupBroadcast {
@@ -793,7 +751,6 @@ mod tests {
                     },
                     frame,
                 });
-            });
         }
     }
 

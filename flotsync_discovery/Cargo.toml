@@ -28,6 +28,7 @@ pnet_datalink = "0.35"
 itertools = "0.14"
 hostname = "0.4"
 base64 = { workspace = true }
+bitflags = { workspace = true }
 smallvec = { workspace = true }
 blocking = "1"
 uuid = { version = "1", features = ["v4"] }
@@ -38,3 +39,4 @@ kompact = { workspace = true, optional = true }
 [dev-dependencies]
 bytes = { workspace = true }
 flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
+futures-util = { workspace = true }

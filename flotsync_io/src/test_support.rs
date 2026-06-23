@@ -8,6 +8,7 @@ use crate::{
     prelude::*,
     socket_support::{configure_bind_reuse, socket_domain},
 };
+use flotsync_utils::option_when;
 use futures_util::FutureExt;
 use kompact::{config_keys::system, default_components::install_manual_timer, prelude::*};
 use socket2::{Protocol, SockAddr, Socket, Type};
@@ -1547,7 +1548,7 @@ pub fn eventually<M>(timeout: Duration, mut predicate: impl FnMut() -> bool, fai
 where
     M: Display,
 {
-    eventually_value(timeout, || predicate().then_some(()), failure_message);
+    eventually_value(timeout, || option_when!(predicate(), ()), failure_message);
 }
 
 /// Waits for one future to resolve within `timeout`.
@@ -1996,6 +1997,8 @@ impl<T> BufferedReceiver<T> {
 }
 
 /// Test observer that forwards UDP indications to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace this observer/barrier fixture once generic
+// actor-message testing support covers barrier-style test commands.
 #[derive(ComponentDefinition)]
 pub struct UdpObserver {
     ctx: ComponentContext<Self>,
@@ -2049,6 +2052,7 @@ impl Actor for UdpObserver {
 }
 
 /// Test actor that forwards UDP send results to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct UdpSendResultProbe {
     ctx: ComponentContext<Self>,
@@ -2080,6 +2084,7 @@ impl Actor for UdpSendResultProbe {
 }
 
 /// Test actor that forwards TCP session events to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct TcpSessionEventProbe {
     ctx: ComponentContext<Self>,
@@ -2111,6 +2116,7 @@ impl Actor for TcpSessionEventProbe {
 }
 
 /// Test actor that forwards TCP listener events to an `mpsc` channel.
+// TODO(flotsync-h1z0): Replace with a generic actor-message probe.
 #[derive(ComponentDefinition)]
 pub struct TcpListenerEventProbe {
     ctx: ComponentContext<Self>,
