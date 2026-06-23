@@ -510,8 +510,7 @@ impl IoTopology {
             &udp_connect_handle,
             &discovery.peer_announcement_observation,
         )
-        .await?;
-        connect_udp_component(&udp_connect_handle, &discovery.route_establishment).await
+        .await
     }
 }
 
@@ -699,7 +698,7 @@ impl DiscoveryTopology {
         group_memberships: SharedGroupMemberships,
         local_member: MemberIdentity,
         security: DeliverySecurity,
-        egress_pool: flotsync_io::prelude::EgressPool,
+        route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         static_route_hints: PreconfiguredPeerRoutesConfig,
     ) -> Self {
         let route_config = route_establishment_config(
@@ -722,10 +721,10 @@ impl DiscoveryTopology {
         let route_establishment = system.create(move || {
             RouteEstablishmentComponent::new(
                 route_config,
+                route_transport,
                 local_member,
                 Arc::new(security),
                 group_memberships,
-                egress_pool,
             )
         });
         let route_adapter = system.create(DiscoveryRouteAdapterComponent::new);
@@ -755,6 +754,15 @@ impl DiscoveryTopology {
 
     fn local_endpoint_manager(&self) -> &Arc<Component<LocalEndpointManager>> {
         &self.local_endpoint_manager
+    }
+
+    /// Connect route-transport ingress carrying discovery endpoint frames into route establishment.
+    fn connect_transport(&self, transport: &TransportTopology) -> Result<(), RuntimeHostError> {
+        connect_components::<TransportRoutePort, _, _>(
+            transport.route_transport_manager(),
+            &self.route_establishment,
+            "route transport -> route establishment",
+        )
     }
 
     fn connect_internal_routes(&self) -> Result<(), RuntimeHostError> {
@@ -981,14 +989,11 @@ impl RuntimeTopology {
         let io = IoTopology::build(system);
         let transport = TransportTopology::build(system, &io.bridge);
         let manager_ref = transport.manager_ref();
-        let egress_pool = IoBridgeHandle::from_component(&io.bridge)
-            .egress_pool()
-            .clone();
         let delivery = DeliveryTopology::build(
             system,
             input.group_memberships.clone(),
             input.local_member.clone(),
-            manager_ref,
+            manager_ref.clone(),
             input.security.clone(),
         );
         let discovery = DiscoveryTopology::build(
@@ -997,7 +1002,7 @@ impl RuntimeTopology {
             input.group_memberships.clone(),
             input.local_member.clone(),
             input.security.clone(),
-            egress_pool,
+            manager_ref,
             input.static_route_hints,
         );
         let runtime = RuntimeLogicTopology::build(
@@ -1021,6 +1026,7 @@ impl RuntimeTopology {
 
     fn connect_all(&self) -> Result<(), RuntimeHostError> {
         self.delivery.connect_transport(&self.transport)?;
+        self.discovery.connect_transport(&self.transport)?;
         self.delivery.connect_internal_routes()?;
         self.discovery.connect_internal_routes()?;
         self.delivery.connect_discovery(&self.discovery)?;
