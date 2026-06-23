@@ -42,15 +42,22 @@ use flotsync_replication::{
     SnapshotRowsRequest,
     SqliteReplicationStore,
     StoreError,
+    StoreSecretKeyId,
     SummaryRequest,
     load_replication_runtime_with_runtime_config_toml,
     prepare_initial_group_security_material,
     provision_replication_security,
     validate_initial_group_security_material,
 };
-use flotsync_security::{SecurityError, generate_member_key_files};
+use flotsync_security::{
+    STORE_SECRET_KEY_LENGTH,
+    SecurityError,
+    StoreSecretKey,
+    generate_member_key_files,
+};
 use futures_util::{FutureExt, future::join_all};
 use kompact::prelude::block_on;
+use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
     collections::HashSet,
@@ -70,6 +77,13 @@ use std::{
 const CHECKLIST_SNAPSHOT_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
 const GENERATED_PRIVATE_JWKS_FILE_NAME: &str = "private.jwks";
 const GENERATED_PUBLIC_JWKS_FILE_NAME: &str = "public.jwks";
+// TODO(flotsync-lsi8): Remove this unsafe profile escape hatch once headless
+// local store-secret backends are implemented.
+const UNSAFE_STORE_SECRET_PROFILE_PREFIX: &str = "unsafe:";
+const UNSAFE_STORE_SECRET_KEY_ID_DOMAIN: &[u8] =
+    b"flotsync/examples/replicated-checklist/unsafe-store-secret-key-id/v1";
+const UNSAFE_STORE_SECRET_KEY_DOMAIN: &[u8] =
+    b"flotsync/examples/replicated-checklist/unsafe-store-secret-key/v1";
 
 /// Command-line arguments for the replicated checklist example.
 #[derive(Clone, Debug, Parser)]
@@ -169,10 +183,61 @@ fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistErro
 fn load_checklist_replication_security(
     config: &ChecklistAppConfig,
 ) -> Result<ReplicationSecuritySecrets, LoadSecurityError> {
+    if config
+        .store_secret_profile
+        .as_str()
+        .starts_with(UNSAFE_STORE_SECRET_PROFILE_PREFIX)
+    {
+        // TODO(flotsync-lsi8): Route headless configs through the real local
+        // store-secret backend instead of deriving secrets from config text.
+        return Ok(derive_unsafe_checklist_replication_security(config));
+    }
+
     ReplicationSecuritySecrets::load_or_create_local(
         &checklist_application_id(),
         &config.store_secret_profile,
     )
+}
+
+/// Derive temporary headless example secrets from plaintext config.
+fn derive_unsafe_checklist_replication_security(
+    config: &ChecklistAppConfig,
+) -> ReplicationSecuritySecrets {
+    let store_secret_key_id = derive_unsafe_checklist_store_secret_key_id(config);
+    let store_secret_key =
+        StoreSecretKey::from_bytes(derive_unsafe_checklist_store_secret_key(config));
+    ReplicationSecuritySecrets::from_unmanaged_store_secret(store_secret_key_id, store_secret_key)
+}
+
+/// Build the synthetic key id attached to example-local encrypted cells.
+fn derive_unsafe_checklist_store_secret_key_id(config: &ChecklistAppConfig) -> StoreSecretKeyId {
+    let digest =
+        derive_unsafe_checklist_store_secret_digest(UNSAFE_STORE_SECRET_KEY_ID_DOMAIN, config);
+    let mut key_id = [0_u8; StoreSecretKeyId::BYTE_LENGTH];
+    key_id.copy_from_slice(&digest[..StoreSecretKeyId::BYTE_LENGTH]);
+    StoreSecretKeyId::from_bytes(key_id)
+}
+
+/// Build the synthetic store-secret key used by the unsafe example path.
+fn derive_unsafe_checklist_store_secret_key(
+    config: &ChecklistAppConfig,
+) -> [u8; STORE_SECRET_KEY_LENGTH] {
+    derive_unsafe_checklist_store_secret_digest(UNSAFE_STORE_SECRET_KEY_DOMAIN, config)
+}
+
+/// Bind unsafe derivation to this example application and full profile string.
+fn derive_unsafe_checklist_store_secret_digest(
+    domain: &[u8],
+    config: &ChecklistAppConfig,
+) -> [u8; 32] {
+    let application_id = checklist_application_id().to_string();
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(application_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(config.store_secret_profile.as_str().as_bytes());
+    hasher.finalize().into()
 }
 
 /// Generate the fixed key-file pair expected by replicated-checklist config.
@@ -1175,6 +1240,48 @@ mod tests {
         .expect("checklist sync publish should succeed");
         working_set.set_read_token(receipt.read_token);
         working_set.finish_successful_sync(Some(plan));
+    }
+
+    // TODO(flotsync-lsi8): Remove these unsafe profile tests with the temporary
+    // derivation path they cover.
+    #[test]
+    fn unsafe_store_secret_profile_derives_stable_security_without_keyring() {
+        let mut config = test_config(GroupId(Uuid::from_u128(0x51afe)), PathBuf::from("unused"));
+        config.store_secret_profile =
+            flotsync_replication::LocalStoreSecretProfile::new("unsafe:raspberrypi")
+                .expect("unsafe test profile should build");
+
+        let first =
+            load_checklist_replication_security(&config).expect("unsafe security should derive");
+        let second =
+            load_checklist_replication_security(&config).expect("unsafe security should derive");
+
+        assert_eq!(first.store_secret_key_id(), second.store_secret_key_id());
+        assert_ne!(
+            first.store_secret_key_id().to_string(),
+            "00000000-0000-0000-0000-000000000000"
+        );
+    }
+
+    #[test]
+    fn unsafe_store_secret_profile_changes_derived_key_id() {
+        let mut first_config =
+            test_config(GroupId(Uuid::from_u128(0x51aff)), PathBuf::from("unused-a"));
+        first_config.store_secret_profile =
+            flotsync_replication::LocalStoreSecretProfile::new("unsafe:first-pi")
+                .expect("first unsafe test profile should build");
+        let mut second_config =
+            test_config(GroupId(Uuid::from_u128(0x51b00)), PathBuf::from("unused-b"));
+        second_config.store_secret_profile =
+            flotsync_replication::LocalStoreSecretProfile::new("unsafe:second-pi")
+                .expect("second unsafe test profile should build");
+
+        let first = load_checklist_replication_security(&first_config)
+            .expect("first unsafe security should derive");
+        let second = load_checklist_replication_security(&second_config)
+            .expect("second unsafe security should derive");
+
+        assert_ne!(first.store_secret_key_id(), second.store_secret_key_id());
     }
 
     #[test]

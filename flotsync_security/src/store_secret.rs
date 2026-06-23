@@ -219,7 +219,8 @@ fn store_secret_aad(context: StoreSecretContext<'_>) -> Vec<u8> {
 pub struct StoreSecretKeyId(Uuid);
 
 impl StoreSecretKeyId {
-    pub(crate) const BYTE_LENGTH: usize = 16;
+    /// Byte length of one encoded store-secret key id.
+    pub const BYTE_LENGTH: usize = 16;
 
     /// Return opaque key-id bytes for authenticated store-secret context.
     #[must_use]
@@ -232,8 +233,12 @@ impl StoreSecretKeyId {
         Self(Uuid::new_v4())
     }
 
+    /// Build a store-secret key id from encoded bytes.
+    ///
+    /// TODO(flotsync-lsi8): Re-evaluate this public constructor once the
+    /// temporary checklist unsafe profile path is removed.
     #[must_use]
-    pub(crate) const fn from_bytes(value: [u8; Self::BYTE_LENGTH]) -> Self {
+    pub const fn from_bytes(value: [u8; Self::BYTE_LENGTH]) -> Self {
         Self(Uuid::from_bytes(value))
     }
 

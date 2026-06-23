@@ -48,6 +48,14 @@ the temporary `group-secret-password`, `local-private-jwks-path`, and
 store-secret slot; the group password and this application-side provisioning
 step are temporary for the current security MVP.
 
+<!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
+proper local store-secret backend exists. -->
+On headless Linux machines without a working Secret Service keyring, use an
+explicitly unsafe profile such as `unsafe:raspberrypi`. This skips OS keyring
+storage and derives the local store secret from the profile string. Changing
+that profile later makes existing local security material unreadable; delete the
+example store and start fresh if you change it.
+
 Use one terminal per peer. In each REPL, run:
 
 ```text
