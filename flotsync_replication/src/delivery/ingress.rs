@@ -22,7 +22,7 @@ use super::{
     },
 };
 use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
-use flotsync_route_transport::{
+use flotsync_routes::{
     InboundTransportMeta,
     RouteTransportInboundDeliver,
     RouteTransportPort,
@@ -429,9 +429,9 @@ mod tests {
     }
 
     fn test_route() -> TransportRouteKey {
-        TransportRouteKey::Udp(flotsync_route_transport::UdpRouteKey {
+        TransportRouteKey::Udp(flotsync_routes::UdpRouteKey {
             remote_addr: "127.0.0.1:40100".parse().expect("test remote address"),
-            scope: flotsync_route_transport::DatagramRouteScope::Unicast,
+            scope: flotsync_routes::DatagramRouteScope::Unicast,
             local_bind: Some("127.0.0.1:40200".parse().expect("test local bind")),
         })
     }

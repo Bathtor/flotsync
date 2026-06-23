@@ -1,3 +1,5 @@
+//! Shared utility helpers used across Flotsync crates.
+
 use kompact::prelude::{HandlerError, HandlerResultExt as _};
 use snafu::{FromString, OptionExt as SnafuOptionExt, ResultExt as SnafuResultExt};
 use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time::Duration};
@@ -5,11 +7,13 @@ use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
+pub mod kompact_fsm;
 pub mod kompact_testing;
 pub mod testing;
 
 pub use async_std::future::TimeoutError;
 pub use claimable_promise::KClaimablePromise;
+pub use kompact;
 
 /// Heap-allocated, `Send` future used by dyn-friendly async APIs.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;

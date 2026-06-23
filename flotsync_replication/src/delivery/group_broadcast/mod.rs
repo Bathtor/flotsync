@@ -18,7 +18,7 @@ use flotsync_messages::{
     endpoint as endpoint_proto,
     serialisation::FlotsyncSerializable,
 };
-use flotsync_route_transport::{
+use flotsync_routes::{
     RouteDiscoveryPort,
     RouteSendId,
     RouteSharingKind,
@@ -542,7 +542,7 @@ mod tests {
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
     };
-    use flotsync_route_transport::{
+    use flotsync_routes::{
         DatagramRouteScope,
         InboundTransportMeta,
         RoutePreferenceRank,

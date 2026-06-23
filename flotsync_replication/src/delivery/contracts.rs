@@ -10,7 +10,7 @@ use kompact::prelude::Port;
 use snafu::prelude::*;
 use std::time::SystemTime;
 
-pub use flotsync_route_transport::DiscoveryRouteUpdate;
+pub use flotsync_routes::DiscoveryRouteUpdate;
 
 /// Group-broadcast Kompact port.
 #[derive(Clone, Copy, Debug)]

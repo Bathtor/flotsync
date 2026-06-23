@@ -1,11 +1,9 @@
+//! Runtime-host adapters between route establishment and delivery transport.
+
 use crate::delivery::security::DeliverySecurity;
 use flotsync_core::MemberIdentity;
-use flotsync_discovery::{
-    protocol::DiscoveryRoute,
-    route_establishment::{DiscoveryCredentialFuture, DiscoveryCredentials},
-    route_publication::{DiscoveryRoutePort, DiscoveryRouteUpdate},
-};
-use flotsync_route_transport::{
+use flotsync_discovery::protocol::DiscoveryRoute;
+use flotsync_routes::{
     DatagramRouteScope,
     DiscoveryRouteUpdate as TransportDiscoveryRouteUpdate,
     RouteDiscoveryPort,
@@ -14,6 +12,8 @@ use flotsync_route_transport::{
     SendRouteCandidate,
     TransportRouteKey,
     UdpRouteKey,
+    route_establishment::{DiscoveryCredentialFuture, DiscoveryCredentials},
+    route_publication::{DiscoveryRoutePort, DiscoveryRouteUpdate},
 };
 use flotsync_utils::BoxError;
 use futures_util::FutureExt as _;

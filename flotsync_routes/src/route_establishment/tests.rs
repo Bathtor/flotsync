@@ -1,15 +1,12 @@
+//! Route-establishment component tests.
+
 use super::{
     component::{claim_matches_group_memberships, local_claim_group_ids},
-    observation::SocketState,
     *,
 };
 use crate::{
-    DEFAULT_DISCOVERY_PORT,
-    config_keys,
-    endpoint_selection::EndpointSelection,
     protocol::{
         decode_endpoint_discovery_frame_from_buf,
-        discovery_route_from_wire,
         introduction_endpoint_frame,
         introduction_request_endpoint_frame,
     },
@@ -20,6 +17,11 @@ use flotsync_core::{
     member::{Identifier, TrieSet},
     membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
 };
+use flotsync_discovery::{
+    endpoint_selection::EndpointSelection,
+    protocol::{DiscoveryRoute, discovery_route_from_wire},
+    services::PeerAnnouncementObserved,
+};
 use flotsync_io::{
     prelude::{
         EgressPool,
@@ -27,17 +29,14 @@ use flotsync_io::{
         IoBufferPools,
         IoPayload,
         SocketId,
-        UdpBindOptions,
         UdpCloseReason,
         UdpIndication,
-        UdpLocalBind,
         UdpOpenRequestId,
         UdpPort,
         UdpRequest,
     },
     test_support::{
         build_test_kompact_system,
-        build_test_kompact_system_with,
         eventually_component_state,
         kill_component,
         start_component,
@@ -56,14 +55,7 @@ use flotsync_utils::{
 };
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
-use std::{
-    cell::Cell,
-    collections::HashSet,
-    io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{cell::Cell, collections::HashSet, io, net::SocketAddr, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
@@ -702,26 +694,6 @@ fn config_accepts_concrete_advertised_route() {
 }
 
 #[test]
-fn combined_peer_announcement_setup_rejects_bind_port_mismatch() {
-    let mut config = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52157)));
-    config.peer_announcement_bind_addr = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        *DEFAULT_DISCOVERY_PORT + 1,
-    );
-
-    let result =
-        peer_announcement_and_observation_components(PeerAnnouncementOptions::DEFAULT, config);
-
-    assert_eq!(
-        result.err(),
-        Some(PeerAnnouncementSetupError::BindPortMismatch {
-            sender_bind_port: *DEFAULT_DISCOVERY_PORT,
-            observer_bind_port: *DEFAULT_DISCOVERY_PORT + 1,
-        })
-    );
-}
-
-#[test]
 fn local_claim_groups_only_include_groups_hosted_by_local_member() {
     let local_member = member(["alice"]);
     let remote_member = member(["bob"]);
@@ -808,133 +780,6 @@ fn verified_claim_acceptance_uses_group_membership_snapshot() {
         &unknown_member,
         &matching_claim,
     ));
-}
-
-#[test]
-fn observing_peer_announcement_component_infers_socket_id_by_configured_port() {
-    let peer_port = 53156;
-    let mut config = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52157)));
-    config.peer_announcement_bind_addr =
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), peer_port);
-    config.instance_id = Uuid::from_u128(9);
-    let system = build_test_kompact_system();
-    let component = system.create(move || {
-        PeerAnnouncementObservationComponent::with_socket_maintenance(
-            config,
-            PeerAnnouncementSocketMaintenance::Observe,
-        )
-    });
-
-    component.on_definition(|component| {
-        let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-            component,
-            UdpIndication::Bound {
-                request_id: UdpOpenRequestId::new(),
-                socket_id: SocketId(77),
-                local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port)),
-            },
-        )
-        .expect("bound indication should be handled");
-
-        assert_eq!(
-            component.socket_state(),
-            &SocketState::Listening {
-                socket_id: SocketId(77)
-            }
-        );
-
-        let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-            component,
-            UdpIndication::Closed {
-                socket_id: SocketId(77),
-                remote_addr: None,
-                reason: UdpCloseReason::Requested,
-            },
-        )
-        .expect("close indication should be handled");
-
-        assert_eq!(component.socket_state(), &SocketState::WaitingForSocket);
-    });
-
-    system.shutdown().wait().expect("Kompact shutdown");
-}
-
-#[test]
-fn observing_peer_announcement_component_ignores_other_bound_ports() {
-    let peer_port = 53157;
-    let mut config = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52157)));
-    config.peer_announcement_bind_addr =
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), peer_port);
-    config.instance_id = Uuid::from_u128(10);
-    let system = build_test_kompact_system();
-    let component = system.create(move || {
-        PeerAnnouncementObservationComponent::with_socket_maintenance(
-            config,
-            PeerAnnouncementSocketMaintenance::Observe,
-        )
-    });
-
-    component.on_definition(|component| {
-        let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-            component,
-            UdpIndication::Bound {
-                request_id: UdpOpenRequestId::new(),
-                socket_id: SocketId(78),
-                local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port + 1)),
-            },
-        )
-        .expect("bound indication should be handled");
-
-        assert_eq!(component.socket_state(), &SocketState::WaitingForSocket);
-    });
-
-    system.shutdown().wait().expect("Kompact shutdown");
-}
-
-#[test]
-fn observing_peer_announcement_maintainer_uses_shared_bind_reuse_config() {
-    let peer_port = 53158;
-    let mut config = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52157)));
-    config.peer_announcement_bind_addr =
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), peer_port);
-    let system = build_test_kompact_system_with(|config| {
-        config.set_config_value(&config_keys::PEER_ANNOUNCEMENT_BIND_REUSE_ADDRESS, false);
-    });
-    let probe = system.create(UdpPort::tester_component_sidecar);
-    let probe_ref = probe.actor_ref();
-    let component = system.create(move || {
-        PeerAnnouncementObservationComponent::with_socket_maintenance(
-            config,
-            PeerAnnouncementSocketMaintenance::Maintain,
-        )
-    });
-    biconnect_components::<UdpPort, _, _>(&probe, &component).expect("connect probe/component");
-
-    start_component(&system, &probe);
-    start_component(&system, &component);
-
-    let bind = probe_ref
-        .observe_request(|request| matches!(request, UdpRequest::Bind { .. }))
-        .wait_timeout(Duration::from_secs(1))
-        .expect("UDP bind request should be observed")
-        .expect("UDP probe should stay live");
-    match bind.request() {
-        UdpRequest::Bind { bind, options, .. } => {
-            assert_eq!(
-                *bind,
-                UdpLocalBind::Exact(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                    peer_port
-                ))
-            );
-            assert_eq!(*options, UdpBindOptions::default().with_socket_reuse(false));
-        }
-        other => unreachable!("filtered to bind request, got {other:?}"),
-    }
-
-    kill_component(&system, component);
-    kill_component(&system, probe);
-    system.shutdown().wait().expect("Kompact shutdown");
 }
 
 #[test]

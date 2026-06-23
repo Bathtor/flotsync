@@ -1,5 +1,7 @@
-use crate::protocol::DiscoveryRoute;
+//! Mutable route-establishment state and manual watch reconciliation.
+
 use flotsync_core::{MemberIdentity, member::TrieSet};
+use flotsync_discovery::protocol::DiscoveryRoute;
 use flotsync_messages::discovery as discovery_proto;
 use flotsync_security::FrameSignature;
 use kompact::prelude::ScheduledTimer;

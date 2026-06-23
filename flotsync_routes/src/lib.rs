@@ -20,9 +20,38 @@
 //! - inbound delivery is port-based because it is an unsolicited event stream
 //!   produced by the network.
 
+pub use kompact;
+
 pub mod manager;
+pub mod protocol;
+pub mod route_establishment;
+pub mod route_publication;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+/// Kompact configuration keys consumed by route-establishment support.
+pub mod config_keys {
+    use kompact::{config::DurationValue, kompact_config};
+    use std::time::Duration;
+
+    kompact_config! {
+        ROUTE_ESTABLISHMENT_PROBE_TIMEOUT,
+        key = "flotsync.discovery.route-establishment.probe-timeout",
+        type = DurationValue,
+        default = Duration::from_secs(2),
+        doc = "Maximum wait for a route establishment introduction response before a probe is considered stale.",
+        version = "0.1.0"
+    }
+
+    kompact_config! {
+        ROUTE_ESTABLISHMENT_REACHABLE_LEASE,
+        key = "flotsync.discovery.route-establishment.reachable-lease",
+        type = DurationValue,
+        default = Duration::from_secs(30),
+        doc = "Time for which one verified route remains published before refresh is required.",
+        version = "0.1.0"
+    }
+}
 
 use flotsync_core::MemberIdentity;
 use flotsync_io::prelude::{IoPayload, SocketId};

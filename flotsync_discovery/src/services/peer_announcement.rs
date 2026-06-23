@@ -1,3 +1,5 @@
+//! UDP peer-announcement sender component.
+
 use crate::{
     DEFAULT_DISCOVERY_PORT,
     SocketPort,

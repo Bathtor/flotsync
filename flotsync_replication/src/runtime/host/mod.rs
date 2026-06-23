@@ -1,3 +1,5 @@
+//! Kompact component topology for a replication runtime host.
+
 use super::{
     ReplicationRuntimeComponent,
     catch_up_manager::CatchUpManagerComponent,
@@ -22,17 +24,10 @@ use flotsync_core::{
 use flotsync_discovery::{
     config_keys as discovery_config_keys,
     endpoint_selection::EndpointSelectionPort,
-    route_establishment::{
-        ManualRouteWatchError,
-        PeerAnnouncementObservationComponent,
-        PeerAnnouncementObservationPort,
-        RouteEstablishmentComponent,
-        RouteEstablishmentConfig,
-        RouteEstablishmentMessage,
-    },
-    route_publication::DiscoveryRoutePort,
     services::{
         PeerAnnouncementComponent,
+        PeerAnnouncementObservationComponent,
+        PeerAnnouncementObservationPort,
         PeerAnnouncementOptions,
         PeerAnnouncementSocketMaintenance,
     },
@@ -49,7 +44,7 @@ use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
-use flotsync_route_transport::{
+use flotsync_routes::{
     ExternalUdpSocketRegistration,
     ExternalUdpSocketRegistrationError,
     RouteDiscoveryPort,
@@ -58,6 +53,13 @@ use flotsync_route_transport::{
     TransportRouteKey,
     UDPourConfig,
     manager::{RouteTransportManager, configure_replication_runtime},
+    route_establishment::{
+        ManualRouteWatchError,
+        RouteEstablishmentComponent,
+        RouteEstablishmentConfig,
+        RouteEstablishmentMessage,
+    },
+    route_publication::DiscoveryRoutePort,
 };
 use flotsync_utils::{FutureTimeoutExt as _, TimeoutError};
 use futures_util::{FutureExt, future::BoxFuture};
@@ -710,10 +712,10 @@ impl DiscoveryTopology {
             .with_socket_maintenance(PeerAnnouncementSocketMaintenance::Maintain);
         let peer_announcement =
             system.create(move || PeerAnnouncementComponent::with_options(peer_options));
-        let peer_observation_config = route_config.clone();
+        let peer_observation_bind_addr = route_config.peer_announcement_bind_addr;
         let peer_announcement_observation = system.create(move || {
             PeerAnnouncementObservationComponent::with_socket_maintenance(
-                peer_observation_config,
+                peer_observation_bind_addr,
                 PeerAnnouncementSocketMaintenance::Observe,
             )
         });
@@ -816,7 +818,7 @@ impl DiscoveryTopology {
     #[cfg(any(test, feature = "test-support"))]
     fn publish_route_update(
         &self,
-        update: flotsync_route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
+        update: flotsync_routes::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
         self.route_adapter_ref
             .tell(DiscoveryRouteAdapterMessage::Publish(update));
@@ -1249,7 +1251,7 @@ impl DeliveryRuntimeHost {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish_route_update(
         &self,
-        update: flotsync_route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
+        update: flotsync_routes::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
         self.topology().discovery.publish_route_update(update);
     }
@@ -1423,7 +1425,7 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use flotsync_route_transport::{
+        use flotsync_routes::{
             DatagramRouteScope,
             RoutePreferenceRank,
             RouteSharingKind,
@@ -1440,7 +1442,7 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             sharing: RouteSharingKind::Exclusive,
             preference_rank: RoutePreferenceRank::new(1),
         };
-        self.publish_route_update(flotsync_route_transport::DiscoveryRouteUpdate::PeerRoutes {
+        self.publish_route_update(flotsync_routes::DiscoveryRouteUpdate::PeerRoutes {
             peer: peer.clone(),
             routes: vec![route],
         });

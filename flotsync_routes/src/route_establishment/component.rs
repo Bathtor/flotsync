@@ -1,9 +1,9 @@
-use super::{DiscoveryCredentials, PeerAnnouncementObserved};
+//! Kompact component implementing route establishment probes and introductions.
+
+use super::DiscoveryCredentials;
 use crate::{
     config_keys,
-    endpoint_selection::{EndpointSelection, EndpointSelectionPort},
     protocol::{
-        DiscoveryRoute,
         decode_endpoint_discovery_frame_from_buf,
         decode_introduction_claim_group_ids,
         introduction_endpoint_frame,
@@ -21,6 +21,11 @@ use flotsync_core::{
     MemberIdentity,
     member::{TrieMap, TrieSet},
     membership::{GroupMemberships, SharedGroupMemberships},
+};
+use flotsync_discovery::{
+    endpoint_selection::{EndpointSelection, EndpointSelectionPort},
+    protocol::DiscoveryRoute,
+    services::{PeerAnnouncementObservationPort, PeerAnnouncementObserved},
 };
 use flotsync_io::prelude::{
     EgressPool,
@@ -110,7 +115,7 @@ pub struct RouteEstablishmentComponent {
     /// Route source port where verified peer routes are published.
     discovery_port: ProvidedPort<DiscoveryRoutePort>,
     /// Peer-announcement input from one or more announcement protocols.
-    announcement_port: RequiredPort<super::PeerAnnouncementObservationPort>,
+    announcement_port: RequiredPort<PeerAnnouncementObservationPort>,
     /// UDP transport port shared with the replication endpoint.
     udp_port: RequiredPort<UdpPort>,
     /// Receives selected local endpoints used for signed introduction claims.
@@ -958,7 +963,7 @@ impl Require<UdpPort> for RouteEstablishmentComponent {
     }
 }
 
-impl Require<super::PeerAnnouncementObservationPort> for RouteEstablishmentComponent {
+impl Require<PeerAnnouncementObservationPort> for RouteEstablishmentComponent {
     fn handle(&mut self, indication: PeerAnnouncementObserved) -> HandlerResult {
         Handled::block_on(self, async move |mut async_self| {
             async_self.handle_peer_announcement_async(indication).await;

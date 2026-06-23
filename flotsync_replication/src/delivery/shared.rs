@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 use flotsync_core::{GroupId, MemberIdentity};
-use flotsync_route_transport::{RelayIdentity, RouteSendId};
+use flotsync_routes::{RelayIdentity, RouteSendId};
 use std::{fmt, time::SystemTime};
 use uuid::Uuid;
 

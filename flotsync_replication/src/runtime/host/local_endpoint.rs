@@ -1,3 +1,5 @@
+//! Local UDP endpoint binding and endpoint-selection publication.
+
 use super::{
     BindLocalEndpointSnafu,
     ControlFutureSnafu,
@@ -5,17 +7,13 @@ use super::{
     RuntimeHostError,
     config_keys,
 };
-use flotsync_discovery::{
-    endpoint_selection::{
-        EndpointSelection,
-        EndpointSelectionPolicy,
-        EndpointSelectionPort,
-        InterfaceSnapshot,
-        InterfaceSnapshotProvider,
-        PnetInterfaceSnapshotProvider,
-    },
-    kompact_fsm::{State, StateUpdate},
-    transform_state_match,
+use flotsync_discovery::endpoint_selection::{
+    EndpointSelection,
+    EndpointSelectionPolicy,
+    EndpointSelectionPort,
+    InterfaceSnapshot,
+    InterfaceSnapshotProvider,
+    PnetInterfaceSnapshotProvider,
 };
 use flotsync_io::prelude::{
     SocketId,
@@ -26,7 +24,11 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
-use flotsync_utils::FutureTimeoutExt as _;
+use flotsync_utils::{
+    FutureTimeoutExt as _,
+    kompact_fsm::{State, StateUpdate},
+    transform_state_match,
+};
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
 use snafu::ResultExt;

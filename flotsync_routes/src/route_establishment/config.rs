@@ -1,4 +1,6 @@
-use crate::DEFAULT_DISCOVERY_PORT;
+//! Route-establishment configuration and advertised-route validation.
+
+use flotsync_discovery::DEFAULT_DISCOVERY_PORT;
 use snafu::Snafu;
 use std::{
     collections::BTreeSet,

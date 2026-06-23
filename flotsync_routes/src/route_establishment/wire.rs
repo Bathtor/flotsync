@@ -1,10 +1,12 @@
-use crate::protocol::{
+//! Wire-level validation helpers for signed route-establishment introductions.
+
+use crate::protocol::decode_introduction_claim_payload_view;
+use flotsync_core::MemberIdentity;
+use flotsync_discovery::protocol::{
     DiscoveryProtocolError,
     DiscoveryRoute,
-    decode_introduction_claim_payload_view,
     discovery_route_from_wire_view,
 };
-use flotsync_core::MemberIdentity;
 use flotsync_messages::{
     buffa::EnumValue,
     discovery::{self as discovery_proto, IntroductionClaimPayloadView},

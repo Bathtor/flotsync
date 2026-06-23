@@ -1,5 +1,7 @@
-use crate::protocol::DiscoveryRoute;
+//! Verified route publication port and update types.
+
 use flotsync_core::MemberIdentity;
+use flotsync_discovery::protocol::DiscoveryRoute;
 use kompact::prelude::{Never, Port};
 use smallvec::SmallVec;
 use std::net::SocketAddr;
@@ -21,7 +23,9 @@ pub struct DiscoveryRouteCandidate {
 pub enum DiscoveryRouteUpdate {
     /// Fully replace the route set for `peer`; an empty list withdraws all routes.
     PeerRoutes {
+        /// Peer whose verified routes are being replaced.
         peer: MemberIdentity,
+        /// Complete replacement route set for the peer.
         routes: DiscoveryRouteCandidates,
     },
 }

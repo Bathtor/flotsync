@@ -68,7 +68,15 @@ use crate::NonOwningPhantomData;
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
 use snafu::{ResultExt as _, Whatever};
-use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    marker::PhantomData,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
+const EVENTUALLY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Future returned by typed observation helpers.
 ///
@@ -82,6 +90,46 @@ pub type ObservedRequest<PortType> = ObservedEvent<PortType, RequestEvent>;
 
 /// One indication selected from a [`PortTesterComponent`] event log.
 pub type ObservedIndication<PortType> = ObservedEvent<PortType, IndicationEvent>;
+
+/// Wait until `predicate` becomes true or `timeout` elapses.
+///
+/// # Panics
+///
+/// Panics with `failure_message` if the predicate does not become true before the timeout.
+pub fn eventually(
+    timeout: Duration,
+    mut predicate: impl FnMut() -> bool,
+    failure_message: impl fmt::Display,
+) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if predicate() {
+            return;
+        }
+        thread::sleep(EVENTUALLY_POLL_INTERVAL);
+    }
+    panic!("{failure_message}");
+}
+
+/// Wait until one component-state predicate becomes true or `timeout` elapses.
+///
+/// # Panics
+///
+/// Panics with `failure_message` if the predicate does not become true before the timeout.
+pub fn eventually_component_state<C>(
+    timeout: Duration,
+    component: &Arc<Component<C>>,
+    mut predicate: impl FnMut(&mut C) -> bool,
+    failure_message: impl fmt::Display,
+) where
+    C: ComponentDefinition + Sized + 'static,
+{
+    eventually(
+        timeout,
+        || component.on_definition(|definition| predicate(definition)),
+        failure_message,
+    );
+}
 
 /// One event observed on a Kompact port pair.
 ///

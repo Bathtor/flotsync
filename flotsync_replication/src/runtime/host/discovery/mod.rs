@@ -1,8 +1,11 @@
+//! Runtime-host discovery configuration and static route parsing.
+
 use super::RuntimeHostError;
 use flotsync_core::MemberIdentity;
-use flotsync_discovery::{protocol::DiscoveryRoute, route_establishment::WatchedRoute};
+use flotsync_discovery::protocol::DiscoveryRoute;
+use flotsync_routes::route_establishment::WatchedRoute;
 #[cfg(test)]
-use flotsync_route_transport::{
+use flotsync_routes::{
     DatagramRouteScope,
     DiscoveryRouteUpdate,
     RoutePreferenceRank,

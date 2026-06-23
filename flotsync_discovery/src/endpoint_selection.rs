@@ -284,7 +284,6 @@ impl Default for EndpointSelectionPolicy {
     }
 }
 
-#[cfg(feature = "kompact-runtime")]
 pub use kompact_port::EndpointSelectionPort;
 
 /// Raw bit shared by interface and endpoint-selection policy flags for running interfaces.
@@ -366,7 +365,6 @@ fn interface_is_running(interface: &datalink::NetworkInterface) -> bool {
     }
 }
 
-#[cfg(feature = "kompact-runtime")]
 mod kompact_port {
     //! Kompact port for publishing endpoint-selection updates.
 

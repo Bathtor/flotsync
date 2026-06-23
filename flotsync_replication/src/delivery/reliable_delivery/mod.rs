@@ -31,7 +31,7 @@ use flotsync_messages::{
     endpoint as endpoint_proto,
     serialisation::FlotsyncSerializable,
 };
-use flotsync_route_transport::{
+use flotsync_routes::{
     RelayIdentity,
     RouteDiscoveryPort,
     RouteSendId,
@@ -1287,7 +1287,7 @@ mod tests {
             start_component,
         },
     };
-    use flotsync_route_transport::{
+    use flotsync_routes::{
         DatagramRouteScope,
         RoutePreferenceRank,
         RouteTransportPort,

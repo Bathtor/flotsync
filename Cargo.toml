@@ -6,7 +6,7 @@ members = [
     "flotsync_discovery_cli",
     "flotsync_data_types",
     "flotsync_security",
-    "flotsync_route_transport",
+    "flotsync_routes",
     "flotsync_udpour",
     "flotsync_utils",
     "flotsync_replication",
