@@ -1,6 +1,8 @@
 use super::RuntimeHostError;
+use flotsync_core::MemberIdentity;
+use flotsync_discovery::{protocol::DiscoveryRoute, route_establishment::WatchedRoute};
 #[cfg(test)]
-use crate::delivery::route_transport::{
+use flotsync_route_transport::{
     DatagramRouteScope,
     DiscoveryRouteUpdate,
     RoutePreferenceRank,
@@ -9,8 +11,6 @@ use crate::delivery::route_transport::{
     TransportRouteKey,
     UdpRouteKey,
 };
-use flotsync_core::MemberIdentity;
-use flotsync_discovery::{protocol::DiscoveryRoute, route_establishment::WatchedRoute};
 use kompact::config::{Config, ConfigError, ConfigLookup};
 use std::{
     fmt,

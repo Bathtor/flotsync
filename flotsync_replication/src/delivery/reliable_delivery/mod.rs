@@ -9,16 +9,6 @@ use super::{
         ReliableDeliveryPortRequest,
     },
     ingress::InboundDeliveryMeta,
-    route_transport::{
-        RouteDiscoveryPort,
-        RouteSharingKind,
-        RouteTransportActorMessage,
-        RouteTransportNackReason,
-        RouteTransportSend,
-        RouteTransportSubmitResult,
-        SendRouteCandidate,
-        TransportRouteKey,
-    },
     security::{DeliverySecurity, DeliverySecurityError},
     shared::{
         ActiveRouteRecord,
@@ -28,9 +18,7 @@ use super::{
         MessageId,
         PendingRouteReason,
         PlaintextPayload,
-        RelayIdentity,
         RouteActiveState,
-        RouteSendId,
         SignedEnvelopeFooter,
         StableRouteKey,
         WorkScopeKey,
@@ -42,6 +30,18 @@ use flotsync_messages::{
     delivery as delivery_proto,
     endpoint as endpoint_proto,
     serialisation::FlotsyncSerializable,
+};
+use flotsync_route_transport::{
+    RelayIdentity,
+    RouteDiscoveryPort,
+    RouteSendId,
+    RouteSharingKind,
+    RouteTransportActorMessage,
+    RouteTransportNackReason,
+    RouteTransportSend,
+    RouteTransportSubmitResult,
+    SendRouteCandidate,
+    TransportRouteKey,
 };
 use flotsync_security::SealedHPKEPayload;
 use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
@@ -1265,12 +1265,6 @@ mod tests {
         SqliteReplicationStore,
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-            route_transport::{
-                DatagramRouteScope,
-                RoutePreferenceRank,
-                RouteTransportPort,
-                UdpRouteKey,
-            },
             test_support::{
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
@@ -1292,6 +1286,12 @@ mod tests {
             localhost,
             start_component,
         },
+    };
+    use flotsync_route_transport::{
+        DatagramRouteScope,
+        RoutePreferenceRank,
+        RouteTransportPort,
+        UdpRouteKey,
     };
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{

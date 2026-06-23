@@ -1,0 +1,22 @@
+[package]
+name = "flotsync_route_transport"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+test-support = ["flotsync_io/test-support"]
+
+[dependencies]
+flotsync_core = { path = "../flotsync_core" }
+flotsync_io = { path = "../flotsync_io", default-features = false }
+flotsync_messages = { path = "../flotsync_messages" }
+flotsync_udpour = { path = "../flotsync_udpour" }
+flotsync_utils = { path = "../flotsync_utils" }
+kompact = { workspace = true }
+snafu = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
+futures-util = { workspace = true }

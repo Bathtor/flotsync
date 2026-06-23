@@ -14,12 +14,6 @@
 use super::{
     group_broadcast::{GroupBroadcastInboundDeliver, GroupBroadcastInboundPort},
     reliable_delivery::{ReliableDeliveryInboundDeliver, ReliableDeliveryInboundPort},
-    route_transport::{
-        InboundTransportMeta,
-        RouteTransportInboundDeliver,
-        RouteTransportPort,
-        TransportRouteKey,
-    },
     shared::{MessageId, RouteEndpoint},
     wire::{
         DecodedDeliveryFrame,
@@ -28,6 +22,12 @@ use super::{
     },
 };
 use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
+use flotsync_route_transport::{
+    InboundTransportMeta,
+    RouteTransportInboundDeliver,
+    RouteTransportPort,
+    TransportRouteKey,
+};
 use flotsync_utils::ResultExt as _;
 use kompact::{Never, prelude::*};
 use std::{collections::HashSet, sync::Arc};
@@ -429,9 +429,9 @@ mod tests {
     }
 
     fn test_route() -> TransportRouteKey {
-        TransportRouteKey::Udp(super::super::route_transport::UdpRouteKey {
+        TransportRouteKey::Udp(flotsync_route_transport::UdpRouteKey {
             remote_addr: "127.0.0.1:40100".parse().expect("test remote address"),
-            scope: super::super::route_transport::DatagramRouteScope::Unicast,
+            scope: flotsync_route_transport::DatagramRouteScope::Unicast,
             local_bind: Some("127.0.0.1:40200".parse().expect("test local bind")),
         })
     }

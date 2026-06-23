@@ -1,21 +1,19 @@
-use crate::delivery::{
-    route_transport::{
-        DatagramRouteScope,
-        DiscoveryRouteUpdate as TransportDiscoveryRouteUpdate,
-        RouteDiscoveryPort,
-        RoutePreferenceRank,
-        RouteSharingKind,
-        SendRouteCandidate,
-        TransportRouteKey,
-        UdpRouteKey,
-    },
-    security::DeliverySecurity,
-};
+use crate::delivery::security::DeliverySecurity;
 use flotsync_core::MemberIdentity;
 use flotsync_discovery::{
     protocol::DiscoveryRoute,
     route_establishment::{DiscoveryCredentialFuture, DiscoveryCredentials},
     route_publication::{DiscoveryRoutePort, DiscoveryRouteUpdate},
+};
+use flotsync_route_transport::{
+    DatagramRouteScope,
+    DiscoveryRouteUpdate as TransportDiscoveryRouteUpdate,
+    RouteDiscoveryPort,
+    RoutePreferenceRank,
+    RouteSharingKind,
+    SendRouteCandidate,
+    TransportRouteKey,
+    UdpRouteKey,
 };
 use flotsync_utils::BoxError;
 use futures_util::FutureExt as _;

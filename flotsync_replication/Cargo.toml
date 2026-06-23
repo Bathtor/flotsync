@@ -14,8 +14,8 @@ flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_discovery = { path = "../flotsync_discovery", default-features = false, features = ["peer-announcement-via-kompact"] }
 flotsync_messages = { path = "../flotsync_messages" }
+flotsync_route_transport = { path = "../flotsync_route_transport" }
 flotsync_security = { path = "../flotsync_security" }
-flotsync_udpour = { path = "../flotsync_udpour" }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 futures-util = { workspace = true }
@@ -29,4 +29,5 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+flotsync_route_transport = { path = "../flotsync_route_transport", features = ["test-support"] }
 flotsync_security = { path = "../flotsync_security", features = ["test-support"] }

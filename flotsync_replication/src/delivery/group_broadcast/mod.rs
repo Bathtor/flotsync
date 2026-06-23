@@ -3,17 +3,8 @@
 use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
-    route_transport::{
-        RouteDiscoveryPort,
-        RouteSharingKind,
-        RouteTransportActorMessage,
-        RouteTransportSend,
-        RouteTransportSubmitResult,
-        SendRouteCandidate,
-        TransportRouteKey,
-    },
     security::{DeliverySecurity, DeliverySecurityError},
-    shared::{DeliveryClass, MessageId, PlaintextPayload, RouteSendId},
+    shared::{DeliveryClass, MessageId, PlaintextPayload},
 };
 use bytes::Bytes;
 use flotsync_core::{
@@ -26,6 +17,16 @@ use flotsync_messages::{
     delivery as delivery_proto,
     endpoint as endpoint_proto,
     serialisation::FlotsyncSerializable,
+};
+use flotsync_route_transport::{
+    RouteDiscoveryPort,
+    RouteSendId,
+    RouteSharingKind,
+    RouteTransportActorMessage,
+    RouteTransportSend,
+    RouteTransportSubmitResult,
+    SendRouteCandidate,
+    TransportRouteKey,
 };
 use flotsync_security::SealedPSKPayload;
 use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
@@ -524,13 +525,6 @@ mod tests {
         api::{ReplicationGroupRecord, ReplicationStore},
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
-            route_transport::{
-                DatagramRouteScope,
-                InboundTransportMeta,
-                RoutePreferenceRank,
-                RouteTransportPort,
-                UdpRouteKey,
-            },
             test_support::{
                 FULL_STACK_WAIT_TIMEOUT,
                 TransportHarnessCore,
@@ -547,6 +541,13 @@ mod tests {
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
+    };
+    use flotsync_route_transport::{
+        DatagramRouteScope,
+        InboundTransportMeta,
+        RoutePreferenceRank,
+        RouteTransportPort,
+        UdpRouteKey,
     };
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{cell::Cell, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};

@@ -20,6 +20,7 @@ use super::{
     Hash,
     IString,
     InboundTransportMeta,
+    RouteSendId,
     RouteTransportActorMessage,
     RouteTransportInboundDeliver,
     RouteTransportNackReason,
@@ -30,9 +31,8 @@ use super::{
     TransportRouteKey,
     UdpRouteKey,
 };
-use crate::delivery::shared::RouteSendId;
-#[cfg(test)]
-use crate::delivery::test_support::ManagerOwnedUdpBindBudget;
+#[cfg(any(test, feature = "test-support"))]
+use crate::test_support::ManagerOwnedUdpBindBudget;
 use flotsync_io::prelude::{
     IoBridgeHandle,
     IoPayload,
@@ -61,7 +61,7 @@ use flotsync_udpour::{
 };
 use flotsync_utils::OptionExt as _;
 use kompact::{config::UsizeValue, kompact_config, prelude::*};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -114,7 +114,7 @@ pub struct RouteTransportManager {
     /// Logical sends that are still waiting for one route-transport outcome.
     pending_sends: HashMap<RouteSendId, PendingRouteSend>,
     /// Test-only declared budget for manager-owned lazy UDP binds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
 }
 
@@ -141,14 +141,14 @@ impl RouteTransportManager {
             udp_sockets: HashMap::new(),
             tcp_routes: HashMap::new(),
             pending_sends: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_manager_owned_udp_bind_budget: None,
         }
     }
 
     /// Creates one manager with one explicit test-only budget for lazy
     /// manager-owned UDP binds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_with_test_manager_owned_udp_bind_budget(
         system: KompactSystem,
         bridge: IoBridgeHandle,
@@ -192,7 +192,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn test_manager_owned_udp_bind_policy(
         &mut self,
         request_id: UdpOpenRequestId,
@@ -231,7 +231,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -245,7 +245,7 @@ impl RouteTransportManager {
         requested_bind
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn complete_test_manager_owned_udp_bind(
         &mut self,
         request_id: UdpOpenRequestId,
@@ -265,7 +265,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -278,7 +278,7 @@ impl RouteTransportManager {
     ) {
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn fail_test_manager_owned_udp_bind(&mut self, request_id: UdpOpenRequestId) {
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
@@ -293,14 +293,14 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
     )]
     fn fail_test_manager_owned_udp_bind(&mut self, _request_id: UdpOpenRequestId) {}
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn release_test_manager_owned_udp_bind(&mut self, socket_id: SocketId) {
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
@@ -315,7 +315,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -1007,7 +1007,7 @@ impl RouteTransportManager {
 
     /// Test-only probe for whether one externally bound socket has been
     /// incorporated into the manager's current UDP socket state yet.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_external_udp_socket_binding(
         &self,
         socket_id: SocketId,
@@ -1154,7 +1154,7 @@ impl UdpActivationPolicy {
 /// The current replication runtime keeps per-socket `UDPour` children dormant
 /// until a concrete route is first used. That avoids unnecessary startup churn
 /// for sockets that may never carry delivery traffic.
-pub(crate) fn configure_replication_runtime(config: &mut KompactConfig) {
+pub fn configure_replication_runtime(config: &mut KompactConfig) {
     config.set_config_value(
         &config_keys::UDP_ACTIVATION_POLICY,
         UdpActivationPolicy::OnFirstUse.config_value(),
@@ -1356,8 +1356,10 @@ fn classify_udp_connect_failure_for_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delivery::{
-        route_transport::{RoutePreferenceRank, RouteSharingKind, SendRouteCandidate},
+    use crate::{
+        RoutePreferenceRank,
+        RouteSharingKind,
+        SendRouteCandidate,
         test_support::{BoundReservedUdpSocket, TransportHarnessCore},
     };
     use bytes::Bytes;

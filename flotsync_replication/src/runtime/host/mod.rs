@@ -12,15 +12,6 @@ use crate::{
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
         ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         reliable_delivery::{ReliableDeliveryComponent, ReliableDeliveryInboundPort},
-        route_transport::{
-            ExternalUdpSocketRegistration,
-            ExternalUdpSocketRegistrationError,
-            RouteDiscoveryPort,
-            RouteTransportActorMessage,
-            RouteTransportPort,
-            TransportRouteKey,
-            manager::{RouteTransportManager, configure_replication_runtime},
-        },
         security::DeliverySecurity,
     },
 };
@@ -58,7 +49,16 @@ use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
-use flotsync_udpour::UDPourConfig;
+use flotsync_route_transport::{
+    ExternalUdpSocketRegistration,
+    ExternalUdpSocketRegistrationError,
+    RouteDiscoveryPort,
+    RouteTransportActorMessage,
+    RouteTransportPort,
+    TransportRouteKey,
+    UDPourConfig,
+    manager::{RouteTransportManager, configure_replication_runtime},
+};
 use flotsync_utils::{FutureTimeoutExt as _, TimeoutError};
 use futures_util::{FutureExt, future::BoxFuture};
 use kompact::{
@@ -816,7 +816,7 @@ impl DiscoveryTopology {
     #[cfg(any(test, feature = "test-support"))]
     fn publish_route_update(
         &self,
-        update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
+        update: flotsync_route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
         self.route_adapter_ref
             .tell(DiscoveryRouteAdapterMessage::Publish(update));
@@ -1249,7 +1249,7 @@ impl DeliveryRuntimeHost {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn publish_route_update(
         &self,
-        update: crate::delivery::route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
+        update: flotsync_route_transport::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
         self.topology().discovery.publish_route_update(update);
     }
@@ -1423,7 +1423,7 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
     }
 
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr) {
-        use crate::delivery::route_transport::{
+        use flotsync_route_transport::{
             DatagramRouteScope,
             RoutePreferenceRank,
             RouteSharingKind,
@@ -1440,12 +1440,10 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             sharing: RouteSharingKind::Exclusive,
             preference_rank: RoutePreferenceRank::new(1),
         };
-        self.publish_route_update(
-            crate::delivery::route_transport::DiscoveryRouteUpdate::PeerRoutes {
-                peer: peer.clone(),
-                routes: vec![route],
-            },
-        );
+        self.publish_route_update(flotsync_route_transport::DiscoveryRouteUpdate::PeerRoutes {
+            peer: peer.clone(),
+            routes: vec![route],
+        });
         wait_for_direct_peer_route(self.topology(), &peer);
     }
 

@@ -21,11 +21,14 @@
 //!   produced by the network.
 
 pub mod manager;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
-use super::shared::{RelayIdentity, RouteSendId};
 use flotsync_core::MemberIdentity;
 use flotsync_io::prelude::{IoPayload, SocketId};
 use flotsync_messages::serialisation::FlotsyncSerializable;
+/// Per-socket `UDPour` runtime configuration used by route transport.
+pub use flotsync_udpour::UDPourConfig;
 use flotsync_utils::{IString, NonOwningPhantomData};
 use kompact::{
     Never,
@@ -33,6 +36,22 @@ use kompact::{
 };
 use snafu::Snafu;
 use std::{fmt::Debug, hash::Hash, net::SocketAddr, sync::Arc};
+use uuid::Uuid;
+
+/// Temporary relay identity choice.
+///
+/// Discovery owns identity verification for peers and relays. Until a later
+/// task proves otherwise, relay identities can stay on the same underlying type
+/// as peer/member identities.
+pub type RelayIdentity = MemberIdentity;
+
+/// Stable identifier for one concrete send operation issued against an opaque
+/// discovery-provided route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RouteSendId(
+    /// Caller-provided correlation id for this route-transport send.
+    pub Uuid,
+);
 
 /// Whether semantic delivery may collapse equal candidates into one shared send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -50,8 +69,10 @@ pub enum RouteSharingKind {
 pub struct RoutePreferenceRank(u8);
 
 impl RoutePreferenceRank {
+    /// Preference value used when discovery did not rank one route.
     pub const UNRANKED: Self = Self(0);
 
+    /// Build a route preference from its raw rank value.
     #[must_use]
     pub fn new(value: u8) -> Self {
         Self(value)
@@ -67,30 +88,40 @@ impl RoutePreferenceRank {
 /// Datagram-like delivery scope for one concrete UDP route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DatagramRouteScope {
+    /// Point-to-point UDP route to one remote address.
     Unicast,
+    /// UDP broadcast route for one local network.
     Broadcast,
+    /// UDP multicast route for one multicast group.
     Multicast,
 }
 
 /// Concrete UDP route key owned by route transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct UdpRouteKey {
+    /// Concrete remote UDP address used for outbound datagrams.
     pub remote_addr: SocketAddr,
+    /// Datagram addressing mode for this route.
     pub scope: DatagramRouteScope,
+    /// Optional local UDP bind address required for this route.
     pub local_bind: Option<SocketAddr>,
 }
 
 /// Concrete TCP route key owned by route transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TcpRouteKey {
+    /// Concrete remote TCP address used for connection establishment.
     pub remote_addr: SocketAddr,
+    /// Optional local TCP bind address required for this route.
     pub local_bind: Option<SocketAddr>,
 }
 
 /// Concrete route key used by the current transport-manager sketch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TransportRouteKey {
+    /// UDP-backed route key.
     Udp(UdpRouteKey),
+    /// TCP-backed route key.
     Tcp(TcpRouteKey),
 }
 
@@ -99,8 +130,11 @@ pub enum TransportRouteKey {
 /// `R` is the concrete coverage key type owned by route transport/discovery.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SendRouteCandidate<R> {
+    /// Concrete key used by route transport to identify the candidate.
     pub coverage_key: R,
+    /// Whether equal candidates may share one physical send.
     pub sharing: RouteSharingKind,
+    /// Discovery-provided preference rank for this candidate.
     pub preference_rank: RoutePreferenceRank,
 }
 
@@ -111,12 +145,18 @@ pub struct SendRouteCandidate<R> {
 /// for that identity.
 #[derive(Clone, Debug)]
 pub enum DiscoveryRouteUpdate<R> {
+    /// Replace all known routes for one discovered peer.
     PeerRoutes {
+        /// Peer whose routes are being replaced.
         peer: MemberIdentity,
+        /// Complete replacement route set for the peer.
         routes: Vec<SendRouteCandidate<R>>,
     },
+    /// Replace all known routes for one discovered relay.
     RelayRoutes {
+        /// Relay whose routes are being replaced.
         relay: RelayIdentity,
+        /// Complete replacement route set for the relay.
         routes: Vec<SendRouteCandidate<R>>,
     },
 }
@@ -137,8 +177,11 @@ where
 /// health.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionInfoIndication<R> {
+    /// Report that one concrete route failed and should be downgraded or withdrawn.
     ReportRouteFailed {
+        /// Concrete route that failed.
         route: R,
+        /// Transport-observed failure reason.
         reason: ConnectionFailureReason,
     },
 }
@@ -146,11 +189,19 @@ pub enum ConnectionInfoIndication<R> {
 /// Reasons why a concrete route should be downgraded or dropped by discovery.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionFailureReason {
+    /// Remote endpoint could not be reached.
     Unreachable,
+    /// Remote endpoint refused the transport attempt.
     Refused,
+    /// Transport attempt or exchange timed out.
     TimedOut,
+    /// The route was closed while still considered usable.
     Closed,
-    Other(IString),
+    /// Route failed for a transport-specific reason.
+    Other(
+        /// Transport-specific failure description.
+        IString,
+    ),
 }
 
 /// Discovery-provided port used by route transport to report route health.
@@ -193,12 +244,21 @@ where
 /// Abstract reasons why route transport rejected one logical send.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteTransportNackReason {
+    /// Route transport does not know the submitted concrete route.
     RouteUnknown,
+    /// Route transport knows the route, but it cannot currently be used.
     RouteUnavailable,
+    /// Route transport rejected the send because local queues were full.
     Backpressure,
+    /// Payload serialisation failed before transport handoff.
     InvalidPayload,
+    /// Route transport could not allocate a required local resource.
     LocalResourcePressure,
-    Other(IString),
+    /// Route transport rejected the send for a transport-specific reason.
+    Other(
+        /// Transport-specific rejection description.
+        IString,
+    ),
 }
 
 /// Directed outcome of one outbound route-transport submission.
@@ -212,11 +272,16 @@ where
     ///
     /// This is a transport-layer success only. It does not mean that any
     /// semantic-delivery acknowledgement was observed.
-    Sent { coverage_key: R },
+    Sent {
+        /// Concrete route key that accepted the outbound payload.
+        coverage_key: R,
+    },
     /// Route transport rejected the logical send before or during transport
     /// handoff.
     SendFailed {
+        /// Concrete route key that rejected the outbound payload.
         coverage_key: R,
+        /// Transport-layer rejection reason.
         reason: RouteTransportNackReason,
     },
 }
