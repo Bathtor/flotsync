@@ -45,9 +45,8 @@ use flotsync_io::{
     prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
 use flotsync_routes::{
-    ExternalUdpSocketRegistration,
-    ExternalUdpSocketRegistrationError,
     RouteDiscoveryPort,
+    RouteEndpointLifecyclePort,
     RouteTransportActorMessage,
     RouteTransportPort,
     TransportRouteKey,
@@ -59,7 +58,13 @@ use flotsync_routes::{
         RouteEstablishmentConfig,
         RouteEstablishmentMessage,
     },
-    route_publication::DiscoveryRoutePort,
+};
+#[cfg(any(test, feature = "test-support"))]
+use flotsync_utils::kompact_testing::{
+    PortTestMsg,
+    PortTesterComponent,
+    PortTestingExt as _,
+    PortTestingRefExt as _,
 };
 use flotsync_utils::{FutureTimeoutExt as _, TimeoutError};
 use futures_util::{FutureExt, future::BoxFuture};
@@ -81,19 +86,16 @@ use std::{
 mod discovery;
 mod local_endpoint;
 
+use discovery::PreconfiguredPeerRoutesConfig;
 #[cfg(test)]
 pub(super) use discovery::PreconfiguredPeerRoutesPublishMode;
-#[cfg(any(test, feature = "test-support"))]
-use discovery::route_establishment::DiscoveryRouteAdapterMessage;
-use discovery::{
-    PreconfiguredPeerRoutesConfig,
-    route_establishment::DiscoveryRouteAdapterComponent,
-};
 use local_endpoint::LocalEndpointManager;
 
 type TransportRoutePort = RouteTransportPort<TransportRouteKey>;
 type GroupBroadcastInboundRoutePort = GroupBroadcastInboundPort<TransportRouteKey>;
 type ReliableDeliveryInboundRoutePort = ReliableDeliveryInboundPort<TransportRouteKey>;
+#[cfg(any(test, feature = "test-support"))]
+type ManualRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
 
 #[cfg(any(test, feature = "test-support"))]
 const TEST_DIRECT_PEER_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -180,8 +182,6 @@ pub(crate) enum RuntimeHostError {
     },
     #[snafu(display("Failed to bind the runtime local delivery endpoint: {source}"))]
     BindLocalEndpoint { source: RuntimeControlError },
-    #[snafu(display("Failed to register the runtime local delivery endpoint: {source}"))]
-    RegisterRouteTransportEndpoint { source: RuntimeControlError },
     #[snafu(display(
         "Failed to bind the runtime local delivery endpoint: {source}; configured_bind_addr={configured_bind_addr}; system_label={system_label}"
     ))]
@@ -483,6 +483,17 @@ struct BuiltRuntimeSystem {
     local_endpoint_lease: ReservedSocketLease,
 }
 
+/// IO driver and bridge topology.
+///
+/// ```text
+/// IoDriverComponent
+///        ^
+///        |
+///    IoBridge --UdpPort--+--> RouteTransportManager
+///                         +--> LocalEndpointManager
+///                         +--> PeerAnnouncementComponent
+///                         +--> PeerAnnouncementObservationComponent
+/// ```
 struct IoTopology {
     driver: Arc<Component<IoDriverComponent>>,
     bridge: Arc<Component<IoBridge>>,
@@ -522,6 +533,17 @@ impl ComponentTopology for IoTopology {
     }
 }
 
+/// Transport backend topology.
+///
+/// ```text
+/// IoBridge ----------------UdpPort----------------+
+///                                                 v
+/// LocalEndpointManager --RouteEndpointLifecyclePort--> RouteTransportManager --RouteTransportPort--+--> DeliveryIngress
+///                                                                  |                              |
+///                                                                  +--RouteEndpointLifecyclePort--+
+///                                                                                                 v
+///                                                                                  RouteEstablishmentComponent
+/// ```
 struct TransportTopology {
     manager: Arc<Component<RouteTransportManager>>,
 }
@@ -547,44 +569,6 @@ impl TransportTopology {
     fn route_transport_manager(&self) -> &Arc<Component<RouteTransportManager>> {
         &self.manager
     }
-
-    /// Register the endpoint-manager-owned runtime endpoint with route transport.
-    ///
-    /// This keeps route transport from inferring ownership from unrelated UDP
-    /// bind events on the shared bridge.
-    async fn register_external_udp_socket(
-        &self,
-        local_endpoint: local_endpoint::LocalEndpointBinding,
-        control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError> {
-        let manager_ref = self.manager_ref();
-        let registration = ExternalUdpSocketRegistration {
-            socket_id: local_endpoint.socket_id,
-            local_addr: local_endpoint.local_addr,
-        };
-        let future = manager_ref.ask_with(|promise| {
-            RouteTransportActorMessage::RegisterExternalUdpSocket(Ask::new(promise, registration))
-        });
-        future
-            .map(flatten_external_udp_socket_registration_result)
-            .timeout_fold_err(control_timeout)
-            .await
-            .context(RegisterRouteTransportEndpointSnafu)
-    }
-}
-
-fn flatten_external_udp_socket_registration_result<E>(
-    result: Result<Result<(), ExternalUdpSocketRegistrationError>, E>,
-) -> Result<(), RuntimeControlError>
-where
-    E: StdError + Send + Sync + 'static,
-{
-    let registration_result = result.boxed().context(ControlFutureSnafu)?;
-    registration_result.map_err(|error| {
-        RuntimeControlError::failed(format!(
-            "route transport rejected endpoint registration: {error}"
-        ))
-    })
 }
 
 impl ComponentTopology for TransportTopology {
@@ -593,6 +577,16 @@ impl ComponentTopology for TransportTopology {
     }
 }
 
+/// Semantic delivery topology.
+///
+/// ```text
+/// RouteTransportManager --RouteTransportPort--> DeliveryIngress
+///                                                |--GroupBroadcastInboundPort----> GroupBroadcastComponent <---+
+///                                                |                                                             |
+///                                                +--ReliableDeliveryInboundPort--> ReliableDeliveryComponent <--+
+///                                                                                                              |
+/// RouteDiscoveryPort ------------------------------------------------------------------------------------------+
+/// ```
 struct DeliveryTopology {
     ingress: Arc<Component<DeliveryIngressComponent>>,
     group_broadcast: Arc<Component<GroupBroadcastComponent>>,
@@ -650,13 +644,27 @@ impl DeliveryTopology {
         connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             discovery.route_discovery_provider(),
             &self.group_broadcast,
-            "route establishment adapter -> group broadcast",
+            "route establishment -> group broadcast",
         )?;
         connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
             discovery.route_discovery_provider(),
             &self.reliable_delivery,
-            "route establishment adapter -> reliable delivery",
-        )
+            "route establishment -> reliable delivery",
+        )?;
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+                discovery.manual_route_discovery_provider(),
+                &self.group_broadcast,
+                "manual route discovery -> group broadcast",
+            )?;
+            connect_components::<RouteDiscoveryPort<TransportRouteKey>, _, _>(
+                discovery.manual_route_discovery_provider(),
+                &self.reliable_delivery,
+                "manual route discovery -> reliable delivery",
+            )?;
+        }
+        Ok(())
     }
 
     fn group_broadcast_provider(&self) -> &Arc<Component<GroupBroadcastComponent>> {
@@ -680,13 +688,29 @@ impl ComponentTopology for DeliveryTopology {
     }
 }
 
+/// Discovery and route-establishment topology.
+///
+/// ```text
+/// LocalEndpointManager
+///   |--EndpointSelectionPort------+--> PeerAnnouncementComponent
+///   |                              |
+///   |                              +--------------------------+
+///   |                                                         v
+///   +--RouteEndpointLifecyclePort--> RouteTransportManager    |
+///                                  |--RouteEndpointLifecyclePort--+
+///                                  +--RouteTransportPort----------+
+/// PeerAnnouncementObservationComponent --------------------------+
+///                                                                 v
+///                                               RouteEstablishmentComponent --RouteDiscoveryPort--> semantic delivery
+/// ```
 struct DiscoveryTopology {
     peer_announcement: Arc<Component<PeerAnnouncementComponent>>,
     peer_announcement_observation: Arc<Component<PeerAnnouncementObservationComponent>>,
     route_establishment: Arc<Component<RouteEstablishmentComponent>>,
-    route_adapter: Arc<Component<DiscoveryRouteAdapterComponent>>,
     #[cfg(any(test, feature = "test-support"))]
-    route_adapter_ref: ActorRefStrong<DiscoveryRouteAdapterMessage>,
+    manual_route_discovery: Arc<Component<PortTesterComponent<ManualRouteDiscoveryPort>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    manual_route_discovery_ref: ActorRef<PortTestMsg<ManualRouteDiscoveryPort>>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
     static_route_hints: PreconfiguredPeerRoutesConfig,
 }
@@ -701,10 +725,7 @@ impl DiscoveryTopology {
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         static_route_hints: PreconfiguredPeerRoutesConfig,
     ) -> Self {
-        let route_config = route_establishment_config(
-            host_config.local_endpoint_bind_addr,
-            host_config.peer_announcement_bind_addr,
-        );
+        let route_config = route_establishment_config(host_config.peer_announcement_bind_addr);
         let peer_options = PeerAnnouncementOptions::DEFAULT
             .with_socket_bind_addr(route_config.peer_announcement_bind_addr)
             .with_instance_id(route_config.instance_id)
@@ -727,12 +748,11 @@ impl DiscoveryTopology {
                 group_memberships,
             )
         });
-        let route_adapter = system.create(DiscoveryRouteAdapterComponent::new);
         #[cfg(any(test, feature = "test-support"))]
-        let route_adapter_ref = route_adapter
-            .actor_ref()
-            .hold()
-            .expect("route adapter must expose a strong actor ref");
+        let manual_route_discovery =
+            system.create(ManualRouteDiscoveryPort::tester_component_sidecar);
+        #[cfg(any(test, feature = "test-support"))]
+        let manual_route_discovery_ref = manual_route_discovery.actor_ref();
         let local_endpoint_manager =
             LocalEndpointManager::new(host_config.local_endpoint_bind_addr);
         let local_endpoint_manager = system.create(move || local_endpoint_manager);
@@ -740,16 +760,24 @@ impl DiscoveryTopology {
             peer_announcement,
             peer_announcement_observation,
             route_establishment,
-            route_adapter,
             #[cfg(any(test, feature = "test-support"))]
-            route_adapter_ref,
+            manual_route_discovery,
+            #[cfg(any(test, feature = "test-support"))]
+            manual_route_discovery_ref,
             local_endpoint_manager,
             static_route_hints,
         }
     }
 
-    fn route_discovery_provider(&self) -> &Arc<Component<DiscoveryRouteAdapterComponent>> {
-        &self.route_adapter
+    fn route_discovery_provider(&self) -> &Arc<Component<RouteEstablishmentComponent>> {
+        &self.route_establishment
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn manual_route_discovery_provider(
+        &self,
+    ) -> &Arc<Component<PortTesterComponent<ManualRouteDiscoveryPort>>> {
+        &self.manual_route_discovery
     }
 
     fn local_endpoint_manager(&self) -> &Arc<Component<LocalEndpointManager>> {
@@ -762,6 +790,16 @@ impl DiscoveryTopology {
             transport.route_transport_manager(),
             &self.route_establishment,
             "route transport -> route establishment",
+        )?;
+        connect_components::<RouteEndpointLifecyclePort, _, _>(
+            &self.local_endpoint_manager,
+            transport.route_transport_manager(),
+            "local endpoint lifecycle -> route transport",
+        )?;
+        connect_components::<RouteEndpointLifecyclePort, _, _>(
+            transport.route_transport_manager(),
+            &self.route_establishment,
+            "route transport endpoint lifecycle -> route establishment",
         )
     }
 
@@ -780,25 +818,13 @@ impl DiscoveryTopology {
             &self.local_endpoint_manager,
             &self.route_establishment,
             "local endpoint selection -> route establishment",
-        )?;
-        connect_components::<DiscoveryRoutePort, _, _>(
-            &self.route_establishment,
-            &self.route_adapter,
-            "route establishment -> route adapter",
         )
     }
 
-    async fn configure_bound_endpoint(
+    async fn configure_route_establishment_watches(
         &self,
-        local_endpoint: local_endpoint::LocalEndpointBinding,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.route_establishment
-            .actor_ref()
-            .tell(RouteEstablishmentMessage::LocalEndpointBound {
-                socket_id: local_endpoint.socket_id,
-                local_addr: local_endpoint.local_addr,
-            });
         self.replace_manual_route_watches(control_timeout).await
     }
 
@@ -828,8 +854,7 @@ impl DiscoveryTopology {
         &self,
         update: flotsync_routes::DiscoveryRouteUpdate<TransportRouteKey>,
     ) {
-        self.route_adapter_ref
-            .tell(DiscoveryRouteAdapterMessage::Publish(update));
+        self.manual_route_discovery_ref.inject_indication(update);
     }
 
     #[cfg(test)]
@@ -840,11 +865,8 @@ impl DiscoveryTopology {
     }
 }
 
-fn route_establishment_config(
-    local_endpoint_bind_addr: SocketAddr,
-    peer_announcement_bind_addr: SocketAddr,
-) -> RouteEstablishmentConfig {
-    let mut config = RouteEstablishmentConfig::new(local_endpoint_bind_addr);
+fn route_establishment_config(peer_announcement_bind_addr: SocketAddr) -> RouteEstablishmentConfig {
+    let mut config = RouteEstablishmentConfig::new();
     config.peer_announcement_bind_addr = peer_announcement_bind_addr;
     config
 }
@@ -859,23 +881,41 @@ where
 }
 
 impl ComponentTopology for DiscoveryTopology {
+    #[cfg(not(any(test, feature = "test-support")))]
     fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
-        std::iter::once(&self.peer_announcement as &dyn RuntimeLifecycleComponent)
-            .chain(std::iter::once(
-                &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
-            ))
-            .chain(std::iter::once(
-                &self.route_establishment as &dyn RuntimeLifecycleComponent,
-            ))
-            .chain(std::iter::once(
-                &self.route_adapter as &dyn RuntimeLifecycleComponent,
-            ))
-            .chain(std::iter::once(
-                &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
-            ))
+        [
+            &self.peer_announcement as &dyn RuntimeLifecycleComponent,
+            &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
+            &self.route_establishment as &dyn RuntimeLifecycleComponent,
+            &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
+        ]
+        .into_iter()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn nodes(&self) -> impl DoubleEndedIterator<Item = &dyn RuntimeLifecycleComponent> {
+        [
+            &self.peer_announcement as &dyn RuntimeLifecycleComponent,
+            &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
+            &self.route_establishment as &dyn RuntimeLifecycleComponent,
+            &self.manual_route_discovery as &dyn RuntimeLifecycleComponent,
+            &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
+        ]
+        .into_iter()
     }
 }
 
+/// Replication runtime logic topology.
+///
+/// ```text
+/// GroupBroadcastComponent ----+--> CatchUpManagerComponent
+///                             |
+///                             v
+///                  ReplicationRuntimeComponent
+///                             ^
+///                             |
+/// ReliableDeliveryComponent --+--> SummaryRequestManagerComponent
+/// ```
 struct RuntimeLogicTopology {
     catch_up_manager: Arc<Component<CatchUpManagerComponent>>,
     summary_request_manager: Arc<Component<SummaryRequestManagerComponent>>,
@@ -965,6 +1005,16 @@ impl ComponentTopology for RuntimeLogicTopology {
     }
 }
 
+/// Full runtime host topology.
+///
+/// ```text
+/// IoTopology --sockets--+--> TransportTopology --inbound payloads--+
+///                       |                         |                 |
+///                       v                         |                 v
+///                DiscoveryTopology --routes-------+----------> DeliveryTopology --semantic events--> RuntimeLogicTopology
+///                       ^                         |
+///                       +----inbound payloads-----+
+/// ```
 struct RuntimeTopology {
     io: IoTopology,
     transport: TransportTopology,
@@ -1178,12 +1228,8 @@ impl DeliveryRuntimeHost {
             host_config.peer_announcement_bind_addr,
         )?;
         topology
-            .transport
-            .register_external_udp_socket(local_endpoint, host_config.control_timeout)
-            .await?;
-        topology
             .discovery
-            .configure_bound_endpoint(local_endpoint, host_config.control_timeout)
+            .configure_route_establishment_watches(host_config.control_timeout)
             .await?;
         #[cfg(test)]
         if route_publish_mode == PreconfiguredPeerRoutesPublishMode::OnLocalEndpointBound {

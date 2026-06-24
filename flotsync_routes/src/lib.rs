@@ -25,7 +25,6 @@ pub use kompact;
 pub mod manager;
 pub mod protocol;
 pub mod route_establishment;
-pub mod route_publication;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
@@ -54,7 +53,7 @@ pub mod config_keys {
 }
 
 use flotsync_core::MemberIdentity;
-use flotsync_io::prelude::{IoPayload, SocketId};
+use flotsync_io::prelude::{IoPayload, SocketId, UdpCloseReason};
 use flotsync_messages::serialisation::FlotsyncSerializable;
 /// Per-socket `UDPour` runtime configuration used by route transport.
 pub use flotsync_udpour::UDPourConfig;
@@ -152,6 +151,59 @@ pub enum TransportRouteKey {
     Udp(UdpRouteKey),
     /// TCP-backed route key.
     Tcp(TcpRouteKey),
+}
+
+/// Externally owned route endpoint socket authorised for route traffic.
+///
+/// This is route-endpoint ownership state, not a raw UDP bind event. The
+/// `socket_bound_addr` is the concrete bind address reported by `flotsync_io`
+/// for the socket and is used as the transport-local socket key. Concrete
+/// addresses advertised to peers are published separately through discovery's
+/// endpoint-selection contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteEndpointBinding {
+    /// Driver-local socket id assigned by `flotsync_io`.
+    pub socket_id: SocketId,
+    /// Actual local bind address for this socket.
+    pub socket_bound_addr: SocketAddr,
+}
+
+/// Reason why one authorised route endpoint became unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteEndpointUnavailableReason {
+    /// The underlying UDP socket closed.
+    Closed {
+        /// UDP close reason observed by the endpoint owner.
+        reason: UdpCloseReason,
+    },
+}
+
+/// Route endpoint lifecycle published as endpoint ownership changes.
+///
+/// Endpoint owners publish the initial lifecycle. Route transport may
+/// republish accepted events after applying them so downstream route users see
+/// only endpoints that are already available through transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteEndpointLifecycle {
+    /// The endpoint owner authorises this socket for route traffic.
+    Available(RouteEndpointBinding),
+    /// The endpoint owner no longer authorises this socket for route traffic.
+    Unavailable {
+        /// Binding that became unavailable.
+        binding: RouteEndpointBinding,
+        /// Semantic reason for the endpoint becoming unavailable.
+        reason: RouteEndpointUnavailableReason,
+    },
+}
+
+/// Port used to publish route endpoint availability between endpoint owners,
+/// route transport, and route users.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouteEndpointLifecyclePort;
+
+impl Port for RouteEndpointLifecyclePort {
+    type Request = Never;
+    type Indication = RouteEndpointLifecycle;
 }
 
 /// Discovery-published route candidate.

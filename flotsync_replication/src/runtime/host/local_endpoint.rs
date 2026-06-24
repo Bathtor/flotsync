@@ -24,6 +24,12 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
+use flotsync_routes::{
+    RouteEndpointBinding,
+    RouteEndpointLifecycle,
+    RouteEndpointLifecyclePort,
+    RouteEndpointUnavailableReason,
+};
 use flotsync_utils::{
     FutureTimeoutExt as _,
     kompact_fsm::{State, StateUpdate},
@@ -61,6 +67,8 @@ pub(super) struct LocalEndpointManager {
     ctx: ComponentContext<Self>,
     /// UDP transport port used to request the runtime endpoint bind.
     udp_port: RequiredPort<UdpPort>,
+    /// Output port for route endpoint ownership lifecycle events.
+    route_endpoint_lifecycle_port: ProvidedPort<RouteEndpointLifecyclePort>,
     /// Output port for concrete local endpoints selected for discovery advertisements.
     endpoint_selection_port: ProvidedPort<EndpointSelectionPort>,
     /// Configured bind address requested from the UDP transport.
@@ -95,6 +103,7 @@ impl LocalEndpointManager {
         Self {
             ctx: ComponentContext::uninitialised(),
             udp_port: RequiredPort::uninitialised(),
+            route_endpoint_lifecycle_port: ProvidedPort::uninitialised(),
             endpoint_selection_port: ProvidedPort::uninitialised(),
             configured_bind_addr,
             endpoint_selection_policy: EndpointSelectionPolicy::default(),
@@ -106,6 +115,12 @@ impl LocalEndpointManager {
         }
     }
 
+    /// Return the UDP port reference used by tests to inject driver indications.
+    #[cfg(test)]
+    fn udp_port(&mut self) -> RequiredRef<UdpPort> {
+        self.udp_port.share()
+    }
+
     /// Refresh selected endpoints for a bound endpoint and schedule future wildcard polls.
     fn begin_endpoint_selection_updates(&mut self, local_addr: SocketAddr) {
         self.clear_endpoint_selection_timer();
@@ -113,6 +128,31 @@ impl LocalEndpointManager {
         if local_addr.ip().is_unspecified() {
             self.schedule_endpoint_selection_refresh();
         }
+    }
+
+    /// Publish that this runtime endpoint socket is authorised for route traffic.
+    fn publish_route_endpoint_available(&mut self, binding: LocalEndpointBinding) {
+        self.route_endpoint_lifecycle_port
+            .trigger(RouteEndpointLifecycle::Available(RouteEndpointBinding {
+                socket_id: binding.socket_id,
+                socket_bound_addr: binding.local_addr,
+            }));
+    }
+
+    /// Publish that this runtime endpoint socket is no longer authorised for route traffic.
+    fn publish_route_endpoint_unavailable(
+        &mut self,
+        binding: LocalEndpointBinding,
+        reason: RouteEndpointUnavailableReason,
+    ) {
+        self.route_endpoint_lifecycle_port
+            .trigger(RouteEndpointLifecycle::Unavailable {
+                binding: RouteEndpointBinding {
+                    socket_id: binding.socket_id,
+                    socket_bound_addr: binding.local_addr,
+                },
+                reason,
+            });
     }
 
     /// Return the current endpoint binding if the manager is bound.
@@ -263,6 +303,7 @@ impl ComponentLifecycle for LocalEndpointManager {
 }
 
 ignore_requests!(EndpointSelectionPort, LocalEndpointManager);
+ignore_requests!(RouteEndpointLifecyclePort, LocalEndpointManager);
 
 impl Require<UdpPort> for LocalEndpointManager {
     fn handle(&mut self, indication: UdpIndication) -> HandlerResult {
@@ -280,12 +321,10 @@ impl Require<UdpPort> for LocalEndpointManager {
                         socket_id,
                         local_addr,
                     };
-                    if promise.fulfil(Ok(binding)).is_ok() {
-                        self.begin_endpoint_selection_updates(binding.local_addr);
-                        StateUpdate::transition(LocalEndpointManagerState::Bound(binding))
-                    } else {
-                        StateUpdate::transition(LocalEndpointManagerState::Unbound)
-                    }
+                    self.begin_endpoint_selection_updates(binding.local_addr);
+                    self.publish_route_endpoint_available(binding);
+                    let _ = promise.fulfil(Ok(binding));
+                    StateUpdate::transition(LocalEndpointManagerState::Bound(binding))
                 }
                 UdpIndication::BindFailed {
                     request_id,
@@ -301,6 +340,20 @@ impl Require<UdpPort> for LocalEndpointManager {
                     request_id: current_request_id,
                     promise,
                 }),
+            },
+            LocalEndpointManagerState::Bound(binding) => match indication {
+                UdpIndication::Closed {
+                    socket_id, reason, ..
+                } if binding.socket_id == socket_id => {
+                    self.publish_route_endpoint_unavailable(
+                        binding,
+                        RouteEndpointUnavailableReason::Closed { reason },
+                    );
+                    self.clear_endpoint_selection_timer();
+                    self.publish_empty_endpoint_selection();
+                    StateUpdate::transition(LocalEndpointManagerState::Unbound)
+                }
+                _ => StateUpdate::ok(LocalEndpointManagerState::Bound(binding)),
             },
             state => StateUpdate::ok(state),
         })
@@ -406,14 +459,77 @@ mod tests {
     use flotsync_io::test_support::{
         build_test_kompact_system,
         build_test_kompact_system_with,
+        eventually_component_state,
         kill_component,
         start_component,
     };
     use flotsync_utils::kompact_testing::{PortTestingExt, PortTestingRefExt};
     use std::{
         net::{IpAddr, Ipv4Addr},
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, mpsc},
     };
+
+    /// Event observed by the cross-port endpoint ordering probe.
+    #[derive(Debug, PartialEq, Eq)]
+    enum EndpointOrderingEvent {
+        /// Endpoint-selection update from the local endpoint manager.
+        Selection(EndpointSelection),
+        /// Route-endpoint lifecycle update from the local endpoint manager.
+        Lifecycle(RouteEndpointLifecycle),
+    }
+
+    /// Test probe that records endpoint-selection and lifecycle events into one ordered stream.
+    #[derive(ComponentDefinition)]
+    struct EndpointOrderingProbeComponent {
+        /// Kompact component context.
+        ctx: ComponentContext<Self>,
+        /// Required endpoint-selection port under test.
+        endpoint_selection_port: RequiredPort<EndpointSelectionPort>,
+        /// Required route-endpoint lifecycle port under test.
+        route_endpoint_lifecycle_port: RequiredPort<RouteEndpointLifecyclePort>,
+        /// Ordered event sink shared with the test thread.
+        events: mpsc::Sender<EndpointOrderingEvent>,
+    }
+
+    impl EndpointOrderingProbeComponent {
+        /// Build one ordering probe.
+        fn new(events: mpsc::Sender<EndpointOrderingEvent>) -> Self {
+            Self {
+                ctx: ComponentContext::uninitialised(),
+                endpoint_selection_port: RequiredPort::uninitialised(),
+                route_endpoint_lifecycle_port: RequiredPort::uninitialised(),
+                events,
+            }
+        }
+    }
+
+    ignore_lifecycle!(EndpointOrderingProbeComponent);
+
+    impl Require<EndpointSelectionPort> for EndpointOrderingProbeComponent {
+        fn handle(&mut self, indication: EndpointSelection) -> HandlerResult {
+            self.events
+                .send(EndpointOrderingEvent::Selection(indication))
+                .expect("endpoint ordering receiver should stay live");
+            Handled::OK
+        }
+    }
+
+    impl Require<RouteEndpointLifecyclePort> for EndpointOrderingProbeComponent {
+        fn handle(&mut self, indication: RouteEndpointLifecycle) -> HandlerResult {
+            self.events
+                .send(EndpointOrderingEvent::Lifecycle(indication))
+                .expect("endpoint ordering receiver should stay live");
+            Handled::OK
+        }
+    }
+
+    impl Actor for EndpointOrderingProbeComponent {
+        type Message = Never;
+
+        fn receive_local(&mut self, _msg: Self::Message) -> HandlerResult {
+            unreachable!("Never message type cannot be instantiated")
+        }
+    }
 
     /// Test interface provider whose snapshot can be replaced between refreshes.
     #[derive(Debug)]
@@ -576,6 +692,185 @@ mod tests {
         });
 
         kill_component(&system, manager);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn endpoint_manager_publishes_selection_before_endpoint_availability() {
+        let system = build_test_kompact_system();
+        let manager = system.create(|| {
+            LocalEndpointManager::with_interface_snapshot_provider(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                Arc::new(MutableInterfaceSnapshotProvider::new(
+                    InterfaceSnapshot::default(),
+                )),
+            )
+        });
+        let (events_tx, events_rx) = mpsc::channel();
+        let ordering_probe = system.create(move || EndpointOrderingProbeComponent::new(events_tx));
+        biconnect_components::<EndpointSelectionPort, _, _>(&manager, &ordering_probe)
+            .expect("connect endpoint selection ordering probe");
+        biconnect_components::<RouteEndpointLifecyclePort, _, _>(&manager, &ordering_probe)
+            .expect("connect route endpoint lifecycle ordering probe");
+
+        start_component(&system, &ordering_probe);
+        start_component(&system, &manager);
+
+        let bind_future = manager
+            .actor_ref()
+            .ask_with(|promise| LocalEndpointManagerMessage::EnsureBound(Ask::new(promise, ())));
+        eventually_component_state(
+            Duration::from_secs(1),
+            &manager,
+            |manager| {
+                matches!(
+                    manager.state.get(),
+                    LocalEndpointManagerState::Binding { .. }
+                )
+            },
+            "endpoint manager should start binding",
+        );
+        let request_id = manager.on_definition(|manager| match manager.state.get() {
+            LocalEndpointManagerState::Binding { request_id, .. } => *request_id,
+            LocalEndpointManagerState::Unbound | LocalEndpointManagerState::Bound(_) => {
+                panic!("endpoint manager should be binding")
+            }
+        });
+        let udp_port = manager.on_definition(LocalEndpointManager::udp_port);
+        let socket_id = SocketId(12);
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 45_112));
+        system.trigger_i(
+            UdpIndication::Bound {
+                request_id,
+                socket_id,
+                local_addr,
+            },
+            &udp_port,
+        );
+        bind_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("endpoint bind ask should complete")
+            .expect("endpoint bind should succeed");
+
+        let first_event = events_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint selection event should arrive first");
+        let second_event = events_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint lifecycle event should arrive second");
+        assert_eq!(
+            first_event,
+            EndpointOrderingEvent::Selection(EndpointSelection::from_endpoints([local_addr]))
+        );
+        assert_eq!(
+            second_event,
+            EndpointOrderingEvent::Lifecycle(RouteEndpointLifecycle::Available(
+                RouteEndpointBinding {
+                    socket_id,
+                    socket_bound_addr: local_addr,
+                },
+            ))
+        );
+
+        kill_component(&system, manager);
+        kill_component(&system, ordering_probe);
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn endpoint_manager_publishes_route_endpoint_lifecycle_for_active_binding() {
+        let system = build_test_kompact_system();
+        let manager = system.create(|| {
+            LocalEndpointManager::with_interface_snapshot_provider(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+                Arc::new(MutableInterfaceSnapshotProvider::new(
+                    InterfaceSnapshot::default(),
+                )),
+            )
+        });
+        let lifecycle_probe = system.create(RouteEndpointLifecyclePort::tester_component_sidecar);
+        let lifecycle_probe_ref = lifecycle_probe.actor_ref();
+        biconnect_components::<RouteEndpointLifecyclePort, _, _>(&manager, &lifecycle_probe)
+            .expect("connect route endpoint lifecycle probe");
+
+        start_component(&system, &lifecycle_probe);
+        start_component(&system, &manager);
+
+        let bind_future = manager
+            .actor_ref()
+            .ask_with(|promise| LocalEndpointManagerMessage::EnsureBound(Ask::new(promise, ())));
+        eventually_component_state(
+            Duration::from_secs(1),
+            &manager,
+            |manager| {
+                matches!(
+                    manager.state.get(),
+                    LocalEndpointManagerState::Binding { .. }
+                )
+            },
+            "endpoint manager should start binding",
+        );
+        let request_id = manager.on_definition(|manager| match manager.state.get() {
+            LocalEndpointManagerState::Binding { request_id, .. } => *request_id,
+            LocalEndpointManagerState::Unbound | LocalEndpointManagerState::Bound(_) => {
+                panic!("endpoint manager should be binding")
+            }
+        });
+        let udp_port = manager.on_definition(LocalEndpointManager::udp_port);
+        let socket_id = SocketId(11);
+        let local_addr = SocketAddr::from(([127, 0, 0, 1], 45_111));
+        let available_future = lifecycle_probe_ref.observe_indication(move |indication| {
+            *indication
+                == RouteEndpointLifecycle::Available(RouteEndpointBinding {
+                    socket_id,
+                    socket_bound_addr: local_addr,
+                })
+        });
+        system.trigger_i(
+            UdpIndication::Bound {
+                request_id,
+                socket_id,
+                local_addr,
+            },
+            &udp_port,
+        );
+        bind_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("endpoint bind ask should complete")
+            .expect("endpoint bind should succeed");
+        let available = available_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("available lifecycle should arrive")
+            .expect("lifecycle probe should stay live");
+
+        let unavailable_future =
+            lifecycle_probe_ref.observe_indication_from(available.index() + 1, move |indication| {
+                *indication
+                    == RouteEndpointLifecycle::Unavailable {
+                        binding: RouteEndpointBinding {
+                            socket_id,
+                            socket_bound_addr: local_addr,
+                        },
+                        reason: RouteEndpointUnavailableReason::Closed {
+                            reason: flotsync_io::prelude::UdpCloseReason::Requested,
+                        },
+                    }
+            });
+        system.trigger_i(
+            UdpIndication::Closed {
+                socket_id,
+                remote_addr: None,
+                reason: flotsync_io::prelude::UdpCloseReason::Requested,
+            },
+            &udp_port,
+        );
+        unavailable_future
+            .wait_timeout(Duration::from_secs(1))
+            .expect("unavailable lifecycle should arrive")
+            .expect("lifecycle probe should stay live");
+
+        kill_component(&system, manager);
+        kill_component(&system, lifecycle_probe);
         system.shutdown().wait().expect("Kompact shutdown");
     }
 

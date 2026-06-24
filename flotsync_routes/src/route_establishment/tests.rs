@@ -6,7 +6,13 @@ use super::{
 };
 use crate::{
     DatagramRouteScope,
+    DiscoveryRouteUpdate,
     InboundTransportMeta,
+    RouteDiscoveryPort,
+    RouteEndpointBinding,
+    RouteEndpointLifecycle,
+    RouteEndpointUnavailableReason,
+    RoutePreferenceRank,
     RouteSharingKind,
     RouteTransportActorMessage,
     RouteTransportInboundDeliver,
@@ -20,7 +26,6 @@ use crate::{
         introduction_endpoint_frame,
         introduction_request_endpoint_frame,
     },
-    route_publication::{DiscoveryRoutePort, DiscoveryRouteUpdate},
 };
 use flotsync_core::{
     GroupId,
@@ -189,8 +194,7 @@ fn route_establishment_component_with_credentials(
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
 ) -> RouteEstablishmentComponent {
     RouteEstablishmentComponent::new(
-        RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52157)))
-            .with_instance_id(Uuid::from_u128(11)),
+        RouteEstablishmentConfig::new().with_instance_id(Uuid::from_u128(11)),
         route_transport,
         local_member,
         credentials,
@@ -359,7 +363,7 @@ impl<'a> IntroductionSpec<'a> {
 }
 
 fn assert_peer_route_update(
-    update: &DiscoveryRouteUpdate,
+    update: &DiscoveryRouteUpdate<TransportRouteKey>,
     expected_peer: &MemberIdentity,
     expected_routes: &[SocketAddr],
     expected_local_bind: Option<SocketAddr>,
@@ -370,13 +374,24 @@ fn assert_peer_route_update(
             let actual_routes = routes
                 .iter()
                 .map(|candidate| {
-                    assert_eq!(candidate.local_bind, expected_local_bind);
-                    match &candidate.route {
-                        DiscoveryRoute::Udp(route) => *route,
+                    assert_eq!(candidate.sharing, RouteSharingKind::Exclusive);
+                    assert_eq!(candidate.preference_rank, RoutePreferenceRank::new(1));
+                    match candidate.coverage_key {
+                        TransportRouteKey::Udp(route) => {
+                            assert_eq!(route.scope, DatagramRouteScope::Unicast);
+                            assert_eq!(route.local_bind, expected_local_bind);
+                            route.remote_addr
+                        }
+                        TransportRouteKey::Tcp(route) => {
+                            panic!("expected UDP published route, got TCP route {route:?}");
+                        }
                     }
                 })
                 .collect::<Vec<_>>();
             assert_eq!(actual_routes, expected_routes);
+        }
+        DiscoveryRouteUpdate::RelayRoutes { relay, routes } => {
+            panic!("expected peer route update, got relay {relay:?} with routes {routes:?}");
         }
     }
 }
@@ -419,6 +434,8 @@ fn assert_introduction_claims_route(
 
 /// Concrete route-transport test port used for inbound route-establishment deliveries.
 type TestRouteTransportPort = RouteTransportPort<TransportRouteKey>;
+/// Concrete route-discovery test port used for route-establishment publications.
+type TestRouteDiscoveryPort = RouteDiscoveryPort<TransportRouteKey>;
 
 /// Owns the route-establishment test topology.
 struct RouteEstablishmentHarness {
@@ -426,7 +443,7 @@ struct RouteEstablishmentHarness {
     route_transport: Arc<Component<RouteTransportRecorderComponent>>,
     route_transport_rx: mpsc::Receiver<RouteTransportSend<TransportRouteKey>>,
     inbound_transport: Arc<Component<PortTesterComponent<TestRouteTransportPort>>>,
-    update_probe: Arc<Component<PortTesterComponent<DiscoveryRoutePort>>>,
+    update_probe: Arc<Component<PortTesterComponent<TestRouteDiscoveryPort>>>,
     component: Arc<Component<RouteEstablishmentComponent>>,
     update_cursor: Cell<usize>,
 }
@@ -454,7 +471,7 @@ impl RouteEstablishmentHarness {
             .hold()
             .expect("route transport recorder must expose a strong actor ref");
         let inbound_transport = system.create(TestRouteTransportPort::tester_component_sidecar);
-        let update_probe = system.create(DiscoveryRoutePort::tester_component_sidecar);
+        let update_probe = system.create(TestRouteDiscoveryPort::tester_component_sidecar);
         let component = system.create(move || {
             route_establishment_component_with_credentials(
                 local_member,
@@ -465,7 +482,7 @@ impl RouteEstablishmentHarness {
         });
         biconnect_components::<TestRouteTransportPort, _, _>(&inbound_transport, &component)
             .expect("connect route transport probe");
-        biconnect_components::<DiscoveryRoutePort, _, _>(&component, &update_probe)
+        biconnect_components::<TestRouteDiscoveryPort, _, _>(&component, &update_probe)
             .expect("connect route update probe");
 
         start_component(&system, &route_transport);
@@ -523,12 +540,34 @@ impl RouteEstablishmentHarness {
     }
 
     fn bind_endpoint(&self, socket_id: SocketId, local_addr: SocketAddr) {
-        self.component
-            .actor_ref()
-            .tell(RouteEstablishmentMessage::LocalEndpointBound {
+        let route_endpoint_lifecycle_port = self
+            .component
+            .on_definition(RouteEstablishmentComponent::route_endpoint_lifecycle_port);
+        self.system.trigger_i(
+            RouteEndpointLifecycle::Available(RouteEndpointBinding {
                 socket_id,
-                local_addr,
-            });
+                socket_bound_addr: local_addr,
+            }),
+            &route_endpoint_lifecycle_port,
+        );
+    }
+
+    fn close_endpoint(&self, socket_id: SocketId, local_addr: SocketAddr) {
+        let route_endpoint_lifecycle_port = self
+            .component
+            .on_definition(RouteEstablishmentComponent::route_endpoint_lifecycle_port);
+        self.system.trigger_i(
+            RouteEndpointLifecycle::Unavailable {
+                binding: RouteEndpointBinding {
+                    socket_id,
+                    socket_bound_addr: local_addr,
+                },
+                reason: RouteEndpointUnavailableReason::Closed {
+                    reason: flotsync_io::prelude::UdpCloseReason::Requested,
+                },
+            },
+            &route_endpoint_lifecycle_port,
+        );
     }
 
     /// Publish selected local endpoints and wait until they replace introduction claim routes.
@@ -672,7 +711,7 @@ impl RouteEstablishmentHarness {
 
 #[test]
 fn config_rejects_wildcard_advertised_route() {
-    let result = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52156)))
+    let result = RouteEstablishmentConfig::new()
         .with_advertised_routes([SocketAddr::from(([0, 0, 0, 0], 52156))]);
 
     assert!(matches!(
@@ -683,7 +722,7 @@ fn config_rejects_wildcard_advertised_route() {
 
 #[test]
 fn config_rejects_port_zero_advertised_route() {
-    let result = RouteEstablishmentConfig::new(SocketAddr::from(([127, 0, 0, 1], 52156)))
+    let result = RouteEstablishmentConfig::new()
         .with_advertised_routes([SocketAddr::from(([127, 0, 0, 1], 0))]);
 
     assert!(matches!(
@@ -695,7 +734,7 @@ fn config_rejects_port_zero_advertised_route() {
 #[test]
 fn config_accepts_concrete_advertised_route() {
     let route = SocketAddr::from(([127, 0, 0, 1], 52156));
-    let config = RouteEstablishmentConfig::new(route)
+    let config = RouteEstablishmentConfig::new()
         .with_advertised_routes([route])
         .expect("concrete route should be accepted");
 
@@ -1199,8 +1238,10 @@ fn endpoint_rebinding_withdraws_routes_and_reprobes() {
     harness.mark_route_reachable(remote_route, [remote_member.clone()]);
     harness.expect_peer_route_update(&remote_member, &[remote_route], Some(first_local_endpoint));
 
-    harness.bind_endpoint(SocketId(84), second_local_endpoint);
+    harness.close_endpoint(SocketId(83), first_local_endpoint);
     harness.expect_peer_route_update(&remote_member, &[], None);
+
+    harness.bind_endpoint(SocketId(84), second_local_endpoint);
     harness.expect_transport_probe(second_local_endpoint, remote_route);
     harness.shutdown();
 }

@@ -3,6 +3,11 @@
 use super::DiscoveryCredentials;
 use crate::{
     DatagramRouteScope,
+    RouteDiscoveryPort,
+    RouteEndpointBinding,
+    RouteEndpointLifecycle,
+    RouteEndpointLifecyclePort,
+    RouteEndpointUnavailableReason,
     RoutePreferenceRank,
     RouteSendId,
     RouteSharingKind,
@@ -20,12 +25,6 @@ use crate::{
         decode_introduction_claim_group_ids,
         introduction_endpoint_frame,
         introduction_request_endpoint_frame,
-    },
-    route_publication::{
-        DiscoveryRouteCandidate,
-        DiscoveryRouteCandidates,
-        DiscoveryRoutePort,
-        DiscoveryRouteUpdate,
     },
 };
 use flotsync_core::{
@@ -78,13 +77,6 @@ use super::{
 /// Actor messages accepted by [`RouteEstablishmentComponent`].
 #[derive(Debug)]
 pub enum RouteEstablishmentMessage {
-    /// Setup-layer report for a freshly bound runtime endpoint socket.
-    LocalEndpointBound {
-        /// Socket id owned by the shared runtime endpoint.
-        socket_id: SocketId,
-        /// Concrete local address for the runtime endpoint bind.
-        local_addr: SocketAddr,
-    },
     /// Replace all manual route watches currently configured on this component.
     ReplaceManualRouteWatches(Ask<Vec<WatchedRoute>, Result<(), ManualRouteWatchError>>),
     /// Test hook that withdraws one route without waiting for a wall-clock timer.
@@ -114,11 +106,13 @@ pub struct RouteEstablishmentComponent {
     /// Kompact component context.
     ctx: ComponentContext<Self>,
     /// Route source port where verified peer routes are published.
-    discovery_port: ProvidedPort<DiscoveryRoutePort>,
+    discovery_port: ProvidedPort<RouteDiscoveryPort<TransportRouteKey>>,
     /// Peer-announcement input from one or more announcement protocols.
     announcement_port: RequiredPort<PeerAnnouncementObservationPort>,
     /// Reassembled route-transport payloads sharing the runtime endpoint.
     route_transport_port: RequiredPort<RouteTransportPort<TransportRouteKey>>,
+    /// Accepted route endpoint lifecycle from route transport.
+    route_endpoint_lifecycle_port: RequiredPort<RouteEndpointLifecyclePort>,
     /// Actor interface used for directed introduction request/response submits.
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
     /// Receives selected local endpoints used for signed introduction claims.
@@ -161,6 +155,7 @@ impl RouteEstablishmentComponent {
             discovery_port: ProvidedPort::uninitialised(),
             announcement_port: RequiredPort::uninitialised(),
             route_transport_port: RequiredPort::uninitialised(),
+            route_endpoint_lifecycle_port: RequiredPort::uninitialised(),
             route_transport,
             endpoint_selection_port: RequiredPort::uninitialised(),
             config,
@@ -192,6 +187,14 @@ impl RouteEstablishmentComponent {
     #[cfg(test)]
     pub(super) fn endpoint_selection_port(&mut self) -> RequiredRef<EndpointSelectionPort> {
         self.endpoint_selection_port.share()
+    }
+
+    /// Return the route-endpoint lifecycle port reference used by tests to inject endpoint state.
+    #[cfg(test)]
+    pub(super) fn route_endpoint_lifecycle_port(
+        &mut self,
+    ) -> RequiredRef<RouteEndpointLifecyclePort> {
+        self.route_endpoint_lifecycle_port.share()
     }
 
     /// Load route-establishment timing from Kompact config.
@@ -228,24 +231,52 @@ impl RouteEstablishmentComponent {
         })
     }
 
-    /// Record the currently bound shared runtime endpoint and invalidate routes tied to the old
-    /// endpoint.
-    fn on_local_endpoint_bound(&mut self, socket_id: SocketId, local_addr: SocketAddr) {
+    /// Record the route endpoint authorised for introduction traffic.
+    fn handle_route_endpoint_available(&mut self, binding: RouteEndpointBinding) -> HandlerResult {
         let binding = LocalUdpEndpointBinding {
-            socket_id,
-            local_addr,
+            socket_id: binding.socket_id,
+            local_addr: binding.socket_bound_addr,
         };
         if self.local_endpoint.binding() == Some(binding) {
-            return;
+            return Handled::OK;
         }
         info!(
             self.log(),
             "route establishment accepted local endpoint bind local_addr={} socket_id={}",
-            local_addr,
-            socket_id
+            binding.local_addr,
+            binding.socket_id
         );
         self.local_endpoint = LocalUdpEndpointState::Bound(binding);
         self.invalidate_route_verification_for_endpoint_change();
+        Handled::block_on(self, async move |mut async_self| {
+            async_self.probe_all_inactive_routes().await;
+            Handled::OK
+        })
+    }
+
+    /// Clear route endpoint state when the endpoint owner withdraws authorisation.
+    fn handle_route_endpoint_unavailable(
+        &mut self,
+        binding: RouteEndpointBinding,
+        reason: RouteEndpointUnavailableReason,
+    ) -> HandlerResult {
+        let binding = LocalUdpEndpointBinding {
+            socket_id: binding.socket_id,
+            local_addr: binding.socket_bound_addr,
+        };
+        if self.local_endpoint.binding() != Some(binding) {
+            return Handled::OK;
+        }
+        debug!(
+            self.log(),
+            "route establishment endpoint became unavailable local_addr={} socket_id={}: {:?}",
+            binding.local_addr,
+            binding.socket_id,
+            reason
+        );
+        self.local_endpoint = LocalUdpEndpointState::Unbound;
+        self.invalidate_route_verification_for_endpoint_change();
+        Handled::OK
     }
 
     /// Record advertised routes and probe any route without an active timeout.
@@ -894,13 +925,18 @@ impl RouteEstablishmentComponent {
             .get(&member)
             .into_iter()
             .flat_map(|routes| routes.iter().copied())
-            .map(|route| DiscoveryRouteCandidate {
-                route: DiscoveryRoute::Udp(route),
-                local_bind,
+            .map(|remote_addr| SendRouteCandidate {
+                coverage_key: TransportRouteKey::Udp(UdpRouteKey {
+                    remote_addr,
+                    scope: DatagramRouteScope::Unicast,
+                    local_bind,
+                }),
+                sharing: RouteSharingKind::Exclusive,
+                preference_rank: RoutePreferenceRank::new(1),
             })
-            .collect::<DiscoveryRouteCandidates>();
+            .collect();
         self.discovery_port
-            .trigger(DiscoveryRouteUpdate::PeerRoutes {
+            .trigger(crate::DiscoveryRouteUpdate::PeerRoutes {
                 peer: member,
                 routes,
             });
@@ -914,7 +950,10 @@ impl ComponentLifecycle for RouteEstablishmentComponent {
     }
 }
 
-ignore_requests!(DiscoveryRoutePort, RouteEstablishmentComponent);
+ignore_requests!(
+    RouteDiscoveryPort<TransportRouteKey>,
+    RouteEstablishmentComponent
+);
 
 impl Require<RouteTransportPort<TransportRouteKey>> for RouteEstablishmentComponent {
     fn handle(
@@ -922,6 +961,19 @@ impl Require<RouteTransportPort<TransportRouteKey>> for RouteEstablishmentCompon
         indication: RouteTransportInboundDeliver<TransportRouteKey>,
     ) -> HandlerResult {
         self.handle_route_transport_inbound(&indication)
+    }
+}
+
+impl Require<RouteEndpointLifecyclePort> for RouteEstablishmentComponent {
+    fn handle(&mut self, indication: RouteEndpointLifecycle) -> HandlerResult {
+        match indication {
+            RouteEndpointLifecycle::Available(binding) => {
+                self.handle_route_endpoint_available(binding)
+            }
+            RouteEndpointLifecycle::Unavailable { binding, reason } => {
+                self.handle_route_endpoint_unavailable(binding, reason)
+            }
+        }
     }
 }
 
@@ -953,16 +1005,6 @@ impl Actor for RouteEstablishmentComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
-            RouteEstablishmentMessage::LocalEndpointBound {
-                socket_id,
-                local_addr,
-            } => {
-                self.on_local_endpoint_bound(socket_id, local_addr);
-                Handled::block_on(self, async move |mut async_self| {
-                    async_self.probe_all_inactive_routes().await;
-                    Handled::OK
-                })
-            }
             RouteEstablishmentMessage::ReplaceManualRouteWatches(watches) => {
                 Handled::block_on(self, async move |mut async_self| {
                     let (promise, watches) = watches.take();

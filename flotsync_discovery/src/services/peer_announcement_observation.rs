@@ -1,4 +1,4 @@
-//! Peer-announcement observer component for route establishment.
+//! Peer-announcement observer component.
 
 use super::{
     PeerAnnouncementSocketMaintenance,
@@ -172,6 +172,12 @@ impl PeerAnnouncementObservationComponent {
     pub(super) fn socket_state(&self) -> &SocketState {
         self.state.get()
     }
+
+    /// Return the UDP port reference used by tests to inject driver indications.
+    #[cfg(test)]
+    pub(super) fn udp_port(&mut self) -> RequiredRef<UdpPort> {
+        self.udp_port.share()
+    }
 }
 
 impl ComponentLifecycle for PeerAnnouncementObservationComponent {
@@ -185,7 +191,7 @@ impl ComponentLifecycle for PeerAnnouncementObservationComponent {
                     Err(error) => {
                         error!(
                             self.log(),
-                            "route establishment peer-announcement bind setup failed: {error}"
+                            "peer-announcement observation bind setup failed: {error}"
                         );
                         Handled::SHUTDOWN.and_transition(SocketState::Unbound)
                     }
@@ -195,7 +201,7 @@ impl ComponentLifecycle for PeerAnnouncementObservationComponent {
             state => {
                 warn!(
                     self.log(),
-                    "route establishment peer-announcement observation started in non-initial state {:?}",
+                    "peer-announcement observation started in non-initial state {:?}",
                     state
                 );
                 StateUpdate::ok(state)
@@ -234,7 +240,7 @@ impl Require<UdpPort> for PeerAnnouncementObservationComponent {
                 } if current == request_id => {
                     info!(
                         self.log(),
-                        "route establishment peer announcement listening at {} on {}",
+                        "peer-announcement observation listening at {} on {}",
                         local_addr,
                         socket_id
                     );
@@ -247,7 +253,7 @@ impl Require<UdpPort> for PeerAnnouncementObservationComponent {
                 } if current == request_id => {
                     warn!(
                         self.log(),
-                        "route establishment peer-announcement bind failed at {}: {:?}",
+                        "peer-announcement observation bind failed at {}: {:?}",
                         local_addr,
                         reason
                     );
@@ -265,7 +271,7 @@ impl Require<UdpPort> for PeerAnnouncementObservationComponent {
                 } if local_addr.port() == self.socket_bind_addr.port() => {
                     info!(
                         self.log(),
-                        "route establishment peer announcement observation inferred socket {} at {}",
+                        "peer-announcement observation inferred socket {} at {}",
                         socket_id,
                         local_addr
                     );
@@ -327,6 +333,7 @@ mod tests {
         test_support::{
             build_test_kompact_system,
             build_test_kompact_system_with,
+            eventually_component_state,
             kill_component,
             start_component,
         },
@@ -348,38 +355,45 @@ mod tests {
                 PeerAnnouncementSocketMaintenance::Observe,
             )
         });
+        start_component(&system, &component);
 
-        component.on_definition(|component| {
-            let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-                component,
-                UdpIndication::Bound {
-                    request_id: UdpOpenRequestId::new(),
-                    socket_id: SocketId(77),
-                    local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port)),
-                },
-            )
-            .expect("bound indication should be handled");
+        let udp_port = component.on_definition(PeerAnnouncementObservationComponent::udp_port);
+        system.trigger_i(
+            UdpIndication::Bound {
+                request_id: UdpOpenRequestId::new(),
+                socket_id: SocketId(77),
+                local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port)),
+            },
+            &udp_port,
+        );
+        eventually_component_state(
+            Duration::from_secs(1),
+            &component,
+            |component| {
+                component.socket_state()
+                    == &SocketState::Listening {
+                        socket_id: SocketId(77),
+                    }
+            },
+            "peer-announcement observer should infer the matching socket",
+        );
 
-            assert_eq!(
-                component.socket_state(),
-                &SocketState::Listening {
-                    socket_id: SocketId(77)
-                }
-            );
+        system.trigger_i(
+            UdpIndication::Closed {
+                socket_id: SocketId(77),
+                remote_addr: None,
+                reason: UdpCloseReason::Requested,
+            },
+            &udp_port,
+        );
+        eventually_component_state(
+            Duration::from_secs(1),
+            &component,
+            |component| component.socket_state() == &SocketState::WaitingForSocket,
+            "peer-announcement observer should return to waiting after close",
+        );
 
-            let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-                component,
-                UdpIndication::Closed {
-                    socket_id: SocketId(77),
-                    remote_addr: None,
-                    reason: UdpCloseReason::Requested,
-                },
-            )
-            .expect("close indication should be handled");
-
-            assert_eq!(component.socket_state(), &SocketState::WaitingForSocket);
-        });
-
+        kill_component(&system, component);
         system.shutdown().wait().expect("Kompact shutdown");
     }
 
@@ -394,21 +408,25 @@ mod tests {
                 PeerAnnouncementSocketMaintenance::Observe,
             )
         });
+        start_component(&system, &component);
 
-        component.on_definition(|component| {
-            let _handled = <PeerAnnouncementObservationComponent as Require<UdpPort>>::handle(
-                component,
-                UdpIndication::Bound {
-                    request_id: UdpOpenRequestId::new(),
-                    socket_id: SocketId(78),
-                    local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port + 1)),
-                },
-            )
-            .expect("bound indication should be handled");
+        let udp_port = component.on_definition(PeerAnnouncementObservationComponent::udp_port);
+        system.trigger_i(
+            UdpIndication::Bound {
+                request_id: UdpOpenRequestId::new(),
+                socket_id: SocketId(78),
+                local_addr: SocketAddr::from(([127, 0, 0, 1], peer_port + 1)),
+            },
+            &udp_port,
+        );
+        eventually_component_state(
+            Duration::from_secs(1),
+            &component,
+            |component| component.socket_state() == &SocketState::WaitingForSocket,
+            "peer-announcement observer should ignore unrelated bind ports",
+        );
 
-            assert_eq!(component.socket_state(), &SocketState::WaitingForSocket);
-        });
-
+        kill_component(&system, component);
         system.shutdown().wait().expect("Kompact shutdown");
     }
 

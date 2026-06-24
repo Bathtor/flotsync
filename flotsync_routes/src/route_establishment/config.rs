@@ -27,8 +27,6 @@ pub struct RouteEstablishmentConfig {
     /// address, the advertised delivery routes signed in introductions, or the peer-announcement
     /// broadcast destination port.
     pub peer_announcement_bind_addr: SocketAddr,
-    /// Local runtime endpoint bind configured for follow-up discovery and replication traffic.
-    pub configured_local_endpoint: SocketAddr,
     /// Local process instance id used in outgoing peer announcements and introductions.
     pub instance_id: Uuid,
     /// Initial concrete routes this endpoint is allowed to claim in signed introductions.
@@ -36,15 +34,14 @@ pub struct RouteEstablishmentConfig {
 }
 
 impl RouteEstablishmentConfig {
-    /// Build a default config for the given runtime endpoint.
+    /// Build a default route-establishment config.
     #[must_use]
-    pub fn new(configured_local_endpoint: SocketAddr) -> Self {
+    pub fn new() -> Self {
         Self {
             peer_announcement_bind_addr: SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 *DEFAULT_DISCOVERY_PORT,
             ),
-            configured_local_endpoint,
             instance_id: Uuid::new_v4(),
             advertised_routes: ConcreteRoutes::default(),
         }
@@ -76,6 +73,12 @@ impl RouteEstablishmentConfig {
     pub fn with_instance_id(mut self, instance_id: Uuid) -> Self {
         self.instance_id = instance_id;
         self
+    }
+}
+
+impl Default for RouteEstablishmentConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

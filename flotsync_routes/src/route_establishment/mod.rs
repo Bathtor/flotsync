@@ -28,6 +28,12 @@ pub trait DiscoveryCredentials: Send + Sync {
     fn sign_discovery_claim_payload(&self, payload: &[u8]) -> Result<FrameSignature, BoxError>;
 
     /// Verify one exact encoded discovery claim payload against the claimed member.
+    ///
+    /// # Errors
+    ///
+    /// The returned future resolves to an implementation-specific error when the claimed member's
+    /// verification key is unavailable, the signature is malformed, or the signature does not
+    /// verify for the supplied payload.
     fn verify_discovery_claim_payload<'a>(
         &'a self,
         member: &'a MemberIdentity,
