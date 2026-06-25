@@ -653,9 +653,9 @@ impl ReliableDeliveryComponent {
         if let Some(route) = self.direct_peer_routes.get(&original_sender).cloned() {
             self.dispatch_recipient_ack(message_id, ack, route).await;
         } else {
-            warn!(
+            debug!(
                 self.log(),
-                "Reliable delivery processed message_id={message_id} but has no direct route back to original sender={original_sender} for recipient ack"
+                "Reliable delivery processed message_id={message_id} before observing a direct route back to original sender={original_sender}; recipient ack will retry"
             );
             self.schedule_retry(RetryKey::InboundAck(message_id), self.retry_delay);
         }
