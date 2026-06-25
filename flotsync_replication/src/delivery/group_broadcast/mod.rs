@@ -525,13 +525,6 @@ mod tests {
         api::{ReplicationGroupRecord, ReplicationStore},
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
-            test_support::{
-                FULL_STACK_WAIT_TIMEOUT,
-                TransportHarnessCore,
-                build_delivery_test_system,
-                default_udpour_config,
-                member_identity,
-            },
             wire::{group_id_from_wire, message_id_from_wire},
         },
         test_support::{load_test_delivery_security, provision_test_security, test_group_key},
@@ -548,6 +541,13 @@ mod tests {
         RoutePreferenceRank,
         RouteTransportPort,
         UdpRouteKey,
+        test_support::{
+            FULL_STACK_WAIT_TIMEOUT,
+            TransportHarnessCore,
+            build_delivery_test_system,
+            default_udpour_config,
+            member_identity,
+        },
     };
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{cell::Cell, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};

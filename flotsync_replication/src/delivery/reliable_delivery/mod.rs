@@ -1263,17 +1263,7 @@ mod tests {
     use super::*;
     use crate::{
         SqliteReplicationStore,
-        delivery::{
-            ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-            test_support::{
-                FULL_STACK_WAIT_TIMEOUT,
-                TransportHarnessCore,
-                build_delivery_test_system,
-                build_delivery_test_system_with,
-                default_udpour_config,
-                member_identity,
-            },
-        },
+        delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         test_support::{load_test_delivery_security, provision_test_security},
     };
     use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
@@ -1292,6 +1282,14 @@ mod tests {
         RoutePreferenceRank,
         RouteTransportPort,
         UdpRouteKey,
+        test_support::{
+            FULL_STACK_WAIT_TIMEOUT,
+            TransportHarnessCore,
+            build_delivery_test_system,
+            build_delivery_test_system_with,
+            default_udpour_config,
+            member_identity,
+        },
     };
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{
