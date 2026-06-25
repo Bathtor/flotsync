@@ -1548,8 +1548,8 @@ dependencies = [
  "flotsync_discovery",
  "flotsync_io",
  "flotsync_messages",
+ "flotsync_routes",
  "flotsync_security",
- "flotsync_udpour",
  "flotsync_utils",
  "futures-util",
  "intervallum",
@@ -1559,6 +1559,26 @@ dependencies = [
  "smallvec",
  "snafu",
  "sqlx",
+ "uuid",
+]
+
+[[package]]
+name = "flotsync_routes"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "flotsync_core",
+ "flotsync_discovery",
+ "flotsync_io",
+ "flotsync_messages",
+ "flotsync_security",
+ "flotsync_udpour",
+ "flotsync_utils",
+ "futures-util",
+ "kompact",
+ "rand 0.9.4",
+ "smallvec",
+ "snafu",
  "uuid",
 ]
 

@@ -20,6 +20,11 @@ use super::{
     Hash,
     IString,
     InboundTransportMeta,
+    RouteEndpointBinding,
+    RouteEndpointLifecycle,
+    RouteEndpointLifecyclePort,
+    RouteEndpointUnavailableReason,
+    RouteSendId,
     RouteTransportActorMessage,
     RouteTransportInboundDeliver,
     RouteTransportNackReason,
@@ -30,9 +35,8 @@ use super::{
     TransportRouteKey,
     UdpRouteKey,
 };
-use crate::delivery::shared::RouteSendId;
-#[cfg(test)]
-use crate::delivery::test_support::ManagerOwnedUdpBindBudget;
+#[cfg(any(test, feature = "test-support"))]
+use crate::test_support::ManagerOwnedUdpBindBudget;
 use flotsync_io::prelude::{
     IoBridgeHandle,
     IoPayload,
@@ -61,7 +65,7 @@ use flotsync_udpour::{
 };
 use flotsync_utils::OptionExt as _;
 use kompact::{config::UsizeValue, kompact_config, prelude::*};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
@@ -78,6 +82,13 @@ pub struct RouteTransportManager {
     ctx: ComponentContext<Self>,
     inbound_port: ProvidedPort<TransportRouteTransportPort>,
     connection_info_port: ProvidedPort<TransportConnectionInfoPort>,
+    /// Accepted endpoint lifecycle after route transport has applied it locally.
+    ///
+    /// Republishing from here preserves registration-before-use ordering for
+    /// downstream route users such as route establishment.
+    route_endpoint_lifecycle_provided: ProvidedPort<RouteEndpointLifecyclePort>,
+    /// Raw endpoint-owner lifecycle that drives route-transport registration.
+    route_endpoint_lifecycle_required: RequiredPort<RouteEndpointLifecyclePort>,
     udp_bridge_port: RequiredPort<UdpPort>,
     /// Inbound `UDPour` deliveries from child runtimes.
     udpour_port: RequiredPort<UDPourPort>,
@@ -114,7 +125,7 @@ pub struct RouteTransportManager {
     /// Logical sends that are still waiting for one route-transport outcome.
     pending_sends: HashMap<RouteSendId, PendingRouteSend>,
     /// Test-only declared budget for manager-owned lazy UDP binds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
 }
 
@@ -126,6 +137,8 @@ impl RouteTransportManager {
             ctx: ComponentContext::uninitialised(),
             inbound_port: ProvidedPort::uninitialised(),
             connection_info_port: ProvidedPort::uninitialised(),
+            route_endpoint_lifecycle_provided: ProvidedPort::uninitialised(),
+            route_endpoint_lifecycle_required: RequiredPort::uninitialised(),
             udp_bridge_port: RequiredPort::uninitialised(),
             udpour_port: RequiredPort::uninitialised(),
             system,
@@ -141,14 +154,20 @@ impl RouteTransportManager {
             udp_sockets: HashMap::new(),
             tcp_routes: HashMap::new(),
             pending_sends: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             test_manager_owned_udp_bind_budget: None,
         }
     }
 
+    /// Return the route-endpoint lifecycle port reference used by tests to inject endpoint state.
+    #[cfg(test)]
+    fn route_endpoint_lifecycle_port(&mut self) -> RequiredRef<RouteEndpointLifecyclePort> {
+        self.route_endpoint_lifecycle_required.share()
+    }
+
     /// Creates one manager with one explicit test-only budget for lazy
     /// manager-owned UDP binds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new_with_test_manager_owned_udp_bind_budget(
         system: KompactSystem,
         bridge: IoBridgeHandle,
@@ -192,7 +211,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn test_manager_owned_udp_bind_policy(
         &mut self,
         request_id: UdpOpenRequestId,
@@ -231,7 +250,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -245,7 +264,7 @@ impl RouteTransportManager {
         requested_bind
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn complete_test_manager_owned_udp_bind(
         &mut self,
         request_id: UdpOpenRequestId,
@@ -265,7 +284,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -278,7 +297,7 @@ impl RouteTransportManager {
     ) {
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn fail_test_manager_owned_udp_bind(&mut self, request_id: UdpOpenRequestId) {
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
@@ -293,14 +312,14 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
     )]
     fn fail_test_manager_owned_udp_bind(&mut self, _request_id: UdpOpenRequestId) {}
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn release_test_manager_owned_udp_bind(&mut self, socket_id: SocketId) {
         let Some(test_manager_owned_udp_bind_budget) = &self.test_manager_owned_udp_bind_budget
         else {
@@ -315,7 +334,7 @@ impl RouteTransportManager {
         }
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     #[allow(
         clippy::unused_self,
         reason = "Test builds inspect component state here; non-test builds keep the same call shape."
@@ -487,6 +506,43 @@ impl RouteTransportManager {
             }
         }
         Ok(())
+    }
+
+    /// Apply one route-endpoint lifecycle event from the endpoint owner.
+    fn handle_route_endpoint_lifecycle(&mut self, lifecycle: RouteEndpointLifecycle) {
+        match lifecycle {
+            RouteEndpointLifecycle::Available(binding) => {
+                if let Err(error) = self.register_route_endpoint(binding) {
+                    error!(
+                        self.log(),
+                        "route transport rejected route endpoint lifecycle registration: {}", error
+                    );
+                    return;
+                }
+                self.route_endpoint_lifecycle_provided
+                    .trigger(RouteEndpointLifecycle::Available(binding));
+            }
+            RouteEndpointLifecycle::Unavailable { binding, reason } => {
+                match reason {
+                    RouteEndpointUnavailableReason::Closed { reason } => {
+                        self.handle_udp_closed(binding.socket_id, reason);
+                    }
+                }
+                self.route_endpoint_lifecycle_provided
+                    .trigger(RouteEndpointLifecycle::Unavailable { binding, reason });
+            }
+        }
+    }
+
+    /// Register one endpoint-owner socket as a route-transport endpoint.
+    fn register_route_endpoint(
+        &mut self,
+        binding: RouteEndpointBinding,
+    ) -> Result<(), ExternalUdpSocketRegistrationError> {
+        self.register_external_udp_socket(ExternalUdpSocketRegistration {
+            socket_id: binding.socket_id,
+            local_addr: binding.socket_bound_addr,
+        })
     }
 
     fn begin_starting_udp_socket(
@@ -1007,7 +1063,7 @@ impl RouteTransportManager {
 
     /// Test-only probe for whether one externally bound socket has been
     /// incorporated into the manager's current UDP socket state yet.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn knows_external_udp_socket_binding(
         &self,
         socket_id: SocketId,
@@ -1047,10 +1103,18 @@ impl ComponentLifecycle for RouteTransportManager {
 
 ignore_requests!(TransportRouteTransportPort, RouteTransportManager);
 ignore_requests!(TransportConnectionInfoPort, RouteTransportManager);
+ignore_requests!(RouteEndpointLifecyclePort, RouteTransportManager);
 
 impl Require<UDPourPort> for RouteTransportManager {
     fn handle(&mut self, indication: UDPourDeliver) -> HandlerResult {
         self.handle_udp_runtime_indication(indication)
+    }
+}
+
+impl Require<RouteEndpointLifecyclePort> for RouteTransportManager {
+    fn handle(&mut self, indication: RouteEndpointLifecycle) -> HandlerResult {
+        self.handle_route_endpoint_lifecycle(indication);
+        Handled::OK
     }
 }
 
@@ -1154,7 +1218,7 @@ impl UdpActivationPolicy {
 /// The current replication runtime keeps per-socket `UDPour` children dormant
 /// until a concrete route is first used. That avoids unnecessary startup churn
 /// for sockets that may never carry delivery traffic.
-pub(crate) fn configure_replication_runtime(config: &mut KompactConfig) {
+pub fn configure_replication_runtime(config: &mut KompactConfig) {
     config.set_config_value(
         &config_keys::UDP_ACTIVATION_POLICY,
         UdpActivationPolicy::OnFirstUse.config_value(),
@@ -1356,14 +1420,16 @@ fn classify_udp_connect_failure_for_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delivery::{
-        route_transport::{RoutePreferenceRank, RouteSharingKind, SendRouteCandidate},
+    use crate::{
+        RoutePreferenceRank,
+        RouteSharingKind,
+        SendRouteCandidate,
         test_support::{BoundReservedUdpSocket, TransportHarnessCore},
     };
     use bytes::Bytes;
     use flotsync_io::{
         pool::PayloadWriter,
-        prelude::{SocketId, UdpIndication, UdpLocalBind},
+        prelude::{MAX_UDP_PAYLOAD_BYTES, SocketId, UdpIndication, UdpLocalBind},
         test_support::{
             ReservedSocketKind,
             WAIT_TIMEOUT,
@@ -1373,6 +1439,7 @@ mod tests {
             eventually_value,
             localhost,
             set_test_system_label,
+            start_component,
         },
     };
     use flotsync_messages::serialisation::{
@@ -1386,8 +1453,12 @@ mod tests {
         SenderConfig,
         config_keys as udpour_config_keys,
     };
-    use flotsync_utils::BoxFuture;
+    use flotsync_utils::{
+        BoxFuture,
+        kompact_testing::{PortTestingExt, PortTestingRefExt},
+    };
     use futures_util::FutureExt;
+    use rand::{RngCore, SeedableRng, rngs::StdRng};
     use std::{
         cell::Cell,
         fmt::{self, Display},
@@ -1578,6 +1649,45 @@ mod tests {
             if let Err(error) = result {
                 panic!("external UDP socket registration failed: {error}");
             }
+        }
+
+        fn publish_route_endpoint_available(
+            &self,
+            socket_id: SocketId,
+            socket_bound_addr: SocketAddr,
+        ) {
+            let route_endpoint_lifecycle_port = self
+                .manager
+                .on_definition(RouteTransportManager::route_endpoint_lifecycle_port);
+            self.core.system().trigger_i(
+                RouteEndpointLifecycle::Available(RouteEndpointBinding {
+                    socket_id,
+                    socket_bound_addr,
+                }),
+                &route_endpoint_lifecycle_port,
+            );
+        }
+
+        fn publish_route_endpoint_unavailable(
+            &self,
+            socket_id: SocketId,
+            socket_bound_addr: SocketAddr,
+        ) {
+            let route_endpoint_lifecycle_port = self
+                .manager
+                .on_definition(RouteTransportManager::route_endpoint_lifecycle_port);
+            self.core.system().trigger_i(
+                RouteEndpointLifecycle::Unavailable {
+                    binding: RouteEndpointBinding {
+                        socket_id,
+                        socket_bound_addr,
+                    },
+                    reason: RouteEndpointUnavailableReason::Closed {
+                        reason: UdpCloseReason::Requested,
+                    },
+                },
+                &route_endpoint_lifecycle_port,
+            );
         }
 
         fn wait_for_send_ack(&self, send: TransportRouteTransportSend) -> TransportRouteKey {
@@ -1830,6 +1940,77 @@ mod tests {
     }
 
     #[test]
+    fn udp_manager_delivers_oversized_payload_over_real_udpour_socket() {
+        let receiver_harness = UdpManagerHarness::with_external_socket(
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config_with_part_size(256),
+        );
+        let (receiver_socket_id, receiver_addr) =
+            receiver_harness.bind_external_socket(UdpLocalBind::Exact(localhost(0)));
+        let receiver_socket_key = UdpSocketKey {
+            local_addr: receiver_addr,
+        };
+        receiver_harness.publish_route_endpoint_available(receiver_socket_id, receiver_addr);
+        receiver_harness.wait_for_live_udp_socket(receiver_socket_key);
+
+        let inbound_probe = receiver_harness
+            .core
+            .system()
+            .create(TransportRouteTransportPort::tester_component_sidecar);
+        let inbound_probe_ref = inbound_probe.actor_ref();
+        biconnect_components::<TransportRouteTransportPort, _, _>(
+            &receiver_harness.manager,
+            &inbound_probe,
+        )
+        .expect("connect receiver route transport probe");
+        start_component(receiver_harness.core.system(), &inbound_probe);
+
+        let sender_harness = UdpManagerHarness::with_socket_budgets(
+            0,
+            1,
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config_with_part_size(256),
+        );
+        let oversized_payload = deterministic_test_payload(MAX_UDP_PAYLOAD_BYTES + 513);
+        let oversized_payload_len = oversized_payload.len();
+        let route = UdpRouteKey {
+            remote_addr: receiver_addr,
+            scope: DatagramRouteScope::Unicast,
+            local_bind: None,
+        };
+        let send_id = RouteSendId(Uuid::new_v4());
+        let submit =
+            sender_harness.send_async(route_send(send_id, route, oversized_payload.clone()));
+        let (_sender_socket_id, sender_addr) = sender_harness.wait_for_new_bound_socket();
+        let delivery_future = inbound_probe_ref.observe_indication(move |deliver| {
+            deliver.payload.len() == oversized_payload_len
+                && deliver.transport.remote_addr == Some(sender_addr)
+        });
+
+        assert_eq!(
+            UdpManagerHarness::wait_for_send_ack_future(submit),
+            TransportRouteKey::Udp(route)
+        );
+        let observed = delivery_future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for oversized route-transport delivery")
+            .expect("route transport delivery probe should stay live");
+        let delivery = observed.indication();
+        assert_eq!(delivery.payload.to_vec(), oversized_payload);
+        assert_eq!(delivery.transport.remote_addr, Some(sender_addr));
+        assert_eq!(
+            delivery.transport.route,
+            TransportRouteKey::Udp(UdpRouteKey {
+                remote_addr: sender_addr,
+                scope: DatagramRouteScope::Unicast,
+                local_bind: Some(receiver_addr),
+            })
+        );
+    }
+
+    #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
         let harness = UdpManagerHarness::with_socket_budgets(
             2,
@@ -1989,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_manager_ignores_unregistered_external_udp_bind() {
+    fn udp_manager_does_not_start_udpour_for_unregistered_external_udp_socket() {
         let harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
@@ -1997,16 +2178,101 @@ mod tests {
         );
         let socket_id = SocketId(77);
         let local_addr = localhost(34568);
+        let source_addr = localhost(45689);
         let socket_key = UdpSocketKey { local_addr };
 
         harness.manager.on_definition(|component| {
             component.handle_udp_bound(UdpOpenRequestId::new(), socket_id, local_addr);
+            component.handle_udp_received(
+                socket_id,
+                source_addr,
+                IoPayload::from(Bytes::from_static(b"peer announcement traffic")),
+            );
 
             assert!(!component.udp_socket_ids.contains_key(&socket_id));
             assert!(!component.udp_dormant_sockets.contains_key(&socket_key));
             assert!(!component.udp_starting_sockets.contains_key(&socket_key));
             assert!(!component.udp_sockets.contains_key(&socket_key));
         });
+    }
+
+    #[test]
+    fn udp_manager_registers_lifecycle_authorised_route_endpoint() {
+        let harness = UdpManagerHarness::with_config(
+            UdpActivationPolicy::OnFirstUse,
+            TestSendRateControl::default(),
+            udpour_config(),
+        );
+        let lifecycle_probe = harness
+            .core
+            .system()
+            .create(RouteEndpointLifecyclePort::tester_component_sidecar);
+        let lifecycle_probe_ref = lifecycle_probe.actor_ref();
+        biconnect_components::<RouteEndpointLifecyclePort, _, _>(
+            &harness.manager,
+            &lifecycle_probe,
+        )
+        .expect("connect accepted route endpoint lifecycle probe");
+        start_component(harness.core.system(), &lifecycle_probe);
+
+        let socket_id = SocketId(78);
+        let local_addr = localhost(34569);
+        let socket_key = UdpSocketKey { local_addr };
+        let available_future = lifecycle_probe_ref.observe_indication(move |indication| {
+            *indication
+                == RouteEndpointLifecycle::Available(RouteEndpointBinding {
+                    socket_id,
+                    socket_bound_addr: local_addr,
+                })
+        });
+
+        harness.publish_route_endpoint_available(socket_id, local_addr);
+
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &harness.manager,
+            |component| {
+                component.udp_socket_ids.get(&socket_id) == Some(&socket_key)
+                    && component.udp_dormant_sockets.contains_key(&socket_key)
+            },
+            "route endpoint lifecycle should register a dormant UDP socket",
+        );
+        let available = available_future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("accepted route endpoint lifecycle should publish availability")
+            .expect("accepted lifecycle probe should stay live");
+
+        let unavailable_future =
+            lifecycle_probe_ref.observe_indication_from(available.index() + 1, move |indication| {
+                *indication
+                    == RouteEndpointLifecycle::Unavailable {
+                        binding: RouteEndpointBinding {
+                            socket_id,
+                            socket_bound_addr: local_addr,
+                        },
+                        reason: RouteEndpointUnavailableReason::Closed {
+                            reason: UdpCloseReason::Requested,
+                        },
+                    }
+            });
+
+        harness.publish_route_endpoint_unavailable(socket_id, local_addr);
+
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &harness.manager,
+            |component| {
+                !component.udp_socket_ids.contains_key(&socket_id)
+                    && !component.udp_dormant_sockets.contains_key(&socket_key)
+                    && !component.udp_starting_sockets.contains_key(&socket_key)
+                    && !component.udp_sockets.contains_key(&socket_key)
+            },
+            "route endpoint lifecycle should remove the dormant UDP socket",
+        );
+        unavailable_future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("accepted route endpoint lifecycle should publish unavailability")
+            .expect("accepted lifecycle probe should stay live");
     }
 
     #[test]
@@ -2066,6 +2332,14 @@ mod tests {
             },
             payload: Arc::new(BytesPayload(bytes)),
         }
+    }
+
+    /// Build deterministic pseudo-random bytes so payload round-trips prove exact content.
+    fn deterministic_test_payload(len: usize) -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(0xa5a5_1f2d_3c4b_5968);
+        let mut bytes = vec![0; len];
+        rng.fill_bytes(&mut bytes);
+        bytes
     }
 
     fn udpour_config() -> UDPourConfig {

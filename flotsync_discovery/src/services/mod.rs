@@ -8,6 +8,8 @@ use snafu::prelude::*;
 #[cfg(feature = "peer-announcement-via-kompact")]
 mod peer_announcement;
 #[cfg(feature = "peer-announcement-via-kompact")]
+mod peer_announcement_observation;
+#[cfg(feature = "peer-announcement-via-kompact")]
 pub use peer_announcement::{
     Options as PeerAnnouncementOptions,
     PEER_ANNOUNCEMENT_DEFAULT_OPTIONS,
@@ -19,6 +21,12 @@ pub use peer_announcement::{
     PeerAnnouncementStartupResult,
     peer_announcement_bind_options_from_config,
     peer_announcement_startup_signal,
+};
+#[cfg(feature = "peer-announcement-via-kompact")]
+pub use peer_announcement_observation::{
+    PeerAnnouncementObservationComponent,
+    PeerAnnouncementObservationPort,
+    PeerAnnouncementObserved,
 };
 
 #[cfg(feature = "zeroconf-support")]

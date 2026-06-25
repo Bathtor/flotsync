@@ -1,0 +1,26 @@
+[package]
+name = "flotsync_routes"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+test-support = ["flotsync_io/test-support"]
+
+[dependencies]
+flotsync_core = { path = "../flotsync_core" }
+flotsync_discovery = { path = "../flotsync_discovery", default-features = false, features = ["peer-announcement-via-kompact"] }
+flotsync_io = { path = "../flotsync_io", default-features = false }
+flotsync_messages = { path = "../flotsync_messages" }
+flotsync_security = { path = "../flotsync_security" }
+flotsync_udpour = { path = "../flotsync_udpour" }
+flotsync_utils = { path = "../flotsync_utils" }
+kompact = { workspace = true }
+snafu = { workspace = true }
+smallvec = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+bytes = { workspace = true }
+flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
+futures-util = { workspace = true }
+rand = "0.9"

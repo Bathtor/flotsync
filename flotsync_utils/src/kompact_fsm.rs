@@ -1,4 +1,6 @@
-use crate::kompact::prelude::*;
+//! Small state-transition helpers for Kompact components.
+
+use kompact::prelude::*;
 use snafu::Snafu;
 
 /// Recoverable component fault emitted for invalid FSM transition tables.
@@ -19,11 +21,16 @@ impl InvalidStateTransition {
     }
 }
 
+/// Owned component state slot used by [`transform_state_match!`].
+///
+/// The state is temporarily taken while matching a transition and must be set again before the
+/// component returns from the handler.
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct State<T>(Option<T>);
 
 impl<T> State<T> {
+    /// Build a state slot from its initial value.
     pub fn new(initial: T) -> Self {
         Self(Some(initial))
     }
@@ -44,16 +51,34 @@ impl<T> State<T> {
         self.0.as_ref().expect("Illegal borrow on dangling state.")
     }
 
+    /// Replace the current state value.
     pub fn set(&mut self, v: T) {
         self.0 = Some(v);
     }
 }
 
+/// Result of applying one state-transition handler.
 #[derive(Debug)]
 pub enum StateUpdate<T> {
-    NoUpdate { old_state: T, result: HandlerResult },
-    Update { new_state: T, result: HandlerResult },
-    Invalid { msg: String },
+    /// Keep the previous state and return the supplied Kompact handler result.
+    NoUpdate {
+        /// State value to restore.
+        old_state: T,
+        /// Handler result to return from the component.
+        result: HandlerResult,
+    },
+    /// Replace the previous state and return the supplied Kompact handler result.
+    Update {
+        /// New state value to install.
+        new_state: T,
+        /// Handler result to return from the component.
+        result: HandlerResult,
+    },
+    /// Report an invalid transition and mark the component recoverably faulty.
+    Invalid {
+        /// Human-readable transition error.
+        msg: String,
+    },
 }
 impl<T> StateUpdate<T> {
     /// No change needed, just keep the current state and move on.
@@ -72,6 +97,7 @@ impl<T> StateUpdate<T> {
         }
     }
 
+    /// Mark this transition as invalid.
     pub fn invalid<I>(msg: I) -> Self
     where
         I: Into<String>,
@@ -94,11 +120,14 @@ impl<T> StateUpdate<T> {
     }
 }
 
+/// Convenience extension for attaching state transitions to Kompact handler results.
 pub trait StateHandled
 where
     Self: Sized,
 {
+    /// Keep `old_state` and return this handler result.
     fn stay_in<T>(self, old_state: T) -> StateUpdate<T>;
+    /// Transition to `new_state` and return this handler result.
     fn and_transition<T>(self, new_state: T) -> StateUpdate<T>;
 }
 
@@ -118,6 +147,7 @@ impl StateHandled for HandlerResult {
     }
 }
 
+/// Run a state-machine match while guaranteeing the state slot is restored.
 #[macro_export]
 macro_rules! transform_state_match {
     ($comp:ident, $state:ident, { $($tokens:tt)* }) => {{
@@ -144,15 +174,11 @@ macro_rules! transform_state_match {
 #[cfg(test)]
 mod tests {
     use super::{State, StateUpdate};
-    use crate::kompact::prelude::*;
-    use flotsync_io::test_support::{
-        WAIT_TIMEOUT,
-        build_test_kompact_system,
-        eventually,
-        eventually_component_state,
-        start_component,
-    };
+    use crate::kompact_testing::{eventually, eventually_component_state};
+    use kompact::prelude::*;
     use std::{sync::mpsc, time::Duration};
+
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TestState {
@@ -206,7 +232,10 @@ mod tests {
 
     #[test]
     fn invalid_state_update_recovers_component_to_initial_state() {
-        let system = build_test_kompact_system();
+        let system = KompactConfig::default()
+            .build()
+            .wait()
+            .expect("test Kompact system");
         let component = system.create(TestComponent::new);
         let component_ref = component.actor_ref();
         let (recovered_tx, recovered_rx) = mpsc::channel();
@@ -221,7 +250,7 @@ mod tests {
             })
         });
 
-        start_component(&system, &component);
+        system.start(&component);
         component_ref.tell(TestMessage::MarkDirty);
         eventually_component_state(
             WAIT_TIMEOUT,

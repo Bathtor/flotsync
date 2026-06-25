@@ -77,10 +77,12 @@ mod kompact_implementation {
     use super::{Options, ServiceConfig, build_mdns_service};
     use crate::{
         kompact::prelude::*,
-        kompact_fsm::{State, StateHandled, StateUpdate},
-        transform_state_match,
         utils::shutdown::{self, BlockingThreadShutdown},
         zeroconf::{ServiceRegistration, prelude::*},
+    };
+    use flotsync_utils::{
+        kompact_fsm::{State, StateHandled, StateUpdate},
+        transform_state_match,
     };
     use std::time::Duration;
 

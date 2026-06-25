@@ -58,7 +58,7 @@
 - Do not hang on the result of `biconnect_components` unless the use-case strictly requires manual disconnection of ports. This is only the case for components that are dynamically created and destroyed during the normal operation of a Kompact system. For all other connections, just drop the handle returned `biconnect_components` immediately (e.g. by assigning to a `let _connection = biconnect_components(...)`.
 - Component structs should have names ending in `*Component` and ports in `*Port`. Port fields `*_port` or if the same port is both required and provided, then one is `*_provided` and the other `*_required`.
 - Kompact timeouts are identified by a `Uuid` (the `ScheduledTimer` field of the timeout handler closure), so there is typically no need for explicit "timer generation" or similar tracking to identify late-firing timeouts. They can simply be compared to a locally stored "expected" timer.
-- Use `KompactSystem::trigger_i` and `::trigger_r` methods in tests instead of creating dedicated testing component, unless complicated logic beyond simple triggering is required.
+- Use `KompactSystem::trigger_i` and `::trigger_r` methods in tests instead of creating dedicated testing component, unless complicated logic beyond simple triggering is required. If a more thorough approach is needed, there is `PortTesterComponent` in `flotsync_utils`.
 - Always document Kompact messages and events very clearly. They are a Kompact component's public interface!
 
 ### Flotsync

@@ -5,7 +5,6 @@ use kompact::config::{Config, parse_config_str};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
-    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -24,7 +23,6 @@ const TRUSTED_PUBLIC_JWKS_PATHS_KEY: &str =
     "flotsync.examples.replicated-checklist.trusted-public-jwks-paths";
 const GROUP_ID_KEY: &str = "flotsync.examples.replicated-checklist.group-id";
 const ORDERED_MEMBERS_KEY: &str = "flotsync.examples.replicated-checklist.ordered-members";
-const LOCAL_ENDPOINT_KEY: &str = "flotsync.replication.runtime.local-endpoint-bind-addr";
 
 const GROUP_SECRET_PASSWORD_DOMAIN: &[u8] =
     b"flotsync/examples/replicated-checklist/group-secret-password/v1";
@@ -51,7 +49,6 @@ pub struct ChecklistAppConfig {
     pub trusted_public_jwks_paths: Vec<PathBuf>,
     pub group_id: GroupId,
     pub ordered_members: Vec<MemberIdentity>,
-    pub local_endpoint_bind_addr: SocketAddr,
 }
 
 impl ChecklistAppConfig {
@@ -78,7 +75,6 @@ impl ChecklistAppConfig {
         let ordered_members = read_ordered_members(&config)?;
         let store_secret_profile = read_store_secret_profile(&config)?;
         let group_key = read_group_key(&config, group_id, &ordered_members)?;
-        let local_endpoint_bind_addr = read_socket_addr(&config, LOCAL_ENDPOINT_KEY)?;
 
         ensure!(
             ordered_members.iter().any(|member| member == &local_member),
@@ -101,7 +97,6 @@ impl ChecklistAppConfig {
             trusted_public_jwks_paths,
             group_id,
             ordered_members,
-            local_endpoint_bind_addr,
         })
     }
 }
@@ -311,19 +306,6 @@ fn read_ordered_members(config: &Config) -> Result<Vec<MemberIdentity>, Checklis
     Ok(members)
 }
 
-fn read_socket_addr(
-    config: &Config,
-    key: &'static str,
-) -> Result<SocketAddr, ChecklistConfigError> {
-    let value = read_string(config, key)?;
-    value.parse().map_err(
-        |source: std::net::AddrParseError| ChecklistConfigError::InvalidConfig {
-            key,
-            message: source.to_string(),
-        },
-    )
-}
-
 fn read_string(config: &Config, key: &'static str) -> Result<String, ChecklistConfigError> {
     config
         .select(key)
@@ -353,9 +335,6 @@ mod tests {
             trusted-public-jwks-paths = ["bob-public.jwks", "/tmp/carol-public.jwks"]
             group-id = 123
             ordered-members = ["alice", "bob"]
-
-            [flotsync.replication.runtime]
-            local-endpoint-bind-addr = "127.0.0.1:45100"
             "#,
         )
         .expect("config should parse");
@@ -373,8 +352,6 @@ mod tests {
         let ordered_members = read_ordered_members(&config).expect("members should parse");
         let group_key =
             read_group_key(&config, group_id, &ordered_members).expect("group key should derive");
-        let endpoint =
-            read_socket_addr(&config, LOCAL_ENDPOINT_KEY).expect("endpoint should parse");
 
         assert_eq!(local_member, MemberIdentity::from_array(["alice"]));
         assert_eq!(store_path, temp_dir.join("alice.sqlite"));
@@ -399,7 +376,37 @@ mod tests {
             group_key,
             derive_group_key_from_password(b"temporary-group-password", group_id, &ordered_members,)
         );
-        assert_eq!(endpoint, "127.0.0.1:45100".parse().unwrap());
+    }
+
+    #[test]
+    fn loads_checklist_app_config_without_runtime_local_endpoint_bind() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!(
+            "alice-checklist-{}.toml",
+            Uuid::new_v4().as_hyphenated()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+            [flotsync.examples.replicated-checklist]
+            local-member = "alice"
+            store-path = "alice.sqlite"
+            store-secret-profile = "config-load-profile"
+            group-secret-password = "temporary-group-password"
+            local-private-jwks-path = "alice-private.jwks"
+            trusted-public-jwks-paths = ["bob-public.jwks"]
+            group-id = 123
+            ordered-members = ["alice", "bob"]
+            "#,
+        )
+        .expect("test config file should be written");
+
+        let loaded = ChecklistAppConfig::load(&path).expect("checklist config should load");
+
+        assert_eq!(loaded.local_member, MemberIdentity::from_array(["alice"]));
+        assert_eq!(loaded.store_path, temp_dir.join("alice.sqlite"));
+        assert_eq!(loaded.group_id, GroupId(Uuid::from_u128(123)));
+        std::fs::remove_file(path).expect("test config file should be removed");
     }
 
     #[test]
@@ -415,9 +422,6 @@ mod tests {
             trusted-public-jwks-paths = ["alice-public.jwks", "bob-public.jwks"]
             group-id = 123
             ordered-members = ["alice", "bob"]
-
-            [flotsync.replication.runtime]
-            local-endpoint-bind-addr = "127.0.0.1:45100"
             "#,
         )
         .expect("config should parse");

@@ -4,7 +4,7 @@
 //! helpers used by the delivery-domain test harnesses. It intentionally stays
 //! small: semantic-owner probes still live next to the tests that use them.
 
-use super::route_transport::{
+use crate::{
     ExternalUdpSocketRegistration,
     RouteTransportActorMessage,
     TransportRouteKey,
@@ -56,13 +56,13 @@ use std::{
 };
 
 /// Longer timeout used by the semantic full-stack delivery tests.
-pub(crate) const FULL_STACK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+pub const FULL_STACK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Shared transport-only harness core for delivery-domain tests.
+/// Declared test budget for UDP sockets opened lazily by the manager.
 ///
-/// This owns the driver, bridge, manager, and observer stack. Semantic-owner
-/// harnesses layer ingress, probes, and route-discovery fixtures on top.
-pub(crate) struct ManagerOwnedUdpBindBudget {
+/// The budget turns manager-owned ephemeral binds into pre-reserved test
+/// socket slots so parallel tests keep full socket ownership up front.
+pub struct ManagerOwnedUdpBindBudget {
     lease: ReservedSocketLease,
     available_slots: Vec<usize>,
     pending_slots: HashMap<UdpOpenRequestId, ClaimedManagerOwnedUdpBind>,
@@ -72,7 +72,8 @@ pub(crate) struct ManagerOwnedUdpBindBudget {
 impl ManagerOwnedUdpBindBudget {
     /// Reserve one fixed amount of manager-owned UDP bind capacity for one
     /// test harness.
-    pub(crate) fn new(slot_count: usize) -> Option<Arc<Mutex<Self>>> {
+    #[must_use]
+    pub fn new(slot_count: usize) -> Option<Arc<Mutex<Self>>> {
         if slot_count == 0 {
             return None;
         }
@@ -89,7 +90,12 @@ impl ManagerOwnedUdpBindBudget {
 
     /// Claim one reservation slot for one manager-owned bind request before
     /// the real bridge bind is issued.
-    pub(crate) fn begin_bind(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the declared manager-owned UDP bind budget has no
+    /// remaining reservation slot for this request.
+    pub fn begin_bind(
         &mut self,
         request_id: UdpOpenRequestId,
         requested_local_addr: SocketAddr,
@@ -121,7 +127,13 @@ impl ManagerOwnedUdpBindBudget {
 
     /// Promote one pending bind reservation into one live manager-owned UDP
     /// socket.
-    pub(crate) fn complete_bind(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request was not pending, if the bridge bound a
+    /// different address than the reserved slot, or if the reserved slot cannot
+    /// be restored after a failed bind.
+    pub fn complete_bind(
         &mut self,
         request_id: UdpOpenRequestId,
         socket_id: SocketId,
@@ -154,7 +166,12 @@ impl ManagerOwnedUdpBindBudget {
 
     /// Restore one failed pending manager-owned bind request back into the
     /// available budget.
-    pub(crate) fn fail_bind(&mut self, request_id: UdpOpenRequestId) -> Result<(), String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request was not pending or if the reserved slot
+    /// cannot be rebound for future use.
+    pub fn fail_bind(&mut self, request_id: UdpOpenRequestId) -> Result<(), String> {
         let claimed = self.pending_slots.remove(&request_id).ok_or_else(|| {
             format!("manager-owned UDP bind budget lost failed request_id={request_id:?}")
         })?;
@@ -163,7 +180,12 @@ impl ManagerOwnedUdpBindBudget {
 
     /// Restore one closed live manager-owned UDP socket back into the
     /// available budget.
-    pub(crate) fn release_live(&mut self, socket_id: SocketId) -> Result<bool, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the socket is part of the live budget but its
+    /// reservation slot cannot be rebound for future use.
+    pub fn release_live(&mut self, socket_id: SocketId) -> Result<bool, String> {
         let Some(claimed) = self.live_slots.remove(&socket_id) else {
             return Ok(false);
         };
@@ -171,6 +193,8 @@ impl ManagerOwnedUdpBindBudget {
         Ok(true)
     }
 
+    /// Return one claimed reservation slot to the available manager-owned
+    /// bind budget.
     fn restore_slot(&mut self, claimed: &ClaimedManagerOwnedUdpBind) -> Result<(), String> {
         self.lease
             .rebind_binding(claimed.slot_index)
@@ -185,13 +209,18 @@ impl ManagerOwnedUdpBindBudget {
     }
 }
 
+/// Reservation slot currently claimed by one manager-owned UDP bind.
 struct ClaimedManagerOwnedUdpBind {
     slot_index: usize,
     requested_local_addr: SocketAddr,
     reserved_bind_addr: SocketAddr,
 }
 
-pub(crate) struct TransportHarnessCore {
+/// Shared transport-only harness core for delivery-domain tests.
+///
+/// This owns the driver, bridge, manager, and observer stack. Semantic-owner
+/// harnesses layer ingress, probes, and route-discovery fixtures on top.
+pub struct TransportHarnessCore {
     system: KompactSystem,
     reserved_socket_lease: Option<Arc<Mutex<ReservedSocketLease>>>,
     _manager_owned_udp_bind_budget: Option<Arc<Mutex<ManagerOwnedUdpBindBudget>>>,
@@ -209,7 +238,13 @@ pub(crate) struct TransportHarnessCore {
 impl TransportHarnessCore {
     /// Create one transport-only harness core with explicit budgets for both
     /// pre-bound raw test sockets and lazy manager-owned UDP sockets.
-    pub(crate) fn with_socket_budgets(
+    ///
+    /// # Panics
+    ///
+    /// Panics if the route-transport manager does not expose a strong actor
+    /// reference during harness construction.
+    #[must_use]
+    pub fn with_socket_budgets(
         system: KompactSystem,
         udpour_config: UDPourConfig,
         reserve_external_udp_socket: bool,
@@ -270,7 +305,12 @@ impl TransportHarnessCore {
 
     /// Start the transport core and connect bridge UDP delivery into the
     /// manager and observer.
-    pub(crate) fn start(&self) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the UDP bridge cannot connect to the route-transport manager
+    /// or UDP observer.
+    pub fn start(&self) {
         let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
         start_component(&self.system, &self.driver);
         start_component(&self.system, &self.bridge);
@@ -283,25 +323,29 @@ impl TransportHarnessCore {
     }
 
     /// Access the underlying Kompact system for creating extra components.
-    pub(crate) fn system(&self) -> &KompactSystem {
+    pub fn system(&self) -> &KompactSystem {
         &self.system
     }
 
     /// Access the route-transport manager component for port wiring or direct
     /// state inspection in tests.
-    pub(crate) fn manager(&self) -> &Arc<Component<RouteTransportManager>> {
+    pub fn manager(&self) -> &Arc<Component<RouteTransportManager>> {
         &self.manager
     }
 
     /// Access the manager actor ref for submit asks.
-    pub(crate) fn manager_ref(
-        &self,
-    ) -> ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>> {
+    pub fn manager_ref(&self) -> ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>> {
         self.manager_ref.clone()
     }
 
     /// Wait for one externally bound UDP socket owned by the observer.
-    pub(crate) fn bind_external_socket(
+    ///
+    /// # Panics
+    ///
+    /// Panics if the harness was not created with an external socket
+    /// reservation, if the reservation lock is poisoned, if the bind fails, or
+    /// if the bind indication is not observed before `timeout`.
+    pub fn bind_external_socket(
         &self,
         bind: UdpLocalBind,
         timeout: Duration,
@@ -368,10 +412,13 @@ impl TransportHarnessCore {
     /// requested via [`with_reserved_socket_kinds`](Self::with_reserved_socket_kinds).
     /// The externally managed route-transport socket always occupies slot `0`
     /// internally and is therefore not visible through this helper.
-    pub(crate) fn bind_reserved_udp_socket(
-        &self,
-        reservation_index: usize,
-    ) -> BoundReservedUdpSocket {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `reservation_index` is outside the declared extra socket
+    /// budget, if no reservation lease exists, if the lease lock is poisoned,
+    /// or if the reserved UDP socket cannot be bound.
+    pub fn bind_reserved_udp_socket(&self, reservation_index: usize) -> BoundReservedUdpSocket {
         assert!(
             reservation_index < self.extra_reserved_socket_slots,
             "reserved UDP socket index {reservation_index} is out of range for {} extra slots",
@@ -399,6 +446,8 @@ impl TransportHarnessCore {
         }
     }
 
+    /// Mark the external route-transport socket reservation as live once the
+    /// bridge has bound it.
     fn release_external_socket_binding(&self, local_addr: SocketAddr) {
         if self
             .external_socket_binding_released
@@ -420,6 +469,7 @@ impl TransportHarnessCore {
             .store(true, Ordering::Relaxed);
     }
 
+    /// Rebind the hidden external-socket reservation during harness teardown.
     fn rebind_external_socket_binding(&self) {
         if !self
             .external_socket_binding_released
@@ -440,7 +490,13 @@ impl TransportHarnessCore {
 
     /// Register one externally bound socket with the route-transport manager
     /// before tests publish routes that rely on reusing it.
-    pub(crate) fn wait_for_manager_external_socket_binding(
+    ///
+    /// # Panics
+    ///
+    /// Panics if registration times out, if the manager rejects the
+    /// registration, or if the manager does not expose the registered socket
+    /// state before `timeout`.
+    pub fn wait_for_manager_external_socket_binding(
         &self,
         socket_id: SocketId,
         local_addr: SocketAddr,
@@ -474,7 +530,7 @@ impl TransportHarnessCore {
     }
 
     /// Wait for the next UDP bind indication observed by the bridge observer.
-    pub(crate) fn wait_for_new_bound_socket(&self, timeout: Duration) -> (SocketId, SocketAddr) {
+    pub fn wait_for_new_bound_socket(&self, timeout: Duration) -> (SocketId, SocketAddr) {
         match self.observer_rx.recv_matching_or_fail(
             timeout,
             |event| matches!(event, UdpIndication::Bound { .. }),
@@ -500,7 +556,7 @@ impl TransportHarnessCore {
 
     /// Access the buffered observer event stream for specialised assertions in
     /// the manager tests.
-    pub(crate) fn observer_rx(&self) -> &BufferedReceiver<UdpIndication> {
+    pub fn observer_rx(&self) -> &BufferedReceiver<UdpIndication> {
         &self.observer_rx
     }
 }
@@ -509,7 +565,7 @@ impl TransportHarnessCore {
 ///
 /// Dropping this wrapper closes the live socket and re-binds the hidden
 /// reservation so later teardown steps keep ownership of the port.
-pub(crate) struct BoundReservedUdpSocket {
+pub struct BoundReservedUdpSocket {
     socket: Option<std::net::UdpSocket>,
     reserved_socket_lease: Arc<Mutex<ReservedSocketLease>>,
     lease_index: usize,
@@ -576,12 +632,13 @@ impl Drop for TransportHarnessCore {
 }
 
 /// Build a Kompact system for the semantic delivery full-stack tests.
-pub(crate) fn build_delivery_test_system() -> KompactSystem {
+#[must_use]
+pub fn build_delivery_test_system() -> KompactSystem {
     build_delivery_test_system_with(|_| {})
 }
 
 /// Build a Kompact system for semantic delivery tests with extra config.
-pub(crate) fn build_delivery_test_system_with(
+pub fn build_delivery_test_system_with(
     configure: impl FnOnce(&mut KompactConfig),
 ) -> KompactSystem {
     build_test_kompact_system_with(|config| {
@@ -593,13 +650,20 @@ pub(crate) fn build_delivery_test_system_with(
 }
 
 /// Build the shared `UDPour` config used by the semantic full-stack tests.
-pub(crate) fn default_udpour_config() -> UDPourConfig {
+#[must_use]
+pub fn default_udpour_config() -> UDPourConfig {
     UDPourConfig::default()
 }
 
 /// Build one loopback member identity for tests from the supplied path
 /// segments.
-pub(crate) fn member_identity(segments: &[&str]) -> MemberIdentity {
+///
+/// # Panics
+///
+/// Panics if any supplied path segment is not a valid member-identifier
+/// segment.
+#[must_use]
+pub fn member_identity(segments: &[&str]) -> MemberIdentity {
     let mut identifier = IdentifierBuf::new();
     for segment in segments {
         identifier

@@ -5,15 +5,9 @@
 
 use bytes::Bytes;
 use flotsync_core::{GroupId, MemberIdentity};
+use flotsync_routes::{RelayIdentity, RouteSendId};
 use std::{fmt, time::SystemTime};
 use uuid::Uuid;
-
-/// Temporary relay identity choice.
-///
-/// Discovery owns identity verification for peers and relays. Until a later
-/// task proves otherwise, relay identities can stay on the same underlying type
-/// as peer/member identities.
-pub type RelayIdentity = MemberIdentity;
 
 /// Stable message identifier reused across retries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -24,11 +18,6 @@ impl fmt::Display for MessageId {
         write!(f, "msg#{}", self.0)
     }
 }
-
-/// Stable identifier for one concrete send operation issued against an opaque
-/// discovery-provided route.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RouteSendId(pub Uuid);
 
 /// Relay-issued or locally generated proof that one relay stored one envelope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

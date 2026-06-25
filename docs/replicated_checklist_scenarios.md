@@ -14,10 +14,11 @@ The steps use the names `alice` and `bob`. If your local config uses different m
 `testing/` are currently named for the machines they target, but the flow is the same.
 
 The normal custom UDP discovery path does not require
-`flotsync.replication.runtime.static-peer-routes`. Use concrete local endpoint addresses that the
-other peer can reach; wildcard bind addresses such as `0.0.0.0:45100` are bind instructions, not
-signed advertised routes. The no-static route scenarios require a network that forwards the
-peer-announcement UDP traffic between the peers.
+`flotsync.replication.runtime.static-peer-routes` or an explicit
+`flotsync.replication.runtime.local-endpoint-bind-addr`. Without an explicit local endpoint, the
+runtime binds an ephemeral wildcard UDP socket and advertises selected concrete local interface
+endpoints. The no-static route scenarios require a network that forwards the peer-announcement UDP
+traffic between the peers.
 
 ## Setup
 
@@ -65,8 +66,8 @@ members
 
 Confirm that:
 
-- Alice prints `member: alice`, the expected config path, and Alice's local endpoint.
-- Bob prints `member: bob`, the expected config path, and Bob's local endpoint.
+- Alice prints `member: alice` and the expected config path.
+- Bob prints `member: bob` and the expected config path.
 - Both peers list the same group and the same ordered members.
 
 The examples below use `ROW` when an item should be addressed by row UUID. Get it from `list`; the
@@ -307,21 +308,9 @@ Goal: two peers discover usable direct UDP routes through peer announcements and
 establishment, without preconfigured peer endpoints.
 
 Before starting the peers, inspect both TOML files and confirm neither file contains
-`flotsync.replication.runtime.static-peer-routes`.
-
-Alice config:
-
-```toml
-[flotsync.replication.runtime]
-local-endpoint-bind-addr = "ALICE_LAN_IP:45100"
-```
-
-Bob config:
-
-```toml
-[flotsync.replication.runtime]
-local-endpoint-bind-addr = "BOB_LAN_IP:45101"
-```
+`flotsync.replication.runtime.static-peer-routes`. Leave
+`flotsync.replication.runtime.local-endpoint-bind-addr` unset unless this manual run needs a fixed
+local address or port for diagnostics.
 
 Start both peers and verify local runtime state.
 
@@ -354,7 +343,7 @@ list
 
 Expected result:
 
-- Each peer prints its configured local endpoint from `me`.
+- Each peer prints its member and config path from `me`.
 - Each peer lists the same static ordered members from `members`.
 - Alice-to-Bob and Bob-to-Alice item exchange works without any static peer route entries.
 - Routes become usable only after route establishment verifies a discovered peer-announcement route
@@ -365,7 +354,8 @@ Expected result:
 Goal: route hints are explicit, visible in the config files, and verified before they become usable
 replication routes.
 
-Before starting the peers, inspect both TOML files.
+Before starting the peers, inspect both TOML files. This scenario pins the local endpoint only to
+make the static-route example addresses stable; use an address currently assigned to each host.
 
 Alice config:
 
@@ -424,7 +414,7 @@ list
 
 Expected result:
 
-- Each peer prints its configured local endpoint from `me`.
+- Each peer prints its member and config path from `me`.
 - Each peer lists the same static ordered members from `members`.
 - Alice-to-Bob and Bob-to-Alice item exchange works only after route establishment verifies the
   hinted remote IP and port with a signed introduction.

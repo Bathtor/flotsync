@@ -3,17 +3,8 @@
 use super::{
     contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
     ingress::InboundDeliveryMeta,
-    route_transport::{
-        RouteDiscoveryPort,
-        RouteSharingKind,
-        RouteTransportActorMessage,
-        RouteTransportSend,
-        RouteTransportSubmitResult,
-        SendRouteCandidate,
-        TransportRouteKey,
-    },
     security::{DeliverySecurity, DeliverySecurityError},
-    shared::{DeliveryClass, MessageId, PlaintextPayload, RouteSendId},
+    shared::{DeliveryClass, MessageId, PlaintextPayload},
 };
 use bytes::Bytes;
 use flotsync_core::{
@@ -26,6 +17,16 @@ use flotsync_messages::{
     delivery as delivery_proto,
     endpoint as endpoint_proto,
     serialisation::FlotsyncSerializable,
+};
+use flotsync_routes::{
+    RouteDiscoveryPort,
+    RouteSendId,
+    RouteSharingKind,
+    RouteTransportActorMessage,
+    RouteTransportSend,
+    RouteTransportSubmitResult,
+    SendRouteCandidate,
+    TransportRouteKey,
 };
 use flotsync_security::SealedPSKPayload;
 use flotsync_utils::{NonOwningPhantomData, OptionExt as _, ResultExt as _};
@@ -524,20 +525,6 @@ mod tests {
         api::{ReplicationGroupRecord, ReplicationStore},
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
-            route_transport::{
-                DatagramRouteScope,
-                InboundTransportMeta,
-                RoutePreferenceRank,
-                RouteTransportPort,
-                UdpRouteKey,
-            },
-            test_support::{
-                FULL_STACK_WAIT_TIMEOUT,
-                TransportHarnessCore,
-                build_delivery_test_system,
-                default_udpour_config,
-                member_identity,
-            },
             wire::{group_id_from_wire, message_id_from_wire},
         },
         test_support::{load_test_delivery_security, provision_test_security, test_group_key},
@@ -547,6 +534,20 @@ mod tests {
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
+    };
+    use flotsync_routes::{
+        DatagramRouteScope,
+        InboundTransportMeta,
+        RoutePreferenceRank,
+        RouteTransportPort,
+        UdpRouteKey,
+        test_support::{
+            FULL_STACK_WAIT_TIMEOUT,
+            TransportHarnessCore,
+            build_delivery_test_system,
+            default_udpour_config,
+            member_identity,
+        },
     };
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
     use std::{cell::Cell, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
