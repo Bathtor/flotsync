@@ -185,9 +185,6 @@ local-private-jwks-path = "alice-keys/private.jwks"
 trusted-public-jwks-paths = ["bob-keys/public.jwks"]
 group-id = 123
 ordered-members = ["alice", "bob"]
-
-[flotsync.replication.runtime]
-local-endpoint-bind-addr = "ALICE_LAN_IP:45100"
 ```
 
 ```toml
@@ -201,14 +198,14 @@ local-private-jwks-path = "bob-keys/private.jwks"
 trusted-public-jwks-paths = ["alice-keys/public.jwks"]
 group-id = 123
 ordered-members = ["alice", "bob"]
-
-[flotsync.replication.runtime]
-local-endpoint-bind-addr = "BOB_LAN_IP:45101"
 ```
 
-Use concrete local endpoint addresses that the other peer can reach. Wildcard bind addresses such
-as `0.0.0.0:45100` are bind instructions, not signed advertised routes. Static peer routes remain
-available as optional route hints for fallback or diagnostics; see
+The runtime local delivery endpoint is optional for the normal custom UDP discovery path. When
+`flotsync.replication.runtime.local-endpoint-bind-addr` is absent, the runtime binds an ephemeral
+wildcard UDP socket and publishes selected concrete local interface endpoints through peer
+announcements. Set it only when you need a fixed local address or port for diagnostics, firewall
+rules, or static route experiments; if you set it, use an address currently assigned to the host.
+Static peer routes remain available as optional route hints for fallback or diagnostics; see
 [`replicated_checklist_scenarios.md`](replicated_checklist_scenarios.md#scenario-6-static-route-hints).
 
 Run each peer in a separate terminal:

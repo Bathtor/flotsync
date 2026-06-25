@@ -1429,7 +1429,7 @@ mod tests {
     use bytes::Bytes;
     use flotsync_io::{
         pool::PayloadWriter,
-        prelude::{SocketId, UdpIndication, UdpLocalBind},
+        prelude::{MAX_UDP_PAYLOAD_BYTES, SocketId, UdpIndication, UdpLocalBind},
         test_support::{
             ReservedSocketKind,
             WAIT_TIMEOUT,
@@ -1458,6 +1458,7 @@ mod tests {
         kompact_testing::{PortTestingExt, PortTestingRefExt},
     };
     use futures_util::FutureExt;
+    use rand::{RngCore, SeedableRng, rngs::StdRng};
     use std::{
         cell::Cell,
         fmt::{self, Display},
@@ -1939,6 +1940,77 @@ mod tests {
     }
 
     #[test]
+    fn udp_manager_delivers_oversized_payload_over_real_udpour_socket() {
+        let receiver_harness = UdpManagerHarness::with_external_socket(
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config_with_part_size(256),
+        );
+        let (receiver_socket_id, receiver_addr) =
+            receiver_harness.bind_external_socket(UdpLocalBind::Exact(localhost(0)));
+        let receiver_socket_key = UdpSocketKey {
+            local_addr: receiver_addr,
+        };
+        receiver_harness.publish_route_endpoint_available(receiver_socket_id, receiver_addr);
+        receiver_harness.wait_for_live_udp_socket(receiver_socket_key);
+
+        let inbound_probe = receiver_harness
+            .core
+            .system()
+            .create(TransportRouteTransportPort::tester_component_sidecar);
+        let inbound_probe_ref = inbound_probe.actor_ref();
+        biconnect_components::<TransportRouteTransportPort, _, _>(
+            &receiver_harness.manager,
+            &inbound_probe,
+        )
+        .expect("connect receiver route transport probe");
+        start_component(receiver_harness.core.system(), &inbound_probe);
+
+        let sender_harness = UdpManagerHarness::with_socket_budgets(
+            0,
+            1,
+            UdpActivationPolicy::OnBind,
+            TestSendRateControl::default(),
+            udpour_config_with_part_size(256),
+        );
+        let oversized_payload = deterministic_test_payload(MAX_UDP_PAYLOAD_BYTES + 513);
+        let oversized_payload_len = oversized_payload.len();
+        let route = UdpRouteKey {
+            remote_addr: receiver_addr,
+            scope: DatagramRouteScope::Unicast,
+            local_bind: None,
+        };
+        let send_id = RouteSendId(Uuid::new_v4());
+        let submit =
+            sender_harness.send_async(route_send(send_id, route, oversized_payload.clone()));
+        let (_sender_socket_id, sender_addr) = sender_harness.wait_for_new_bound_socket();
+        let delivery_future = inbound_probe_ref.observe_indication(move |deliver| {
+            deliver.payload.len() == oversized_payload_len
+                && deliver.transport.remote_addr == Some(sender_addr)
+        });
+
+        assert_eq!(
+            UdpManagerHarness::wait_for_send_ack_future(submit),
+            TransportRouteKey::Udp(route)
+        );
+        let observed = delivery_future
+            .wait_timeout(WAIT_TIMEOUT)
+            .expect("timed out waiting for oversized route-transport delivery")
+            .expect("route transport delivery probe should stay live");
+        let delivery = observed.indication();
+        assert_eq!(delivery.payload.to_vec(), oversized_payload);
+        assert_eq!(delivery.transport.remote_addr, Some(sender_addr));
+        assert_eq!(
+            delivery.transport.route,
+            TransportRouteKey::Udp(UdpRouteKey {
+                remote_addr: sender_addr,
+                scope: DatagramRouteScope::Unicast,
+                local_bind: Some(receiver_addr),
+            })
+        );
+    }
+
+    #[test]
     fn udp_manager_reuses_one_socket_for_two_loopback_targets() {
         let harness = UdpManagerHarness::with_socket_budgets(
             2,
@@ -2098,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_manager_ignores_unregistered_external_udp_bind() {
+    fn udp_manager_does_not_start_udpour_for_unregistered_external_udp_socket() {
         let harness = UdpManagerHarness::with_config(
             UdpActivationPolicy::OnFirstUse,
             TestSendRateControl::default(),
@@ -2106,10 +2178,16 @@ mod tests {
         );
         let socket_id = SocketId(77);
         let local_addr = localhost(34568);
+        let source_addr = localhost(45689);
         let socket_key = UdpSocketKey { local_addr };
 
         harness.manager.on_definition(|component| {
             component.handle_udp_bound(UdpOpenRequestId::new(), socket_id, local_addr);
+            component.handle_udp_received(
+                socket_id,
+                source_addr,
+                IoPayload::from(Bytes::from_static(b"peer announcement traffic")),
+            );
 
             assert!(!component.udp_socket_ids.contains_key(&socket_id));
             assert!(!component.udp_dormant_sockets.contains_key(&socket_key));
@@ -2254,6 +2332,14 @@ mod tests {
             },
             payload: Arc::new(BytesPayload(bytes)),
         }
+    }
+
+    /// Build deterministic pseudo-random bytes so payload round-trips prove exact content.
+    fn deterministic_test_payload(len: usize) -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(0xa5a5_1f2d_3c4b_5968);
+        let mut bytes = vec![0; len];
+        rng.fill_bytes(&mut bytes);
+        bytes
     }
 
     fn udpour_config() -> UDPourConfig {

@@ -1576,6 +1576,7 @@ dependencies = [
  "flotsync_utils",
  "futures-util",
  "kompact",
+ "rand 0.9.4",
  "smallvec",
  "snafu",
  "uuid",

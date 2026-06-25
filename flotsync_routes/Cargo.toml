@@ -23,3 +23,4 @@ uuid = { workspace = true, features = ["v4"] }
 bytes = { workspace = true }
 flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
 futures-util = { workspace = true }
+rand = "0.9"

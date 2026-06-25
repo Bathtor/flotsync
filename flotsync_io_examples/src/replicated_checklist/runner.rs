@@ -829,7 +829,6 @@ impl ChecklistRepl {
         println!("group: {}", self.config.group_id);
         println!("store: {}", self.config.store_path.display());
         println!("config: {}", self.config.source_path.display());
-        println!("local endpoint: {}", self.config.local_endpoint_bind_addr);
         println!(
             "dirty rows: {}, queued events: {}",
             self.working_set.dirty_row_count(),
@@ -1189,7 +1188,6 @@ mod tests {
             trusted_public_jwks_paths,
             group_id,
             ordered_members,
-            local_endpoint_bind_addr: "127.0.0.1:45100".parse().unwrap(),
         }
     }
 

@@ -38,7 +38,14 @@ use flotsync_discovery::{
     services::PeerAnnouncementObserved,
 };
 use flotsync_io::{
-    prelude::{EgressPool, IoBufferConfig, IoBufferPools, IoPayload, SocketId},
+    prelude::{
+        EgressPool,
+        IoBufferConfig,
+        IoBufferPools,
+        IoPayload,
+        MAX_UDP_PAYLOAD_BYTES,
+        SocketId,
+    },
     test_support::{
         build_test_kompact_system,
         eventually_component_state,
@@ -176,6 +183,22 @@ fn shared_memberships(
     remote_member: &MemberIdentity,
 ) -> SharedGroupMemberships {
     single_group_memberships([local_member.clone(), remote_member.clone()])
+}
+
+/// Build `group_count` local shared groups for introduction-size tests.
+fn many_shared_group_memberships(
+    local_member: &MemberIdentity,
+    remote_member: &MemberIdentity,
+    group_count: usize,
+) -> SharedGroupMemberships {
+    let groups = (0..group_count).map(|offset| {
+        let group_index = u128::try_from(offset).expect("test group index should fit u128");
+        (
+            group_id(10_000 + group_index),
+            group_members([local_member.clone(), remote_member.clone()]),
+        )
+    });
+    SharedGroupMemberships::new(GroupMemberships::from_groups(groups))
 }
 
 fn single_group_memberships(
@@ -794,6 +817,41 @@ fn endpoint_selection_port_updates_introduction_claim_routes() {
         remote_route,
         &request_nonce,
         selected_endpoint,
+    );
+    harness.shutdown();
+}
+
+#[test]
+fn oversized_introduction_response_is_submitted_through_route_transport() {
+    let local_member = member(["alice"]);
+    let remote_member = member(["bob"]);
+    let memberships = many_shared_group_memberships(&local_member, &remote_member, 128);
+    let local_endpoint = SocketAddr::from(([0, 0, 0, 0], 45_101));
+    let selected_endpoint = SocketAddr::from(([192, 168, 1, 21], 45_101));
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_101));
+    let request_nonce = uuid_to_wire_bytes(Uuid::from_u128(42_101));
+    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+
+    harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
+    harness.bind_endpoint(SocketId(43), local_endpoint);
+    let frame = introduction_request_endpoint_frame(request_nonce.clone());
+    let payload = block_on(encode_message_payload(&test_egress_pool(), &frame))
+        .expect("introduction request payload should encode");
+    harness.receive_transport(remote_route, payload);
+    let response = harness.recv_transport_submit();
+
+    assert_introduction_claims_route(
+        &response,
+        local_endpoint,
+        remote_route,
+        &request_nonce,
+        selected_endpoint,
+    );
+    let response_payload = encode_transport_payload(&response.payload);
+    assert!(
+        response_payload.len() > MAX_UDP_PAYLOAD_BYTES,
+        "expected introduction response to exceed one UDP datagram; response_len={}, max_udp_payload={MAX_UDP_PAYLOAD_BYTES}",
+        response_payload.len(),
     );
     harness.shutdown();
 }
