@@ -1,0 +1,24 @@
+id = "019f0593-d303-7692-b7d3-f7694772d7fe"
+ref = "flotsync-6s0-m2"
+title = "Add runtime borrowed proto view decode traits"
+body = """
+Add the runtime protobuf borrowed-view decode mechanism on top of the owned conversion traits from flotsync-6s0-m1.
+
+Scope A: define DecodeProtoView and DecodeProtoViewWith traits for generated buffa::MessageView values. Keep view decode separate from owned DecodeProto so borrowed input lifetimes remain visible.
+
+Scope B: implement view decode for the runtime messages and helper types where generated views exist and where the decode path benefits from avoiding owned generated protobuf construction. Initial candidates are WireRuntimeMessage, WireUpdateMessage, WireSummaryMessage, NeedRangeMessage, WireUpdateBatchMessage, WireVersionVector, UpdateRangeMessage, and possibly DatasetUpdateMessage if datamodel operations can remain reasonably scoped.
+
+Scope C: use generated RuntimeMessageView, UpdateView, SummaryView, NeedRangeView, UpdateBatchView, VersionVectorView, and related views directly instead of calling to_owned_message unless ownership is intentionally required.
+
+Scope D: add equivalence tests showing owned proto decode and view proto decode produce the same runtime wire values for representative messages, plus malformed/missing-field coverage.
+
+Acceptance E: hot-path runtime decode can use generated borrowed protobuf views through a consistent trait shape, call sites make view usage explicit, and unavoidable ownership conversion is documented.
+
+Dependency F: blocked by flotsync-6s0-m1 because the view traits should mirror and extend the owned conversion trait vocabulary."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f0593-9f5d-7120-a8d8-0709d3fbfac3"]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-26T20:16:41.731744Z"
+updated_at = "2026-06-26T20:17:13.805638Z"

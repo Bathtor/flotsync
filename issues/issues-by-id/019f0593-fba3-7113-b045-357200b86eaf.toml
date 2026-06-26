@@ -1,0 +1,24 @@
+id = "019f0593-fba3-7113-b045-357200b86eaf"
+ref = "flotsync-6s0-m3"
+title = "Add runtime borrowed proto source encode adapters"
+body = """
+Add explicit borrowed-source adapters for runtime protobuf encoding on top of the owned conversion traits from flotsync-6s0-m1.
+
+Scope A: introduce typed source adapters for encode paths where callers already have the necessary fields by reference and should not need to construct an intermediate owned runtime message first.
+
+Scope B: initial candidates are UpdateMessageProtoSource, SummaryMessageProtoSource, and UpdateBatchMessageProtoSource. Include only adapters that remove real intermediate construction or clarify allocation behaviour.
+
+Scope C: each source adapter should implement the same EncodeProto trait introduced by flotsync-6s0-m1, so borrowed-source encoding has a consistent shape rather than extra free functions with arbitrary arguments.
+
+Scope D: update selected call sites, such as stored update encoding in store/sqlite.rs, only where the adapter materially improves clarity or avoids intermediate owned values.
+
+Acceptance E: borrowed-source encode paths are represented by named adapter types, ownership and clone behaviour remain visible, equivalence tests compare adapter output with owned-message encode output, and simple messages are not given unnecessary adapter types.
+
+Dependency F: blocked by flotsync-6s0-m1 because source adapters should implement the baseline EncodeProto trait."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f0593-9f5d-7120-a8d8-0709d3fbfac3"]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-26T20:16:52.131197Z"
+updated_at = "2026-06-26T20:17:18.088279Z"
