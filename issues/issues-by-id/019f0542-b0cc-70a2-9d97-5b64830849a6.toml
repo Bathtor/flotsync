@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5b64830849a6"
+ref = "flotsync-665"
+title = "Introduce a proper local delivery endpoint bind manager"
+body = "The replication runtime currently binds its externally reachable UDP socket directly from DeliveryRuntimeHost startup via a temporary observer/queue path. Replace that with a dedicated internal component or service that owns the local endpoint binding lifecycle, starting with a simple single-preconfigured-port stub and leaving network-change handling for later. This should also eliminate the temporary RuntimeUdpObserver bind path from production runtime code."
+status = "closed"
+status_reason = "Completed via merged PR #3"
+type = "task"
+priority = 2
+created_at = "2026-04-13T15:44:33Z"
+updated_at = "2026-04-17T15:36:48Z"
+closed_at = "2026-04-17T15:36:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

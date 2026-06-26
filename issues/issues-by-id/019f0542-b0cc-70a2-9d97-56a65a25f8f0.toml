@@ -1,0 +1,56 @@
+id = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+ref = "flotsync-5j0"
+title = "Complete the manual functional replication slice"
+body = """
+Aligned scope for the manual functional replication slice, explicitly before automatic discovery.
+
+Security follow-up moved out of this parent: authenticated and encrypted replication envelopes are tracked separately in flotsync-sec and are blocked by completion of this slice.
+
+Current scope decision: live UpdateBatch broadcasts in this slice are best-effort. Durable GroupBroadcast work only belongs with the future relay or mailbox path, so broadcast delivery-state persistence is deferred out of this slice.
+
+S01. Manual-slice contract: fixed-membership replication groups of arbitrary size, live peers, direct UDP routes configured out-of-band, no automatic discovery, no migration, and no relay or offline catch-up.
+
+S02. Manual reachability via configuration is complete through TOML/Kompact runtime configuration and static UDP peer routes.
+
+S03. Reliable bootstrap robustness is complete via flotsync-46r. ReliableDelivery now has sender-side recipient-ack timeout retry for bootstrap work that would otherwise remain stuck awaiting semantic acknowledgement.
+
+S04. Runtime delivery robustness is complete via flotsync-4x8. Expected protocol-boundary noise, including live UpdateBatch delivery before local group installation, is logged and dropped instead of poisoning the runtime.
+
+S05. Update mapping for the current row/schema operation path is complete via flotsync-94d. This covers UpdateId derivation, read_versions rules, group binding, compatibility checks, and inbound validation needed by the manual slice.
+
+S06. Remaining correctness work: flotsync-a3v must separate replication tombstones from row garbage collection because delete-vs-edit is part of the checklist scenarios.
+
+S07. Runnable checklist example, manual synchronisation control, checklist row model, and CLI command surface are complete through the flotsync-5j0 child tasks for the example.
+
+S08. Remaining acceptance work: flotsync-5j0.9 must exercise the manual checklist scenarios after delete semantics are safe enough for the delete-vs-edit case.
+
+S09. Deferred protocol and delivery work: durable GroupBroadcast relay state, common outer envelopes, full Summary/NeedRange/Snapshot/Ack catch-up, migration, rich group lifecycle modelling, and security hardening are future work outside this slice."""
+status = "closed"
+status_reason = "Reviewed scenarios and confirmed fine"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+children = [
+    "019f0542-b0cc-70a2-9d97-56068f44e30a",
+    "019f0542-b0cc-70a2-9d97-56171050aa5d",
+    "019f0542-b0cc-70a2-9d97-5624ac2017ef",
+    "019f0542-b0cc-70a2-9d97-563e6b449376",
+    "019f0542-b0cc-70a2-9d97-564d67d95318",
+    "019f0542-b0cc-70a2-9d97-565b91d60d3f",
+    "019f0542-b0cc-70a2-9d97-566805dea04c",
+    "019f0542-b0cc-70a2-9d97-5672673b4f73",
+    "019f0542-b0cc-70a2-9d97-569663c845e0",
+    "019f0542-b0cc-70a2-9d97-56c814c369e5",
+    "019f0542-b0cc-70a2-9d97-573c9c8d0da7",
+    "019f0542-b0cc-70a2-9d97-574b0c8e2774",
+    "019f0542-b0cc-70a2-9d97-59575b315dd2",
+    "019f0542-b0cc-70a2-9d97-5b2cdb153914",
+]
+created_at = "2026-04-27T10:23:57Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-06T10:11:29Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

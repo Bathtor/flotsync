@@ -1,0 +1,33 @@
+id = "019f0542-b0cb-7491-bd09-25a32272d84c"
+ref = "flotsync-idcz.5"
+title = "Add oversized introduction and socket ownership regressions"
+body = """
+Slice S05 from flotsync-idcz. Add final regression coverage and manual-test support for the original failure mode after S02-S04 are complete. Focus on proving that large introduction responses use flotsync_routes route transport/UDPour, peer-announcement sockets never start UDPour, and self-announcements are ignored.
+
+This can include unit, component, or runtime integration tests depending on what is practical after the move, behavioural, and lifecycle slices. Keep any socket-binding tests on the flotsync_io test-support reservation broker or an existing harness built on top of it.
+
+Expected size: 300-700 LOC touched.
+
+## Acceptance Criteria
+
+E01 A route-establishment introduction response exceeding MAX_UDP_PAYLOAD_BYTES succeeds through flotsync_routes route transport/UDPour.
+E02 Peer-announcement socket traffic does not create or start UDPour children.
+E03 Local self-announcements remain ignored.
+E04 Manual replicated-checklist notes or test instructions are updated if the workflow changes.
+E05 Socket-binding tests declare reservations through flotsync_io test support or an existing harness.
+E06 cargo fmt, relevant tests, and pedantic clippy for touched crates pass.
+
+## Notes
+
+Agreed scope: this is an automated regression slice, not a manual oversized-introduction test. Add one route-establishment component test proving an introduction response larger than flotsync_io::MAX_UDP_PAYLOAD_BYTES is submitted through route transport, and one route-transport manager integration test proving UDPour carries and reassembles an oversized payload over real UDP sockets. Keep the replicated-checklist run as a manual smoke check for the original warning symptom only. Existing self-announcement and unregistered-bind/socket-ownership regressions can satisfy the socket-warning cases if their names/assertions remain explicit."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 0
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cb-7491-bd09-25fdadb5634f"]
+blocks = ["019f0542-b0cb-7491-bd09-25bccd102890"]
+parent = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+created_at = "2026-06-23T14:24:52Z"
+updated_at = "2026-06-25T09:17:21Z"
+closed_at = "2026-06-25T08:17:22Z"

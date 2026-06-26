@@ -1,0 +1,28 @@
+id = "019f0542-b0cc-70a2-9d97-55b3320f74ae"
+ref = "flotsync-sec.4"
+title = "Secure reliable bootstrap with HPKE and member public keys"
+body = """
+Secure reliable bootstrap through a reusable delivery security boundary. flotsync_security owns crypto primitives for HPKE bootstrap payloads, signature transcripts, validation material, and encrypted store-secret sealing/opening. flotsync_replication adds a delivery-level security service that owns store access for local private keys, trusted public keys, database-secret encryption keys, bootstrap payload preparation, and inbound bootstrap opening. The runtime component should only provide semantic group/bootstrap intent and install or load ReplicationStore records; it must not construct HPKE transcripts or call flotsync_security bootstrap helpers directly. Reliable delivery should use the security service to seal per-recipient bootstrap envelopes and to open inbound bootstrap envelopes. Bootstrap payload includes group id, ordered members, every member signing public key, every member encryption public key, group cipher suite, and group symmetric key. Inbound bootstrap verifies sender signature, decrypts the HPKE payload, validates public keys against provisioned trusted public keys, writes encrypted group material, and installs group membership only after checks pass.
+
+## Acceptance Criteria
+
+Create-group outbound bootstrap seals per recipient through the delivery security service; inbound bootstrap rejects signature failures, HPKE decrypt failures, and trusted-key mismatches through that same service; stored group records contain encrypted sensitive group-security material and member public keys; runtime observes bootstrap state by loading group records from ReplicationStore and does not own crypto transcript construction; flotsync_security remains the only crate constructing bootstrap cryptographic transcripts; tests cover successful secure bootstrap plus mismatched public key and tampered payload failures."""
+status = "closed"
+status_reason = "Completed secure reliable bootstrap delivery slice; reviewed, audited, and validated."
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5578ad0e4480",
+    "019f0542-b0cc-70a2-9d97-559d30e93724",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-55c56c4c3217",
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+    "019f0542-b0cc-70a2-9d97-55ee94817ff5",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:32:22Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-17T15:01:24Z"

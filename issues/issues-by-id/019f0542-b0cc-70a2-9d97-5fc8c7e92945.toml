@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5fc8c7e92945"
+ref = "flotsync-uvo"
+title = "Add ReplicationStore conformance tests"
+body = "Create a reusable public-facing conformance test suite for ReplicationStore implementations. It should encode expected dataset row storage semantics, including tombstone round-trip, missing-to-tombstone acceptance after desync, active-to-tombstone transitions, idempotent tombstone writes, and rejection of tombstone-to-active resurrection. This should be reusable by SQLite and future store implementations rather than duplicated as implementation-local tests."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-04-30T14:21:29Z"
+updated_at = "2026-05-29T14:42:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-56c814c369e5"
+label = "discovered from"

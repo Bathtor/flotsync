@@ -1,0 +1,14 @@
+id = "019f0542-b0cc-70a2-9d97-6021a6d21593"
+ref = "flotsync-sfo"
+title = "Handle relay routes in GroupBroadcast semantic owner"
+body = "The minimal GroupBroadcast slice currently ignores relay route discovery updates and relay-store confirmation traffic. Extend the semantic owner to track relay candidates and handle the relay delivery/control path, with explicit tests for the relay-specific behaviour. Discovered while implementing flotsync-w6r."
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-60a0c00b7da3"]
+created_at = "2026-04-06T14:08:34Z"
+updated_at = "2026-05-30T13:27:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5be2b7e41df5"
+label = "discovered from"

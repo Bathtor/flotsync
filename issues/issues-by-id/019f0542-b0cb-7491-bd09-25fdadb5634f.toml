@@ -1,0 +1,36 @@
+id = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+ref = "flotsync-idcz"
+title = "Move route establishment into flotsync_routes and route introductions through transport"
+body = """
+Context: route establishment introductions can exceed the single UDP datagram payload budget and must use UDPour. Peer announcements remain raw UDP discovery traffic. The route establishment mechanism is a Kompact/runtime route mechanism, not discovery transport in the broad sense, so it should live with route transport in a dedicated flotsync_routes crate. flotsync_discovery should keep peer announcement and discovery mechanisms, while depending on flotsync_routes for route types and endpoint-selection contracts where needed.
+
+P01 S01 already extracted the route transport contracts and RouteTransportManager from flotsync_replication into a temporary crate named flotsync_route_transport.
+
+P02 S02 is move/refactor only: rename flotsync_route_transport to flotsync_routes and move route-owned code from flotsync_discovery into it, including route_establishment, route_publication, endpoint_selection, DiscoveryRoute, introduction frame helpers, and route-establishment wire/state/config/tests. Keep route establishment behaviour unchanged in this slice, including raw UDP introduction traffic and temporary host-level endpoint calls.
+
+P03 S03 is the behavioural introduction-transport slice: route establishment, now in flotsync_routes, sends introduction request/response frames through RouteTransportActorMessage::Submit and handles inbound RouteTransportInboundDeliver carrying EndpointFrame::Discovery.
+
+P04 S04 introduces the runtime endpoint lifecycle capability and removes transitional host fan-out/glue. LocalEndpointManager remains the authority that binds, rebinds, and closes the runtime endpoint socket, and publishes lifecycle indications with SocketId and local_addr. RouteTransportManager and RouteEstablishmentComponent consume those indications instead of host calls.
+
+P05 S05 adds final regressions and manual-test coverage for oversized introductions, peer-announcement socket ownership, and self-announcement filtering.
+
+P06 Peer announcements stay raw UDP and outside EndpointFrame/UDPour. Peer-announcement sockets must never be registered as route transport endpoints.
+
+P07 Expected implementation remains over 1000 LOC touched across the remaining slices, but each child should stay self-contained: move-only first, behavioural route-introduction change second, endpoint lifecycle cleanup third, final regressions last."""
+status = "closed"
+status_reason = "Completed route establishment move and route-transport introduction slices"
+type = "task"
+priority = 0
+assignee = "Lars Kroll"
+blocks = ["019f0542-b0cb-7491-bd09-25a32272d84c"]
+children = [
+    "019f0542-b0cb-7491-bd09-25a32272d84c",
+    "019f0542-b0cb-7491-bd09-25bccd102890",
+    "019f0542-b0cb-7491-bd09-25c5e705ecc6",
+    "019f0542-b0cb-7491-bd09-25d33d4042fd",
+    "019f0542-b0cb-7491-bd09-25e46191eac0",
+    "019f0542-b0cc-70a2-9d97-5a5d20d3711d",
+]
+created_at = "2026-06-23T07:46:44Z"
+updated_at = "2026-06-25T09:10:19Z"
+closed_at = "2026-06-25T09:10:19Z"

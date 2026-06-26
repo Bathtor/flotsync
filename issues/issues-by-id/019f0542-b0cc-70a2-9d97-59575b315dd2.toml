@@ -1,0 +1,19 @@
+id = "019f0542-b0cc-70a2-9d97-59575b315dd2"
+ref = "flotsync-94d"
+title = "Specify Update mapping: SchemaOperation -> Replication Update(ReadVV)"
+body = "Narrowed scope for the manual replication slice: the SchemaOperation -> Update(ReadVV) mapping is already implemented in the runtime. Local publish derives update_id from the durable local member version, captures read_versions before local apply, persists ReplicationUpdateRecord, and sends the same values in UpdateBatch. Inbound delivery validates group membership, sender index, duplicate/conflicting update ids, and causal readiness. Remaining work for this task is to document that existing contract and tighten inbound validation by rejecting operation change_id mismatches and impossible/self-dependent read_versions before bad inbound updates can become durable pending state."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-566805dea04c"]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-03-10T08:32:21Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-28T07:00:24Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

@@ -1,0 +1,44 @@
+id = "019f0542-b0cc-70a2-9d97-559d30e93724"
+ref = "flotsync-sec.6"
+title = "Sign and verify reliable-delivery acknowledgements"
+body = """
+Replace placeholder reliable-delivery recipient acknowledgement signatures with real Ed25519 signatures and verification. RecipientAck messages should sign the canonical ack public header and relevant delivery context. Sender-side reliable delivery must verify the ack against the expected recipient public key and message id before completing the sender work item.
+
+## Design
+
+Agreed plan for flotsync-sec.6:
+
+S6-01R Replace recipient ack `footer` with a reusable sealed-payload field. Generalise the previously added group sealed payload shape so group broadcast and recipient acks use the same content-plus-signature structure instead of keeping another detached footer path.
+
+S6-02R For recipient acks, the sealed payload content may be empty unless implementation naturally needs an explicit signed body. The signature transcript must bind the distinct ack frame kind plus canonical `RecipientAckHeader` bytes, so the semantic ack context is authenticated.
+
+S6-03R Add canonical recipient-ack public-header bytes in reliable-delivery wire code, matching the group-broadcast pattern.
+
+S6-04R Add `DeliverySecurity` helpers for signing and verifying recipient acks using a distinct frame kind from reliable payloads and group broadcasts.
+
+S6-05R Receiver side signs once after `processed` completes, caches the signed ack, and re-dispatches that signed ack on retries.
+
+S6-06R Sender side verifies the ack matches the pending work item and verifies the recipient signature before marking the ack observed.
+
+S6-07R Tests cover successful signed ack completion plus wrong message id, wrong original sender, wrong recipient, malformed sealed payload, and tampered signature/header rejection.
+
+S6-08R Validation with focused reliable-delivery tests, formatting, and the relevant check/clippy pass.
+
+## Acceptance Criteria
+
+Recipient acknowledgements are signed by the recipient identity; sender-side reliable delivery rejects missing, malformed, wrong-recipient, wrong-message, and tampered ack signatures; existing reliable delivery completion only occurs after verification; and tests cover successful ack verification plus spoofed ack rejection."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5578ad0e4480"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+    "019f0542-b0cc-70a2-9d97-55ee94817ff5",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:32:46Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-20T17:55:57Z"

@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-623269adea5e"
+ref = "flotsync-2b9"
+title = "Decide how delivery absolute-time APIs should be represented and tested"
+body = "The delivery domain still exposes uncovered absolute wall-clock types in flotsync_replication/src/delivery/shared.rs and flotsync_replication/src/delivery/contracts.rs (SystemTime in retry_after, observed_at, and first_submitted_at). These are not used in the current flow, but they are outside the new Kompact/manual-timer coverage and need an explicit design decision: either keep wall-clock semantics behind a dedicated injected clock, or move these APIs onto a different representation that matches the timer-controlled runtime model. If we keep absolute timestamps, evaluate whether the hierarchical_hash_wheel_timer simulation timer or a similar virtual wall-clock seam should be replicated so tests can control them as well. Discovered while implementing flotsync-jgg."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-04-07T13:47:11Z"
+updated_at = "2026-05-29T14:42:44Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-579a53eda8b8"
+label = "discovered from"

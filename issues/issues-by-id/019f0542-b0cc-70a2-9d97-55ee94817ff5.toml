@@ -1,0 +1,26 @@
+id = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
+ref = "flotsync-sec.1"
+title = "Scaffold flotsync_security crate and core crypto API"
+body = """
+Create the flotsync_security workspace crate with the crypto-only API surface for the MVP. The crate should own typed key material, jose-jwk based JWKS/JWK parsing, key role validation, identity key generation helpers, deterministic test-support identities, Ed25519ph sign/verify over streamed SHA-512 transcripts, ChaCha20-Poly1305 group seal/open, HPKE single-shot seal/open for X25519 bootstrap, nonce derivation, transcript construction, and Snafu-derived errors. It must not depend on Kompact, flotsync_io, delivery components, replication store internals, or application config parsing.
+
+## Acceptance Criteria
+
+The new flotsync_security crate builds independently; exposes typed APIs for identity generation, JWKS parsing, Ed25519ph sign/verify, group seal/open, and HPKE single-shot seal/open; includes deterministic test-support helpers; and has unit tests for key role rejection, round-trip key generation, sign/verify failure, group context tampering, ciphertext tampering, wrong context, and HPKE decrypt failure."""
+status = "closed"
+status_reason = "Completed flotsync_security crate scaffold and core crypto API; reviewed and validated."
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
+    "019f0542-b0cc-70a2-9d97-559d30e93724",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+    "019f0542-b0cc-70a2-9d97-55c56c4c3217",
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:31:44Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-16T09:24:34Z"

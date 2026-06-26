@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-60a0c00b7da3"
+ref = "flotsync-nzz"
+title = "Integrate datagram transfer with discovery-published route candidates"
+body = "Bridge flotsync_datagram_transfer from its current one-socket/SocketAddr runtime boundary to the broader route-transport architecture. This should define how discovery-published route candidates are consumed, how live route handles are managed, and how the datagram transfer runtime composes with the route-candidate world discussed for flotsync-187."
+status = "in-progress"
+type = "task"
+priority = 3
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-6021a6d21593",
+    "019f0542-b0cc-70a2-9d97-603ce7d8add5",
+]
+created_at = "2026-03-29T12:39:31Z"
+updated_at = "2026-05-30T13:27:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

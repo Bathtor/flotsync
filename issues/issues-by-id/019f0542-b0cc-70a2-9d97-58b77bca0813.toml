@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-58b77bca0813"
+ref = "flotsync-tlk"
+title = "Pilot migration: replace Tokio-based UDP service path in discovery"
+body = "Integrate flotsync_io into flotsync_discovery for UDP announcements and remove Tokio requirement on that path."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-587e766ed00f"]
+blocks = ["019f0542-b0cc-70a2-9d97-58ef8ce39a9b"]
+created_at = "2026-03-12T15:55:19Z"
+updated_at = "2026-03-24T15:04:17Z"
+closed_at = "2026-03-24T15:04:17Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

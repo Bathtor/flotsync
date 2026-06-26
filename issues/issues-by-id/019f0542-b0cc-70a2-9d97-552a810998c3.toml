@@ -1,0 +1,35 @@
+id = "019f0542-b0cc-70a2-9d97-552a810998c3"
+ref = "flotsync-gxle"
+title = "Implement custom UDP peer tracker route source"
+body = """
+Implement the custom UDP peer tracker route source for the non-mDNS discovery path.
+
+Scope:
+- Add pure discovery protocol helpers below replication for validating Peer beacons, IntroductionRequest, Introduction, and signed Introduction claims.
+- Add a replication-side Kompact route-source component that listens for plaintext Peer beacons on the custom discovery port, probes advertised listening_on endpoints from the actual replication UDP endpoint socket, verifies Introduction responses, tracks internal Known/Reachable/Stale state, and publishes DiscoveryRouteUpdate::PeerRoutes for currently reachable UDP routes.
+- Keep IntroductionRequest and Introduction handling on the same UDP endpoint used by replication messages.
+- Keep route classification internal. Consumers only see the current reachable route list; route withdrawal is a fresh update with the route missing or an empty route list.
+- Use receiver-owned freshness. Re-run the Introduction exchange after the receiver lease expires instead of trusting sender TTLs.
+- Sign exact encoded IntroductionClaimPayload bytes and support multiple group ids per signed claim.
+- Do not wire the component into the main replication runtime topology yet; that belongs to flotsync-ol4e.
+
+Testing plan:
+- Do not rely on LAN broadcast in CI.
+- Prefer pure protocol tests and Kompact probe tests with injected UdpIndication messages over real sockets.
+- Cover valid and malformed Peer beacons, request/introduction encode-decode, exact-payload signature verification, bad signatures, nonce/route/source/member mismatches, irrelevant groups, route publication, route withdrawal, and responder behaviour.
+- Use deterministic test hooks for timeout/lease paths instead of wall-clock sleeps.
+- Any optional real UDP smoke test must reserve sockets up front and stay out of normal CI if it needs broadcast."""
+status = "closed"
+status_reason = "Implemented custom UDP peer tracker route source and addressed review feedback"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-55119c3e2a9a"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-5a0dc487e926",
+    "019f0542-b0cc-70a2-9d97-5a2acee950ec",
+]
+parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+created_at = "2026-05-25T07:41:42Z"
+updated_at = "2026-06-04T07:08:14Z"
+closed_at = "2026-06-04T07:08:14Z"

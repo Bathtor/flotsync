@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-5f3d539ed60f"
+ref = "flotsync-7hp0"
+title = "Add shared-memory cross-binary socket reservation coordinator"
+body = """
+Follow-up from flotsync-jzo. Design and implement a cross-test-binary socket reservation coordinator using the shared_memory crate. Use a target-directory flink rendezvous file for the shared mapping, a fixed repr(C) layout for coordinator state, and an interprocess mutex/lock abstraction for safe updates. The coordinator should track process slots, request slots, lease slots, progress epochs, heartbeats, stale process reaping, and recent diagnostics so concurrently running Rust test binaries can decide whether socket acquisition is making global progress or is truly stuck.
+
+## Acceptance Criteria
+
+A shared-memory coordinator is created/opened through a target-directory flink rendezvous path; state uses a fixed layout with version/magic checks; updates are protected by an interprocess synchronisation primitive; processes register heartbeats separately from progress; stale process slots are reaped; socket waiters can diagnose live holders versus environment exhaustion across test binaries; focused multi-process tests cover progress, stale-process cleanup, and stuck-holder diagnostics."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-17T15:42:42Z"
+updated_at = "2026-05-29T14:42:14Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5556f4c25ca7"
+label = "discovered from"

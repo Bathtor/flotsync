@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-5a8613eee6d6"
+ref = "flotsync-54m7"
+title = "Fix discovery CLI shutdown with active service handles"
+body = "After pressing Enter in flotsync_discovery_cli --active, Kompact kills the IO driver, bridge, and peer-announcement component, but shutdown().wait() does not complete because the CLI still holds Arc<Component<...>> references inside ActiveService while waiting for shutdown. The process exits only after Ctrl-C. Drop active service handles before waiting on system shutdown or otherwise restructure shutdown ownership so active mode terminates cleanly."
+status = "closed"
+status_reason = "Fixed discovery CLI shutdown with active service handles"
+type = "bug"
+priority = 2
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5502a3e1ed8f",
+    "019f0542-b0cc-70a2-9d97-594d8b76c49c",
+]
+parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+created_at = "2026-05-25T07:32:45Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-25T13:37:13Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5a48b48a07c4"
+label = "discovered from"

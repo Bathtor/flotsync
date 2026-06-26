@@ -1,0 +1,10 @@
+id = "019f0542-b0cc-70a2-9d97-60d30b30b2e1"
+ref = "flotsync-8j6"
+title = "Extend flotsync_io HTTP example to keep-alive and stricter HTTP/1.1 semantics"
+body = "Follow-up to flotsync-p8n. Extend the minimal flotsync_io HTTP server example from single-request/close behavior to sequential keep-alive handling on one TCP connection, stricter Host/header validation, and broader HTTP/1.1 protocol behavior (including representative 400/404/405/505 paths). Add a stronger protocol-oriented test harness, likely using Python h11, and optionally passive validation of captured exchanges."
+status = "open"
+type = "task"
+priority = 3
+blocked_by = ["019f0542-b0cc-70a2-9d97-5d05f2998b5e"]
+created_at = "2026-03-22T08:35:35Z"
+updated_at = "2026-05-29T14:42:33Z"

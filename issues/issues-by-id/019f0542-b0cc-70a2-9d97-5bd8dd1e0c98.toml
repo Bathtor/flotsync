@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5bd8dd1e0c98"
+ref = "flotsync-r7p"
+title = "Revisit delivery ingress top-level payload clone for buffa view decode"
+body = "The buffa migration preserved shallow delivery classification with MessageView, but decode_boundary_frame_if_interested currently has to materialise a contiguous byte clone via payload.create_byte_clone() before borrowed view traversal. Follow up by evaluating whether IoPayload can expose a zero-copy contiguous view for this path, whether buffa can decode views directly from the existing buffer shape, or whether a different boundary API would avoid the extra top-level copy without regressing the cheap classify-before-full-decode design."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-04-06T09:27:41Z"
+updated_at = "2026-04-06T10:20:23Z"
+closed_at = "2026-04-06T10:20:23Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57dcb0ded3ed"
+label = "discovered from"

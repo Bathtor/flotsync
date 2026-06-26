@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-5a9b3e573837"
+ref = "flotsync-uohh"
+title = "Replace test JWKS key storage with production key provisioning"
+body = "The reliable bootstrap/security refactor still uses deterministic test-support JWKS material and encrypted local-private-key records for runtime tests. Add the production provisioning path for local member private keys, trusted member public keys, and store-secret key handling so test scaffolding is no longer standing in for real key management."
+status = "open"
+type = "task"
+priority = 2
+created_at = "2026-05-17T11:04:50Z"
+updated_at = "2026-05-29T14:42:09Z"

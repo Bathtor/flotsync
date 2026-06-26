@@ -1,0 +1,14 @@
+id = "019f0542-b0cc-70a2-9d97-603ce7d8add5"
+ref = "flotsync-fx5"
+title = "Handle relay route discovery in ReliableDeliveryComponent"
+body = "ReliableDeliveryComponent currently ignores relay-route discovery updates in the minimal direct-only slice. Follow up by consuming relay routes, integrating them into the reliable-delivery state machine, and supporting relay-based retries and mailbox flows."
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-60a0c00b7da3"]
+created_at = "2026-04-05T17:20:41Z"
+updated_at = "2026-05-30T13:27:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5c045fb9f9d8"
+label = "discovered from"

@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-56068f44e30a"
+ref = "flotsync-0ns"
+title = "Add read tokens and replay-backed publish rebasing"
+body = """
+Implement the manual replication slice fix for publishing local row mutations against the correct application read cut. Add an opaque public ReadToken carried by snapshot/listener APIs, change publish_changes to accept a request with that token plus row mutations, validate token/group scope in the runtime, persist enough row metadata to detect rows changed since the token, reconstruct row state at the token by replay when needed, generate CRDT operations from that base state, apply to latest local state, and persist/broadcast the update with read_versions from the token. Acceptance must cover the checklist failure mode where two peers concurrently edit different fields of the same row and sequential sync preserves both fields.
+
+## Notes
+
+Implemented read-token publish rebasing review fixes: receipt tokens now advance only the writer position from the request token; listener events carry per-update tokens and applications merge them; snapshot tokens are built from hosted group memberships; replay loading/materialisation moved into runtime/replay.rs and replay is scoped to touched rows; SQLite now requires row_last_changed_versions without schema migration fallback; checklist working set owns its read token. Validation: cargo test -p flotsync_replication -- --test-threads=1; cargo test -p flotsync_io_examples -- --test-threads=1; cargo test -p flotsync_core -- --test-threads=1; cargo test -p flotsync_data_types -- --test-threads=1."""
+status = "closed"
+status_reason = "Implemented read-token publish rebasing and addressed review feedback"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-05-01T14:38:33Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-02T13:00:51Z"

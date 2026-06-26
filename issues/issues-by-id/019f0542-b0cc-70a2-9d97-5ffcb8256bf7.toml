@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5ffcb8256bf7"
+ref = "flotsync-5j0.4"
+title = "Implement durable GroupBroadcast relay/work persistence"
+body = """
+Deferred follow-up outside the manual replication slice.
+
+Current status: the manual slice sends live UpdateBatch traffic through GroupBroadcast as best-effort direct fan-out. That traffic is intentionally not durable, and accepted best-effort submits or direct route attempts should not be persisted.
+
+Remaining work: revisit this when relay or mailbox delivery is implemented. Persist only durable broadcast work and outcomes that are needed for relay-backed delivery, crash recovery, terminal bookkeeping, and any receipt semantics we explicitly define for durable delivery."""
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-6110c02d1cf4"]
+created_at = "2026-04-27T10:37:54Z"
+updated_at = "2026-05-30T13:27:21Z"

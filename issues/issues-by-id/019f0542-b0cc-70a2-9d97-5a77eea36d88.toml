@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5a77eea36d88"
+ref = "flotsync-562u"
+title = "Route static peer routes through route establishment"
+body = "Static peer routes currently bypass route establishment and can expose replication routes directly. Follow up by modelling static peer routes as internal peer-announcement observations or equivalent candidate-route inputs, then require route establishment verification before those routes are published to replication. This should also settle whether discovery route candidates can make local_bind non-optional once all published routes originate from the runtime endpoint binding."
+status = "open"
+type = "task"
+priority = 2
+created_at = "2026-05-31T11:50:37Z"
+updated_at = "2026-05-31T11:50:37Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+label = "discovered from"

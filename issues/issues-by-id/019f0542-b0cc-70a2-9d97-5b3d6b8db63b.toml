@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-5b3d6b8db63b"
+ref = "flotsync-73q.5"
+title = "Shrink runtime working state to transaction-scoped group and row data"
+body = """
+Refactor LocalRuntimeState into transaction-scoped helpers that operate over stable group metadata plus a small amount of row or dataset working state at a time. Prefer reading through the active store transaction and relying on read-your-own-writes semantics, rather than mirroring whole runtime datasets in component memory.
+
+## Acceptance Criteria
+
+The runtime no longer keeps long-lived full dataset images as its ground truth, row-scale helpers are sufficient for mutation paths, and the remaining in-memory state is clearly scoped to one active transaction."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-18T14:39:30Z"
+updated_at = "2026-04-26T16:07:58Z"
+closed_at = "2026-04-26T16:07:58Z"

@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5be2b7e41df5"
+ref = "flotsync-w6r"
+title = "Implement minimal GroupBroadcast semantic owner slice for end-to-end delivery tests"
+body = "flotsync-d3g delivered the minimal direct ReliableDeliveryComponent path, but the analogous GroupBroadcast semantic owner slice is still missing. Add the smallest GroupBroadcast runtime/component path needed to consume the owner-specific inbound port from DeliveryIngress, emit the existing higher-level Deliver indication, and exercise one real end-to-end transport-to-semantic-owner path for group delivery."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-04-05T17:47:45Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-06T14:56:33Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5c045fb9f9d8"
+label = "discovered from"

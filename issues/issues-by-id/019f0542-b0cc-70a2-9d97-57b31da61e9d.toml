@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+ref = "flotsync-kao"
+title = "Implement datagram multipart transfer in route transport"
+body = "Implement the datagram multipart protocol defined in docs/datagram_multipart_transfer.md inside the route-transport layer. Cover frame encoding/decoding, sender retention and id reuse policy, receiver reassembly and timeout handling, NeedParts bitmap handling, NoLongerAvailable responses, shared-route retransmission behavior, and tests for confusion recovery and checksum validation."
+status = "closed"
+status_reason = "Completed and reviewed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-28T13:30:15Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-04T12:19:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57c6652684dd"
+label = "discovered from"

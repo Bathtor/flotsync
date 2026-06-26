@@ -1,0 +1,25 @@
+id = "019f0542-b0cc-70a2-9d97-5a0dc487e926"
+ref = "flotsync-0mi"
+title = "Add configurable socket reuse option for announcement socket setup."
+body = """
+Evidence: `flotsync_discovery/src/services/peer_announcement.rs:62`
+
+## Design
+
+Agreed design for configurable discovery bind reuse: S01 flotsync_io owns the actual bind-time socket option because address/port reuse must be set before bind, not through post-bind UdpSocketOption. S02 Add per-request UDP bind options to flotsync_io, defaulting to reuse disabled, and thread them through UdpRequest::Bind and UdpRequest::Connect to the raw driver bind path. S03 Existing driver-wide bind_reuse_address and flotsync.io.bind-reuse-address remain overrides; effective reuse is driver/global reuse OR request reuse. S04 PeerAnnouncementComponent reads a flotsync_discovery Kompact config value for bind reuse rather than adding another Options field. S05 The discovery bind reuse config defaults to true so multiple local Flotsync applications can bind the agreed custom discovery protocol port. S06 Enshrine 52156 as the default custom UDP announcement/listen port by making it the default bind port as well as the advertised/broadcast port. S07 CLI and future runtime users should get the default discovery behaviour without special setup; tests can override the Kompact config to false.
+
+## Acceptance Criteria
+
+flotsync_io exposes per-request UDP bind options for Bind and Connect; per-request reuse reaches the driver and composes with the existing global reuse override; PeerAnnouncementComponent reads a documented flotsync_discovery Kompact config key defaulting to true; the announcement component binds to the default custom UDP protocol port 52156 by default; tests cover per-request reuse in flotsync_io and default/overridden discovery bind options."""
+status = "closed"
+status_reason = "Completed configurable custom UDP discovery socket reuse"
+type = "task"
+priority = 1
+labels = ["area:discovery-udp-announcement"]
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-552a810998c3"]
+blocks = ["019f0542-b0cc-70a2-9d97-5a2acee950ec"]
+parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+created_at = "2026-02-21T08:38:42Z"
+updated_at = "2026-05-30T11:27:24Z"
+closed_at = "2026-05-30T11:27:24Z"

@@ -1,0 +1,25 @@
+id = "019f0542-b0cc-70a2-9d97-576291b15912"
+ref = "flotsync-6uy"
+title = "Standardise async test support with eventually-style waits and shared harnesses"
+body = """
+Create one shared test-support layer for flotsync_io, flotsync_udpour, and flotsync_replication that replaces the current ad-hoc polling loops and fragmented harness code. Scope includes an eventually-style helper for predicate-based waiting, shared buffered probe utilities for mpsc-backed event streams, common Kompact lifecycle helpers, and reusable transport/harness fixtures so crates stop re-implementing near-identical test infrastructure.
+
+## Acceptance Criteria
+
+There is one sanctioned eventually-style wait helper used across the targeted crates; duplicated buffered receiver and polling helpers are removed or folded into shared support; new or migrated tests use the shared harness abstractions rather than crate-local bespoke fixtures."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-07T08:41:09Z"
+updated_at = "2026-04-07T11:55:01Z"
+closed_at = "2026-04-07T11:55:01Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-577ee196e486"
+label = "discovered from"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-579a53eda8b8"
+label = "discovered from"

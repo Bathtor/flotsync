@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-57aade8f8563"
+ref = "flotsync-zfe"
+title = "Prevent duplicate UDPour delivery from late retransmissions"
+body = "Add receiver-side delivered tombstones and a payload retransmit flag so late shared-route repair traffic does not cause duplicate delivery. Cover this with a receiver unit regression and a runtime/shared-route smoke test where one receiver repairs while another already delivered."
+status = "closed"
+status_reason = "Completed and reviewed"
+type = "bug"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-02T15:01:04Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-04T12:19:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+ref = "flotsync-pzi"
+title = "Design database-level APIs and replication group model"
+body = "Define next-layer APIs above schema-level operations, including replication group concepts and boundaries. Evaluate crate placement (flotsync_messages vs flotsync_core) and specify how database-level operations compose with schema-level operations."
+status = "closed"
+status_reason = "Completed on codex/flotsync-pzi: finalized flotsync_replication API sketch updates (module split, boxed-future utility reuse, batched provider contracts, IDs/errors submodules, and one-shot invitation responder)."
+type = "epic"
+priority = 2
+labels = [
+    "area:architecture",
+    "area:replication",
+]
+assignee = "Lars Kroll"
+blocks = ["019f0542-b0cc-70a2-9d97-59d242a3b6c1"]
+created_at = "2026-03-05T14:29:54Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-11T13:20:23Z"

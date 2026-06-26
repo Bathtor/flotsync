@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-59aa8b7e7e6f"
+ref = "flotsync-b5v"
+title = "Revise protocol spec after review round"
+body = "Apply review feedback to communication_protocol_spec.md: global causality with read VV, directional state model clarity, Update vs UpdateBatch split, Ack promise semantics, migration-focused 6.6, remove NeedSnapshot and reset/recovery framing, and reduce session-oriented requirements."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-07T17:51:16Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-07T17:53:36Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-59b14fd226dd"
+label = "discovered from"

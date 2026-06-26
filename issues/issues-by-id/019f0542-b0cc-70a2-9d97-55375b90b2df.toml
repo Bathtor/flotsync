@@ -1,0 +1,23 @@
+id = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+ref = "flotsync-5zu2"
+title = "Complete custom UDP discovery for replicated checklist"
+body = """
+Tracking slice for making custom, non-mDNS peer discovery usable by the replication runtime. Completion criterion: the replicated_checklist application can run without any flotsync.replication.runtime.static-peer-routes entries; static-peer-routes become optional hints rather than required for functionality. Scope is the fully custom UDP path first. mDNS browser/public-message tasks are explicitly out of scope for this slice.
+
+## Notes
+
+Agreed custom-only sequence: S01 fix flotsync-54m7 CLI shutdown handle ownership; S02 complete flotsync-31m PeerDiscovery+Tracking protocol/auth rules for the custom path; S03 complete flotsync-brt Kompact interface/path for custom announcements; S04 complete flotsync-0mi socket reuse configuration where needed for custom UDP discovery; S05 complete flotsync-gxle custom UDP peer tracker route source; S06 complete flotsync-ol4e runtime wiring so custom-discovered routes and static hints are composed; S07 complete flotsync-5hvw replicated-checklist validation without static-peer-routes. mDNS tasks flotsync-dnt and flotsync-2ss are intentionally out of scope for this slice."""
+status = "open"
+type = "epic"
+priority = 1
+children = [
+    "019f0542-b0cc-70a2-9d97-5502a3e1ed8f",
+    "019f0542-b0cc-70a2-9d97-55119c3e2a9a",
+    "019f0542-b0cc-70a2-9d97-552a810998c3",
+    "019f0542-b0cc-70a2-9d97-594d8b76c49c",
+    "019f0542-b0cc-70a2-9d97-5a0dc487e926",
+    "019f0542-b0cc-70a2-9d97-5a2acee950ec",
+    "019f0542-b0cc-70a2-9d97-5a8613eee6d6",
+]
+created_at = "2026-05-25T07:41:09Z"
+updated_at = "2026-05-30T13:27:21Z"

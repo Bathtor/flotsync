@@ -1,0 +1,42 @@
+id = "019f0542-b0cc-70a2-9d97-54eb0d46f3c3"
+ref = "flotsync-pex7"
+title = "Wire route-establishment discovery into runtime host"
+body = """
+AGREED PLAN
+
+Scope:
+P01. Make RouteEstablishmentComponent the normal runtime route source for custom UDP discovery.
+P02. Parse flotsync.replication.runtime.static-peer-routes as static route hints, not as directly published replication routes.
+P03. Feed parsed static route hints into RouteEstablishmentComponent through the WatchedRoute manual-watch API from flotsync-bztn.
+P04. Wire the default runtime discovery topology as peer announcement sender, peer announcement observer, route establishment, discovery route adapter, then delivery consumers.
+P05. Connect route establishment to the shared runtime UDP endpoint used by replication traffic.
+P06. Report the concrete local endpoint bind to route establishment after LocalEndpointManager completes binding.
+P07. Ensure route establishment has concrete local advertised routes before it signs Introduction responses.
+P08. Move the direct preconfigured-route publisher out of the normal runtime host path and into test support only.
+P09. Keep or rename the static route config parsing as production hint parsing, because production still needs to accept static-peer-routes as optional hints.
+P10. Keep PreconfiguredPeerRoutesComponent behaviour only for explicit test-support or manual route injection paths.
+P11. Update runtime-host tests so startup succeeds without static-peer-routes.
+P12. Test that static route hints do not publish routes until verified through route establishment.
+P13. Test that legacy manual route injection still works in explicit test mode.
+P14. Add a reserved-socket two-host runtime smoke test where static hints verify through the Introduction exchange before delivery observes a direct route.
+P15. Update docs and examples so static-peer-routes are described as optional hints, not required direct routes.
+
+Out of scope:
+Q01. Implementing route-establishment static hint verification internals; completed separately in flotsync-bztn.
+Q02. Automatic wildcard or LAN advertised-route selection; tracked separately as flotsync-p9oq.
+Q03. Route-watch garbage collection; tracked separately as flotsync-sfun.
+Q04. Broad runtime topology refactors beyond what is needed to route discovery through route establishment.
+
+Estimate:
+R01. Likely 500-900 LOC, mostly runtime topology wiring and tests.
+R02. Could exceed 1000 LOC if the two-host smoke harness expands; keep that test narrow and avoid unrelated runtime refactors."""
+status = "closed"
+status_reason = "Completed route-establishment integration for replication runtime host"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocks = ["019f0542-b0cc-70a2-9d97-54fbb2fa0c9f"]
+parent = "019f0542-b0cc-70a2-9d97-55119c3e2a9a"
+created_at = "2026-06-05T13:57:47Z"
+updated_at = "2026-06-14T17:48:48Z"
+closed_at = "2026-06-14T17:48:48Z"

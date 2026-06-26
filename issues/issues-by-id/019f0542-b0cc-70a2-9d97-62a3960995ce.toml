@@ -1,0 +1,11 @@
+id = "019f0542-b0cc-70a2-9d97-62a3960995ce"
+ref = "flotsync-4lo"
+title = "Decide whether to keep and complete linked-list backend or remove it."
+body = "Evidence: Disabled module note in `flotsync_data_types/src/linear_data/mod.rs:14`"
+status = "open"
+type = "task"
+priority = 4
+labels = ["area:linear-data-backend"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-62980edf2925"]
+created_at = "2026-02-21T08:38:40Z"
+updated_at = "2026-05-30T13:27:21Z"

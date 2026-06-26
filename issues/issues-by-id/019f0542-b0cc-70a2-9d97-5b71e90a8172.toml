@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5b71e90a8172"
+ref = "flotsync-36j"
+title = "Remove or consume runtime UDP observer backlog after startup bind"
+body = "DeliveryRuntimeHost currently wires RuntimeUdpObserver to the shared IoBridge and queues every UdpIndication into an internal IndicationQueue. That queue is only consumed during external UDP socket startup binding, so ongoing socket-activity indications can accumulate unboundedly in long-running runtimes. Revisit this runtime-host design and either remove the observer after startup, scope it to bind confirmation only, or actively consume/drop irrelevant indications."
+status = "closed"
+status_reason = "Completed via merged PR #3"
+type = "task"
+priority = 2
+created_at = "2026-04-12T15:58:47Z"
+updated_at = "2026-04-17T15:36:52Z"
+closed_at = "2026-04-17T15:36:52Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-613a65961d6e"
+ref = "flotsync-fxr"
+title = "Define common outer protocol envelope"
+body = """
+Future common-envelope specification outside the manual replication slice.
+
+Current status: the manual slice can use the existing delivery envelopes and runtime payload framing. No common outer envelope redesign is required before best-effort live UpdateBatch replication and the checklist example are functional.
+
+Remaining work: specify the shared outer envelope across PeerDiscovery/Tracking, GroupBroadcast, and Replication. This should settle message ids, sender ids, optional group ids, payload kind, correlation ids, extension strategy, and which header fields remain cleartext once group-scoped payload encryption is introduced. This should line up with the later security and payload-redesign work, not block flotsync-5j0."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-10T08:32:18Z"
+updated_at = "2026-05-29T14:42:38Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

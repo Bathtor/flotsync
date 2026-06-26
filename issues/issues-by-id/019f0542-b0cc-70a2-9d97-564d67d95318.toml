@@ -1,0 +1,35 @@
+id = "019f0542-b0cc-70a2-9d97-564d67d95318"
+ref = "flotsync-5j0.7"
+title = "T11 Define the replicated checklist row model"
+body = """
+Define the replicated checklist row model for the manual replication CLI example. Each checklist item is one replicated row keyed by a generated UUID. The CLI should display the full UUID and may use it directly in commands; this example does not need pretty ids.
+
+Agreed schema proposal:
+
+- text: LINEAR_STRING, default empty string. Main item label; concurrent text edits merge structurally.
+- note: LINEAR_STRING, default empty string. Longer free-form notes; useful for concurrent text-edit scenarios.
+- tags: LINEAR_LIST<STRING>, default empty list. Exercises list CRDT behaviour for concurrent tag insertions/deletions.
+- status: TOTAL_ORDER_FINITE_STATE_REGISTER over open < in_progress < done, default open. Status is monotonic; un-done is represented by creating a copy/replacement item with a new row id.
+- priority: LATEST_VALUE_WINS U8 NOT NULL, default 0. Freely editable priority where concurrent edits resolve by the register's LWW total order.
+- edit_count: MONOTONIC_COUNTER, default 0. Increment implicitly whenever any CLI command changes a row value, including row creation. Row deletion does not need to increment because the row disappears.
+
+This intentionally skips plain TOTAL_ORDER_REGISTER because status and edit_count already cover the more interesting ordered/monotonic behaviours without adding a redundant checklist concept.
+
+Scenarios to flesh out with concrete CLI commands once the command surface exists:
+
+- Concurrent text edits on the same item should exercise LINEAR_STRING merging.
+- Concurrent note edits on the same item should exercise longer LINEAR_STRING merging.
+- Concurrent tag insertions/deletions should exercise LINEAR_LIST<STRING> merging.
+- Concurrent status transitions should converge to the furthest monotonic state.
+- Concurrent priority edits should exercise LATEST_VALUE_WINS conflict resolution.
+- Concurrent value-changing edits should accumulate edit_count increments."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+blocked_by = ["019f0542-b0cc-70a2-9d97-563e6b449376"]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:38:16Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-28T07:27:00Z"

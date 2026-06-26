@@ -1,0 +1,40 @@
+id = "019f0542-b0cc-70a2-9d97-54fbb2fa0c9f"
+ref = "flotsync-bztn"
+title = "Add static route hints to route establishment"
+body = """
+AGREED PLAN
+
+Scope:
+- Implement static/manual route watches inside flotsync_discovery::route_establishment without changing the runtime host topology yet.
+- Add a public WatchedRoute type carrying route: DiscoveryRoute and expected_member: Option<MemberIdentity>.
+- Add a message-based API, RouteEstablishmentMessage::ReplaceManualRouteWatches(Vec<WatchedRoute>), so callers can replace the authoritative set of manual routes to watch at runtime.
+- Use DiscoveryRoute as the route-state key.
+- Store route state once per route. Separate interest from verification state to avoid duplicating probe/lease/publication state across Peer announcements and manual watches.
+- Model interest as peer_announced: bool plus a manual member filter. Manual watches for the same route merge; any watch without an expected member means any verified local-group member is acceptable for that manual route.
+- Do not store Peer announcement UUIDs long term. Treat a Peer announcement as interest in the route, not as an ordered or retained instance set.
+- Keep verification route-owned: Known, Probing, Reachable, and Stale states. Reachable should remember the verified instance id and published members where needed.
+- Send IntroductionRequest probes for watched routes using the same runtime endpoint socket used by existing announcement-discovered probes.
+- Validate Introduction replies route-first: look up the route by source, check the active probe nonce, decode the Introduction instance id, require signed claim payloads to carry the same instance id, and require the claim route to match the probed route.
+- Accept a verified member only when the current interest permits it: Peer-announced routes may accept any verified local-group member; manual-only routes with expected_member = Some(member) accept only that member; manual-only routes with expected_member = None accept any verified local-group member.
+- Publish successfully verified watched routes through the existing member-route snapshot machinery, preserving withdrawal, lease, and refresh behaviour.
+- Preserve the existing Peer announcement path except where shared helper/state changes are needed.
+- Add focused tests for valid manual watch verification, wrong expected member, invalid signature, nonce mismatch, route mismatch, probe timeout/stale transition, and lease expiry/refresh.
+
+Out of scope:
+- Runtime-host topology rewiring.
+- Documentation/example updates.
+- Removing the normal-runtime direct static publication path.
+- Automatic wildcard LAN address selection.
+- Route-watch garbage collection; tracked separately as flotsync-sfun.
+
+Estimated size: 350-550 LOC."""
+status = "closed"
+status_reason = "Implemented and reviewed manual route watches in route establishment"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-54eb0d46f3c3"]
+parent = "019f0542-b0cc-70a2-9d97-55119c3e2a9a"
+created_at = "2026-06-05T13:56:41Z"
+updated_at = "2026-06-13T07:40:17Z"
+closed_at = "2026-06-13T07:40:17Z"

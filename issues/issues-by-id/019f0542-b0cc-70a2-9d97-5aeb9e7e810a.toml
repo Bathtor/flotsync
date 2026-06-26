@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5aeb9e7e810a"
+ref = "flotsync-m33"
+title = "Add passphrase protection for private JWKS files"
+body = "Follow-up to the flotsync_security MVP. Add support for protecting local private identity JWKS files with a user-provided passphrase or equivalent local secret handling before these files become the normal long-term configuration format. The design should preserve the typed flotsync_security API boundary and avoid introducing a second application config parser."
+status = "closed"
+status_reason = "Won't do: these files are temporary and we are not going to keep this setup long-term."
+type = "task"
+priority = 2
+created_at = "2026-05-15T09:37:55Z"
+updated_at = "2026-05-23T07:31:26Z"
+closed_at = "2026-05-23T07:31:26Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
+label = "discovered from"

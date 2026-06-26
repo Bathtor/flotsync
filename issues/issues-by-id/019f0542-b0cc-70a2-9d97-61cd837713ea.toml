@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-61cd837713ea"
+ref = "flotsync-h1z0"
+title = "Design actor-message probes for Kompact tests"
+body = "Capture requirements from flotsync custom probe survey: support observing Actor<Message = T> traffic with the same indexed log and positive/negative observation style as PortTesterComponent. The design needs a separate control path because a component whose data plane is Actor<Message = T> cannot also receive probe commands through the same actor message type. Consider handle/on_definition control, tokio or async mpsc drained from spawn_local, a control port, or a companion control component. Needs to cover recipient-only APIs, APIs requiring a real actor ref of T, tagged/mapped recipients, and combined port-event plus actor-message instrumentation for cases like UDP send results."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-06-22T11:38:33Z"
+updated_at = "2026-06-22T11:38:33Z"

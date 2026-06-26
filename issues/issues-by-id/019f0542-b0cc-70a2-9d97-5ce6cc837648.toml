@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5ce6cc837648"
+ref = "flotsync-8hl"
+title = "Make Kompact test logging follow cargo test capture"
+body = "In flotsync_io tests, replace Kompact's default terminal logger with a test-only logger that emits through the Rust test harness capture path so logs stay hidden in normal cargo test runs and appear under --no-capture/show-output."
+status = "closed"
+status_reason = "Completed; test logging now uses the upstreamed Kompact support rather than the local follow-up."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-19T05:57:14Z"
+updated_at = "2026-05-29T14:43:07Z"
+closed_at = "2026-05-29T14:43:07Z"

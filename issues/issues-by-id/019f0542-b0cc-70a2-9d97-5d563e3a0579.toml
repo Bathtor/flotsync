@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5d563e3a0579"
+ref = "flotsync-opy"
+title = "Specify strict Ack semantics (G7 non-regression promise)"
+body = "Produce a strict specification for Ack behavior matching protocol invariant G7. Define acceptance criteria, sender obligations, receiver checks, and edge cases (replay, gaps, coarse catch-up acks) so later implementation can enforce non-regression without compatibility ambiguity."
+status = "open"
+type = "task"
+priority = 2
+created_at = "2026-03-10T08:32:31Z"
+updated_at = "2026-05-29T14:42:06Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

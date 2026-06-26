@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-5dff9faf7fb8"
+ref = "flotsync-vrt.6.2"
+title = "Add correctness fixtures and roundtrip tests for the experimental columnar HistorySnapshot"
+body = """
+Add representative history fixtures and correctness coverage for the experimental columnar HistorySnapshot codec, including boundary nodes, tombstones, null payloads, and empty arrays where allowed by schema.
+
+## Acceptance Criteria
+
+1) Deterministic fixtures cover LatestValueWins, LinearString, and LinearList history streams with representative edge cases. 2) Experimental-format roundtrip tests verify node equivalence and reconstructed CRDT integrity. 3) Edge cases cover boundary nodes, tombstones, nullable values, and empty array payloads where valid."""
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:messages-protobuf"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-5dec86bf40c8"]
+blocks = ["019f0542-b0cc-70a2-9d97-5e0fe032be29"]
+parent = "019f0542-b0cc-70a2-9d97-617be655e796"
+created_at = "2026-03-03T13:51:31Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-03T14:01:10Z"

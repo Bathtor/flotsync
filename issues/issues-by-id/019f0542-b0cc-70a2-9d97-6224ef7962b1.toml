@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-6224ef7962b1"
+ref = "flotsync-gxo"
+title = "Evaluate parallel runtime topology startup"
+body = "Runtime host startup currently starts topology components sequentially even after moving to Kompact async lifecycle APIs. Investigate which topology components can safely start concurrently, document dependency ordering, and update startup to parallelise only independent components."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-05-14T11:32:12Z"
+updated_at = "2026-05-29T14:42:43Z"

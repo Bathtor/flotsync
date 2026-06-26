@@ -1,0 +1,49 @@
+id = "019f0542-b0cb-7491-bd09-25bccd102890"
+ref = "flotsync-idcz.4"
+title = "Introduce endpoint lifecycle and remove transitional route glue"
+body = """
+Slice S04 from flotsync-idcz. Replace transitional host-level endpoint fan-out and route adapter glue after S02 and S03 are complete.
+
+Introduce a runtime endpoint lifecycle capability in flotsync_routes. LocalEndpointManager remains the authority that binds, rebinds, and closes the runtime endpoint socket, and publishes bound/closed lifecycle indications that include SocketId and local_addr. RouteTransportManager and RouteEstablishmentComponent consume this lifecycle instead of relying on separate host calls for RegisterExternalUdpSocket and LocalEndpointBound.
+
+Also remove or shrink the replication-local route establishment adapter once route establishment and route publication live in flotsync_routes. Prefer having route establishment publish the route-transport route update contract directly where that keeps ownership clearer. Preserve semantic delivery consumers: group broadcast and reliable delivery still consume RouteDiscoveryPort<TransportRouteKey>.
+
+Do not replace EndpointSelectionPort; peer announcement and route-establishment claim routes should continue using EndpointSelectionPort for advertisement addresses selected from wildcard binds/interfaces. The lifecycle port is for socket ownership and local transport binding only.
+
+Expected size: 400-900 LOC touched.
+
+## Acceptance Criteria
+
+D01 A runtime endpoint lifecycle port/type exists in flotsync_routes or an explicitly justified shared location.
+D02 LocalEndpointManager provides lifecycle indications for bound and closed runtime endpoints.
+D03 RouteTransportManager consumes lifecycle indications to register/unregister externally owned transport endpoint sockets.
+D04 RouteEstablishmentComponent consumes lifecycle indications for socket id/local bind state.
+D05 Host startup no longer directly calls route transport endpoint registration or route-establishment LocalEndpointBound for normal lifecycle flow.
+D06 EndpointSelectionPort remains the route-advertisement address feed.
+D07 Route establishment route publication no longer requires a replication-local translation component for the normal runtime path, or any remaining adapter is test-only glue with a clear reason.
+D08 GroupBroadcastComponent and ReliableDeliveryComponent still receive RouteDiscoveryPort<TransportRouteKey> updates.
+D09 Tests cover lifecycle publication and consumers.
+D10 cargo fmt, relevant tests, and pedantic clippy for touched crates pass.
+
+## Notes
+
+Agreed S04 implementation plan:
+P01 Introduce RouteEndpointLifecyclePort in flotsync_routes with semantic endpoint ownership events, not raw UDP bind copies. Events should describe a route endpoint becoming Available or Unavailable, carrying RouteEndpointBinding { socket_id, socket_bound_addr }. Docs must state that socket_bound_addr is the actual flotsync_io bind address used as the transport socket key, while EndpointSelectionPort remains responsible for many advertised interface endpoints.
+P02 LocalEndpointManager remains the owner of the runtime UDP bind and continues publishing EndpointSelectionPort unchanged. It should additionally provide RouteEndpointLifecyclePort, publishing Available after a successful bind and Unavailable when the active endpoint closes or is cleared.
+P03 RouteTransportManager consumes RouteEndpointLifecyclePort. Available registers the externally owned endpoint through existing registration logic. Unavailable unregisters or closes the associated route-transport state through the same cleanup path currently used for UDP close handling. Normal host startup should no longer call RegisterExternalUdpSocket directly.
+P04 RouteEstablishmentComponent consumes RouteEndpointLifecyclePort. Available replaces LocalEndpointBound for endpoint state and probing. Unavailable clears the local endpoint and withdraws endpoint-tied routes. EndpointSelectionPort remains the claim-route advertisement feed.
+P05 Runtime host wires LocalEndpointManager lifecycle output to RouteTransportManager and RouteEstablishmentComponent. Host startup keeps EnsureBound and manual route-watch configuration but removes direct route-transport registration and route-establishment LocalEndpointBound fan-out.
+P06 Remove the replication-local DiscoveryRouteAdapterComponent from the normal path. RouteEstablishmentComponent should publish RouteDiscoveryPort<TransportRouteKey> directly because both route establishment and TransportRouteKey now live in flotsync_routes. Move the current DiscoveryRoute to TransportRouteKey conversion into route establishment route publication. Runtime tests that need manual route injection should use a small test-only route source rather than a production adapter.
+P07 Add focused tests for lifecycle publication, route transport lifecycle consumption, route establishment Available/Unavailable handling, direct transport-shaped route publication, and host wiring. Keep socket-binding tests on existing reservation harnesses. Run cargo fmt, cargo check, pedantic clippy, and serial tests for touched crates.
+P08 Expected size is around 800-1200 LOC touched. If adapter removal or lifecycle cleanup expands materially beyond this, split the remaining work before changing behaviour further."""
+status = "closed"
+status_reason = "Completed endpoint lifecycle route glue removal"
+type = "task"
+priority = 0
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cb-7491-bd09-25a32272d84c"]
+blocks = ["019f0542-b0cb-7491-bd09-25c5e705ecc6"]
+parent = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+created_at = "2026-06-23T14:24:40Z"
+updated_at = "2026-06-24T14:06:40Z"
+closed_at = "2026-06-24T13:06:40Z"

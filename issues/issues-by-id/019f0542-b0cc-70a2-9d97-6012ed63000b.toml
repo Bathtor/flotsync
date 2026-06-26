@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-6012ed63000b"
+ref = "flotsync-kdg"
+title = "Support shared-coverage routes in direct GroupBroadcast fan-out"
+body = "The minimal GroupBroadcast slice currently filters to exclusive direct routes and sends one copy per recipient. Extend it to group recipients by shared-capable route coverage and emit one transport submission per shared/broadcast-capable direct route where appropriate. Add tests that prove route grouping rather than one-send-per-recipient fan-out. Discovered while implementing flotsync-w6r."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-04-06T14:08:34Z"
+updated_at = "2026-05-29T14:42:24Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5be2b7e41df5"
+label = "discovered from"

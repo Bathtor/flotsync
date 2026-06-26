@@ -1,0 +1,10 @@
+id = "019f0542-b0cc-70a2-9d97-5ee5ee74bba2"
+ref = "flotsync-ej39"
+title = "Introduce OKF-style design documentation and Flotsync OKF agent skill"
+body = "Adopt OKF as an organisation layer for Flotsync design documentation, without making it the design authority. Scope: create a repo-local Flotsync OKF skill, likely under .codex/skills/flotsync-okf/; add a concise SKILL.md plus a conventions reference for concept types, frontmatter fields, body templates, link rules, and preservation rules for existing prescriptive specs; decide whether AGENTS.md should point agents at the skill; add OKF-compatible frontmatter to docs/*.md with mandatory type/title/description/status fields; use Flotsync concept types such as Protocol, State Machine, Wire Format, API Contract, Decision, Scenario, Benchmark, Testing Guide, and Crate Overview; add optional local fields such as applies_to, source_of_truth, implements, depends_on, supersedes, and tracked_by; add or generate docs/index.md grouped by concept type; improve cross-links between related docs; create scripts/okf-docs.sc as an Ammonite checker/generator using SnakeYAML; support at least check and generate-index modes; validate required frontmatter, known concept types/status values, broken internal links, relationship references, duplicate titles/ids, and stale generated index; wire amm scripts/okf-docs.sc check into the Linux style CI job using coursier/cache-action and coursier/setup-action with apps: ammonite. Keep the first implementation under roughly 1000 LOC and avoid adding OKF log.md files unless a later concrete need appears."
+status = "in-progress"
+type = "task"
+priority = 3
+assignee = "Lars Kroll"
+created_at = "2026-06-13T08:14:41Z"
+updated_at = "2026-06-14T16:38:03Z"

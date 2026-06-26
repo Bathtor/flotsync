@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5dd156d8d2eb"
+ref = "flotsync-0rz"
+title = "Implement row decode APIs for InMemoryDataRow"
+body = "Implement RowOperations for InMemoryDataRow and Decode for Rust primitives, owned collections/slices, String, NaiveDate, and UnixTimestamp against InMemoryFieldValue. Include nullable decode support and typed error reporting for mismatches."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-04T08:21:39Z"
+updated_at = "2026-03-04T08:34:16Z"
+closed_at = "2026-03-04T08:34:16Z"

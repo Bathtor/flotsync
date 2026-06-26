@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5f59ac064081"
+ref = "flotsync-qzt"
+title = "Design migration UX for secure group changes"
+body = """
+Follow-up after the flotsync_security MVP: design the user and application-facing migration experience for secure group changes. This should cover how users review member additions or removals, how public keys are displayed or verified, how new group ids and group keys are accepted, and how applications handle denial or delayed acceptance.
+
+## Acceptance Criteria
+
+There is a concrete migration UX and API design covering user-mediated trust decisions, key display or verification, accept/reject flows, new group id installation, and failure handling; implementation tasks can be derived from it."""
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:34:17Z"
+updated_at = "2026-05-29T14:42:16Z"

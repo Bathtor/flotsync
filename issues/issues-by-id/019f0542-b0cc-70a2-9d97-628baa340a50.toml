@@ -1,0 +1,10 @@
+id = "019f0542-b0cc-70a2-9d97-628baa340a50"
+ref = "flotsync-xop"
+title = "Remove unused `Result` import (or reintroduce async path using it)."
+body = "Evidence: `flotsync_discovery_cli/src/main.rs:2`"
+status = "open"
+type = "task"
+priority = 4
+labels = ["area:discovery-cli-cleanup"]
+created_at = "2026-02-21T08:38:43Z"
+updated_at = "2026-05-29T14:42:47Z"

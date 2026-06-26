@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-5f240db25047"
+ref = "flotsync-e0fz"
+title = "Specify authenticated delivery header fields in protobuf"
+body = """
+Define and apply protobuf-level documentation or custom options for delivery fields that are included in authenticated public-header bytes/AAD/signature transcripts. The goal is to make the protocol boundary explicit in the schema instead of relying only on Rust wire helpers. Start with delivery envelope and ack headers, then apply the same convention consistently to future signed or sealed frames.
+
+## Acceptance Criteria
+
+Delivery protobufs clearly mark which public-header fields are included in authenticated bytes; the convention is documented; and Rust canonicalisation helpers are checked against that schema convention where practical."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-20T15:31:22Z"
+updated_at = "2026-05-29T14:42:13Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-559d30e93724"
+label = "discovered from"

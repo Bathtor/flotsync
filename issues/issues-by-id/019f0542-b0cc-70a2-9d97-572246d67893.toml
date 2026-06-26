@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-572246d67893"
+ref = "flotsync-73q.1"
+title = "Define transactional ReplicationStore boundary for the first replication slice"
+body = """
+Expand ReplicationStore from identity/schema lookup into an object-safe, async-safe transaction boundary for the first replication slice. Cover replication group metadata, canonical members and member indices, version vectors, dataset snapshot access, persisted dataset update records, and schema lookup that can return either shared Arc-backed schemas or static schemas. Keep the scope deliberately to the current replication runtime needs rather than the full long-term storage abstraction.
+
+## Acceptance Criteria
+
+A concrete trait and DTO shape exists for first-slice replication state, transaction semantics are explicit about read-your-own-writes plus commit/rollback, and the schema source can represent Arc or &'static schemas without forcing extra cloning."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-18T14:38:59Z"
+updated_at = "2026-04-19T15:11:17Z"
+closed_at = "2026-04-19T15:11:17Z"

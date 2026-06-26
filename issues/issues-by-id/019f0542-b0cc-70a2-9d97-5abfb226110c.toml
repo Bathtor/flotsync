@@ -1,0 +1,72 @@
+id = "019f0542-b0cc-70a2-9d97-5abfb226110c"
+ref = "flotsync-sec.9"
+title = "Move local database secret storage to OS keyring"
+body = """
+Replace the MVP plaintext application-config local database secret with OS-backed secure storage using the keyring crate. Preserve the store/setup boundary: application setup obtains or creates the device-local database secret, passes only the database-secret key or handle through setup as needed, and replication runtime continues to read provisioned security state from ReplicationStore rather than receiving identity or group secrets from live configuration.
+
+## Design
+
+S9-01. Goal
+
+Move the device-local store-secret key out of plaintext application config and into an OS-backed local secret facility, while keeping the public replication API opaque to that storage mechanism.
+
+S9-02. Ownership boundary
+
+`flotsync_security` owns the storage implementation details: keyring dependency, service/account naming, record encoding, random store-secret key generation, generated store-secret key id, load/create semantics, backend errors, and test-support helpers for isolated test storage.
+
+S9-03. Public API shape
+
+`flotsync_replication` exposes only application-facing security bootstrap concepts. Callers provide an application identifier and a local store-secret profile. They do not construct or inspect keyring entries, service names, account names, record bytes, or backend-specific handles.
+
+S9-04. Lookup identity
+
+The lookup key is application-scoped and profile-scoped, not member-scoped. Use `Identifier` plus a caller-chosen local profile string/value. Do not include `MemberIdentity`, because one application/store should later be able to host multiple local identities sharing the same store secret.
+
+S9-05. Security-crate API
+
+Add an opaque local store-secret profile type and load/create helpers in `flotsync_security`, e.g. `LocalStoreSecretProfile`, `LoadedLocalStoreSecret`, `load_local_store_secret(...)`, and `load_or_create_local_store_secret(...)`. The loaded value carries a generated store-secret key id and the `StoreSecretKey`; implementation names can be refined during coding.
+
+S9-06. Replication wrapper
+
+Refactor `ReplicationSecuritySecrets` so normal callers obtain it through `load_local(...)` or `load_or_create_local(...)` wrappers that delegate to `flotsync_security`, convert the security-crate key id into `StoreSecretKeyId`, and wrap the key for runtime loading.
+
+S9-07. Constructor policy
+
+Remove or gate raw store-secret-key constructors from the normal public application path. Keep test-support construction available where tests need deterministic in-memory fixtures, but avoid making raw key bytes the documented runtime setup path.
+
+S9-08. Error model
+
+Add Snafu errors for local store-secret load/create failures. Public replication errors should remain actionable and storage-opaque; storage-specific causes can stay in source chains without exposing keyring as part of the public API contract.
+
+S9-09. Replicated checklist config
+
+Replace `store-secret-password` with a local store-secret profile config field. Keep `group-secret-password` as the shared static group secret input from the previous task. Checklist instances on the same machine can choose different profiles to avoid clashing when running multiple local instances.
+
+S9-10. Docs and sample config
+
+Update replicated-checklist docs and sample TOML to describe the local profile as an application-local selector for the device secret. Mention that the current implementation stores the secret in OS-backed local storage, but do not document backend internals as the public interface.
+
+S9-11. Tests
+
+Add security-crate tests for first-run create, reload, profile isolation, and error behaviour using an isolated sample/test secret store. Add replication/checklist tests for wrapper loading, config parsing, and multi-profile non-collision. Existing runtime security tests should move from raw secret construction to test helpers where practical.
+
+S9-12. Validation
+
+Run `cargo fmt --all`, focused tests for security/replication/checklist changes, workspace clippy with `-D warnings -W clippy::pedantic`, and `git diff --check`. Before final response, compare implementation against this bd design and call out anything intentionally deferred.
+
+## Acceptance Criteria
+
+local database secret material is stored and retrieved through OS secure storage using keyring; first-run setup can create or initialise the secret; existing plaintext-config development path is removed or clearly gated for tests; sensitive store columns remain encrypted through the same database-secret boundary; and replicated-checklist docs describe the OS-backed setup flow.
+
+## Notes
+
+Implementation plan aligned on 2026-05-24: make StoreSecretKeyId an opaque UUID across layers; use fixed-layout local keyring records; use readable validated application/profile keyring account names; select persistent OS keyring backends explicitly (macOS keychain, iOS protected data, Android native, Windows Credential Manager, Linux Secret Service); install test sample store through one-time process-global initialisation; keep raw ReplicationSecuritySecrets::new only for test-support borked-key fixtures. Working note: .agent_local_docs/tmp/flotsync-sec9-keyring-plan.md"""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-16T09:53:23Z"
+updated_at = "2026-05-24T14:33:23Z"
+closed_at = "2026-05-24T14:33:23Z"

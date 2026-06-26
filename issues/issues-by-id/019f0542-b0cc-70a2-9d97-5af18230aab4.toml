@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+ref = "flotsync-ist"
+title = "Publish and verify member public keys through discovery"
+body = """
+Follow-up after the flotsync_security MVP: move beyond configured trusted public JWKS files by integrating public key advertisement and verification into discovery or a related trust mechanism. This should settle how discovery announcements carry key material or key references, how keys are authenticated, and how runtime trust decisions avoid accepting spoofed identities.
+
+## Acceptance Criteria
+
+Discovery or a defined adjacent trust path can advertise member public keys or references; recipients can authenticate them before use; configured JWKS trust remains available as a bootstrap or override path; and tests cover spoofed announcements and key mismatch rejection."""
+status = "open"
+type = "task"
+priority = 2
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:33:46Z"
+updated_at = "2026-05-29T14:42:10Z"

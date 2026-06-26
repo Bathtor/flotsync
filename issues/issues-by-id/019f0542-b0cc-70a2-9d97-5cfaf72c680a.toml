@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5cfaf72c680a"
+ref = "flotsync-8zk"
+title = "Build flotsync_io netcat-style CLI example"
+body = "Build a reference CLI application on top of flotsync_io/Kompact that can be launched in various TCP/UDP configurations to send and receive strings between instances. This should validate the session and shared-UDP model and serve as an example application for users of the new I/O stack."
+status = "closed"
+status_reason = "Reviewed and completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-587e766ed00f"]
+created_at = "2026-03-17T15:57:08Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-21T15:50:27Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

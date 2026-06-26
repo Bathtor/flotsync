@@ -1,0 +1,22 @@
+id = "019f0542-b0cc-70a2-9d97-5aa133ae5801"
+ref = "flotsync-b6lc"
+title = "Persist reliable outbound state and bound sealed bootstrap fan-out"
+body = """
+Follow-up from flotsync-sec.4. Reliable bootstrap payloads can eventually contain substantial group state, so reliable delivery must not build and retain every per-recipient sealed bootstrap message in memory. Combine the prerequisite and the fan-out fix in one slice: persist reliable outbound pending-send state first, then change bootstrap fan-out so it stores recipient work durably and seals at most one or a bounded set of envelopes at a time. Retry and restart handling should resume from persisted sender work instead of requiring all sealed envelopes to remain in memory.
+
+## Acceptance Criteria
+
+Reliable delivery persists pending outbound sender work needed to resume retries after runtime restart; bootstrap fan-out stores recipient work durably before transport submission; sealing is performed lazily or in a bounded batch instead of pre-sealing every recipient envelope; retry and recipient-ack timeout paths can reconstruct or continue work from persisted state; tests cover restart/resume, bounded sealing behaviour, retry after transient send failure, and completion cleanup.
+
+## Notes
+
+Explore the idea of a Multicast-like request type to reliable delivery so that the individual messages don't have to be created all at once at the replication component level."""
+status = "open"
+type = "task"
+priority = 2
+created_at = "2026-05-17T06:59:09Z"
+updated_at = "2026-05-29T14:42:04Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55b3320f74ae"
+label = "discovered from"

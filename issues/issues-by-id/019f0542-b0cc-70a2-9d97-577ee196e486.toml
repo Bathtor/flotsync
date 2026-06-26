@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-577ee196e486"
+ref = "flotsync-t0a"
+title = "Serialise socket-heavy test harnesses across crates"
+body = "The current replication and IO integration tests use real local UDP sockets and rely on ad-hoc serialisation. Evaluate project-level test serialisation and/or a shared cross-process lock so socket-heavy tests do not interfere across crates or test binaries. This was discovered while implementing flotsync-w6r."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-06T13:06:03Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-08T07:15:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5be2b7e41df5"
+label = "discovered from"

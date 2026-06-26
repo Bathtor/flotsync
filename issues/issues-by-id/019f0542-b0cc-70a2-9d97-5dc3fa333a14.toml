@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5dc3fa333a14"
+ref = "flotsync-ve8"
+title = "Add schema-level default field values"
+body = "Follow up on table insert ergonomics. Allow schema fields to declare default values so insert_row does not require every field to be provided explicitly when a schema-defined default can be materialized safely."
+status = "closed"
+status_reason = "Completed"
+type = "feature"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-04T15:06:37Z"
+updated_at = "2026-03-09T15:43:56Z"
+closed_at = "2026-03-09T15:43:56Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-618d3d8a00d1"
+label = "discovered from"

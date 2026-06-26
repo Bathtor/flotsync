@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-56171050aa5d"
+ref = "flotsync-3h9"
+title = "Document public ReplicationApi methods"
+body = "High-priority follow-up in the manual replication slice. The public ReplicationApi trait methods are the main application-facing runtime boundary and need explicit docs covering what each method does, what state it reads or mutates, ordering/consistency expectations, error behaviour, and lifecycle constraints for returned providers."
+status = "closed"
+status_reason = "Documented public ReplicationApi methods"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-05-01T11:57:10Z"
+updated_at = "2026-05-01T13:56:43Z"
+closed_at = "2026-05-01T13:56:43Z"

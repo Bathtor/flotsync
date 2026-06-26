@@ -1,0 +1,14 @@
+id = "019f0542-b0cc-70a2-9d97-5e8fb3413473"
+ref = "flotsync-8hn"
+title = "Review snapshot datamodel + InMemoryData serialization flow"
+body = "Review the new schema/datamodel snapshot shape and InMemoryData::visit_row_snapshot integration, including ID-shape split (LVW uses base Id; linear history uses IdWithIndex<Id>) and test coverage."
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:data-types-schema"]
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5e762519ec07"]
+created_at = "2026-02-25T16:13:28Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-02-27T16:54:05Z"

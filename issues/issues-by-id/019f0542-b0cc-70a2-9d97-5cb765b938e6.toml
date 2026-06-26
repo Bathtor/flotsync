@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5cb765b938e6"
+ref = "flotsync-bql"
+title = "Add TCP send-and-close helper for request/response handlers"
+body = "Add a helper on the Kompact-facing TCP session API for the common pattern of sending one payload, waiting for transport acceptance/completion, and then closing the session gracefully. This should remove manual response_in_flight/response_sent bookkeeping from simple request/response components like the HTTP example."
+status = "closed"
+status_reason = "Completed"
+type = "feature"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-23T15:36:03Z"
+updated_at = "2026-03-23T18:26:37Z"
+closed_at = "2026-03-23T18:26:37Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d05f2998b5e"
+label = "discovered from"

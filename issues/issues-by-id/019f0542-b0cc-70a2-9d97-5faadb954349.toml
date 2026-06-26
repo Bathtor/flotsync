@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-5faadb954349"
+ref = "flotsync-ozi"
+title = "Rethink replication component public API boundary"
+body = "Summary requests currently enter through ReplicationRuntimeComponent and are temporarily forwarded to SummaryRequestManager. Revisit whether public API asks should be routed directly to capability-specific Kompact components or through a dedicated stable facade."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-03T14:08:55Z"
+updated_at = "2026-05-29T14:42:19Z"

@@ -1,0 +1,24 @@
+id = "019f0542-b0cc-70a2-9d97-609d309b1b70"
+ref = "flotsync-2hd"
+title = "Stream outbound multipart frames instead of materializing full frame vectors"
+body = """
+Avoid building full Vec<PayloadFrame> batches for UDPour initial sends and NeedParts repair responses. Rework sender/runtime interaction so multipart payload frames can be emitted incrementally, reducing allocation and peak scheduler pressure for large logical messages and late repair traffic.
+
+## Notes
+
+2026-04-04 implementation proposal:
+1. Replace sender-side `SenderAction::SendPayloads { frames: Vec<PayloadFrame> }` with an owned payload-stream cursor that carries `message_id`, retained `IoPayload`, `checksum`, `part_count`, `max_part_payload_len`, retransmit flags, and an exact remaining-frame count.
+2. Initial sends should iterate one contiguous part range; `NeedParts` repairs should own a `RoaringBitmap` into-iterator so requested parts are emitted incrementally in ascending order without materialising payload frames.
+3. Carry the change through the UDPour runtime as well: extend the outbound queue from only concrete `QueuedDatagram`s to a queue entry enum that can hold either one concrete control datagram or one payload stream. When a payload stream reaches the queue head, materialise at most one payload datagram, dispatch it under the existing pacing/backpressure rules, and re-queue the stream at the front if more frames remain. This keeps payload ordering contiguous while still allowing newly queued control traffic to pre-empt.
+4. Keep submit semantics unchanged. `OutboundTransfer.pending_initial_transmissions` should come from the stream's exact frame count instead of `frames.len()`, and `UDPourSubmitResult::Sent` should still mean that all initial payload datagrams were transport-acked.
+5. Validation plan: update sender tests to consume the new cursor and assert part ordering plus retransmit flags; keep runtime coverage for paced multipart sends, repair retransmission, retention expiry to `NoLongerAvailable`, socket-close mid-send, and backpressure behaviour.
+6. Rejected smaller variant: replacing the `Vec<PayloadFrame>` with an iterator while still enqueueing all datagrams up front would reduce sender allocation only partially and would not address the runtime queue pressure that motivated the task."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-29T12:39:31Z"
+updated_at = "2026-05-29T14:42:30Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

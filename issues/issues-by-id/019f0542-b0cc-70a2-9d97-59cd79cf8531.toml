@@ -1,0 +1,36 @@
+id = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+ref = "flotsync-73q"
+title = "Build schema storage abstraction for operations and snapshots"
+body = """
+Define a storage interface that applications embedding flotsync can implement to persist and retrieve schema-level replication artifacts, including SchemaOperations and Snapshots. Include clear API contracts for write/read semantics and expected consistency guarantees.
+
+## Notes
+
+Aligned plan before implementation:
+101. Change the storage abstraction so writes do not infer semantics from the shape of InMemoryData alone.
+102. Introduce an explicit row-wise storage argument type that carries per-row Insert, Update, or Delete actions.
+103. Change storage-touching transaction methods to borrow &mut self and tie borrowed inputs to the returned boxed future lifetime, so backends do not need async Mutexes or argument cloning.
+104. Reuse shared version-vector and UpdateBatch codec helpers rather than duplicating encode/decode logic in the backend.
+105. Move canonical member-identity text parsing into flotsync_core and consume that from storage code.
+106. Audit crate-local wait helper usage and replace the timeout-style cases with kompact::prelude::block_until, leaving block_on only for genuine one-shot completion points."""
+status = "closed"
+status_reason = "Completed; child storage/runtime tasks are closed and publish_changes durability follow-up flotsync-74h is closed."
+type = "feature"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+assignee = "Lars Kroll"
+children = [
+    "019f0542-b0cc-70a2-9d97-56e78a48afe2",
+    "019f0542-b0cc-70a2-9d97-56f4d178b851",
+    "019f0542-b0cc-70a2-9d97-570c04159a17",
+    "019f0542-b0cc-70a2-9d97-571062c8af6b",
+    "019f0542-b0cc-70a2-9d97-572246d67893",
+    "019f0542-b0cc-70a2-9d97-5b3d6b8db63b",
+    "019f0542-b0cc-70a2-9d97-5b8b7af0bf60",
+]
+created_at = "2026-03-05T14:30:01Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-26T16:22:38Z"

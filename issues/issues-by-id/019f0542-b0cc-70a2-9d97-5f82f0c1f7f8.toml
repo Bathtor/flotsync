@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5f82f0c1f7f8"
+ref = "flotsync-mfs"
+title = "Switch Kompact dependency back to a published 0.12 release"
+body = "Follow-up after flotsync-dya. The workspace currently points at Kompact master because the needed 0.12 APIs were only available upstream. Once an actual Kompact 0.12 release is published, replace the git patch/dependency with the crates.io release, refresh Cargo.lock, and verify the workspace still builds against the released API."
+status = "closed"
+status_reason = "Switched workspace back to the published Kompact 0.12.0 crates.io release and verified the workspace."
+type = "chore"
+priority = 3
+created_at = "2026-05-13T16:56:17Z"
+updated_at = "2026-05-14T14:49:22Z"
+closed_at = "2026-05-14T14:49:22Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5b97eb7840a5"
+label = "discovered from"

@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5c2755d39e76"
+ref = "flotsync-szl"
+title = "Queue outbound datagram-transfer frame sends instead of spawning per frame"
+body = "Replace the current spawn_local-per-frame runtime send path in flotsync_datagram_transfer with a queued sender loop or equivalent owned dispatcher. The goal is to reduce scheduler overhead and provide one clearer outbound execution path for large multipart sends."
+status = "closed"
+status_reason = "Subsumed by flotsync-ml0 outbound dispatcher work"
+type = "task"
+priority = 2
+created_at = "2026-03-29T12:39:31Z"
+updated_at = "2026-04-04T12:19:48Z"
+closed_at = "2026-04-04T12:19:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

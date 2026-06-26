@@ -1,0 +1,34 @@
+id = "019f0542-b0cc-70a2-9d97-5546566b00ff"
+ref = "flotsync-sec.11"
+title = "Enable public replication runtime load with store-provisioned security"
+body = """
+Remove the temporary public-loader SecurityUnavailable fail-fast path. Normal replication load should construct DeliverySecurity from already-provisioned ReplicationStore security records plus the caller/device-local store-secret key material, then build the runtime host/topology through the same path currently used by tests. This task is intentionally independent of replicated-checklist setup: replication should not care whether security records were provisioned by checklist setup, a test harness, or another application. It is also separate from replacing the stored local private-key/JWKS representation; this task only makes the production runtime load consume the provisioned security state instead of requiring test-only injection.
+
+## Design
+
+SEC11-01. Add an explicit public security load input, separate from ReplicationConfig, so secret-bearing state is not placed into a clone/debug/equality policy struct. Use a small load-time security input carrying the store-secret key id and device-local StoreSecretKey handle with redacted Debug.
+
+SEC11-02. Change the public runtime loaders to require that input and build DeliverySecurity in the normal path: load local member identity from the store, load DeliverySecurity from store-provisioned records and the supplied store-secret key, validate persisted group security readiness, then start DeliveryRuntimeHost through the same runtime construction path used by tests.
+
+SEC11-03. Remove the temporary SecurityUnavailable fail-fast loader. Replace LoadError::SecurityUnavailable with a real security-loading error variant wrapping DeliverySecurityError with application context.
+
+SEC11-04. Move DeliverySecurity::load, local private-key opening, local-private-key error variants, and EncryptedStoreSecret::to_store_secret_ciphertext out from test-support cfg. Deterministic provisioning helpers remain test-only.
+
+SEC11-05. Reuse test support only to provision store records, then exercise the public loader. The core success test proves provisioned local private keys plus the correct store-secret key starts the runtime without test-only DeliverySecurity injection.
+
+SEC11-06. During public runtime load, validate security for every persisted replication group in the store. After loading DeliverySecurity, load all ReplicationGroupRecords, build GroupMembers from each record's canonical members, and require public keys for every member needed by those groups. The local member can be satisfied by the loaded local private keys; every non-local group member must have a trusted public-key record that decodes successfully. If any group cannot be made usable, fail load with clear LoadError context naming the group/member/security problem. Empty stores still load with only local private keys; create/bootstrap paths continue to validate trusted keys for newly introduced members.
+
+SEC11-07. Remove dead-code allowances that only existed because the public loader returned immediately.
+
+## Acceptance Criteria
+
+Public load no longer returns LoadError::SecurityUnavailable when required security inputs are supplied; DeliverySecurity loading/opening is available outside test-support; an explicit load-time security input carries the device-local store-secret key material or handle without parsing application config inside flotsync_security; normal runtime host construction receives a mandatory DeliverySecurity; missing local private keys, invalid/wrong store-secret material, or missing trusted public keys for persisted replication-group members fail with clear LoadError context; empty stores can load with only local private keys; broad dead_code allowances caused by the fail-fast loader are removed where the production path makes code reachable again; tests cover successful public runtime load from provisioned store records and failure cases for missing security state."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+blocks = ["019f0542-b0cc-70a2-9d97-5556f4c25ca7"]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-17T15:19:12Z"
+updated_at = "2026-05-17T18:11:47Z"
+closed_at = "2026-05-17T18:11:47Z"

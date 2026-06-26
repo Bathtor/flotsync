@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-625f7b4f5b4d"
+ref = "flotsync-rp3"
+title = "Improve reliable-delivery outbound serialisation laziness"
+body = "ReliableDeliveryComponent currently wraps pre-encoded protobuf frames in FlotsyncSerializable, which keeps an intermediate buffer around instead of serialising lazily into transport-owned buffers. Follow up by revisiting the boundary once the protobuf implementation is upgraded and remove the unnecessary intermediate representation where practical."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-04-05T17:20:41Z"
+updated_at = "2026-05-29T14:42:46Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5c045fb9f9d8"
+label = "discovered from"

@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-606294387745"
+ref = "flotsync-a5d"
+title = "Build UDPour performance measurement CLI"
+body = "Create a CLI tool for measuring UDPour transfer performance with separate sender and receiver roles so both sides can be set up externally (for example over ssh). Scope the tool to: (1) measure unicast performance between one sender and one receiver; (2) measure multicast/broadcast performance between one sender and multiple receivers using the same sender/receiver setup model; (3) collect metrics that help localise bottlenecks or failure modes, including enough stage-specific information to tell whether problems came from send pacing/rate control, transport loss or repair traffic, receiver-side reassembly, scheduling, or completion latency; (4) provide a simple flotsync_tcp transfer baseline so we can compare against UDPour and identify limitations caused by poor rate control rather than the wider stack; and (5) provide a simple tokio-based TCP transfer baseline as an additional comparison point. The deliverable should make cross-run comparison straightforward and should report results in a form suitable for later analysis."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-04-02T18:14:04Z"
+updated_at = "2026-05-29T14:42:28Z"

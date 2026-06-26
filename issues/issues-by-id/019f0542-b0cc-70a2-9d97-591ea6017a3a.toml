@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-591ea6017a3a"
+ref = "flotsync-xko"
+title = "Implement UDP core: bind/send/recv for connected and unconnected sockets"
+body = "Support core UDP operations and event flow for raw bytes on the new driver."
+status = "closed"
+status_reason = "Completed: implemented real mio-backed UDP bind/connect/send/recv/close handling with driver-owned socket state, event emission for success and failure paths, ingress-capacity read suspend/resume, reusable scratch-buffer linearisation for lease-backed datagrams, and UDP integration tests for unconnected, connected, invalid-target, and suspend/resume behavior."
+type = "feature"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-58aa68458085",
+    "019f0542-b0cc-70a2-9d97-59044182d991",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-58ef8ce39a9b"]
+created_at = "2026-03-12T15:55:18Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-15T18:51:55Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

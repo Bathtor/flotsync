@@ -1,0 +1,55 @@
+id = "019f0542-b0cc-70a2-9d97-55ad62e7e2ac"
+ref = "flotsync-sec.5"
+title = "Seal and verify group broadcast runtime payloads"
+body = """
+Replace group-broadcast placeholder encrypted payload handling with flotsync_security group sealing and opening. Runtime outbound and inbound paths should load group security material from ReplicationStore, with sensitive columns decrypted through the store/database-secret layer. Outbound runtime messages should be encoded, sealed with the stored group symmetric key using ChaCha20-Poly1305 and derived nonce, signed with the local Ed25519 key, and sent through the existing delivery frame. Inbound group messages should keep shallow public-header routing, then verify the sender signature, open the AEAD payload with public header authenticated data, decode RuntimeMessage, and process only after all checks pass.
+
+## Design
+
+Implement secure group-broadcast runtime payloads through the delivery security boundary.
+
+Plan:
+
+G01 Change group broadcast wire shape to match reliable delivery: the public header remains shallow-routeable, while the sealed payload contains ciphertext plus sender signature together. Avoid the existing split between encrypted_payload and footer for group envelopes.
+
+G02 Add a typed group sealed payload in flotsync_security or flotsync_replication as appropriate, with ciphertext and sender signature as one value. flotsync_security should own transcript construction, signature creation/verification, AEAD seal/open, and stored group-key plaintext parsing.
+
+G03 Keep group message overhead to the current MVP target: ChaCha20-Poly1305 tag in ciphertext plus one Ed25519 signature. Do not add per-message nonce, key id, epoch, or algorithm fields.
+
+G04 Add stored group-secret open/parse support. DeliverySecurity should load the group record, open EncryptedStoreSecret with the configured store-secret key/context, parse the plaintext into a supported group cipher suite plus GroupKey, and reject unsupported suite, wrong key id/version/nonce length, malformed plaintext, missing group, or store access failures with Snafu errors.
+
+G05 Make GroupMessageEnvelope explicit over payload state: GroupMessageEnvelope<PlaintextPayload> for runtime and catch-up submissions/deliveries, and GroupMessageEnvelope<SealedGroupPayload> for network wire. Do not keep placeholder footers in the group path.
+
+G06 Put sealing/opening at the GroupBroadcastComponent boundary, because it owns the delivery message id and serves both runtime and catch-up traffic. Inject mandatory DeliverySecurity into the component through the host topology.
+
+G07 Outbound submit flow: accept plaintext from runtime or catch-up, generate/keep the message id, load the stored group key for the target group, seal and sign with group context, convert to wire, and submit to the route transport. Self-delivery should also pass through successful sealing first, then deliver plaintext locally.
+
+G08 Inbound flow: decode wire into GroupMessageEnvelope<SealedGroupPayload>, use the public header for shallow routing, load stored group security, verify sender signature, open AEAD payload with public header authenticated data, and emit GroupBroadcastDeliver with plaintext bytes only after checks pass.
+
+G09 Runtime and catch-up code should continue to encode/decode RuntimeMessage bytes, but should read/write PlaintextPayload.bytes rather than ciphertext-shaped placeholders.
+
+G10 Preserve the existing best-effort group broadcast semantics for this slice: on sealing/opening failures, log and drop rather than inventing new retry policy.
+
+G11 Update protobuf/adapters/tests for the new sealed group payload shape. Cover successful secure group update delivery plus tampering failures for signature, public header/group context, and ciphertext. Keep summary, NeedRange, and UpdateBatch paths working after successful open.
+
+G12 Validate with formatting, cargo checks, focused tests, clippy pedantic where practical, and a final check against this bd plan before declaring the task done.
+
+## Acceptance Criteria
+
+Group outbound paths no longer emit plaintext runtime payload bytes in secure mode; runtime uses group security material loaded from ReplicationStore rather than live application config; inbound group delivery rejects invalid signatures, tampered public headers, wrong group context, and tampered ciphertext; existing update, summary, NeedRange, and UpdateBatch paths operate after successful open; and tests cover secure group update delivery and tampering failures."""
+status = "closed"
+status_reason = "Completed group broadcast payload security slice"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5578ad0e4480"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+    "019f0542-b0cc-70a2-9d97-55c56c4c3217",
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+    "019f0542-b0cc-70a2-9d97-55ee94817ff5",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:32:34Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-20T11:26:19Z"

@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5fde54d5e059"
+ref = "flotsync-hnu"
+title = "Support structural dataset identifiers"
+body = 'DatasetId is currently a flat SQL-like identifier, so the replicated checklist example uses checklist_items even though the logical identity would be structural ["checklist", "items"]. Add support for structural dataset identifiers if we want dataset ids to align with member-style multi-segment identities. This likely touches the public API, store encoding, wire representation, and migrations/compatibility.'
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-04-28T16:05:55Z"
+updated_at = "2026-05-29T14:42:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-563e6b449376"
+label = "discovered from"

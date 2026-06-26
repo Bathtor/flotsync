@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5fb762bcf154"
+ref = "flotsync-261"
+title = "Make ReadToken opaquely serialisable"
+body = "Follow-up to flotsync-0ns. The first manual-slice ReadToken can be an opaque in-memory API value because replicated-checklist is in-memory, but later slices need applications to persist and restore tokens without inspecting replication group scoping. Design and implement opaque serialisation/deserialisation for ReadToken with versioning and validation against the runtime/store state."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-01T14:38:40Z"
+updated_at = "2026-05-29T14:42:20Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-56068f44e30a"
+label = "discovered from"

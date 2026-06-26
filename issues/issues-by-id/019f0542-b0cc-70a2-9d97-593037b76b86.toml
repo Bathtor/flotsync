@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-593037b76b86"
+ref = "flotsync-mi2"
+title = "Add freeform network I/O support in Kompact"
+body = "Implement foundational support for freeform network I/O in Kompact so components can perform arbitrary network reads/writes beyond current constrained messaging paths."
+status = "closed"
+status_reason = "Completed: foundational freeform network I/O support and discovery migration are in place; soak/perf work deferred"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-12T15:09:09Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-24T15:16:40Z"

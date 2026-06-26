@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-608428c42572"
+ref = "flotsync-8zf"
+title = "Upstream LocalActor helper to Kompact"
+body = "Contribute the LocalActor blanket Actor implementation helper upstream to Kompact so the workspace can eventually drop the local patch. Include API discussion, trait bounds, and migration notes from the flotsync local usage."
+status = "closed"
+status_reason = "No longer needed after moving LocalActor helper back into flotsync_utils and dropping the Kompact patch"
+type = "task"
+priority = 3
+created_at = "2026-03-29T17:45:12Z"
+updated_at = "2026-03-31T17:08:49Z"
+closed_at = "2026-03-31T17:08:49Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-60a0c00b7da3"
+label = "discovered from"

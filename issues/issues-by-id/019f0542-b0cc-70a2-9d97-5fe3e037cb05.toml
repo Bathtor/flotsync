@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5fe3e037cb05"
+ref = "flotsync-6in"
+title = "Upstream Kompact config array iteration API"
+body = "Kompact ConfigLookup currently lets consumers select an indexed element, but does not expose selected array values as a slice or iterator. flotsync_replication's static peer route parser currently has to probe get_index(index) until MissingIndex. Upstream an API such as ConfigLookup::as_array()/iter_array() or a typed iterator so consumers can avoid guessing indices, then update flotsync_replication/src/runtime/host/discovery.rs to use it."
+status = "closed"
+status_reason = "Kompact config array iteration API is upstreamed and flotsync use-sites now use array_entries()"
+type = "task"
+priority = 3
+created_at = "2026-04-27T16:53:31Z"
+updated_at = "2026-05-12T09:18:50Z"
+closed_at = "2026-05-12T09:18:50Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5672673b4f73"
+label = "discovered from"

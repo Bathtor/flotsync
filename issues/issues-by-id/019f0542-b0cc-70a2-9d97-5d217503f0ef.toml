@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5d217503f0ef"
+ref = "flotsync-urw"
+title = "Investigate shareable ChunkLease cloning semantics for flotsync_io payloads"
+body = "The current flotsync_io IoPayload clone path materialises ChunkLease into bytes::Bytes because Kompact Port traffic must be Clone while ChunkLease is uniquely owned. Evaluate whether we can preserve lease-backed payload sharing across clones, or otherwise reduce the memory cost of cloning lease-backed payloads. Context: freeform I/O API skeleton in flotsync_io."
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+created_at = "2026-03-14T16:01:33Z"
+updated_at = "2026-03-22T08:24:48Z"
+closed_at = "2026-03-22T08:24:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

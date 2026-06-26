@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-615af5af81da"
+ref = "flotsync-9dm"
+title = "Add Display impls across schema type hierarchy"
+body = "Follow up on schema ergonomics. Add readable fmt::Display implementations across Schema, Field, ReplicatedDataType, and related schema/value types so schema definitions and errors can be rendered for humans without relying on Debug."
+status = "closed"
+status_reason = "Implemented SQL-like Display formatting across schema types with deterministic ordering, TBLPROPERTIES, backtick identifiers, ARRAY<T> types, and single-quoted state literals; added unit coverage."
+type = "task"
+priority = 3
+assignee = "Lars Kroll"
+created_at = "2026-03-04T18:01:01Z"
+updated_at = "2026-03-05T12:02:33Z"
+closed_at = "2026-03-05T12:02:33Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d97437a89db"
+label = "discovered from"

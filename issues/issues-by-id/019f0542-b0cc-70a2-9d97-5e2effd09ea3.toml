@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-5e2effd09ea3"
+ref = "flotsync-vrt.2"
+title = "Implement protobuf snapshot payload codecs for the datamodel surface"
+body = """
+Implement specialized protobuf encode and decode helpers for all schema snapshot value shapes, including state values, NullableBasicValue, PrimitiveValueArray, SnapshotNode payloads, IdWithIndex<UpdateId>, tombstones, and boundary nodes.
+
+## Acceptance Criteria
+
+1) Snapshot payload codecs cover every value shape needed by SchemaSnapshotEncoder and SchemaSnapshotDecoder. 2) Primitive-specialized array encodings are implemented for efficient wire layout. 3) History node codecs preserve stable link, tombstone, and boundary-node semantics."""
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:messages-protobuf"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-5e348324ef83"]
+blocks = ["019f0542-b0cc-70a2-9d97-5e471b71fad5"]
+parent = "019f0542-b0cc-70a2-9d97-5e9d983d9d0b"
+created_at = "2026-03-02T17:41:29Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-03T09:02:07Z"

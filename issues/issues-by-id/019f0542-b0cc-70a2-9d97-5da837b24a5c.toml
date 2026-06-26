@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5da837b24a5c"
+ref = "flotsync-nad"
+title = "Adjust tombstone row semantics and indexed-id cleanup"
+body = "Update InMemoryData row semantics so tombstones still count in len/is_empty and are included in snapshots, return tombstoned rows from get_row, allow applying remote updates to deleted rows while still rejecting local modify_row on deleted rows, remove redundant total-order helper constructors, move uuid to workspace deps, clean up flotsync_messages indexed-id aliases/imports, and make proto chunk_index fields required."
+status = "closed"
+status_reason = "Completed tombstone row semantics update, indexed-id/proto cleanup, workspace uuid dependency move, and related test/protobuf adjustments."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-04T17:23:21Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-04T17:28:10Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-618d3d8a00d1"
+label = "discovered from"

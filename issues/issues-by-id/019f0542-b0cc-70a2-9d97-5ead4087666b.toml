@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5ead4087666b"
+ref = "flotsync-54v"
+title = "Validate/handle local subtree ordering in insertion path."
+body = "Evidence: `flotsync_data_types/src/linear_data/coalesced.rs:1007`"
+status = "closed"
+status_reason = "Reclassified as non-actionable question marker in code"
+type = "task"
+priority = 2
+labels = ["area:coalesced-linear-data"]
+created_at = "2026-02-21T08:38:41Z"
+updated_at = "2026-02-21T08:52:49Z"
+closed_at = "2026-02-21T08:52:49Z"

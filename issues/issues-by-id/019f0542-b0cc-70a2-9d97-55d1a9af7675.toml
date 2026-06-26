@@ -1,0 +1,24 @@
+id = "019f0542-b0cc-70a2-9d97-55d1a9af7675"
+ref = "flotsync-sec.2"
+title = "Abandoned: live replication security configuration"
+body = """
+Abandoned in favour of store-provisioned security state. The previous live runtime configuration approach is no longer part of the MVP direction: storage layout work now comes first, and replicated-checklist setup will provision security material into ReplicationStore before replication starts.
+
+## Acceptance Criteria
+
+Closed as abandoned. Replacement work is tracked by flotsync-sec.10 after the store layout task."""
+status = "closed"
+status_reason = "Abandoned: live typed replication security configuration is superseded by store-provisioned security state and a later replicated-checklist setup task."
+type = "task"
+priority = 1
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
+    "019f0542-b0cc-70a2-9d97-559d30e93724",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-55ee94817ff5"]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:31:57Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-16T09:52:25Z"

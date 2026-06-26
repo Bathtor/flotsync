@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5bf1927e6a96"
+ref = "flotsync-d8d"
+title = "Replace placeholder reliable-delivery signatures with real signing"
+body = "ReliableDeliveryComponent currently uses placeholder_signed_footer() for direct envelope and recipient-ack messages in the minimal end-to-end slice. Replace this with the real signing/verification path once the concrete signature boundary is available, and remove the placeholder helper and TODO."
+status = "closed"
+status_reason = "Confirmed completed: placeholder signed footer helper is gone and reliable-delivery recipient acks are signed and verified with tamper coverage."
+type = "task"
+priority = 2
+created_at = "2026-04-05T16:02:51Z"
+updated_at = "2026-05-29T14:43:06Z"
+closed_at = "2026-05-29T14:43:06Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5c045fb9f9d8"
+label = "discovered from"

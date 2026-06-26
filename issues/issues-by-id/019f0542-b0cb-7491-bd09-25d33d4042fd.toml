@@ -1,0 +1,33 @@
+id = "019f0542-b0cb-7491-bd09-25d33d4042fd"
+ref = "flotsync-idcz.2"
+title = "Rename to flotsync_routes and move route modules"
+body = """
+Slice S02 from flotsync-idcz. Move/refactor only. Rename the temporary flotsync_route_transport crate to flotsync_routes, then move route-owned code out of flotsync_discovery into flotsync_routes.
+
+Scope: move flotsync_discovery::route_establishment, flotsync_discovery::route_publication, flotsync_discovery::endpoint_selection, DiscoveryRoute, route-establishment introduction frame helpers, route-establishment protocol decode helpers, route-establishment wire/state/config/tests, and any route-specific support they need. Update flotsync_discovery so peer announcements and discovery services import route and endpoint-selection contracts from flotsync_routes.
+
+Keep behaviour unchanged in this slice. Introduction requests and responses may still use raw UdpRequest::Send. The host-level endpoint registration and LocalEndpointBound calls may remain. The replication-local route adapter may remain if needed to avoid behaviour changes.
+
+Expected size: 900-1500 LOC touched, mostly moves, module-path rewrites, manifest updates, and test import rewrites. If this grows beyond a mechanical move, stop and split before changing behaviour.
+
+## Acceptance Criteria
+
+B01 The workspace crate is renamed from flotsync_route_transport to flotsync_routes.
+B02 flotsync_routes owns route transport contracts, RouteTransportManager, route_establishment, route_publication, endpoint_selection, DiscoveryRoute, and route-establishment protocol helpers.
+B03 flotsync_discovery no longer defines route_establishment, route_publication, endpoint_selection, or DiscoveryRoute; it keeps peer announcement and discovery-facing services.
+B04 flotsync_discovery compiles by importing route and endpoint-selection contracts from flotsync_routes where peer announcements need them.
+B05 flotsync_replication imports the renamed flotsync_routes crate and keeps existing runtime behaviour.
+B06 Introduction traffic behaviour is unchanged in this slice; no switch from raw UDP to route transport here.
+B07 Existing route-establishment and peer-announcement tests are moved or import-rewritten without changing assertions except for paths/names.
+B08 cargo fmt, relevant tests, and pedantic clippy for touched crates pass."""
+status = "closed"
+status_reason = "Completed and reviewed route/discovery boundary refactor slice"
+type = "task"
+priority = 0
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cb-7491-bd09-25c5e705ecc6"]
+blocks = ["019f0542-b0cb-7491-bd09-25e46191eac0"]
+parent = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+created_at = "2026-06-23T14:24:12Z"
+updated_at = "2026-06-23T17:34:53Z"
+closed_at = "2026-06-23T16:34:53Z"

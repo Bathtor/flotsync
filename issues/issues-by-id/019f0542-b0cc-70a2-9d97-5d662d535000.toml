@@ -1,0 +1,57 @@
+id = "019f0542-b0cc-70a2-9d97-5d662d535000"
+ref = "flotsync-cns"
+title = "Design catch-up fulfillment policy v1 (UpdateBatch-first)"
+body = """
+Define catch-up behavior for NeedRange in two phases: v1 must always fulfill via UpdateBatch, and v2 adds Snapshot + trailing UpdateBatch optimization. Specify selection rules, correlation handling, and how this composes with GroupBroadcast delivery classes.
+
+## Design
+
+Agreed implementation plan for catch-up fulfilment v1.
+
+CNS-001. Scope v1 to manual/live fixed-membership peers, durable local stores, and existing direct group broadcast delivery. Do not include Snapshot fulfilment, relay/mailbox repair, automatic discovery, public manual catch-up API, or encrypted/authenticated envelope changes.
+
+CNS-002. Extend `ReplicationUpdateFilter` with a simple single-producer linear range query, for example producer member index plus inclusive start/end versions and a bounded limit. The storage layer must not compare full read-version vectors or decide causal readiness.
+
+CNS-003. Add `NeedRange` as a repair signal, not an RPC. It carries `group_id` and one or more single-producer inclusive ranges. It does not need a correlation id; completion is determined by local durable version-vector progress.
+
+CNS-004. Add catch-up `UpdateBatch` as the fulfilment message: a bounded list of existing `Update` messages. Responses may partially satisfy a requested range. Empty fulfilment is not useful on the wire for v1.
+
+CNS-005. Use `GroupBroadcast` for `NeedRange` and catch-up `UpdateBatch` in v1. Do not add more per-peer lifecycle state to `ReliableDelivery`; duplicate responses are acceptable and must be harmless.
+
+CNS-006. Introduce `CatchUpManager` as the owner of repair protocol mechanics: outbound needed-range state, narrowing/removal when local progress advances, retry/backoff, broadcasting `NeedRange`, receiving inbound `NeedRange`, loading matching stored updates, and broadcasting catch-up `UpdateBatch`.
+
+CNS-007. Keep `ReplicationRuntimeComponent` responsible for diagnosis. It observes summaries, inbound updates, and stuck pending apply state; computes concrete missing single-producer ranges; and sends those ranges to `CatchUpManager` as local `NeedVersions` messages.
+
+CNS-008. `CatchUpManager` may talk to the store only to fulfil other nodes' `NeedRange` requests. It should not inspect pending apply state or compare read versions to decide what this node is missing.
+
+CNS-009. `SummaryRequest` still returns the requested `Summary`. When a received summary reports versions ahead of local state, the replication component computes missing producer ranges and notifies `CatchUpManager`.
+
+CNS-010. Inbound `Update` handling should trigger catch-up when it sees producer gaps from `update_id.version > expected_next`, dependency gaps from `read_versions > local_versions`, or pending updates that remain blocked after the apply attempt.
+
+CNS-011. Pending apply handling should report why it is stuck by deriving missing ranges from current local VV and the pending updates' producer/read versions, then notifying `CatchUpManager`.
+
+CNS-012. When receiving a `NeedRange`, `CatchUpManager` validates that the sender is a member of the target group, loads applied/persisted updates for each requested single-producer range, and broadcasts a bounded `UpdateBatch`.
+
+CNS-013. For catch-up `UpdateBatch`, validate only that the batch sender is some member of the replication group it is sending updates for. Do not require the sender to be the original producer of each contained update.
+
+CNS-014. For each contained `Update`, derive the logical producer from `update_id.node_index` using the group's canonical member order, then feed that producer into the existing persist/apply path. Do not add redundant catch-up-layer validation against the same producer information.
+
+CNS-015. Reuse existing durable persist/apply logic for every update delivered by catch-up. Duplicate `UpdateBatch` delivery, overlapping ranges, and repeated broadcasts must be harmless through existing persisted-update equality checks and already-applied detection.
+
+CNS-016. Retry policy v1: after a short interval, unresolved ranges are rebroadcast, narrowed first from current local progress. There is no per-peer response tracking or explicit ack.
+
+CNS-017. Scenario expectations should change after implementation: two peers with two independent changes should converge after two syncs instead of three, and a restarted/down replica should catch up after seeing a summary or update frontier.
+
+CNS-018. Acceptance tests should cover the store range filter, summary-triggered need, update-triggered need, pending-apply-triggered need, partial `UpdateBatch`, duplicate `UpdateBatch`, third-party fulfilment, and range narrowing after progress."""
+status = "closed"
+status_reason = "Implemented catch-up fulfilment v1 and added runtime coverage; checklist three-sync issue remains an app-level manual-sync semantics limitation."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-10T08:32:27Z"
+updated_at = "2026-05-12T08:41:51Z"
+closed_at = "2026-05-12T08:41:51Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

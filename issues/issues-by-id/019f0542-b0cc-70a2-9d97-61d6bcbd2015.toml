@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-61d6bcbd2015"
+ref = "flotsync-1bkz"
+title = "Evaluate converting OKF docs Ammonite script to Mill"
+body = "Follow-up after the OKF documentation checker/generator exists in Ammonite. Evaluate whether scripts/okf-docs.sc should be converted to a Mill single-file script or another Mill-based shape now that Ammonite is deprecated upstream. Keep this separate from the initial OKF documentation introduction so the first pass can use Ammonite and SnakeYAML without requiring Mill research. Acceptance direction: document the trade-off, convert only if the Mill version is clearer and easy to run locally and on GitHub Actions, and update CI/docs accordingly if conversion happens."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-06-13T08:14:46Z"
+updated_at = "2026-06-13T08:14:46Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5ee5ee74bba2"
+label = "discovered from"

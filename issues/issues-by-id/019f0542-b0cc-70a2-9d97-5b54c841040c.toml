@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5b54c841040c"
+ref = "flotsync-ylo"
+title = "Separate replication runtime payload encoding from encrypted byte transport"
+body = "The replication runtime currently serialises runtime messages directly to bytes at the delivery-envelope boundary because payload handling is still byte-oriented for the future encryption setup. Track the follow-up to redesign this boundary around a proper payload abstraction (likely aligned with IoPayload or the eventual ciphertext envelope API) so in-memory runtime messages convert to wire format separately from byte or ciphertext serialisation."
+status = "closed"
+status_reason = "Not currently actionable; current delivery byte boundary is acceptable, and a narrower task can be created if a concrete issue appears."
+type = "task"
+priority = 2
+created_at = "2026-04-13T17:14:30Z"
+updated_at = "2026-05-29T14:54:23Z"
+closed_at = "2026-05-29T14:54:23Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

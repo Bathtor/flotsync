@@ -1,0 +1,19 @@
+id = "019f0542-b0cc-70a2-9d97-5dec86bf40c8"
+ref = "flotsync-vrt.6.3"
+title = "Benchmark node-oriented vs experimental columnar HistorySnapshot formats and record a recommendation"
+body = """
+Add a benchmark harness comparing the current node-oriented HistorySnapshot format with the experimental columnar alternative for encoded size, encode/decode cost, and reconstruction cost, then record the results and recommendation.
+
+## Acceptance Criteria
+
+1) Benchmarks compare current and experimental HistorySnapshot formats for encoded size and encode/decode performance on representative fixtures. 2) The benchmark harness includes medium and large histories plus tombstone-heavy cases. 3) Results are written down with a clear keep/discard/iterate recommendation."""
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:messages-protobuf"]
+blocks = ["019f0542-b0cc-70a2-9d97-5dff9faf7fb8"]
+parent = "019f0542-b0cc-70a2-9d97-617be655e796"
+created_at = "2026-03-03T13:51:37Z"
+updated_at = "2026-03-03T14:07:52Z"
+closed_at = "2026-03-03T14:07:52Z"

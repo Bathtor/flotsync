@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-61f01138eede"
+ref = "flotsync-apu"
+title = "Reduce HPKE encapsulated-key conversion churn"
+body = "Follow-up from flotsync_security review. The public HpkeCiphertext type now stores the fixed-width DHKEM(X25519, HKDF-SHA256) encapsulated key as a 32-byte array and exposes typed from_parts/into_parts helpers. Remaining work, if this still proves worth doing, is to centralise the upstream hpke Serializable/Deserializable conversion helpers and profile whether avoiding the HPKE ciphertext Vec returned by the library is worth a larger API change."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-05-15T17:21:21Z"
+updated_at = "2026-05-29T14:42:41Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
+label = "discovered from"

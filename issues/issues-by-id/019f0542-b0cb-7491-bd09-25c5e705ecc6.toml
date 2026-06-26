@@ -1,0 +1,45 @@
+id = "019f0542-b0cb-7491-bd09-25c5e705ecc6"
+ref = "flotsync-idcz.3"
+title = "Route establishment introductions through route transport"
+body = """
+Slice S03 from flotsync-idcz. Behavioural change after the move-only S02 slice. Update flotsync_routes route establishment so introduction request and response frames use route transport/UDPour instead of raw UdpRequest::Send.
+
+RouteEstablishmentComponent should submit outbound EndpointFrame::Discovery payloads through RouteTransportActorMessage::Submit and consume reassembled RouteTransportInboundDeliver for inbound discovery frames. Use the runtime endpoint local bind when building UDP route keys so route transport reuses the registered endpoint socket instead of opening a fresh socket.
+
+Keep peer announcements as raw UDP. Keep EndpointSelectionPort as the advertisement-address feed. Retain the host-level endpoint registration barrier and LocalEndpointBound call initially; S04 replaces that with a lifecycle port.
+
+Expected size: 500-900 LOC touched, including route-establishment tests currently built around raw UDP sends.
+
+## Acceptance Criteria
+
+C01 Introduction requests are submitted through route transport, not raw UDP sends.
+C02 Introduction responses are submitted through route transport, not raw UDP sends.
+C03 Route establishment handles inbound RouteTransportInboundDeliver carrying EndpointFrame::Discovery.
+C04 Delivery ingress continues to ignore discovery endpoint frames.
+C05 Existing self-announcement and endpoint-selection route-claim tests remain green.
+C06 Tests cover route establishment outbound submit and inbound reassembled discovery delivery.
+C07 Peer announcements remain raw UDP and outside route transport.
+C08 cargo fmt, relevant tests, and pedantic clippy for touched crates pass.
+
+## Notes
+
+Agreed S03 implementation plan:
+P01 RouteEstablishmentComponent sends IntroductionRequest and Introduction EndpointFrame payloads via RouteTransportActorMessage::Submit instead of raw UdpRequest::Send.
+P02 Outbound UDP route keys use the runtime endpoint local bind from LocalEndpointBound so RouteTransportManager reuses the registered endpoint-manager socket.
+P03 Probe timeout is scheduled only after route transport returns Sent; SendFailed is logged and leaves the route non-probing so a later trigger can retry.
+P04 RouteEstablishmentComponent consumes RouteTransportInboundDeliver on RouteTransportPort<TransportRouteKey>; source is transport.remote_addr when present, otherwise the UDP route key remote_addr.
+P05 Inbound route-transport payloads reuse the existing EndpointFrame discovery decoder and existing IntroductionRequest/Introduction semantic handlers.
+P06 Delivery ingress keeps its existing RouteTransportPort connection and continues to ignore discovery endpoint frames.
+P07 Runtime host wires RouteTransportPort from RouteTransportManager to RouteEstablishmentComponent and keeps peer announcements raw UDP. S04 still owns replacing the host-level endpoint lifecycle glue.
+P08 Tests should cover outbound submit route keys/payloads and inbound reassembled discovery delivery; expected implementation size remains about 600-950 LOC touched."""
+status = "closed"
+status_reason = "Completed route establishment introduction traffic through route transport"
+type = "task"
+priority = 0
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cb-7491-bd09-25bccd102890"]
+blocks = ["019f0542-b0cb-7491-bd09-25d33d4042fd"]
+parent = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+created_at = "2026-06-23T14:24:30Z"
+updated_at = "2026-06-23T19:13:24Z"
+closed_at = "2026-06-23T18:13:25Z"

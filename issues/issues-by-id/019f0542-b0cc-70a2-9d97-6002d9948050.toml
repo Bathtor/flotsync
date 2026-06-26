@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-6002d9948050"
+ref = "flotsync-3ht"
+title = "Support Kompact-owned replication runtime topology embedding"
+body = """
+Reframed follow-up from the runtime-host topology refactor. The current DeliveryRuntimeHost topology is now structured enough for ordinary Rust async runtime setup, but it still owns the complete Kompact component topology externally. What is missing for a real Kompact-first API is an embedding surface that lets an existing Kompact component or topology create and own the replication runtime topology as child components under its own lifecycle, supervision, and configuration boundaries.
+
+Design the required Kompact-facing APIs and ownership model: how callers supply or obtain a KompactSystem, how child topology components are registered, started, and stopped, how ports and actor refs are exposed without leaking internals, how failures propagate to the parent, and how this coexists with the current Rust async DeliveryRuntimeHost API.
+
+Do not move the topology inward just for cosmetic ownership. The task is complete only when applications can set up replication through a Kompact-native integration path rather than only through the host wrapper."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-04-15T18:54:45Z"
+updated_at = "2026-05-29T14:42:23Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

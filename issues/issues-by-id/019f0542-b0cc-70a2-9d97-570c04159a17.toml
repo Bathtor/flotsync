@@ -1,0 +1,22 @@
+id = "019f0542-b0cc-70a2-9d97-570c04159a17"
+ref = "flotsync-73q.3"
+title = "Hydrate replication_groups and membership snapshots from ReplicationStore"
+body = """
+Refactor runtime startup so persisted replication group metadata and canonical member snapshots are loaded from ReplicationStore, then used to seed SharedGroupMemberships. Remove LocalRuntimeState as the whole-runtime source of truth and keep only derived read models plus transaction-scoped metadata in the component.
+
+## Acceptance Criteria
+
+Runtime startup can recover persisted replication groups after restart, SharedGroupMemberships is derived from store state, and the component no longer treats its own in-memory map as the authoritative group registry."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-18T14:39:17Z"
+updated_at = "2026-04-19T17:45:33Z"
+closed_at = "2026-04-19T17:45:33Z"

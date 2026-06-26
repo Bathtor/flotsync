@@ -1,0 +1,44 @@
+id = "019f0542-b0cc-70a2-9d97-5efa7f50f9f3"
+ref = "flotsync-p9oq"
+title = "Select concrete LAN advertised routes for wildcard runtime binds"
+body = """
+AGREED PLAN
+
+Scope:
+P9A. Do not fail startup when no eligible advertised LAN routes exist. Publish an empty advertised-route set so peer announcements stop until routes become available.
+P9B. Use the existing pnet_datalink dependency for interface snapshots in the first slice.
+P9C. Use polling only for network changes in the first slice; do not add platform-specific network-change notification APIs yet.
+P9D. Advertise all plausible LAN addresses, not one best interface. Route establishment verification remains the receiver-side safety net.
+P9E. Add pure flotsync_discovery route-selection types and tests: interface snapshot data, policy/config, and a selector that maps configured bind + actual bound port + interfaces into concrete advertised UDP routes.
+P9F. Keep Kompact lifecycle and timing out of flotsync_discovery. It should provide the selector, not a runtime component.
+P9G. Extend flotsync_replication's LocalEndpointManager to own advertised-route polling because it already binds the runtime endpoint and learns the final bound port.
+P9H. Add a LocalEndpointManager provided port for local advertised-route updates. Runtime topology fans those updates out to peer announcement and route establishment.
+P9I. Add RouteEstablishmentMessage::ReplaceAdvertisedRoutes(Vec<SocketAddr>) so allowed signed advertised routes can change at runtime.
+P9J. Reuse PeerAnnouncementMessage::ReplaceAdvertisedRoutes for the peer announcement side.
+P9K. If the configured local endpoint has a concrete IP, publish exactly that concrete local route. If it uses a wildcard IP, poll interfaces and publish all plausible interface IPs using the bound port.
+P9L. Empty route sets are valid and suppress announcements and local route signing.
+
+Out of scope:
+Q9A. Platform-specific network-change event subscriptions.
+Q9B. Ranking or selecting one best interface.
+Q9C. Full NAT traversal or non-LAN reachability discovery.
+Q9D. Route-watch garbage collection, tracked separately as flotsync-sfun.
+
+Estimate:
+R9A. Pure discovery selector and tests: 150-250 LOC.
+R9B. Route-establishment mutable advertised routes: 50-100 LOC.
+R9C. LocalEndpointManager polling/update port and runtime wiring: 150-250 LOC.
+R9D. Tests/docs: 150-250 LOC.
+R9E. Total likely 500-850 LOC; keep polling-only to stay under 1000 LOC."""
+status = "closed"
+status_reason = "Implemented LAN endpoint selection and runtime wiring"
+type = "task"
+priority = 3
+assignee = "Lars Kroll"
+created_at = "2026-06-13T08:01:59Z"
+updated_at = "2026-06-16T18:26:25Z"
+closed_at = "2026-06-16T18:26:25Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-54eb0d46f3c3"
+label = "discovered from"

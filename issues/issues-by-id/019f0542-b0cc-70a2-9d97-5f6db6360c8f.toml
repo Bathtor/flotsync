@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5f6db6360c8f"
+ref = "flotsync-1zx"
+title = "Design session encryption for relay and TCP communication"
+body = """
+Follow-up after the flotsync_security MVP: design session-oriented encryption for relay or TCP communication where multi-shot HPKE or another session protocol may reduce overhead and provide cleaner stream semantics. This should account for message ordering, retries, reconnects, relay authentication, and how session keys interact with envelope-level group encryption.
+
+## Acceptance Criteria
+
+There is a concrete design for relay or TCP session encryption, including handshake, key lifecycle, ordering assumptions, reconnect behaviour, failure handling, and tests or follow-up implementation tasks."""
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:34:08Z"
+updated_at = "2026-05-29T14:42:16Z"

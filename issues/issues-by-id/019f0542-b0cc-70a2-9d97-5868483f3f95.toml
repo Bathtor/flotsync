@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5868483f3f95"
+ref = "flotsync-27h"
+title = "Switch flotsync_io runtime logging to Kompact logger"
+body = "Refactor non-test runtime logging in flotsync_io driver and pool code to use KompactLogger instead of the global log facade, add explicit logger injection to IoDriver, and isolate example-app logging so it no longer interferes with library/runtime logs. Discovered while finishing flotsync_io_examples netcat logging."
+status = "closed"
+status_reason = "Reviewed and completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-20T07:22:39Z"
+updated_at = "2026-03-21T15:50:27Z"
+closed_at = "2026-03-21T15:50:27Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5cfaf72c680a"
+label = "discovered from"

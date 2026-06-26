@@ -1,0 +1,38 @@
+id = "019f0542-b0cc-70a2-9d97-5672673b4f73"
+ref = "flotsync-5j0.3"
+title = "T03 Configure manual runtime peer endpoints"
+body = """
+Expose runtime-host configuration for manual peer endpoints through TOML/Kompact configuration, without adding a temporary public ReplicationApi route-management surface.
+
+Agreed design:
+
+S01. Replace the temporary runtime discovery source with PreconfiguredPeerRoutesComponent.
+
+S02. PreconfiguredPeerRoutesComponent implements Provide<RouteDiscoveryPort<TransportRouteKey>) and publishes only configured peer routes. No automatic discovery behaviour.
+
+S03. Configuration lives under flotsync.replication.runtime.static-peer-routes as TOML arrays of tables. Each peer route has name, protocol, ip, and port fields. The local bind remains flotsync.replication.runtime.local-endpoint-bind-addr.
+
+S04. Supported protocol for this slice is udp only. Unknown protocols are invalid configuration.
+
+S05. Add a reusable parser/pre-check around Kompact's parsed TOML config so bad static routes fail runtime startup before component execution.
+
+S06. Extend the runtime-system builder path with an in-memory TOML string parameter that is merged into KompactConfig before the system is built. Applications can own file loading themselves.
+
+S07. The route component listens to UdpPort indications and publishes configured peer routes after observing the local endpoint bind announcement from the bridge. This keeps route announcements sequenced after the runtime has a receive socket, without involving LocalEndpointManager explicitly.
+
+S08. Static peer routes require a fixed local endpoint port in this slice. If static routes are configured with local-endpoint-bind-addr port 0, startup should fail.
+
+S09. Tests may use constructor/test-only controls to make route publication timing deterministic, while production uses publish-on-local-endpoint-bound.
+
+S10. Keep relay routes, TCP routes, route refresh loops, route health policy, and automatic discovery out of scope."""
+status = "closed"
+status_reason = "Completed static peer route configuration for manual replication slice"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-566805dea04c"]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:37:20Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-27T17:13:12Z"

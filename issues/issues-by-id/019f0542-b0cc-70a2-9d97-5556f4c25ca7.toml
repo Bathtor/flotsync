@@ -1,0 +1,36 @@
+id = "019f0542-b0cc-70a2-9d97-5556f4c25ca7"
+ref = "flotsync-jzo"
+title = "Improve test socket reservation to avoid stuck replication tests"
+body = """
+Runtime and integration tests still sometimes need manual intervention to kill stuck runs when reserved sockets or runtime-host endpoint bindings do not unwind cleanly. Improve the socket reservation/broker path so tests fail fast with useful diagnostics instead of hanging: track live reservations and activated bindings, make cleanup idempotent, detect leaked or unreleased bindings at test shutdown, and ensure runtime-host tests cannot wait forever on a reserved UDP endpoint that was not rebound or released correctly.
+
+## Design
+
+JZO-01. Stay process-local for this task.
+
+JZO-02. Add a progress_epoch to the existing ReservedSocketBrokerState.
+
+JZO-03. Count only meaningful local progress: fulfilled request, lease release, OS socket acquired, idle socket consumed, partial acquisition returned, idle trim after demand changes.
+
+JZO-04. Do not count wakeups, sleeps, lock acquisition, or repeated bind failures.
+
+JZO-05. Replace the normal acquire failure trigger with a no-progress stall window. If progress keeps happening, keep waiting. If no meaningful local progress happens and this request still cannot acquire its declared slots, fail early.
+
+JZO-06. Keep a large absolute timeout only as a safety fuse.
+
+JZO-07. Diagnostics should include request id, requested/acquired counts, next needed kind, waiting/idle counts, active acquisition owner, last progress event, last bind error, and slot summary.
+
+JZO-08. If there are no local holders and OS acquisition keeps failing, the error should say local acquisition is stuck and full cross-binary holder diagnosis is deferred to flotsync-7hp0.
+
+## Acceptance Criteria
+
+The process-local reserved-socket broker tracks a progress epoch for meaningful acquisition/release progress; waiting reservations reset their stall timer when progress advances; repeated OS bind failures and condvar wakeups do not count as progress; a reservation fails early when no local progress happens for the stall window; a larger absolute timeout remains only as a safety fuse; failure diagnostics include request/acquisition counts, next needed kind, waiting/idle counts, active owner, last progress event, last bind error, and slot summary; tests cover progress reset, no-progress stall, bind failures not counting as progress, and release/idle return counting as progress."""
+status = "closed"
+status_reason = "Completed local socket reservation progress tracking and diagnostics"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5546566b00ff"]
+created_at = "2026-05-16T17:38:32Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-17T16:07:26Z"

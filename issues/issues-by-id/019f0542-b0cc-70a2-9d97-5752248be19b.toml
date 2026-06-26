@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5752248be19b"
+ref = "flotsync-0uc"
+title = "Investigate flaky Linux workspace test failures in pr-linux CI"
+body = "PR #2 hit a flaky failure in the pr-linux GitHub Actions workflow on April 12, 2026 (run 24302768196, job 70958911092). The failing tests were driver::udp::tests::udp_connected_send_and_receive_work, driver::udp::tests::udp_unconnected_bind_send_and_receive_work, kompact::tests::tcp_listener_reuse_config_allows_binding_to_a_reserved_port, and kompact::tests::udp_bridge_broadcasts_socket_activity_but_send_results_stay_private. The failure did not reproduce locally with cargo test -p flotsync_io or cargo test --workspace on macOS, so this likely needs investigation on Linux or in a Linux-like environment. Capture a deterministic reproduction path if possible, then stabilise or redesign the flaky socket/runtime test expectations."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-12T08:57:16Z"
+updated_at = "2026-04-18T13:14:39Z"
+closed_at = "2026-04-18T13:14:39Z"

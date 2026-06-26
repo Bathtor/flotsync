@@ -1,0 +1,26 @@
+id = "019f0542-b0cc-70a2-9d97-5e348324ef83"
+ref = "flotsync-vrt.3"
+title = "Implement protobuf snapshot visitors and dataset decoders"
+body = """
+Implement SchemaSnapshotEncoder, SchemaSnapshotDecoder, DataSnapshotEncoder, and DataSnapshotDecoder in flotsync_messages for the specialized protobuf format, following the existing schema/datamodel snapshot flow end to end.
+
+## Acceptance Criteria
+
+1) flotsync_messages provides working protobuf-backed implementations of the schema snapshot visitor and decoder traits. 2) Dataset-level row encoding and lazy row decoding work through InMemoryData encode_data_snapshots and decode_data_snapshots. 3) The implementation uses the specialized snapshot payload codecs rather than per-CRDT bespoke paths."""
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:messages-protobuf"]
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5e51dfb214a7",
+    "019f0542-b0cc-70a2-9d97-617be655e796",
+]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-5e2effd09ea3",
+    "019f0542-b0cc-70a2-9d97-5e471b71fad5",
+]
+parent = "019f0542-b0cc-70a2-9d97-5e9d983d9d0b"
+created_at = "2026-03-02T17:41:29Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-03T10:33:09Z"

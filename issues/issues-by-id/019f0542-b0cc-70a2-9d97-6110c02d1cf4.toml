@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-6110c02d1cf4"
+ref = "flotsync-yd6"
+title = "Specify GroupBroadcast queue model and delivery semantics"
+body = """
+Future GroupBroadcast durable-delivery work outside the manual replication slice.
+
+Current status: the queue model and delivery semantics have been specified in docs/group_broadcast_queue_model.md. The important slice boundary is that BestEffort work is non-durable and is dropped on restart. The manual replication slice only uses best-effort direct GroupBroadcast for live UpdateBatch traffic.
+
+Remaining work: apply the queue model when relay or mailbox delivery is implemented. That future work needs durable active work, relay store acknowledgement state, crash recovery, terminal outcomes, and any explicit delivery receipt semantics for durable routes. It does not block flotsync-5j0."""
+status = "open"
+type = "task"
+priority = 3
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5ffcb8256bf7"]
+created_at = "2026-03-10T08:33:03Z"
+updated_at = "2026-05-30T13:27:21Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

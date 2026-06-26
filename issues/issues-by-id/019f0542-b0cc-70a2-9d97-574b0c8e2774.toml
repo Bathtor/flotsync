@@ -1,0 +1,36 @@
+id = "019f0542-b0cc-70a2-9d97-574b0c8e2774"
+ref = "flotsync-46r"
+title = "Add sender-side recipient-ack timeout retry to ReliableDelivery"
+body = """
+ReliableDelivery currently leaves sender work items stuck in AwaitingRecipientAck when a recipient never completes semantic processing or rejects an inbound message before acking. Add a sender-side timeout that re-enters the existing retry path when no recipient ack is observed, and update runtime/bootstrap handling to surface failures with context. Discovered while reviewing the first replication slice runtime on flotsync-75s.
+
+Agreed implementation plan:
+
+P01. Add a recipient-ack timeout config key flotsync.reliable-delivery.recipient-ack-timeout with a five-minute production default. Tests may override it to a short duration.
+
+P02. After an outbound reliable envelope transport send succeeds, move the sender work item to AwaitingRecipientAck and schedule its sender retry key for recipient-ack-timeout.
+
+P03. When that retry key fires while the work item is still AwaitingRecipientAck and RecipientAckStatus is still Pending, log the timeout, move the item back to PendingRoute, and reuse the normal direct dispatch path. The retry sends the same message_id and payload, not a new logical reliable message.
+
+P04. Recipient acks may arrive late while the sender work item is PendingRoute or AttemptingDirect after a timeout-driven retry. Accept them for any existing sender work item, cancel the sender retry key, and mark RecipientAckStatus::Observed.
+
+P05. Make receiver duplicate handling state-aware. If a duplicate inbound envelope arrives while AwaitingProcessed, drop it because the receiver already has the envelope locally. If it arrives while AckPending, retry/schedule the cached recipient ack. If it arrives while AckInFlight, drop it because an ack send is already in progress. If the receiver already sent the ack and removed inbound state, a later resend is processed as fresh; bootstrap installation is idempotent for the same group definition and will ack again.
+
+P06. Update the runtime bootstrap processed-promise comment to document the contract: processed is completed only after durable bootstrap install; failures intentionally withhold processed so the sender-side recipient-ack timeout drives redelivery.
+
+P07. Add tests for timeout redelivery, late ack acceptance after a timeout retry, and receiver duplicate handling. Verify with focused ReliableDelivery tests, the full flotsync_replication test suite, and clippy."""
+status = "closed"
+status_reason = "Completed sender-side recipient-ack timeout retry"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-566805dea04c"]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-12T11:59:04Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-27T17:57:37Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

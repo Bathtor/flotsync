@@ -1,0 +1,52 @@
+id = "019f0542-b0cc-70a2-9d97-56c814c369e5"
+ref = "flotsync-a3v"
+title = "Separate replication tombstones from row garbage collection"
+body = """
+Current manual-slice blocker for delete semantics.
+
+Current row-level delete handling physically removes rows from storage. Replication correctness needs durable tombstones to preserve delete causality independently from later row garbage collection.
+
+Required for flotsync-5j0: the checklist delete-vs-edit scenario must not lose the delete intent or allow a concurrent edit to resurrect a deleted row incorrectly. Split durable replication tombstone semantics from eventual row cleanup in the replication store and runtime apply path. Later garbage collection remains a separate follow-up.
+
+Concrete implementation plan:
+
+P01. Model durable row state explicitly. Replace the current Option<RowSnapshot> storage view with a tombstone-aware row state so None means absent and Some(tombstoned=true) means deleted but causally retained.
+
+P02. Stop treating replication deletes as physical storage deletes. Runtime delete application should persist the post-delete row snapshot plus a tombstone flag. Physical removal is future garbage collection work.
+
+P03. Extend SQLite dataset_rows with a tombstone flag that defaults to false for existing rows, and make load/apply round-trip that flag.
+
+P04. Add a small flotsync_data_types API for rebuilding InMemoryData rows as tombstoned from snapshots, plus a helper to query whether an existing row is tombstoned.
+
+P05. Change local delete handling to persist a tombstoned row while still emitting RowChange::Delete.
+
+P06. Change inbound apply visibility semantics: active update emits Upsert, active delete emits Delete, tombstoned-row update persists silently, and repeated tombstoned delete is idempotent and silent.
+
+P07. Allow applied inbound operations to carry no listener-visible RowChange while still producing durable row patches.
+
+P08. Add focused tests for SQLite tombstone round-trip, runtime restart preserving tombstones, inbound update-after-delete not resurrecting a row, and repeated/concurrent delete idempotence.
+
+P09. Keep the checklist app unchanged unless the focused tests show a small adapter fix is required.
+
+## Notes
+
+2026-04-30 implementation update: keep tombstone metadata out of bare RowSnapshot, introduce a documented RowRecord for retained row images, replace StoredDatasetRow with replication aliases around RowRecord, rename DatasetRowWrite cases to UpsertActive/UpsertTombstone, allow missing -> tombstone while rejecting tombstone -> active in the store layer, remove the unused physical delete/GC design, remove the SQLite migration helper because no durable databases exist yet, and add focused tests for tombstone storage semantics.
+2026-04-30 implementation result: introduced RowRecord and replication row aliases, replaced DatasetRowWrite::Put/Delete with UpsertActive/UpsertTombstone, added SQLite transition validation that allows missing -> tombstone and rejects tombstone -> active, removed the SQLite tombstone migration helper, and added focused store/runtime/datamodel coverage. Created follow-up flotsync-uvo for the public ReplicationStore conformance suite. Local validation passed: cargo fmt --all; cargo test -p flotsync_data_types -- --test-threads=1; cargo test -p flotsync_replication -- --test-threads=1; cargo check --workspace --all-targets; git diff --check."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5624ac2017ef",
+    "019f0542-b0cc-70a2-9d97-566805dea04c",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-25T13:37:32Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-30T15:05:37Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-56db1392eb12"
+label = "discovered from"

@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-619a98b39c4c"
+ref = "flotsync-cv6"
+title = "Remove or justify old commented helper in `VecLinearData` implementation."
+body = "Evidence: `flotsync_data_types/src/linear_data/vec_impl.rs:83`"
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 3
+labels = ["area:linear-data-cleanup"]
+created_at = "2026-02-21T08:38:42Z"
+updated_at = "2026-02-21T08:59:59Z"
+closed_at = "2026-02-21T08:59:59Z"

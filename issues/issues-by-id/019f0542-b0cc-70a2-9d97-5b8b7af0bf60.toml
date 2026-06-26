@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5b8b7af0bf60"
+ref = "flotsync-74h"
+title = "Persist local updates before returning PublishReceipt once durability exists"
+body = "The first replication slice currently returns PublishReceipt once local in-memory state has been accepted and the outbound delivery submit has been issued. Once the replication runtime has a durable persistence layer, publish_changes should persist the local update before returning the receipt so the acknowledgement reflects durable local acceptance rather than only in-memory mutation."
+status = "closed"
+status_reason = "Completed; publish_changes commits row patches, the update record, and the group version vector before returning PublishReceipt."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-12T15:16:20Z"
+updated_at = "2026-04-26T16:22:33Z"
+closed_at = "2026-04-26T16:22:33Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

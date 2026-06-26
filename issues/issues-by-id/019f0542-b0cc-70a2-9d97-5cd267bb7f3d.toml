@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5cd267bb7f3d"
+ref = "flotsync-ywd"
+title = "Add lease ownership handoff between ingress and egress pools"
+body = "Add an explicit API for moving uniquely-owned lease-backed payload memory from ingress to egress ownership so request/response protocols can reuse pool-backed bytes without re-copying them. The first cut should be restricted to whole-segment handoff for uniquely-owned leases and preserve the current backpressure semantics while the bytes remain in flight."
+status = "closed"
+status_reason = "Completed"
+type = "feature"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-23T15:36:03Z"
+updated_at = "2026-03-23T18:26:29Z"
+closed_at = "2026-03-23T18:26:29Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d05f2998b5e"
+label = "discovered from"

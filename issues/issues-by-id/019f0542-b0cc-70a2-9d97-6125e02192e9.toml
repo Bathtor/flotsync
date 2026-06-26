@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-6125e02192e9"
+ref = "flotsync-uqx"
+title = "Define Application/Dataset namespacing in replication API"
+body = "Specify how Application and Dataset are represented as public API namespacing for rows while keeping the internal replication model group/schema-centric. Document naming, identifiers, and mapping rules from namespaced API calls to internal group/schema operations."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-10T08:32:46Z"
+updated_at = "2026-05-29T14:42:37Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

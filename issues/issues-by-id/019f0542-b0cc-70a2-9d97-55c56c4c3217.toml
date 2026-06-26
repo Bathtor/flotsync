@@ -1,0 +1,24 @@
+id = "019f0542-b0cc-70a2-9d97-55c56c4c3217"
+ref = "flotsync-sec.3"
+title = "Store encrypted group secrets with replication group metadata"
+body = """
+Extend ReplicationStore and the SQLite implementation so replication group records carry already-encrypted group-security material next to existing group metadata. The store must not own the device-local database secret or perform encryption itself: setup/runtime code passes opaque encrypted blobs into the store and later reads the same blobs back. Use an encrypted-cell shape with crypto version, key id, 24-byte XChaCha20-Poly1305 random nonce, and ciphertext. The group-secret authenticated data is canonically built from logical identifiers, not physical SQL names: logical table replication_group, logical column group_secret, logical row id group_id, key id, and crypto version. Add store-owned persistence for encrypted local member private keys and unencrypted trusted member public keys, because local private material is sensitive and trusted public credentials can be shared across groups without duplication. There are no legacy rows or migrations for this task; new storage is security-by-default.
+
+## Acceptance Criteria
+
+ReplicationGroupRecord carries required EncryptedGroupSecurityMaterial; SQLite schema initialisation creates non-null group-secret crypto_version, key_id, nonce, and ciphertext columns; insert/load/load_all/load_for_ids round-trip encrypted group material; the store API has records and transaction methods for encrypted local member private keys and trusted member public keys; trusted public key bytes are opaque Box<[u8]> values to keep cryptographic primitive sizes out of the store boundary; tests cover group material round-trips, local encrypted private-key round-trips, trusted public-key round-trips, and fixed helper material without plaintext or None placeholders; no migration, legacy-row, nullable-security-state, or store-owned-secret handling is introduced."""
+status = "closed"
+status_reason = "Completed security storage layout slice"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-556a15c24f8e",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-55ee94817ff5"]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:32:10Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-16T13:48:46Z"

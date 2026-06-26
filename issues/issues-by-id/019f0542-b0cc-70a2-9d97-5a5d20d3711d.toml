@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5a5d20d3711d"
+ref = "flotsync-lobi"
+title = "Update remaining flotsync_routes test-support use sites before PR"
+body = "Follow-up from review on flotsync_replication/src/delivery/test_support.rs. After S02 renames the crate to flotsync_routes, replace remaining semantic delivery test imports that still depend on the replication-local test_support shim with direct flotsync_routes::test_support imports before opening the PR."
+status = "closed"
+status_reason = "Completed direct flotsync_routes test-support imports"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f0542-b0cb-7491-bd09-25fdadb5634f"
+created_at = "2026-06-23T14:48:15Z"
+updated_at = "2026-06-25T09:10:15Z"
+closed_at = "2026-06-25T09:10:15Z"
+
+[[links]]
+target = "019f0542-b0cb-7491-bd09-25e46191eac0"
+label = "discovered from"

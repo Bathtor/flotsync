@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5dbfcd51920a"
+ref = "flotsync-21v"
+title = "Add proper LinearList diff helper"
+body = "modify_row currently computes LinearList updates by dropping no-ops and otherwise emitting a simple full-replacement delete+insert sequence. Add a dedicated list diff helper, similar in spirit to text::linear_diff, to produce smaller list CRDT update batches."
+status = "closed"
+status_reason = "Completed public LinearList diff helper using similar slice diff, wired modify_row to use minimal list operations, added list/public API tests, and validated with cargo test -p flotsync_data_types."
+type = "feature"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-04T15:06:45Z"
+updated_at = "2026-03-05T13:59:29Z"
+closed_at = "2026-03-05T13:59:29Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-618d3d8a00d1"
+label = "discovered from"

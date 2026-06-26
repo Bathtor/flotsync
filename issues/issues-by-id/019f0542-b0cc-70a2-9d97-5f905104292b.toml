@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-5f905104292b"
+ref = "flotsync-8fk"
+title = "Peek runtime message type before full decode"
+body = "Investigate a lightweight runtime-envelope decode path that lets components route or drop by message type before decoding full payloads. Catch-up and summary components currently decode full RuntimeMessage values only to ignore most variants."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-07T17:01:19Z"
+updated_at = "2026-05-29T14:42:18Z"

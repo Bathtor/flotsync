@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5adb383bca47"
+ref = "flotsync-ydg"
+title = "Load private security files through zeroised buffers"
+body = "Follow-up to the flotsync_security MVP. When config integration starts loading private identity JWKS files from disk, ensure private file contents are held in zeroised buffers or equivalent secret containers from read through parse, with clear APIs that avoid accidental long-lived plaintext copies."
+status = "closed"
+status_reason = "Superseded by flotsync-uohh production key provisioning; private JWKS file handling should go away rather than be hardened separately."
+type = "task"
+priority = 2
+created_at = "2026-05-15T09:38:04Z"
+updated_at = "2026-05-29T14:43:04Z"
+closed_at = "2026-05-29T14:43:04Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
+label = "discovered from"

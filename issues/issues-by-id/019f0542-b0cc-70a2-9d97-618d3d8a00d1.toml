@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-618d3d8a00d1"
+ref = "flotsync-6vh"
+title = "Add InMemoryData helper API to create row operations"
+body = "Add reusable in-memory orchestration for constructing full-row operations (partial field updates) so tests and transports do not hand-assemble per-field operations."
+status = "closed"
+status_reason = "Completed TableOperations public API, in-memory row operation helpers, protobuf row-operation wiring, UUID row ids, indexed LVW ids, tombstoned deletes, ergonomic field builders/macros, and public API tests."
+type = "task"
+priority = 3
+labels = ["area:data-types-schema"]
+assignee = "Lars Kroll"
+created_at = "2026-02-25T16:13:29Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-04T16:29:54Z"

@@ -1,0 +1,33 @@
+id = "019f0542-b0cc-70a2-9d97-571062c8af6b"
+ref = "flotsync-73q.2"
+title = "Implement an in-memory sqlx ReplicationStore backend for the replication slice"
+body = """
+Add a sqlx-backed ReplicationStore implementation that runs entirely in named shared-cache SQLite memory mode so tests stay isolated and concurrent-safe. Share an Arc<SqlitePool> across the store, acquire a dedicated connection per transaction, configure the pool so the in-memory database stays alive, and persist the replication slice using immutable group membership, a version-vector blob, row-wise dataset persistence driven by the aligned storage action API, and immutable UpdateBatch blobs with separately tracked applied state.
+
+## Acceptance Criteria
+
+The backend opens without creating on-disk files, initialises its schema automatically, keeps the named in-memory database alive through the pool, begins write transactions with BEGIN IMMEDIATE, preserves full u64 update ordering, enforces the agreed group and update immutability rules, reuses shared codec helpers instead of duplicating encode/decode logic, and is usable as the primary test store for runtime integration tests.
+
+## Notes
+
+Backend plan aligned with review:
+107. Use sqlx SQLite in named shared in-memory mode, with an Arc<SqlitePool> shared by the store and a dedicated acquired connection per transaction.
+108. Configure the pool so the in-memory database stays alive, then begin each write transaction with BEGIN IMMEDIATE.
+109. Keep substantial SQL as static strings and rely on sqlx's per-connection statement cache; if hot statements need warming, do that in after_connect rather than pretending a global sqlx::query value carries prepared-statement state.
+110. Store group membership as immutable rows plus a stored member_count, and allow only the version_vector blob to change on an existing group.
+111. Store each UpdateBatch as one immutable blob; only the applied flag may change after insertion.
+112. Preserve full u64 update ordering by storing versions in fixed-width big-endian blobs, with explicit comments explaining why SQLite's lexicographic BLOB ordering is correct here.
+113. Replace whole-dataset snapshot blobs with row-wise persistence driven by the explicit storage action API."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-18T14:39:05Z"
+updated_at = "2026-04-26T16:07:53Z"
+closed_at = "2026-04-26T16:07:53Z"

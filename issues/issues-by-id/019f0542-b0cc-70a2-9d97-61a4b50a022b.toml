@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-61a4b50a022b"
+ref = "flotsync-e0wg"
+title = "Design cancellable observe-or-fail helper for port tester"
+body = "Follow-up from the Kompact port tester work. Once positive observe and fail_if_observed_during exist, callers can approximate observe_or_fail by running both futures and selecting the first result, but the losing observation can remain registered in the tester until it eventually matches or the component stops. Design a combined API that cancels or removes the losing branch cleanly, produces good diagnostics from the fail predicate, and works with typed request/indication observation wrappers."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-06-22T11:38:48Z"
+updated_at = "2026-06-22T11:38:48Z"

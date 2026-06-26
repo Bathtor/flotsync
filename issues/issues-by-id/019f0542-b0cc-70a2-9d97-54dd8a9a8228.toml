@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-54dd8a9a8228"
+ref = "flotsync-m0jj"
+title = "Replicated checklist static groups use per-device random group keys"
+body = "replicated_checklist currently generates a fresh random GroupKey when inserting the configured static group. Devices bootstrapping the same configured group independently therefore persist different symmetric group secrets under the same group id, so reliable delivery works but group broadcast AEAD open fails. Add a temporary explicit group-secret-password config field, derive the group key from that password plus group identity context, and reject existing local stores whose persisted group key does not match the configured derived key."
+status = "closed"
+status_reason = "Completed"
+type = "bug"
+priority = 0
+assignee = "Lars Kroll"
+created_at = "2026-05-23T12:38:55Z"
+updated_at = "2026-05-23T13:10:56Z"
+closed_at = "2026-05-23T13:10:56Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-556a15c24f8e"
+label = "discovered from"

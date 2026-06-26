@@ -1,0 +1,22 @@
+id = "019f0542-b0cc-70a2-9d97-5583ac0c71fa"
+ref = "flotsync-sec.7"
+title = "Add replicated-checklist key generation and secure config docs"
+body = """
+Update replicated-checklist so users can generate local identity JWKS files through the CLI and configure secure peers without external crypto tooling. Extend example config parsing and docs for this MVP slice to include the temporary plaintext local database secret, local private identity JWKS path, and trusted public JWKS paths. Scenario docs should show first-run key generation and setup that provisions the store before replication starts.
+
+## Acceptance Criteria
+
+CLI exposes a key-generation command using flotsync_security; generated private/public JWKS files round-trip through example setup; example configs document temporary plaintext local database secret plus local/trusted JWKS paths; scenario docs show secure multi-peer setup and make clear the plaintext database secret is MVP-only pending keyring; tests cover relative/absolute key paths and config validation."""
+status = "closed"
+status_reason = "Completed replicated-checklist key generation and secure config/docs setup; reviewed and validated."
+type = "task"
+priority = 1
+blocked_by = ["019f0542-b0cc-70a2-9d97-5578ad0e4480"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+    "019f0542-b0cc-70a2-9d97-55ee94817ff5",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:32:57Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-23T08:35:23Z"

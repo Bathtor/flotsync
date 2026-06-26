@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-59d242a3b6c1"
+ref = "flotsync-bj9"
+title = "Add schema definition serialization/deserialization"
+body = "Introduce a transport format and codecs for Schema/Field definitions (including replicated data types and metadata), so peers can exchange schema definitions instead of relying on out-of-band schema agreement."
+status = "closed"
+status_reason = "Completed in commit 04daaea (schema definition protobuf transport and codecs)"
+type = "feature"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:messages",
+]
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5d70821f565d"]
+created_at = "2026-03-05T14:29:45Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-05T16:33:07Z"

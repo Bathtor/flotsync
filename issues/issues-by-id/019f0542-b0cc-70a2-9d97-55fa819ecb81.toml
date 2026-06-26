@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+ref = "flotsync-6s0"
+title = "Introduce runtime message proto conversion trait"
+body = """
+Runtime message encoding/decoding currently uses ad hoc to_proto/from_proto helpers for Update, Summary, and related wire forms. Turn this into a small, consistent conversion API so runtime message types have one obvious path into and out of the generated protobuf structures.
+
+Context A: the cleanup should reduce duplicated conversion code without hiding ownership costs. Keep the conversion surface explicit enough that callers can see when data is borrowed, cloned, encoded into owned protobuf buffers, or decoded into runtime-owned structures.
+
+Direction B: consider a trait-based shape if it stays lightweight, but do not force every message through a single abstraction if separate encode/decode traits or narrow helper functions better match the existing runtime message model. The resulting API should make common conversions hard to misuse and should avoid broad blanket impls that obscure allocation behaviour.
+
+Reminder C: think carefully about efficient usage of ViewEncode. If a runtime message can be encoded from borrowed data or an existing read view, prefer plumbing that through the API instead of eagerly constructing intermediate owned values.
+
+Reminder D: treat the read views as first-class helpers in the API design. Where read views can provide the fields needed by protobuf encoding, use them to avoid unnecessary allocations and copies, especially in hot paths involving Update, Summary, and related wire forms.
+
+Acceptance E: the change should leave the conversion call sites clearer than the current ad hoc helpers, include focused tests for representative encode/decode paths, and document any cases where cloning or allocation remains intentionally required."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-05-03T14:52:20Z"
+updated_at = "2026-06-02T10:55:47Z"

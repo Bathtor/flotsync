@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-620f5d896ae1"
+ref = "flotsync-7ef"
+title = "Precompute canonical group crypto context if hot"
+body = "Follow-up from flotsync_security review. group_nonce and group_aad now encode sender identity directly from Identifier segments rather than allocating sender.to_string(), but both paths still rebuild the canonical context bytes on each seal/open. If group traffic becomes hot, introduce a small precomputed context type so nonce derivation, AAD construction, and signature transcripts can reuse canonical frame/member context bytes without repeated segment iteration or temporary encoding."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-05-15T10:57:34Z"
+updated_at = "2026-05-29T14:42:41Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
+label = "discovered from"

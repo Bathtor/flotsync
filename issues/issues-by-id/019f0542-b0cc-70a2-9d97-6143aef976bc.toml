@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-6143aef976bc"
+ref = "flotsync-pcv"
+title = "Define replication-group domain model and lifecycle"
+body = """
+Future replication-group domain model specification outside the manual replication slice.
+
+Current status: the manual slice already has the fixed-membership model it needs: GroupId, canonical ordered GroupMembers, local member index, VersionVector, and durable ReplicationGroupRecord storage for the configured static group.
+
+Remaining work: define the richer long-term group domain model for schema epochs, key-material references, relay-set references, membership changes, and lifecycle states such as Active, CatchUp, CausalityBlocked, Migrating, and Closed. These concepts are not required before the static-group checklist slice works."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-10T08:32:14Z"
+updated_at = "2026-05-29T14:42:39Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

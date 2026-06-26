@@ -1,0 +1,10 @@
+id = "019f0542-b0cc-70a2-9d97-5ed690a6e1fe"
+ref = "flotsync-2ss"
+title = "Implement public message handling for `MdnsAnnouncementComponent`."
+body = "Evidence: `flotsync_discovery/src/services/mdns_announcement.rs:256`"
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:discovery-mdns"]
+created_at = "2026-02-21T08:38:39Z"
+updated_at = "2026-05-29T14:42:08Z"

@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-5f1f2efb838c"
+ref = "flotsync-nszi"
+title = "Retry peer-announcement socket binds after closure or bind failure"
+body = "Peer-announcement maintaining components currently treat bind/configure failures and maintained socket closure as terminal. Add a retry cycle so hosts can recover when network availability changes or the configured discovery port is temporarily unavailable. This should distinguish maintained sockets from observe-only components and avoid assuming observed sockets close with the owner."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-06-04T05:35:51Z"
+updated_at = "2026-06-04T05:35:51Z"

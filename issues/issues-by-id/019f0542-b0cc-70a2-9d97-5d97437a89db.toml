@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5d97437a89db"
+ref = "flotsync-88o"
+title = "Refine deleted-row error and test ergonomics"
+body = "Add a dedicated ModifyDeletedRow operation error, revert only inline origin chunk fields in proto metadata to optional while keeping HistoryId chunk_index required, fix the LatestValueWins chunk_index comment, replace remaining assert!(matches!(...)) with assert_matches!, and simplify selected tests to use the new schema/value helpers."
+status = "closed"
+status_reason = "Completed deleted-row error refinement, proto origin chunk-index fix, LatestValueWins chunk-index comment correction, assert_matches cleanup, and test ergonomics updates."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-04T17:38:44Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-04T17:45:57Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5da837b24a5c"
+label = "discovered from"

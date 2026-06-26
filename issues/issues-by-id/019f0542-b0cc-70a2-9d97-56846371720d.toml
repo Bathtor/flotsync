@@ -1,0 +1,95 @@
+id = "019f0542-b0cc-70a2-9d97-56846371720d"
+ref = "flotsync-sec"
+title = "Implement flotsync_security MVP for authenticated encrypted replication envelopes"
+body = """
+Baseline MVP for flotsync_security after planning discussion on 2026-05-14 and setup-boundary revision on 2026-05-16.
+
+Goal: make replication delivery envelopes encrypted and signed by default, with external JWKS identity key files, group security state provisioned into ReplicationStore before runtime start, sensitive group-security columns encrypted with a device-local application database secret, helper key generation, replicated-checklist setup support, and scenario documentation for the secure first-run flow.
+
+Non-goals for this MVP: discovery-advertised trust, certificates, key rotation, revocation, multi-shot HPKE sessions, relay-specific TCP session encryption, user passphrase handling, OS keyring storage for the database secret, and long-term migration UX. Those items are tracked as follow-up tasks rather than hidden in this umbrella.
+
+## Design
+
+P01 Crate boundary: add a new workspace crate named flotsync_security. It owns key parsing, typed key material, key generation helpers, signing, verification, group encryption, HPKE bootstrap encryption, transcript construction, deterministic test-support identities, and crypto errors. It must not depend on Kompact, flotsync_io, delivery components, or store internals.
+
+P02 Dependencies: flotsync_replication depends on flotsync_security. flotsync_security may depend on flotsync_core for member identifiers and on crypto/JWK crates. flotsync_messages and flotsync_io stay crypto-free. flotsync_discovery may later depend on flotsync_security for signed discovery, but not in this MVP.
+
+P03 Setup boundary: flotsync_security does not parse application TOML or Kompact config. For this MVP slice, replicated-checklist setup reads a temporary plaintext local database secret, local private JWKS path, and trusted public JWKS paths from application config, validates them, and provisions ReplicationStore during ensure_configured_group before replication starts.
+
+P04 Identity key files: use JWKS/JWK via jose-jwk. One local private JWKS contains two OKP keys: Ed25519 for signing and X25519 for encryption. A public JWKS contains the matching public keys and is easy to copy to peers. The implementation extracts the strict fields it supports and rejects unexpected or missing key roles.
+
+P05 Key generation: flotsync_security exposes helper functions to generate a local identity JWKS and matching public JWKS for a MemberIdentity. The replicated-checklist CLI uses these helpers so users can bootstrap example setup without external crypto tooling.
+
+P06 Trusted public identities: MVP trust is supplied to replicated-checklist setup as trusted member JWKS files. Setup validates configured static group members against those files and writes the accepted public keys into ReplicationStore.
+
+P07 Sensitive group storage: add sensitive columns or an opaque sensitive BLOB next to existing replication_groups metadata. ReplicationGroupRecord should carry group security material because group membership, current group version state, and group key are normally needed together.
+
+P08 Local database secret: sensitive group-security material is encrypted at rest with a device-local application database secret. For this MVP slice, replicated-checklist reads that secret from plaintext application config; OS-backed storage through keyring is a follow-up.
+
+P09 Stored group-security material: the stored sensitive material carries the group symmetric key, group cipher suite, and group member public keys required to verify later group traffic without global config lookups.
+
+P10 Group lifetime: the group id is the group version and key epoch. Membership or key changes happen by creating a new group id through migration. There is no separate group epoch field in this MVP.
+
+P11 Group cipher: use ChaCha20-Poly1305 as the default symmetric AEAD for group messages. It has a 32-byte key, 12-byte nonce, and 16-byte authentication tag. Nonces are derived from existing envelope context instead of transmitted.
+
+P12 Group nonce derivation: derive the nonce from a domain separator plus group id, frame kind, sender identity, and delivery message id. The nonce is public information by design and must be unique under a group key.
+
+P13 Group AEAD authenticated data: include canonical public header bytes and frame kind as authenticated data. This binds the ciphertext to its routing context.
+
+P14 Group signature transcript: Ed25519 signatures cover a domain separator, frame kind, canonical public header, and ciphertext including the AEAD tag. The signature proves the claimed sender signed this exact sealed envelope. The AEAD tag proves ciphertext and authenticated context were produced under the group key.
+
+P15 Group per-message overhead: keep per-message security overhead to the 16-byte ChaCha20-Poly1305 tag plus the 64-byte Ed25519 signature, beyond existing protobuf framing. Do not repeat algorithm id, key id, group epoch, or nonce on every group message.
+
+P16 Reliable bootstrap encryption: use HPKE single-shot encryption with X25519 for bootstrap and recipient-specific key transport. Each encrypted bootstrap envelope has one fresh ephemeral HPKE public key, one ciphertext with tag, and one Ed25519 sender signature.
+
+P17 HPKE ephemeral keys: generate a fresh ephemeral key pair per recipient bootstrap envelope, use it once, transmit the ephemeral public key as HPKE encapsulated key material, and erase the ephemeral private key after sealing. Multi-shot HPKE contexts are explicitly deferred.
+
+P18 Bootstrap payload: include group id, ordered members, each member Ed25519 public signing key, each member X25519 public encryption key, group cipher suite, and group symmetric key. Future migration metadata can extend this payload.
+
+P19 Inbound bootstrap handling: decrypt with the local X25519 private key, verify the sender signature over the public header plus HPKE encapsulated key plus ciphertext, validate public keys against trusted keys provisioned during setup when available, write group security material through the encrypted sensitive-column path, and install group membership only after those checks pass.
+
+P20 Group outbound path: replace placeholder encrypted payload handling with flotsync_security group sealing. The runtime loads group security material from ReplicationStore, encodes RuntimeMessage bytes, seals them with the stored group key and derived nonce, signs the resulting envelope, and submits the existing delivery wire frame.
+
+P21 Group inbound path: delivery ingress can still use clear public headers for shallow routing. The semantic owner or runtime then verifies the signature, opens the AEAD payload with the stored group key, decodes RuntimeMessage, and only then applies or responds.
+
+P22 Reliable ack signing: recipient acknowledgements must be signed by the recipient key. Sender-side reliable delivery only completes after verifying the ack signature against the expected recipient public key and message id.
+
+P23 Security default: no insecure off mode in normal runtime. Tests use deterministic test identities and test group keys from flotsync_security test-support helpers rather than plaintext placeholder signatures.
+
+P24 Example and docs: update replicated-checklist setup, CLI key generation commands, and scenario docs to show local database secret setup, local identity JWKS paths, trusted public JWKS paths, and store provisioning before replication starts.
+
+P25 Implementation structure: the MVP is broken into child bd tasks for crate foundation, abandoned live config, store metadata, bootstrap, group traffic, reliable acks, example setup/docs, store-provisioning setup, OS keyring follow-up, and integration validation. Deferred security work is tracked as separate follow-up tasks.
+
+## Acceptance Criteria
+
+The MVP is considered ready when replication runtime messages are sealed and signed through flotsync_security, secure group bootstrap installs encrypted sensitive group-security material in ReplicationStore, recipient acknowledgements are signed and verified, replicated-checklist can generate JWKS identity files and provision security state from its setup config, updated scenarios document the secure first-run flow, and tests cover tampering, trust mismatch, bootstrap, group delivery, and ack spoofing."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5af18230aab4",
+    "019f0542-b0cc-70a2-9d97-5b09a198323c",
+    "019f0542-b0cc-70a2-9d97-5f59ac064081",
+    "019f0542-b0cc-70a2-9d97-5f6db6360c8f",
+    "019f0542-b0cc-70a2-9d97-5f77226bbaea",
+    "019f0542-b0cc-70a2-9d97-6217d27b1d18",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-56a65a25f8f0"]
+children = [
+    "019f0542-b0cc-70a2-9d97-5546566b00ff",
+    "019f0542-b0cc-70a2-9d97-556a15c24f8e",
+    "019f0542-b0cc-70a2-9d97-5578ad0e4480",
+    "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
+    "019f0542-b0cc-70a2-9d97-559d30e93724",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+    "019f0542-b0cc-70a2-9d97-55c56c4c3217",
+    "019f0542-b0cc-70a2-9d97-55d1a9af7675",
+    "019f0542-b0cc-70a2-9d97-55ee94817ff5",
+    "019f0542-b0cc-70a2-9d97-5abfb226110c",
+]
+created_at = "2026-04-27T10:37:15Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-24T14:45:24Z"

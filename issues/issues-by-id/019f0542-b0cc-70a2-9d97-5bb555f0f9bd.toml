@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5bb555f0f9bd"
+ref = "flotsync-geq"
+title = "Add manual-time quiescence helper for timer-driven runtime tests"
+body = "Proposal: keep the first implementation local to flotsync_udpour runtime tests and add a harness-level helper such as RuntimeHarness::advance_time_and_quiesce(duration). The helper should only be available on manual-timer harnesses. Step 1: call manual_timer.advance_by(duration). Step 2: wait until sender and receiver runtime components report that no timer-driven work remains due at the current logical time; add test-only idle/quiescent predicates on those components if the existing state probes are not sufficient. Step 3: round-trip one explicit test barrier through the probe side that observes externally visible outcomes, so any bridge frames or receiver deliveries triggered before the barrier are guaranteed to be enqueued before the helper returns. With that in place, rewrite the current candidate sites to use immediate buffered negative checks instead of short real-time silence windows: flotsync_udpour/src/runtime_tests.rs around shared_route_retransmissions_do_not_redeliver_before_tombstone_expiry, send_delay_and_window_pace_multipart_transmission, and no_longer_available_after_sender_retention_expiry. Do not generalise this into flotsync_io::test_support unless a second consumer appears; the problem is currently specific to UDPour's manual-time harness."
+status = "closed"
+status_reason = "Implemented manual-time due-timer harness and applied stable sites"
+type = "task"
+priority = 2
+created_at = "2026-04-08T16:40:06Z"
+updated_at = "2026-04-08T17:28:54Z"
+closed_at = "2026-04-08T17:28:54Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5bc6ef308f56"
+label = "discovered from"

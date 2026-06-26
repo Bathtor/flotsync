@@ -1,0 +1,123 @@
+id = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+ref = "flotsync-75s"
+title = "Prepare Replication runtime boundary for GroupBroadcast integration"
+body = """
+After the queue/state model, transport mapping, and domain types are settled, extend the replication runtime boundary so a future implementation can wire GroupBroadcast in cleanly. Specify or add the internal hooks for enqueueing messages, receiving reachability updates, handling relay durability outcomes, and bridging replication events into GroupBroadcast without prematurely exposing transport details in the public Replication API.
+
+## Design
+
+Agreed implementation scope for codex/flotsync-75s-replication-slice:
+
+1. Make load_replication_runtime(...) return a concrete runtime behind the existing public ReplicationApi boundary.
+2. Extend ReplicationStore minimally so the runtime can obtain the local member identity and dataset schemas it needs for this slice; do not attempt the full storage abstraction from flotsync-73q here.
+3. Introduce a runtime-owned ordered hosted-group model alongside SharedGroupMemberships. SharedGroupMemberships/TrieSet remain the fast membership-presence view for delivery, but canonical member order must not be inferred from Trie iteration because TrieMap/TrieSet are backed by AHashMap and do not provide a stable order.
+4. Build an internal runtime host around the existing delivery components so replication can update group membership snapshots, submit outbound work, and consume inbound deliveries.
+5. Implement create_group for the fixed-membership, online-only path using ReliableDelivery for bootstrap. Do not support create_group.initial_state in this slice.
+6. Materialise per-(group_id, dataset_id) schema-aware InMemoryData state and map public RowMutation values into local schema operations before transport.
+7. Add the smallest useful replication wire/messages layer for this slice: one bootstrap message carried by ReliableDelivery and one live update message carried by GroupBroadcast. Do not try to complete the full Replication protocol state machine in this branch.
+8. Implement publish_changes as: local apply, outbound GroupBroadcast fan-out, inbound remote apply, then ReplicationEvent::DataChanged emission on the receiving runtime.
+9. Add one full-stack loopback test with two runtimes proving create_group followed by publish_changes produces a remote DataChanged event through the public API.
+10. Keep the branch deliberately narrow and honest: fixed membership, live peers, direct routes only.
+
+Explicit deferrals for this branch:
+
+11. No change_group_membership implementation and no migration/invitation-policy flow beyond the bootstrap needed for create_group.
+12. No Summary/NeedRange/Snapshot/Ack catch-up flow, no offline repair, and no causality-blocked replay beyond what falls out trivially from the narrow live-update path.
+13. No relay/mailbox integration, no restart recovery, and no signature-verification enforcement yet.
+
+## Notes
+
+Stage 1 implemented on codex/flotsync-75s-replication-slice: added minimal ReplicationStore hooks (local member identity plus dataset schema lookup), introduced runtime-owned HostedGroup/HostedGroups state with canonical member order and member-index lookup, and added unit tests for canonical ordering, duplicate rejection, and delivery snapshot derivation. load_replication_runtime now validates the store boundary by loading the local member identity before returning the current placeholder error.
+Correction to stage 1: dropped the separate HostedGroup/HostedGroups model. SharedGroupMemberships remains authoritative, and GroupMemberships now stores GroupMembers (TrieMap-backed membership with fixed canonical member indices as values). GroupBroadcast was adjusted to iterate GroupMembers directly, and the stage-1 tests now cover indexed membership behaviour on the authoritative snapshot.
+Stage 2 and the first half of stage 3 are now implemented. load_replication_runtime returns a concrete runtime with a fully wired internal delivery host, one externally bound UDP socket, and a background inbound-delivery loop. Added a minimal protobuf-backed runtime bootstrap message (group id plus canonical member order) and implemented create_group for the narrow first slice: it rejects initial_state, validates fixed membership including the local member, installs the group locally, and sends recipient-addressed reliable bootstrap envelopes to the remote members. Inbound reliable bootstrap messages install the same group membership snapshot remotely and complete the reliable-delivery processed promise so the ack path can run. Added an end-to-end replication test that loads two runtimes, publishes direct peer routes, calls create_group via the public API, and verifies remote membership installation with preserved canonical member indices. publish_changes, dataset state, group-broadcasted updates, and listener DataChanged events remain the next step.
+Tightened the first runtime slice after review: GroupMembers is now canonical-order-only via from_ordered_members; the runtime host no longer relies on a fixed sleep for direct route publication and instead waits for route visibility in both semantic owners; ReplicationConfig now carries the external UDP bind address and defaults it to 0.0.0.0:0 so the runtime is no longer loopback-only by default. Added follow-up flotsync-46r for the ReliableDelivery sender-side recipient-ack timeout gap.
+Implemented the first publish/apply replication slice on top of the delivery layer. Added a minimal runtime UpdateBatch message carrying one shared UpdateId plus per-dataset schema operations, runtime-owned hosted dataset state, local publish_changes staging/encoding/commit, inbound GroupBroadcast decode/apply, and listener-facing DataChanged emission. Added an end-to-end test that boots two runtimes, creates a group, publishes one row mutation, and verifies remote event delivery and replicated state. Verification: cargo test -p flotsync_replication; cargo clippy -p flotsync_replication --all-targets.
+Implemented the review follow-up for the first replication slice: GroupMembers now only builds from canonical ordered members; hosted groups now track a real VersionVector instead of a local counter; UpdateBatch carries ReadVV on the runtime wire; inbound live updates deduplicate by UpdateId, buffer until LocalVV >= ReadVV and the producer version is the next expected one, then drain buffered updates once dependencies are satisfied; inbound delivery faults now terminate the runtime and fail subsequent API calls instead of being swallowed. Added focused tests for causal buffering/duplicate suppression. Follow-up tracking for future durability semantics: flotsync-74h.
+2026-04-13 review-driven follow-up worklist agreed for this branch:
+
+A. Architecture
+1. Move the bulk of replication runtime logic into a Kompact ReplicationRuntimeComponent.
+2. Keep the public ReplicationApi surface as a thin ask or tell bridge into that component.
+3. Remove the external delivery loop and related imperative scaffolding once the component owns inbound and outbound delivery handling.
+
+B. Runtime host and local endpoint binding
+4. Split DeliveryRuntimeHost construction into separate build, connect, start, and shutdown phases.
+5. Introduce readable local type aliases for long delivery port types and route transport types.
+6. Replace repeated ad hoc connection error formatting with shared helpers.
+7. Replace the UDP activation policy magic string with a named constant or helper for OnFirstUse.
+8. Add a Kompact config key for runtime host control timeouts and use it for start, bind, and shutdown waits.
+9. Move the local UDP bind concern out of public ReplicationConfig.
+10. Introduce a simple internal local endpoint binder stub that owns one configured UDP bind for this slice.
+11. Remove RuntimeUdpObserver as part of the binder stub work.
+12. Make DeliveryRuntimeHost::drop a last resort guard after an explicit shutdown path exists.
+13. Remove production use of flotsync.io.bind-reuse-address in the runtime host.
+
+C. Discovery and temporary test scaffolding
+14. Move RuntimeDiscoverySource into test support or otherwise isolate it clearly as temporary.
+15. Document publish_route_update as temporary until real discovery wiring exists.
+16. Clean up publish_direct_peer_route readability with local aliases or helpers.
+
+D. Error and config surface
+17. Remove unnecessary handwritten external constructors around boxed error sources and use idiomatic Snafu conversions instead.
+18. Add a GroupMembers singleton convenience constructor.
+19. Add sensible Default impls for SenderConfig, ReceiverConfig, and UDPourConfig, then use UDPourConfig::default() in the runtime host.
+
+E. Wire format and payload handling
+20. Add documentation comments to replication.proto that explain message expectations and ordering significance.
+21. Rename read_vv to read_versions in proto and Rust.
+22. Confirm and document that BootstrapGroup.members ordering is semantically significant and preserved on the wire.
+23. Separate runtime in-memory message to protobuf conversion from protobuf to bytes conversion.
+24. Keep bytes conversion at the use site for now, with a comment plus follow-up task reference for the later encryption-aligned payload redesign.
+25. Stop forcing full version-vector encoding on the runtime wire. Support the compact VersionVector encodings properly.
+26. Replace stringly decode_version_vector errors with a real internal error type and treat unsupported runtime wire shapes as bugs rather than soft strings.
+
+F. Readability and tests
+27. Remove test-only imports from top-level production scope in host.rs.
+28. Use assert_matches! where appropriate.
+29. Add GroupMembers tests that use multi-segment member identifiers.
+30. Split runtime.rs into a folder module with separate tests and further submodules where sensible.
+31. Trim import noise after the split, including broader local or wildcard imports where that genuinely improves readability.
+
+G. Existing agreed follow-ups to keep referenced
+32. Keep flotsync-46r referenced for ReliableDelivery sender-side recipient-ack timeout retry.
+33. Keep flotsync-4x8 referenced for relaxing transient inbound delivery failures.
+34. Keep flotsync-36j referenced for the UDP observer backlog concern until that code is removed.
+35. Keep flotsync-665 referenced for the proper long-term local endpoint bind manager beyond the temporary stub.
+36. Keep flotsync-74h referenced for persisting accepted local updates before returning PublishReceipt once durability exists.
+
+Execution order for the branch from here:
+37. Component inversion first.
+38. Host and binder refactor second.
+39. Wire and payload cleanup third.
+40. File split and test cleanup last.
+41. Verify with cargo test -p flotsync_replication and cargo clippy -p flotsync_replication --all-targets before the next push.
+2026-04-15 review-plan alignment:
+- R1 Error-surface cleanup across runtime/errors.rs and ApiError usage: add Display for GroupId and RowId, stop using debug formatting in user-facing errors, remove gratuitous Box<RowId>, merge or rename ambiguous variants, and promote obvious runtime conditions out of io::Error wrappers.
+- R2 Runtime API ergonomics in runtime/handle.rs: introduce ApiResult/ApiFuture aliases, prefer actor ask conveniences over manual promise boilerplate, simplify or remove resolve_runtime_future if snafu wrapping can express the same behaviour directly, and remove slice wording from public docs.
+- R3 Component visibility/test hygiene in runtime/component.rs: make component fields private again, group test-only messages under one nested test command path, and keep test-only access behind cfg(test) helpers instead of broad pub(super) exposure.
+- R4 Local state backend abstraction in runtime/in_memory.rs: rename Hosted* to Local*, define an internal storage/state trait for the in-memory backend, move repeated group logic onto the group state type, move mutation-scope helpers closer to RowMutation or the storage contract, and push reusable VersionVector helpers to the right abstraction layer.
+- R5 Message/wire simplification in runtime/messages.rs: clarify the domain/proto/wire separation, reduce unnecessary parallel DTOs where practical, and flatten large nested constructor transforms into named local fields.
+- R6 Component control-flow refactor in runtime/component.rs: extract helpers for publish preflight, inbound apply readiness, listener notification, and reliable bootstrap handling; replace Vec-based de-duplication with HashSet where appropriate; move repeated can-apply and decode-with-member-count logic onto local group state.
+- R7 Host-topology/orchestration redesign in runtime/host.rs is explicitly deferred to flotsync-3ht. Keep current PR bounded; only leave tracking comments where the deferral matters.
+- R8 Test-infrastructure consolidation in runtime/tests.rs: replace the listener capture Mutex<VecDeque<_>> with a queue/channel-based recorder, record all events and filter in assertions, centralise timeout/eventually helpers, and add reusable fixtures for ids, schemas, and datasets.
+- R9 Module-shell discipline in runtime/mod.rs: keep mod.rs minimal, move per-file imports local, and reconsider whether handle should become a public module rather than a re-export surface.
+- C1 macOS CI failure in flotsync_udpour runtime_tests::repair_path_emits_need_parts_and_retransmits_only_missing_part appears to be a timer-processing race in the test harness, not a reproduced local protocol bug.
+- C2 Preferred fix: use advance_time_and_process_due_timers for timer-driven assertions in that test and similar sites, document raw advance_time as logical-clock-only, and audit similar manual-time tests for the same assumption.
+- Execution order: O1 R1+R2, O2 R4+R5+R6, O3 bounded R7/R9 handling with flotsync-3ht tracking left in place, O4 R8 + C1/C2."""
+status = "closed"
+status_reason = "Completed via merged PR #3"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocks = [
+    "019f0542-b0cc-70a2-9d97-57e34d2366f5",
+    "019f0542-b0cc-70a2-9d97-57fc5ce67722",
+    "019f0542-b0cc-70a2-9d97-58092159f5b0",
+]
+created_at = "2026-03-26T05:14:10Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-17T15:36:40Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-6110c02d1cf4"
+label = "discovered from"

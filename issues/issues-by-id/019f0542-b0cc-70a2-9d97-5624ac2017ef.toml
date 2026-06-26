@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5624ac2017ef"
+ref = "flotsync-5j0.9"
+title = "T13 Exercise manual checklist concurrency scenarios"
+body = "Use the replicated checklist example to exercise the manual slice scenarios: concurrent adds from two machines; one peer marks an item done while another renames it; one peer deletes an item while another edits it; one peer restarts and retains durable local state; and manual route configuration remains visible and testable without pretending discovery exists."
+status = "closed"
+status_reason = "Reviewed scenarios and confirmed fine"
+type = "task"
+priority = 1
+blocks = [
+    "019f0542-b0cc-70a2-9d97-566805dea04c",
+    "019f0542-b0cc-70a2-9d97-56c814c369e5",
+]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:38:27Z"
+updated_at = "2026-05-06T10:11:35Z"
+closed_at = "2026-05-06T10:11:35Z"

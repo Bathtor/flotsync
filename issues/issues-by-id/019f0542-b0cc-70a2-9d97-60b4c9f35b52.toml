@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-60b4c9f35b52"
+ref = "flotsync-8la"
+title = "Track stable Rust compatibility"
+body = "Plan and execute the work needed to make the workspace build and test on stable Rust. Cover removal or replacement of nightly-only features, toolchain/CI updates, and any crate-level API or dependency changes required for stable compatibility."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-25T07:11:18Z"
+updated_at = "2026-05-29T14:42:31Z"

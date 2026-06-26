@@ -1,0 +1,45 @@
+id = "019f0542-b0cc-70a2-9d97-566805dea04c"
+ref = "flotsync-5j0.5"
+title = "T09 Build the replicated checklist CLI example"
+body = """
+Add a very small replicated checklist CLI example that can run on two machines on a home network. It is configured entirely from one TOML config file passed as the only CLI argument. The config supplies local member identity, store path, fixed group id, ordered members, local endpoint bind address, and static peer routes. The app installs or loads exactly one configured static group, publishes checklist changes only on explicit sync, and shows replicated events clearly from a line-oriented terminal interface.
+
+Agreed implementation plan:
+
+G01. Add replicated_checklist as a real binary with exactly one positional argument: the config file path. No --member, no separate group id arg, no runtime flags.
+
+G02. Define checklist app config inside that same TOML file, alongside the existing runtime keys. Required fields: local member identity, store path, fixed group id, ordered members. Runtime reachability stays under flotsync.replication.runtime.local-endpoint-bind-addr and [[flotsync.replication.runtime.static-peer-routes]].
+
+G03. Parse and validate config before startup: group id must parse, local member must be present in ordered members, ordered members must be valid and duplicate-free, and static peer routes remain the existing UDP-only runtime config path.
+
+G04. Add a second disk-backed SQLite constructor. Unsynced checklist edits stay process-local in the working copy as agreed; the store path is for runtime/group/update state that has actually been accepted durably.
+
+G05. Install/load exactly one configured static group before loading the runtime. If the store already has the group, verify the configured group id, ordered members, and local member index match. If absent, insert the configured ReplicationGroupRecord with the configured group id and initial version vector. This can be removed later once mutable group support exists.
+
+G06. Start the replication runtime from the configured store plus the same runtime config TOML. The app does not call create_group; it relies on the configured static group and startup store preparation.
+
+G07. Make listener ingestion concurrency-safe with a listener-to-REPL queue, not by sharing ChecklistWorkingCopy across threads. The listener drains ReplicationEvent::DataChanged providers and sends row batches/events into a thread-safe channel. The REPL thread remains the only owner of ChecklistWorkingCopy.
+
+G08. Keep inbound events buffered until sync. On sync: prepare dirty rows from the working copy, call publish_changes if dirty, clear dirty flags only after success, then drain the listener queue into the working copy and apply all queued events. This preserves the publish first, then drain incoming including our own publish result model.
+
+G09. Wire the existing command surface only: item commands, list, show, events, sync, members, me, help, quit. members and me render config/runtime summary; they do not mutate group state.
+
+G10. Keep tests light: config parsing/validation, static group preparation mismatch handling, and sync orchestration around the listener queue. The binary itself is the manual testing tool, so no heavy end-to-end harness."""
+status = "closed"
+status_reason = "Replicated checklist binary is ready for manual testing"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5624ac2017ef"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-565b91d60d3f",
+    "019f0542-b0cc-70a2-9d97-5672673b4f73",
+    "019f0542-b0cc-70a2-9d97-56c814c369e5",
+    "019f0542-b0cc-70a2-9d97-573c9c8d0da7",
+    "019f0542-b0cc-70a2-9d97-574b0c8e2774",
+    "019f0542-b0cc-70a2-9d97-59575b315dd2",
+]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:38:01Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-29T09:39:11Z"

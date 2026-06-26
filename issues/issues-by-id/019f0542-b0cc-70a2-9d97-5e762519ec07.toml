@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5e762519ec07"
+ref = "flotsync-s02"
+title = "Review operations datamodel shape and field-level API"
+body = "After snapshot review approval, review schema/datamodel operations API shape and confirm it is final enough to lock serialization and tests."
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 2
+labels = ["area:data-types-schema"]
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5e699b8ce79c"]
+blocks = ["019f0542-b0cc-70a2-9d97-5e8fb3413473"]
+created_at = "2026-02-25T16:13:29Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-02-28T10:49:34Z"

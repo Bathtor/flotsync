@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-59b14fd226dd"
+ref = "flotsync-26h"
+title = "Draft communication protocol spec for sync/migration"
+body = "Create an implementation-oriented high-level protocol spec document for FlotSync covering session model, summary/range/update/ack semantics, replay/recovery, and replication group migration (including schema change via migration)."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-07T17:15:39Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-07T17:17:26Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

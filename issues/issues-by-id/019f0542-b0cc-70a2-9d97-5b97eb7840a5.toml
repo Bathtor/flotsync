@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5b97eb7840a5"
+ref = "flotsync-dya"
+title = "Switch Kompact from vendored copy to upstream master"
+body = "Stop patching crates.io to the vendored vendor/kompact-0.11.3 copy, point the workspace at https://github.com/kompics/kompact master instead, remove the vendored crate, refresh Cargo.lock, and fix any compile issues caused by the upstream git revision."
+status = "closed"
+status_reason = "Completed: workspace now uses upstream Kompact master and has been adapted to the upstream 0.12 API surface; follow-up flotsync-mfs tracks switching back to the published 0.12 release once available."
+type = "chore"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-04-11T19:07:07Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-13T16:57:33Z"

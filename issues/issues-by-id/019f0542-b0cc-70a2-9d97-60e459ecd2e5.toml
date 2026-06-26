@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-60e459ecd2e5"
+ref = "flotsync-xdx"
+title = "Investigate TCP session cleanup after last session handle drops"
+body = "The current Kompact TCP session adapter keeps session cleanup explicit and lifecycle-driven. Follow up on whether session components should be owned differently, or whether the adapter should support cleanup/GC when the last TcpSessionRef is dropped. This work was discovered during flotsync-hn4 review."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-17T14:58:08Z"
+updated_at = "2026-05-29T14:42:34Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58aa68458085"
+label = "discovered from"

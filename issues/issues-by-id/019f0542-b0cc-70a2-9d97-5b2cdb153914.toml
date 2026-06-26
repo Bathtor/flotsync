@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5b2cdb153914"
+ref = "flotsync-42p"
+title = "Unify row provider end-of-stream semantics"
+body = "Follow-up in the manual replication slice. SnapshotRowProvider should not diverge permanently from the listener RowProvider contract: decide whether row providers should use Option<Batch> or another explicit end-of-stream signal, then apply the same convention consistently across snapshot and event row providers."
+status = "closed"
+status_reason = "Completed unified batch provider API"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-05-01T11:17:23Z"
+updated_at = "2026-05-01T13:45:32Z"
+closed_at = "2026-05-01T13:45:32Z"

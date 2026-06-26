@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-58db56d2552d"
+ref = "flotsync-bhj"
+title = "Create flotsync_io crate skeleton with mio-first architecture"
+body = "Add workspace crate and module layout for API, mio driver, and Kompact integration adapter surface. No protocol implementation yet."
+status = "closed"
+status_reason = "Completed: added flotsync_io workspace crate skeleton with api/driver/kompact/errors modules, moved kompact to workspace dependencies, and verified with cargo check -p flotsync_io -p flotsync_discovery."
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-58c930a9669c"]
+blocks = ["019f0542-b0cc-70a2-9d97-58fd15b07c07"]
+created_at = "2026-03-12T15:55:18Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-14T15:28:29Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

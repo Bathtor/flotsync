@@ -1,0 +1,10 @@
+id = "019f0542-b0cc-70a2-9d97-5ecb0072a545"
+ref = "flotsync-dnt"
+title = "Implement browser module."
+body = "Evidence: Empty file: `flotsync_discovery/src/services/mdns_browser.rs`"
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:discovery-mdns"]
+created_at = "2026-02-21T08:38:40Z"
+updated_at = "2026-05-29T14:42:07Z"

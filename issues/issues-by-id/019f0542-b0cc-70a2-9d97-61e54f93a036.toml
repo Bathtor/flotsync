@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-61e54f93a036"
+ref = "flotsync-ct7n"
+title = "Generalise Kompact FSM helper support"
+body = "The discovery crate has a small kompact_fsm helper for owned-state transitions in Kompact components. Capture follow-up work to turn this into a reusable, better documented helper for other components, and evaluate whether the shape could be proposed upstream to Kompact once it has proven useful locally. Scope should include API naming, invalid-transition handling, documentation, examples/tests, and crate placement."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-05-26T11:02:43Z"
+updated_at = "2026-05-29T14:42:40Z"

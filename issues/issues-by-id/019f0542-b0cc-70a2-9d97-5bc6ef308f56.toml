@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-5bc6ef308f56"
+ref = "flotsync-642"
+title = "Re-audit negative timing assertions after timer and wait-helper work"
+body = "After controllable timer support and standardised eventually-style wait helpers land, revisit the remaining negative timing assertions across flotsync_io, flotsync_udpour, and flotsync_replication. Reclassify each case as either still semantically necessary, replaceable with a stronger causal assertion, or removable once the new test infrastructure is in place. Representative sites from the current analysis include UDPour runtime negative assertions, replication delivery full-stack silence checks, and raw/bridge IO no-event checks."
+status = "closed"
+status_reason = "Re-audit completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-04-07T08:30:03Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-08T16:42:49Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-577ee196e486"
+label = "discovered from"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-579a53eda8b8"
+label = "discovered from"

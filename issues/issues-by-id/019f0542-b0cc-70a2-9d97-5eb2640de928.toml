@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5eb2640de928"
+ref = "flotsync-amg"
+title = "Memoize right-subtree checks to avoid repeated expensive traversal."
+body = "Evidence: `flotsync_data_types/src/linear_data/coalesced.rs:958`"
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 2
+labels = ["area:coalesced-linear-data"]
+assignee = "Lars Kroll"
+created_at = "2026-02-21T08:38:41Z"
+updated_at = "2026-03-05T09:57:30Z"
+closed_at = "2026-03-05T09:57:30Z"

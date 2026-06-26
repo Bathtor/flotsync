@@ -66,97 +66,79 @@
 - Any test that binds TCP or UDP sockets must declare its full socket requirement up front via `flotsync_io::test_support::reserve_sockets(...)` or a harness built on top of that broker. Do not bind ad hoc sockets or rely on unmanaged ephemeral ports in parallel tests.
 - Prefer the `option_when` macro over `<cond>.then_some(...)`.
 
-<!-- BEGIN BEADS INTEGRATION -->
+<!-- BEGIN GITRACK MANAGED INSTRUCTIONS -->
 
-## Issue Tracking with bd (beads)
+## Issue Tracking with gitrack
 
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
+This project uses `gitrack` for Git-native issue tracking. Issue state lives in ordinary tracked files in this repository.
 
-### Why bd?
+### Tool Rules
 
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Dolt-powered version control with native sync
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
+- Use `gitrack` for project issue tracking.
+- Prefer `--json` for agent-driven workflows.
+- Use `gitrack ready --json` to find unblocked open work.
+- Use `gitrack show <ref> --json` before changing an issue.
+- Use `gitrack claim <ref> --assignee <name> --json` before starting assigned work.
+- Use `gitrack update <ref> --body <text> --json` to keep the current issue description and plan up to date.
+- Use `gitrack link <parent> <child> --child --json` when splitting work into child issues.
+- Use `gitrack link <issue> <blocker> --blocked-by --json` when one issue must wait for another.
+- Use labelled `gitrack link <source> <target> --label <label> --json` for loose one-way context.
+- Use comments for chronological notes, review observations, and progress history.
+- Close issues with `gitrack close <ref> --reason <reason> --json`.
+- Do not create parallel TODO lists when the item should be tracked as an issue.
 
-### Important Rules
+### Git Workflow Notes
 
-- Do not access `bd` in parallel!
-- Always access it outside the sandbox. (It starts a server and it gets confused otherwise.)
+- When creating a branch for a new task, create the branch first, then claim the issue so the claim is committed on that branch.
+- Before committing completed work, update the issue state first so the issue change is included in the same commit.
 
-### Quick Start
+<!-- END GITRACK MANAGED INSTRUCTIONS -->
 
-**Check for ready work:**
-
-```bash
-bd ready --json
-```
-
-**Create new issues:**
-
-```bash
-bd create "Issue title" --description="Detailed context" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" --description="What this issue is about" -p 1 --deps discovered-from:bd-123 --json
-```
-
-**Claim and update:**
-
-```bash
-bd update <id> --claim --json
-bd update bd-42 --priority 1 --json
-```
-
-**Complete work:**
-
-```bash
-bd close bd-42 --reason "Completed" --json
-```
-
-_Note:_ Do _not_ close issues until I have reviewed the changes made and agreed that the issue is indeed completed. Ask if uncertain.
-
-### Issue Types
-
-- `bug` - Something broken
-- `feature` - New functionality
-- `task` - Work item (tests, docs, refactoring)
-- `epic` - Large feature with subtasks
-- `chore` - Maintenance (dependencies, tooling)
+## Suggested gitrack Workflow
 
 ### Priorities
 
-- `0` - Immediate (Drop everything and do this now.)
-- `1` - ASAP (Finish what we are working on and then pick this up next. Don't start anything lower priority until this is done, even if it would complete a MVP slice.)
-- `2` - High (Important Items to work on.)
-- `3` - Normal (default; Just stuff that needs to be done.)
-- `4` - Low/Backlog (nice-to-have, polish, cleanup, future ideas)
+- `0` - Immediate: drop everything and do this now.
+- `1` - ASAP: finish the current task, then pick this up next before lower-priority work.
+- `2` - High: important work.
+- `3` - Normal: default priority for ordinary work.
+- `4` - Low/Backlog: nice-to-have, polish, cleanup, or future ideas.
 
-### Workflow for AI Agents
+### Agent Workflow
 
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task atomically**: `bd update <id> --claim`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-    - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
+#### Core Loop
 
-### Auto-Sync
+1. Check ready work with `gitrack ready --json`.
+2. Claim the selected issue with `gitrack claim <ref> --assignee <name> --json`.
+3. Read the issue with `gitrack show <ref> --json`.
+4. Set `status_reason = "planning"` while preparing the implementation plan.
+5. Align on a concrete plan with the user before implementation.
+6. Store the agreed plan in the issue body.
+7. Once the user agrees, set `status_reason = "plan agreed"`.
+8. Implement against the agreed plan.
+9. Before handing work over for review, compare the result against the issue body and agreed plan.
+10. Set `status_reason = "in review"` when ready for user review.
 
-bd automatically syncs via Dolt:
+#### When a Branch Is Needed
 
-- Each write auto-commits to Dolt history
-- Use `bd dolt push`/`bd dolt pull` for remote sync
-- No manual export/import needed!
+Create the branch before claiming the issue so the claim is committed on that branch.
 
-### Important Rules
+#### When Work Splits Into Children
 
-- ✅ Use bd for ALL task tracking
-- ✅ Always use `--json` flag for programmatic use
-- ✅ Link discovered work with `discovered-from` dependencies
-- ✅ Check `bd ready` before asking "what should I work on?"
-- ❌ Do NOT create markdown TODO lists
-- ❌ Do NOT use external issue trackers
-- ❌ Do NOT duplicate tracking systems
+Create child issues and link them with `gitrack link <parent> <child> --child --json`.
 
-For more details, see README.md and docs/QUICKSTART.md.
+If the split issues have ordering constraints, link them with `gitrack link <issue> <blocker> --blocked-by --json`.
 
-<!-- END BEADS INTEGRATION -->
+#### When New Work Is Discovered
+
+Create the new issue, then link it back to the source issue with `gitrack link <new-ref> <source-ref> --label "discovered from" --json`.
+
+#### Before Committing
+
+Update issue state before committing so issue changes travel with the code or documentation changes they describe.
+
+#### Closing Work
+
+Only close the issue after the user agrees it is complete.
+
+When closing, use `gitrack close <ref> --reason <reason> --json` with a concise reason such as `completed`, `won't do`, or `duplicate`.

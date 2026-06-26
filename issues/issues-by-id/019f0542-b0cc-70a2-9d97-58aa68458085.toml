@@ -1,0 +1,22 @@
+id = "019f0542-b0cc-70a2-9d97-58aa68458085"
+ref = "flotsync-hn4"
+title = "Implement Kompact IoDriver and IoBridge typed integration"
+body = "Expose the API via Kompact-native typed ports/channels with shared driver state and lightweight per-client bridges."
+status = "closed"
+status_reason = "Completed"
+type = "feature"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-5898ac2ecb82"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-587e766ed00f",
+    "019f0542-b0cc-70a2-9d97-591ea6017a3a",
+    "019f0542-b0cc-70a2-9d97-592151b35684",
+]
+created_at = "2026-03-12T15:55:19Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-17T15:28:00Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

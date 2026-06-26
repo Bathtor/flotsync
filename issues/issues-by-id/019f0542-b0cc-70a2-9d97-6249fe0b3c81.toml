@@ -1,0 +1,18 @@
+id = "019f0542-b0cc-70a2-9d97-6249fe0b3c81"
+ref = "flotsync-qy6"
+title = "Decouple semantic delivery tests from route transport and IO with scripted doubles"
+body = """
+Introduce scripted route-discovery and route-transport test doubles so GroupBroadcast and ReliableDelivery semantics can be tested without full flotsync_io and UDPour bring-up. Keep a smaller set of full-stack smoke tests for end-to-end signal; the goal here is better debuggability and isolation for semantic-owner tests, not to replace the smoke coverage.
+
+## Acceptance Criteria
+
+GroupBroadcast and ReliableDelivery each have semantic-level tests that exercise routing outcomes, delivery, acknowledgements, and failure handling without binding real sockets or starting the full transport stack; a smaller curated set of end-to-end smoke tests remains for transport integration coverage."""
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-04-07T08:43:12Z"
+updated_at = "2026-05-29T14:42:45Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-577ee196e486"
+label = "discovered from"

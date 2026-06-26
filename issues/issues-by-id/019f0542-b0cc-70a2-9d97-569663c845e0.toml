@@ -1,0 +1,50 @@
+id = "019f0542-b0cc-70a2-9d97-569663c845e0"
+ref = "flotsync-5j0.1"
+title = "T01 Define the manual replication slice contract"
+body = """
+Manual functional replication slice contract.
+
+C01. The manual slice supports fixed-membership replication groups between live peers with direct UDP routes configured out of band.
+
+C02. Group size is not fixed by the slice. Any group size supported by the current fixed-membership runtime should be valid when every member is manually configured and live.
+
+C03. Peer reachability is configured through Kompact/runtime configuration, including local bind endpoint and manually supplied peer endpoints. Do not add a temporary public ReplicationApi route-management surface.
+
+C04. Automatic discovery is out of scope. mDNS, peer tracking, reachability probing, relay routes, shared routes, and TCP routes remain later work.
+
+C05. Security is out of scope for this slice. No real encryption or signing; post-slice authenticated/encrypted envelopes are tracked by flotsync-sec.
+
+C06. Group creation covers only fixed initial membership. No change_group_membership, migration, invitations, schema epoch changes, or group close flow.
+
+C07. Replication covers row-level checklist-style changes over the existing schema-operation mapping: insert/update/delete where delete semantics are safe once flotsync-a3v is handled.
+
+C08. Local publish semantics remain: durable local acceptance plus outbound submission before PublishReceipt returns.
+
+C09. Runtime robustness must be strong enough that expected delivery and ordering faults are handled explicitly rather than turning into terminal runtime state. The implementation work for removing the runtime component's set_terminal-style mechanics is owned by flotsync-4x8 and blocks moving beyond this contract.
+
+C10. Delivery robustness required for this slice includes ReliableDelivery sender-side recipient-ack timeout handling and non-terminal handling of expected transient inbound ordering races.
+
+C11. The example app must allow manual synchronisation, so local edits can be staged on multiple peers and flushed with an explicit sync command.
+
+C12. Offline catch-up, Summary/NeedRange/Snapshot/Ack flows, replay after extended disconnection, and relay/mailbox repair are out of scope.
+
+C13. Functional acceptance means manually configured machines can create or join an arbitrary-size fixed group, make checklist edits, manually sync, observe remote events, and preserve durable local state across restart.
+
+C14. Manual test scenarios include concurrent adds, done-vs-rename, delete-vs-edit, restart persistence, and visible static peer configuration."""
+status = "closed"
+status_reason = "Contract agreed and recorded in the bead"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-564d67d95318",
+    "019f0542-b0cc-70a2-9d97-5672673b4f73",
+    "019f0542-b0cc-70a2-9d97-56c814c369e5",
+    "019f0542-b0cc-70a2-9d97-573c9c8d0da7",
+    "019f0542-b0cc-70a2-9d97-574b0c8e2774",
+    "019f0542-b0cc-70a2-9d97-59575b315dd2",
+]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:37:08Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-27T12:15:03Z"

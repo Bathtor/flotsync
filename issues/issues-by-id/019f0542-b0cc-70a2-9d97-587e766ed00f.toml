@@ -1,0 +1,25 @@
+id = "019f0542-b0cc-70a2-9d97-587e766ed00f"
+ref = "flotsync-0w3"
+title = "Add integration test matrix for correctness and flow control"
+body = "Test lease starvation, suspend/resume transitions, UDP multicast/broadcast behavior, and TCP lifecycle edge cases."
+status = "closed"
+status_reason = "Reviewed and completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-58aa68458085"]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-5898ac2ecb82",
+    "019f0542-b0cc-70a2-9d97-58b77bca0813",
+    "019f0542-b0cc-70a2-9d97-58ef8ce39a9b",
+    "019f0542-b0cc-70a2-9d97-5cfaf72c680a",
+    "019f0542-b0cc-70a2-9d97-5d05f2998b5e",
+    "019f0542-b0cc-70a2-9d97-5d3801f241ab",
+]
+created_at = "2026-03-12T15:55:19Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-19T05:07:05Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

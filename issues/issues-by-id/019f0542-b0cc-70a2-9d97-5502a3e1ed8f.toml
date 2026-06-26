@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-5502a3e1ed8f"
+ref = "flotsync-5hvw"
+title = "Validate replicated checklist without static routes"
+body = """
+Update replicated-checklist configuration, docs, and acceptance coverage so the application can be run without any static-peer-routes entries. Static routes should remain accepted as optional hints, but the documented custom UDP discovery flow should show two peers finding usable direct UDP routes and completing the existing checklist sync scenarios without preconfigured peer endpoints.
+
+## Notes
+
+Testing follow-up from flotsync-brt: if peer-announcement service tests are touched again while validating the custom UDP discovery slice, extract a small component/probe fixture to avoid repeating the current Kompact setup boilerplate across route-update and announcement tests.
+Non-device-dependent prep completed: primary replicated-checklist docs now show custom UDP discovery without static-peer-routes, static route hints are split into an optional fallback scenario, and replicated_checklist config parser coverage uses a no-static runtime config. Manual multi-device/broadcast validation is still pending before this task should close or the PR should merge."""
+status = "in-progress"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocks = [
+    "019f0542-b0cc-70a2-9d97-55119c3e2a9a",
+    "019f0542-b0cc-70a2-9d97-5a8613eee6d6",
+]
+parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+created_at = "2026-05-25T07:41:56Z"
+updated_at = "2026-06-14T18:00:26Z"

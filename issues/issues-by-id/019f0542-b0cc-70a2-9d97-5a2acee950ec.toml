@@ -1,0 +1,44 @@
+id = "019f0542-b0cc-70a2-9d97-5a2acee950ec"
+ref = "flotsync-brt"
+title = "Provide Kompact interface/path for custom announcement service."
+body = """
+Evidence: `flotsync_discovery_cli/src/main.rs:126`
+
+## Design
+
+Agreed implementation plan for custom UDP announcement interface/path:
+
+S01 Keep `PeerAnnouncementComponent` as the Kompact-owned UDP beacon sender. It owns the UDP bind, broadcast option, interface refresh, periodic timer, and send acknowledgements.
+
+S02 Do not add a second configuration field for advertised routes. The component starts with an empty advertised route set, and route changes are supplied through one runtime actor-message/control path. Callers that want initial routes can send that same message immediately after component creation/startup.
+
+S03 While the advertised route set is empty, the component must not send Peer announcements. A route-less Peer beacon is not useful for this slice because no receiver can verify a replication endpoint from it.
+
+S04 Add a Rust-native public advertised route type for the custom path, initially UDP socket addresses only, and convert it to `flotsync.discovery.v1.SocketAddress` only when encoding Peer.
+
+S05 Add a route update actor message, e.g. replace advertised routes. Every route update triggers an immediate announcement when the component is running, even if the replacement list is equal to the existing list. That immediate announcement resets the periodic timer so the new cadence starts from the route update.
+
+S06 Keep `AnnounceNow` implicit for production API. Tests may use direct component hooks where necessary, but callers should not need a separate public immediate-announcement message.
+
+S07 Update the CLI to exercise the public control path by publishing a fake UDP listening route after startup. The fake route is acceptable for the standalone smoke tool until the runtime wires in the real local delivery endpoint.
+
+S08 Leave IntroductionRequest/Introduction responder logic, signed verification, tracker state, RouteDiscoveryPort publication, socket reuse changes, and mDNS changes out of this task.
+
+## Acceptance Criteria
+
+`PeerAnnouncementComponent` exposes a documented Kompact control path for replacing custom UDP advertised routes, suppresses announcements while no routes are configured, encodes configured UDP routes into Peer.listening_on, immediately announces and resets its timer after every route replacement, and has focused tests for empty-route suppression, route encoding, and route-change announcements. The discovery CLI uses the same route-update path with a fake UDP route for standalone discovery smoke testing."""
+status = "closed"
+status_reason = "Completed custom UDP announcement control path"
+type = "task"
+priority = 1
+labels = ["area:discovery-architecture"]
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-552a810998c3",
+    "019f0542-b0cc-70a2-9d97-5a0dc487e926",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-594d8b76c49c"]
+parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
+created_at = "2026-02-21T08:38:39Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-29T14:46:57Z"

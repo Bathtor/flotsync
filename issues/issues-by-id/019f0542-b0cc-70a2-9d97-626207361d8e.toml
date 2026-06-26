@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-626207361d8e"
+ref = "flotsync-a07"
+title = "Design row tombstone garbage collection"
+body = "We now retain tombstoned rows in InMemoryData and include them in snapshots to preserve ordering and convergence semantics. Follow up with a design for when and how tombstoned rows and their ids can be garbage-collected safely without violating replication correctness."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-03-04T17:27:59Z"
+updated_at = "2026-05-29T14:42:46Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5da837b24a5c"
+label = "discovered from"

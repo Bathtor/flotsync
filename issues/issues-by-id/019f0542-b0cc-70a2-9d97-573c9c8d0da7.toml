@@ -1,0 +1,44 @@
+id = "019f0542-b0cc-70a2-9d97-573c9c8d0da7"
+ref = "flotsync-4x8"
+title = "Remove terminal runtime fault handling for expected inbound delivery errors"
+body = """
+The manual replication slice must not record terminal runtime state for expected delivery and ordering faults. The current runtime component uses set_terminal-style mechanics and fails subsequent API calls after inbound group-delivery errors. That was acceptable as a conservative first-slice guard, but it is too strong for the manual functional slice.
+
+Agreed handling policy:
+
+R01. Remove the runtime component's terminal_fault / set_terminal-style mechanics entirely, including RuntimeTerminated API failure behaviour.
+
+R02. API calls should fail only when the component is actually unavailable, using the normal ask failure path.
+
+R03. Production protocol-boundary noise should log and drop: unknown group updates, wrong runtime message kind on a delivery channel, and corrupt runtime payloads.
+
+R04. Test-only protocol-boundary noise may panic or otherwise fail loudly instead of growing elaborate result plumbing.
+
+R05. Unknown group updates are treated as not interested in this group. Drop with logging; do not buffer pre-bootstrap races.
+
+R06. Reliable-delivery messages that cannot be decoded or accepted must not complete the processed promise. Ack/retry behaviour remains with flotsync-46r.
+
+R07. Store access failures from inbound delivery are fatal for now. A closed or corrupted database should not leave a ghost component that only logs repeated failures.
+
+R08. Listener errors are treated as permanent boundary failures. The runtime does not own listener retry and may terminate/fault on listener failure.
+
+R09. Conflicting duplicate payloads should log loudly, not apply, not advance state, and not kill the runtime.
+
+R10. No custom Kompact recovery is required in this task. Stop self-poisoning expected errors; let real panics/component faults flow through normal Kompact supervision.
+
+R11. Keep tests minimal: prove an unknown-group inbound update does not poison later API calls, and keep existing direct error tests where useful. Avoid an exhaustive corrupt-payload matrix."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-566805dea04c"]
+blocks = ["019f0542-b0cc-70a2-9d97-569663c845e0"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-12T15:51:16Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-27T14:15:17Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58251a1cdb89"
+label = "discovered from"

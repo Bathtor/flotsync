@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5c3ddfeb81d3"
+ref = "flotsync-ml0"
+title = "Control datagram transfer send rate and backpressure handling"
+body = "Runtime currently reports logical send failure on most UDP Nacks and has no dedicated send-rate control/backpressure adaptation. Design and implement a bounded send-rate mechanism for flotsync_datagram_transfer so Backpressure can be handled without immediately surfacing a fatal logical send failure."
+status = "closed"
+status_reason = "Completed and reviewed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-28T15:13:32Z"
+updated_at = "2026-04-04T12:19:48Z"
+closed_at = "2026-04-04T12:19:48Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

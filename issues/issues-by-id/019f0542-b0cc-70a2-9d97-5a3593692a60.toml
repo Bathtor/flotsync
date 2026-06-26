@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-5a3593692a60"
+ref = "flotsync-cl5"
+title = "Fix latest-value-wins register behavior so all tests pass."
+body = "Evidence: Failing tests: `any_data::tests::concurrent_updates_converge_independent_of_delivery_order`, `any_data::tests::applying_same_operation_twice_is_illegal` in `flotsync_data_types/src/any_data/mod.rs:165` and `flotsync_data_types/src/any_data/mod.rs:195`"
+status = "closed"
+status_reason = "Completed before TODO tracker migration"
+type = "task"
+priority = 1
+labels = ["area:data-types-any-data"]
+created_at = "2026-02-21T08:38:38Z"
+updated_at = "2026-02-21T08:40:14Z"
+closed_at = "2026-02-21T08:40:14Z"

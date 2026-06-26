@@ -1,0 +1,22 @@
+id = "019f0542-b0cc-70a2-9d97-56f4d178b851"
+ref = "flotsync-73q.4"
+title = "Persist dataset_updates and apply causally ready chains transactionally"
+body = """
+Replace the in-memory pending update queue with persisted dataset_updates records for inbound and outbound replication traffic. Support efficient lookup of not-yet-applied candidates, load those candidates into memory when checking causal readiness, and commit an entire newly-ready apply chain atomically so failures do not leave partially advanced replication state behind.
+
+## Acceptance Criteria
+
+Inbound and outbound updates are durably recorded, duplicate and conflict detection use persisted records, and applying one update together with any newly-ready successors is all-or-nothing at the transaction boundary."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+labels = [
+    "area:datamodel",
+    "area:storage",
+]
+assignee = "Lars Kroll"
+parent = "019f0542-b0cc-70a2-9d97-59cd79cf8531"
+created_at = "2026-04-18T14:39:24Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-25T09:20:22Z"

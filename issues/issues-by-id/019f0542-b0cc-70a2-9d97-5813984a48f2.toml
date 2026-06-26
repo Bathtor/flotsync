@@ -1,0 +1,20 @@
+id = "019f0542-b0cc-70a2-9d97-5813984a48f2"
+ref = "flotsync-220"
+title = "Specify GroupBroadcast queue state machine and ownership model"
+body = "Define the concrete GroupBroadcast state machine for per-message/per-target fan-out. Specify active states, terminal outcomes, legal transitions, retry triggers, ownership boundaries between discovery, broadcast, replication, and persistence, and which facts are internal bookkeeping versus externally observable. This task should produce an implementation-oriented spec that later runtime work can follow."
+status = "closed"
+status_reason = "Reviewed and completed via commit 34438dc (GroupBroadcast route queue semantics spec)."
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-57fc5ce67722",
+    "019f0542-b0cc-70a2-9d97-58092159f5b0",
+]
+created_at = "2026-03-26T05:14:10Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-26T06:25:43Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-6110c02d1cf4"
+label = "discovered from"

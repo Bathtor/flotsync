@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5d154987978f"
+ref = "flotsync-743"
+title = "Refactor flotsync_io driver module layout"
+body = "Split flotsync_io/src/driver.rs into smaller transport- and concern-specific modules before additional UDP/TCP work, keeping behavior unchanged. This was discovered while reviewing and extending flotsync-xko."
+status = "closed"
+status_reason = "Completed: split flotsync_io driver into focused registry, runtime, thread, tcp, and udp modules, moved UDP-specific tests beside the transport implementation, and kept behavior unchanged."
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-16T17:35:12Z"
+updated_at = "2026-03-16T17:57:00Z"
+closed_at = "2026-03-16T17:57:00Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-591ea6017a3a"
+label = "discovered from"

@@ -1,0 +1,72 @@
+id = "019f0542-b0cc-70a2-9d97-579a53eda8b8"
+ref = "flotsync-jgg"
+title = "Add mockable clocks for UDPour timing tests"
+body = """
+Replace real sleeps in UDPour timing tests with mockable or controllable clocks/timers so tombstone expiry, pacing, and retry behavior can be tested deterministically without wall-clock waits.
+
+## Design
+
+Goal
+- Make Kompact runtimes testable against a manually advanced timer without changing the default production behaviour.
+- Preserve current scheduling semantics for one-shot, periodic, cancellation, and zero-delay timers.
+
+Chosen Route
+- Keep the existing Kompact config seam at `KompactConfig::timer(...)`.
+- Preserve Kompact's concrete `timer::TimerRef` path by teaching `hierarchical_hash_wheel_timer` to expose one queue-based timer reference that can be driven either by a dedicated thread or by a manual driver.
+- Add a test-oriented manual timer component in Kompact that wraps the manual driver and exposes a separate control handle to the harness.
+
+P1. Timer Crate Refactor
+- Extract the queue message type, timer-reference construction, and schedule/cancel plumbing out of `thread_timer.rs` into a shared queue-driven core.
+- Keep `thread_timer::TimerRef` as the public scheduling handle so downstream API churn stays minimal.
+- Refactor `TimerWithThread` to delegate to that shared core plus a thread loop.
+- Add a new manual driver type, tentatively `ManualTimer` or `DrivenTimer`, with `timer_ref()`, `advance_by`, `advance_one`, `advance_until_idle`, `current_time`, and one lightweight observability method such as `is_idle` or `next_due_in`.
+- Ensure queued schedule/cancel messages are drained both before and during advancement so commands issued between advances, or triggered indirectly during execution, are observed deterministically.
+- Define zero-delay semantics explicitly and match the threaded behaviour as closely as possible.
+
+P2. Timer Crate Validation
+- Add parity tests that run equivalent scripted schedule/cancel sequences against both the threaded and manual drivers.
+- Cover one-shot timers, periodic timers, cancellation before fire, cancellation after enqueue, zero-delay timers, large skips, multiple timers expiring on the same tick, and schedule-from-trigger behaviour.
+- Add explicit tests for `advance_until_idle` so pathological periodic workloads fail loudly instead of spinning silently.
+- Document any deliberate semantic difference that cannot be eliminated.
+
+P3. Kompact Integration
+- Add a `ManualTimerComponent` that stores shared manual-timer state and implements `TimerComponent` by returning the shared queue-based `TimerRef`.
+- Add a companion `ManualTimerControl` handle for tests. Harnesses should keep this handle outside the runtime and use it to advance time.
+- Keep the production default unchanged; tests opt in by installing the manual timer through `KompactConfig::timer(...)`.
+- If useful upstream, add a small helper constructor that returns the builder closure together with the retained control handle.
+- Avoid widening Kompact abstractions unless the shared-reference route proves insufficient.
+- Fallback if necessary: generalise `TimerRefFactory` and `TimerManager` away from the concrete `timer::TimerRef` alias as a second-stage patch.
+
+P4. Kompact Validation
+- Add system-level tests showing that scheduled timeouts do not fire until manual time advances past the deadline.
+- Cover periodic rescheduling, cancellation, dropping components with pending timers, and runtime shutdown with queued timeouts.
+- Add a multi-component test to verify deterministic delivery when several components share the same manual timer.
+- Document the contract between time advancement and component execution, because advancing time will enqueue work but may still require the harness to wait for component turns to run.
+
+P5. Flotsync Adoption
+- Extend the local Kompact test builders so they can install the manual timer and return its control handle.
+- Migrate the timing-sensitive UDPour runtime tests in this issue first: pacing, retries, retention or tombstone expiry, and similar wall-clock-driven cases.
+- Use the shared eventually-style helper from `flotsync-6uy` for post-advance observation. The manual timer removes real sleeps; it does not remove the need to wait for asynchronous side effects to become visible.
+- Keep a smaller set of real-time smoke tests where the purpose is explicitly to cover threaded scheduling and integration with the live runtime.
+
+P6. Risks And Upstreaming Notes
+- The existing `simulation::SimulationTimer` is not a direct fit for Kompact because it is not queue-reference based and relies on `Rc`, so it should inform semantics rather than be wrapped directly.
+- The most delicate semantic area is commands racing with `advance_by`; those rules need to be explicit and tested.
+- Prefer an upstreamable manual-driver abstraction in the timer crate over a flotsync-only test shim.
+
+Done Means
+- A Kompact runtime can be built with a manual timer and externally advanced deterministically.
+- The UDPour timing tests covered by `flotsync-jgg` stop depending on wall-clock sleeps for timer progression.
+- The default threaded timer remains the production default and retains its current behaviour."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-02T15:42:41Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-07T13:50:30Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57aade8f8563"
+label = "discovered from"

@@ -1,0 +1,35 @@
+id = "019f0542-b0cc-70a2-9d97-556a15c24f8e"
+ref = "flotsync-sec.10"
+title = "Provision replicated-checklist security state during setup"
+body = """
+For this MVP slice, the replicated-checklist example owns application-side security provisioning before replication starts. The example reads its temporary plaintext local database secret plus local private JWKS and trusted public JWKS paths from application config, parses key material through flotsync_security, validates the configured static group members, and writes the resulting group-security state into ReplicationStore during ensure_configured_group. Replication runtime then reads security material from the store like normal group metadata.
+
+## Design
+
+S710-04/10 agreed implementation plan for temporary replicated-checklist store provisioning.
+
+1. Temporary replication API: add a public provisioning helper in flotsync_replication that owns the store-record and encryption details while the example owns config/files/setup policy. Mark the helper as temporary MVP setup pending flotsync-uohh; long-term we do not want an application-side provisioning step.
+
+2. Local and trusted key provisioning: the helper accepts the local member id, ReplicationSecuritySecrets, local private JWKS text, and trusted public JWKS texts. It parses through flotsync_security, seals local private keys into LocalMemberPrivateKeysRecord, stores trusted public keys as TrustedMemberPublicKeysRecord values, and returns parsed identities so the example can validate static group coverage.
+
+3. Initial group material: add a temporary public helper that prepares EncryptedGroupSecurityMaterial for the initial static group from a GroupKey and ReplicationSecuritySecrets. This keeps encrypted-cell contexts out of the example.
+
+4. replicated-checklist setup flow: ensure_configured_group reads key files from config, provisions local/trusted security state before inserting the static group, validates that every configured group member has trusted public keys except the local member, creates the initial group security material, and then inserts the group record.
+
+5. Idempotency and diagnostics: repeated setup with identical local/trusted material should be accepted; missing, malformed, duplicate, or mismatched key files should fail setup with clear example-level errors.
+
+6. Validation: add focused tests proving setup writes security records that runtime load accepts, and that malformed or incomplete key files fail before runtime start. flotsync_security must remain free of application TOML/Kompact parsing.
+
+## Acceptance Criteria
+
+replicated-checklist config includes the temporary plaintext local database secret and local/trusted JWKS paths; ensure_configured_group validates and provisions security state into ReplicationStore before runtime start; malformed or mismatched local/trusted key files fail setup with clear errors; runtime startup loads provisioned group security state from ReplicationStore; and flotsync_security still does not parse application TOML or Kompact config."""
+status = "closed"
+status_reason = "Completed temporary replicated-checklist security provisioning setup; reviewed and validated."
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocks = ["019f0542-b0cc-70a2-9d97-55c56c4c3217"]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-16T09:55:40Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-23T08:34:45Z"

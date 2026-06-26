@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-5f77226bbaea"
+ref = "flotsync-2jw"
+title = "Design flotsync_security key rotation and revocation"
+body = """
+Follow-up after the flotsync_security MVP: design and implement rotation and revocation for member identity keys and group symmetric keys. This should define how compromised member keys trigger group migration, how old keys remain usable for historical verification when appropriate, how revoked keys are represented, and what store/runtime migrations are required.
+
+## Acceptance Criteria
+
+There is a concrete rotation and revocation design covering member signing keys, member encryption keys, group keys, stored group metadata, migration interaction, and compatibility with existing groups; implementation tasks or code changes follow that design."""
+status = "open"
+type = "task"
+priority = 3
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:33:27Z"
+updated_at = "2026-05-29T14:42:17Z"

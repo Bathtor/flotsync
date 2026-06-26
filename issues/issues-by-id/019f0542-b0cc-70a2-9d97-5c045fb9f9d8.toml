@@ -1,0 +1,38 @@
+id = "019f0542-b0cc-70a2-9d97-5c045fb9f9d8"
+ref = "flotsync-d3g"
+title = "Implement minimal semantic ingress consumers for end-to-end delivery tests"
+body = """
+Add the smallest GroupBroadcast and/or ReliableDelivery runtime slices needed to consume the new owner-specific inbound ports from DeliveryIngress and emit the existing higher-level Deliver indications, so the inbound path can be exercised end-to-end from RouteTransportManager through delivery ingress into a semantic owner. Scope this narrowly: no full queue/scheduler work, just enough wiring and tests to validate the new transport+ingress boundary in one integrated path.
+
+## Notes
+
+2026-04-05 implementation plan:
+1. Add a reusable cloneable one-shot completion helper (KClaimablePromise) around Arc<Mutex<Option<KPromise<...>>>> for Kompact-delivered indications that must remain Clone.
+2. Implement ReliableDeliveryComponent as the first minimal semantic owner that supports the direct reliable-delivery path only.
+3. Extend ReliableDeliveryDeliver to carry a cloneable processed-completion handle so receiver-side ack emission is gated on explicit processing rather than mere ingress receipt.
+4. Add outbound reliable-envelope encoding and outbound recipient-ack encoding, plus inbound decoding from DeliveryIngress into domain objects.
+5. Track sender-side work items through Pending to Observed recipient-ack state, and receiver-side pending inbound deliveries until processed completion triggers ack emission.
+6. Build a reusable full-stack test harness per KompactSystem containing IoDriverComponent, IoBridge, RouteTransportManager, DeliveryIngressComponent, ReliableDeliveryComponent, the required wiring, discovery-route injection, external probes, and test-only state inspection.
+7. Add a two-system end-to-end test using two full stacks with real UDPour/route-transport traffic in one direction for the envelope and the reverse direction for the ack; the test should complete the receiver-side processed handle immediately and assert sender-side ack observation.
+2026-04-05 implementation progress:
+- Added flotsync_utils::KClaimablePromise as a reusable cloneable one-shot completion helper over Arc<Mutex<Option<KPromise<...>>>> with focused unit tests.
+- Implemented ReliableDeliveryComponent as the first minimal semantic owner for the direct reliable-delivery path.
+- Extended ReliableDeliveryDeliver with a cloneable processed handle that gates recipient-ack emission on explicit processed completion rather than ingress receipt.
+- Added direct reliable-envelope and recipient-ack protobuf boundary encoding/decoding plus sender-side and receiver-side in-memory tracking.
+- Added a reusable two-system full-stack test harness covering IoDriverComponent, IoBridge, RouteTransportManager, DeliveryIngressComponent, ReliableDeliveryComponent, discovery injection, and external probes.
+- Added an end-to-end test that sends a real direct reliable-delivery envelope through one full stack, completes the receiver-side processed handle, and observes the recipient ack return through the reverse stack.
+- Verification: cargo fmt --all and cargo test -p flotsync_utils -p flotsync_replication --lib passed.
+Refined the minimal direct reliable-delivery slice: switched direct route tracking to TrieMap, collapsed sender/inbound-ack retries onto one monotonic earliest-deadline timer queue, removed unused wall-clock timestamps from reliable sender state, moved reliable-delivery protobuf encode/decode into delivery/reliable_delivery/wire.rs, and added follow-up tasks flotsync-irn (multiple direct routes), flotsync-fx5 (relay route discovery), and flotsync-rp3 (lazy outbound serialisation).
+Addressed follow-up review fixes: corrected the shared retry scheduler so stale-entry cleanup no longer drops overdue retries, renamed timer setup helpers from arm_* to set_*, rejected duplicate reliable submits by message_id, narrowed the member trie re-export to TrieMap/TrieSet, and added focused regression tests for overdue retry preservation and duplicate-submit retention of the original work item."""
+status = "closed"
+status_reason = "Completed reliable-delivery semantic owner slice with end-to-end tests; group-broadcast split to follow-up task"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-04-05T15:01:54Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-05T17:47:45Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5c4df94a8cba"
+label = "discovered from"

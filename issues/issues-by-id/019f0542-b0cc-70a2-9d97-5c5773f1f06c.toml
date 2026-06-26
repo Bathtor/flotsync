@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5c5773f1f06c"
+ref = "flotsync-ddj"
+title = "Evaluate buffa zero-copy view adoption opportunities"
+body = "Assess where buffa MessageView / OwnedView types could materially improve flotsync without making the migration harder than necessary. Focus on hot decode paths in flotsync_messages and flotsync_discovery, identify where messages are read-only long enough to benefit from zero-copy borrowing, and spell out the API/lifetime changes required to use views safely across async or actor boundaries. Include a recommendation on whether to keep views disabled for the initial migration and introduce them in a second step, or adopt them immediately in a narrow set of paths."
+status = "closed"
+status_reason = "Won't do"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-26T16:03:51Z"
+updated_at = "2026-04-06T09:57:33Z"
+closed_at = "2026-04-06T09:57:33Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57dcb0ded3ed"
+label = "discovered from"

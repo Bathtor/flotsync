@@ -1,0 +1,21 @@
+id = "019f0542-b0cc-70a2-9d97-592151b35684"
+ref = "flotsync-ztx"
+title = "Implement TCP stream client path"
+body = "Support connect, raw byte send/recv, and close variants for outbound TCP streams with driver-managed lifecycle events."
+status = "closed"
+status_reason = "Completed: implemented outbound TCP stream client support with nonblocking connect completion, partial-write send progression, ingress-pool-based read suspend/resume, explicit connect failure reporting, graceful close-after-flush, abort close, and loopback coverage for connect/send/recv, failure, backpressure, graceful close, and ingress exhaustion."
+type = "feature"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-58aa68458085",
+    "019f0542-b0cc-70a2-9d97-59044182d991",
+]
+blocks = ["019f0542-b0cc-70a2-9d97-5886fca1ce44"]
+created_at = "2026-03-12T15:55:18Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-16T18:41:59Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

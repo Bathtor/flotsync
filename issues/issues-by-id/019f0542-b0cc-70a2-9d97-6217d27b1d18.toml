@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-6217d27b1d18"
+ref = "flotsync-etc"
+title = "Evaluate certificate or PKI-based trust for flotsync_security"
+body = """
+Follow-up after the flotsync_security MVP: decide whether Flotsync should support certificates, PKI, or another structured trust model beyond copied public JWKS files and discovery-published keys. This should compare operational complexity, mobile or desktop UX, local-first expectations, revocation, and compatibility with existing MemberIdentity values.
+
+## Acceptance Criteria
+
+There is a written decision or implementation plan for whether certificate or PKI support belongs in Flotsync, how it maps to MemberIdentity, how revocation would work, and what remains intentionally unsupported."""
+status = "open"
+type = "task"
+priority = 4
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:33:58Z"
+updated_at = "2026-05-29T14:42:42Z"

@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5c98dea50511"
+ref = "flotsync-514"
+title = "Add composite IoPayload chaining and payload traversal helpers"
+body = "Extend IoPayload with a composite/chained variant so one logical send can interleave pooled leases, owned Bytes payloads, and static/literal fragments without forcing callers to flatten everything into one buffer first. Also add traversal/accessor APIs on IoPayload so client code does not need to match on the internal representation directly for common operations such as length, iteration, flattening, and cursor-style reads."
+status = "closed"
+status_reason = "Completed"
+type = "feature"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-23T15:48:18Z"
+updated_at = "2026-03-23T18:25:26Z"
+closed_at = "2026-03-23T18:25:26Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d05f2998b5e"
+label = "discovered from"

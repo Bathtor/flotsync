@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-585c453c42a1"
+ref = "flotsync-7oo"
+title = "Improve flotsync_io Kompact open ergonomics"
+body = "Make TCP open/listen futures resolve only when usable, remove redundant establishment events from steady-state streams, remove UDP socket reservation from the public Kompact API, switch UDP open requests to create-and-open with auto-assigned SocketId and UdpOpenRequestId correlation, and use UdpLocalBind consistently across UDP bind/connect. Update docs, examples, and tests accordingly."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-21T16:16:03Z"
+updated_at = "2026-03-22T08:16:00Z"
+closed_at = "2026-03-22T08:16:00Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

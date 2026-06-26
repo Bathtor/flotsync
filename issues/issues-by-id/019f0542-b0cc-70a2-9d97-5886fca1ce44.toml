@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5886fca1ce44"
+ref = "flotsync-7j8"
+title = "Implement TCP listener and accept path (listener-owned connections)"
+body = "Support bind/listen/accept and assign accepted connection ownership to the listener bridge for v1."
+status = "closed"
+status_reason = "Completed: implemented TCP listener bind/listen/close support, paused accepted-connection adoption via AdoptAccepted/RejectAccepted, Kompact TcpListener/PendingTcpSession/TcpListenerRef model, and raw plus Kompact test coverage for accept, reject, and drop-to-reject flows."
+type = "feature"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-592151b35684"]
+created_at = "2026-03-12T15:55:19Z"
+updated_at = "2026-03-17T17:12:16Z"
+closed_at = "2026-03-17T17:12:16Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-593037b76b86"
+label = "discovered from"

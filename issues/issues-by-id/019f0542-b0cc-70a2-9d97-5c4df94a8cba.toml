@@ -1,0 +1,53 @@
+id = "019f0542-b0cc-70a2-9d97-5c4df94a8cba"
+ref = "flotsync-zup"
+title = "Decide inbound transport decode and demux ownership"
+body = """
+Decide which component owns inbound wire parsing, signature verification boundaries, protobuf decoding, and demultiplexing from raw transport messages into GroupBroadcastPort and ReliableDeliveryPort Deliver indications. This was deferred during flotsync-187 and should be resolved before runtime implementation work gets too far.
+
+## Notes
+
+2026-04-04 agreed design direction:
+1. Rename the existing outbound-only `RouteTransportPort` to `RouteTransportOutboundPort` and add a sibling `RouteTransportInboundPort` for fully reassembled inbound logical payloads plus transport metadata.
+2. Keep transport metadata transport-pure. UDP/datagram ingress must not expose a claimed authenticated sender on the route-transport port; verified sender identity belongs to the delivery-ingress layer after message-level parsing and signature verification.
+3. Introduce a dedicated `DeliveryIngress` component between route transport and the semantic services. It owns shallow wire classification, full delivery-wire protobuf decode, message-level signature verification, and semantic demultiplexing.
+4. Do not add a third application-bypass ingress port for now. `DeliveryIngress` should route only to semantic-owner-specific inbound ports: `GroupBroadcastInboundPort` and `ReliableDeliveryInboundPort`. The semantic services continue to emit the existing external `Deliver(...)` indications upward when appropriate.
+5. The semantic-owner-specific inbound indications should carry shared metadata once plus one generated protobuf boundary frame, rather than repeating metadata in every enum variant.
+6. Split the delivery wire at semantic boundaries with a small top-level discriminator: `DeliveryBoundaryFrame { group_broadcast | reliable_delivery }`. Inside each branch, the generated protobuf boundary frame owns the concrete variants.
+7. Each concrete wire message must explicitly separate public routing/header fields from encrypted or bulky payloads using nested sub-messages such as `public_header` and `encrypted_payload`. We must not rely on protobuf field ordering alone to distinguish cheap routing data from encrypted content.
+8. The earliest classification step in `DeliveryIngress` should parse only the top-level boundary plus the relevant `public_header`, derive a `DeliveryTargetHint`, and drop frames that are not locally interesting before full decode or signature verification.
+9. The local-interest filter should use `active_groups` via `ArcSwap`, while `local_members` and `hosted_mailboxes` remain simpler shared `Arc<HashSet<...>>` values.
+10. The semantic `MessageId` used by ingress is the delivery-domain message id from `flotsync_replication::delivery::shared`, not any transport-local id such as UDPour message ids.
+11. `RecipientAckHeader` should gain `original_sender` so ingress can cheaply reject irrelevant acks, and the current generic relay-store confirmation shape should split into group and reliable variants carrying the sender/recipient scope needed for early routing.
+12. Initial implementation slice: land the Rust-side port, metadata, and ingress scaffolding first, then follow with delivery-wire protobuf types/codecs and finally the concrete route-transport-to-ingress wiring.
+2026-04-04 implementation progress:
+- Renamed the route-transport semantic-delivery port to `RouteTransportOutboundPort` and added `RouteTransportInboundPort` plus `InboundTransportMeta` / `RouteTransportInboundDeliver`.
+- Added `delivery::ingress` with `DeliveryIngress`, `DeliveryInterestConfig`, `DeliveryTargetHint`, `InboundDeliveryMeta`, and owner-specific inbound ports for group broadcast and reliable delivery.
+- Extended `UDPourDeliver` with `socket_id` and wired `RouteTransportManager` to emit inbound transport deliveries for reassembled UDPour payloads using reconstructed UDP route metadata.
+- Added the `original_sender` field to `RecipientAckHeader` and split relay-store confirmation into group and reliable variants.
+- Current limitation: the new semantic inbound ports still carry temporary raw boundary payloads because delivery-wire protobuf boundary types and shallow parsing have not been implemented yet.
+- Verification: `cargo test -p flotsync_udpour -p flotsync_replication` passed.
+2026-04-04 implementation progress:
+- Added generated messages/proto/delivery.proto with semantic-owner boundary frames and explicit public_header separation for envelope, mailbox, ack, and relay-store traffic.
+- Added delivery::wire in flotsync_replication with a shallow protobuf classifier over IoPayload, early local-interest filtering, full protobuf decode only for relevant frames, and focussed unit tests.
+- Updated delivery::ingress to use generated GroupBroadcastFrame / ReliableDeliveryFrame, route locally relevant frames onto the owner-specific inbound ports, and leave verified_sender unset pending a concrete signature verifier.
+- Added ingress integration tests for active group frames and local recipient acks, and improved route-transport observability by warning on inbound UDPour deliveries from unknown socket ids.
+- Verification: cargo fmt --all and cargo test -p flotsync_messages -p flotsync_replication -p flotsync_udpour passed.
+2026-04-05 implementation adjustment:
+- Removed mailbox pagination from the current delivery/mailbox wire and domain shapes. Mailbox fetch now assumes full fetch semantics, and mailbox batch no longer carries a cursor.
+- Follow-up task flotsync-45z was created to revisit mailbox fetch pagination and cursor design once the mailbox subsystem semantics are clearer.
+2026-04-05 wire clean-up:
+- Flattened the delivery-wire signature footer so envelope-like messages now carry SignatureWire directly instead of a one-field SignatureFooterWire wrapper.
+- Removed the unsupported custom signature-scheme variant from both the delivery wire and the shared delivery-domain SignatureScheme type. The wire now relies on protobuf enum unknown values for future unsupported schemes.
+Reworked route-transport boundary towards actor-based outbound submission. Removed the outbound Kompact port and replaced it with RouteTransportActorMessage::Submit(Ask<...>) plus RouteTransportSubmitResult. The remaining RouteTransportPort is now indication-only with Request = Never explicitly documented as inbound-only. RouteTransportManager now fulfils pending submit promises directly, and manager tests now drive submits via actor ask instead of a probe port."""
+status = "closed"
+status_reason = "Implemented and verified inbound transport decode/demux boundary"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+created_at = "2026-03-27T16:26:52Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-05T15:01:54Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58092159f5b0"
+label = "discovered from"

@@ -1,0 +1,15 @@
+id = "019f0542-b0cc-70a2-9d97-565b91d60d3f"
+ref = "flotsync-5j0.6"
+title = "T10 Add manual synchronisation control to the checklist example"
+body = "Make the checklist example stage local edits without automatically synchronising every change immediately. Add an explicit manual command, such as sync, that triggers outbound replication so concurrent scenarios can be prepared on separate machines before the user presses Enter."
+status = "closed"
+status_reason = "Implemented"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocked_by = ["019f0542-b0cc-70a2-9d97-566805dea04c"]
+blocks = ["019f0542-b0cc-70a2-9d97-563e6b449376"]
+parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
+created_at = "2026-04-27T10:38:07Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-28T18:26:56Z"

@@ -1,0 +1,26 @@
+id = "019f0542-b0cc-70a2-9d97-5f007759be72"
+ref = "flotsync-sfun"
+title = "Garbage collect stale route-establishment watches"
+body = """
+Route-establishment route watches can remain stale after peer restarts, topology changes, or removed manual watches. Before release, add bounded garbage collection for stale route-establishment state.
+
+Scope:
+- Expire peer-announced interest after an appropriate receiver-owned freshness window.
+- Remove route state once there is no remaining interest and verification is stale or otherwise inactive.
+- Keep manual watches authoritative: removed manual watches should not keep routes alive indefinitely.
+- Preserve reachable lease/refresh semantics for currently verified routes.
+- Add focused tests for peer restart churn, removed manual watches, stale-route cleanup, and no cleanup of active reachable routes.
+
+Context:
+- Discovered while planning flotsync-bztn.
+- Not required for the first static-route-hints slice, but should happen before release."""
+status = "open"
+type = "task"
+priority = 3
+parent = "019f0542-b0cc-70a2-9d97-55119c3e2a9a"
+created_at = "2026-06-05T14:24:52Z"
+updated_at = "2026-06-05T14:24:52Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-54fbb2fa0c9f"
+label = "discovered from"

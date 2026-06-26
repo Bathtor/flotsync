@@ -1,0 +1,9 @@
+id = "019f0542-b0cc-70a2-9d97-61bbc13dd17f"
+ref = "flotsync-wpvk"
+title = "Design scripted Kompact port proxy"
+body = "Follow-up from the flotsync Kompact port tester survey. Explore whether a generic scripted port proxy is worth upstreaming separately from the plain observer/forwarder. Requirements include matching ordered event sequences, applying actions per match, passing events through, dropping events, emitting extra events, reordering or duplicating events, and synthesising actor replies from embedded reply recipients such as UdpSendResult::Nack. Keep the first design intentionally scoped; a full regex/parser-like event language is powerful but can become a large standalone feature."
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-06-22T11:38:41Z"
+updated_at = "2026-06-22T11:38:41Z"

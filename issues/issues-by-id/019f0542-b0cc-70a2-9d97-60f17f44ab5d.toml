@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-60f17f44ab5d"
+ref = "flotsync-7jb"
+title = "Audit HashMap/HashSet hasher usage and performance tradeoffs"
+body = "Audit all HashMap/HashSet usage across the workspace and decide where cryptographic-strength hashing is unnecessary. For each call site, classify risk profile (trusted/untrusted keys), throughput sensitivity, and collision-abuse exposure; then choose and document the appropriate hasher strategy (keep default SipHash where needed, use faster non-crypto hashers where safe). Include a rollout plan, migration checklist, and benchmark guidance for high-traffic paths."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-03-11T12:45:21Z"
+updated_at = "2026-05-29T14:42:35Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-596cfd55b01f"
+label = "discovered from"

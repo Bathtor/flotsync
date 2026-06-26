@@ -1,0 +1,24 @@
+id = "019f0542-b0cc-70a2-9d97-617be655e796"
+ref = "flotsync-vrt.6"
+title = "Benchmark a columnar HistorySnapshot format against the current node-oriented encoding"
+body = """
+Once the baseline protobuf snapshot encoder/decoder exists, add an alternative HistorySnapshot storage format that stores node metadata columnar-style and packs node payloads into shared value arrays recoverable from the metadata. Benchmark the baseline and alternative formats against each other for encoded size plus encode/decode performance on representative history snapshots, and capture the tradeoffs and recommendation.
+
+## Acceptance Criteria
+
+1) An alternative HistorySnapshot representation is prototyped for benchmarking, using columnar node metadata plus shared value storage. 2) Benchmarks compare the baseline and alternative snapshot formats for encoded size and encode/decode performance on representative datasets. 3) Results are recorded with a clear comparison and recommendation on whether to keep, discard, or further iterate on the columnar format."""
+status = "closed"
+status_reason = "Closed"
+type = "task"
+priority = 3
+labels = ["area:messages-protobuf"]
+blocks = ["019f0542-b0cc-70a2-9d97-5e348324ef83"]
+parent = "019f0542-b0cc-70a2-9d97-5e9d983d9d0b"
+children = [
+    "019f0542-b0cc-70a2-9d97-5dec86bf40c8",
+    "019f0542-b0cc-70a2-9d97-5dff9faf7fb8",
+    "019f0542-b0cc-70a2-9d97-5e0fe032be29",
+]
+created_at = "2026-03-03T07:09:28Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-03T15:56:59Z"

@@ -1,0 +1,17 @@
+id = "019f0542-b0cc-70a2-9d97-5b09a198323c"
+ref = "flotsync-mxj"
+title = "Protect local identity JWKS files with passphrases"
+body = """
+Follow-up after the flotsync_security MVP: add passphrase-protected local identity files or an equivalent local secret protection mechanism. The design should decide whether to use encrypted JWK/JWE, age-like wrapping, OS keychain integration, or another approach, and should cover CLI prompts, non-interactive configuration, and test support.
+
+## Acceptance Criteria
+
+Local private identity material can be stored encrypted at rest with a documented unlock path; replicated-checklist or future CLIs can load protected identities; and tests cover wrong passphrase, successful unlock, and unprotected test fixtures."""
+status = "closed"
+status_reason = "Superseded by flotsync-uohh production key provisioning; avoid adding passphrase-protected private identity files if the file path is removed."
+type = "task"
+priority = 2
+blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+created_at = "2026-05-14T16:33:36Z"
+updated_at = "2026-05-29T14:43:05Z"
+closed_at = "2026-05-29T14:43:05Z"

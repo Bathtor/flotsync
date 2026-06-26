@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-596cfd55b01f"
+ref = "flotsync-ca7"
+title = "Create flotsync_replication crate and define boundaries"
+body = "Introduce a dedicated flotsync_replication crate as the home for replication-group and protocol orchestration APIs above schema-level operations. Define crate responsibilities and boundaries vs flotsync_core (VV/identifiers) and flotsync_messages (wire codecs). Deliverable is an architecture note and crate boundary contract, no implementation required in this task."
+status = "closed"
+status_reason = "Completed: added flotsync_replication crate to workspace and introduced initial app-facing dyn-trait API contracts, event listener model, row provider abstraction, and runtime/store boundaries."
+type = "feature"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-10T08:32:05Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-10T15:17:35Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5d70821f565d"
+label = "discovered from"

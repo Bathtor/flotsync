@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-57c6652684dd"
+ref = "flotsync-p9u"
+title = "Design logical-payload transfer over datagram routes"
+body = "Define how the lower route-transport layer handles logical payloads that do not fit into a single datagram. Cover fragmentation/framing, reassembly, missing-piece requests, spill-to-disk buffering, retransmission expectations, and how this integrates with route-local Ack/Nack semantics without leaking multipart details into GroupBroadcast or ReliableDelivery. This task must first survey relevant existing protocols and framing schemes before proposing a custom design."
+status = "closed"
+status_reason = "Multipart datagram protocol specified"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-27T16:26:52Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-03-28T13:29:58Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-58092159f5b0"
+label = "discovered from"

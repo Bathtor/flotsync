@@ -1,0 +1,16 @@
+id = "019f0542-b0cc-70a2-9d97-5784ca0bc484"
+ref = "flotsync-469"
+title = "Fix egress adopt_payload to accept payloads already owned by the same pool"
+body = "EgressPool::adopt_payload currently rejects pooled IoPayload fragments once they have been cloned, even when those fragments are already owned by the same egress pool. UDPour currently has to fall back to copying in this case. Adjust the adopt logic so payloads already retargeted to the destination pool are accepted instead of treated as shared ownership failures."
+status = "closed"
+status_reason = "Completed and reviewed"
+type = "bug"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-04-04T12:12:50Z"
+updated_at = "2026-04-04T12:32:20Z"
+closed_at = "2026-04-04T12:32:20Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-57b31da61e9d"
+label = "discovered from"

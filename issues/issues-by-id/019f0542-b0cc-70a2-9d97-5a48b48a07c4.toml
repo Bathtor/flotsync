@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5a48b48a07c4"
+ref = "flotsync-ug2"
+title = "Implement non-mDNS active mode in CLI (`--active` without `--mdns`)."
+body = "Evidence: `flotsync_discovery_cli/src/main.rs:55`, `flotsync_discovery_cli/src/main.rs:58`"
+status = "closed"
+status_reason = "Verified non-mDNS active CLI mode"
+type = "task"
+priority = 1
+labels = ["area:discovery-cli"]
+assignee = "Lars Kroll"
+created_at = "2026-02-21T08:38:38Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-05-25T07:31:27Z"

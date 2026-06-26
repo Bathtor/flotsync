@@ -1,0 +1,13 @@
+id = "019f0542-b0cc-70a2-9d97-5f4104db8a5b"
+ref = "flotsync-93s"
+title = "Deduplicate replication store transaction read APIs"
+body = "ReplicationStoreReadTransaction and ReplicationStoreTransaction currently duplicate read method declarations, including the member-security storage reads added by flotsync-sec.3. After this security-storage slice settles, extract a shared read surface or otherwise collapse the duplicated API so read methods are declared once."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-05-16T13:23:57Z"
+updated_at = "2026-05-29T14:42:15Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-55c56c4c3217"
+label = "discovered from"

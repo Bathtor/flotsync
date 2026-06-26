@@ -1,0 +1,42 @@
+id = "019f0542-b0cc-70a2-9d97-5578ad0e4480"
+ref = "flotsync-sec.8"
+title = "Add end-to-end validation for secure replication envelopes"
+body = """
+Add end-to-end and focused integration validation for the flotsync_security MVP after the crate, config, store, bootstrap, group traffic, reliable ack, and example slices exist. The tests should prove that secure create-group bootstrap, secure group update delivery, secure summary/catch-up paths where applicable, and recipient ack verification work together through the runtime.
+
+## Design
+
+S8R agreed implementation plan, restructure first.
+
+S8R-01 Add a narrow public test-support surface behind the test-support feature rather than exposing broad runtime internals. The wrapper should let integration tests start runtimes with schemas and deterministic security, access the ReplicationApi, publish direct peer routes, inspect/wait for group membership, capture listener data-change events, and temporarily install groups for catch-up setup. Mark the temporary install helper as pending flotsync-sec.9.
+
+S8R-02 Move security-oriented runtime end-to-end tests into flotsync_replication/tests/secure_runtime.rs: create-group bootstrap membership, secure publish delivery, update-gap NeedRange/UpdateBatch catch-up, and observed-summary catch-up.
+
+S8R-03 Move public runtime security-loading tests into flotsync_replication/tests/security_loading.rs if the extraction stays clean. If this would require exposing inappropriate internals, leave that split for a follow-up and keep flotsync-sec.8 focused on secure runtime flows.
+
+S8R-04 Keep delivery boundary tamper and recipient-ack spoofing tests local to delivery/group_broadcast and delivery/reliable_delivery. They use focused wire injection and component state and should not drive public test-support API shape.
+
+S8R-05 After the restructure passes, add the missing end-to-end trust mismatch test in secure_runtime.rs: Bob has a trusted Alice record under Alice's identity but with wrong public key material; Alice creates a group; Bob must not install it. Use eventually/never helpers, not sleeps.
+
+S8R-06 While moving tests, enforce socket-broker compliance: integration tests that start UDP runtime hosts reserve sockets up front and pass explicit runtime config.
+
+S8R-07 Validate with cargo fmt --all, focused moved integration tests with -- --test-threads=1, focused delivery tests if test-support changes affect them, cargo check -p flotsync_replication --features test-support, cargo clippy -p flotsync_replication --features test-support -- -W clippy::pedantic, and git diff --check.
+
+## Acceptance Criteria
+
+Integration tests cover secure create-group bootstrap between peers, secure group update delivery, signature rejection, ciphertext rejection, public header authenticated-data rejection, trust mismatch rejection, and spoofed recipient ack rejection. Existing tests use deterministic flotsync_security test-support keys rather than placeholder plaintext signatures."""
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+blocks = [
+    "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
+    "019f0542-b0cc-70a2-9d97-559d30e93724",
+    "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
+    "019f0542-b0cc-70a2-9d97-55b3320f74ae",
+]
+parent = "019f0542-b0cc-70a2-9d97-56846371720d"
+created_at = "2026-05-14T16:33:10Z"
+updated_at = "2026-05-23T11:28:30Z"
+closed_at = "2026-05-23T11:28:30Z"

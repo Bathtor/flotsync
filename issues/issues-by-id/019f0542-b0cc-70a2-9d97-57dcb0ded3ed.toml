@@ -1,0 +1,12 @@
+id = "019f0542-b0cc-70a2-9d97-57dcb0ded3ed"
+ref = "flotsync-26x"
+title = "Migrate protobuf runtime/codegen from protobuf v3 to buffa"
+body = "The current protobuf crate in use is end-of-life, so migrate now while the codebase is still pre-production. Key points from the assessment: the .proto schemas themselves look compatible, but the handwritten transport layer is tightly coupled to rust-protobuf v3 APIs (MessageField, EnumOrUnknown, set_* oneof helpers, parse_from_bytes/write_to_bytes, generated ::new()). The migration surface is concentrated in flotsync_messages plus a small discovery follow-up. The current build uses pure Rust protobuf_codegen::Codegen::pure(); buffa instead requires either buffa-build with protoc, buffa-build with .use_buf(), or external buf generate, so CI/dev tooling must be updated accordingly. First implementation spike should confirm generated module paths for package-less protos, preserve current public module names if needed, and start with a narrow config (no JSON, no views, no use_bytes_type) before evaluating follow-up optimizations."
+status = "closed"
+status_reason = "Completed"
+type = "task"
+priority = 1
+assignee = "Lars Kroll"
+created_at = "2026-03-26T16:03:41Z"
+updated_at = "2026-05-30T13:27:21Z"
+closed_at = "2026-04-06T09:27:41Z"
