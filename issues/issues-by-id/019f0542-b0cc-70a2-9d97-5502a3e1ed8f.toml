@@ -8,14 +8,22 @@ Update replicated-checklist configuration, docs, and acceptance coverage so the 
 
 Testing follow-up from flotsync-brt: if peer-announcement service tests are touched again while validating the custom UDP discovery slice, extract a small component/probe fixture to avoid repeating the current Kompact setup boilerplate across route-update and announcement tests.
 Non-device-dependent prep completed: primary replicated-checklist docs now show custom UDP discovery without static-peer-routes, static route hints are split into an optional fallback scenario, and replicated_checklist config parser coverage uses a no-static runtime config. Manual multi-device/broadcast validation is still pending before this task should close or the PR should merge."""
-status = "in-progress"
+status = "closed"
+status_reason = "manual no-static custom UDP replicated-checklist validation completed"
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocks = [
+blocked_by = [
     "019f0542-b0cc-70a2-9d97-55119c3e2a9a",
     "019f0542-b0cc-70a2-9d97-5a8613eee6d6",
 ]
 parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
 created_at = "2026-05-25T07:41:56Z"
-updated_at = "2026-06-14T18:00:26Z"
+updated_at = "2026-06-26T19:15:13.204683Z"
+closed_at = "2026-06-26T19:06:00.376104Z"
+
+[[comments]]
+id = "019f0553-1b38-7b32-8b7d-03b6983b27f0"
+author = "lkroll"
+body = "manual no-static custom UDP replicated-checklist validation completed"
+created_at = "2026-06-26T19:06:00.376104Z"

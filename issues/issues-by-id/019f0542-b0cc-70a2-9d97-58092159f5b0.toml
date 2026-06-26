@@ -7,13 +7,13 @@ status_reason = "Documented delivery transport mapping"
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-58251a1cdb89"]
 blocks = [
     "019f0542-b0cc-70a2-9d97-57e34d2366f5",
     "019f0542-b0cc-70a2-9d97-5813984a48f2",
+    "019f0542-b0cc-70a2-9d97-58251a1cdb89",
 ]
 created_at = "2026-03-26T05:14:10Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.624911Z"
 closed_at = "2026-03-27T16:46:20Z"
 
 [[links]]

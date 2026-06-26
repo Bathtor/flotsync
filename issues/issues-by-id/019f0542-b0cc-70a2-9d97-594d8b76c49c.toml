@@ -34,11 +34,11 @@ status_reason = "Specified custom UDP discovery protocol and authentication rule
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-5a2acee950ec"]
-blocks = ["019f0542-b0cc-70a2-9d97-5a8613eee6d6"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-5a8613eee6d6"]
+blocks = ["019f0542-b0cc-70a2-9d97-5a2acee950ec"]
 parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
 created_at = "2026-03-10T08:33:00Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.11513Z"
 closed_at = "2026-05-26T09:27:12Z"
 
 [[links]]

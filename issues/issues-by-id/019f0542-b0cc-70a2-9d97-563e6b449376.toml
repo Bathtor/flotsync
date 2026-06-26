@@ -69,9 +69,11 @@ status_reason = "Completed"
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-565b91d60d3f"]
-blocks = ["019f0542-b0cc-70a2-9d97-564d67d95318"]
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-564d67d95318",
+    "019f0542-b0cc-70a2-9d97-565b91d60d3f",
+]
 parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
 created_at = "2026-04-27T10:38:22Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.500678Z"
 closed_at = "2026-04-28T17:06:25Z"

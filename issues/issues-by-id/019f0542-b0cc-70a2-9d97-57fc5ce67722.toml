@@ -7,13 +7,13 @@ status_reason = "Reviewed and completed via commit 128556f (delivery domain cont
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-58251a1cdb89"]
 blocks = [
     "019f0542-b0cc-70a2-9d97-57e34d2366f5",
     "019f0542-b0cc-70a2-9d97-5813984a48f2",
+    "019f0542-b0cc-70a2-9d97-58251a1cdb89",
 ]
 created_at = "2026-03-26T05:15:42Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.607152Z"
 closed_at = "2026-03-27T07:14:46Z"
 
 [[links]]

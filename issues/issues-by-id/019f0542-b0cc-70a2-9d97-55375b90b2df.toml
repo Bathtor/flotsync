@@ -7,7 +7,8 @@ Tracking slice for making custom, non-mDNS peer discovery usable by the replicat
 ## Notes
 
 Agreed custom-only sequence: S01 fix flotsync-54m7 CLI shutdown handle ownership; S02 complete flotsync-31m PeerDiscovery+Tracking protocol/auth rules for the custom path; S03 complete flotsync-brt Kompact interface/path for custom announcements; S04 complete flotsync-0mi socket reuse configuration where needed for custom UDP discovery; S05 complete flotsync-gxle custom UDP peer tracker route source; S06 complete flotsync-ol4e runtime wiring so custom-discovered routes and static hints are composed; S07 complete flotsync-5hvw replicated-checklist validation without static-peer-routes. mDNS tasks flotsync-dnt and flotsync-2ss are intentionally out of scope for this slice."""
-status = "open"
+status = "closed"
+status_reason = "custom UDP discovery slice completed"
 type = "epic"
 priority = 1
 children = [
@@ -20,4 +21,11 @@ children = [
     "019f0542-b0cc-70a2-9d97-5a8613eee6d6",
 ]
 created_at = "2026-05-25T07:41:09Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:06:04.261842Z"
+closed_at = "2026-06-26T19:06:04.261842Z"
+
+[[comments]]
+id = "019f0553-2a65-7a62-909a-5e83776f37ff"
+author = "lkroll"
+body = "custom UDP discovery slice completed"
+created_at = "2026-06-26T19:06:04.261842Z"

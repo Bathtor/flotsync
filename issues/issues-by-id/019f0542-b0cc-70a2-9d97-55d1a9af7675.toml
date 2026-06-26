@@ -11,14 +11,14 @@ status = "closed"
 status_reason = "Abandoned: live typed replication security configuration is superseded by store-provisioned security state and a later replicated-checklist setup task."
 type = "task"
 priority = 1
-blocked_by = [
+blocked_by = ["019f0542-b0cc-70a2-9d97-55ee94817ff5"]
+blocks = [
     "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
     "019f0542-b0cc-70a2-9d97-559d30e93724",
     "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
     "019f0542-b0cc-70a2-9d97-55b3320f74ae",
 ]
-blocks = ["019f0542-b0cc-70a2-9d97-55ee94817ff5"]
 parent = "019f0542-b0cc-70a2-9d97-56846371720d"
 created_at = "2026-05-14T16:31:57Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:16:49.153932Z"
 closed_at = "2026-05-16T09:52:25Z"

@@ -10,6 +10,6 @@ Discovery or a defined adjacent trust path can advertise member public keys or r
 status = "open"
 type = "task"
 priority = 2
-blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-56846371720d"]
 created_at = "2026-05-14T16:33:46Z"
-updated_at = "2026-05-29T14:42:10Z"
+updated_at = "2026-06-26T19:15:13.223887Z"

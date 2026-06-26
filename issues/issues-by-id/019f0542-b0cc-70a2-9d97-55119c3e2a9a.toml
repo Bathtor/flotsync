@@ -6,14 +6,13 @@ status = "closed"
 status_reason = "Completed by manual route watches and runtime route-establishment wiring; stale watch GC remains tracked separately as flotsync-sfun"
 type = "task"
 priority = 1
-blocked_by = ["019f0542-b0cc-70a2-9d97-5502a3e1ed8f"]
-blocks = ["019f0542-b0cc-70a2-9d97-552a810998c3"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-552a810998c3"]
+blocks = ["019f0542-b0cc-70a2-9d97-5502a3e1ed8f"]
 parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
 children = [
     "019f0542-b0cc-70a2-9d97-54eb0d46f3c3",
     "019f0542-b0cc-70a2-9d97-54fbb2fa0c9f",
-    "019f0542-b0cc-70a2-9d97-5f007759be72",
 ]
 created_at = "2026-05-25T07:41:50Z"
-updated_at = "2026-06-14T17:53:11Z"
+updated_at = "2026-06-26T19:15:13.204683Z"
 closed_at = "2026-06-14T17:53:11Z"

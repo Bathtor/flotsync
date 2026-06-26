@@ -12,7 +12,7 @@ status_reason = "Completed flotsync_security crate scaffold and core crypto API;
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = [
+blocks = [
     "019f0542-b0cc-70a2-9d97-5583ac0c71fa",
     "019f0542-b0cc-70a2-9d97-559d30e93724",
     "019f0542-b0cc-70a2-9d97-55ad62e7e2ac",
@@ -22,5 +22,5 @@ blocked_by = [
 ]
 parent = "019f0542-b0cc-70a2-9d97-56846371720d"
 created_at = "2026-05-14T16:31:44Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:16:49.153932Z"
 closed_at = "2026-05-16T09:24:34Z"

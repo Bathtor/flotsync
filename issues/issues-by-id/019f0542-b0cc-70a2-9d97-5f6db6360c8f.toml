@@ -10,6 +10,6 @@ There is a concrete design for relay or TCP session encryption, including handsh
 status = "open"
 type = "task"
 priority = 3
-blocks = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-56846371720d"]
 created_at = "2026-05-14T16:34:08Z"
-updated_at = "2026-05-29T14:42:16Z"
+updated_at = "2026-06-26T19:15:13.280363Z"

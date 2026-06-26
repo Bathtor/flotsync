@@ -24,12 +24,12 @@ status_reason = "Implemented custom UDP peer tracker route source and addressed 
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-55119c3e2a9a"]
-blocks = [
+blocked_by = [
     "019f0542-b0cc-70a2-9d97-5a0dc487e926",
     "019f0542-b0cc-70a2-9d97-5a2acee950ec",
 ]
+blocks = ["019f0542-b0cc-70a2-9d97-55119c3e2a9a"]
 parent = "019f0542-b0cc-70a2-9d97-55375b90b2df"
 created_at = "2026-05-25T07:41:42Z"
-updated_at = "2026-06-04T07:08:14Z"
+updated_at = "2026-06-26T19:15:13.187309Z"
 closed_at = "2026-06-04T07:08:14Z"

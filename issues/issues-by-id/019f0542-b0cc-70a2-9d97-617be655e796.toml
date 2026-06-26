@@ -12,7 +12,7 @@ status_reason = "Closed"
 type = "task"
 priority = 3
 labels = ["area:messages-protobuf"]
-blocks = ["019f0542-b0cc-70a2-9d97-5e348324ef83"]
+blocked_by = ["019f0542-b0cc-70a2-9d97-5e348324ef83"]
 parent = "019f0542-b0cc-70a2-9d97-5e9d983d9d0b"
 children = [
     "019f0542-b0cc-70a2-9d97-5dec86bf40c8",
@@ -20,5 +20,5 @@ children = [
     "019f0542-b0cc-70a2-9d97-5e0fe032be29",
 ]
 created_at = "2026-03-03T07:09:28Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.697766Z"
 closed_at = "2026-03-03T15:56:59Z"

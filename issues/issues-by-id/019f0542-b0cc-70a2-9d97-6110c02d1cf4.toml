@@ -11,9 +11,9 @@ status = "open"
 type = "task"
 priority = 3
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-5ffcb8256bf7"]
+blocks = ["019f0542-b0cc-70a2-9d97-5ffcb8256bf7"]
 created_at = "2026-03-10T08:33:03Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.643335Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5d70821f565d"

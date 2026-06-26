@@ -109,13 +109,13 @@ status_reason = "Completed via merged PR #3"
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocks = [
-    "019f0542-b0cc-70a2-9d97-57e34d2366f5",
+blocked_by = [
     "019f0542-b0cc-70a2-9d97-57fc5ce67722",
     "019f0542-b0cc-70a2-9d97-58092159f5b0",
 ]
+blocks = ["019f0542-b0cc-70a2-9d97-57e34d2366f5"]
 created_at = "2026-03-26T05:14:10Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.624911Z"
 closed_at = "2026-04-17T15:36:40Z"
 
 [[links]]

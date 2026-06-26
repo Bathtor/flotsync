@@ -30,16 +30,18 @@ status_reason = "Replicated checklist binary is ready for manual testing"
 type = "task"
 priority = 1
 assignee = "Lars Kroll"
-blocked_by = ["019f0542-b0cc-70a2-9d97-5624ac2017ef"]
-blocks = [
-    "019f0542-b0cc-70a2-9d97-565b91d60d3f",
+blocked_by = [
     "019f0542-b0cc-70a2-9d97-5672673b4f73",
     "019f0542-b0cc-70a2-9d97-56c814c369e5",
     "019f0542-b0cc-70a2-9d97-573c9c8d0da7",
     "019f0542-b0cc-70a2-9d97-574b0c8e2774",
     "019f0542-b0cc-70a2-9d97-59575b315dd2",
 ]
+blocks = [
+    "019f0542-b0cc-70a2-9d97-5624ac2017ef",
+    "019f0542-b0cc-70a2-9d97-565b91d60d3f",
+]
 parent = "019f0542-b0cc-70a2-9d97-56a65a25f8f0"
 created_at = "2026-04-27T10:38:01Z"
-updated_at = "2026-05-30T13:27:21Z"
+updated_at = "2026-06-26T19:15:13.589731Z"
 closed_at = "2026-04-29T09:39:11Z"
