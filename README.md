@@ -1,80 +1,122 @@
-# FlotSync
+# Flotsync
 
-FlotSync is a Rust workspace for decentralized peer-to-peer group synchronization.
-It currently contains reusable crates for version tracking, discovery, wire messages, and replicated data types.
+Flotsync is an experimental Rust workspace for local-first, peer-to-peer group
+replication. It contains building blocks for replicated data models, group
+membership, authenticated and encrypted replication messages, direct UDP route
+establishment, multipart datagram transport, and a small application-facing
+replication runtime.
 
-## Current Status (as of 2026-03-05)
+The repository is under active development. APIs, protocols, storage layouts,
+and crate boundaries may change while the system is still being assembled. This
+README is intentionally a stable orientation document rather than a detailed
+status page; use `gitrack` for current work and detailed task state.
 
-| Area | Status | Notes |
-| --- | --- | --- |
-| Core versioning and identifiers | Implemented | `flotsync_core` provides version vectors, group membership identifiers, and ordering logic. |
-| Datamodel wire transport | Implemented (operations/snapshots) | `flotsync_messages` supports proto codecs for schema operations and snapshots via generated `buffa` bindings. |
-| Schema definition transport | Planned | Schema definitions are still agreed out-of-band and need first-class transport support. |
-| In-memory schema datamodel | In progress | Local table operations exist; inbound operation application remains to be added. |
-| Discovery stack | In progress | Core components exist, with remaining open work on browser/public handling and non-mDNS active mode. |
-| Persistence abstraction | Planned | Storage interface for schema operations and snapshots is still pending. |
+## Project Status
 
-## Issue Tracking
+Flotsync is not yet a finished library or application. The current repository is
+best treated as a development workspace with design documents, implementation
+slices, tests, and manual scenarios that evolve together.
 
-This repository uses `bd` (beads) as the source of truth for tasks and dependencies.
+In particular:
 
-- Check ready work: `bd ready --json`
-- Inspect an issue: `bd show <issue-id> --json`
-- Create new work: `bd create "Title" --description "..." -t task|feature|bug --json`
+- public APIs are still allowed to change;
+- protocol documents describe current design intent, not a compatibility
+  promise;
+- examples are development and acceptance tools, not polished end-user apps;
+- open work, priorities, dependencies, and near-term plans live in `gitrack`.
 
 ## Workspace Layout
 
-- `flotsync_core/`: Version vectors, group membership identifiers, and happened-before logic.
-- `flotsync_messages/`: Generated protobuf message bindings.
-- `messages/proto/`: Source `.proto` definitions organised by package and version.
-- `flotsync_discovery/`: Discovery services (mDNS, peer announcements, and route establishment building blocks).
-- `flotsync_discovery_cli/`: CLI entrypoint for discovery components.
-- `flotsync_data_types/`: Replicated data structures (text and latest-value-wins register).
-- `flotsync_utils/`: Shared utility helpers/macros used by other crates.
+### Core Model
+
+- `flotsync_core/`: common identifiers, version vectors, group ids, member ids,
+  and ordering primitives.
+- `flotsync_data_types/`: replicated data structures and schema-aware mutation
+  support used by the replication runtime and wire formats.
+
+### Wire Formats and Security
+
+- `flotsync_messages/`: generated protobuf bindings and wire conversion helpers.
+- `messages/proto/`: source `.proto` definitions organised by package and
+  version.
+- `flotsync_security/`: cryptographic building blocks for authenticated and
+  encrypted replication frames, member identity keys, group keys, and bootstrap
+  material.
+
+### Transport, Routes, and Discovery
+
+- `flotsync_io/`: low-level freeform network I/O and Kompact-facing socket
+  integration.
+- `flotsync_udpour/`: multipart datagram protocol for carrying one logical
+  payload over UDP when it exceeds the single-datagram budget.
+- `flotsync_routes/`: route-transport contracts, route establishment, endpoint
+  selection, and route transport management.
+- `flotsync_discovery/`: peer announcement and discovery services.
+- `flotsync_discovery_cli/`: command-line entry point for discovery components.
+
+### Runtime, Examples, and Support
+
+- `flotsync_replication/`: application-facing replication API and internal
+  replication runtime.
+- `flotsync_io_examples/`: small examples and manual acceptance tools, including
+  `replicated_checklist`.
+- `flotsync_utils/`: shared utility helpers and test support.
+
+## Design Documentation
+
+Design documentation lives under `docs/`. The generated index is the best entry
+point:
+
+```text
+docs/index.md
+```
+
+Useful starting points include:
+
+- `docs/communication_protocol_spec.md` for the high-level replication protocol
+  model.
+- `docs/flotsync_security_mvp.md` for the initial security model.
+- `docs/route_establishment.md` for verified direct UDP route discovery.
+- `docs/datagram_multipart_transfer.md` for UDPour.
+- `docs/group_broadcast_queue_model.md` for GroupBroadcast queue semantics.
+- `docs/flotsync_io_examples.md` and
+  `docs/replicated_checklist_scenarios.md` for example workflows.
+
+The documentation index is generated. Update the source documents and regenerate
+or check the index through `scripts/okf-docs.sc`; do not edit `docs/index.md`
+directly.
+
+## Issue Tracking
+
+This repository uses [`gitrack`](https://github.com/Bathtor/gitrack) for
+Git-native issue tracking. Issue state is stored in tracked files under
+`issues/`.
+
+Common commands:
+
+```bash
+gitrack ready --json
+gitrack list --json
+gitrack show <ref> --json
+```
+
+The README does not maintain a separate roadmap. Current priorities,
+dependencies, follow-ups, and implementation detail belong in `gitrack`.
 
 ## Build and Test
 
 ### Toolchain
 
-This workspace currently uses nightly-only features in source code (for example `#![feature(...)]` in
-`flotsync_core/src/lib.rs` and `flotsync_data_types/src/lib.rs`), so a nightly Rust toolchain is currently expected.
-The Linux formatting and clippy checks are pinned to `nightly-2026-04-11` so CI matches local
-development for those tools, while the test workflows continue to follow floating `nightly`.
+The workspace currently uses nightly Rust features, so a nightly Rust toolchain
+is expected. CI is the canonical source for the exact check set. Some local
+checks also require:
 
-### Commands
+- `buf` for protobuf formatting and linting;
+- Ammonite (`amm`) for OKF-style design documentation checks.
 
-Run the full workspace tests:
-
-```bash
-cargo test --workspace
-```
-
-Check the OKF-style design documentation index and metadata:
+### Common Checks
 
 ```bash
-amm scripts/okf-docs.sc check
-```
-
-The OKF docs check requires Ammonite (`amm`). GitHub Actions installs it with
-Coursier before running the check.
-
-### Codex Web on Ubuntu
-
-If you want to reproduce the Linux CI environment from Codex web on Ubuntu, bootstrap the host with:
-
-```bash
-./scripts/setup-codex-web-ubuntu.sh
-```
-
-That setup pins the toolchain to `nightly-2026-04-11`, matching the local fmt/clippy toolchain on
-this repo, and it also runs `cargo fetch --locked` so the workspace dependencies are cached before
-the Codex web environment loses internet access.
-
-After the script finishes, install Ammonite if it is not already available, then
-run the same checks as `pr-linux`:
-
-```bash
-export CARGO_NET_GIT_FETCH_WITH_CLI=true
 buf format --diff --exit-code
 buf lint
 amm scripts/okf-docs.sc check
@@ -83,24 +125,36 @@ cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
 cargo test --workspace --locked
 ```
 
-## Roadmap
+For focused Rust work, run the relevant package tests first and broaden to the
+workspace checks before review.
 
-### Near-Term
+### Codex Web on Ubuntu
 
-1. Apply inbound schema operations to `InMemoryData` with thorough test coverage.
-2. Define a storage abstraction for persisting and retrieving schema operations/snapshots.
-3. Close outstanding discovery P1 gaps (non-mDNS active mode, mDNS public/network handling, browser module).
+The repository includes a bootstrap script for reproducing the Linux CI-style
+environment in Codex web on Ubuntu:
 
-### Medium-Term
+```bash
+./scripts/setup-codex-web-ubuntu.sh
+```
 
-1. Add transport serialization/deserialization for schema definitions.
-2. Design database-level APIs and replication group semantics.
-3. Tighten convergence/integration coverage for multi-replica, multi-schema scenarios.
+The script pins the local formatting and clippy toolchain and fetches locked
+Cargo dependencies while network access is available.
 
-## Repository Workflow
+## Examples
 
-This repository uses Jujutsu (`jj`) for history/workflow.
+The examples are intended to exercise the runtime and transport stack while the
+project is still evolving.
 
-## License
+The most complete manual example is `replicated_checklist`:
+
+```bash
+cargo run -p flotsync_io_examples --bin replicated_checklist -- --help
+```
+
+See `docs/flotsync_io_examples.md` and
+`docs/replicated_checklist_scenarios.md` for configuration notes and manual
+multi-peer scenarios.
+
+## Licence
 
 This project is licensed under the MIT License. See `LICENSE.txt` for details.
