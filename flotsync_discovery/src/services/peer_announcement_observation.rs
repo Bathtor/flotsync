@@ -5,7 +5,7 @@ use super::{
     PeerAnnouncementStartupError,
     peer_announcement_bind_options_from_config,
 };
-use crate::protocol::{DiscoveryRoute, decode_peer_bytes};
+use crate::protocol::{DecodedPeer, DiscoveryRoute};
 use flotsync_io::prelude::{
     IoPayload,
     SocketId,
@@ -15,6 +15,7 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
+use flotsync_messages::proto::DecodeProtoView;
 use flotsync_utils::{
     kompact_fsm::{State, StateHandled, StateUpdate},
     transform_state_match,
@@ -134,7 +135,7 @@ impl PeerAnnouncementObservationComponent {
     /// Decode one peer-announcement payload and publish it to the observation port.
     fn handle_peer_announcement_payload(&mut self, payload: &IoPayload) {
         let bytes = payload.to_vec();
-        let peer = match decode_peer_bytes(&bytes) {
+        let peer = match DecodedPeer::decode_proto_view_from_slice(&bytes) {
             Ok(peer) => peer,
             Err(error) => {
                 trace!(

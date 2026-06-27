@@ -45,9 +45,7 @@ use flotsync_messages::{
     buffa::Message as _,
     codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
     datamodel as datamodel_proto,
-    proto::{DecodeProto, DecodeProtoWith, EncodeProto},
-    replication as replication_proto,
-    versions as versions_proto,
+    proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
@@ -1461,7 +1459,7 @@ async fn append_replication_update(
     connection: &mut SqliteStoreConnection,
     update: &ReplicationUpdateRecord,
 ) -> Result<(), StoreError> {
-    let update_message = encode_stored_update(update);
+    let update_message = UpdateMessageProtoSource::from(update).encode_proto_to_vec();
     sqlx::query(
         "
 INSERT INTO dataset_updates (
@@ -1652,35 +1650,20 @@ fn decode_dataset_row_last_changed_versions(
 }
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
-    RuntimeVersionVectorProtoSource::from(version_vector)
-        .encode_proto()
-        .encode_to_bytes()
-        .to_vec()
+    RuntimeVersionVectorProtoSource::from(version_vector).encode_proto_to_vec()
 }
 
 fn decode_stored_version_vector(
     bytes: &[u8],
     member_count: NonZeroUsize,
 ) -> Result<VersionVector, StoreError> {
-    let version_vector =
-        versions_proto::VersionVector::decode_from_slice(bytes).map_err(|source| {
-            SqliteStoreError::DecodeStoredProto {
-                object: "version vector",
-                source,
-            }
-        })?;
-    let version_vector = WireVersionVector::decode_proto(version_vector)
-        .map_err(|source| invalid_stored_object("version vector", source))?;
+    let version_vector = decode_stored_proto(
+        "version vector",
+        WireVersionVector::try_decode_proto_from_slice(bytes),
+    )?;
     version_vector
         .to_runtime(member_count)
         .map_err(|source| invalid_stored_object("version vector", source))
-}
-
-fn encode_stored_update(update: &ReplicationUpdateRecord) -> Vec<u8> {
-    UpdateMessageProtoSource::from(update)
-        .encode_proto()
-        .encode_to_bytes()
-        .to_vec()
 }
 
 fn decode_stored_update_row(
@@ -1691,15 +1674,14 @@ fn decode_stored_update_row(
 ) -> Result<ReplicationUpdateRecord, StoreError> {
     let sender = decode_member_identity(&row.get::<String, _>("sender"))?;
     let applied_locally = row.get::<bool, _>("applied_locally");
-    let update_message =
-        replication_proto::Update::decode_from_slice(&row.get::<Vec<u8>, _>("update_message"))
-            .map_err(|source| SqliteStoreError::DecodeStoredProto {
-                object: "update",
-                source,
-            })?;
-    let message =
-        UpdateMessage::decode_proto_with(update_message, MemberCountContext::new(member_count))
-            .map_err(|source| invalid_stored_object("update", source))?;
+    let update_message = row.get::<Vec<u8>, _>("update_message");
+    let message = decode_stored_proto(
+        "update",
+        UpdateMessage::try_decode_proto_from_slice_with(
+            &update_message,
+            MemberCountContext::new(member_count),
+        ),
+    )?;
     ensure!(
         message.group_id == *expected_group_id,
         StoredUpdateGroupMismatchSnafu {
@@ -1835,6 +1817,24 @@ fn invalid_stored_object(
         source: Box::new(source),
     }
     .into()
+}
+
+fn decode_stored_proto<T, E>(
+    object: &'static str,
+    result: Result<T, ProtoInputDecodeError<E>>,
+) -> Result<T, StoreError>
+where
+    E: StdError + Send + Sync + 'static,
+{
+    match result {
+        Ok(value) => Ok(value),
+        Err(ProtoInputDecodeError::Decode { source }) => {
+            Err(SqliteStoreError::DecodeStoredProto { object, source }.into())
+        }
+        Err(ProtoInputDecodeError::Convert { source }) => {
+            Err(invalid_stored_object(object, source))
+        }
+    }
 }
 
 #[derive(Debug, Snafu)]

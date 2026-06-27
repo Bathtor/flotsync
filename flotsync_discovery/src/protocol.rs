@@ -2,7 +2,7 @@
 
 use flotsync_core::GroupId;
 use flotsync_messages::{
-    buffa::{DecodeError, EnumValue, MessageField, MessageView as _},
+    buffa::{DecodeError, EnumValue, MessageField},
     discovery::{
         IPAddress,
         IPAddressView,
@@ -214,15 +214,10 @@ pub enum DiscoveryProtocolError {
     DuplicateClaimGroup { group_id: GroupId },
 }
 
-/// Decode and validate one plaintext peer announcement from bytes.
-///
-/// # Errors
-///
-/// Returns [`DiscoveryProtocolError`] if the bytes are not a valid `Peer` or if any required
-/// protocol field is malformed.
-pub fn decode_peer_bytes(bytes: &[u8]) -> Result<DecodedPeer, DiscoveryProtocolError> {
-    let peer = PeerView::decode_view(bytes).context(discovery_protocol_error::DecodeSnafu)?;
-    DecodedPeer::decode_proto_view(&peer)
+impl proto::FromProtoDecodeError for DiscoveryProtocolError {
+    fn from_proto_decode_error(source: DecodeError) -> Self {
+        Self::Decode { source }
+    }
 }
 
 fn udp_socket_address_proto(address: SocketAddr) -> SocketAddress {
@@ -350,7 +345,7 @@ fn ip_address_from_wire_view(
 mod tests {
     use super::*;
     use flotsync_messages::{
-        buffa::Message as _,
+        buffa::{Message as _, MessageView as _},
         proto::{DecodeProtoView, EncodeProto},
         wire::uuid_to_wire_bytes,
     };

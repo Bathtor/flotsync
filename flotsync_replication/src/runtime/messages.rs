@@ -15,7 +15,7 @@ use flotsync_core::{
     versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector, VersionVectorGap},
 };
 use flotsync_messages::{
-    buffa::{MessageField, MessageView as _},
+    buffa::MessageField,
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
     datamodel as datamodel_proto,
     proto::{self, DecodeProto, DecodeProtoView, DecodeProtoViewWith, EncodeProto},
@@ -168,6 +168,12 @@ pub(crate) enum WireVersionVectorError {
         "Version-vector field '{field}' used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
     ))]
     VersionBoundTooLarge { field: &'static str, version: u64 },
+}
+
+impl proto::FromProtoDecodeError for RuntimeMessageError {
+    fn from_proto_decode_error(source: flotsync_messages::buffa::DecodeError) -> Self {
+        Self::Decode { source }
+    }
 }
 
 /// Hosted-group member count needed by compact runtime protobuf decoders.
@@ -1290,14 +1296,6 @@ impl DecodeProtoViewWith<MemberCountContext> for UpdateBatchMessage {
     }
 }
 
-impl WireRuntimeMessage {
-    pub(crate) fn decode_from_slice(payload: &[u8]) -> Result<Self, RuntimeMessageError> {
-        let message =
-            replication_proto::RuntimeMessageView::decode_view(payload).context(DecodeSnafu)?;
-        Self::decode_proto_view(&message)
-    }
-}
-
 impl DecodeProto for WireRuntimeMessage {
     type Error = RuntimeMessageError;
     type Proto = replication_proto::RuntimeMessage;
@@ -2036,7 +2034,7 @@ mod tests {
         let request_payload = summary_request.encode_proto().encode_to_bytes();
 
         assert_eq!(
-            WireRuntimeMessage::decode_from_slice(&request_payload)
+            WireRuntimeMessage::decode_proto_view_from_slice(&request_payload)
                 .expect("summary request should decode"),
             WireRuntimeMessage::SummaryRequest(SummaryRequestMessage {
                 group_id,
@@ -2051,8 +2049,8 @@ mod tests {
             has_versions.clone(),
         ));
         let summary_payload = summary.encode_proto().encode_to_bytes();
-        let decoded_summary =
-            WireRuntimeMessage::decode_from_slice(&summary_payload).expect("summary should decode");
+        let decoded_summary = WireRuntimeMessage::decode_proto_view_from_slice(&summary_payload)
+            .expect("summary should decode");
 
         let WireRuntimeMessage::Summary(decoded_summary) = decoded_summary else {
             panic!("summary payload should decode as a summary");
@@ -2091,6 +2089,31 @@ mod tests {
             update
         );
         let update_payload = update.encode_proto().encode_to_bytes();
+        assert_eq!(
+            UpdateMessage::decode_proto_from_slice_with(
+                &update_payload,
+                MemberCountContext::new(member_count),
+            )
+            .expect("update slice should decode with member count"),
+            update
+        );
+        let mut update_payload_buf = update_payload.clone();
+        assert_eq!(
+            UpdateMessage::decode_proto_from_buf_with(
+                &mut update_payload_buf,
+                MemberCountContext::new(member_count),
+            )
+            .expect("update buffer should decode with member count"),
+            update
+        );
+        assert_eq!(
+            UpdateMessage::decode_proto_view_from_slice_with(
+                &update_payload,
+                MemberCountContext::new(member_count),
+            )
+            .expect("update view slice should decode with member count"),
+            update
+        );
         let update_view = replication_proto::UpdateView::decode_view(&update_payload)
             .expect("view should decode");
         assert_eq!(
@@ -2110,6 +2133,31 @@ mod tests {
             batch
         );
         let batch_payload = batch.encode_proto().encode_to_bytes();
+        assert_eq!(
+            UpdateBatchMessage::decode_proto_from_slice_with(
+                &batch_payload,
+                MemberCountContext::new(member_count),
+            )
+            .expect("batch slice should decode with member count"),
+            batch
+        );
+        let mut batch_payload_buf = batch_payload.clone();
+        assert_eq!(
+            UpdateBatchMessage::decode_proto_from_buf_with(
+                &mut batch_payload_buf,
+                MemberCountContext::new(member_count),
+            )
+            .expect("batch buffer should decode with member count"),
+            batch
+        );
+        assert_eq!(
+            UpdateBatchMessage::decode_proto_view_from_slice_with(
+                &batch_payload,
+                MemberCountContext::new(member_count),
+            )
+            .expect("batch view slice should decode with member count"),
+            batch
+        );
         let batch_view = replication_proto::UpdateBatchView::decode_view(&batch_payload)
             .expect("view should decode");
         assert_eq!(
@@ -2267,7 +2315,8 @@ mod tests {
 
         let payload = proto.encode_to_bytes();
         assert_eq!(
-            WireRuntimeMessage::decode_from_slice(&payload).expect("bootstrap should decode"),
+            WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+                .expect("bootstrap should decode"),
             WireRuntimeMessage::BootstrapGroup(bootstrap)
         );
     }
@@ -2297,7 +2346,7 @@ mod tests {
         }
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("duplicate bootstrap key member entries should be rejected");
         assert!(matches!(
             error,
@@ -2349,7 +2398,7 @@ mod tests {
         .encode_proto()
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("reserved max range bound should be rejected");
         assert!(matches!(
             error,
@@ -2375,7 +2424,7 @@ mod tests {
         .encode_proto()
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("reserved update id version should be rejected");
         assert!(matches!(
             error,
@@ -2400,7 +2449,7 @@ mod tests {
         .encode_proto()
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("reserved read version should be rejected");
         assert!(matches!(
             error,
@@ -2429,7 +2478,7 @@ mod tests {
         .encode_proto()
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("reserved summary version should be rejected");
         assert!(matches!(
             error,
@@ -2462,7 +2511,7 @@ mod tests {
         .encode_proto()
         .encode_to_bytes();
 
-        let error = WireRuntimeMessage::decode_from_slice(&payload)
+        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
             .expect_err("mismatched batch group should be rejected");
         assert!(matches!(
             error,

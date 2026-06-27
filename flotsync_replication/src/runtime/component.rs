@@ -7,7 +7,6 @@ use super::{
         ObservedAvailable,
         subtract_available_ranges,
     },
-    envelope::encode_runtime_payload,
     errors::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
@@ -131,6 +130,7 @@ use flotsync_core::{
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::OwnedRow;
+use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
 use flotsync_utils::{BoxFuture, KClaimablePromise, ResultExt as _};
 use futures_util::FutureExt;
@@ -1008,7 +1008,7 @@ impl ReplicationRuntimeComponent {
         recipient: MemberIdentity,
         message: &RuntimeMessage,
     ) {
-        let payload = encode_runtime_payload(message);
+        let payload = message.encode_proto_to_bytes();
         self.reliable_delivery
             .trigger(ReliableDeliveryPortRequest::Submit(
                 ReliableDeliverySubmit {
@@ -1322,7 +1322,7 @@ impl ReplicationRuntimeComponent {
                 .map(Into::into)
                 .collect(),
         });
-        let payload = encode_runtime_payload(&message);
+        let payload = message.encode_proto_to_bytes();
         Ok(PreparedLocalPublish {
             group_id,
             update_id,
@@ -1354,7 +1354,7 @@ impl ReplicationRuntimeComponent {
                 self.group_broadcast.trigger(
                     GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
                         .for_member_in_group(self.local_member.clone(), message.group_id)
-                        .with_payload(encode_runtime_payload(summary)),
+                        .with_payload(summary.encode_proto_to_bytes()),
                 );
             }
         }
@@ -1442,12 +1442,13 @@ impl ReplicationRuntimeComponent {
         deliver: ReliableDeliveryDeliver,
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::reliable(&deliver.envelope.header);
-        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
-            .context(inbound::DecodeMessageSnafu)
-        {
-            Ok(message) => message,
-            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-        };
+        let message =
+            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
+                .context(inbound::DecodeMessageSnafu)
+            {
+                Ok(message) => message,
+                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+            };
         match message {
             WireRuntimeMessage::BootstrapGroup(message) => {
                 Ok(self.handle_bootstrap_group_delivery(context, deliver, message))
@@ -1489,12 +1490,13 @@ impl ReplicationRuntimeComponent {
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::group(&deliver.envelope.header);
         let sender = deliver.envelope.header.sender.clone();
-        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
-            .context(inbound::DecodeMessageSnafu)
-        {
-            Ok(message) => message,
-            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-        };
+        let message =
+            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
+                .context(inbound::DecodeMessageSnafu)
+            {
+                Ok(message) => message,
+                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+            };
         match message {
             WireRuntimeMessage::BootstrapGroup(_) => Err(InboundDeliveryFailure::new(
                 context,

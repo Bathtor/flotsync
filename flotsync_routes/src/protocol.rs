@@ -106,20 +106,6 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
     }
 }
 
-/// Decode and validate one signed claim payload from its exact transmitted bytes.
-///
-/// # Errors
-///
-/// Returns [`DiscoveryProtocolError`] if the bytes are not a valid claim payload or if any
-/// required protocol field is malformed.
-pub fn decode_introduction_claim_payload(
-    bytes: &[u8],
-) -> Result<DecodedIntroductionClaimPayload, DiscoveryProtocolError> {
-    let payload = IntroductionClaimPayloadView::decode_view(bytes)
-        .context(discovery_protocol_error::DecodeSnafu)?;
-    DecodedIntroductionClaimPayload::decode_proto_view(&payload)
-}
-
 /// Decode and validate the group ids in one signed claim payload.
 ///
 /// # Errors
@@ -292,8 +278,8 @@ mod tests {
         };
 
         let payload_bytes = payload.encode_to_vec();
-        let decoded =
-            decode_introduction_claim_payload(&payload_bytes).expect("valid claim should decode");
+        let decoded = DecodedIntroductionClaimPayload::decode_proto_view_from_slice(&payload_bytes)
+            .expect("valid claim should decode");
         let payload_view = IntroductionClaimPayloadView::decode_view(&payload_bytes)
             .expect("claim payload view should decode");
 
@@ -324,7 +310,8 @@ mod tests {
             ..IntroductionClaimPayload::default()
         };
 
-        let result = decode_introduction_claim_payload(&payload.encode_to_vec());
+        let result =
+            DecodedIntroductionClaimPayload::decode_proto_view_from_slice(&payload.encode_to_vec());
 
         assert!(matches!(
             result,
