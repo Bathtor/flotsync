@@ -2075,10 +2075,6 @@ mod tests {
             },
             VersionVector::Full(PureVersionVector::from([1, 2])),
         );
-        let batch = UpdateBatchMessage {
-            group_id,
-            updates: vec![update.clone()],
-        };
 
         assert_eq!(
             UpdateMessage::decode_proto_with(
@@ -2124,6 +2120,25 @@ mod tests {
             .expect("update view should decode with member count"),
             update
         );
+    }
+
+    #[test]
+    fn update_batches_decode_with_member_count_context_from_owned_and_view() {
+        let group_id = GroupId(Uuid::from_u128(211));
+        let member_count = NonZeroUsize::new(2).expect("two members");
+        let update = test_update_message(
+            group_id,
+            UpdateId {
+                version: 3,
+                node_index: 1,
+            },
+            VersionVector::Full(PureVersionVector::from([1, 2])),
+        );
+        let batch = UpdateBatchMessage {
+            group_id,
+            updates: vec![update],
+        };
+
         assert_eq!(
             UpdateBatchMessage::decode_proto_with(
                 batch.encode_proto(),
