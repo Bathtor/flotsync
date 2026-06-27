@@ -1,6 +1,5 @@
 mod catch_up_manager;
 mod component;
-mod envelope;
 mod errors;
 pub mod handle;
 pub(crate) mod host;

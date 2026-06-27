@@ -6,15 +6,37 @@ Runtime message encoding/decoding currently uses ad hoc to_proto/from_proto help
 
 Context A: the cleanup should reduce duplicated conversion code without hiding ownership costs. Keep the conversion surface explicit enough that callers can see when data is borrowed, cloned, encoded into owned protobuf buffers, or decoded into runtime-owned structures.
 
-Direction B: consider a trait-based shape if it stays lightweight, but do not force every message through a single abstraction if separate encode/decode traits or narrow helper functions better match the existing runtime message model. The resulting API should make common conversions hard to misuse and should avoid broad blanket impls that obscure allocation behaviour.
+Direction B: establish a new mechanism, not a one-time cleanup pass. The conversion API should force future runtime protobuf conversions into consistent shapes while still allowing separate mechanisms for owned proto conversion, generated borrowed view decode, and borrowed source encode adapters.
 
-Reminder C: think carefully about efficient usage of ViewEncode. If a runtime message can be encoded from borrowed data or an existing read view, prefer plumbing that through the API instead of eagerly constructing intermediate owned values.
+Reminder C: local buffa 0.3 generated views are decode-side views: generated View types implement buffa::MessageView with decode_view and to_owned_message. I found no generated ViewEncode trait in the installed buffa sources, so encode-side borrowed support should be modelled through explicit typed source adapters rather than assumed generated view encoding.
 
-Reminder D: treat the read views as first-class helpers in the API design. Where read views can provide the fields needed by protobuf encoding, use them to avoid unnecessary allocations and copies, especially in hot paths involving Update, Summary, and related wire forms.
+Agreed split D: implementation is split into three child tasks.
 
-Acceptance E: the change should leave the conversion call sites clearer than the current ad hoc helpers, include focused tests for representative encode/decode paths, and document any cases where cloning or allocation remains intentionally required."""
-status = "open"
+Child D1: flotsync-6s0-m1 introduces the baseline owned proto conversion trait family: EncodeProto, DecodeProto, DecodeProtoWith<Context>, plus MemberCountContext for contextual decode.
+
+Child D2: flotsync-6s0-m2 adds generated borrowed proto view decode traits on top of M1. It is blocked by flotsync-6s0-m1.
+
+Child D3: flotsync-6s0-m3 adds explicit borrowed proto source encode adapters on top of M1. It is blocked by flotsync-6s0-m1 and is independent of M2.
+
+Acceptance E: the child tasks should leave conversion call sites clearer than the current ad hoc helpers, include focused tests for representative encode/decode paths, document any cases where cloning or allocation remains intentionally required, and avoid broad blanket impls that obscure allocation behaviour."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
+children = [
+    "019f0593-9f5d-7120-a8d8-0709d3fbfac3",
+    "019f0593-d303-7692-b7d3-f7694772d7fe",
+    "019f0593-fba3-7113-b045-357200b86eaf",
+    "019f0787-3033-71c0-abb4-6d022ed646a5",
+    "019f0887-814f-7802-bcf1-5d4fd4e626e0",
+]
 created_at = "2026-05-03T14:52:20Z"
-updated_at = "2026-06-02T10:55:47Z"
+updated_at = "2026-06-27T12:34:47.272466Z"
+closed_at = "2026-06-27T12:34:47.272466Z"
+
+[[comments]]
+id = "019f0913-4b68-7082-ac98-1f51efe58829"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T12:34:47.272466Z"

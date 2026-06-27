@@ -1,0 +1,41 @@
+id = "019f0593-d303-7692-b7d3-f7694772d7fe"
+ref = "flotsync-6s0-m2"
+title = "Add runtime borrowed proto view decode traits"
+body = """
+Add the runtime protobuf borrowed-view decode mechanism on top of the owned conversion traits from flotsync-6s0-m1.
+
+Scope A: define DecodeProtoView and DecodeProtoViewWith<Context> in flotsync_messages::proto using GAT-associated protobuf view types, e.g. type ProtoView<'a>: buffa::MessageView<'a>. Keep view decode separate from owned DecodeProto so borrowed input lifetimes remain visible without forcing lifetime parameters onto every impl.
+
+Scope B: implement view decode across all crates that currently use generated borrowed protobuf views in this slice: flotsync_replication runtime messages, flotsync_discovery route views, and flotsync_routes introduction/endpoint decode paths where a direct view trait replacement exists.
+
+Scope C: implement replication view decode for all relevant runtime messages and helpers, including WireRuntimeMessage, BootstrapGroupMessage, BootstrapMemberPublicKeysEntry, WireUpdateMessage, SummaryRequestMessage, WireSummaryMessage, NeedRangeMessage, UpdateRangeMessage, WireUpdateBatchMessage, DatasetUpdateMessage, and WireVersionVector. Contextual runtime decodes for UpdateMessage, SummaryMessage, and UpdateBatchMessage should use DecodeProtoViewWith<MemberCountContext> via the wire message view decode.
+
+Scope D: remove duplicate ad hoc view conversion helpers where they overlap with the new mechanism. In particular, do not keep separate public helpers for route view decoding or claim-payload view decoding if the trait-based API can be used directly. Keep endpoint envelope builders and other non-conversion helpers out of this slice.
+
+Scope E: DatasetUpdateMessage should decode from DatasetUpdateView without constructing an owned replication DatasetUpdate, but nested SchemaOperationView values may be converted to owned SchemaOperation values for now because the runtime/store path currently needs owned operations. Follow-up flotsync-git-02c tracks evaluating whether direct SchemaOperationView decoding would have enough payoff to justify its own work.
+
+Scope F: update hot-path decode call sites to use generated RuntimeMessageView, UpdateView, SummaryView, NeedRangeView, UpdateBatchView, VersionVectorView, SocketAddressView, and IntroductionClaimPayloadView directly instead of calling to_owned_message unless ownership is intentionally required.
+
+Scope G: add equivalence tests showing owned proto decode and view proto decode produce the same runtime wire values for representative bootstrap, update, summary, need-range, update-batch, route, and introduction-claim payloads. Add malformed/missing-field coverage where it is not already covered by the existing tests.
+
+Estimate H: trait definitions ~40-70 LOC, replication view implementations ~300-500 LOC, discovery/routes view implementation and call-site cleanup ~80-180 LOC, tests ~150-260 LOC. The expected total is around 600-1000 LOC. If direct datamodel SchemaOperationView decoding is pulled in, this likely exceeds 1000 LOC and should remain separate.
+
+Acceptance I: borrowed-view decode has a consistent trait shape, call sites make view usage explicit, duplicate ad hoc view helpers are removed where avoidable, unavoidable nested ownership conversion is documented, and focused tests cover owned/view equivalence and important malformed inputs.
+
+Out of scope J: borrowed-source encode adapters from flotsync-6s0-m3 and direct datamodel SchemaOperationView decoding beyond the explicit DatasetUpdateMessage boundary."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "codex"
+blocked_by = ["019f0593-9f5d-7120-a8d8-0709d3fbfac3"]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-26T20:16:41.731744Z"
+updated_at = "2026-06-27T10:03:35.848621Z"
+closed_at = "2026-06-27T10:03:35.848621Z"
+
+[[comments]]
+id = "019f0888-e028-7920-a5ca-00663e197d54"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T10:03:35.848621Z"

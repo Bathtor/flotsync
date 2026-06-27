@@ -65,6 +65,7 @@
 
 - Any test that binds TCP or UDP sockets must declare its full socket requirement up front via `flotsync_io::test_support::reserve_sockets(...)` or a harness built on top of that broker. Do not bind ad hoc sockets or rely on unmanaged ephemeral ports in parallel tests.
 - Prefer the `option_when` macro over `<cond>.then_some(...)`.
+- For protobuf conversion code, prefer the established `flotsync_messages::proto` traits (`EncodeProto`, `DecodeProto`, contextual decode traits, borrowed view decode traits, and borrowed source adapters) over ad hoc `to_proto`/`from_proto` helpers; call out necessary deviations explicitly for approval.
 
 <!-- BEGIN GITRACK MANAGED INSTRUCTIONS -->
 

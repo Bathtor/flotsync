@@ -1,0 +1,44 @@
+id = "019f0787-3033-71c0-abb4-6d022ed646a5"
+ref = "flotsync-6s0.4"
+title = "Final Sweep for encoding/decoding functions"
+body = """
+After all conversion slices, do a final cleanup sweep over remaining protobuf encoding and decoding sites. Scope excludes flotsync_data_types as agreed.
+
+Survey S1: searched production Rust files outside flotsync_data_types for generated protobuf decode APIs (`decode_from_slice`, `decode_view`, `decode`) and encode APIs (`encode_to_bytes`, `encode_to_vec`, `encode_proto`). Also checked `to_owned_message`, `IoPayload::to_vec`, and current unified helper usage.
+
+Finding F1: `flotsync_discovery/src/services/peer_announcement_observation.rs` still copies an `IoPayload` into a `Vec` only to call `DecodedPeer::decode_proto_view_from_slice`. `IoPayloadCursor` implements `Buf`, and `DecodedPeer` implements owned `DecodeProto`, so this can become `let mut cursor = payload.cursor(); DecodedPeer::decode_proto_from_buf(&mut cursor)`. Estimate: 4-8 LOC. Recommendation: implement; it removes an allocation and exercises the M4 Buf helper at a real ingress boundary.
+
+Finding F2: `flotsync_discovery/src/services/peer_announcement.rs` builds a generated `Peer` and encodes it with `encode_to_vec`. This is one local outbound construction site, with `PeerAnnouncementRoute` already using `EncodeProto` for routes. A fuller domain/source wrapper would be possible, but likely adds more shape than it removes. Estimate if pursued: 20-40 LOC. Recommendation: leave as-is unless we want a named outbound peer-announcement source type.
+
+Finding F3: `flotsync_replication/src/store/sqlite.rs` still encodes and decodes dataset row snapshots through generated `RowSnapshot` bytes. This is coupled to the datamodel/schema codecs and to the flotsync_data_types-dependent row-snapshot shape. Estimate if pulled into proto traits now: 60-140 LOC plus tests. Recommendation: leave for the separate datamodel/schema-codec evaluation path rather than folding into this final sweep.
+
+Finding F4: `flotsync_routes/src/protocol.rs` and `flotsync_replication/src/delivery/wire.rs` still decode endpoint frames directly. These are deliberate endpoint-boundary helpers: route discovery returns owned generated discovery frames, delivery does shallow classification before full decode, and the Buf variant must support non-contiguous input. Recommendation: no change in this slice.
+
+Finding F5: delivery public-header/AAD/signature helpers still encode generated header projections directly. This is intentional because the bytes authenticate a canonical projection, not a general runtime proto conversion. Recommendation: no change.
+
+Finding F6: tests and benches still contain many direct `encode_proto().encode_to_bytes()` and generated `decode_from_slice` calls. Most are asserting generated wire compatibility or constructing malformed protobuf payloads. Recommendation: no broad test churn; only touch tests when required by production cleanup.
+
+Proposed plan P1: implement only F1 now, run `cargo fmt --all`, `cargo check -p flotsync_discovery`, `cargo test -p flotsync_discovery peer_announcement -- --test-threads=1`, and `cargo clippy -p flotsync_discovery -- -W clippy::pedantic`.
+
+Proposed plan P2: leave F2-F6 unchanged, record the rationale in this issue, and close after validation if P1 is accepted.
+
+Estimate P3: implementation likely under 20 LOC total. No risk of exceeding 1000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 3
+assignee = "codex"
+blocked_by = [
+    "019f0593-fba3-7113-b045-357200b86eaf",
+    "019f0887-814f-7802-bcf1-5d4fd4e626e0",
+]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-27T05:22:08.051795Z"
+updated_at = "2026-06-27T12:34:39.563996Z"
+closed_at = "2026-06-27T12:34:39.563996Z"
+
+[[comments]]
+id = "019f0913-2d4c-7462-b11c-1bd19c09d367"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T12:34:39.563996Z"

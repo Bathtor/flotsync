@@ -38,6 +38,11 @@ use crate::{
 };
 use bytes::Bytes;
 use flotsync_core::member::Identifier;
+use flotsync_messages::{
+    buffa::{Message as _, MessageView as _},
+    discovery::DiscoverySignatureView,
+    proto::{DecodeProtoView, EncodeProto},
+};
 use jose_jwk::{JwkSet, Operations};
 use std::{
     collections::BTreeSet,
@@ -196,6 +201,17 @@ fn signature_verification_fails_when_public_header_changes() {
     .unwrap_err();
 
     assert!(matches!(err, SecurityError::VerifySignature { .. }));
+}
+
+#[test]
+fn frame_signature_decodes_from_proto_view() {
+    let (_alice, signature) = signed_frame_fixture();
+    let payload = signature.encode_proto().encode_to_bytes();
+    let view = DiscoverySignatureView::decode_view(&payload).expect("signature view should decode");
+
+    let decoded = FrameSignature::decode_proto_view(&view).expect("signature view should convert");
+
+    assert_eq!(decoded, signature);
 }
 
 #[test]

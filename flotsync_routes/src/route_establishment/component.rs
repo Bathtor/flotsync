@@ -42,6 +42,7 @@ use flotsync_io::prelude::{IoPayload, SocketId};
 use flotsync_messages::{
     buffa::{Message as _, MessageField},
     discovery as discovery_proto,
+    proto::EncodeProto,
     serialisation::FlotsyncSerializable,
     wire::{
         group_id_to_wire_bytes,
@@ -71,7 +72,7 @@ use super::{
         WatchedRoute,
         WatchedRouteState,
     },
-    wire::{discovery_signature_to_wire, prepare_claim_for_verification},
+    wire::prepare_claim_for_verification,
 };
 
 /// Actor messages accepted by [`RouteEstablishmentComponent`].
@@ -631,7 +632,7 @@ impl RouteEstablishmentComponent {
         let member_id = member_identity_to_wire_format(&self.local_member);
         let mut claims = Vec::with_capacity(self.claim_routes.len());
         for route in self.claim_routes.iter() {
-            let route = DiscoveryRoute::Udp(*route).to_wire_format();
+            let route = DiscoveryRoute::Udp(*route).encode_proto();
             let claim_payload = discovery_proto::IntroductionClaimPayload {
                 instance_uuid: instance_uuid.clone(),
                 request_nonce: request_nonce.clone(),
@@ -656,7 +657,7 @@ impl RouteEstablishmentComponent {
             claims.push(discovery_proto::SignedIntroductionClaim {
                 member_id: MessageField::some(member_id.clone()),
                 claim_payload,
-                signature: MessageField::some(discovery_signature_to_wire(&signature)),
+                signature: MessageField::some(signature.encode_proto()),
                 ..discovery_proto::SignedIntroductionClaim::default()
             });
         }

@@ -12,7 +12,7 @@ mod wire;
 pub use component::{RouteEstablishmentComponent, RouteEstablishmentMessage};
 pub use config::{ConcreteRoutes, RouteEstablishmentConfig, RouteEstablishmentConfigError};
 pub use state::{ManualRouteWatchError, WatchedRoute};
-pub use wire::{RouteEstablishmentError, frame_signature_from_wire};
+pub use wire::RouteEstablishmentError;
 
 /// Future returned by asynchronous discovery credential verification.
 pub type DiscoveryCredentialFuture<'a> = BoxFuture<'a, Result<(), BoxError>>;

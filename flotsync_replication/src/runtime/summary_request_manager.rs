@@ -1,5 +1,4 @@
 use super::{
-    envelope::encode_runtime_payload,
     errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary},
     messages::{RuntimeMessage, SummaryRequestMessage, WireRuntimeMessage, WireSummaryMessage},
 };
@@ -21,6 +20,7 @@ use crate::{
     },
 };
 use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
+use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;
@@ -156,7 +156,7 @@ impl SummaryRequestManagerComponent {
         recipient: MemberIdentity,
         message: &RuntimeMessage,
     ) {
-        let payload = encode_runtime_payload(message);
+        let payload = message.encode_proto_to_bytes();
         self.reliable_delivery
             .trigger(ReliableDeliveryPortRequest::Submit(
                 ReliableDeliverySubmit {
@@ -295,16 +295,17 @@ impl SummaryRequestManagerComponent {
 
     fn handle_reliable_delivery(&mut self, deliver: ReliableDeliveryDeliver) -> HandlerResult {
         let context = SummaryInboundContext::reliable(&deliver.envelope.header);
-        let message = match WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
-            .context(inbound::DecodeMessageSnafu)
-        {
-            Ok(message) => message,
-            Err(error) => {
-                let failure = SummaryInboundFailure::new(context, error);
-                let action = self.record_inbound_failure(&failure);
-                return handled_after_inbound_failure(action, &failure);
-            }
-        };
+        let message =
+            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
+                .context(inbound::DecodeMessageSnafu)
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    let failure = SummaryInboundFailure::new(context, error);
+                    let action = self.record_inbound_failure(&failure);
+                    return handled_after_inbound_failure(action, &failure);
+                }
+            };
         match message {
             WireRuntimeMessage::Summary(message) => {
                 let sender = deliver.envelope.header.sender.clone();

@@ -1,0 +1,45 @@
+id = "019f0593-fba3-7113-b045-357200b86eaf"
+ref = "flotsync-6s0-m3"
+title = "Add runtime borrowed proto source encode adapters"
+body = """
+Add runtime borrowed proto source encode adapters on top of the owned conversion traits from flotsync-6s0-m1.
+
+Agreed scope M3-1: keep this slice encode-only. flotsync-6s0-m4 owns byte/buffer decode conveniences, and flotsync-git-02c owns the SchemaOperation view-decoding evaluation.
+
+Agreed scope M3-2: do not add another encode trait. Borrowed-source adapters implement the existing EncodeProto trait, with the adapter type carrying the source and borrow policy.
+
+Agreed scope M3-3: keep adapters in flotsync_replication/src/runtime/messages.rs near the runtime message encode impls. These are runtime/store-specific helpers, not generic flotsync_messages traits.
+
+Implementation M3-4: add RuntimeVersionVectorProtoSource to encode &VersionVector directly and avoid cloning a full vector before the generated protobuf allocation.
+
+Implementation M3-5: add DatasetUpdateProtoSource and UpdateMessageProtoSource so stored update encoding can encode borrowed ReplicationUpdateRecord values without constructing an owned UpdateMessage first.
+
+Implementation M3-6: add SummaryMessageProtoSource and UpdateBatchMessageProtoSource as named adapter shapes that mirror the candidate runtime messages, but do not broaden delivery helper APIs in this slice.
+
+Implementation M3-7: update selected material call sites only. The expected production call-site change is store/sqlite.rs encode_stored_update. RuntimeMessage delivery remains the owned-message path unless the existing impl can delegate internally without changing the public shape.
+
+Tests M3-8: add equivalence coverage comparing adapter output with existing owned-message encode output for update, summary, and update batch. Existing store round-trip tests should continue to cover the stored-update path.
+
+Validation M3-9: run cargo fmt --all, focused flotsync_replication checks/tests, and pedantic clippy for flotsync_replication.
+
+Estimate M3-10: roughly 355-610 LOC, staying well below 1000 LOC as long as RuntimeMessage envelope APIs are left out of this slice."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "codex"
+blocked_by = ["019f0593-9f5d-7120-a8d8-0709d3fbfac3"]
+blocks = [
+    "019f0787-3033-71c0-abb4-6d022ed646a5",
+    "019f0887-814f-7802-bcf1-5d4fd4e626e0",
+]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-26T20:16:52.131197Z"
+updated_at = "2026-06-27T10:29:30.374736Z"
+closed_at = "2026-06-27T10:29:30.374736Z"
+
+[[comments]]
+id = "019f08a0-9886-7111-9ae3-9f3b3d90704c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T10:29:30.374736Z"

@@ -1,13 +1,10 @@
-use super::{
-    envelope::encode_runtime_payload,
-    messages::{
-        NeedRangeMessage,
-        RuntimeMessage,
-        UpdateBatchMessage,
-        UpdateMessage,
-        UpdateRangeMessage,
-        WireRuntimeMessage,
-    },
+use super::messages::{
+    NeedRangeMessage,
+    RuntimeMessage,
+    UpdateBatchMessage,
+    UpdateMessage,
+    UpdateRangeMessage,
+    WireRuntimeMessage,
 };
 use crate::{
     api::{ReplicationStore, ReplicationUpdateFilter, StoreError},
@@ -24,6 +21,7 @@ use flotsync_core::{
     membership::SharedGroupMemberships,
     versions::UpdateId,
 };
+use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_utils::{OptionExt as _, ResultExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
@@ -363,7 +361,7 @@ impl CatchUpManagerComponent {
         self.group_broadcast.trigger(
             GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
                 .for_member_in_group(self.local_member.clone(), group_id)
-                .with_payload(encode_runtime_payload(&message)),
+                .with_payload(message.encode_proto_to_bytes()),
         );
     }
 
@@ -525,13 +523,14 @@ impl CatchUpManagerComponent {
     }
 
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
-        let message = WireRuntimeMessage::decode_from_slice(&deliver.envelope.payload.bytes)
-            .with_whatever_benign(|_| {
-                format!(
-                    "dropping inbound catch-up candidate from {} after decode error",
-                    deliver.envelope.header.sender
-                )
-            })?;
+        let message =
+            WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
+                .with_whatever_benign(|_| {
+                    format!(
+                        "dropping inbound catch-up candidate from {} after decode error",
+                        deliver.envelope.header.sender
+                    )
+                })?;
         match message {
             WireRuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)
@@ -654,7 +653,7 @@ impl CatchUpManagerComponent {
                 self.group_broadcast.trigger(
                     GroupBroadcastPortRequest::build_submit(DeliveryClass::BestEffort)
                         .for_member_in_group(self.local_member.clone(), group_id)
-                        .with_payload(encode_runtime_payload(&message)),
+                        .with_payload(message.encode_proto_to_bytes()),
                 );
             }
             Err(error) => {
