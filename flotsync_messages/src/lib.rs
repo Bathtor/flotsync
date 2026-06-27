@@ -5,6 +5,7 @@ pub use buffa;
 pub use uuid::Uuid;
 
 pub mod codecs;
+pub mod proto;
 pub mod serialisation;
 pub mod snapshots;
 pub mod wire;

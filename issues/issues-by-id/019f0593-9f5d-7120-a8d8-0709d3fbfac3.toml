@@ -2,26 +2,43 @@ id = "019f0593-9f5d-7120-a8d8-0709d3fbfac3"
 ref = "flotsync-6s0-m1"
 title = "Introduce runtime owned proto conversion traits"
 body = """
-Introduce the baseline runtime protobuf conversion mechanism for owned generated protobuf messages.
+Introduce the baseline protobuf conversion mechanism for owned generated protobuf messages across the crates that directly own runtime/domain types used by proto payloads.
 
-Scope A: define a small trait family for owned runtime conversions: EncodeProto, DecodeProto, and DecodeProtoWith<Context>. Keep context-free decode and contextual decode as distinct traits so required runtime context cannot disappear behind optional arguments.
+Scope A: define a small trait family for owned protobuf conversions in a new flotsync_messages::proto module: EncodeProto, DecodeProto, DecodeProtoWith<Context>, ProtoCodec, and ProtoCodecWith<Context>. Keep context-free decode and contextual decode as distinct traits so required runtime context cannot disappear behind optional arguments. ProtoCodec provides EncodeProto + DecodeProto from one bidirectional impl using to_proto/from_proto hooks, so public encode_proto/decode_proto call sites do not clash with codec implementation methods. ProtoCodecWith<Context> provides DecodeProtoWith<Context> from a from_proto_with hook while using the existing EncodeProto side, because Rust cannot provide a coherent blanket EncodeProto impl for every arbitrary context.
 
-Scope B: add MemberCountContext for conversions that need hosted-group member count, especially UpdateMessage, SummaryMessage, UpdateBatch-related paths, and VersionVector decode.
+Scope B: add MemberCountContext in flotsync_replication/src/runtime/messages.rs for conversions that need hosted-group member count, especially UpdateMessage, SummaryMessage, UpdateBatch-related paths, and VersionVector decode. Keep it simple on the first pass: it should wrap only NonZeroUsize and should not carry field labels.
 
-Scope C: convert the existing runtime message and helper conversions in flotsync_replication/src/runtime/messages.rs from ad hoc to_proto/from_proto/encode_* helpers into trait implementations. This should cover RuntimeMessage, WireRuntimeMessage, BootstrapGroupMessage, BootstrapMemberPublicKeysMessage, UpdateMessage, WireUpdateMessage, SummaryRequestMessage, SummaryMessage, WireSummaryMessage, NeedRangeMessage, UpdateRangeMessage, UpdateBatchMessage, WireUpdateBatchMessage, DatasetUpdateMessage, WireVersionVector, and VersionVector.
+Scope C: convert the existing owned runtime message conversions in flotsync_replication/src/runtime/messages.rs from ad hoc to_proto/from_proto/encode_* helpers into trait implementations. This covers RuntimeMessage, WireRuntimeMessage, BootstrapGroupMessage, BootstrapMemberPublicKeysMessage, UpdateMessage, WireUpdateMessage, SummaryRequestMessage, SummaryMessage, WireSummaryMessage, NeedRangeMessage, UpdateRangeMessage, UpdateBatchMessage, WireUpdateBatchMessage, DatasetUpdateMessage, and WireVersionVector. Direct VersionVector impls remain blocked by orphan rules, so they go through the local WireVersionVector adapter.
 
-Scope D: update runtime/envelope.rs, store/sqlite.rs, and focused tests to use the new mechanism rather than ad hoc conversion helpers.
+Scope D: update runtime/envelope.rs, store/sqlite.rs, and focused tests to use the new mechanism directly. Remove old helper names immediately where the replacement is a direct owned trait implementation.
 
-Acceptance E: conversion call sites have a consistent trait shape, contextual decode is explicit in the type/API, representative runtime encode/decode round trips are tested, and any intentionally remaining clones/allocations are documented near the relevant implementations.
+Scope E: convert flotsync_discovery owned proto conversions into the same trait shape. This includes DiscoveryRoute <-> SocketAddress and DecodedPeer <- Peer. Keep borrowed/view route decode for M2.
 
-Out of scope F: generated borrowed view decode and borrowed source encode adapters. Those are tracked separately in flotsync-6s0-m2 and flotsync-6s0-m3."""
-status = "open"
+Scope F: convert flotsync_routes owned proto conversions into the same trait shape. This includes DecodedIntroductionClaimPayload <- IntroductionClaimPayload. Keep borrowed claim payload views and endpoint-frame source/envelope builders for M2/M3 rather than forcing artificial M1 wrappers.
+
+Scope G: add flotsync_security -> flotsync_messages as a dependency and implement FrameSignature <-> DiscoverySignature in flotsync_security, where FrameSignature is local and the orphan rules allow the impls.
+
+Estimate H: flotsync_messages traits ~100 LOC, replication adoption ~450-650 LOC, discovery/routes adoption ~120-220 LOC, security signature proto support ~60-100 LOC, tests/call-site updates ~80-180 LOC. The total is likely below 1000 LOC for M1; M2 and M3 remain separate to avoid crossing that threshold.
+
+Acceptance I: owned conversion call sites have a consistent trait shape, contextual decode is explicit in the type/API, representative runtime/discovery/routes encode/decode cases are tested, and any intentionally remaining clones/allocations are documented near the relevant implementations.
+
+Out of scope J: generated borrowed view decode and borrowed source encode adapters. Those are tracked separately in flotsync-6s0-m2 and flotsync-6s0-m3."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
 blocks = [
     "019f0593-d303-7692-b7d3-f7694772d7fe",
     "019f0593-fba3-7113-b045-357200b86eaf",
 ]
 parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
 created_at = "2026-06-26T20:16:28.509133Z"
-updated_at = "2026-06-26T20:17:18.088279Z"
+updated_at = "2026-06-27T08:05:47.064286Z"
+closed_at = "2026-06-27T08:05:47.064286Z"
+
+[[comments]]
+id = "019f081d-03b8-7cb1-85fe-9d5fa1db6dfc"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T08:05:47.064286Z"

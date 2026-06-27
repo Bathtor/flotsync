@@ -6,7 +6,6 @@ use crate::{
     config_keys,
     endpoint_selection::{EndpointSelection, EndpointSelectionPort},
     kompact::{config::Config, prelude::*},
-    protocol::udp_socket_address_to_wire_format,
 };
 use flotsync_io::prelude::{
     ConfigureFailureReason,
@@ -26,6 +25,7 @@ use flotsync_io::prelude::{
 use flotsync_messages::{
     buffa::Message,
     discovery::{Peer, SocketAddress},
+    proto::EncodeProto,
 };
 use itertools::Itertools;
 use pnet_datalink::{self as datalink, MacAddr, NetworkInterface};
@@ -211,11 +211,14 @@ pub enum PeerAnnouncementRoute {
     Udp(SocketAddr),
 }
 
-impl PeerAnnouncementRoute {
-    fn to_wire_format(self) -> SocketAddress {
-        match self {
-            Self::Udp(address) => udp_socket_address_to_wire_format(address),
-        }
+impl EncodeProto for PeerAnnouncementRoute {
+    type Proto = SocketAddress;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let route = match self {
+            Self::Udp(address) => crate::protocol::DiscoveryRoute::Udp(*address),
+        };
+        route.encode_proto()
     }
 }
 
@@ -486,7 +489,7 @@ impl PeerAnnouncementComponent {
                 .advertised_routes
                 .iter()
                 .copied()
-                .map(PeerAnnouncementRoute::to_wire_format)
+                .map(|route| route.encode_proto())
                 .collect(),
             ..Default::default()
         }

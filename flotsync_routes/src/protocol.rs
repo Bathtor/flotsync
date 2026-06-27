@@ -1,11 +1,7 @@
 //! Route-establishment introduction protocol helpers.
 
 use flotsync_core::GroupId;
-use flotsync_discovery::protocol::{
-    DiscoveryProtocolError,
-    discovery_protocol_error,
-    discovery_route_from_wire,
-};
+use flotsync_discovery::protocol::{DiscoveryProtocolError, discovery_protocol_error};
 use flotsync_messages::{
     buffa::{self, Message, MessageView},
     discovery::{
@@ -17,6 +13,7 @@ use flotsync_messages::{
         discovery_frame,
     },
     endpoint::{EndpointFrame, EndpointFrameView, endpoint_frame},
+    proto::DecodeProto,
     wire::{UUID_BYTE_LENGTH, fixed_bytes_field, group_id_from_wire_bytes},
 };
 use snafu::prelude::*;
@@ -38,6 +35,42 @@ pub struct DecodedIntroductionClaimPayload {
     pub group_ids: HashSet<GroupId>,
 }
 
+impl DecodeProto for DecodedIntroductionClaimPayload {
+    type Error = DiscoveryProtocolError;
+    type Proto = IntroductionClaimPayload;
+
+    fn decode_proto(mut payload: Self::Proto) -> Result<Self, Self::Error> {
+        let instance_id = uuid_from_wire(
+            &payload.instance_uuid,
+            "IntroductionClaimPayload.instance_uuid",
+        )?;
+        ensure!(
+            !payload.request_nonce.is_empty(),
+            discovery_protocol_error::EmptyBytesSnafu {
+                field: "IntroductionClaimPayload.request_nonce"
+            }
+        );
+        let route = payload
+            .route
+            .take()
+            .context(discovery_protocol_error::MissingFieldSnafu {
+                message: "IntroductionClaimPayload",
+                field: "route",
+            })?;
+        let route = DiscoveryRoute::decode_proto(route)?;
+        let group_ids = decode_claim_group_ids(
+            payload.group_ids.iter().map(Vec::as_slice),
+            payload.group_ids.len(),
+        )?;
+        Ok(Self {
+            instance_id,
+            request_nonce: payload.request_nonce,
+            route,
+            group_ids,
+        })
+    }
+}
+
 /// Decode and validate one signed claim payload from its exact transmitted bytes.
 ///
 /// # Errors
@@ -49,34 +82,7 @@ pub fn decode_introduction_claim_payload(
 ) -> Result<DecodedIntroductionClaimPayload, DiscoveryProtocolError> {
     let payload = IntroductionClaimPayload::decode_from_slice(bytes)
         .context(discovery_protocol_error::DecodeSnafu)?;
-    let instance_id = uuid_from_wire(
-        &payload.instance_uuid,
-        "IntroductionClaimPayload.instance_uuid",
-    )?;
-    ensure!(
-        !payload.request_nonce.is_empty(),
-        discovery_protocol_error::EmptyBytesSnafu {
-            field: "IntroductionClaimPayload.request_nonce"
-        }
-    );
-    let route = payload
-        .route
-        .as_option()
-        .context(discovery_protocol_error::MissingFieldSnafu {
-            message: "IntroductionClaimPayload",
-            field: "route",
-        })?;
-    let route = discovery_route_from_wire(route, "IntroductionClaimPayload.route")?;
-    let group_ids = decode_claim_group_ids(
-        payload.group_ids.iter().map(Vec::as_slice),
-        payload.group_ids.len(),
-    )?;
-    Ok(DecodedIntroductionClaimPayload {
-        instance_id,
-        request_nonce: payload.request_nonce,
-        route,
-        group_ids,
-    })
+    DecodedIntroductionClaimPayload::decode_proto(payload)
 }
 
 /// Decode one signed claim payload view from its exact transmitted bytes.
@@ -236,10 +242,10 @@ fn decode_claim_group_ids<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_discovery::protocol::udp_socket_address_to_wire_format;
     use flotsync_messages::{
         buffa::MessageField,
         discovery::socket_address,
+        proto::{DecodeProto, EncodeProto},
         wire::{group_id_to_wire_bytes, uuid_to_wire_bytes},
     };
     use std::net::SocketAddr;
@@ -252,7 +258,7 @@ mod tests {
         let payload = IntroductionClaimPayload {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
             request_nonce: vec![0x42; 16],
-            route: MessageField::some(route.to_wire_format()),
+            route: MessageField::some(route.encode_proto()),
             group_ids: vec![
                 group_id_to_wire_bytes(first_group),
                 group_id_to_wire_bytes(second_group),
@@ -279,7 +285,7 @@ mod tests {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
             request_nonce: vec![0x42; 16],
             route: MessageField::some(
-                DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).to_wire_format(),
+                DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).encode_proto(),
             ),
             group_ids: vec![group_id_to_wire_bytes(group), group_id_to_wire_bytes(group)],
             ..IntroductionClaimPayload::default()
@@ -337,10 +343,9 @@ mod tests {
 
     #[test]
     fn route_conversion_accepts_udp_routes_from_discovery_protocol() {
-        let route = udp_socket_address_to_wire_format(SocketAddr::from(([127, 0, 0, 1], 52156)));
+        let route = DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).encode_proto();
 
-        let decoded =
-            discovery_route_from_wire(&route, "test route").expect("UDP route should decode");
+        let decoded = DiscoveryRoute::decode_proto(route).expect("UDP route should decode");
 
         assert_eq!(
             decoded,
@@ -351,11 +356,11 @@ mod tests {
     #[test]
     fn route_conversion_rejects_tcp_routes_from_discovery_protocol() {
         let mut route =
-            udp_socket_address_to_wire_format(SocketAddr::from(([127, 0, 0, 1], 52156)));
+            DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).encode_proto();
         route.protocol =
             flotsync_messages::buffa::EnumValue::from(socket_address::Protocol::PROTOCOL_TCP);
 
-        let result = discovery_route_from_wire(&route, "test route");
+        let result = DiscoveryRoute::decode_proto(route);
 
         assert!(matches!(
             result,

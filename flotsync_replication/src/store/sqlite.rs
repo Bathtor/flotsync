@@ -28,11 +28,9 @@ use crate::{
     },
     runtime::messages::{
         DatasetUpdateMessage,
+        MemberCountContext,
         UpdateMessage,
-        decode_update_proto,
-        decode_version_vector_proto,
-        encode_update_proto,
-        encode_version_vector_proto,
+        WireVersionVector,
     },
 };
 use flotsync_core::{
@@ -46,6 +44,7 @@ use flotsync_messages::{
     buffa::Message as _,
     codecs::datamodel::{decode_row_snapshot, encode_row_snapshot},
     datamodel as datamodel_proto,
+    proto::{DecodeProto, DecodeProtoWith, EncodeProto},
     replication as replication_proto,
     versions as versions_proto,
 };
@@ -1652,7 +1651,8 @@ fn decode_dataset_row_last_changed_versions(
 }
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
-    encode_version_vector_proto(version_vector)
+    WireVersionVector::from_runtime(version_vector)
+        .encode_proto()
         .encode_to_bytes()
         .to_vec()
 }
@@ -1668,7 +1668,10 @@ fn decode_stored_version_vector(
                 source,
             }
         })?;
-    decode_version_vector_proto(version_vector, member_count)
+    let version_vector = WireVersionVector::decode_proto(version_vector)
+        .map_err(|source| invalid_stored_object("version vector", source))?;
+    version_vector
+        .to_runtime(member_count)
         .map_err(|source| invalid_stored_object("version vector", source))
 }
 
@@ -1686,7 +1689,7 @@ fn encode_stored_update(update: &ReplicationUpdateRecord) -> Vec<u8> {
             })
             .collect(),
     };
-    encode_update_proto(&message).encode_to_bytes().to_vec()
+    message.encode_proto().encode_to_bytes().to_vec()
 }
 
 fn decode_stored_update_row(
@@ -1703,8 +1706,9 @@ fn decode_stored_update_row(
                 object: "update",
                 source,
             })?;
-    let message = decode_update_proto(update_message, member_count)
-        .map_err(|source| invalid_stored_object("update", source))?;
+    let message =
+        UpdateMessage::decode_proto_with(update_message, MemberCountContext::new(member_count))
+            .map_err(|source| invalid_stored_object("update", source))?;
     ensure!(
         message.group_id == *expected_group_id,
         StoredUpdateGroupMismatchSnafu {

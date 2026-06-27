@@ -1593,6 +1593,7 @@ dependencies = [
  "dbus-secret-service-keyring-store",
  "ed25519-dalek",
  "flotsync_core",
+ "flotsync_messages",
  "flotsync_utils",
  "hpke",
  "jose-jwk",

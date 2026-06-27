@@ -51,6 +51,7 @@ pub use reliable_payload::{
 pub use sealed_psk_payload::SealedPSKPayload;
 pub use signature::{
     FrameSignature,
+    FrameSignatureProtoError,
     SIGNATURE_LENGTH,
     SignedFrameParts,
     sign_discovery_payload,

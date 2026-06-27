@@ -1,0 +1,11 @@
+id = "019f0787-3033-71c0-abb4-6d022ed646a5"
+ref = "flotsync-6s0.4"
+title = "Final Sweep for encoding/decoding functions"
+body = "After all the conversions are applied we should do a final cleanup sweep over the sprawl of proto encoding/decoding functions and helpers to see what can be cleaned up, simplified, or improved."
+status = "open"
+type = "task"
+priority = 3
+blocked_by = ["019f0593-fba3-7113-b045-357200b86eaf"]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-27T05:22:08.051795Z"
+updated_at = "2026-06-27T05:22:40.066419Z"

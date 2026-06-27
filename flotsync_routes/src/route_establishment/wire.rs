@@ -8,11 +8,11 @@ use flotsync_discovery::protocol::{
     discovery_route_from_wire_view,
 };
 use flotsync_messages::{
-    buffa::EnumValue,
     discovery::{self as discovery_proto, IntroductionClaimPayloadView},
+    proto::DecodeProto,
     wire::{WireValueDecodeError, member_identity_from_wire_format},
 };
-use flotsync_security::{FrameSignature, SIGNATURE_LENGTH};
+use flotsync_security::{FrameSignature, FrameSignatureProtoError};
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -34,12 +34,9 @@ pub enum RouteEstablishmentError {
     /// A decoded claim did not match the active route probe.
     #[snafu(display("claim payload field '{field}' did not match the active probe"))]
     ClaimMismatch { field: &'static str },
-    /// A discovery signature declared a scheme this runtime does not understand.
-    #[snafu(display("signature used unsupported scheme value {value}"))]
-    UnsupportedSignatureScheme { value: i32 },
-    /// A discovery signature did not have the Ed25519 signature byte length.
-    #[snafu(display("signature had {actual} byte(s), expected {SIGNATURE_LENGTH}"))]
-    InvalidSignatureLength { actual: usize },
+    /// A discovery signature wrapper could not be decoded into a frame signature.
+    #[snafu(display("discovery signature could not be decoded: {source}"))]
+    DecodeSignature { source: FrameSignatureProtoError },
 }
 
 /// Decode and validate one signed introduction claim before asynchronous signature verification.
@@ -51,7 +48,7 @@ pub enum RouteEstablishmentError {
 /// # Errors
 ///
 /// Returns [`RouteEstablishmentError`] when required fields are absent, values cannot be decoded,
-/// the payload does not match the active probe, or the discovery signature wrapper is unsupported.
+/// the payload does not match the active probe, or the discovery signature wrapper is malformed.
 pub fn prepare_claim_for_verification(
     expected_route: DiscoveryRoute,
     expected_instance_id: Uuid,
@@ -83,7 +80,8 @@ pub fn prepare_claim_for_verification(
         message: "SignedIntroductionClaim",
         field: "signature",
     })?;
-    let signature = frame_signature_from_wire(signature)?;
+    let signature =
+        FrameSignature::decode_proto(signature.clone()).context(DecodeSignatureSnafu)?;
     Ok(Some(super::state::PendingClaimVerification {
         member,
         claim,
@@ -128,46 +126,4 @@ pub fn validate_claim_payload(
         ClaimMismatchSnafu { field: "route" }
     );
     Ok(())
-}
-
-/// Convert an internal discovery signature into the protobuf wire shape.
-#[must_use]
-pub fn discovery_signature_to_wire(
-    signature: &FrameSignature,
-) -> discovery_proto::DiscoverySignature {
-    discovery_proto::DiscoverySignature {
-        scheme: EnumValue::from(discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH),
-        signature_bytes: signature.as_bytes().to_vec(),
-        ..discovery_proto::DiscoverySignature::default()
-    }
-}
-
-/// Decode the protobuf discovery signature wrapper into raw signature bytes.
-///
-/// # Errors
-///
-/// Returns [`RouteEstablishmentError`] when the signature scheme or byte width is unsupported.
-pub fn frame_signature_from_wire(
-    signature: &discovery_proto::DiscoverySignature,
-) -> Result<FrameSignature, RouteEstablishmentError> {
-    let scheme = signature.scheme.as_known().ok_or_else(|| {
-        RouteEstablishmentError::UnsupportedSignatureScheme {
-            value: signature.scheme.to_i32(),
-        }
-    })?;
-    ensure!(
-        scheme == discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH,
-        UnsupportedSignatureSchemeSnafu {
-            value: signature.scheme.to_i32()
-        }
-    );
-    let bytes: [u8; SIGNATURE_LENGTH] =
-        signature
-            .signature_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| RouteEstablishmentError::InvalidSignatureLength {
-                actual: signature.signature_bytes.len(),
-            })?;
-    Ok(FrameSignature::from_bytes(bytes))
 }

@@ -34,7 +34,7 @@ use flotsync_core::{
 };
 use flotsync_discovery::{
     endpoint_selection::EndpointSelection,
-    protocol::{DiscoveryRoute, discovery_route_from_wire},
+    protocol::DiscoveryRoute,
     services::PeerAnnouncementObserved,
 };
 use flotsync_io::{
@@ -56,6 +56,7 @@ use flotsync_io::{
 use flotsync_messages::{
     buffa::{Message as _, MessageField},
     discovery as discovery_proto,
+    proto::{DecodeProto, EncodeProto},
     serialisation::{FlotsyncSerializable, encode_message_payload},
     wire::{group_id_to_wire_bytes, member_identity_to_wire_format, uuid_to_wire_bytes},
 };
@@ -360,7 +361,7 @@ impl<'a> IntroductionSpec<'a> {
         let claim_payload = discovery_proto::IntroductionClaimPayload {
             instance_uuid: claim_instance_uuid,
             request_nonce: claim_nonce,
-            route: MessageField::some(DiscoveryRoute::Udp(claimed_route).to_wire_format()),
+            route: MessageField::some(DiscoveryRoute::Udp(claimed_route).encode_proto()),
             group_ids: group_ids.into_iter().map(group_id_to_wire_bytes).collect(),
             ..discovery_proto::IntroductionClaimPayload::default()
         };
@@ -372,7 +373,7 @@ impl<'a> IntroductionSpec<'a> {
             claims: vec![discovery_proto::SignedIntroductionClaim {
                 member_id: MessageField::some(member_identity_to_wire_format(member)),
                 claim_payload,
-                signature: MessageField::some(super::wire::discovery_signature_to_wire(&signature)),
+                signature: MessageField::some(signature.encode_proto()),
                 ..discovery_proto::SignedIntroductionClaim::default()
             }],
             ..discovery_proto::Introduction::default()
@@ -440,17 +441,16 @@ fn assert_introduction_claims_route(
     };
     assert_eq!(introduction.request_nonce, expected_nonce);
     assert_eq!(introduction.claims.len(), 1);
-    let claim_payload = discovery_proto::IntroductionClaimPayload::decode_from_slice(
+    let mut claim_payload = discovery_proto::IntroductionClaimPayload::decode_from_slice(
         &introduction.claims[0].claim_payload,
     )
     .expect("claim payload should decode");
     let route = claim_payload
         .route
-        .as_option()
+        .take()
         .expect("claim payload route should be present");
     assert_eq!(
-        discovery_route_from_wire(route, "IntroductionClaimPayload.route")
-            .expect("claim route should decode"),
+        DiscoveryRoute::decode_proto(route).expect("claim route should decode"),
         DiscoveryRoute::Udp(expected_route)
     );
 }

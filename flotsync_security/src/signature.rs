@@ -4,6 +4,11 @@ use crate::{
     util::hash_len_prefixed,
 };
 use ed25519_dalek::{Digest, Sha512, Signature};
+use flotsync_messages::{
+    buffa::EnumValue,
+    discovery::{self as discovery_proto, DiscoverySignature},
+    proto,
+};
 use snafu::prelude::*;
 
 /// Byte length of an Ed25519ph frame signature.
@@ -88,6 +93,17 @@ pub fn verify_discovery_payload_signature(
         .context(VerifySignatureSnafu)
 }
 
+/// Decode failures for the protobuf discovery-signature wrapper.
+#[derive(Debug, Snafu)]
+pub enum FrameSignatureProtoError {
+    /// The protobuf wrapper selected a signature scheme this runtime does not support.
+    #[snafu(display("signature used unsupported scheme value {value}"))]
+    UnsupportedSignatureScheme { value: i32 },
+    /// The protobuf wrapper carried the wrong number of Ed25519ph signature bytes.
+    #[snafu(display("signature had {actual} byte(s), expected {SIGNATURE_LENGTH}"))]
+    InvalidSignatureLength { actual: usize },
+}
+
 /// Replication frame components covered by a detached signature.
 #[derive(Clone, Copy, Debug)]
 pub struct SignedFrameParts<'a> {
@@ -116,6 +132,41 @@ impl FrameSignature {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; SIGNATURE_LENGTH] {
         &self.bytes
+    }
+}
+
+impl proto::ProtoCodec for FrameSignature {
+    type DecodeError = FrameSignatureProtoError;
+    type Proto = DiscoverySignature;
+
+    fn to_proto(&self) -> Self::Proto {
+        DiscoverySignature {
+            scheme: EnumValue::from(discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH),
+            signature_bytes: self.as_bytes().to_vec(),
+            ..DiscoverySignature::default()
+        }
+    }
+
+    fn from_proto(signature: Self::Proto) -> std::result::Result<Self, Self::DecodeError> {
+        let scheme = signature.scheme.as_known().ok_or_else(|| {
+            FrameSignatureProtoError::UnsupportedSignatureScheme {
+                value: signature.scheme.to_i32(),
+            }
+        })?;
+        ensure!(
+            scheme == discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH,
+            UnsupportedSignatureSchemeSnafu {
+                value: signature.scheme.to_i32()
+            }
+        );
+        let bytes: [u8; SIGNATURE_LENGTH] = signature
+            .signature_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrameSignatureProtoError::InvalidSignatureLength {
+                actual: signature.signature_bytes.len(),
+            })?;
+        Ok(Self::from_bytes(bytes))
     }
 }
 

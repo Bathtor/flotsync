@@ -18,6 +18,7 @@ use flotsync_messages::{
     buffa::{Message as _, MessageField},
     codecs::datamodel::{CodecError as DatamodelCodecError, decode_update_id, encode_update_id},
     datamodel as datamodel_proto,
+    proto::{self, DecodeProto, EncodeProto},
     replication as replication_proto,
     versions as versions_proto,
 };
@@ -166,6 +167,25 @@ pub(crate) enum WireVersionVectorError {
         "Version-vector field '{field}' used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
     ))]
     VersionBoundTooLarge { field: &'static str, version: u64 },
+}
+
+/// Hosted-group member count needed by compact runtime protobuf decoders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MemberCountContext {
+    /// Number of members in the hosted replication group.
+    member_count: NonZeroUsize,
+}
+
+impl MemberCountContext {
+    /// Create a new member-count decode context.
+    pub(crate) const fn new(member_count: NonZeroUsize) -> Self {
+        Self { member_count }
+    }
+
+    /// Return the hosted-group member count.
+    pub(crate) const fn member_count(self) -> NonZeroUsize {
+        self.member_count
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -371,8 +391,11 @@ pub(crate) struct DatasetUpdateMessage {
     pub(crate) operations: Vec<datamodel_proto::SchemaOperation>,
 }
 
-impl DatasetUpdateMessage {
-    fn to_proto(&self) -> replication_proto::DatasetUpdate {
+impl proto::ProtoCodec for DatasetUpdateMessage {
+    type DecodeError = RuntimeMessageError;
+    type Proto = replication_proto::DatasetUpdate;
+
+    fn to_proto(&self) -> Self::Proto {
         replication_proto::DatasetUpdate {
             dataset_id: self.dataset_id.as_str().to_owned(),
             operations: self.operations.clone(),
@@ -380,34 +403,36 @@ impl DatasetUpdateMessage {
         }
     }
 
-    fn decode_proto_vec(
-        dataset_updates: Vec<replication_proto::DatasetUpdate>,
-    ) -> Result<Vec<Self>, RuntimeMessageError> {
-        if dataset_updates.is_empty() {
-            return EmptyUpdateSnafu.fail();
-        }
-
-        let mut decoded_updates = Vec::with_capacity(dataset_updates.len());
-        for dataset_update in dataset_updates {
-            if dataset_update.operations.is_empty() {
-                return EmptyDatasetUpdateSnafu {
-                    dataset_id: dataset_update.dataset_id,
-                }
-                .fail();
+    fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
+        if message.operations.is_empty() {
+            return EmptyDatasetUpdateSnafu {
+                dataset_id: message.dataset_id,
             }
-
-            let dataset_id = DatasetId::try_new(dataset_update.dataset_id.clone()).context(
-                InvalidDatasetIdSnafu {
-                    value: dataset_update.dataset_id,
-                },
-            )?;
-            decoded_updates.push(Self {
-                dataset_id,
-                operations: dataset_update.operations,
-            });
+            .fail();
         }
-        Ok(decoded_updates)
+
+        let dataset_id =
+            DatasetId::try_new(message.dataset_id.clone()).context(InvalidDatasetIdSnafu {
+                value: message.dataset_id,
+            })?;
+        Ok(Self {
+            dataset_id,
+            operations: message.operations,
+        })
     }
+}
+
+fn decode_required_dataset_updates(
+    dataset_updates: Vec<replication_proto::DatasetUpdate>,
+) -> Result<Vec<DatasetUpdateMessage>, RuntimeMessageError> {
+    if dataset_updates.is_empty() {
+        return EmptyUpdateSnafu.fail();
+    }
+
+    dataset_updates
+        .into_iter()
+        .map(DatasetUpdateMessage::decode_proto)
+        .collect()
 }
 
 impl From<DatasetUpdateRecord> for DatasetUpdateMessage {
@@ -448,42 +473,44 @@ impl From<ReplicationUpdateRecord> for UpdateMessage {
     }
 }
 
-impl RuntimeMessage {
-    pub(crate) fn encode_to_proto(&self) -> replication_proto::RuntimeMessage {
+impl EncodeProto for RuntimeMessage {
+    type Proto = replication_proto::RuntimeMessage;
+
+    fn encode_proto(&self) -> Self::Proto {
         match self {
             RuntimeMessage::BootstrapGroup(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
-                    Box::new(message.to_proto()),
+                    Box::new(message.encode_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::Update(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::Update(Box::new(
-                    message.to_proto(),
+                    message.encode_proto(),
                 ))),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::SummaryRequest(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::SummaryRequest(
-                    Box::new(message.to_proto()),
+                    Box::new(message.encode_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::Summary(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::Summary(Box::new(
-                    message.to_proto(),
+                    message.encode_proto(),
                 ))),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::NeedRange(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::NeedRange(
-                    Box::new(message.to_proto()),
+                    Box::new(message.encode_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
             RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
                 body: Some(replication_proto::runtime_message::Body::UpdateBatch(
-                    Box::new(message.to_proto()),
+                    Box::new(message.encode_proto()),
                 )),
                 ..replication_proto::RuntimeMessage::default()
             },
@@ -531,16 +558,26 @@ impl BootstrapGroupMessage {
     pub(crate) fn group_key(&self) -> &BootstrapGroupKey {
         &self.group_key
     }
+}
 
-    fn to_proto(&self) -> replication_proto::BootstrapGroup {
+impl proto::ProtoCodec for BootstrapGroupMessage {
+    type DecodeError = RuntimeMessageError;
+    type Proto = replication_proto::BootstrapGroup;
+
+    fn to_proto(&self) -> Self::Proto {
         let member_public_keys = self
             .members
             .iter()
             .map(|member| {
-                self.member_public_keys
+                let public_keys = self
+                    .member_public_keys
                     .get(member)
-                    .expect("bootstrap member keys must cover every member")
-                    .to_proto(member)
+                    .expect("bootstrap member keys must cover every member");
+                BootstrapMemberPublicKeysProtoSource {
+                    member_id: member,
+                    public_keys,
+                }
+                .encode_proto()
             })
             .collect();
         replication_proto::BootstrapGroup {
@@ -550,6 +587,41 @@ impl BootstrapGroupMessage {
             group_key: self.group_key.to_bytes().to_vec(),
             ..replication_proto::BootstrapGroup::default()
         }
+    }
+
+    fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
+        let group_id = group_id_from_wire(&message.group_id, "bootstrap_group.group_id").context(
+            InvalidWireValueSnafu {
+                field: "bootstrap_group.group_id",
+            },
+        )?;
+        if message.member_public_keys.is_empty() {
+            return EmptyBootstrapGroupSnafu.fail();
+        }
+        let mut members = Vec::with_capacity(message.member_public_keys.len());
+        let mut member_public_keys = TrieMap::new();
+        for public_keys in message.member_public_keys {
+            let entry = BootstrapMemberPublicKeysEntry::decode_proto(public_keys)?;
+            members.push(entry.member_id.clone());
+            member_public_keys.insert(entry.member_id, entry.public_keys);
+        }
+        let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
+        ensure!(
+            message.group_cipher_suite == u32::from(expected),
+            UnsupportedBootstrapGroupCipherSuiteSnafu {
+                actual: message.group_cipher_suite,
+                expected,
+            }
+        );
+        let group_key =
+            fixed_bytes_field::<GROUP_KEY_LENGTH>("bootstrap_group.group_key", &message.group_key)?;
+        Self::new(
+            group_id,
+            members,
+            member_public_keys,
+            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+            BootstrapGroupKey::from_bytes(group_key),
+        )
     }
 }
 
@@ -561,19 +633,42 @@ impl BootstrapMemberPublicKeysMessage {
             encryption_public_key: public_keys.encryption_key_bytes(),
         }
     }
+}
 
-    fn to_proto(&self, member_id: &MemberIdentity) -> replication_proto::BootstrapMemberPublicKeys {
+/// Borrowed source for encoding one bootstrap member public-key entry.
+struct BootstrapMemberPublicKeysProtoSource<'a> {
+    /// Member identity that owns the public keys.
+    member_id: &'a MemberIdentity,
+    /// Typed signing and encryption keys for the member.
+    public_keys: &'a BootstrapMemberPublicKeysMessage,
+}
+
+impl EncodeProto for BootstrapMemberPublicKeysProtoSource<'_> {
+    type Proto = replication_proto::BootstrapMemberPublicKeys;
+
+    fn encode_proto(&self) -> Self::Proto {
         replication_proto::BootstrapMemberPublicKeys {
-            member_id: MessageField::some(member_identity_to_wire_format(member_id)),
-            signing_public_key: self.signing_public_key.to_vec(),
-            encryption_public_key: self.encryption_public_key.to_vec(),
+            member_id: MessageField::some(member_identity_to_wire_format(self.member_id)),
+            signing_public_key: self.public_keys.signing_public_key.to_vec(),
+            encryption_public_key: self.public_keys.encryption_public_key.to_vec(),
             ..replication_proto::BootstrapMemberPublicKeys::default()
         }
     }
+}
 
-    fn from_proto(
-        mut message: replication_proto::BootstrapMemberPublicKeys,
-    ) -> Result<(MemberIdentity, Self), RuntimeMessageError> {
+/// Decoded bootstrap member public-key entry before coverage validation.
+struct BootstrapMemberPublicKeysEntry {
+    /// Member identity decoded from the entry key field.
+    member_id: MemberIdentity,
+    /// Public keys decoded for the member.
+    public_keys: BootstrapMemberPublicKeysMessage,
+}
+
+impl DecodeProto for BootstrapMemberPublicKeysEntry {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::BootstrapMemberPublicKeys;
+
+    fn decode_proto(mut message: Self::Proto) -> Result<Self, Self::Error> {
         let Some(member_id_wire) = message.member_id.take() else {
             return MissingBootstrapMemberIdSnafu.fail();
         };
@@ -592,23 +687,25 @@ impl BootstrapMemberPublicKeysMessage {
             "bootstrap_group.member_public_keys.encryption_public_key",
             &message.encryption_public_key,
         )?;
-        Ok((
+        Ok(Self {
             member_id,
-            Self {
+            public_keys: BootstrapMemberPublicKeysMessage {
                 signing_public_key,
                 encryption_public_key,
             },
-        ))
+        })
     }
 }
 
-impl UpdateMessage {
-    fn to_proto(&self) -> replication_proto::Update {
-        let read_versions = WireVersionVector::from_runtime(&self.read_versions).to_proto();
+impl EncodeProto for UpdateMessage {
+    type Proto = replication_proto::Update;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let read_versions = WireVersionVector::from_runtime(&self.read_versions).encode_proto();
         let dataset_updates = self
             .dataset_updates
             .iter()
-            .map(DatasetUpdateMessage::to_proto)
+            .map(DatasetUpdateMessage::encode_proto)
             .collect();
         replication_proto::Update {
             group_id: self.group_id.0.as_bytes().to_vec(),
@@ -620,31 +717,77 @@ impl UpdateMessage {
     }
 }
 
-impl SummaryRequestMessage {
-    fn to_proto(self) -> replication_proto::SummaryRequest {
+impl proto::ProtoCodecWith<MemberCountContext> for UpdateMessage {
+    type DecodeError = RuntimeMessageError;
+
+    fn from_proto_with(
+        proto: <Self as EncodeProto>::Proto,
+        context: MemberCountContext,
+    ) -> Result<Self, Self::DecodeError> {
+        let message = WireUpdateMessage::decode_proto(proto)?;
+        message.into_runtime(context.member_count())
+    }
+}
+
+impl proto::ProtoCodec for SummaryRequestMessage {
+    type DecodeError = RuntimeMessageError;
+    type Proto = replication_proto::SummaryRequest;
+
+    fn to_proto(&self) -> Self::Proto {
         replication_proto::SummaryRequest {
             group_id: self.group_id.0.as_bytes().to_vec(),
             correlation_id: self.correlation_id.as_bytes().to_vec(),
             ..replication_proto::SummaryRequest::default()
         }
     }
+
+    fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
+        let group_id = group_id_from_wire(&message.group_id, "summary_request.group_id").context(
+            InvalidWireValueSnafu {
+                field: "summary_request.group_id",
+            },
+        )?;
+        let correlation_id =
+            correlation_id_from_wire(&message.correlation_id, "summary_request.correlation_id")?;
+        Ok(Self {
+            group_id,
+            correlation_id,
+        })
+    }
 }
 
-impl SummaryMessage {
-    fn to_proto(&self) -> replication_proto::Summary {
+impl EncodeProto for SummaryMessage {
+    type Proto = replication_proto::Summary;
+
+    fn encode_proto(&self) -> Self::Proto {
         replication_proto::Summary {
             group_id: self.group_id.0.as_bytes().to_vec(),
             correlation_id: self.correlation_id.as_bytes().to_vec(),
             has_versions: MessageField::some(
-                WireVersionVector::from_runtime(&self.has_versions).to_proto(),
+                WireVersionVector::from_runtime(&self.has_versions).encode_proto(),
             ),
             ..replication_proto::Summary::default()
         }
     }
 }
 
-impl UpdateRangeMessage {
-    fn to_proto(self) -> replication_proto::UpdateRange {
+impl proto::ProtoCodecWith<MemberCountContext> for SummaryMessage {
+    type DecodeError = RuntimeMessageError;
+
+    fn from_proto_with(
+        proto: <Self as EncodeProto>::Proto,
+        context: MemberCountContext,
+    ) -> Result<Self, Self::DecodeError> {
+        let message = WireSummaryMessage::decode_proto(proto)?;
+        message.into_runtime(context.member_count())
+    }
+}
+
+impl proto::ProtoCodec for UpdateRangeMessage {
+    type DecodeError = RuntimeMessageError;
+    type Proto = replication_proto::UpdateRange;
+
+    fn to_proto(&self) -> Self::Proto {
         replication_proto::UpdateRange {
             producer_index: self.producer_index,
             start_version: self.start_version,
@@ -653,7 +796,7 @@ impl UpdateRangeMessage {
         }
     }
 
-    fn from_proto(message: &replication_proto::UpdateRange) -> Result<Self, RuntimeMessageError> {
+    fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
         let end_version = message.end_version.unwrap_or(message.start_version);
         ensure!(
             message.start_version <= end_version,
@@ -680,161 +823,118 @@ impl UpdateRangeMessage {
     }
 }
 
-impl NeedRangeMessage {
-    fn to_proto(&self) -> replication_proto::NeedRange {
+impl proto::ProtoCodec for NeedRangeMessage {
+    type DecodeError = RuntimeMessageError;
+    type Proto = replication_proto::NeedRange;
+
+    fn to_proto(&self) -> Self::Proto {
         replication_proto::NeedRange {
             group_id: self.group_id.0.as_bytes().to_vec(),
             ranges: self
                 .ranges
                 .iter()
-                .copied()
-                .map(UpdateRangeMessage::to_proto)
+                .map(UpdateRangeMessage::encode_proto)
                 .collect(),
             ..replication_proto::NeedRange::default()
         }
     }
+
+    fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
+        let group_id = group_id_from_wire(&message.group_id, "need_range.group_id").context(
+            InvalidWireValueSnafu {
+                field: "need_range.group_id",
+            },
+        )?;
+        if message.ranges.is_empty() {
+            return EmptyNeedRangeSnafu.fail();
+        }
+        let ranges = message
+            .ranges
+            .into_iter()
+            .map(UpdateRangeMessage::decode_proto)
+            .collect::<Result<_, _>>()?;
+        Ok(Self { group_id, ranges })
+    }
 }
 
-impl UpdateBatchMessage {
-    fn to_proto(&self) -> replication_proto::UpdateBatch {
+impl EncodeProto for UpdateBatchMessage {
+    type Proto = replication_proto::UpdateBatch;
+
+    fn encode_proto(&self) -> Self::Proto {
         replication_proto::UpdateBatch {
             group_id: self.group_id.0.as_bytes().to_vec(),
-            updates: self.updates.iter().map(UpdateMessage::to_proto).collect(),
+            updates: self
+                .updates
+                .iter()
+                .map(UpdateMessage::encode_proto)
+                .collect(),
             ..replication_proto::UpdateBatch::default()
         }
     }
 }
 
-pub(crate) fn encode_update_proto(message: &UpdateMessage) -> replication_proto::Update {
-    message.to_proto()
-}
+impl proto::ProtoCodecWith<MemberCountContext> for UpdateBatchMessage {
+    type DecodeError = RuntimeMessageError;
 
-pub(crate) fn decode_update_proto(
-    message: replication_proto::Update,
-    num_members: NonZeroUsize,
-) -> Result<UpdateMessage, RuntimeMessageError> {
-    let message = WireUpdateMessage::from_proto(message)?;
-    message.into_runtime(num_members)
-}
-
-pub(crate) fn encode_version_vector_proto(
-    version_vector: &VersionVector,
-) -> versions_proto::VersionVector {
-    WireVersionVector::from_runtime(version_vector).to_proto()
-}
-
-pub(crate) fn decode_version_vector_proto(
-    version_vector: versions_proto::VersionVector,
-    num_members: NonZeroUsize,
-) -> Result<VersionVector, WireVersionVectorError> {
-    let version_vector = WireVersionVector::from_proto(version_vector)?;
-    version_vector.to_runtime(num_members)
+    fn from_proto_with(
+        proto: <Self as EncodeProto>::Proto,
+        context: MemberCountContext,
+    ) -> Result<Self, Self::DecodeError> {
+        let message = WireUpdateBatchMessage::decode_proto(proto)?;
+        message.into_runtime(context.member_count())
+    }
 }
 
 impl WireRuntimeMessage {
     pub(crate) fn decode_from_slice(payload: &[u8]) -> Result<Self, RuntimeMessageError> {
         let message =
             replication_proto::RuntimeMessage::decode_from_slice(payload).context(DecodeSnafu)?;
-        Self::from_proto(message)
+        Self::decode_proto(message)
     }
+}
 
-    fn from_proto(message: replication_proto::RuntimeMessage) -> Result<Self, RuntimeMessageError> {
+impl DecodeProto for WireRuntimeMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::RuntimeMessage;
+
+    fn decode_proto(message: Self::Proto) -> Result<Self, Self::Error> {
         let Some(body) = message.body else {
             return MissingBodySnafu.fail();
         };
         match body {
             replication_proto::runtime_message::Body::BootstrapGroup(message) => {
-                let bootstrap_message = Self::bootstrap_group_from_proto(*message)?;
+                let bootstrap_message = BootstrapGroupMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::BootstrapGroup(bootstrap_message))
             }
             replication_proto::runtime_message::Body::Update(message) => {
-                let message = WireUpdateMessage::from_proto(*message)?;
+                let message = WireUpdateMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::Update(message))
             }
             replication_proto::runtime_message::Body::SummaryRequest(message) => {
-                let group_id = group_id_from_wire(&message.group_id, "summary_request.group_id")
-                    .context(InvalidWireValueSnafu {
-                        field: "summary_request.group_id",
-                    })?;
-                let correlation_id = correlation_id_from_wire(
-                    &message.correlation_id,
-                    "summary_request.correlation_id",
-                )?;
-                Ok(WireRuntimeMessage::SummaryRequest(SummaryRequestMessage {
-                    group_id,
-                    correlation_id,
-                }))
+                let message = SummaryRequestMessage::decode_proto(*message)?;
+                Ok(WireRuntimeMessage::SummaryRequest(message))
             }
             replication_proto::runtime_message::Body::Summary(message) => {
-                let message = WireSummaryMessage::from_proto(*message)?;
+                let message = WireSummaryMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::Summary(message))
             }
             replication_proto::runtime_message::Body::NeedRange(message) => {
-                let group_id = group_id_from_wire(&message.group_id, "need_range.group_id")
-                    .context(InvalidWireValueSnafu {
-                        field: "need_range.group_id",
-                    })?;
-                if message.ranges.is_empty() {
-                    return EmptyNeedRangeSnafu.fail();
-                }
-                let ranges = message
-                    .ranges
-                    .iter()
-                    .map(UpdateRangeMessage::from_proto)
-                    .collect::<Result<_, _>>()?;
-                Ok(WireRuntimeMessage::NeedRange(NeedRangeMessage {
-                    group_id,
-                    ranges,
-                }))
+                let message = NeedRangeMessage::decode_proto(*message)?;
+                Ok(WireRuntimeMessage::NeedRange(message))
             }
             replication_proto::runtime_message::Body::UpdateBatch(message) => {
-                let message = WireUpdateBatchMessage::from_proto(*message)?;
+                let message = WireUpdateBatchMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::UpdateBatch(message))
             }
         }
     }
-
-    /// Decode the bootstrap-group proto body into the runtime message form.
-    fn bootstrap_group_from_proto(
-        message: replication_proto::BootstrapGroup,
-    ) -> Result<BootstrapGroupMessage, RuntimeMessageError> {
-        let group_id = group_id_from_wire(&message.group_id, "bootstrap_group.group_id").context(
-            InvalidWireValueSnafu {
-                field: "bootstrap_group.group_id",
-            },
-        )?;
-        if message.member_public_keys.is_empty() {
-            return EmptyBootstrapGroupSnafu.fail();
-        }
-        let mut members = Vec::with_capacity(message.member_public_keys.len());
-        let mut member_public_keys = TrieMap::new();
-        for public_keys in message.member_public_keys {
-            let (member_id, decoded) = BootstrapMemberPublicKeysMessage::from_proto(public_keys)?;
-            members.push(member_id.clone());
-            member_public_keys.insert(member_id, decoded);
-        }
-        let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
-        ensure!(
-            message.group_cipher_suite == u32::from(expected),
-            UnsupportedBootstrapGroupCipherSuiteSnafu {
-                actual: message.group_cipher_suite,
-                expected,
-            }
-        );
-        let group_key =
-            fixed_bytes_field::<GROUP_KEY_LENGTH>("bootstrap_group.group_key", &message.group_key)?;
-        BootstrapGroupMessage::new(
-            group_id,
-            members,
-            member_public_keys,
-            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes(group_key),
-        )
-    }
 }
 
-impl WireUpdateMessage {
-    fn from_proto(mut message: replication_proto::Update) -> Result<Self, RuntimeMessageError> {
+impl DecodeProto for WireUpdateMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::Update;
+
+    fn decode_proto(mut message: Self::Proto) -> Result<Self, Self::Error> {
         let group_id = group_id_from_wire(&message.group_id, "update.group_id").context(
             InvalidWireValueSnafu {
                 field: "update.group_id",
@@ -851,10 +951,10 @@ impl WireUpdateMessage {
             return MissingReadVersionsSnafu.fail();
         };
         let read_versions =
-            WireVersionVector::from_proto(read_versions).context(InvalidReadVersionsSnafu {
+            WireVersionVector::decode_proto(read_versions).context(InvalidReadVersionsSnafu {
                 field: "update.read_versions",
             })?;
-        let dataset_updates = DatasetUpdateMessage::decode_proto_vec(message.dataset_updates)?;
+        let dataset_updates = decode_required_dataset_updates(message.dataset_updates)?;
         Ok(Self {
             group_id,
             update_id,
@@ -862,7 +962,9 @@ impl WireUpdateMessage {
             dataset_updates,
         })
     }
+}
 
+impl WireUpdateMessage {
     pub(crate) fn into_runtime(
         self,
         num_members: NonZeroUsize,
@@ -906,8 +1008,11 @@ impl From<UpdateBatchMessage> for WireUpdateBatchMessage {
     }
 }
 
-impl WireUpdateBatchMessage {
-    fn from_proto(message: replication_proto::UpdateBatch) -> Result<Self, RuntimeMessageError> {
+impl DecodeProto for WireUpdateBatchMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::UpdateBatch;
+
+    fn decode_proto(message: Self::Proto) -> Result<Self, Self::Error> {
         let group_id = group_id_from_wire(&message.group_id, "update_batch.group_id").context(
             InvalidWireValueSnafu {
                 field: "update_batch.group_id",
@@ -919,7 +1024,7 @@ impl WireUpdateBatchMessage {
         let updates: Vec<WireUpdateMessage> = message
             .updates
             .into_iter()
-            .map(WireUpdateMessage::from_proto)
+            .map(WireUpdateMessage::decode_proto)
             .collect::<Result<_, _>>()?;
         for update in &updates {
             ensure!(
@@ -935,8 +1040,28 @@ impl WireUpdateBatchMessage {
     }
 }
 
-impl WireSummaryMessage {
-    fn from_proto(mut message: replication_proto::Summary) -> Result<Self, RuntimeMessageError> {
+impl WireUpdateBatchMessage {
+    pub(crate) fn into_runtime(
+        self,
+        num_members: NonZeroUsize,
+    ) -> Result<UpdateBatchMessage, RuntimeMessageError> {
+        let updates = self
+            .updates
+            .into_iter()
+            .map(|update| update.into_runtime(num_members))
+            .collect::<Result<_, _>>()?;
+        Ok(UpdateBatchMessage {
+            group_id: self.group_id,
+            updates,
+        })
+    }
+}
+
+impl DecodeProto for WireSummaryMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::Summary;
+
+    fn decode_proto(mut message: Self::Proto) -> Result<Self, Self::Error> {
         let group_id = group_id_from_wire(&message.group_id, "summary.group_id").context(
             InvalidWireValueSnafu {
                 field: "summary.group_id",
@@ -948,12 +1073,14 @@ impl WireSummaryMessage {
             return MissingSummaryVersionsSnafu.fail();
         };
         let has_versions =
-            WireVersionVector::from_proto(has_versions).context(InvalidReadVersionsSnafu {
+            WireVersionVector::decode_proto(has_versions).context(InvalidReadVersionsSnafu {
                 field: "summary.has_versions",
             })?;
         Ok(Self::new(group_id, correlation_id, has_versions))
     }
+}
 
+impl WireSummaryMessage {
     pub(crate) fn into_runtime(
         self,
         num_members: NonZeroUsize,
@@ -986,7 +1113,7 @@ impl WireSummaryMessage {
 }
 
 impl WireVersionVector {
-    fn from_runtime(version_vector: &VersionVector) -> Self {
+    pub(crate) fn from_runtime(version_vector: &VersionVector) -> Self {
         match version_vector {
             VersionVector::Full(vector) => Self::Full(vector.clone()),
             VersionVector::Override { version, .. } => Self::Override {
@@ -1000,8 +1127,13 @@ impl WireVersionVector {
             },
         }
     }
+}
 
-    fn to_proto(&self) -> versions_proto::VersionVector {
+impl proto::ProtoCodec for WireVersionVector {
+    type DecodeError = WireVersionVectorError;
+    type Proto = versions_proto::VersionVector;
+
+    fn to_proto(&self) -> Self::Proto {
         let versions = match self {
             WireVersionVector::Full(vector) => versions_proto::version_vector::Versions::Full(
                 Box::new(versions_proto::FullVersionVector {
@@ -1036,9 +1168,7 @@ impl WireVersionVector {
         }
     }
 
-    fn from_proto(
-        version_vector: versions_proto::VersionVector,
-    ) -> Result<Self, WireVersionVectorError> {
+    fn from_proto(version_vector: Self::Proto) -> Result<Self, Self::DecodeError> {
         let Some(versions) = version_vector.versions else {
             return MissingVersionsBodySnafu.fail();
         };
@@ -1077,8 +1207,10 @@ impl WireVersionVector {
             }
         }
     }
+}
 
-    fn to_runtime(
+impl WireVersionVector {
+    pub(crate) fn to_runtime(
         &self,
         num_members: NonZeroUsize,
     ) -> Result<VersionVector, WireVersionVectorError> {
@@ -1210,6 +1342,7 @@ mod tests {
         BootstrapGroupMessage,
         BootstrapMemberPublicKeysMessage,
         DatasetUpdateMessage,
+        MemberCountContext,
         NeedRangeMessage,
         RuntimeMessage,
         RuntimeMessageError,
@@ -1234,6 +1367,7 @@ mod tests {
     use flotsync_messages::{
         buffa::{Message as _, MessageField},
         datamodel as datamodel_proto,
+        proto::{DecodeProto, DecodeProtoWith, EncodeProto},
         replication as replication_proto,
     };
     use flotsync_security::{
@@ -1275,9 +1409,9 @@ mod tests {
 
         for vector in [full, override_vector, synced] {
             let wire = WireVersionVector::from_runtime(&vector);
-            let proto = wire.to_proto();
+            let proto = wire.encode_proto();
             let decoded_wire =
-                WireVersionVector::from_proto(proto).expect("wire decode should work");
+                WireVersionVector::decode_proto(proto).expect("wire decode should work");
             let decoded_vector = decoded_wire
                 .to_runtime(vector.num_members())
                 .expect("runtime decode should work");
@@ -1293,7 +1427,7 @@ mod tests {
             group_id,
             correlation_id,
         });
-        let request_payload = summary_request.encode_to_proto().encode_to_bytes();
+        let request_payload = summary_request.encode_proto().encode_to_bytes();
 
         assert_eq!(
             WireRuntimeMessage::decode_from_slice(&request_payload)
@@ -1310,7 +1444,7 @@ mod tests {
             correlation_id,
             has_versions.clone(),
         ));
-        let summary_payload = summary.encode_to_proto().encode_to_bytes();
+        let summary_payload = summary.encode_proto().encode_to_bytes();
         let decoded_summary =
             WireRuntimeMessage::decode_from_slice(&summary_payload).expect("summary should decode");
 
@@ -1322,6 +1456,41 @@ mod tests {
                 .into_runtime(NonZeroUsize::new(2).expect("two members"))
                 .expect("summary versions should normalise"),
             SummaryMessage::new(group_id, correlation_id, has_versions)
+        );
+    }
+
+    #[test]
+    fn owned_updates_decode_with_member_count_context() {
+        let group_id = GroupId(Uuid::from_u128(211));
+        let member_count = NonZeroUsize::new(2).expect("two members");
+        let update = test_update_message(
+            group_id,
+            UpdateId {
+                version: 3,
+                node_index: 1,
+            },
+            VersionVector::Full(PureVersionVector::from([1, 2])),
+        );
+        let batch = UpdateBatchMessage {
+            group_id,
+            updates: vec![update.clone()],
+        };
+
+        assert_eq!(
+            UpdateMessage::decode_proto_with(
+                update.encode_proto(),
+                MemberCountContext::new(member_count),
+            )
+            .expect("update should decode with member count"),
+            update
+        );
+        assert_eq!(
+            UpdateBatchMessage::decode_proto_with(
+                batch.encode_proto(),
+                MemberCountContext::new(member_count),
+            )
+            .expect("batch should decode with member count"),
+            batch
         );
     }
 
@@ -1354,7 +1523,7 @@ mod tests {
         )
         .expect("bootstrap message should build");
         let runtime_message = RuntimeMessage::BootstrapGroup(bootstrap.clone());
-        let proto = runtime_message.encode_to_proto();
+        let proto = runtime_message.encode_proto();
         let Some(replication_proto::runtime_message::Body::BootstrapGroup(proto_bootstrap)) =
             proto.body.clone()
         else {
@@ -1422,10 +1591,10 @@ mod tests {
             start_version: 7,
             end_version: 7,
         };
-        let singleton_proto = singleton.to_proto();
+        let singleton_proto = singleton.encode_proto();
         assert_eq!(singleton_proto.end_version, None);
         assert_eq!(
-            UpdateRangeMessage::from_proto(&singleton_proto).expect("singleton should decode"),
+            UpdateRangeMessage::decode_proto(singleton_proto).expect("singleton should decode"),
             singleton
         );
 
@@ -1434,10 +1603,10 @@ mod tests {
             start_version: 7,
             end_version: 9,
         };
-        let range_proto = range.to_proto();
+        let range_proto = range.encode_proto();
         assert_eq!(range_proto.end_version, Some(9));
         assert_eq!(
-            UpdateRangeMessage::from_proto(&range_proto).expect("range should decode"),
+            UpdateRangeMessage::decode_proto(range_proto).expect("range should decode"),
             range
         );
     }
@@ -1453,7 +1622,7 @@ mod tests {
                 end_version: u64::MAX,
             }],
         })
-        .encode_to_proto()
+        .encode_proto()
         .encode_to_bytes();
 
         let error = WireRuntimeMessage::decode_from_slice(&payload)
@@ -1479,7 +1648,7 @@ mod tests {
             update_id,
             VersionVector::initial(NonZeroUsize::new(2).expect("two members")),
         ))
-        .encode_to_proto()
+        .encode_proto()
         .encode_to_bytes();
 
         let error = WireRuntimeMessage::decode_from_slice(&payload)
@@ -1504,7 +1673,7 @@ mod tests {
             },
             VersionVector::Full(PureVersionVector::from([u64::MAX, 0])),
         ))
-        .encode_to_proto()
+        .encode_proto()
         .encode_to_bytes();
 
         let error = WireRuntimeMessage::decode_from_slice(&payload)
@@ -1533,7 +1702,7 @@ mod tests {
                 version: u64::MAX,
             },
         ))
-        .encode_to_proto()
+        .encode_proto()
         .encode_to_bytes();
 
         let error = WireRuntimeMessage::decode_from_slice(&payload)
@@ -1566,7 +1735,7 @@ mod tests {
                 VersionVector::initial(NonZeroUsize::new(2).expect("two members")),
             )],
         })
-        .encode_to_proto()
+        .encode_proto()
         .encode_to_bytes();
 
         let error = WireRuntimeMessage::decode_from_slice(&payload)
