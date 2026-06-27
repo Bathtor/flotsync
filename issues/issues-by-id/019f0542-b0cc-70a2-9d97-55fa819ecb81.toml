@@ -19,8 +19,8 @@ Child D2: flotsync-6s0-m2 adds generated borrowed proto view decode traits on to
 Child D3: flotsync-6s0-m3 adds explicit borrowed proto source encode adapters on top of M1. It is blocked by flotsync-6s0-m1 and is independent of M2.
 
 Acceptance E: the child tasks should leave conversion call sites clearer than the current ad hoc helpers, include focused tests for representative encode/decode paths, document any cases where cloning or allocation remains intentionally required, and avoid broad blanket impls that obscure allocation behaviour."""
-status = "in-progress"
-status_reason = "split into child tasks"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 assignee = "codex"
@@ -32,4 +32,11 @@ children = [
     "019f0887-814f-7802-bcf1-5d4fd4e626e0",
 ]
 created_at = "2026-05-03T14:52:20Z"
-updated_at = "2026-06-27T10:02:13.147856Z"
+updated_at = "2026-06-27T12:34:47.272466Z"
+closed_at = "2026-06-27T12:34:47.272466Z"
+
+[[comments]]
+id = "019f0913-4b68-7082-ac98-1f51efe58829"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T12:34:47.272466Z"

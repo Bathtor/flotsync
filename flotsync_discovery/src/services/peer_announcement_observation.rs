@@ -15,7 +15,7 @@ use flotsync_io::prelude::{
     UdpPort,
     UdpRequest,
 };
-use flotsync_messages::proto::DecodeProtoView;
+use flotsync_messages::proto::DecodeProto;
 use flotsync_utils::{
     kompact_fsm::{State, StateHandled, StateUpdate},
     transform_state_match,
@@ -134,8 +134,8 @@ impl PeerAnnouncementObservationComponent {
 
     /// Decode one peer-announcement payload and publish it to the observation port.
     fn handle_peer_announcement_payload(&mut self, payload: &IoPayload) {
-        let bytes = payload.to_vec();
-        let peer = match DecodedPeer::decode_proto_view_from_slice(&bytes) {
+        let mut cursor = payload.cursor();
+        let peer = match DecodedPeer::decode_proto_from_buf(&mut cursor) {
             Ok(peer) => peer,
             Err(error) => {
                 trace!(
