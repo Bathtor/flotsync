@@ -392,16 +392,246 @@ pub(crate) struct DatasetUpdateMessage {
     pub(crate) operations: Vec<datamodel_proto::SchemaOperation>,
 }
 
+/// Borrowed source for encoding a runtime version vector without first
+/// constructing the compact owned wire representation.
+pub(crate) struct RuntimeVersionVectorProtoSource<'a> {
+    /// Runtime version vector to encode into the generated protobuf shape.
+    version_vector: &'a VersionVector,
+}
+
+impl<'a> From<&'a VersionVector> for RuntimeVersionVectorProtoSource<'a> {
+    fn from(version_vector: &'a VersionVector) -> Self {
+        Self { version_vector }
+    }
+}
+
+impl EncodeProto for RuntimeVersionVectorProtoSource<'_> {
+    type Proto = versions_proto::VersionVector;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let versions = match self.version_vector {
+            VersionVector::Full(vector) => versions_proto::version_vector::Versions::Full(
+                Box::new(versions_proto::FullVersionVector {
+                    entries: vector.0.to_vec(),
+                    ..versions_proto::FullVersionVector::default()
+                }),
+            ),
+            VersionVector::Override { version, .. } => {
+                versions_proto::version_vector::Versions::Override(Box::new(
+                    versions_proto::OverrideVersionVector {
+                        group_version: version.group_version(),
+                        override_position: u32::try_from(version.override_position)
+                            .expect("wire version override position must fit into u32"),
+                        override_version: version.override_version(),
+                        ..versions_proto::OverrideVersionVector::default()
+                    },
+                ))
+            }
+            VersionVector::Synced { version, .. } => {
+                versions_proto::version_vector::Versions::Synced(Box::new(
+                    versions_proto::SyncedVersionVector {
+                        group_version: *version,
+                        ..versions_proto::SyncedVersionVector::default()
+                    },
+                ))
+            }
+        };
+        versions_proto::VersionVector {
+            versions: Some(versions),
+            ..versions_proto::VersionVector::default()
+        }
+    }
+}
+
+/// Borrowed source for encoding one dataset update from either the runtime
+/// message model or the persisted store-record model.
+pub(crate) struct DatasetUpdateProtoSource<'a> {
+    /// Dataset whose operations are carried by this protobuf entry.
+    dataset_id: &'a DatasetId,
+    /// Already encoded schema operations for this dataset.
+    operations: &'a [datamodel_proto::SchemaOperation],
+}
+
+impl<'a> From<&'a DatasetUpdateMessage> for DatasetUpdateProtoSource<'a> {
+    fn from(message: &'a DatasetUpdateMessage) -> Self {
+        Self {
+            dataset_id: &message.dataset_id,
+            operations: &message.operations,
+        }
+    }
+}
+
+impl<'a> From<&'a DatasetUpdateRecord> for DatasetUpdateProtoSource<'a> {
+    fn from(record: &'a DatasetUpdateRecord) -> Self {
+        Self {
+            dataset_id: &record.dataset_id,
+            operations: &record.operations,
+        }
+    }
+}
+
+impl EncodeProto for DatasetUpdateProtoSource<'_> {
+    type Proto = replication_proto::DatasetUpdate;
+
+    fn encode_proto(&self) -> Self::Proto {
+        replication_proto::DatasetUpdate {
+            dataset_id: self.dataset_id.as_str().to_owned(),
+            operations: self.operations.to_vec(),
+            ..replication_proto::DatasetUpdate::default()
+        }
+    }
+}
+
+/// Borrowed source for encoding an update from runtime messages or persisted
+/// store records without an intermediate owned `UpdateMessage`.
+pub(crate) struct UpdateMessageProtoSource<'a> {
+    /// Group whose log contains the update.
+    group_id: GroupId,
+    /// Producer and version of the update.
+    update_id: UpdateId,
+    /// Read-version frontier carried by the update.
+    read_versions: &'a VersionVector,
+    /// Dataset updates borrowed from the original source shape.
+    dataset_updates: DatasetUpdateProtoSources<'a>,
+}
+
+impl<'a> From<&'a UpdateMessage> for UpdateMessageProtoSource<'a> {
+    fn from(message: &'a UpdateMessage) -> Self {
+        Self {
+            group_id: message.group_id,
+            update_id: message.update_id,
+            read_versions: &message.read_versions,
+            dataset_updates: DatasetUpdateProtoSources::Messages(&message.dataset_updates),
+        }
+    }
+}
+
+impl<'a> From<&'a ReplicationUpdateRecord> for UpdateMessageProtoSource<'a> {
+    fn from(record: &'a ReplicationUpdateRecord) -> Self {
+        Self {
+            group_id: record.group_id,
+            update_id: record.update_id,
+            read_versions: &record.read_versions,
+            dataset_updates: DatasetUpdateProtoSources::Records(&record.dataset_updates),
+        }
+    }
+}
+
+impl EncodeProto for UpdateMessageProtoSource<'_> {
+    type Proto = replication_proto::Update;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let read_versions =
+            RuntimeVersionVectorProtoSource::from(self.read_versions).encode_proto();
+        replication_proto::Update {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            update_id: MessageField::some(encode_update_id(self.update_id)),
+            read_versions: MessageField::some(read_versions),
+            dataset_updates: self.dataset_updates.encode_proto(),
+            ..replication_proto::Update::default()
+        }
+    }
+}
+
+/// Borrowed source for encoding a summary message without constructing compact
+/// owned wire-version state first.
+pub(crate) struct SummaryMessageProtoSource<'a> {
+    /// Group whose version frontier is being reported.
+    group_id: GroupId,
+    /// Request correlation identifier copied into the reply.
+    correlation_id: Uuid,
+    /// Responder version frontier.
+    has_versions: &'a VersionVector,
+}
+
+impl<'a> From<&'a SummaryMessage> for SummaryMessageProtoSource<'a> {
+    fn from(message: &'a SummaryMessage) -> Self {
+        Self {
+            group_id: message.group_id,
+            correlation_id: message.correlation_id,
+            has_versions: &message.has_versions,
+        }
+    }
+}
+
+impl EncodeProto for SummaryMessageProtoSource<'_> {
+    type Proto = replication_proto::Summary;
+
+    fn encode_proto(&self) -> Self::Proto {
+        replication_proto::Summary {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            correlation_id: self.correlation_id.as_bytes().to_vec(),
+            has_versions: MessageField::some(
+                RuntimeVersionVectorProtoSource::from(self.has_versions).encode_proto(),
+            ),
+            ..replication_proto::Summary::default()
+        }
+    }
+}
+
+/// Borrowed source for encoding an update batch from borrowed runtime updates.
+pub(crate) struct UpdateBatchMessageProtoSource<'a> {
+    /// Group whose missing updates are carried in this batch.
+    group_id: GroupId,
+    /// Updates borrowed from the runtime batch.
+    updates: &'a [UpdateMessage],
+}
+
+impl<'a> From<&'a UpdateBatchMessage> for UpdateBatchMessageProtoSource<'a> {
+    fn from(message: &'a UpdateBatchMessage) -> Self {
+        Self {
+            group_id: message.group_id,
+            updates: &message.updates,
+        }
+    }
+}
+
+impl EncodeProto for UpdateBatchMessageProtoSource<'_> {
+    type Proto = replication_proto::UpdateBatch;
+
+    fn encode_proto(&self) -> Self::Proto {
+        replication_proto::UpdateBatch {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            updates: self
+                .updates
+                .iter()
+                .map(|update| UpdateMessageProtoSource::from(update).encode_proto())
+                .collect(),
+            ..replication_proto::UpdateBatch::default()
+        }
+    }
+}
+
+/// Borrowed dataset-update collection source inside an update message.
+enum DatasetUpdateProtoSources<'a> {
+    /// Dataset updates borrowed from a runtime update message.
+    Messages(&'a [DatasetUpdateMessage]),
+    /// Dataset updates borrowed from a persisted update record.
+    Records(&'a [DatasetUpdateRecord]),
+}
+
+impl DatasetUpdateProtoSources<'_> {
+    /// Encode every borrowed dataset update into generated protobuf entries.
+    fn encode_proto(&self) -> Vec<replication_proto::DatasetUpdate> {
+        match self {
+            Self::Messages(dataset_updates) => dataset_updates
+                .iter()
+                .map(|message| DatasetUpdateProtoSource::from(message).encode_proto())
+                .collect(),
+            Self::Records(dataset_updates) => dataset_updates
+                .iter()
+                .map(|record| DatasetUpdateProtoSource::from(record).encode_proto())
+                .collect(),
+        }
+    }
+}
+
 impl proto::ProtoCodec for DatasetUpdateMessage {
     type DecodeError = RuntimeMessageError;
     type Proto = replication_proto::DatasetUpdate;
 
     fn to_proto(&self) -> Self::Proto {
-        replication_proto::DatasetUpdate {
-            dataset_id: self.dataset_id.as_str().to_owned(),
-            operations: self.operations.clone(),
-            ..replication_proto::DatasetUpdate::default()
-        }
+        DatasetUpdateProtoSource::from(self).encode_proto()
     }
 
     fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
@@ -792,19 +1022,7 @@ impl EncodeProto for UpdateMessage {
     type Proto = replication_proto::Update;
 
     fn encode_proto(&self) -> Self::Proto {
-        let read_versions = WireVersionVector::from_runtime(&self.read_versions).encode_proto();
-        let dataset_updates = self
-            .dataset_updates
-            .iter()
-            .map(DatasetUpdateMessage::encode_proto)
-            .collect();
-        replication_proto::Update {
-            group_id: self.group_id.0.as_bytes().to_vec(),
-            update_id: MessageField::some(encode_update_id(self.update_id)),
-            read_versions: MessageField::some(read_versions),
-            dataset_updates,
-            ..replication_proto::Update::default()
-        }
+        UpdateMessageProtoSource::from(self).encode_proto()
     }
 }
 
@@ -883,14 +1101,7 @@ impl EncodeProto for SummaryMessage {
     type Proto = replication_proto::Summary;
 
     fn encode_proto(&self) -> Self::Proto {
-        replication_proto::Summary {
-            group_id: self.group_id.0.as_bytes().to_vec(),
-            correlation_id: self.correlation_id.as_bytes().to_vec(),
-            has_versions: MessageField::some(
-                WireVersionVector::from_runtime(&self.has_versions).encode_proto(),
-            ),
-            ..replication_proto::Summary::default()
-        }
+        SummaryMessageProtoSource::from(self).encode_proto()
     }
 }
 
@@ -1050,15 +1261,7 @@ impl EncodeProto for UpdateBatchMessage {
     type Proto = replication_proto::UpdateBatch;
 
     fn encode_proto(&self) -> Self::Proto {
-        replication_proto::UpdateBatch {
-            group_id: self.group_id.0.as_bytes().to_vec(),
-            updates: self
-                .updates
-                .iter()
-                .map(UpdateMessage::encode_proto)
-                .collect(),
-            ..replication_proto::UpdateBatch::default()
-        }
+        UpdateBatchMessageProtoSource::from(self).encode_proto()
     }
 }
 
@@ -1732,14 +1935,19 @@ mod tests {
         BootstrapGroupMessage,
         BootstrapMemberPublicKeysMessage,
         DatasetUpdateMessage,
+        DatasetUpdateProtoSource,
         MemberCountContext,
         NeedRangeMessage,
         RuntimeMessage,
         RuntimeMessageError,
+        RuntimeVersionVectorProtoSource,
         SummaryMessage,
+        SummaryMessageProtoSource,
         SummaryRequestMessage,
         UpdateBatchMessage,
+        UpdateBatchMessageProtoSource,
         UpdateMessage,
+        UpdateMessageProtoSource,
         UpdateRangeMessage,
         WireRuntimeMessage,
         WireVersionVector,
@@ -1747,7 +1955,7 @@ mod tests {
         member_identity_from_wire,
         member_identity_to_wire_format,
     };
-    use crate::api::DatasetId;
+    use crate::api::{DatasetId, DatasetUpdateRecord, ReplicationUpdateRecord};
     use flotsync_core::{
         GroupId,
         MemberIdentity,
@@ -1911,6 +2119,102 @@ mod tests {
             )
             .expect("batch view should decode with member count"),
             batch
+        );
+    }
+
+    #[test]
+    fn borrowed_proto_sources_match_owned_runtime_message_encoding() {
+        let group_id = GroupId(Uuid::from_u128(212));
+        let update = test_update_message(
+            group_id,
+            UpdateId {
+                version: 4,
+                node_index: 1,
+            },
+            VersionVector::Full(PureVersionVector::from([1, 3])),
+        );
+        let summary = SummaryMessage::new(
+            group_id,
+            Uuid::from_u128(213),
+            VersionVector::Override {
+                num_members: NonZeroUsize::new(2).expect("two members"),
+                version: OverrideVersion::new(6, 1, 7),
+            },
+        );
+        let batch = UpdateBatchMessage {
+            group_id,
+            updates: vec![update.clone()],
+        };
+
+        assert_eq!(
+            RuntimeVersionVectorProtoSource::from(&update.read_versions)
+                .encode_proto()
+                .encode_to_bytes(),
+            WireVersionVector::from_runtime(&update.read_versions)
+                .encode_proto()
+                .encode_to_bytes()
+        );
+        assert_eq!(
+            DatasetUpdateProtoSource::from(&update.dataset_updates[0])
+                .encode_proto()
+                .encode_to_bytes(),
+            update.dataset_updates[0].encode_proto().encode_to_bytes()
+        );
+        assert_eq!(
+            UpdateMessageProtoSource::from(&update)
+                .encode_proto()
+                .encode_to_bytes(),
+            update.encode_proto().encode_to_bytes()
+        );
+        assert_eq!(
+            SummaryMessageProtoSource::from(&summary)
+                .encode_proto()
+                .encode_to_bytes(),
+            summary.encode_proto().encode_to_bytes()
+        );
+        assert_eq!(
+            UpdateBatchMessageProtoSource::from(&batch)
+                .encode_proto()
+                .encode_to_bytes(),
+            batch.encode_proto().encode_to_bytes()
+        );
+    }
+
+    #[test]
+    fn stored_update_proto_source_matches_owned_update_message_encoding() {
+        let group_id = GroupId(Uuid::from_u128(214));
+        let update = ReplicationUpdateRecord {
+            group_id,
+            update_id: UpdateId {
+                version: 5,
+                node_index: 0,
+            },
+            sender: MemberIdentity::from_array(["runtime-message", "sender"]),
+            read_versions: VersionVector::Synced {
+                num_members: NonZeroUsize::new(2).expect("two members"),
+                version: 3,
+            },
+            dataset_updates: vec![DatasetUpdateRecord {
+                dataset_id: DatasetId::try_new("docs").expect("dataset id should build"),
+                operations: vec![datamodel_proto::SchemaOperation::default()],
+            }],
+            applied_locally: true,
+        };
+        let owned_message = UpdateMessage::from(update.clone());
+
+        assert_eq!(
+            DatasetUpdateProtoSource::from(&update.dataset_updates[0])
+                .encode_proto()
+                .encode_to_bytes(),
+            owned_message.dataset_updates[0]
+                .encode_proto()
+                .encode_to_bytes()
+        );
+        assert_eq!(
+            UpdateMessageProtoSource::from(&update)
+                .encode_proto()
+                .encode_to_bytes(),
+            owned_message.encode_proto().encode_to_bytes()
         );
     }
 

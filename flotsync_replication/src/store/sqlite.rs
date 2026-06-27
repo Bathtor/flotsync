@@ -27,9 +27,10 @@ use crate::{
         TrustedMemberPublicKeysRecord,
     },
     runtime::messages::{
-        DatasetUpdateMessage,
         MemberCountContext,
+        RuntimeVersionVectorProtoSource,
         UpdateMessage,
+        UpdateMessageProtoSource,
         WireVersionVector,
     },
 };
@@ -1651,7 +1652,7 @@ fn decode_dataset_row_last_changed_versions(
 }
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
-    WireVersionVector::from_runtime(version_vector)
+    RuntimeVersionVectorProtoSource::from(version_vector)
         .encode_proto()
         .encode_to_bytes()
         .to_vec()
@@ -1676,20 +1677,10 @@ fn decode_stored_version_vector(
 }
 
 fn encode_stored_update(update: &ReplicationUpdateRecord) -> Vec<u8> {
-    let message = UpdateMessage {
-        group_id: update.group_id,
-        update_id: update.update_id,
-        read_versions: update.read_versions.clone(),
-        dataset_updates: update
-            .dataset_updates
-            .iter()
-            .map(|dataset_update| DatasetUpdateMessage {
-                dataset_id: dataset_update.dataset_id.clone(),
-                operations: dataset_update.operations.clone(),
-            })
-            .collect(),
-    };
-    message.encode_proto().encode_to_bytes().to_vec()
+    UpdateMessageProtoSource::from(update)
+        .encode_proto()
+        .encode_to_bytes()
+        .to_vec()
 }
 
 fn decode_stored_update_row(
