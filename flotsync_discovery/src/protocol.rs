@@ -2,17 +2,18 @@
 
 use flotsync_core::GroupId;
 use flotsync_messages::{
-    buffa::{DecodeError, EnumValue, Message, MessageField},
+    buffa::{DecodeError, EnumValue, MessageField, MessageView as _},
     discovery::{
         IPAddress,
         IPAddressView,
         Peer,
+        PeerView,
         SocketAddress,
         SocketAddressView,
         ip_address,
         socket_address,
     },
-    proto::{self, DecodeProto},
+    proto::{self, DecodeProto, DecodeProtoView},
     wire::{UUID_BYTE_LENGTH, fixed_bytes_field},
 };
 use snafu::prelude::*;
@@ -91,6 +92,41 @@ impl proto::ProtoCodec for DiscoveryRoute {
     }
 }
 
+impl DecodeProtoView for DiscoveryRoute {
+    type Error = DiscoveryProtocolError;
+    type ProtoView<'a> = SocketAddressView<'a>;
+
+    fn decode_proto_view(route: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let protocol = route.protocol.as_known().ok_or_else(|| {
+            DiscoveryProtocolError::UnsupportedRouteProtocol {
+                field: "SocketAddress.protocol",
+                value: route.protocol.to_i32(),
+            }
+        })?;
+        match protocol {
+            socket_address::Protocol::PROTOCOL_UDP => {
+                let address = route.address.as_option().context(
+                    discovery_protocol_error::MissingFieldSnafu {
+                        message: "SocketAddress",
+                        field: "address",
+                    },
+                )?;
+                let ip = ip_address_from_wire_view(address, "SocketAddress.address")?;
+                let port = socket_port_from_wire(route.port, "SocketAddress.port")?;
+                Ok(DiscoveryRoute::Udp(SocketAddr::new(ip, port)))
+            }
+            socket_address::Protocol::PROTOCOL_UNSPECIFIED
+            | socket_address::Protocol::PROTOCOL_TCP => {
+                discovery_protocol_error::UnsupportedRouteProtocolSnafu {
+                    field: "SocketAddress.protocol",
+                    value: route.protocol.to_i32(),
+                }
+                .fail()
+            }
+        }
+    }
+}
+
 impl DecodeProto for DecodedPeer {
     type Error = DiscoveryProtocolError;
     type Proto = Peer;
@@ -104,6 +140,28 @@ impl DecodeProto for DecodedPeer {
         let mut listening_on = Vec::with_capacity(peer.listening_on.len());
         for route in peer.listening_on {
             let route = DiscoveryRoute::decode_proto(route)?;
+            listening_on.push(route);
+        }
+        Ok(Self {
+            instance_id,
+            listening_on,
+        })
+    }
+}
+
+impl DecodeProtoView for DecodedPeer {
+    type Error = DiscoveryProtocolError;
+    type ProtoView<'a> = PeerView<'a>;
+
+    fn decode_proto_view(peer: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        ensure!(
+            !peer.listening_on.is_empty(),
+            discovery_protocol_error::EmptyPeerRoutesSnafu
+        );
+        let instance_id = uuid_from_wire(peer.instance_uuid, "Peer.instance_uuid")?;
+        let mut listening_on = Vec::with_capacity(peer.listening_on.len());
+        for route in &peer.listening_on {
+            let route = DiscoveryRoute::decode_proto_view(route)?;
             listening_on.push(route);
         }
         Ok(Self {
@@ -163,8 +221,8 @@ pub enum DiscoveryProtocolError {
 /// Returns [`DiscoveryProtocolError`] if the bytes are not a valid `Peer` or if any required
 /// protocol field is malformed.
 pub fn decode_peer_bytes(bytes: &[u8]) -> Result<DecodedPeer, DiscoveryProtocolError> {
-    let peer = Peer::decode_from_slice(bytes).context(discovery_protocol_error::DecodeSnafu)?;
-    DecodedPeer::decode_proto(peer)
+    let peer = PeerView::decode_view(bytes).context(discovery_protocol_error::DecodeSnafu)?;
+    DecodedPeer::decode_proto_view(&peer)
 }
 
 fn udp_socket_address_proto(address: SocketAddr) -> SocketAddress {
@@ -250,45 +308,6 @@ fn ip_address_from_wire(
     }
 }
 
-/// Decode and validate a borrowed discovery route view.
-///
-/// # Errors
-///
-/// Returns [`DiscoveryProtocolError`] if the route protocol, address, or port is unsupported.
-pub fn discovery_route_from_wire_view(
-    route: &SocketAddressView<'_>,
-    field: &'static str,
-) -> Result<DiscoveryRoute, DiscoveryProtocolError> {
-    let protocol = route.protocol.as_known().ok_or_else(|| {
-        DiscoveryProtocolError::UnsupportedRouteProtocol {
-            field,
-            value: route.protocol.to_i32(),
-        }
-    })?;
-    match protocol {
-        socket_address::Protocol::PROTOCOL_UDP => {
-            let address =
-                route
-                    .address
-                    .as_option()
-                    .context(discovery_protocol_error::MissingFieldSnafu {
-                        message: "SocketAddress",
-                        field: "address",
-                    })?;
-            let ip = ip_address_from_wire_view(address, field)?;
-            let port = socket_port_from_wire(route.port, field)?;
-            Ok(DiscoveryRoute::Udp(SocketAddr::new(ip, port)))
-        }
-        socket_address::Protocol::PROTOCOL_UNSPECIFIED | socket_address::Protocol::PROTOCOL_TCP => {
-            discovery_protocol_error::UnsupportedRouteProtocolSnafu {
-                field,
-                value: route.protocol.to_i32(),
-            }
-            .fail()
-        }
-    }
-}
-
 /// Decode and validate a borrowed discovery route IP-address view.
 fn ip_address_from_wire_view(
     address: &IPAddressView<'_>,
@@ -330,7 +349,11 @@ fn ip_address_from_wire_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_messages::{proto::EncodeProto, wire::uuid_to_wire_bytes};
+    use flotsync_messages::{
+        buffa::Message as _,
+        proto::{DecodeProtoView, EncodeProto},
+        wire::uuid_to_wire_bytes,
+    };
 
     #[test]
     fn decodes_valid_peer_with_udp_route() {
@@ -352,6 +375,19 @@ mod tests {
                 52156
             )))]
         );
+    }
+
+    #[test]
+    fn route_conversion_accepts_udp_route_views() {
+        let route = DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156)));
+        let route_payload = route.encode_proto().encode_to_bytes();
+        let route_view =
+            SocketAddressView::decode_view(&route_payload).expect("route view should decode");
+
+        let decoded =
+            DiscoveryRoute::decode_proto_view(&route_view).expect("UDP route view should decode");
+
+        assert_eq!(decoded, route);
     }
 
     #[test]

@@ -1,0 +1,25 @@
+id = "019f0887-814f-7802-bcf1-5d4fd4e626e0"
+ref = "flotsync-6s0-m4"
+title = "Add proto byte and buffer decode conveniences"
+body = """
+Add convenience decode entry points on the proto conversion traits so byte and buffer boundaries do not need to repeat the decode-view boilerplate at every call site.
+
+Context: after flotsync-6s0-m2, DecodeProtoView and DecodeProtoViewWith know the generated borrowed view type. Call sites such as decode_peer_bytes still manually call FooView::decode_view(bytes) and then Type::decode_proto_view(&view). The trait API can provide this common shape directly.
+
+Scope A: add default helper methods to DecodeProtoView and DecodeProtoViewWith for decoding from &[u8]. Prefer names that clearly describe the byte boundary, for example decode_proto_view_from_slice or decode_from_proto_bytes.
+
+Scope B: evaluate whether equivalent helpers for buffa::bytes::Buf, IoPayload, or buffers derived from ingress/egress pools belong on the shared traits or should be small crate-local adapters. Keep this initial pass narrow if the shared trait would otherwise learn too much about IO-layer types.
+
+Scope C: update representative call sites such as discovery peer bytes, runtime message bytes, route claim payload bytes, and security signature tests where the default helper removes repeated view boilerplate without hiding required runtime context.
+
+Scope D: preserve the owned-vs-view distinction. The conveniences should still route through generated borrowed views and should not construct owned generated protobuf messages unless explicitly required.
+
+Acceptance E: common slice-to-view-to-runtime decode paths use the new trait helpers, contextual decode remains explicit, and flotsync-6s0.4 can focus on any residual conversion sprawl rather than this repeated boilerplate."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f0593-fba3-7113-b045-357200b86eaf"]
+blocks = ["019f0787-3033-71c0-abb4-6d022ed646a5"]
+parent = "019f0542-b0cc-70a2-9d97-55fa819ecb81"
+created_at = "2026-06-27T10:02:06.031153Z"
+updated_at = "2026-06-27T10:02:22.354369Z"

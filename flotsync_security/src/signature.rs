@@ -6,7 +6,7 @@ use crate::{
 use ed25519_dalek::{Digest, Sha512, Signature};
 use flotsync_messages::{
     buffa::EnumValue,
-    discovery::{self as discovery_proto, DiscoverySignature},
+    discovery::{self as discovery_proto, DiscoverySignature, DiscoverySignatureView},
     proto,
 };
 use snafu::prelude::*;
@@ -166,6 +166,33 @@ impl proto::ProtoCodec for FrameSignature {
             .map_err(|_| FrameSignatureProtoError::InvalidSignatureLength {
                 actual: signature.signature_bytes.len(),
             })?;
+        Ok(Self::from_bytes(bytes))
+    }
+}
+
+impl proto::DecodeProtoView for FrameSignature {
+    type Error = FrameSignatureProtoError;
+    type ProtoView<'a> = DiscoverySignatureView<'a>;
+
+    fn decode_proto_view(
+        signature: &Self::ProtoView<'_>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let scheme = signature.scheme.as_known().ok_or_else(|| {
+            FrameSignatureProtoError::UnsupportedSignatureScheme {
+                value: signature.scheme.to_i32(),
+            }
+        })?;
+        ensure!(
+            scheme == discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH,
+            UnsupportedSignatureSchemeSnafu {
+                value: signature.scheme.to_i32()
+            }
+        );
+        let bytes: [u8; SIGNATURE_LENGTH] = signature.signature_bytes.try_into().map_err(|_| {
+            FrameSignatureProtoError::InvalidSignatureLength {
+                actual: signature.signature_bytes.len(),
+            }
+        })?;
         Ok(Self::from_bytes(bytes))
     }
 }

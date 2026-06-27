@@ -13,7 +13,7 @@ use flotsync_messages::{
         discovery_frame,
     },
     endpoint::{EndpointFrame, EndpointFrameView, endpoint_frame},
-    proto::DecodeProto,
+    proto::{DecodeProto, DecodeProtoView},
     wire::{UUID_BYTE_LENGTH, fixed_bytes_field, group_id_from_wire_bytes},
 };
 use snafu::prelude::*;
@@ -71,6 +71,41 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
     }
 }
 
+impl DecodeProtoView for DecodedIntroductionClaimPayload {
+    type Error = DiscoveryProtocolError;
+    type ProtoView<'a> = IntroductionClaimPayloadView<'a>;
+
+    fn decode_proto_view(payload: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let instance_id = uuid_from_wire(
+            payload.instance_uuid,
+            "IntroductionClaimPayload.instance_uuid",
+        )?;
+        ensure!(
+            !payload.request_nonce.is_empty(),
+            discovery_protocol_error::EmptyBytesSnafu {
+                field: "IntroductionClaimPayload.request_nonce"
+            }
+        );
+        let route =
+            payload
+                .route
+                .as_option()
+                .context(discovery_protocol_error::MissingFieldSnafu {
+                    message: "IntroductionClaimPayload",
+                    field: "route",
+                })?;
+        let route = DiscoveryRoute::decode_proto_view(route)?;
+        let group_ids =
+            decode_claim_group_ids(payload.group_ids.iter().copied(), payload.group_ids.len())?;
+        Ok(Self {
+            instance_id,
+            request_nonce: payload.request_nonce.to_vec(),
+            route,
+            group_ids,
+        })
+    }
+}
+
 /// Decode and validate one signed claim payload from its exact transmitted bytes.
 ///
 /// # Errors
@@ -80,20 +115,9 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
 pub fn decode_introduction_claim_payload(
     bytes: &[u8],
 ) -> Result<DecodedIntroductionClaimPayload, DiscoveryProtocolError> {
-    let payload = IntroductionClaimPayload::decode_from_slice(bytes)
+    let payload = IntroductionClaimPayloadView::decode_view(bytes)
         .context(discovery_protocol_error::DecodeSnafu)?;
-    DecodedIntroductionClaimPayload::decode_proto(payload)
-}
-
-/// Decode one signed claim payload view from its exact transmitted bytes.
-///
-/// # Errors
-///
-/// Returns [`DiscoveryProtocolError`] if the bytes are not a valid claim payload.
-pub fn decode_introduction_claim_payload_view(
-    bytes: &[u8],
-) -> Result<IntroductionClaimPayloadView<'_>, DiscoveryProtocolError> {
-    IntroductionClaimPayloadView::decode_view(bytes).context(discovery_protocol_error::DecodeSnafu)
+    DecodedIntroductionClaimPayload::decode_proto_view(&payload)
 }
 
 /// Decode and validate the group ids in one signed claim payload.
@@ -105,7 +129,8 @@ pub fn decode_introduction_claim_payload_view(
 pub fn decode_introduction_claim_group_ids(
     bytes: &[u8],
 ) -> Result<HashSet<GroupId>, DiscoveryProtocolError> {
-    let payload = decode_introduction_claim_payload_view(bytes)?;
+    let payload = IntroductionClaimPayloadView::decode_view(bytes)
+        .context(discovery_protocol_error::DecodeSnafu)?;
     decode_claim_group_ids(payload.group_ids.iter().copied(), payload.group_ids.len())
 }
 
@@ -245,7 +270,7 @@ mod tests {
     use flotsync_messages::{
         buffa::MessageField,
         discovery::socket_address,
-        proto::{DecodeProto, EncodeProto},
+        proto::{DecodeProto, DecodeProtoView, EncodeProto},
         wire::{group_id_to_wire_bytes, uuid_to_wire_bytes},
     };
     use std::net::SocketAddr;
@@ -266,8 +291,11 @@ mod tests {
             ..IntroductionClaimPayload::default()
         };
 
-        let decoded = decode_introduction_claim_payload(&payload.encode_to_vec())
-            .expect("valid claim should decode");
+        let payload_bytes = payload.encode_to_vec();
+        let decoded =
+            decode_introduction_claim_payload(&payload_bytes).expect("valid claim should decode");
+        let payload_view = IntroductionClaimPayloadView::decode_view(&payload_bytes)
+            .expect("claim payload view should decode");
 
         assert_eq!(decoded.instance_id, Uuid::from_u128(0x1234));
         assert_eq!(decoded.request_nonce, vec![0x42; 16]);
@@ -275,6 +303,11 @@ mod tests {
         assert_eq!(
             decoded.group_ids,
             HashSet::from([first_group, second_group])
+        );
+        assert_eq!(
+            DecodedIntroductionClaimPayload::decode_proto_view(&payload_view)
+                .expect("claim payload view should convert"),
+            decoded
         );
     }
 

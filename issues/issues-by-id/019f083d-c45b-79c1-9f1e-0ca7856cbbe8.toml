@@ -1,0 +1,24 @@
+id = "019f083d-c45b-79c1-9f1e-0ca7856cbbe8"
+ref = "flotsync-git-02c"
+title = "Evaluate schema-operation view decoding payoff"
+body = """
+Evaluate whether direct borrowed-view decoding for datamodel SchemaOperation payloads is worth implementing.
+
+Context: flotsync-6s0-m2 decodes runtime DatasetUpdateView without constructing an owned replication DatasetUpdate, but it intentionally converts nested SchemaOperationView values to owned SchemaOperation values because replication runtime/storage currently needs owned operations.
+
+Scope A: inspect the generated datamodel SchemaOperationView tree and the existing flotsync_messages::codecs::datamodel operation decoders.
+
+Scope B: estimate the LOC, test surface, allocation savings, and hot-path impact of decoding SchemaOperationView directly into the datamodel runtime operation type.
+
+Scope C: recommend either doing nothing, adding a narrow view helper for SchemaOperation only, or introducing a broader datamodel view conversion layer.
+
+Acceptance D: the decision is recorded with enough evidence to decide whether a future implementation task is useful."""
+status = "open"
+type = "task"
+priority = 2
+created_at = "2026-06-27T08:41:33.531362Z"
+updated_at = "2026-06-27T09:06:38.539324Z"
+
+[[links]]
+target = "019f0593-d303-7692-b7d3-f7694772d7fe"
+label = "discovered from"

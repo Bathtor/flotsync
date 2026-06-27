@@ -1,15 +1,15 @@
 //! Wire-level validation helpers for signed route-establishment introductions.
 
-use crate::protocol::decode_introduction_claim_payload_view;
 use flotsync_core::MemberIdentity;
 use flotsync_discovery::protocol::{
     DiscoveryProtocolError,
     DiscoveryRoute,
-    discovery_route_from_wire_view,
+    discovery_protocol_error,
 };
 use flotsync_messages::{
+    buffa::MessageView as _,
     discovery::{self as discovery_proto, IntroductionClaimPayloadView},
-    proto::DecodeProto,
+    proto::{DecodeProto, DecodeProtoView},
     wire::{WireValueDecodeError, member_identity_from_wire_format},
 };
 use flotsync_security::{FrameSignature, FrameSignatureProtoError};
@@ -67,7 +67,8 @@ pub fn prepare_claim_for_verification(
         return Ok(None);
     }
     {
-        let payload = decode_introduction_claim_payload_view(&claim.claim_payload)
+        let payload = IntroductionClaimPayloadView::decode_view(&claim.claim_payload)
+            .context(discovery_protocol_error::DecodeSnafu)
             .context(DecodeClaimPayloadSnafu)?;
         validate_claim_payload(
             expected_route,
@@ -119,8 +120,8 @@ pub fn validate_claim_payload(
         message: "IntroductionClaimPayload",
         field: "route",
     })?;
-    let claimed_route = discovery_route_from_wire_view(route, "IntroductionClaimPayload.route")
-        .context(DecodeClaimPayloadSnafu)?;
+    let claimed_route =
+        DiscoveryRoute::decode_proto_view(route).context(DecodeClaimPayloadSnafu)?;
     ensure!(
         claimed_route == expected_route,
         ClaimMismatchSnafu { field: "route" }
