@@ -40,15 +40,6 @@ impl DiscoveryRoute {
     }
 }
 
-/// A decoded plaintext peer announcement.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodedPeer {
-    /// Running process id for the announcing peer instance.
-    pub instance_id: Uuid,
-    /// Reachability endpoints advertised by this peer instance.
-    pub listening_on: Vec<DiscoveryRoute>,
-}
-
 impl proto::ProtoCodec for DiscoveryRoute {
     type DecodeError = DiscoveryProtocolError;
     type Proto = SocketAddress;
@@ -125,6 +116,15 @@ impl DecodeProtoView for DiscoveryRoute {
             }
         }
     }
+}
+
+/// A decoded plaintext peer announcement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedPeer {
+    /// Running process id for the announcing peer instance.
+    pub instance_id: Uuid,
+    /// Reachability endpoints advertised by this peer instance.
+    pub listening_on: Vec<DiscoveryRoute>,
 }
 
 impl DecodeProto for DecodedPeer {

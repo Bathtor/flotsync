@@ -2,7 +2,7 @@ use crate::{buffa::Message as BuffaMessage, proto::EncodeProto};
 use flotsync_io::prelude::{EgressAsyncWriter, EgressPool, Error as IoError, IoPayload};
 use flotsync_utils::{BoxFuture, IString};
 use futures_util::FutureExt;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 /// Size hint returned by one serialisable network message.
 ///
@@ -73,7 +73,7 @@ where
             let mut reserved = writer
                 .write_with_reserved(reserved_bytes)
                 .await
-                .map_err(|source| FlotsyncSerializeError::Io { source })?;
+                .context(IoSnafu)?;
             proto.encode(&mut reserved);
             Ok(())
         }
@@ -98,7 +98,7 @@ where
             let mut reserved = writer
                 .write_with_reserved(reserved_bytes)
                 .await
-                .map_err(|source| FlotsyncSerializeError::Io { source })?;
+                .context(IoSnafu)?;
             self.encode(&mut reserved);
             Ok(())
         }
@@ -135,9 +135,7 @@ pub async fn encode_message_payload(
     };
     let mut writer = egress_pool.writer(hint);
     message.serialize_into(&mut writer).await?;
-    let payload = writer
-        .finish()
-        .map_err(|source| FlotsyncSerializeError::Io { source })?;
+    let payload = writer.finish().context(IoSnafu)?;
     Ok(payload.unwrap_or_else(|| IoPayload::from_static(b"")))
 }
 
