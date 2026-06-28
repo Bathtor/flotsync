@@ -6,8 +6,9 @@ use crate::{
 use ed25519_dalek::{Digest, Sha512, Signature};
 use flotsync_messages::{
     buffa::EnumValue,
-    discovery::{self as discovery_proto, DiscoverySignature, DiscoverySignatureView},
+    discovery::{DiscoverySignature, DiscoverySignatureView},
     proto,
+    security as security_proto,
 };
 use snafu::prelude::*;
 
@@ -141,7 +142,7 @@ impl proto::ProtoCodec for FrameSignature {
 
     fn to_proto(&self) -> Self::Proto {
         DiscoverySignature {
-            scheme: EnumValue::from(discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH),
+            scheme: EnumValue::from(security_proto::SignatureScheme::SIGNATURE_SCHEME_ED25519PH),
             signature_bytes: self.as_bytes().to_vec(),
             ..DiscoverySignature::default()
         }
@@ -154,7 +155,7 @@ impl proto::ProtoCodec for FrameSignature {
             }
         })?;
         ensure!(
-            scheme == discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH,
+            scheme == security_proto::SignatureScheme::SIGNATURE_SCHEME_ED25519PH,
             UnsupportedSignatureSchemeSnafu {
                 value: signature.scheme.to_i32()
             }
@@ -183,7 +184,7 @@ impl proto::DecodeProtoView for FrameSignature {
             }
         })?;
         ensure!(
-            scheme == discovery_proto::discovery_signature::Scheme::SCHEME_ED25519PH,
+            scheme == security_proto::SignatureScheme::SIGNATURE_SCHEME_ED25519PH,
             UnsupportedSignatureSchemeSnafu {
                 value: signature.scheme.to_i32()
             }

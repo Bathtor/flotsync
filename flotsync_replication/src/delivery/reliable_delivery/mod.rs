@@ -1841,7 +1841,7 @@ mod tests {
             signature: flotsync_messages::buffa::MessageField::some(
                 delivery_proto::DetachedSignature {
                     scheme: flotsync_messages::buffa::EnumValue::from(
-                        delivery_proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
+                        flotsync_messages::security::SignatureScheme::SIGNATURE_SCHEME_ED25519PH,
                     ),
                     signature_bytes: Bytes::from_static(b"short"),
                     ..delivery_proto::DetachedSignature::default()

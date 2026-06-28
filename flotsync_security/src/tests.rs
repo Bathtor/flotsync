@@ -15,19 +15,20 @@ use crate::{
     StoreSecretContext,
     StoreSecretCryptoVersion,
     StoreSecretKey,
+    encode_public_key_bundle,
     group_key_from_stored_secret_plaintext,
     hpke_open,
     hpke_seal,
-    identity::{MEMBER_KEY_SEED_LENGTH, generate_member_key_files_from_seed},
+    identity::{MEMBER_KEY_SEED_LENGTH, generate_member_key_bundles_from_seed},
     install_local_store_secret_test_store,
     load_local_store_secret,
     load_or_create_local_store_secret,
-    local_member_keys_from_jwks,
+    local_member_keys_from_private_bundle,
     open_group_message,
     open_group_payload,
     open_reliable_payload,
     open_store_secret,
-    public_member_keys_from_jwks,
+    public_member_keys_from_public_bundle,
     seal_group_message,
     seal_group_payload,
     seal_reliable_payload,
@@ -39,15 +40,12 @@ use crate::{
 use bytes::Bytes;
 use flotsync_core::member::Identifier;
 use flotsync_messages::{
-    buffa::{Message as _, MessageView as _},
+    buffa::{EnumValue, Message as _, MessageField, MessageView as _},
     discovery::DiscoverySignatureView,
     proto::{DecodeProtoView, EncodeProto},
+    security as security_proto,
 };
-use jose_jwk::{JwkSet, Operations};
-use std::{
-    collections::BTreeSet,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 const ALICE_SEED: [u8; MEMBER_KEY_SEED_LENGTH] = [1u8; MEMBER_KEY_SEED_LENGTH];
@@ -59,23 +57,13 @@ const STORE_SECRET_TEST_KEY_ID: Uuid = Uuid::from_u128(0x100);
 
 fn local_member(name: &str, seed: [u8; MEMBER_KEY_SEED_LENGTH]) -> LocalMemberKeys {
     let member = member(name);
-    let generated = generate_member_key_files_from_seed(member.clone(), &seed).unwrap();
-    local_member_keys_from_jwks(generated.local_private_jwks.as_str(), Some(&member)).unwrap()
+    let generated = generate_member_key_bundles_from_seed(member.clone(), &seed);
+    local_member_keys_from_private_bundle(generated.local_private_bundle.as_bytes(), member)
+        .unwrap()
 }
 
 fn member(name: &str) -> MemberIdentity {
     Identifier::from_array([name, "laptop"])
-}
-
-fn key_ops(jwks: &JwkSet, kid: &str) -> BTreeSet<Operations> {
-    jwks.keys
-        .iter()
-        .find(|jwk| jwk.prm.kid.as_deref() == Some(kid))
-        .unwrap()
-        .prm
-        .ops
-        .clone()
-        .unwrap()
 }
 
 fn unique_local_store_secret_profile(label: &str) -> LocalStoreSecretProfile {
@@ -99,13 +87,17 @@ fn signed_frame_fixture() -> (LocalMemberKeys, FrameSignature) {
 }
 
 #[test]
-fn generated_key_files_parse_back_to_member_keys() {
+fn generated_key_bundles_decode_back_to_member_keys() {
     let alice = member("alice");
-    let generated = generate_member_key_files_from_seed(alice.clone(), &ALICE_SEED).unwrap();
+    let generated = generate_member_key_bundles_from_seed(alice.clone(), &ALICE_SEED);
 
-    let local =
-        local_member_keys_from_jwks(generated.local_private_jwks.as_str(), Some(&alice)).unwrap();
-    let public = public_member_keys_from_jwks(&generated.public_jwks, Some(&alice)).unwrap();
+    let local = local_member_keys_from_private_bundle(
+        generated.local_private_bundle.as_bytes(),
+        alice.clone(),
+    )
+    .unwrap();
+    let public =
+        public_member_keys_from_public_bundle(&generated.public_bundle, alice.clone()).unwrap();
 
     assert_eq!(local.member_id(), &alice);
     assert_eq!(public.member_id(), &alice);
@@ -113,40 +105,95 @@ fn generated_key_files_parse_back_to_member_keys() {
 }
 
 #[test]
-fn rejects_key_with_wrong_role_suffix() {
+fn generated_public_key_bundle_is_identity_free() {
     let alice = member("alice");
-    let generated = generate_member_key_files_from_seed(alice, &ALICE_SEED).unwrap();
-    let invalid = generated.public_jwks.replace("#sign", "#enc");
+    let bob = member("bob");
+    let generated = generate_member_key_bundles_from_seed(alice, &ALICE_SEED);
 
-    let err = public_member_keys_from_jwks(&invalid, None).unwrap_err();
+    let decoded =
+        public_member_keys_from_public_bundle(&generated.public_bundle, bob.clone()).unwrap();
 
-    assert!(matches!(err, SecurityError::KeyRoleMismatch { .. }));
+    assert_eq!(decoded.member_id(), &bob);
 }
 
 #[test]
-fn generated_key_files_use_scope_appropriate_key_ops() {
-    let alice = member("alice");
-    let generated = generate_member_key_files_from_seed(alice, &ALICE_SEED).unwrap();
-    let public_jwks = serde_json::from_str::<JwkSet>(&generated.public_jwks).unwrap();
-    let private_jwks =
-        serde_json::from_str::<JwkSet>(generated.local_private_jwks.as_str()).unwrap();
+fn rejects_malformed_key_bundle_bytes() {
+    let err = public_member_keys_from_public_bundle(b"not protobuf", member("alice")).unwrap_err();
 
-    assert_eq!(
-        key_ops(&public_jwks, "alice.laptop#sign"),
-        BTreeSet::from([Operations::Verify])
-    );
-    assert_eq!(
-        key_ops(&public_jwks, "alice.laptop#enc"),
-        BTreeSet::from([Operations::Encrypt])
-    );
-    assert_eq!(
-        key_ops(&private_jwks, "alice.laptop#sign"),
-        BTreeSet::from([Operations::Sign])
-    );
-    assert_eq!(
-        key_ops(&private_jwks, "alice.laptop#enc"),
-        BTreeSet::from([Operations::Decrypt])
-    );
+    assert!(matches!(err, SecurityError::DecodeKeyBundle { .. }));
+}
+
+#[test]
+fn rejects_unsupported_key_bundle_version() {
+    let alice = member("alice");
+    let generated = generate_member_key_bundles_from_seed(alice.clone(), &ALICE_SEED);
+    let public = public_member_keys_from_public_bundle(&generated.public_bundle, alice).unwrap();
+    let mut proto = public.encode_proto();
+    proto.format_version = 999;
+
+    let err =
+        public_member_keys_from_public_bundle(&proto.encode_to_vec(), member("alice")).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::UnsupportedKeyBundleVersion { actual: 999, .. }
+    ));
+}
+
+#[test]
+fn rejects_unknown_public_key_scheme() {
+    let alice = member("alice");
+    let generated = generate_member_key_bundles_from_seed(alice.clone(), &ALICE_SEED);
+    let public = public_member_keys_from_public_bundle(&generated.public_bundle, alice).unwrap();
+    let mut proto = public.encode_proto();
+    let mut signing_key = proto.signing_key.take().expect("signing key should exist");
+    signing_key.scheme = EnumValue::from(404);
+    proto.signing_key = MessageField::some(signing_key);
+
+    let err =
+        public_member_keys_from_public_bundle(&proto.encode_to_vec(), member("alice")).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::UnknownKeyScheme {
+            role: crate::KeyRole::Signing,
+            value: 404,
+        }
+    ));
+}
+
+#[test]
+fn rejects_public_private_key_pair_mismatch() {
+    let alice = member("alice");
+    let generated = generate_member_key_bundles_from_seed(alice.clone(), &ALICE_SEED);
+    let mut proto = security_proto::LocalPrivateKeyBundle::decode_from_slice(
+        generated.local_private_bundle.as_bytes(),
+    )
+    .unwrap();
+    let mut signing_key = proto.signing_key.take().expect("signing key should exist");
+    signing_key.public_key = [9u8; 32].to_vec();
+    proto.signing_key = MessageField::some(signing_key);
+
+    let err = local_member_keys_from_private_bundle(&proto.encode_to_vec(), alice).unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::KeyPairMismatch {
+            role: crate::KeyRole::Signing,
+        }
+    ));
+}
+
+#[test]
+fn public_key_bundle_encoding_roundtrips_public_keys() {
+    let alice = member("alice");
+    let local = local_member("alice", ALICE_SEED);
+    let bundle = encode_public_key_bundle(local.public_keys());
+
+    let public = public_member_keys_from_public_bundle(&bundle, alice.clone()).unwrap();
+
+    assert_eq!(public.member_id(), &alice);
+    assert_eq!(&public, local.public_keys());
 }
 
 #[test]

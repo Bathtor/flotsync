@@ -49,10 +49,10 @@ use flotsync_security::{
     STORE_SECRET_NONCE_LENGTH,
     StoreSecretContext,
     StoreSecretKey,
-    public_member_keys_from_jwks,
+    public_member_keys_from_public_bundle,
     seal_store_secret_for_test,
     test_group_key_from_id,
-    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_files_from_seed},
+    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_bundles_from_seed},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
@@ -573,8 +573,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`LoadError`] when deterministic test key generation, store-secret
-/// sealing, or any store transaction operation fails.
+/// Returns [`LoadError`] when store-secret sealing or any store transaction
+/// operation fails.
 pub async fn provision_test_security(
     application_id: Identifier,
     store: &dyn ReplicationStore,
@@ -582,11 +582,7 @@ pub async fn provision_test_security(
     trusted_members: impl IntoIterator<Item = MemberIdentity>,
 ) -> Result<(), LoadError> {
     let local_seed = test_member_seed(local_member);
-    let generated = member_key_files_from_seed(local_member.clone(), &local_seed)
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let generated = member_key_bundles_from_seed(local_member.clone(), &local_seed);
     let row_id = local_member.to_string();
     let context = StoreSecretContext {
         table: "local_member",
@@ -598,7 +594,7 @@ pub async fn provision_test_security(
     let sealed = seal_store_secret_for_test(
         &test_store_secret_key(),
         context,
-        generated.local_private_jwks.as_str().as_bytes(),
+        generated.local_private_bundle.as_bytes(),
         test_store_secret_nonce(local_member),
     )
     .boxed()
@@ -730,13 +726,12 @@ fn test_member_seed(member: &Identifier) -> [u8; TEST_MEMBER_KEY_SEED_LENGTH] {
 ///
 /// # Panics
 ///
-/// Panics if deterministic key generation or public-key parsing fails.
+/// Panics if public-key parsing fails.
 #[must_use]
 pub fn test_public_member_keys(member: &MemberIdentity) -> PublicMemberKeys {
     let seed = test_member_seed(member);
-    let generated = member_key_files_from_seed(member.clone(), &seed)
-        .expect("test member keys should generate");
-    public_member_keys_from_jwks(&generated.public_jwks, Some(member))
+    let generated = member_key_bundles_from_seed(member.clone(), &seed);
+    public_member_keys_from_public_bundle(&generated.public_bundle, member.clone())
         .expect("test public keys should parse")
 }
 

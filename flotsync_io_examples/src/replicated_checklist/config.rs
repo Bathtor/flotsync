@@ -17,10 +17,6 @@ const STORE_SECRET_PROFILE_KEY: &str =
     "flotsync.examples.replicated-checklist.store-secret-profile";
 const GROUP_SECRET_PASSWORD_KEY: &str =
     "flotsync.examples.replicated-checklist.group-secret-password";
-const LOCAL_PRIVATE_JWKS_PATH_KEY: &str =
-    "flotsync.examples.replicated-checklist.local-private-jwks-path";
-const TRUSTED_PUBLIC_JWKS_PATHS_KEY: &str =
-    "flotsync.examples.replicated-checklist.trusted-public-jwks-paths";
 const GROUP_ID_KEY: &str = "flotsync.examples.replicated-checklist.group-id";
 const ORDERED_MEMBERS_KEY: &str = "flotsync.examples.replicated-checklist.ordered-members";
 
@@ -43,10 +39,6 @@ pub struct ChecklistAppConfig {
     pub store_secret_profile: LocalStoreSecretProfile,
     /// Shared static-group secret derived from temporary plaintext config.
     pub group_key: Arc<GroupKey>,
-    /// Local-private member JWKS used by temporary setup provisioning.
-    pub local_private_jwks_path: PathBuf,
-    /// Trusted public member JWKS files used by temporary setup provisioning.
-    pub trusted_public_jwks_paths: Vec<PathBuf>,
     pub group_id: GroupId,
     pub ordered_members: Vec<MemberIdentity>,
 }
@@ -67,10 +59,6 @@ impl ChecklistAppConfig {
 
         let local_member = read_member(&config, LOCAL_MEMBER_KEY)?;
         let store_path = read_store_path(&config, &source_path)?;
-        let local_private_jwks_path =
-            read_path(&config, LOCAL_PRIVATE_JWKS_PATH_KEY, &source_path)?;
-        let trusted_public_jwks_paths =
-            read_path_list(&config, TRUSTED_PUBLIC_JWKS_PATHS_KEY, &source_path)?;
         let group_id = read_group_id(&config)?;
         let ordered_members = read_ordered_members(&config)?;
         let store_secret_profile = read_store_secret_profile(&config)?;
@@ -93,8 +81,6 @@ impl ChecklistAppConfig {
             store_path,
             store_secret_profile,
             group_key: Arc::new(group_key),
-            local_private_jwks_path,
-            trusted_public_jwks_paths,
             group_id,
             ordered_members,
         })
@@ -138,31 +124,6 @@ fn read_path(
 ) -> Result<PathBuf, ChecklistConfigError> {
     let value = read_string(config, key)?;
     Ok(resolve_config_path(PathBuf::from(value), source_path))
-}
-
-fn read_path_list(
-    config: &Config,
-    key: &'static str,
-    source_path: &Path,
-) -> Result<Vec<PathBuf>, ChecklistConfigError> {
-    let lookup = config.select(key);
-    let entries = lookup
-        .array_entries()
-        .map_err(|source| ChecklistConfigError::InvalidConfig {
-            key,
-            message: source.to_string(),
-        })?;
-    let mut paths = Vec::new();
-    for (index, entry) in entries {
-        let value = entry
-            .as_string()
-            .map_err(|source| ChecklistConfigError::InvalidConfig {
-                key,
-                message: format!("path[{index}]: {source}"),
-            })?;
-        paths.push(resolve_config_path(PathBuf::from(value), source_path));
-    }
-    Ok(paths)
 }
 
 fn resolve_config_path(path: PathBuf, source_path: &Path) -> PathBuf {
@@ -331,8 +292,6 @@ mod tests {
             store-path = "alice.sqlite"
             store-secret-profile = "config-parse-profile"
             group-secret-password = "temporary-group-password"
-            local-private-jwks-path = "alice-private.jwks"
-            trusted-public-jwks-paths = ["bob-public.jwks", "/tmp/carol-public.jwks"]
             group-id = 123
             ordered-members = ["alice", "bob"]
             "#,
@@ -343,11 +302,6 @@ mod tests {
         let store_path = read_store_path(&config, &path).expect("store path should parse");
         let store_secret_profile =
             read_store_secret_profile(&config).expect("profile should parse");
-        let local_private_jwks_path = read_path(&config, LOCAL_PRIVATE_JWKS_PATH_KEY, &path)
-            .expect("local private key path should parse");
-        let trusted_public_jwks_paths =
-            read_path_list(&config, TRUSTED_PUBLIC_JWKS_PATHS_KEY, &path)
-                .expect("trusted public key paths should parse");
         let group_id = read_group_id(&config).expect("group id should parse");
         let ordered_members = read_ordered_members(&config).expect("members should parse");
         let group_key =
@@ -356,14 +310,6 @@ mod tests {
         assert_eq!(local_member, MemberIdentity::from_array(["alice"]));
         assert_eq!(store_path, temp_dir.join("alice.sqlite"));
         assert_eq!(store_secret_profile.as_str(), "config-parse-profile");
-        assert_eq!(local_private_jwks_path, temp_dir.join("alice-private.jwks"));
-        assert_eq!(
-            trusted_public_jwks_paths,
-            vec![
-                temp_dir.join("bob-public.jwks"),
-                PathBuf::from("/tmp/carol-public.jwks")
-            ]
-        );
         assert_eq!(group_id, GroupId(Uuid::from_u128(123)));
         assert_eq!(
             ordered_members,
@@ -393,8 +339,6 @@ mod tests {
             store-path = "alice.sqlite"
             store-secret-profile = "config-load-profile"
             group-secret-password = "temporary-group-password"
-            local-private-jwks-path = "alice-private.jwks"
-            trusted-public-jwks-paths = ["bob-public.jwks"]
             group-id = 123
             ordered-members = ["alice", "bob"]
             "#,
@@ -418,8 +362,6 @@ mod tests {
             store-path = "alice.sqlite"
             store-secret-profile = "local-dev"
             group-secret-password = "temporary-group-password"
-            local-private-jwks-path = "carol-private.jwks"
-            trusted-public-jwks-paths = ["alice-public.jwks", "bob-public.jwks"]
             group-id = 123
             ordered-members = ["alice", "bob"]
             "#,
@@ -483,29 +425,6 @@ mod tests {
             result,
             Err(ChecklistConfigError::InvalidConfig { key, .. })
                 if key == GROUP_SECRET_PASSWORD_KEY
-        ));
-    }
-
-    #[test]
-    fn rejects_non_array_trusted_public_jwks_paths() {
-        let config = parse_config_str(
-            r#"
-            [flotsync.examples.replicated-checklist]
-            trusted-public-jwks-paths = "bob-public.jwks"
-            "#,
-        )
-        .expect("config should parse");
-
-        let result = read_path_list(
-            &config,
-            TRUSTED_PUBLIC_JWKS_PATHS_KEY,
-            Path::new("alice.toml"),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ChecklistConfigError::InvalidConfig { key, .. })
-                if key == TRUSTED_PUBLIC_JWKS_PATHS_KEY
         ));
     }
 }

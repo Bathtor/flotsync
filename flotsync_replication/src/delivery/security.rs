@@ -40,7 +40,7 @@ use flotsync_security::{
     StoreSecretContext,
     StoreSecretCryptoVersion,
     StoreSecretKey,
-    local_member_keys_from_jwks,
+    local_member_keys_from_private_bundle,
     open_group_payload,
     open_reliable_payload,
     open_store_secret,
@@ -168,8 +168,6 @@ pub(crate) enum DeliverySecurityError {
         expected: StoreSecretKeyId,
         actual: StoreSecretKeyId,
     },
-    #[snafu(display("Local private key payload was not valid UTF-8: {source}"))]
-    InvalidLocalPrivateKeyUtf8 { source: std::str::Utf8Error },
     #[snafu(display("Local private keys were invalid: {source}"))]
     InvalidLocalPrivateKeys { source: BoxError },
     #[snafu(display("Trusted public keys for member {member_id} were invalid: {source}"))]
@@ -266,7 +264,7 @@ impl DeliverySecurityError {
             // Group-secret key id mismatches require loading with the matching local key id.
             Self::GroupSecretKeyIdMismatch { .. } => false,
             // Invalid local private-key records need reprovisioning.
-            Self::InvalidLocalPrivateKeyUtf8 { .. } | Self::InvalidLocalPrivateKeys { .. } => false,
+            Self::InvalidLocalPrivateKeys { .. } => false,
             // Group-key generation depends on OS randomness and may recover on retry.
             Self::GenerateGroupKey { .. } => true,
             // Reliable-payload seal/open failures are crypto or key-consistency failures.
@@ -434,7 +432,7 @@ impl DeliverySecurity {
             recipient: header.recipient.clone(),
         })?;
         Ok(DetachedSignature {
-            scheme: SignatureScheme::Ed25519,
+            scheme: SignatureScheme::Ed25519Ph,
             bytes: Bytes::copy_from_slice(signature.as_bytes()),
         })
     }
@@ -779,7 +777,7 @@ fn recipient_ack_frame_signature(
     signature: &DetachedSignature,
 ) -> Result<FrameSignature, DeliverySecurityError> {
     match signature.scheme {
-        SignatureScheme::Ed25519 => {}
+        SignatureScheme::Ed25519Ph => {}
     }
     let bytes = signature.bytes.as_ref().try_into().map_err(|_| {
         DeliverySecurityError::InvalidRecipientAckSignatureLength {
@@ -815,9 +813,7 @@ fn open_local_private_keys(
     let plaintext = open_store_secret(store_secret_key, context, &sealed)
         .boxed()
         .context(OpenLocalPrivateKeysSnafu)?;
-    let jwks =
-        std::str::from_utf8(plaintext.as_slice()).context(InvalidLocalPrivateKeyUtf8Snafu)?;
-    local_member_keys_from_jwks(jwks, Some(&record.member_id))
+    local_member_keys_from_private_bundle(plaintext.as_slice(), record.member_id.clone())
         .boxed()
         .context(InvalidLocalPrivateKeysSnafu)
 }

@@ -76,8 +76,7 @@ pub(super) fn load_security_error_from_local_member(
         DeliverySecurityError::MissingLocalPrivateKeys { member_id } => {
             LoadSecurityError::MissingLocalPrivateKeys { member_id }
         }
-        DeliverySecurityError::InvalidLocalPrivateKeyUtf8 { .. }
-        | DeliverySecurityError::InvalidLocalPrivateKeys { .. }
+        DeliverySecurityError::InvalidLocalPrivateKeys { .. }
         | DeliverySecurityError::OpenLocalPrivateKeys { .. }
         | DeliverySecurityError::UnsupportedStoreSecretVersion { .. }
         | DeliverySecurityError::InvalidStoreSecretNonce { .. } => {

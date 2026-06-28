@@ -902,7 +902,7 @@ pub struct EncryptedGroupSecurityMaterial {
 /// Encrypted local member private key material.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedLocalMemberPrivateKeys {
-    /// Encrypted private JWKS/key payload for the local member.
+    /// Encrypted private key bundle for the local member.
     pub secret: EncryptedStoreSecret,
 }
 

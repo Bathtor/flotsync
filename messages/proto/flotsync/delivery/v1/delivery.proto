@@ -3,6 +3,7 @@ syntax = "proto3";
 package flotsync.delivery.v1;
 
 import "flotsync/discovery/v1/discovery.proto";
+import "flotsync/security/v1/security.proto";
 
 // Group-broadcast-owned inbound endpoint branch.
 message GroupBroadcastFrame {
@@ -183,14 +184,9 @@ message ReliableRelayStoreConfirmationWire {
   bytes receipt_id = 17;
 }
 
-enum KnownSignatureScheme {
-  KNOWN_SIGNATURE_SCHEME_UNSPECIFIED = 0;
-  KNOWN_SIGNATURE_SCHEME_ED25519 = 1;
-}
-
 // Signature-only authentication bytes plus scheme reference. Use this when a
 // frame authenticates its public header but carries no encrypted body.
 message DetachedSignature {
-  KnownSignatureScheme scheme = 1;
+  flotsync.security.v1.SignatureScheme scheme = 1;
   bytes signature_bytes = 2;
 }

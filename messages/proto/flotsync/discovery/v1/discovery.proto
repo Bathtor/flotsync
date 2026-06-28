@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package flotsync.discovery.v1;
 
+import "flotsync/security/v1/security.proto";
+
 // A full socket address, specifying protocol, address, and port.
 message SocketAddress {
   enum Protocol {
@@ -68,12 +70,7 @@ message Identifier {
 
 // Signature schemes used by discovery identity proofs.
 message DiscoverySignature {
-  enum Scheme {
-    SCHEME_UNSPECIFIED = 0;
-    SCHEME_ED25519PH = 1;
-  }
-
-  Scheme scheme = 1;
+  flotsync.security.v1.SignatureScheme scheme = 1;
   bytes signature_bytes = 2;
 }
 

@@ -46,15 +46,9 @@ use flotsync_replication::{
     SummaryRequest,
     load_replication_runtime_with_runtime_config_toml,
     prepare_initial_group_security_material,
-    provision_replication_security,
     validate_initial_group_security_material,
 };
-use flotsync_security::{
-    STORE_SECRET_KEY_LENGTH,
-    SecurityError,
-    StoreSecretKey,
-    generate_member_key_files,
-};
+use flotsync_security::{STORE_SECRET_KEY_LENGTH, StoreSecretKey};
 use futures_util::{FutureExt, future::join_all};
 use kompact::prelude::block_on;
 use sha2::{Digest, Sha256};
@@ -75,8 +69,6 @@ use std::{
 };
 
 const CHECKLIST_SNAPSHOT_BATCH_SIZE: NonZeroUsize = NonZeroUsize::new(128).unwrap();
-const GENERATED_PRIVATE_JWKS_FILE_NAME: &str = "private.jwks";
-const GENERATED_PUBLIC_JWKS_FILE_NAME: &str = "public.jwks";
 // TODO(flotsync-lsi8): Remove this unsafe profile escape hatch once headless
 // local store-secret backends are implemented.
 const UNSAFE_STORE_SECRET_PROFILE_PREFIX: &str = "unsafe:";
@@ -101,25 +93,6 @@ pub enum ReplicatedChecklistCommand {
         /// Path to the node-specific checklist TOML config.
         config: PathBuf,
     },
-    /// Generate local-private and public JWKS files for one member.
-    GenerateKeys {
-        /// Member identity to encode into the generated JWKS files.
-        member: MemberIdentity,
-        /// Directory where private.jwks and public.jwks will be written.
-        out_dir: PathBuf,
-        /// Replace existing generated files in the output directory.
-        #[arg(long)]
-        force: bool,
-    },
-}
-
-/// Sensitivity class for generated key-file write policy.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GeneratedKeyFileKind {
-    /// Local private identity JWKS; final and temporary files must be owner-only.
-    Private,
-    /// Public identity JWKS intended to be copied to trusted peers.
-    Public,
 }
 
 /// Run one configured replicated checklist REPL.
@@ -134,11 +107,6 @@ enum GeneratedKeyFileKind {
 pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError> {
     match args.command {
         ReplicatedChecklistCommand::Run { config } => run_configured_peer(&config),
-        ReplicatedChecklistCommand::GenerateKeys {
-            member,
-            out_dir,
-            force,
-        } => generate_checklist_key_files(member, &out_dir, force),
     }
 }
 
@@ -240,109 +208,6 @@ fn derive_unsafe_checklist_store_secret_digest(
     hasher.finalize().into()
 }
 
-/// Generate the fixed key-file pair expected by replicated-checklist config.
-fn generate_checklist_key_files(
-    member: MemberIdentity,
-    out_dir: &Path,
-    force: bool,
-) -> Result<(), ReplicatedChecklistError> {
-    fs::create_dir_all(out_dir).context(repl_error::CreateKeyDirectorySnafu {
-        path: out_dir.to_path_buf(),
-    })?;
-    let private_path = out_dir.join(GENERATED_PRIVATE_JWKS_FILE_NAME);
-    let public_path = out_dir.join(GENERATED_PUBLIC_JWKS_FILE_NAME);
-    ensure_generated_key_targets_available([&private_path, &public_path], force)?;
-
-    let generated = generate_member_key_files(member).context(repl_error::GenerateKeysSnafu)?;
-    let public_temp = write_generated_key_temp_file(
-        &public_path,
-        &generated.public_jwks,
-        GeneratedKeyFileKind::Public,
-    )?;
-    let private_temp = match write_generated_key_temp_file(
-        &private_path,
-        generated.local_private_jwks.as_str(),
-        GeneratedKeyFileKind::Private,
-    ) {
-        Ok(temp_path) => temp_path,
-        Err(error) => {
-            let _ = fs::remove_file(&public_temp);
-            return Err(error);
-        }
-    };
-    if let Err(error) = promote_generated_key_file(&public_temp, &public_path) {
-        let _ = fs::remove_file(&public_temp);
-        let _ = fs::remove_file(&private_temp);
-        return Err(error);
-    }
-    if let Err(error) = promote_generated_key_file(&private_temp, &private_path) {
-        let _ = fs::remove_file(&public_path);
-        let _ = fs::remove_file(&private_temp);
-        return Err(error);
-    }
-
-    println!("wrote {}", private_path.display());
-    println!("wrote {}", public_path.display());
-    Ok(())
-}
-
-/// Fail before generating new material if any final key-file target already exists.
-fn ensure_generated_key_targets_available<'a>(
-    paths: impl IntoIterator<Item = &'a PathBuf>,
-    force: bool,
-) -> Result<(), ReplicatedChecklistError> {
-    for path in paths {
-        ensure!(
-            force || !path.exists(),
-            repl_error::KeyFileExistsSnafu { path: path.clone() }
-        );
-    }
-    Ok(())
-}
-
-/// Write one generated key file to a same-directory temporary path.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn write_generated_key_temp_file(
-    path: &Path,
-    contents: &str,
-    kind: GeneratedKeyFileKind,
-) -> Result<PathBuf, ReplicatedChecklistError> {
-    let temp_path = generated_key_temp_path(path);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    if kind == GeneratedKeyFileKind::Private {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temp_path)
-        .context(repl_error::WriteKeyFileSnafu {
-            path: temp_path.clone(),
-        })?;
-    file.write_all(contents.as_bytes())
-        .context(repl_error::WriteKeyFileSnafu {
-            path: temp_path.clone(),
-        })?;
-    Ok(temp_path)
-}
-
-/// Build a collision-resistant temporary path next to the final key-file target.
-fn generated_key_temp_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(".key-{}.tmp", uuid::Uuid::new_v4()))
-}
-
-/// Move a completed temporary key file into its final location.
-fn promote_generated_key_file(
-    temp_path: &Path,
-    path: &Path,
-) -> Result<(), ReplicatedChecklistError> {
-    fs::rename(temp_path, path).context(repl_error::PromoteKeyFileSnafu {
-        temp_path: temp_path.to_path_buf(),
-        path: path.to_path_buf(),
-    })
-}
-
 /// Errors from the replicated checklist binary.
 #[derive(Debug, Snafu)]
 #[snafu(module(repl_error))]
@@ -355,24 +220,6 @@ pub enum ReplicatedChecklistError {
     CreateStoreDirectory { path: PathBuf, source: io::Error },
     #[snafu(display("Failed to open checklist replication store: {source}"))]
     Store { source: StoreError },
-    #[snafu(display("Failed to create key output directory {}: {source}", path.display()))]
-    CreateKeyDirectory { path: PathBuf, source: io::Error },
-    #[snafu(display("Failed to generate member key files: {source}"))]
-    GenerateKeys { source: SecurityError },
-    #[snafu(display("Refusing to overwrite existing key file {}", path.display()))]
-    KeyFileExists { path: PathBuf },
-    #[snafu(display("Failed to write key file {}: {source}", path.display()))]
-    WriteKeyFile { path: PathBuf, source: io::Error },
-    #[snafu(display(
-        "Failed to promote generated key file {} to {}: {source}",
-        temp_path.display(),
-        path.display()
-    ))]
-    PromoteKeyFile {
-        temp_path: PathBuf,
-        path: PathBuf,
-        source: io::Error,
-    },
     #[snafu(display("{source}"))]
     StaticGroup { source: StaticGroupError },
     #[snafu(display("Failed to load replication runtime: {source}"))]
@@ -433,18 +280,6 @@ pub enum StaticGroupError {
         expected: MemberIndex,
         actual: MemberIndex,
     },
-    #[snafu(display("Failed to read security key file {}: {source}", path.display()))]
-    ReadSecurityFile { path: PathBuf, source: io::Error },
-    #[snafu(display("Failed to provision security records: {source}"))]
-    ProvisionSecurity { source: ProvisionSecurityError },
-    #[snafu(display("Configured static group member {member_id} has no trusted public JWKS."))]
-    MissingTrustedPublicKeys { member_id: MemberIdentity },
-    #[snafu(display(
-        "Configured trusted public JWKS includes local member {member_id}; local private JWKS already provides local identity."
-    ))]
-    TrustedPublicKeysForLocalMember { member_id: MemberIdentity },
-    #[snafu(display("Configured trusted public JWKS includes non-group member {member_id}."))]
-    UnexpectedTrustedPublicKeys { member_id: MemberIdentity },
     #[snafu(display("Failed to prepare initial static group security material: {source}"))]
     InitialGroupSecurity { source: ProvisionSecurityError },
     #[snafu(display(
@@ -919,14 +754,9 @@ async fn ensure_configured_group(
     if let Some(existing_group) = existing_group {
         validate_existing_static_group(existing_group, config, local_member_index)?;
         validate_existing_static_group_security(existing_group, config, replication_security)?;
-        let provisioned =
-            provision_configured_security(store, config, replication_security).await?;
-        validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
         return Ok(());
     }
 
-    let provisioned = provision_configured_security(store, config, replication_security).await?;
-    validate_provisioned_group_security(&members, &config.local_member, &provisioned)?;
     let security_material = prepare_initial_group_security_material(
         config.group_id,
         replication_security,
@@ -990,7 +820,7 @@ async fn load_persisted_groups(
     Ok(groups)
 }
 
-/// Validate the existing static group before temporary security provisioning writes records.
+/// Validate the existing static group before runtime loading checks member key records.
 fn validate_existing_static_group(
     existing_group: &ReplicationGroupRecord,
     config: &ChecklistAppConfig,
@@ -1019,70 +849,6 @@ fn validate_existing_static_group(
             actual: existing_group.local_member_index,
         }
     );
-    Ok(())
-}
-
-/// Provision temporary static-group identity records from configured JWKS files.
-async fn provision_configured_security(
-    store: &dyn ReplicationStore,
-    config: &ChecklistAppConfig,
-    replication_security: &ReplicationSecuritySecrets,
-) -> Result<flotsync_replication::ProvisionedReplicationSecurity, StaticGroupError> {
-    let local_private_jwks = read_security_file(&config.local_private_jwks_path)?;
-    let mut trusted_public_jwks = Vec::new();
-    for path in &config.trusted_public_jwks_paths {
-        let jwks = read_security_file(path)?;
-        trusted_public_jwks.push(jwks);
-    }
-    let trusted_public_jwks = trusted_public_jwks.iter().map(String::as_str);
-    provision_replication_security(
-        store,
-        &config.local_member,
-        replication_security,
-        &local_private_jwks,
-        trusted_public_jwks,
-    )
-    .await
-    .context(static_group_error::ProvisionSecuritySnafu)
-}
-
-/// Read one configured security input file from disk.
-fn read_security_file(path: &Path) -> Result<String, StaticGroupError> {
-    fs::read_to_string(path).with_context(|_| static_group_error::ReadSecurityFileSnafu {
-        path: path.to_path_buf(),
-    })
-}
-
-/// Ensure provisioned trusted public keys exactly cover the configured remote group members.
-fn validate_provisioned_group_security(
-    members: &GroupMembers,
-    local_member: &MemberIdentity,
-    provisioned: &flotsync_replication::ProvisionedReplicationSecurity,
-) -> Result<(), StaticGroupError> {
-    let trusted_members: HashSet<_> = provisioned.trusted_members.iter().cloned().collect();
-    for member in members.ordered_members() {
-        if member == *local_member {
-            continue;
-        }
-        ensure!(
-            trusted_members.contains(&member),
-            static_group_error::MissingTrustedPublicKeysSnafu { member_id: member }
-        );
-    }
-    for trusted_member in trusted_members {
-        ensure!(
-            &trusted_member != local_member,
-            static_group_error::TrustedPublicKeysForLocalMemberSnafu {
-                member_id: trusted_member.clone(),
-            }
-        );
-        ensure!(
-            members.contains(&trusted_member),
-            static_group_error::UnexpectedTrustedPublicKeysSnafu {
-                member_id: trusted_member,
-            }
-        );
-    }
     Ok(())
 }
 
@@ -1128,14 +894,8 @@ fn format_timestamp(timestamp: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_io::test_support::{ReservedSocketKind, reserve_sockets};
-    use flotsync_replication::{RowKey, test_support::test_replication_security_secrets};
-    use flotsync_security::{
-        GROUP_KEY_LENGTH,
-        GroupKey,
-        local_member_keys_from_jwks,
-        public_member_keys_from_jwks,
-    };
+    use flotsync_replication::test_support::test_replication_security_secrets;
+    use flotsync_security::{GROUP_KEY_LENGTH, GroupKey};
     use uuid::Uuid;
 
     fn test_config(group_id: GroupId, store_path: PathBuf) -> ChecklistAppConfig {
@@ -1152,28 +912,6 @@ mod tests {
         ordered_members: Vec<MemberIdentity>,
     ) -> ChecklistAppConfig {
         let local_member = MemberIdentity::from_array(["alice"]);
-        let key_dir = std::env::temp_dir().join(format!("flotsync-checklist-test-{}", group_id.0));
-        std::fs::create_dir_all(&key_dir).expect("test key dir should be created");
-        let local_private_jwks_path = key_dir.join("alice-private.jwks");
-        let local_keys = generate_member_key_files(local_member.clone())
-            .expect("local test key files should generate");
-        std::fs::write(
-            &local_private_jwks_path,
-            local_keys.local_private_jwks.as_str(),
-        )
-        .expect("local private JWKS should be written");
-        let mut trusted_public_jwks_paths = Vec::new();
-        for (index, member) in ordered_members.iter().enumerate() {
-            if member == &local_member {
-                continue;
-            }
-            let generated = generate_member_key_files(member.clone())
-                .expect("trusted test key files should generate");
-            let path = key_dir.join(format!("trusted-{index}.jwks"));
-            std::fs::write(&path, &generated.public_jwks)
-                .expect("trusted public JWKS should be written");
-            trusted_public_jwks_paths.push(path);
-        }
         ChecklistAppConfig {
             source_path: PathBuf::from("test.toml"),
             runtime_config_toml: String::new(),
@@ -1184,8 +922,6 @@ mod tests {
             )
             .expect("test profile should build"),
             group_key: test_group_key(1),
-            local_private_jwks_path,
-            trusted_public_jwks_paths,
             group_id,
             ordered_members,
         }
@@ -1193,51 +929,6 @@ mod tests {
 
     fn test_group_key(seed: u8) -> Arc<GroupKey> {
         Arc::new(GroupKey::from_bytes([seed; GROUP_KEY_LENGTH]))
-    }
-
-    fn test_runtime_config_toml(local_endpoint: std::net::SocketAddr) -> String {
-        format!(
-            r#"
-            [flotsync.io]
-            bind-reuse-address = true
-
-            [flotsync.replication.runtime]
-            local-endpoint-bind-addr = "{local_endpoint}"
-            "#,
-        )
-    }
-
-    fn add_trusted_public_key(config: &mut ChecklistAppConfig, member: MemberIdentity) {
-        let key_dir = config
-            .local_private_jwks_path
-            .parent()
-            .expect("test local key path should have parent");
-        let generated =
-            generate_member_key_files(member).expect("trusted test key files should generate");
-        let path = key_dir.join(format!(
-            "trusted-extra-{}.jwks",
-            config.trusted_public_jwks_paths.len()
-        ));
-        std::fs::write(&path, &generated.public_jwks)
-            .expect("trusted public JWKS should be written");
-        config.trusted_public_jwks_paths.push(path);
-    }
-
-    fn sync_working_set(replication: &dyn ReplicationApi, working_set: &mut ChecklistWorkingSet) {
-        let plan = working_set
-            .prepare_sync()
-            .expect("sync plan should build")
-            .expect("dirty checklist row should produce a sync plan");
-        let read_token = working_set
-            .read_token()
-            .expect("working set should have a read token");
-        let receipt = block_on(replication.publish_changes(PublishChangesRequest {
-            read_token,
-            changes: plan.mutations.clone(),
-        }))
-        .expect("checklist sync publish should succeed");
-        working_set.set_read_token(receipt.read_token);
-        working_set.finish_successful_sync(Some(plan));
     }
 
     // TODO(flotsync-lsi8): Remove these unsafe profile tests with the temporary
@@ -1283,52 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn checklist_rename_with_two_insert_hunks_syncs() {
-        kompact::test_support::init_test_logger();
-
-        let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
-        let group_id = GroupId(Uuid::from_u128(0x45d0));
-        let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));
-        let replication_security = test_replication_security_secrets();
-        config.runtime_config_toml = test_runtime_config_toml(endpoint_lease.addr(0));
-        let store = Arc::new(
-            SqliteReplicationStore::in_memory_with_schema_sources(
-                config.local_member.clone(),
-                [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
-            )
-            .expect("store should build"),
-        );
-        block_on(ensure_configured_group(
-            store.as_ref(),
-            &config,
-            &replication_security,
-        ))
-        .expect("static group should be prepared");
-        let (listener, _listener_receiver) = ChecklistListener::pair();
-        let replication = block_on(load_replication_runtime_with_runtime_config_toml(
-            checklist_application_id(),
-            store,
-            listener,
-            ReplicationConfig::default(),
-            replication_security,
-            &config.runtime_config_toml,
-        ))
-        .expect("runtime should load");
-        let mut working_set = load_checklist_working_set(replication.as_ref(), group_id)
-            .expect("working set should load");
-        let row_key = RowKey(Uuid::from_u128(1));
-
-        working_set.add_item_with_key(row_key, "a");
-        sync_working_set(replication.as_ref(), &mut working_set);
-        // This rename produces two insert hunks around the existing character.
-        working_set
-            .rename_item(ItemSelector::RowKey(row_key), "xay")
-            .expect("rename should apply locally");
-
-        sync_working_set(replication.as_ref(), &mut working_set);
-    }
-
-    #[test]
     fn ensure_configured_group_inserts_missing_static_group() {
         let group_id = GroupId(Uuid::from_u128(100));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
@@ -1360,68 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_configured_group_rejects_missing_trusted_public_keys() {
-        let group_id = GroupId(Uuid::from_u128(102));
-        let mut config = test_config(group_id, PathBuf::from("unused.sqlite"));
-        let replication_security = test_replication_security_secrets();
-        config
-            .ordered_members
-            .push(MemberIdentity::from_array(["bob"]));
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
-
-        let result = block_on(ensure_configured_group(
-            &store,
-            &config,
-            &replication_security,
-        ));
-
-        assert!(matches!(
-            result,
-            Err(StaticGroupError::MissingTrustedPublicKeys { .. })
-        ));
-    }
-
-    #[test]
-    fn ensure_configured_group_provisions_security_that_runtime_loads() {
-        let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
-        let group_id = GroupId(Uuid::from_u128(103));
-        let mut config = test_config_with_members(
-            group_id,
-            PathBuf::from("unused.sqlite"),
-            vec![
-                MemberIdentity::from_array(["alice"]),
-                MemberIdentity::from_array(["bob"]),
-            ],
-        );
-        let replication_security = test_replication_security_secrets();
-        config.runtime_config_toml = test_runtime_config_toml(endpoint_lease.addr(0));
-        let store = Arc::new(
-            SqliteReplicationStore::in_memory(config.local_member.clone())
-                .expect("store should build"),
-        );
-
-        block_on(ensure_configured_group(
-            store.as_ref(),
-            &config,
-            &replication_security,
-        ))
-        .expect("group should be prepared");
-        let (listener, _listener_receiver) = ChecklistListener::pair();
-        let runtime = block_on(load_replication_runtime_with_runtime_config_toml(
-            checklist_application_id(),
-            store,
-            listener,
-            ReplicationConfig::default(),
-            replication_security,
-            &config.runtime_config_toml,
-        ))
-        .expect("runtime should load provisioned security");
-
-        drop(runtime);
-    }
-
-    #[test]
     fn ensure_configured_group_rejects_member_mismatch() {
         let group_id = GroupId(Uuid::from_u128(101));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
@@ -1433,7 +1016,6 @@ mod tests {
             MemberIdentity::from_array(["alice"]),
             MemberIdentity::from_array(["carol"]),
         ];
-        add_trusted_public_key(&mut existing, MemberIdentity::from_array(["carol"]));
         block_on(ensure_configured_group(
             &store,
             &existing,
@@ -1482,61 +1064,5 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn generate_checklist_key_files_writes_round_trippable_jwks() {
-        let out_dir =
-            std::env::temp_dir().join(format!("flotsync-checklist-keys-{}", Uuid::new_v4()));
-        let member = MemberIdentity::from_array(["alice"]);
-
-        generate_checklist_key_files(member.clone(), &out_dir, false)
-            .expect("key generation should succeed");
-
-        let private_path = out_dir.join(GENERATED_PRIVATE_JWKS_FILE_NAME);
-        let private_jwks =
-            std::fs::read_to_string(&private_path).expect("private JWKS should be written");
-        let public_jwks = std::fs::read_to_string(out_dir.join(GENERATED_PUBLIC_JWKS_FILE_NAME))
-            .expect("public JWKS should be written");
-        let local_keys = local_member_keys_from_jwks(&private_jwks, Some(&member))
-            .expect("private JWKS should parse");
-        let public_keys = public_member_keys_from_jwks(&public_jwks, Some(&member))
-            .expect("public JWKS should parse");
-
-        assert_eq!(local_keys.member_id(), &member);
-        assert_eq!(public_keys.member_id(), &member);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let permissions = std::fs::metadata(private_path)
-                .expect("private JWKS metadata should load")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(permissions, 0o600);
-        }
-    }
-
-    #[test]
-    fn generate_checklist_key_files_refuses_overwrite_without_partial_private_file() {
-        let out_dir =
-            std::env::temp_dir().join(format!("flotsync-checklist-keys-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&out_dir).expect("key dir should be created");
-        let private_path = out_dir.join(GENERATED_PRIVATE_JWKS_FILE_NAME);
-        let public_path = out_dir.join(GENERATED_PUBLIC_JWKS_FILE_NAME);
-        std::fs::write(&public_path, "existing-public").expect("existing public key should write");
-
-        let result =
-            generate_checklist_key_files(MemberIdentity::from_array(["alice"]), &out_dir, false);
-
-        assert!(matches!(
-            result,
-            Err(ReplicatedChecklistError::KeyFileExists { .. })
-        ));
-        assert!(!private_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(public_path).expect("existing public key should remain"),
-            "existing-public"
-        );
     }
 }

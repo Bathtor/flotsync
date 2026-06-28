@@ -4,26 +4,46 @@ title = "Replace JWKS identity provisioning with protobuf key bundles"
 body = """
 Implement the agreed key-format outcome from flotsync-ist.1.9: replace JWKS identity provisioning with Flotsync-native protobuf key bundles and DB-native local key storage.
 
-Agreed direction:
-A01. Public key bundles and encrypted local-private key payloads are Flotsync-owned protobuf formats.
-A02. Base64url or QR/text wrappers are presentation concerns for exchange mechanisms, not part of this first implementation.
-A03. Public member bundles carry both Ed25519 signing and X25519 encryption public keys as mandatory v1 fields.
-A04. Local private-key store payloads carry the corresponding private material and enough public material to validate consistency on load.
-A05. One canonical public bundle type should be reusable by QR, pasteable invites, discovery, relays, bootstrap, and fingerprints.
-A06. The segmented MemberIdentity must be preserved exactly so later identity-hierarchy and trust-inheritance policy can reason about parent and child identities.
+Agreed implementation plan:
+P01. Define Flotsync-owned protobuf key bundle messages in a security protobuf package and expose them through flotsync_messages.
+P02. Use symmetric naming: PublicKeyBundle for exchangeable public key material and LocalPrivateKeyBundle for the encrypted local-store plaintext.
+P03. Keep both bundle messages identity-free. The authoritative MemberIdentity comes from the database row, provisioning API argument, or caller context.
+P04. PublicKeyBundle uses role-named bundle fields, but the key material messages are generic: PublicKey plus KeyScheme. Decode validates that signing_key uses ED25519 and encryption_key uses X25519.
+P05. LocalPrivateKeyBundle uses role-named bundle fields, but the key material messages are generic: PrivateKey plus KeyScheme. Decode validates scheme and public/private consistency per role.
+P06. Expose a shared SignatureScheme enum from the security proto package and import it into delivery/discovery signature messages where semantically appropriate. Keep key schemes and signature schemes separate.
+P07. Base64url, QR, pasteable text, fingerprints, discovery publication, bootstrap key references, and trust/evidence policy are downstream concerns handled by other flotsync-ist children.
+P08. Preserve the existing known_peers schema as public key byte columns; add conversions from the canonical public bundle to existing public-key records.
+P09. Preserve the existing local_members encrypted store-secret envelope and SQLite columns; change only the encrypted plaintext from JWKS text to encoded LocalPrivateKeyBundle bytes.
+P10. Remove production dependence on jose-jwk and JWKS parsing/generation from flotsync_security, replication provisioning, and runtime loading.
+P11. Do not replace replicated-checklist setup/config in this slice. Remove obsolete JWKS config/provisioning/generate-keys helper code and let setup/loading fail until flotsync-ist.9 adds the store-native keys commands.
+P12. Use view decoding for LocalPrivateKeyBundle so private fields are not allocated into an owned generated proto during load.
+P13. Keep private-bundle encoding contained in one helper with explicit zeroisation for now. A P0 follow-up child task will upgrade Buffa and switch private-key encoding to ViewEncode.
+
+Out of scope:
+Q01. Store-native replicated-checklist keys commands and manual setup UX; tracked by flotsync-ist.9.
+Q02. Pasteable/base64 bundle strings, key fingerprints, and inspect APIs; tracked by flotsync-ist.8.
+Q03. Trust evidence, blocked fingerprints, and authority evaluation; tracked by flotsync-ist.3.
+Q04. Discovery introduction fingerprints and direct key-bundle fetching; tracked by flotsync-ist.6 and flotsync-ist.7.
+Q05. Bootstrap member key fingerprints or unresolved-key install behaviour; tracked by flotsync-ist.4 and flotsync-ist.5.
+Q06. Buffa 0.8 upgrade and private-key ViewEncode conversion; tracked by a P0 child task created from this review follow-up.
 
 Acceptance criteria:
-B01. Production identity generation, parsing, and provisioning no longer depend on jose-jwk or JWKS files.
-B02. local_members stores encrypted typed protobuf private-key payloads instead of encrypted JWKS text.
-B03. known_peers continues to store public key bytes, with conversions from the canonical public bundle.
-B04. flotsync_security exposes encode/decode helpers for the canonical public bundle and local private payload.
-B05. replicated-checklist can create/provision identities without local-private-jwks-path or trusted-public-jwks-paths.
-B06. Tests cover roundtrip, malformed payloads, unsupported versions/schemes, member mismatch, public/private mismatch, and runtime loading from the new store payload.
+R01. Production identity generation, parsing, and provisioning no longer depend on jose-jwk or JWKS files.
+R02. local_members stores encrypted typed protobuf LocalPrivateKeyBundle bytes instead of encrypted JWKS text.
+R03. known_peers continues to store public key bytes, with conversions from PublicKeyBundle.
+R04. flotsync_security exposes encode/decode helpers for PublicKeyBundle and LocalPrivateKeyBundle.
+R05. Runtime loading can open the new encrypted local private bundle and validate key-pair consistency.
+R06. Replicated-checklist has no temporary replacement JWKS setup path in this slice; obsolete JWKS config and generate-keys helpers are removed, and final key setup is deferred to flotsync-ist.9.
+R07. Tests cover roundtrip, malformed payloads, unsupported versions/schemes, public/private mismatch, row-context member handling, and runtime loading from the new store payload.
+R08. Delivery/discovery import the shared security SignatureScheme enum where it is the same semantic concept.
+R09. LocalPrivateKeyBundle decode uses borrowed protobuf views for private fields.
 
-Estimate: roughly 500-900 LOC across protobuf messages, flotsync_security identity handling, store provisioning, replicated-checklist setup, and tests."""
-status = "open"
+Estimate: roughly 700-1000 LOC across protobuf messages, flotsync_security identity handling, replication store provisioning/loading, replicated-checklist cleanup, dependency removal, and focused tests."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "Codex"
 blocks = [
     "019f098b-8001-7fc0-92ed-86392e41fb7d",
     "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
@@ -33,5 +53,19 @@ blocks = [
     "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
 ]
 parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+children = ["019f0e4f-7ec8-7bd3-83eb-1cb4584d9a55"]
 created_at = "2026-06-27T14:28:51.34357Z"
-updated_at = "2026-06-28T10:28:20.582661Z"
+updated_at = "2026-06-28T13:35:52.487833Z"
+closed_at = "2026-06-28T13:35:52.487833Z"
+
+[[comments]]
+id = "019f0e59-e5d4-7021-9b91-db5545a7aa81"
+author = "Codex"
+body = "Implemented review follow-up: removed replicated-checklist JWKS config/provisioning/generate-keys helper path, switched key bundle proto to generic PublicKey/PrivateKey plus KeyScheme, exposed shared SignatureScheme for delivery/discovery, renamed public-bundle parsing terminology to decode, and moved LocalPrivateKeyBundle decode to borrowed protobuf views. Created P0 child flotsync-ist.2.1 for the Buffa 0.8 upgrade and private-key ViewEncode conversion. Validation passed for messages/security/replication/io_examples checks, tests, fmt, and pedantic clippy."
+created_at = "2026-06-28T13:10:00.404777Z"
+
+[[comments]]
+id = "019f0e71-94a7-7fe3-9c4e-96edb8bbb8db"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T13:35:52.487833Z"

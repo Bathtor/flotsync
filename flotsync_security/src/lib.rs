@@ -20,16 +20,18 @@ pub use group::{
 pub use hpke::{HPKE_ENCAPSULATED_KEY_LENGTH, HpkeCiphertext, hpke_open, hpke_seal};
 pub use identity::{
     ED25519_KEY_LENGTH,
-    GeneratedMemberKeyFiles,
+    EncodedLocalPrivateKeyBundle,
+    GeneratedMemberKeyBundles,
     KeyRole,
     LocalMemberKeys,
     MemberIdentity,
-    PrivateJwks,
     PublicMemberKeys,
     X25519_KEY_LENGTH,
-    generate_member_key_files,
-    local_member_keys_from_jwks,
-    public_member_keys_from_jwks,
+    encode_local_private_key_bundle,
+    encode_public_key_bundle,
+    generate_member_key_bundles,
+    local_member_keys_from_private_bundle,
+    public_member_keys_from_public_bundle,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use local_store_secret::install_local_store_secret_test_store;

@@ -14,11 +14,9 @@ flotsync_core = { path = "../flotsync_core" }
 flotsync_messages = { path = "../flotsync_messages" }
 flotsync_utils = { path = "../flotsync_utils" }
 hpke = { version = "0.13.0", default-features = false, features = ["std", "x25519"] }
-jose-jwk = { version = "0.1.2", default-features = false }
 keyring-core = "1"
 rand_chacha = { version = "0.9", optional = true }
 rand_core = { version = "0.9", features = ["os_rng", "std"] }
-serde_json = "1"
 sha2 = "0.10"
 snafu = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
