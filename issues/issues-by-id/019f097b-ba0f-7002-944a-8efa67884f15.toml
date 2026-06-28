@@ -1,0 +1,37 @@
+id = "019f097b-ba0f-7002-944a-8efa67884f15"
+ref = "flotsync-ist.2"
+title = "Replace JWKS identity provisioning with protobuf key bundles"
+body = """
+Implement the agreed key-format outcome from flotsync-ist.1.9: replace JWKS identity provisioning with Flotsync-native protobuf key bundles and DB-native local key storage.
+
+Agreed direction:
+A01. Public key bundles and encrypted local-private key payloads are Flotsync-owned protobuf formats.
+A02. Base64url or QR/text wrappers are presentation concerns for exchange mechanisms, not part of this first implementation.
+A03. Public member bundles carry both Ed25519 signing and X25519 encryption public keys as mandatory v1 fields.
+A04. Local private-key store payloads carry the corresponding private material and enough public material to validate consistency on load.
+A05. One canonical public bundle type should be reusable by QR, pasteable invites, discovery, relays, bootstrap, and fingerprints.
+A06. The segmented MemberIdentity must be preserved exactly so later identity-hierarchy and trust-inheritance policy can reason about parent and child identities.
+
+Acceptance criteria:
+B01. Production identity generation, parsing, and provisioning no longer depend on jose-jwk or JWKS files.
+B02. local_members stores encrypted typed protobuf private-key payloads instead of encrypted JWKS text.
+B03. known_peers continues to store public key bytes, with conversions from the canonical public bundle.
+B04. flotsync_security exposes encode/decode helpers for the canonical public bundle and local private payload.
+B05. replicated-checklist can create/provision identities without local-private-jwks-path or trusted-public-jwks-paths.
+B06. Tests cover roundtrip, malformed payloads, unsupported versions/schemes, member mismatch, public/private mismatch, and runtime loading from the new store payload.
+
+Estimate: roughly 500-900 LOC across protobuf messages, flotsync_security identity handling, store provisioning, replicated-checklist setup, and tests."""
+status = "open"
+type = "task"
+priority = 2
+blocks = [
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
+    "019f0d0b-67ec-7381-b786-a3ab8a185843",
+    "019f0d0b-ae5c-75b3-8753-759878367b9a",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+    "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T14:28:51.34357Z"
+updated_at = "2026-06-28T10:28:20.582661Z"

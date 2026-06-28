@@ -1,0 +1,27 @@
+id = "019f096c-22ba-75e2-bbd8-94feffc1e0ef"
+ref = "flotsync-ist.1.4"
+title = "Design trusted introducer key assertions"
+body = """
+Design trusted-introducer assertions, where an already trusted member vouches for another member key bundle.
+
+Questions:
+Q01. What exactly does an introducer sign: member id, full key bundle, trust level, groups, expiry, route context, or policy constraints?
+Q02. How do policies account for compromised introducers and prevent one bad member from spreading invalid keys too broadly?
+Q03. Are introducer assertions stored permanently, cached as evidence, or reduced to resulting trust state?
+Q04. How does this interact with group bootstrap and later key rotation or revocation?
+Q05. Can a trusted parent identity introduce child devices, and can one trusted child device introduce sibling devices or parent-level trust?"""
+status = "closed"
+status_reason = "deferred to flotsync-kxpeer"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:11:49.562727Z"
+updated_at = "2026-06-28T11:03:24.528534Z"
+closed_at = "2026-06-28T11:03:24.528534Z"
+
+[[comments]]
+id = "019f0de5-fe70-7d03-8832-d537ff350876"
+author = "lkroll"
+body = "deferred to flotsync-kxpeer"
+created_at = "2026-06-28T11:03:24.528534Z"

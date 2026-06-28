@@ -1,0 +1,47 @@
+id = "019f096b-c6ba-7f70-bd54-39ff2d823ab9"
+ref = "flotsync-ist.1.2"
+title = "Design pasteable key invite format"
+body = """
+Design a pasteable/shareable key invite format for applications that want text, links, files, or copy-paste flows instead of QR-specific UI.
+
+Questions:
+Q01. Should Flotsync prescribe one interoperable string format, expose canonical bytes, or support both?
+Q02. How should versioning, feature flags, and algorithm identifiers be represented so old and new Flotsync versions fail safely?
+Q03. Should the same bundle format be reused for QR and pasteable invites?
+Q04. What fields are mandatory for accepting trust, and which are display-only convenience metadata?
+Q05. How should the format represent parent/device identities so applications can show exactly which identity is being trusted?"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:11:26.010575Z"
+updated_at = "2026-06-28T08:32:20.930872Z"
+closed_at = "2026-06-28T08:32:20.930872Z"
+
+[[comments]]
+id = "019f0d5b-a422-7a21-911b-927cfba72eac"
+author = "lkroll"
+body = """
+Resolved as implementation work in flotsync-ist.8.
+
+Decision summary:
+PI01. Public key bundles are Flotsync-owned protobuf binary payloads.
+PI02. Live APIs expose canonical raw bytes and typed values; an auxiliary stateless API provides the recommended pasteable text form.
+PI03. The recommended text form is pure base64 of PublicKeyBundle bytes, with no flotsync-key-v1 prefix.
+PI04. PublicKeyBundle is compact key material only: format version, Ed25519 signing public key, X25519 HPKE/KEM public key, and scheme identifiers.
+PI05. PublicKeyBundle does not carry MemberIdentity, display metadata, application id, policy hints, requested authority, or trust source.
+PI06. Fingerprints are canonically derived from semantic bundle fields with domain separation, not stored in the bundle and not computed from arbitrary protobuf bytes.
+PI07. Multiple fingerprints per identity are allowed, and the same fingerprint may be bound to multiple identities. Trust/evidence is always for an exact MemberIdentity plus fingerprint pair.
+PI08. Decode/inspect APIs may report zero, one, or many known identity bindings and must not reject ambiguous bindings.
+PI09. Trust/evidence recording APIs require explicit MemberIdentity by API shape. Decoding or importing a bundle does not grant authority.
+PI10. Authority remains derived by policy from stored trust/evidence records.
+PI11. flotsync-ist.1.1 and flotsync-ist.1.10 were updated to treat these decisions as settled inputs."""
+created_at = "2026-06-28T08:32:17.442061Z"
+
+[[comments]]
+id = "019f0d5b-b1c2-7493-af8c-39df0f5ee4ba"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T08:32:20.930872Z"

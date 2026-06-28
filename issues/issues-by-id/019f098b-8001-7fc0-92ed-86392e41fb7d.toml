@@ -1,0 +1,56 @@
+id = "019f098b-8001-7fc0-92ed-86392e41fb7d"
+ref = "flotsync-ist.3"
+title = "Implement initial trust evidence and capability evaluation"
+body = """
+Implement the agreed first slice from flotsync-ist.1.8 plus the block-state clarification from flotsync-ist.1.10: replace the implicit trusted/untrusted split with an explicit evaluator that derives local authority from stored key material, trust/evidence records, global blocked-key state, and a runtime trust policy.
+
+Agreed direction:
+A01. Trust is capability-based, not a low/medium/high enum.
+A02. A capability decision asks whether exact key material for an exact subject identity is authorised for a requested local authority scope.
+A03. The evaluator inputs are subject MemberIdentity, subject KeyFingerprint, requested AuthorityScope, stored key bundle and identity bindings, stored trust/evidence records, global blocked fingerprints, and the TrustPolicy configured for the running topology.
+A04. The evaluator output is an allow/deny decision with enough reason information for diagnostics and inspect APIs; it does not mutate store state or silently promote observed material.
+A05. The first implementation slice supports one scope, replication_runtime, which preserves the current trusted-public-key behaviour for secure replication runtime use.
+A06. First-slice evidence kinds are intentionally small: local explicit trust for an exact (MemberIdentity, fingerprint), untrusted observation of key material or bindings, and global blocked fingerprint state. Remote signed introducer evidence is deferred.
+A07. Positive replication_runtime authority requires matching local trust evidence plus policy approval for the exact subject identity and fingerprint.
+A08. Blocked key material is keyed globally by fingerprint, not by (MemberIdentity, fingerprint). Once a fingerprint is blocked, authority checks fail for every identity binding to that key material.
+A09. Blocking indicates the private key material cannot be trusted anymore. It must not be lost by deleting one identity binding, and key acquisition must not silently re-accept the same fingerprint under another identity.
+A10. Trust policy is configured when the replication topology starts; live policy changes are out of scope and require restarting the topology.
+A11. The default policy is conservative: untrusted observations are not authorised for replication_runtime, blocked fingerprints are rejected, and key conflicts are rejected or quarantined rather than silently replacing trusted material.
+A12. Parent/child identity inheritance is intentionally not implemented in this slice; trust applies only to the exact MemberIdentity and exact key bundle being evaluated.
+A13. The store model and evaluator API must be ready to add more authority scopes and evidence kinds later, even if this slice only evaluates one scope and local explicit trust.
+
+Acceptance criteria:
+B01. Store records can represent key material, identity bindings, trust/evidence records, and blocked fingerprints as distinct concepts.
+B02. Store records can represent local explicit trust for an exact (MemberIdentity, fingerprint) without relying on a blanket trusted/untrusted partition.
+B03. Store records can represent untrusted observations of key material or identity bindings without granting replication_runtime authority.
+B04. Store records can represent a blocked fingerprint independently of identity bindings, and blocked fingerprints override all positive authority records.
+B05. Public key lookup flows evaluate whether exact member key material is authorised for replication_runtime instead of treating any known peer row as blanket trust.
+B06. Runtime security loads with a configurable TrustPolicy supplied at topology start.
+B07. Inspect APIs can surface the relevant evaluator inputs and result: known bindings, local trust/evidence summaries, blocked status, and the replication_runtime decision for supplied identity context.
+B08. Existing secure replication behaviour is preserved under the conservative default when keys have replication_runtime authority and are not blocked.
+B09. Tests cover authorised keys, unauthorised observed keys, globally blocked fingerprints, conflicting replacement attempts, missing key material, missing identity binding, policy rejection paths, diagnostic decision reasons, and no implicit trust promotion.
+
+Out of scope:
+C01. Multiple fine-grained authority scopes.
+C02. Live policy reconfiguration.
+C03. Hierarchical parent/child trust inheritance.
+C04. Remote signed introducer evidence, trusted-peer evidence chains, relay evidence, and bootstrap-created trust promotion semantics.
+C05. Remote revocation evidence, permanent self-revocation tombstones, and sibling-revocation suspension rules.
+C06. Fingerprint-only positive trust approval without available key material.
+C07. Policy-dependent authority for parent identities, sibling introductions, group invitations, or recovery flows.
+
+Estimate: roughly 650-950 LOC across store model reshaping, evaluator API, security/replication integration, inspect plumbing, and tests."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f097b-ba0f-7002-944a-8efa67884f15"]
+blocks = [
+    "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
+    "019f09ba-0a9d-7622-9bb1-b9e326f71d48",
+    "019f0d0b-67ec-7381-b786-a3ab8a185843",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+    "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T14:46:05.057992Z"
+updated_at = "2026-06-28T11:04:00.114423Z"

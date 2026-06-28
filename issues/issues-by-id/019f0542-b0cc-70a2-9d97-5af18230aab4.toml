@@ -2,14 +2,26 @@ id = "019f0542-b0cc-70a2-9d97-5af18230aab4"
 ref = "flotsync-ist"
 title = "Publish and verify member public keys through discovery"
 body = """
-Follow-up after the flotsync_security MVP: move beyond configured trusted public JWKS files by integrating public key advertisement and verification into discovery or a related trust mechanism. This should settle how discovery announcements carry key material or key references, how keys are authenticated, and how runtime trust decisions avoid accepting spoofed identities.
+Follow-up after the flotsync_security MVP: move beyond configured trusted public JWKS files by integrating public key advertisement and verification into discovery or a related trust mechanism. This should settle how discovery announcements carry key material or key references, how keys are authenticated, how hierarchical member identities affect trust decisions, and how runtime trust decisions avoid accepting spoofed identities.
 
 ## Acceptance Criteria
 
-Discovery or a defined adjacent trust path can advertise member public keys or references; recipients can authenticate them before use; configured JWKS trust remains available as a bootstrap or override path; and tests cover spoofed announcements and key mismatch rejection."""
-status = "open"
+Discovery or a defined adjacent trust path can advertise member public keys or references; recipients can authenticate them before use; DB-native provisioned trust remains available as a bootstrap or override path; JWKS files and jose-jwk are removed by the agreed key-format implementation path; and tests cover spoofed announcements, key mismatch rejection, and policy-sensitive trust decisions."""
+status = "in-progress"
+status_reason = "planning"
 type = "task"
 priority = 2
-blocked_by = ["019f0542-b0cc-70a2-9d97-56846371720d"]
+assignee = "Lars Kroll"
+children = [
+    "019f096b-586a-7072-afcb-b729d3fddee4",
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
+    "019f09ba-0a9d-7622-9bb1-b9e326f71d48",
+    "019f0d0b-67ec-7381-b786-a3ab8a185843",
+    "019f0d0b-ae5c-75b3-8753-759878367b9a",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+    "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
+]
 created_at = "2026-05-14T16:33:46Z"
-updated_at = "2026-06-26T19:15:13.223887Z"
+updated_at = "2026-06-28T10:28:26.775498Z"

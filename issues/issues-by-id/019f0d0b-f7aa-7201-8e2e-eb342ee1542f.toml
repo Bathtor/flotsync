@@ -1,0 +1,49 @@
+id = "019f0d0b-f7aa-7201-8e2e-eb342ee1542f"
+ref = "flotsync-kxpeer"
+title = "Exchange key bundles with trusted peers"
+body = """
+Deferred post-flotsync-ist task for acquiring key bundles and trust evidence from already trusted peers reachable through overlapping groups.
+
+Design direction:
+A01. Prefer trusted third-party acquisition before direct self-observation when resolving unknown key fingerprints.
+A02. Any peer already trusted through any overlapping group may be eligible to provide the requested bundle.
+A03. Responses may include the canonical public bundle plus a signed trust/evidence statement from the responder describing the exact identity binding being vouched for.
+A04. Local policy decides whether the responder authority is enough to grant route_identity, replication_runtime, introducer, bootstrap, or only untrusted observation status.
+A05. Evidence must bind exact member identity plus exact bundle fingerprint.
+A06. The mechanism must not require accepting a route to the unknown key owner first; it uses routes to already trusted peers.
+A07. Trusted-peer evidence is stored as evidence, not collapsed into permanent trust state. Policy changes, blocked fingerprints, revocation evidence, and conflicting assertions must be evaluable later.
+A08. A blocked subject fingerprint overrides all introducer evidence and must not be resurrected by peer assertions.
+A09. Issuer authority is exact-key based. A statement from alice.phone only counts if the local store trusts the exact (alice.phone, issuer_fingerprint) for the relevant introduction capability.
+A10. Parent/sibling inheritance is out of scope here and deferred to flotsync-hitr.
+A11. Key rotation is not replacement. A new fingerprint for the same identity needs fresh evidence; old evidence remains attached to the old fingerprint.
+
+Trusted introducer assertion shape:
+B01. The issuer signs a domain-separated semantic transcript, not raw protobuf bytes.
+B02. The signed transcript includes assertion format version, issuer MemberIdentity, issuer key fingerprint, subject MemberIdentity, and subject key fingerprint.
+B03. The signed transcript does not include trust levels, local policy scopes, route context, group membership, expiry, requested authority, or full PublicKeyBundle bytes in the first version.
+B04. Responses may carry the subject PublicKeyBundle separately; receivers must derive its fingerprint and verify it matches the asserted subject fingerprint.
+B05. Assertions are evidence about an exact binding, not remote commands to grant local authority.
+
+Open design questions:
+C01. Which peers are eligible to answer and how is overlap established?
+C02. What exact protobuf message and signature envelope represents the assertion transcript?
+C03. How are stale, conflicting, or revoked bundles represented?
+C04. Does the query return one bundle, an evidence chain, or both?
+C05. How does this interact with parent/device trust inheritance from flotsync-hitr?
+C06. How does local policy grant or withhold introducer authority for exact issuer keys?
+
+Estimate: design plus implementation likely 700-1300 LOC and should be split further if evidence-chain handling grows."""
+status = "open"
+type = "task"
+priority = 3
+blocked_by = ["019f0d0b-ae5c-75b3-8753-759878367b9a"]
+created_at = "2026-06-28T07:05:15.946617Z"
+updated_at = "2026-06-28T11:03:20.294227Z"
+
+[[links]]
+target = "019f096b-fc82-7150-9691-60b40da56502"
+label = "deferred from"
+
+[[links]]
+target = "019f096c-22ba-75e2-bbd8-94feffc1e0ef"
+label = "deferred from"

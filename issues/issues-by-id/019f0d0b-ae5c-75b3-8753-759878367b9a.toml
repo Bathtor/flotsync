@@ -1,0 +1,35 @@
+id = "019f0d0b-ae5c-75b3-8753-759878367b9a"
+ref = "flotsync-ist.7"
+title = "Fetch key bundles directly from discovery endpoints"
+body = """
+Implement the in-slice fallback key acquisition path from flotsync-ist.1.3 and flotsync-ist.1.7: request a canonical public key bundle directly from the endpoint that made an introduction claim, without relying on route establishment.
+
+Agreed direction:
+A01. Direct endpoint key exchange is raw endpoint discovery traffic, not route-established replication traffic.
+A02. It is used when an IntroductionClaim names an unknown KeyFingerprint.
+A03. The request carries member_id, requested 32-byte fingerprint, and a nonce.
+A04. The response carries the canonical public key bundle matching the requested fingerprint, echoes the nonce, and should be signed by the corresponding key where practical.
+A05. Direct discovery wire/protobuf frames carry raw fingerprint bytes. Padded base64url canonical strings and grouped display strings are API/display helpers from flotsync-ist.8, not discovery-wire payloads.
+A06. The minimal public key bundle is expected to fit comfortably in one conservative UDP datagram; UDPour is out of scope unless evidence chains or larger payloads are added later.
+A07. A directly returned bundle proves at most possession/self-assertion. It is stored as very low-trust untrusted evidence and does not grant replication_runtime or group authority by itself.
+A08. Once local policy authorises the returned bundle for route_identity, route establishment may retry and verify the route via flotsync-ist.6.
+
+Acceptance criteria:
+B01. Discovery protocol has request/response frames for exact member_id plus fingerprint key-bundle lookup against a concrete endpoint.
+B02. Responses validate fingerprint, member identity, nonce, and bundle shape before storing observation evidence.
+B03. Directly acquired bundles are not trusted for replication_runtime by default.
+B04. Route establishment can trigger or coordinate this acquisition when it observes an unknown introduction fingerprint.
+B05. Tests cover successful bundle response, wrong fingerprint, wrong member identity, nonce mismatch, malformed bundle, and no implicit trust promotion.
+
+Estimate: roughly 500-900 LOC across discovery wire types, endpoint request/response plumbing, observation storage hooks, route-establishment coordination, and tests."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+]
+blocks = ["019f0d0b-f7aa-7201-8e2e-eb342ee1542f"]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-28T07:04:57.180077Z"
+updated_at = "2026-06-28T10:03:57.544223Z"

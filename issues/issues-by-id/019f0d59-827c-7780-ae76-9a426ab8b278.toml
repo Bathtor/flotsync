@@ -1,0 +1,50 @@
+id = "019f0d59-827c-7780-ae76-9a426ab8b278"
+ref = "flotsync-ist.8"
+title = "Expose pasteable public key bundle encoding"
+body = """
+Implement the agreed pasteable key bundle API from flotsync-ist.1.2 and fingerprint decisions from flotsync-ist.1.7. This provides the first user/application-facing no-JWKS key sharing primitive and is reused by manual copy-paste, URI-based, QR-based, direct fetch, and example setup flows.
+
+Agreed direction:
+A01. Live APIs expose canonical raw protobuf bytes and typed bundle values.
+A02. Flotsync also provides stateless auxiliary helpers to encode/decode a recommended pasteable string.
+A03. The recommended bundle string is only base64 of the protobuf PublicKeyBundle bytes; it has no flotsync-key-v1 prefix.
+A04. PublicKeyBundle is compact key material only: format version, Ed25519 signing public key, X25519 HPKE/KEM public key, and scheme fields.
+A05. PublicKeyBundle does not contain MemberIdentity, display metadata, application id, policy hints, requested authority, or trust source.
+A06. KeyFingerprint is 32 bytes: SHA-256 over a domain-separated semantic transcript of signing scheme, signing public key bytes, encryption scheme, and encryption public key bytes.
+A07. The fingerprint transcript does not include protobuf bytes, protobuf field order, unknown fields, PublicKeyBundle format version, identity, trust source, display metadata, policy, or application data.
+A08. The canonical fingerprint transfer string is padded base64url of the 32 fingerprint bytes. The recommended display string is the unpadded base64url text grouped as 4-4-4-4-4-4-4-4-4-4-3.
+A09. Fingerprints are both display/verification metadata and lookup references for discovery, direct bundle fetch, trusted-peer lookup, relay lookup later, and DB queries.
+A10. Multiple fingerprints per identity are allowed; the same fingerprint may be bound to multiple identities. Positive trust and evidence apply to exact (MemberIdentity, fingerprint) pairs.
+A11. Blocked key material is global by fingerprint. Inspect/decode APIs report blocked status for the fingerprint independently of identity bindings, and blocked fingerprints override positive trust during authority evaluation.
+A12. Inspect/decode APIs may return zero, one, or many known identity bindings for a fingerprint and must not reject ambiguity.
+A13. Trust/evidence recording APIs require an explicit MemberIdentity by API shape. Importing or decoding a bundle does not grant authority.
+A14. Authority remains derived by policy from stored trust/evidence records and blocked-key state.
+A15. The same pasteable public bundle string is the Flotsync payload for manual copy-paste, application-defined URIs, and QR code exchanges. These transports share the same decode, inspect, user approval, and trust-recording flow; Flotsync does not own QR rendering, camera scanning, URI scheme registration, or UI.
+
+Acceptance criteria:
+B01. Security protobuf defines PublicKeyBundle, SigningPublicKey, and EncryptionPublicKey with v1 Ed25519 and X25519 schemes.
+B02. flotsync_security exposes encode/decode validation for PublicKeyBundle raw bytes.
+B03. flotsync_security exposes base64 string encode/decode helpers for pasteable public bundles.
+B04. flotsync_security exposes a KeyFingerprint type with byte, padded base64url canonical string, and grouped unpadded display helpers.
+B05. flotsync_security exposes canonical fingerprint derivation independent of protobuf field ordering, unknown fields, and bundle presentation version.
+B06. Replication/security APIs can inspect a decoded bundle and report fingerprint, schemes, known identities bound to that fingerprint, other fingerprints known for supplied identities where available, global blocked status, and current trust/evidence summaries.
+B07. Trust/evidence recording API requires explicit MemberIdentity plus fingerprint and does not infer identity from the bundle itself.
+B08. Public bundle decode/inspect/trust APIs are transport-agnostic: callers can feed them strings obtained by manual copy-paste, QR scanner APIs, URI handlers, files, or other application channels without a separate QR-specific Flotsync API.
+B09. Tests cover roundtrip, malformed base64, malformed protobuf, unsupported format version, unsupported schemes, invalid key lengths, fingerprint stability, canonical/display fingerprint formatting, ambiguous identity bindings, global blocked status, and no implicit trust promotion.
+
+Estimate: roughly 550-950 LOC across protobuf, flotsync_security, replication trust APIs, and tests."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+]
+blocks = [
+    "019f0d0b-67ec-7381-b786-a3ab8a185843",
+    "019f0d0b-ae5c-75b3-8753-759878367b9a",
+    "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-28T08:29:57.75622Z"
+updated_at = "2026-06-28T10:46:31.224676Z"

@@ -1,0 +1,46 @@
+id = "019f096c-be26-76e2-b477-7d196bc20fbf"
+ref = "flotsync-ist.1.7"
+title = "Design key fingerprints and references"
+body = """
+Design fingerprints and key references as stable names for key material.
+
+Questions:
+Q01. What fingerprint algorithm and canonical input should identify a Flotsync member key bundle?
+Q02. Is a fingerprint only display/verification metadata, or can it be used as a network lookup reference?
+Q03. How are fingerprints shown to users and exposed to applications without forcing a UI model?
+Q04. How do fingerprints interact with versioned key bundles, multiple keys per peer, and future rotation?
+Q05. Are fingerprints displayed and compared for exact device identities, parent identities, or both?"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:12:29.350076Z"
+updated_at = "2026-06-28T10:04:19.740442Z"
+closed_at = "2026-06-28T10:04:19.740442Z"
+
+[[comments]]
+id = "019f0daf-d3d9-70d2-9a16-c2a593a3a873"
+author = "lkroll"
+body = """
+Resolved through flotsync-ist.8, with consumer updates in flotsync-ist.6 and flotsync-ist.7.
+
+Decision summary:
+KF01. KeyFingerprint is 32 bytes: SHA-256 over a domain-separated semantic transcript.
+KF02. The transcript includes signing scheme, signing public key bytes, encryption scheme, and encryption public key bytes.
+KF03. The transcript excludes protobuf bytes, protobuf field order, unknown fields, PublicKeyBundle format version, identity, trust source, display metadata, policy, and application data.
+KF04. Fingerprints name exact device/member key material in this slice. Parent identity inheritance is deferred to flotsync-hitr.
+KF05. Fingerprints are both display/verification metadata and lookup references.
+KF06. Protocol and DB APIs use raw fingerprint bytes where possible.
+KF07. The canonical fingerprint string is padded base64url of the 32 fingerprint bytes.
+KF08. The recommended display string is the unpadded base64url text grouped as 4-4-4-4-4-4-4-4-4-4-3.
+KF09. A fingerprint alone does not identify who owns the key material. Trust/evidence remains bound to exact MemberIdentity plus fingerprint.
+KF10. No new implementation task is needed; flotsync-ist.8 owns the fingerprint type, derivation, string helpers, and tests."""
+created_at = "2026-06-28T10:04:14.681911Z"
+
+[[comments]]
+id = "019f0daf-e79c-73c2-8e6d-c01e59ae1f8f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T10:04:19.740442Z"

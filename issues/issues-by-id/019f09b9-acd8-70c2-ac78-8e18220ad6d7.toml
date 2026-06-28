@@ -1,0 +1,32 @@
+id = "019f09b9-acd8-70c2-ac78-8e18220ad6d7"
+ref = "flotsync-ist.4"
+title = "Carry bootstrap member key fingerprints"
+body = """
+Implement the agreed bootstrap key-reference format from flotsync-ist.1.5: bootstrap metadata names exact device/member identities and expected key fingerprints, with full public key bundles optional as an optimisation.
+
+Agreed direction:
+A01. Bootstrap must cover exact individual device/member identities. It does not expand parent identities or apply hierarchy inheritance.
+A02. Bootstrap member metadata carries each member identity plus the expected canonical public key bundle fingerprint.
+A03. Full canonical public key bundles may be included inline, but they are optional and must match the advertised fingerprint.
+A04. Inline bundles are evidence for local policy evaluation; they do not overwrite trusted key material or create authority unless policy explicitly allows that.
+A05. Missing inline bundles require later key resolution from local DB, invite payloads, direct exchange, relay lookup, discovery observation, or another approved mechanism.
+
+Acceptance criteria:
+B01. Bootstrap payloads encode exact member identities plus expected key fingerprints for all group members.
+B02. Inline public bundles, when present, are validated against identity and fingerprint.
+B03. Inline bundles that are unknown locally are stored or surfaced as untrusted evidence, not silently trusted.
+B04. Conflicting inline bundles are rejected or quarantined without changing existing trusted material.
+B05. Tests cover fingerprint-only metadata, valid inline bundle, inline bundle fingerprint mismatch, identity mismatch, and conflicting existing key material.
+
+Estimate: roughly 300-600 LOC after canonical protobuf key bundles exist."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+]
+blocks = ["019f09ba-0a9d-7622-9bb1-b9e326f71d48"]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T15:36:31.192872Z"
+updated_at = "2026-06-27T15:36:55.197626Z"

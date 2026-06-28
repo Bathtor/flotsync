@@ -1,0 +1,33 @@
+id = "019f09ba-0a9d-7622-9bb1-b9e326f71d48"
+ref = "flotsync-ist.5"
+title = "Allow bootstrap install with unresolved member keys"
+body = """
+Implement the agreed bootstrap install behaviour from flotsync-ist.1.5: allow group metadata installation when some non-local member key fingerprints are unresolved, while accepting runtime traffic only from members whose exact key material is authorised by local policy.
+
+Agreed direction:
+A01. Bootstrap can install group metadata before every non-local member key is trusted.
+A02. Conservative policy still requires the inviter/bootstrap sender itself to be trusted enough to accept membership.
+A03. Missing or unauthorised member keys block accepting traffic from those members, not installing the group.
+A04. Runtime can later reacquire messages after key material is resolved and authorised.
+A05. The store/runtime should represent per-member key resolution state such as trusted, missing, known_untrusted, conflict, or blocked.
+A06. Unresolved or unauthorised member traffic must be rejected or quarantined without corrupting group state.
+
+Acceptance criteria:
+B01. Bootstrap installation can persist group membership and expected member fingerprints even when some non-local key bundles are missing.
+B02. Runtime load no longer requires trusted key material for every persisted group member before startup.
+B03. Message verification accepts only exact member keys authorised for replication_runtime.
+B04. Traffic from unresolved, unauthorised, conflicting, or blocked member keys is rejected or quarantined cleanly.
+B05. Resolving and authorising a previously missing member key allows later catch-up to process that member's messages.
+B06. Tests cover install with missing non-local key, rejecting unresolved member traffic, accepting after key resolution, and rejecting mismatched fingerprint traffic.
+
+Estimate: roughly 600-1000 LOC because current runtime security readiness assumes trusted keys for all persisted group members."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = [
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T15:36:55.197626Z"
+updated_at = "2026-06-27T15:37:02.437023Z"
