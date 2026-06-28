@@ -1,0 +1,10 @@
+id = "019f0f89-b72d-7813-9d33-31a4981d9834"
+ref = "flotsync-git-52p"
+title = "Make write store transactions extend read transactions"
+body = 'Follow-up from flotsync-ist.3 review.\n\nRefactor ReplicationStoreTransaction so write transactions inherit or otherwise directly share the ReplicationStoreReadTransaction API instead of duplicating read method declarations across both traits. The change should remove duplicate trait surface and forwarding boilerplate without changing store behaviour.'
+status = "open"
+type = "task"
+priority = 0
+parent = "019f098b-8001-7fc0-92ed-86392e41fb7d"
+created_at = "2026-06-28T18:41:51.405184Z"
+updated_at = "2026-06-28T18:41:55.46876Z"

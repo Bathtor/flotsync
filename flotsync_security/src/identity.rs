@@ -184,18 +184,18 @@ impl DecodeProtoViewWith<MemberIdentity> for LocalMemberKeys {
 
         let signing_public =
             fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.public_key", signing.public_key)?;
-        let signing_private = Zeroizing::new(fixed_key_bytes::<ED25519_KEY_LENGTH>(
-            "signing_key.private_key",
-            signing.private_key,
-        )?);
+        let signing_private =
+            fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.private_key", signing.private_key)?;
+        let signing_private = Zeroizing::new(signing_private);
         let encryption_public = fixed_key_bytes::<X25519_KEY_LENGTH>(
             "encryption_key.public_key",
             encryption.public_key,
         )?;
-        let encryption_private = Zeroizing::new(fixed_key_bytes::<X25519_KEY_LENGTH>(
+        let encryption_private = fixed_key_bytes::<X25519_KEY_LENGTH>(
             "encryption_key.private_key",
             encryption.private_key,
-        )?);
+        )?;
+        let encryption_private = Zeroizing::new(encryption_private);
 
         let signing_key = SigningKey::from_bytes(&signing_private);
         let verifying_key = signing_key.verifying_key();

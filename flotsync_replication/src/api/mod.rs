@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use enumset::{EnumSet, EnumSetType};
 use flotsync_core::{
     GroupId,
     MemberIdentity,
@@ -8,6 +9,8 @@ use flotsync_core::{
 };
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_security::{
+    KeyFingerprint,
+    PublicMemberKeys,
     StoreSecretKey,
     load_local_store_secret,
     load_or_create_local_store_secret,
@@ -19,6 +22,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     num::NonZeroUsize,
+    str::FromStr,
     sync::Arc,
 };
 
@@ -441,6 +445,9 @@ impl Default for GroupMigrationPolicy {
 /// Runtime configuration passed during `load`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplicationConfig {
+    /// Policy used to derive runtime permissions from stored trust evidence.
+    pub trust_policy: TrustPolicy,
+    /// Policy for handling group membership migration invitations.
     pub group_migration_policy: GroupMigrationPolicy,
 }
 
@@ -915,22 +922,104 @@ pub struct LocalMemberPrivateKeysRecord {
     pub private_keys: EncryptedLocalMemberPrivateKeys,
 }
 
-/// Trusted public key material for one member identity.
-#[derive(Clone, PartialEq, Eq)]
-pub struct TrustedMemberPublicKeysRecord {
-    /// Member identity these public keys belong to.
+/// Authority scope requested by one permission check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AuthorityScope {
+    /// Use member key material for active replication runtime traffic.
+    ReplicationRuntime,
+    /// Accept a bootstrap message from this member key for local group activation.
+    BootstrapActivation,
+}
+
+/// Runtime policy that maps stored trust evidence to permission decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustPolicy {
+    /// Evidence requirement for active replication runtime traffic.
+    pub replication_runtime: MemberKeyTrustRequirement,
+    /// Evidence requirement for accepting a bootstrap activation from a sender key.
+    pub bootstrap_activation: MemberKeyTrustRequirement,
+}
+
+impl Default for TrustPolicy {
+    fn default() -> Self {
+        Self {
+            replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
+            bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+        }
+    }
+}
+
+/// Evidence requirement for one member-key authority scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemberKeyTrustRequirement {
+    /// Require locally recorded explicit trust for the exact member key.
+    LocalExplicitTrust,
+    /// Deny every permission request for this authority scope.
+    DenyAll,
+}
+
+/// Result of evaluating whether one member key has a requested permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PermissionDecision {
+    /// The key has the requested permission.
+    Permit,
+    /// The key does not have the requested permission.
+    Deny(PermissionDenialReason),
+}
+
+/// Reason one member key permission request was denied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PermissionDenialReason {
+    /// No stored public key material exists for the exact member key.
+    MissingKeyMaterial,
+    /// Stored evidence does not satisfy the policy for the requested authority.
+    MissingTrustEvidence,
+    /// The fingerprint is globally blocked.
+    FingerprintBlocked,
+    /// The active policy denies the requested authority scope.
+    PolicyDenied,
+}
+
+/// Identity of one exact member-key binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemberKeyId {
+    /// Member identity bound to the key material.
     pub member_id: MemberIdentity,
+    /// Fingerprint derived from the bound public key material.
+    pub fingerprint: KeyFingerprint,
+}
+
+/// Public key material observed for one exact member-key binding.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemberPublicKeysRecord {
+    /// Exact member-key binding for this material.
+    pub key_id: MemberKeyId,
     /// Opaque signing public key bytes.
     pub signing_public_key: Box<[u8]>,
     /// Opaque encryption public key bytes.
     pub encryption_public_key: Box<[u8]>,
 }
 
-impl fmt::Debug for TrustedMemberPublicKeysRecord {
+impl MemberPublicKeysRecord {
+    /// Build a store record from typed public member keys.
+    #[must_use]
+    pub fn from_public_keys(public_keys: &PublicMemberKeys) -> Self {
+        Self {
+            key_id: MemberKeyId {
+                member_id: public_keys.member_id().clone(),
+                fingerprint: public_keys.fingerprint(),
+            },
+            signing_public_key: public_keys.signing_key_bytes().into(),
+            encryption_public_key: public_keys.encryption_key_bytes().into(),
+        }
+    }
+}
+
+impl fmt::Debug for MemberPublicKeysRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let alternate = f.alternate();
-        let mut debug = f.debug_struct("TrustedMemberPublicKeysRecord");
-        debug.field("member_id", &self.member_id);
+        let mut debug = f.debug_struct("MemberPublicKeysRecord");
+        debug.field("key_id", &self.key_id);
         if alternate {
             let signing_public_key = URL_SAFE_NO_PAD.encode(&self.signing_public_key);
             let encryption_public_key = URL_SAFE_NO_PAD.encode(&self.encryption_public_key);
@@ -947,6 +1036,81 @@ impl fmt::Debug for TrustedMemberPublicKeysRecord {
                 )
                 .finish()
         }
+    }
+}
+
+/// Trust evidence recorded for one exact member-key binding.
+#[derive(Debug, EnumSetType, Hash)]
+pub enum MemberKeyTrustEvidenceKind {
+    /// This store locally trusts the exact member-key binding.
+    LocalExplicitTrust,
+}
+
+impl MemberKeyTrustEvidenceKind {
+    /// Store representation for this evidence kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalExplicitTrust => "local_explicit_trust",
+        }
+    }
+}
+
+impl FromStr for MemberKeyTrustEvidenceKind {
+    type Err = MemberKeyTrustEvidenceKindParseError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "local_explicit_trust" => Ok(Self::LocalExplicitTrust),
+            _ => Err(MemberKeyTrustEvidenceKindParseError {
+                value: input.to_owned(),
+            }),
+        }
+    }
+}
+
+/// Error raised while parsing a stored member-key trust evidence kind.
+#[derive(Clone, Debug, PartialEq, Eq, Snafu)]
+#[snafu(display("member-key trust evidence kind '{value}' is invalid"))]
+pub struct MemberKeyTrustEvidenceKindParseError {
+    /// Raw evidence-kind value read from storage.
+    value: String,
+}
+
+/// One stored evidence record for a member-key binding.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MemberKeyTrustEvidenceRecord {
+    /// Exact member-key binding the evidence describes.
+    pub key_id: MemberKeyId,
+    /// Kind of evidence recorded for that binding.
+    pub evidence_kind: MemberKeyTrustEvidenceKind,
+}
+
+/// Evidence set loaded for one exact member-key binding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MemberKeyTrustEvidenceSet {
+    /// In-memory finite-domain set of evidence kinds observed for one exact binding.
+    evidence_kinds: EnumSet<MemberKeyTrustEvidenceKind>,
+}
+
+impl MemberKeyTrustEvidenceSet {
+    /// Build an empty evidence set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            evidence_kinds: EnumSet::new(),
+        }
+    }
+
+    /// Add one evidence kind to the set.
+    pub fn insert(&mut self, evidence_kind: MemberKeyTrustEvidenceKind) {
+        self.evidence_kinds.insert(evidence_kind);
+    }
+
+    /// Return whether the set contains the requested evidence kind.
+    #[must_use]
+    pub fn contains(self, evidence_kind: MemberKeyTrustEvidenceKind) -> bool {
+        self.evidence_kinds.contains(evidence_kind)
     }
 }
 
@@ -1073,11 +1237,29 @@ pub trait ReplicationStoreReadTransaction: Send {
         member_id: &'a MemberIdentity,
     ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>>;
 
-    /// Load trusted public key material for one member identity.
-    fn load_trusted_member_public_keys<'a>(
+    /// Load public key material for one exact member-key binding.
+    fn load_member_public_keys<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
+
+    /// Load every observed public key material record for one member identity.
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
+
+    /// Load trust evidence for one exact member-key binding.
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>>;
+
+    /// Return whether a fingerprint is globally blocked.
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Load one persisted replication update by `(group_id, update_id)`.
     fn load_replication_update<'a>(
@@ -1227,16 +1409,46 @@ pub trait ReplicationStoreTransaction: Send {
         record: LocalMemberPrivateKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Load trusted public key material for one member identity.
-    fn load_trusted_member_public_keys<'a>(
+    /// Load public key material for one exact member-key binding.
+    fn load_member_public_keys<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
+
+    /// Load every observed public key material record for one member identity.
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>>;
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
 
-    /// Insert trusted public key material or confirm it is already stored unchanged.
-    fn ensure_trusted_member_public_keys(
+    /// Load trust evidence for one exact member-key binding.
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>>;
+
+    /// Return whether a fingerprint is globally blocked.
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Insert public key material or confirm it is already stored unchanged.
+    fn ensure_member_public_keys(
         &mut self,
-        record: TrustedMemberPublicKeysRecord,
+        record: MemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Insert trust evidence or confirm it is already present.
+    fn ensure_member_key_trust_evidence(
+        &mut self,
+        record: MemberKeyTrustEvidenceRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Insert a globally blocked fingerprint or confirm it is already present.
+    fn ensure_blocked_key_fingerprint(
+        &mut self,
+        fingerprint: KeyFingerprint,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Advance the stored applied version vector for one existing replication group.
@@ -1343,32 +1555,40 @@ pub trait ReplicationStore: Send + Sync {
 mod tests {
     use super::*;
 
-    fn trusted_public_keys_record() -> TrustedMemberPublicKeysRecord {
-        TrustedMemberPublicKeysRecord {
-            member_id: MemberIdentity::from_array(["debug", "alice"]),
+    fn member_public_keys_record() -> MemberPublicKeysRecord {
+        MemberPublicKeysRecord {
+            key_id: MemberKeyId {
+                member_id: MemberIdentity::from_array(["debug", "alice"]),
+                fingerprint: KeyFingerprint::from_bytes([9_u8; 32]),
+            },
             signing_public_key: Box::from([1_u8, 2, 3]),
             encryption_public_key: Box::from([4_u8, 5, 6]),
         }
     }
 
     #[test]
-    fn trusted_public_keys_debug_prints_lengths_by_default() {
-        let output = format!("{:?}", trusted_public_keys_record());
+    fn member_public_keys_debug_prints_lengths_by_default() {
+        let output = format!("{:?}", member_public_keys_record());
 
         assert_eq!(
             output,
-            r#"TrustedMemberPublicKeysRecord { member_id: Identifier(i"debug", i"alice"), signing_public_key_len: 3, encryption_public_key_len: 3 }"#,
+            r#"MemberPublicKeysRecord { key_id: MemberKeyId { member_id: Identifier(i"debug", i"alice"), fingerprint: KeyFingerprint("CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQk") }, signing_public_key_len: 3, encryption_public_key_len: 3 }"#,
         );
     }
 
     #[test]
-    fn trusted_public_keys_alternate_debug_prints_base64url() {
-        let output = format!("{:#?}", trusted_public_keys_record());
+    fn member_public_keys_alternate_debug_prints_base64url() {
+        let output = format!("{:#?}", member_public_keys_record());
 
         assert_eq!(
             output,
-            r#"TrustedMemberPublicKeysRecord {
-    member_id: Identifier(i"debug", i"alice"),
+            r#"MemberPublicKeysRecord {
+    key_id: MemberKeyId {
+        member_id: Identifier(i"debug", i"alice"),
+        fingerprint: KeyFingerprint(
+            "CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQk",
+        ),
+    },
     signing_public_key: "AQID",
     encryption_public_key: "BAUG",
 }"#,

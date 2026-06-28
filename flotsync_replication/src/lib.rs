@@ -10,6 +10,7 @@ pub mod api;
 pub mod delivery;
 pub mod runtime;
 pub mod security_provisioning;
+pub(crate) mod security_store;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

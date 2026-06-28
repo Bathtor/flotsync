@@ -10,6 +10,11 @@ use crate::{
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
         LocalMemberPrivateKeysRecord,
+        MemberKeyId,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberKeyTrustEvidenceSet,
+        MemberPublicKeysRecord,
         ReplicationGroupRecord,
         ReplicationRowRecord,
         ReplicationRowSnapshot,
@@ -24,7 +29,6 @@ use crate::{
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
-        TrustedMemberPublicKeysRecord,
     },
     runtime::messages::{
         MemberCountContext,
@@ -47,6 +51,7 @@ use flotsync_messages::{
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
 };
+use flotsync_security::{ED25519_KEY_LENGTH, KeyFingerprint, PublicMemberKeys, X25519_KEY_LENGTH};
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
 use kompact::prelude::block_on;
@@ -325,11 +330,34 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_trusted_member_public_keys<'a>(
+    fn load_member_public_keys<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
+    }
+
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
-        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
+        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
+            .boxed()
+    }
+
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        async move { is_key_fingerprint_blocked(self.assert_open_connection(), fingerprint).await }
             .boxed()
     }
 
@@ -449,21 +477,58 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_trusted_member_public_keys<'a>(
+    fn load_member_public_keys<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
+    }
+
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
-        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
             .boxed()
     }
 
-    fn ensure_trusted_member_public_keys(
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
+        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
+            .boxed()
+    }
+
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        async move { is_key_fingerprint_blocked(self.assert_open_connection(), fingerprint).await }
+            .boxed()
+    }
+
+    fn ensure_member_public_keys(
         &mut self,
-        record: TrustedMemberPublicKeysRecord,
+        record: MemberPublicKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        async move {
-            ensure_trusted_member_public_keys(self.assert_open_connection(), &record).await
-        }
+        async move { ensure_member_public_keys(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn ensure_member_key_trust_evidence(
+        &mut self,
+        record: MemberKeyTrustEvidenceRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { ensure_member_key_trust_evidence(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn ensure_blocked_key_fingerprint(
+        &mut self,
+        fingerprint: KeyFingerprint,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { ensure_blocked_key_fingerprint(self.assert_open_connection(), &fingerprint).await }
         .boxed()
     }
 
@@ -676,10 +741,27 @@ CREATE TABLE IF NOT EXISTS local_members (
 );
 ",
         "
-CREATE TABLE IF NOT EXISTS known_peers (
-    member_identity TEXT PRIMARY KEY NOT NULL,
+CREATE TABLE IF NOT EXISTS member_public_keys (
+    member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
     signing_public_key BLOB NOT NULL,
-    encryption_public_key BLOB NOT NULL
+    encryption_public_key BLOB NOT NULL,
+    PRIMARY KEY (member_identity, key_fingerprint)
+);
+",
+        "
+CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
+    member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    PRIMARY KEY (member_identity, key_fingerprint, evidence_kind),
+    FOREIGN KEY (member_identity, key_fingerprint)
+        REFERENCES member_public_keys(member_identity, key_fingerprint) ON DELETE RESTRICT
+);
+",
+        "
+CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
+    key_fingerprint BLOB PRIMARY KEY NOT NULL
 );
 ",
     ];
@@ -954,18 +1036,19 @@ VALUES (?1, ?2, ?3, ?4, ?5)
     Ok(())
 }
 
-async fn load_trusted_member_public_keys(
+async fn load_member_public_keys(
     connection: &mut SqliteStoreConnection,
-    member_id: &MemberIdentity,
-) -> Result<Option<TrustedMemberPublicKeysRecord>, StoreError> {
+    key_id: &MemberKeyId,
+) -> Result<Option<MemberPublicKeysRecord>, StoreError> {
     let row = sqlx::query(
         "
 SELECT signing_public_key, encryption_public_key
-FROM known_peers
-WHERE member_identity = ?1
+FROM member_public_keys
+WHERE member_identity = ?1 AND key_fingerprint = ?2
 ",
     )
-    .bind(member_id.to_string())
+    .bind(key_id.member_id.to_string())
+    .bind(key_id.fingerprint.as_ref())
     .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -973,8 +1056,8 @@ WHERE member_identity = ?1
         return Ok(None);
     };
 
-    Ok(Some(TrustedMemberPublicKeysRecord {
-        member_id: member_id.clone(),
+    Ok(Some(MemberPublicKeysRecord {
+        key_id: key_id.clone(),
         signing_public_key: row
             .get::<Vec<u8>, _>("signing_public_key")
             .into_boxed_slice(),
@@ -984,16 +1067,53 @@ WHERE member_identity = ?1
     }))
 }
 
-async fn ensure_trusted_member_public_keys(
+async fn load_member_public_keys_for_member(
     connection: &mut SqliteStoreConnection,
-    record: &TrustedMemberPublicKeysRecord,
+    member_id: &MemberIdentity,
+) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT key_fingerprint, signing_public_key, encryption_public_key
+FROM member_public_keys
+WHERE member_identity = ?1
+ORDER BY key_fingerprint
+",
+    )
+    .bind(member_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fingerprint = decode_key_fingerprint(&row.get::<Vec<u8>, _>("key_fingerprint"))?;
+        records.push(MemberPublicKeysRecord {
+            key_id: MemberKeyId {
+                member_id: member_id.clone(),
+                fingerprint,
+            },
+            signing_public_key: row
+                .get::<Vec<u8>, _>("signing_public_key")
+                .into_boxed_slice(),
+            encryption_public_key: row
+                .get::<Vec<u8>, _>("encryption_public_key")
+                .into_boxed_slice(),
+        });
+    }
+    Ok(records)
+}
+
+async fn ensure_member_public_keys(
+    connection: &mut SqliteStoreConnection,
+    record: &MemberPublicKeysRecord,
 ) -> Result<(), StoreError> {
-    if let Some(existing) = load_trusted_member_public_keys(connection, &record.member_id).await? {
+    validate_member_public_keys_record(record)?;
+    if let Some(existing) = load_member_public_keys(connection, &record.key_id).await? {
         ensure!(
             existing == *record,
             ConflictingMemberSecurityMaterialSnafu {
-                object: "trusted member public keys",
-                member_id: record.member_id.clone(),
+                object: "member public keys",
+                member_id: record.key_id.member_id.clone(),
             }
         );
         return Ok(());
@@ -1001,17 +1121,101 @@ async fn ensure_trusted_member_public_keys(
 
     sqlx::query(
         "
-INSERT INTO known_peers (
+INSERT INTO member_public_keys (
     member_identity,
+    key_fingerprint,
     signing_public_key,
     encryption_public_key
+)
+VALUES (?1, ?2, ?3, ?4)
+",
+    )
+    .bind(record.key_id.member_id.to_string())
+    .bind(record.key_id.fingerprint.as_ref())
+    .bind(record.signing_public_key.as_ref())
+    .bind(record.encryption_public_key.as_ref())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn load_member_key_trust_evidence(
+    connection: &mut SqliteStoreConnection,
+    key_id: &MemberKeyId,
+) -> Result<MemberKeyTrustEvidenceSet, StoreError> {
+    let evidence_kinds = sqlx::query_scalar::<_, String>(
+        "
+SELECT evidence_kind
+FROM member_key_trust_evidence
+WHERE member_identity = ?1 AND key_fingerprint = ?2
+",
+    )
+    .bind(key_id.member_id.to_string())
+    .bind(key_id.fingerprint.as_ref())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let mut evidence = MemberKeyTrustEvidenceSet::empty();
+    for evidence_kind in evidence_kinds {
+        let evidence_kind = decode_member_key_trust_evidence_kind(&evidence_kind)?;
+        evidence.insert(evidence_kind);
+    }
+    Ok(evidence)
+}
+
+async fn ensure_member_key_trust_evidence(
+    connection: &mut SqliteStoreConnection,
+    record: &MemberKeyTrustEvidenceRecord,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+INSERT OR IGNORE INTO member_key_trust_evidence (
+    member_identity,
+    key_fingerprint,
+    evidence_kind
 )
 VALUES (?1, ?2, ?3)
 ",
     )
-    .bind(record.member_id.to_string())
-    .bind(record.signing_public_key.as_ref())
-    .bind(record.encryption_public_key.as_ref())
+    .bind(record.key_id.member_id.to_string())
+    .bind(record.key_id.fingerprint.as_ref())
+    .bind(record.evidence_kind.as_str())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn is_key_fingerprint_blocked(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<bool, StoreError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "
+SELECT COUNT(*)
+FROM blocked_key_fingerprints
+WHERE key_fingerprint = ?1
+",
+    )
+    .bind(fingerprint.as_ref())
+    .fetch_one(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(count > 0)
+}
+
+async fn ensure_blocked_key_fingerprint(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+INSERT OR IGNORE INTO blocked_key_fingerprints (key_fingerprint)
+VALUES (?1)
+",
+    )
+    .bind(fingerprint.as_ref())
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -1808,6 +2012,58 @@ fn decode_member_identity(raw: &str) -> Result<MemberIdentity, StoreError> {
     })?)
 }
 
+fn decode_key_fingerprint(raw: &[u8]) -> Result<KeyFingerprint, StoreError> {
+    KeyFingerprint::try_from_slice(raw)
+        .map_err(|source| invalid_stored_object("key fingerprint", source))
+}
+
+fn decode_member_key_trust_evidence_kind(
+    raw: &str,
+) -> Result<MemberKeyTrustEvidenceKind, StoreError> {
+    raw.parse()
+        .map_err(|source| invalid_stored_object("member key trust evidence kind", source))
+}
+
+fn validate_member_public_keys_record(record: &MemberPublicKeysRecord) -> Result<(), StoreError> {
+    let public_keys = public_keys_from_member_record(record)?;
+    ensure!(
+        public_keys.fingerprint() == record.key_id.fingerprint,
+        ConflictingMemberSecurityMaterialSnafu {
+            object: "member public keys fingerprint",
+            member_id: record.key_id.member_id.clone(),
+        }
+    );
+    Ok(())
+}
+
+fn public_keys_from_member_record(
+    record: &MemberPublicKeysRecord,
+) -> Result<PublicMemberKeys, StoreError> {
+    let signing_public_key = fixed_member_public_key::<ED25519_KEY_LENGTH>(
+        "member signing public key",
+        record.signing_public_key.as_ref(),
+    )?;
+    let encryption_public_key = fixed_member_public_key::<X25519_KEY_LENGTH>(
+        "member encryption public key",
+        record.encryption_public_key.as_ref(),
+    )?;
+    PublicMemberKeys::from_key_bytes(
+        record.key_id.member_id.clone(),
+        signing_public_key,
+        encryption_public_key,
+    )
+    .map_err(|source| invalid_stored_object("member public keys", source))
+}
+
+fn fixed_member_public_key<const N: usize>(
+    object: &'static str,
+    bytes: &[u8],
+) -> Result<[u8; N], StoreError> {
+    bytes
+        .try_into()
+        .map_err(|source| invalid_stored_object(object, source))
+}
+
 fn invalid_stored_object(
     object: &'static str,
     source: impl StdError + Send + Sync + 'static,
@@ -1949,12 +2205,18 @@ impl From<SqliteStoreError> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{
-        DatasetRowPatch,
-        DatasetRowWrite,
-        ReplicationRowRecord,
-        ReplicationUpdateFilter,
-        current_slice_placeholder_group_security_material,
+    use crate::{
+        api::{
+            DatasetRowPatch,
+            DatasetRowWrite,
+            MemberKeyTrustEvidenceKind,
+            MemberKeyTrustEvidenceRecord,
+            MemberPublicKeysRecord,
+            ReplicationRowRecord,
+            ReplicationUpdateFilter,
+            current_slice_placeholder_group_security_material,
+        },
+        test_support::test_public_member_keys,
     };
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
@@ -2374,65 +2636,88 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_store_roundtrips_trusted_member_public_keys() {
+    fn sqlite_store_roundtrips_member_public_keys_and_trust_evidence() {
         let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: remote_member(),
-            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
+        let record =
+            MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+        let evidence = MemberKeyTrustEvidenceRecord {
+            key_id: record.key_id.clone(),
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
         };
 
         let mut transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("trusted public keys should store");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("same trusted public keys should be accepted");
-        let loaded =
-            wait_for_store_future(transaction.load_trusted_member_public_keys(&record.member_id))
-                .expect("trusted public keys should load")
-                .expect("trusted public keys should exist");
+        wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect("member public keys should store");
+        wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect("same member public keys should be accepted");
+        wait_for_store_future(transaction.ensure_member_key_trust_evidence(evidence.clone()))
+            .expect("trust evidence should store");
+        wait_for_store_future(transaction.ensure_member_key_trust_evidence(evidence.clone()))
+            .expect("same trust evidence should be accepted");
+        let loaded = wait_for_store_future(transaction.load_member_public_keys(&record.key_id))
+            .expect("member public keys should load")
+            .expect("member public keys should exist");
         assert_eq!(loaded, record);
+        let loaded_for_member = wait_for_store_future(
+            transaction.load_member_public_keys_for_member(&record.key_id.member_id),
+        )
+        .expect("member public keys should load by member");
+        assert_eq!(loaded_for_member, vec![record.clone()]);
+        let loaded_evidence =
+            wait_for_store_future(transaction.load_member_key_trust_evidence(&record.key_id))
+                .expect("trust evidence should load");
+        assert!(loaded_evidence.contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust));
         wait_for_store_future(transaction.commit()).expect("commit should succeed");
 
         let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
             .expect("transaction should start");
-        let loaded = wait_for_store_future(
-            read_transaction.load_trusted_member_public_keys(&record.member_id),
-        )
-        .expect("trusted public keys should load through read transaction")
-        .expect("trusted public keys should exist");
+        let loaded =
+            wait_for_store_future(read_transaction.load_member_public_keys(&record.key_id))
+                .expect("member public keys should load through read transaction")
+                .expect("member public keys should exist");
         assert_eq!(loaded, record);
         wait_for_store_future(read_transaction.release()).expect("release should succeed");
     }
 
     #[test]
-    fn sqlite_store_rejects_conflicting_trusted_member_public_keys() {
+    fn sqlite_store_rejects_member_public_keys_with_mismatched_fingerprint() {
         let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: remote_member(),
-            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
-        };
-        let conflicting_record = TrustedMemberPublicKeysRecord {
-            member_id: record.member_id.clone(),
-            signing_public_key: Vec::from([9_u8, 8, 7, 6]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
-        };
+        let mut record =
+            MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+        record.key_id.fingerprint = test_public_member_keys(&local_member()).fingerprint();
 
         let mut transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("trusted public keys should store");
-        let error = wait_for_store_future(
-            transaction.ensure_trusted_member_public_keys(conflicting_record),
-        )
-        .expect_err("conflicting trusted public keys should fail");
+        let error = wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect_err("mismatched member public keys should fail");
         assert!(is_conflicting_member_security_material(
             &error,
-            "trusted member public keys",
-            &record.member_id,
+            "member public keys fingerprint",
+            &record.key_id.member_id,
         ));
+        wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_blocked_key_fingerprints() {
+        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let fingerprint = test_public_member_keys(&remote_member()).fingerprint();
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        assert!(
+            !wait_for_store_future(transaction.is_key_fingerprint_blocked(&fingerprint))
+                .expect("blocked fingerprint should load")
+        );
+        wait_for_store_future(transaction.ensure_blocked_key_fingerprint(fingerprint))
+            .expect("blocked fingerprint should store");
+        wait_for_store_future(transaction.ensure_blocked_key_fingerprint(fingerprint))
+            .expect("same blocked fingerprint should be accepted");
+        assert!(
+            wait_for_store_future(transaction.is_key_fingerprint_blocked(&fingerprint))
+                .expect("blocked fingerprint should load")
+        );
         wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
     }
 

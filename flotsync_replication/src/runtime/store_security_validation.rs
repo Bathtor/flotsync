@@ -12,9 +12,10 @@ use crate::{
         SecuritySnafu,
         StoreError,
         StoreSecretKeyId,
-        StoredGroupInvalidTrustedPublicKeysSnafu,
+        StoredGroupInvalidMemberPublicKeysSnafu,
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
+    security_store::SecurityStoreError,
 };
 use flotsync_core::{
     GroupId,
@@ -194,26 +195,63 @@ fn load_security_error_from_group(
     source: DeliverySecurityError,
 ) -> LoadSecurityError {
     match source {
-        DeliverySecurityError::MissingTrustedPublicKeys { member_id } => {
-            LoadSecurityError::StoredGroupMissingTrustedPublicKeys {
+        DeliverySecurityError::SecurityStore { source } => {
+            load_security_error_from_security_store(group_id, source)
+        }
+        other => other_load_security_error(other),
+    }
+}
+
+fn load_security_error_from_security_store(
+    group_id: GroupId,
+    source: SecurityStoreError,
+) -> LoadSecurityError {
+    match source {
+        SecurityStoreError::NoPermittedMemberPublicKeys { member_id, .. } => {
+            LoadSecurityError::StoredGroupMissingPermittedPublicKeys {
                 group_id,
                 member_id,
             }
         }
-        DeliverySecurityError::InvalidTrustedPublicKeyLength {
+        SecurityStoreError::AmbiguousPermittedMemberPublicKeys {
+            member_id,
+            permitted_count,
+            ..
+        } => LoadSecurityError::StoredGroupAmbiguousPermittedPublicKeys {
+            group_id,
+            member_id,
+            permitted_count,
+        },
+        SecurityStoreError::InvalidMemberPublicKeyLength {
             member_id,
             expected,
             actual,
-        } => LoadSecurityError::StoredGroupInvalidTrustedPublicKeyLength {
+            ..
+        } => LoadSecurityError::StoredGroupInvalidMemberPublicKeyLength {
             group_id,
             member_id,
             expected,
             actual,
         },
-        DeliverySecurityError::InvalidTrustedPublicKeys { member_id, source } => {
-            invalid_stored_group_trusted_public_keys(group_id, member_id, source)
+        SecurityStoreError::InvalidMemberPublicKeys {
+            member_id, source, ..
+        } => invalid_stored_group_member_public_keys(group_id, member_id, source),
+        SecurityStoreError::MemberPublicKeyFingerprintMismatch {
+            member_id,
+            expected,
+            actual,
+        } => {
+            let source: BoxError =
+                Box::new(SecurityStoreError::MemberPublicKeyFingerprintMismatch {
+                    member_id: member_id.clone(),
+                    expected,
+                    actual,
+                });
+            invalid_stored_group_member_public_keys(group_id, member_id, source)
         }
-        other => other_load_security_error(other),
+        other @ SecurityStoreError::StoreAccess { .. } => {
+            other_load_security_error(DeliverySecurityError::SecurityStore { source: other })
+        }
     }
 }
 
@@ -227,14 +265,14 @@ fn invalid_local_private_keys(
     InvalidLocalPrivateKeysSnafu { member_id }.into_error(source)
 }
 
-/// Attach the original trusted-key decode failure as non-public source context.
+/// Attach the original member-key decode failure as non-public source context.
 #[track_caller]
-fn invalid_stored_group_trusted_public_keys(
+fn invalid_stored_group_member_public_keys(
     group_id: GroupId,
     member_id: MemberIdentity,
     source: BoxError,
 ) -> LoadSecurityError {
-    StoredGroupInvalidTrustedPublicKeysSnafu {
+    StoredGroupInvalidMemberPublicKeysSnafu {
         group_id,
         member_id,
     }

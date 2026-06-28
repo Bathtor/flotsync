@@ -1416,7 +1416,7 @@ impl ReplicationRuntimeComponent {
         Self::validate_bootstrap_membership(group_id, &members, &self.local_member, &sender)?;
         let security_material = self
             .security
-            .prepare_security_material_from_bootstrap_msg(&message)
+            .prepare_security_material_from_bootstrap_msg(&message, &sender)
             .await
             .boxed()
             .context(inbound::BootstrapSecuritySnafu)?;

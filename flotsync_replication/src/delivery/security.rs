@@ -1,13 +1,12 @@
 use crate::{
     api::{
+        AuthorityScope,
         BoxError,
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
         LocalMemberPrivateKeysRecord,
-        ReplicationStore,
         StoreError,
         StoreSecretKeyId,
-        TrustedMemberPublicKeysRecord,
     },
     delivery::{
         group_broadcast::GroupMessageHeader,
@@ -15,6 +14,7 @@ use crate::{
         shared::{DetachedSignature, MessageId, SignatureScheme},
     },
     runtime::messages::{BootstrapGroupMessage, BootstrapMemberPublicKeysMessage},
+    security_store::{SecurityStore, SecurityStoreError},
 };
 use bytes::Bytes;
 use flotsync_core::{
@@ -82,8 +82,6 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Local private keys for member {member_id} are not provisioned."))]
     MissingLocalPrivateKeys { member_id: MemberIdentity },
-    #[snafu(display("Trusted public keys for member {member_id} are not provisioned."))]
-    MissingTrustedPublicKeys { member_id: MemberIdentity },
     #[snafu(display("Security material for group {group_id} is not provisioned."))]
     MissingGroupSecurity { group_id: GroupId },
     #[snafu(display("Stored group {group_id} has invalid members: {source}"))]
@@ -142,8 +140,8 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Bootstrap payload is missing public keys for member {member_id}."))]
     MissingBootstrapPublicKeys { member_id: MemberIdentity },
-    #[snafu(display("Bootstrap public keys for member {member_id} do not match trusted keys."))]
-    TrustedPublicKeysMismatch { member_id: MemberIdentity },
+    #[snafu(display("Bootstrap public keys for member {member_id} do not match permitted keys."))]
+    BootstrapPublicKeysMismatch { member_id: MemberIdentity },
     #[snafu(display("Bootstrap public keys included non-member {member_id}."))]
     UnexpectedBootstrapPublicKeys { member_id: MemberIdentity },
     #[snafu(display("Encrypted secret used unsupported crypto version {version}."))]
@@ -152,14 +150,6 @@ pub(crate) enum DeliverySecurityError {
         "Encrypted secret nonce had invalid length {actual}; expected {STORE_SECRET_NONCE_LENGTH}."
     ))]
     InvalidStoreSecretNonce { actual: usize },
-    #[snafu(display(
-        "Trusted public key bytes for member {member_id} had invalid length {actual}; expected {expected}."
-    ))]
-    InvalidTrustedPublicKeyLength {
-        member_id: MemberIdentity,
-        expected: usize,
-        actual: usize,
-    },
     #[snafu(display(
         "Encrypted group secret for group {group_id} used key id {actual}; expected {expected}."
     ))]
@@ -170,11 +160,6 @@ pub(crate) enum DeliverySecurityError {
     },
     #[snafu(display("Local private keys were invalid: {source}"))]
     InvalidLocalPrivateKeys { source: BoxError },
-    #[snafu(display("Trusted public keys for member {member_id} were invalid: {source}"))]
-    InvalidTrustedPublicKeys {
-        member_id: MemberIdentity,
-        source: BoxError,
-    },
     #[snafu(display("Failed to generate group key: {source}"))]
     GenerateGroupKey { source: BoxError },
     #[snafu(display("Failed to seal reliable payload for recipient {recipient}: {source}"))]
@@ -209,6 +194,8 @@ pub(crate) enum DeliverySecurityError {
         member_id: MemberIdentity,
         source: BoxError,
     },
+    #[snafu(display("Public key permission lookup failed: {source}"))]
+    SecurityStore { source: SecurityStoreError },
     #[snafu(display("Failed to open encrypted group secret for group {group_id}: {source}"))]
     OpenGroupSecret { group_id: GroupId, source: BoxError },
     #[snafu(display("Failed to seal group payload for group {group_id}: {source}"))]
@@ -233,8 +220,6 @@ impl DeliverySecurityError {
             Self::StoreAccess { .. } => true,
             // Missing local provisioning is configuration state, not a retry condition.
             Self::MissingLocalPrivateKeys { .. } => false,
-            // Missing trusted keys require provisioning or a trust update.
-            Self::MissingTrustedPublicKeys { .. } => false,
             // Missing or malformed group-security state requires provisioning or data repair.
             Self::MissingGroupSecurity { .. } | Self::InvalidGroupMembers { .. } => false,
             // Reliable self-send is a caller bug.
@@ -251,14 +236,10 @@ impl DeliverySecurityError {
             Self::UnexpectedGroupSender { .. } | Self::GroupSenderNotInGroup { .. } => false,
             // Bootstrap payload membership and key mismatches are permanent for this payload.
             Self::MissingBootstrapPublicKeys { .. }
-            | Self::TrustedPublicKeysMismatch { .. }
+            | Self::BootstrapPublicKeysMismatch { .. }
             | Self::UnexpectedBootstrapPublicKeys { .. } => false,
             // Stored secret encoding/version problems need data repair or a code change.
             Self::UnsupportedStoreSecretVersion { .. } | Self::InvalidStoreSecretNonce { .. } => {
-                false
-            }
-            // Invalid key material needs reprovisioning.
-            Self::InvalidTrustedPublicKeyLength { .. } | Self::InvalidTrustedPublicKeys { .. } => {
                 false
             }
             // Group-secret key id mismatches require loading with the matching local key id.
@@ -273,7 +254,8 @@ impl DeliverySecurityError {
             Self::SignRecipientAck { .. }
             | Self::SignDiscoveryClaim { .. }
             | Self::VerifyRecipientAck { .. }
-            | Self::VerifyDiscoveryClaim { .. } => false,
+            | Self::VerifyDiscoveryClaim { .. }
+            | Self::SecurityStore { .. } => false,
             // Group-secret and group-payload failures are crypto or key-consistency failures.
             Self::OpenGroupSecret { .. }
             | Self::SealGroupPayload { .. }
@@ -289,7 +271,7 @@ impl DeliverySecurityError {
 /// Decrypted security state and store access shared by delivery-oriented security code.
 #[derive(Clone)]
 pub(crate) struct DeliverySecurity {
-    store: Arc<dyn ReplicationStore>,
+    security_store: SecurityStore,
     local_member: MemberIdentity,
     local_keys: Arc<LocalMemberKeys>,
     store_secret_key: Arc<StoreSecretKey>,
@@ -298,12 +280,13 @@ pub(crate) struct DeliverySecurity {
 
 impl DeliverySecurity {
     pub(crate) async fn load(
-        store: Arc<dyn ReplicationStore>,
+        security_store: SecurityStore,
         local_member: &MemberIdentity,
         store_secret_key: Arc<StoreSecretKey>,
         store_secret_key_id: StoreSecretKeyId,
     ) -> Result<Self, DeliverySecurityError> {
-        let mut transaction = store
+        let mut transaction = security_store
+            .replication_store()
             .begin_read_transaction()
             .await
             .context(StoreAccessSnafu)?;
@@ -317,7 +300,7 @@ impl DeliverySecurity {
         transaction.release().await.context(StoreAccessSnafu)?;
         let local_keys = open_local_private_keys(&record, &store_secret_key)?;
         Ok(Self {
-            store,
+            security_store,
             local_member: local_member.clone(),
             local_keys: Arc::new(local_keys),
             store_secret_key,
@@ -353,7 +336,7 @@ impl DeliverySecurity {
                 member_id: self.local_member.clone(),
             }
         );
-        let recipient_keys = self.load_trusted_public_keys(&header.recipient).await?;
+        let recipient_keys = self.load_permitted_public_keys(&header.recipient).await?;
         seal_reliable_payload_with_os_rng(
             self.local_keys(),
             &recipient_keys,
@@ -390,7 +373,7 @@ impl DeliverySecurity {
                 member_id: self.local_member.clone(),
             }
         );
-        let sender_keys = self.load_trusted_public_keys(&header.sender).await?;
+        let sender_keys = self.load_permitted_public_keys(&header.sender).await?;
         open_reliable_payload(
             &sender_keys,
             self.local_keys(),
@@ -472,7 +455,7 @@ impl DeliverySecurity {
             }
         );
         let frame_signature = recipient_ack_frame_signature(header, signature)?;
-        let recipient_keys = self.load_trusted_public_keys(&header.recipient).await?;
+        let recipient_keys = self.load_permitted_public_keys(&header.recipient).await?;
         verify_frame_signature(
             &recipient_keys,
             SignedFrameParts {
@@ -502,7 +485,7 @@ impl DeliverySecurity {
         let public_keys = if member_id == &self.local_member {
             self.local_keys.public_keys().clone()
         } else {
-            self.load_trusted_public_keys(member_id).await?
+            self.load_permitted_public_keys(member_id).await?
         };
         verify_discovery_payload_signature(&public_keys, payload, signature)
             .boxed()
@@ -564,7 +547,7 @@ impl DeliverySecurity {
         let sender_keys = if header.sender == self.local_member {
             self.local_keys.public_keys().clone()
         } else {
-            self.load_trusted_public_keys(&header.sender).await?
+            self.load_permitted_public_keys(&header.sender).await?
         };
         open_group_payload(
             &sender_keys,
@@ -583,8 +566,10 @@ impl DeliverySecurity {
     pub(crate) async fn prepare_security_material_from_bootstrap_msg(
         &self,
         payload: &BootstrapGroupMessage,
+        bootstrap_sender: &MemberIdentity,
     ) -> Result<EncryptedGroupSecurityMaterial, DeliverySecurityError> {
-        self.validate_bootstrap_payload_public_keys(payload).await?;
+        self.validate_bootstrap_payload_public_keys(payload, bootstrap_sender)
+            .await?;
         self.seal_group_secret(payload.group_id().0, payload.group_key().as_group_key())
     }
 
@@ -597,7 +582,8 @@ impl DeliverySecurity {
         group_id: &GroupId,
     ) -> Result<GroupSecurityMaterial, DeliverySecurityError> {
         let mut transaction = self
-            .store
+            .security_store
+            .replication_store()
             .begin_read_transaction()
             .await
             .context(StoreAccessSnafu)?;
@@ -680,38 +666,39 @@ impl DeliverySecurity {
             let member_public_keys = if member == self.local_member {
                 self.local_keys.public_keys().clone()
             } else {
-                self.load_trusted_public_keys(&member).await?
+                self.load_permitted_public_keys(&member).await?
             };
             public_keys.insert(member, member_public_keys);
         }
         Ok(public_keys)
     }
 
-    /// Load and decode trusted public keys for one member from the replication store.
-    async fn load_trusted_public_keys(
+    /// Load and decode public keys permitted for replication runtime use.
+    async fn load_permitted_public_keys(
         &self,
         member_id: &MemberIdentity,
     ) -> Result<PublicMemberKeys, DeliverySecurityError> {
-        let mut transaction = self
-            .store
-            .begin_read_transaction()
+        self.load_permitted_public_keys_for_scope(member_id, AuthorityScope::ReplicationRuntime)
             .await
-            .context(StoreAccessSnafu)?;
-        let record = transaction
-            .load_trusted_member_public_keys(member_id)
+    }
+
+    /// Load and decode public keys permitted for one authority scope.
+    async fn load_permitted_public_keys_for_scope(
+        &self,
+        member_id: &MemberIdentity,
+        authority_scope: AuthorityScope,
+    ) -> Result<PublicMemberKeys, DeliverySecurityError> {
+        self.security_store
+            .load_permitted_member_public_keys(member_id, authority_scope)
             .await
-            .context(StoreAccessSnafu)?
-            .ok_or_else(|| DeliverySecurityError::MissingTrustedPublicKeys {
-                member_id: member_id.clone(),
-            })?;
-        transaction.release().await.context(StoreAccessSnafu)?;
-        public_keys_from_record(record)
+            .context(SecurityStoreSnafu)
     }
 
     /// Compare bootstrap payload keys against locally provisioned trust records.
     pub(crate) async fn validate_bootstrap_payload_public_keys(
         &self,
         payload: &BootstrapGroupMessage,
+        bootstrap_sender: &MemberIdentity,
     ) -> Result<(), DeliverySecurityError> {
         for member_id in payload.members() {
             if payload.member_public_keys().get(member_id).is_none() {
@@ -727,38 +714,29 @@ impl DeliverySecurity {
                 }
             }
         }
-        for (member_id, member_keys) in payload.member_public_keys().owned_entries() {
-            let trusted_keys = if member_id == self.local_member {
-                self.local_public_bootstrap_keys()
-            } else {
-                let trusted = self.load_trusted_public_keys(&member_id).await?;
-                BootstrapMemberPublicKeysMessage::from_public_keys(&trusted)
-            };
-            if &trusted_keys != member_keys {
-                return Err(DeliverySecurityError::TrustedPublicKeysMismatch { member_id });
-            }
+        let Some(sender_keys) = payload.member_public_keys().get(bootstrap_sender) else {
+            return Err(DeliverySecurityError::MissingBootstrapPublicKeys {
+                member_id: bootstrap_sender.clone(),
+            });
+        };
+        let trusted_sender_keys = if bootstrap_sender == &self.local_member {
+            self.local_public_bootstrap_keys()
+        } else {
+            let trusted = self
+                .load_permitted_public_keys_for_scope(
+                    bootstrap_sender,
+                    AuthorityScope::BootstrapActivation,
+                )
+                .await?;
+            BootstrapMemberPublicKeysMessage::from_public_keys(&trusted)
+        };
+        if &trusted_sender_keys != sender_keys {
+            return Err(DeliverySecurityError::BootstrapPublicKeysMismatch {
+                member_id: bootstrap_sender.clone(),
+            });
         }
         Ok(())
     }
-}
-
-/// Decode one opaque trusted-public-key store record into typed security keys.
-pub(crate) fn public_keys_from_record(
-    record: TrustedMemberPublicKeysRecord,
-) -> Result<PublicMemberKeys, DeliverySecurityError> {
-    let signing_public_key =
-        fixed_public_key(&record.member_id, record.signing_public_key.as_ref())?;
-    let encryption_public_key =
-        fixed_public_key(&record.member_id, record.encryption_public_key.as_ref())?;
-    PublicMemberKeys::from_key_bytes(
-        record.member_id.clone(),
-        signing_public_key,
-        encryption_public_key,
-    )
-    .boxed()
-    .context(InvalidTrustedPublicKeysSnafu {
-        member_id: record.member_id,
-    })
 }
 
 fn group_message_context(header: &GroupMessageHeader) -> GroupMessageContext<'_> {
@@ -838,18 +816,4 @@ impl EncryptedStoreSecret {
             ciphertext: self.ciphertext.as_ref().to_vec(),
         })
     }
-}
-
-/// Validate and copy opaque public-key bytes from store records.
-fn fixed_public_key<const N: usize>(
-    member_id: &MemberIdentity,
-    bytes: &[u8],
-) -> Result<[u8; N], DeliverySecurityError> {
-    bytes
-        .try_into()
-        .map_err(|_| DeliverySecurityError::InvalidTrustedPublicKeyLength {
-            member_id: member_id.clone(),
-            expected: N,
-            actual: bytes.len(),
-        })
 }

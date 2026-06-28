@@ -1,0 +1,13 @@
+id = "019f0f17-c1a4-7763-9e3d-0c1bb4c3d0f1"
+ref = "flotsync-git-4in"
+title = "Add trust and key-evidence inspection APIs"
+body = """
+Follow-up from flotsync-ist.3.
+
+Add explicit inspect/reporting APIs for member public-key material, fingerprints, trust evidence, blocked fingerprints, and permission decisions. This is intentionally deferred from the runtime enforcement work: current code only needs store-backed permission checks, while operator-facing inspection can be designed separately once the core evidence model has settled."""
+status = "open"
+type = "task"
+priority = 3
+parent = "019f098b-8001-7fc0-92ed-86392e41fb7d"
+created_at = "2026-06-28T16:37:22.980918Z"
+updated_at = "2026-06-28T16:37:27.470724Z"

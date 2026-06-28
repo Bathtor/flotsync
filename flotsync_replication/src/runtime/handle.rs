@@ -30,6 +30,7 @@ use crate::{
         SummaryRequest,
     },
     delivery::security::DeliverySecurity,
+    security_store::SecurityStore,
 };
 #[cfg(test)]
 use flotsync_core::MemberIdentity;
@@ -133,8 +134,9 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
+    let security_store = SecurityStore::new(store.clone(), config.trust_policy.clone());
     let security_f = DeliverySecurity::load(
-        store.clone(),
+        security_store,
         &local_member,
         security_secrets.store_secret_key().clone(),
         *security_secrets.store_secret_key_id(),

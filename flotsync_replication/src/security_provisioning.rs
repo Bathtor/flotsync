@@ -12,11 +12,13 @@ use crate::{
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
         LocalMemberPrivateKeysRecord,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberPublicKeysRecord,
         ReplicationSecuritySecrets,
         ReplicationStore,
         ReplicationStoreTransaction,
         StoreError,
-        TrustedMemberPublicKeysRecord,
     },
     delivery::security::{
         LOGICAL_GROUP_SECRET_COLUMN,
@@ -159,8 +161,17 @@ pub async fn provision_replication_security<'a>(
     )
     .await?;
     for public_keys in &trusted_public_keys {
+        let public_keys_record = MemberPublicKeysRecord::from_public_keys(public_keys);
+        let key_id = public_keys_record.key_id.clone();
         transaction
-            .ensure_trusted_member_public_keys(trusted_public_keys_record(public_keys))
+            .ensure_member_public_keys(public_keys_record)
+            .await
+            .context(provision_security_error::StoreAccessSnafu)?;
+        transaction
+            .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                key_id,
+                evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+            })
             .await
             .context(provision_security_error::StoreAccessSnafu)?;
     }
@@ -381,13 +392,4 @@ fn local_private_keys_record(
             ),
         },
     })
-}
-
-/// Convert typed public member keys into the store's opaque trusted-key record.
-fn trusted_public_keys_record(public_keys: &PublicMemberKeys) -> TrustedMemberPublicKeysRecord {
-    TrustedMemberPublicKeysRecord {
-        member_id: public_keys.member_id().clone(),
-        signing_public_key: public_keys.signing_key_bytes().into(),
-        encryption_public_key: public_keys.encryption_key_bytes().into(),
-    }
 }

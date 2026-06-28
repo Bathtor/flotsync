@@ -178,9 +178,10 @@ fn encode_field_definition(field: &Field) -> SchemaResult<proto::FieldDefinition
         .as_ref()
         .map(|default_value| encode_nullable_basic_value(default_value.as_ref()))
         .into();
+    let data_type = encode_replicated_data_type(&field.data_type)?;
     Ok(proto::FieldDefinition {
         name: field.name.clone(),
-        data_type: MessageField::some(encode_replicated_data_type(&field.data_type)?),
+        data_type: MessageField::some(data_type),
         default_value,
         metadata: field
             .metadata

@@ -8,6 +8,9 @@ use crate::{
         ListenerExternalSnafu,
         LoadError,
         LocalMemberPrivateKeysRecord,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberPublicKeysRecord,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -27,7 +30,6 @@ use crate::{
         SnapshotRow,
         SnapshotRowsRequest,
         StoreSecretKeyId,
-        TrustedMemberPublicKeysRecord,
         process_batches,
     },
     delivery::security::DeliverySecurity,
@@ -39,6 +41,7 @@ use crate::{
         },
         host::DeliveryRuntimeHostTestExt,
     },
+    security_store::SecurityStore,
 };
 use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
 use flotsync_data_types::RowOperations;
@@ -626,13 +629,20 @@ pub async fn provision_test_security(
         })?;
     for trusted_member in trusted_members {
         let trusted_keys = test_public_member_keys(&trusted_member);
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: trusted_member,
-            signing_public_key: trusted_keys.signing_key_bytes().into(),
-            encryption_public_key: trusted_keys.encryption_key_bytes().into(),
-        };
+        let record = MemberPublicKeysRecord::from_public_keys(&trusted_keys);
+        let key_id = record.key_id.clone();
         transaction
-            .ensure_trusted_member_public_keys(record)
+            .ensure_member_public_keys(record)
+            .await
+            .boxed()
+            .context(RuntimeSnafu {
+                application_id: application_id.clone(),
+            })?;
+        transaction
+            .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                key_id,
+                evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+            })
             .await
             .boxed()
             .context(RuntimeSnafu {
@@ -653,18 +663,16 @@ pub async fn provision_test_security(
 ///
 /// # Errors
 ///
-/// Returns [`LoadError`] when the store transaction or trusted-key write fails.
+/// Returns [`LoadError`] when the store transaction or trust-evidence write fails.
 pub async fn provision_test_trusted_public_keys(
     application_id: Identifier,
     store: &dyn ReplicationStore,
     member_id: MemberIdentity,
     public_keys: &PublicMemberKeys,
 ) -> Result<(), LoadError> {
-    let record = TrustedMemberPublicKeysRecord {
-        member_id,
-        signing_public_key: public_keys.signing_key_bytes().into(),
-        encryption_public_key: public_keys.encryption_key_bytes().into(),
-    };
+    let mut record = MemberPublicKeysRecord::from_public_keys(public_keys);
+    record.key_id.member_id = member_id;
+    let key_id = record.key_id.clone();
     let mut transaction = store
         .begin_transaction()
         .await
@@ -673,7 +681,17 @@ pub async fn provision_test_trusted_public_keys(
             application_id: application_id.clone(),
         })?;
     transaction
-        .ensure_trusted_member_public_keys(record)
+        .ensure_member_public_keys(record)
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    transaction
+        .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+            key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        })
         .await
         .boxed()
         .context(RuntimeSnafu {
@@ -694,7 +712,7 @@ pub(crate) async fn load_test_delivery_security(
     local_member: &MemberIdentity,
 ) -> Result<DeliverySecurity, LoadError> {
     DeliverySecurity::load(
-        store,
+        SecurityStore::new(store, ReplicationConfig::default().trust_policy),
         local_member,
         Arc::new(test_store_secret_key()),
         TEST_STORE_SECRET_KEY_ID,
