@@ -5,6 +5,9 @@ use crate::{
     GroupKey,
     GroupMessageContext,
     HpkeCiphertext,
+    KEY_FINGERPRINT_LENGTH,
+    KeyFingerprint,
+    KeyFingerprintParseError,
     LocalMemberKeys,
     LocalStoreSecretError,
     LocalStoreSecretProfile,
@@ -37,6 +40,7 @@ use crate::{
     test_support::rng_from_seed,
     verify_frame_signature,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use bytes::Bytes;
 use flotsync_core::member::Identifier;
 use flotsync_messages::{
@@ -194,6 +198,119 @@ fn public_key_bundle_encoding_roundtrips_public_keys() {
 
     assert_eq!(public.member_id(), &alice);
     assert_eq!(&public, local.public_keys());
+}
+
+#[test]
+fn public_key_fingerprint_survives_public_bundle_roundtrip() {
+    let alice = member("alice");
+    let local = local_member("alice", ALICE_SEED);
+    let bundle = encode_public_key_bundle(local.public_keys());
+
+    let public = public_member_keys_from_public_bundle(&bundle, alice).unwrap();
+
+    assert_eq!(public.fingerprint(), local.public_keys().fingerprint());
+}
+
+#[test]
+fn public_key_fingerprint_is_identity_free() {
+    let alice = local_member("alice", ALICE_SEED);
+    let rebound = crate::PublicMemberKeys::from_key_bytes(
+        member("bob"),
+        alice.public_keys().signing_key_bytes(),
+        alice.public_keys().encryption_key_bytes(),
+    )
+    .unwrap();
+
+    assert_eq!(rebound.fingerprint(), alice.public_keys().fingerprint());
+}
+
+#[test]
+fn public_key_fingerprint_changes_with_signing_key_material() {
+    let alice = local_member("alice", ALICE_SEED);
+    let bob = local_member("bob", BOB_SEED);
+    let mixed = crate::PublicMemberKeys::from_key_bytes(
+        member("alice"),
+        bob.public_keys().signing_key_bytes(),
+        alice.public_keys().encryption_key_bytes(),
+    )
+    .unwrap();
+
+    assert_ne!(mixed.fingerprint(), alice.public_keys().fingerprint());
+}
+
+#[test]
+fn public_key_fingerprint_changes_with_encryption_key_material() {
+    let alice = local_member("alice", ALICE_SEED);
+    let bob = local_member("bob", BOB_SEED);
+    let mixed = crate::PublicMemberKeys::from_key_bytes(
+        member("alice"),
+        alice.public_keys().signing_key_bytes(),
+        bob.public_keys().encryption_key_bytes(),
+    )
+    .unwrap();
+
+    assert_ne!(mixed.fingerprint(), alice.public_keys().fingerprint());
+}
+
+#[test]
+fn key_fingerprint_canonical_base64url_roundtrips() {
+    let fingerprint = local_member("alice", ALICE_SEED)
+        .public_keys()
+        .fingerprint();
+
+    let encoded = fingerprint.to_canonical_base64url();
+    let parsed = KeyFingerprint::from_canonical_base64url(&encoded).unwrap();
+    let parsed_from_str = encoded.parse::<KeyFingerprint>().unwrap();
+
+    assert_eq!(encoded.len(), 44);
+    assert!(encoded.ends_with('='));
+    assert_eq!(parsed, fingerprint);
+    assert_eq!(parsed_from_str, fingerprint);
+    assert_eq!(fingerprint.to_canonical_base64url(), encoded);
+}
+
+#[test]
+fn key_fingerprint_rejects_malformed_canonical_input() {
+    let fingerprint = local_member("alice", ALICE_SEED)
+        .public_keys()
+        .fingerprint();
+    let unpadded = fingerprint
+        .to_canonical_base64url()
+        .trim_end_matches('=')
+        .to_owned();
+    let mut invalid_base64 = fingerprint.to_canonical_base64url();
+    invalid_base64.replace_range(0..1, "!");
+    let short_bytes = URL_SAFE.encode([7u8; KEY_FINGERPRINT_LENGTH - 1]);
+
+    assert!(matches!(
+        KeyFingerprint::from_canonical_base64url(&unpadded),
+        Err(KeyFingerprintParseError::InvalidTextLength { .. })
+    ));
+    assert!(matches!(
+        KeyFingerprint::from_canonical_base64url(&invalid_base64),
+        Err(KeyFingerprintParseError::InvalidCanonicalBase64Url { .. })
+    ));
+    assert!(matches!(
+        KeyFingerprint::from_canonical_base64url(&short_bytes),
+        Err(KeyFingerprintParseError::InvalidByteLength { .. })
+    ));
+}
+
+#[test]
+fn key_fingerprint_display_string_groups_unpadded_base64url() {
+    let fingerprint = local_member("alice", ALICE_SEED)
+        .public_keys()
+        .fingerprint();
+
+    let display = fingerprint.to_display_string();
+
+    assert_eq!(
+        display,
+        "q6MZ-UqAf-CCRA-Mifp-LKvD-ohTf-JZ6a-Qi62-egmX-D_Sx-xX0"
+    );
+    assert!(display.parse::<KeyFingerprint>().is_err());
+    assert_eq!(fingerprint.to_string(), display);
+    assert!(format!("{fingerprint:?}").contains(&display));
 }
 
 #[test]

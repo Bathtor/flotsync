@@ -7,6 +7,7 @@ edition = "2024"
 test-support = ["dep:rand_chacha", "keyring-core/sample"]
 
 [dependencies]
+base64 = { workspace = true }
 bytes = { workspace = true }
 chacha20poly1305 = "0.10.1"
 ed25519-dalek = { version = "2.2.0", features = ["digest"] }

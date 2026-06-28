@@ -1591,6 +1591,7 @@ version = "0.1.0"
 dependencies = [
  "android-native-keyring-store",
  "apple-native-keyring-store",
+ "base64",
  "bytes",
  "chacha20poly1305",
  "dbus-secret-service-keyring-store",

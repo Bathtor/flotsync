@@ -1,6 +1,7 @@
 //! Cryptographic building blocks for authenticated encrypted replication frames.
 
 pub use error::{Result, SecurityError};
+pub use fingerprint::{KEY_FINGERPRINT_LENGTH, KeyFingerprint, KeyFingerprintParseError};
 #[cfg(any(test, feature = "test-support"))]
 pub use group::test_group_key_from_id;
 pub use group::{
@@ -78,6 +79,7 @@ pub use store_secret::{
 };
 
 mod error;
+mod fingerprint;
 mod group;
 mod hpke;
 mod identity;

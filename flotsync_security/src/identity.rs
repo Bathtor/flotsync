@@ -7,6 +7,7 @@ use crate::{
         Result,
         SecurityError,
     },
+    fingerprint::{KeyFingerprint, derive_public_key_fingerprint},
     hpke::{HpkeKem, HpkePrivateKey, HpkePublicKey},
     util::fixed_array,
 };
@@ -278,6 +279,15 @@ impl PublicMemberKeys {
     #[must_use]
     pub fn encryption_key_bytes(&self) -> [u8; X25519_KEY_LENGTH] {
         fixed_array(self.hpke_public_key.to_bytes().as_slice())
+    }
+
+    /// Derive the stable fingerprint for this exact public key material.
+    #[must_use]
+    pub fn fingerprint(&self) -> KeyFingerprint {
+        derive_public_key_fingerprint(
+            self.signing_key.as_bytes().as_slice(),
+            self.hpke_public_key.to_bytes().as_slice(),
+        )
     }
 }
 

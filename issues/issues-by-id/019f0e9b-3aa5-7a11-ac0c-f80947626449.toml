@@ -1,0 +1,54 @@
+id = "019f0e9b-3aa5-7a11-ac0c-f80947626449"
+ref = "flotsync-ist.10"
+title = "Implement shared key fingerprint primitives"
+body = """
+Intermediate task split out from flotsync-ist.3 and flotsync-ist.8.
+
+Purpose:
+F01. Provide the shared fingerprint primitive needed before trust/evidence authority evaluation and before pasteable public bundle APIs.
+F02. Keep this slice limited to fingerprints, not trust/evidence storage, blocked-fingerprint authority decisions, pasteable public bundle strings, or inspect APIs.
+
+Scope:
+F03. Add a KeyFingerprint type for 32-byte key-material fingerprints.
+F04. Derive fingerprints from PublicMemberKeys using the agreed semantic transcript: domain-separated signing scheme, signing public key bytes, encryption scheme, and encryption public key bytes.
+F05. Keep derivation independent of protobuf bytes, protobuf field order, unknown fields, PublicKeyBundle format version, identity, trust source, metadata, policy, and application data.
+F06. Expose byte access plus canonical padded base64url parse/format helpers.
+F07. Expose grouped unpadded display formatting for human verification. This display string is output-only; no display-string parser is needed.
+F08. Fingerprints are not secret and should not be redacted. Debug/display output may show fingerprint text because the fingerprint is an irreversible identifier derived from public key material.
+F09. Add PublicMemberKeys::fingerprint() as the primary typed derivation API.
+F10. Add tests for derivation stability, semantic sensitivity, protobuf presentation independence where applicable, base64 parse/format, display grouping, malformed canonical input, and no identity dependence.
+
+Out of scope:
+F11. Trust/evidence records, blocked fingerprint storage, and authority evaluation; continue in flotsync-ist.3.
+F12. Pasteable public bundle string encode/decode and transport-facing inspect APIs; continue in flotsync-ist.8.
+F13. Discovery, direct bundle fetch, QR/URI/manual setup flows, and bootstrap fingerprint fields; continue in their existing downstream tasks.
+F14. Parsing grouped display strings; they are for human display only and should not be handed back to Flotsync.
+
+Implementation plan:
+G01. Add a new fingerprint module in flotsync_security and export KeyFingerprint from lib.rs.
+G02. Add base64 = { workspace = true } to flotsync_security; sha2 is already present.
+G03. Implement KeyFingerprint as a 32-byte value type with byte access, fixed-length construction, canonical padded base64url parsing/formatting, grouped unpadded display formatting, and ordinary non-redacted Debug/Display output.
+G04. Implement PublicMemberKeys::fingerprint() using the agreed semantic SHA-256 transcript.
+G05. Keep transcript constants local and version/domain-separated so future fingerprint versions can coexist if needed.
+G06. Add focused unit tests in flotsync_security for stability, sensitivity, identity independence, bundle roundtrip preservation, canonical parse/format rejection paths, and display grouping.
+
+Estimate: roughly 200-350 LOC across flotsync_security and tests."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocks = [
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-28T14:21:21.957149Z"
+updated_at = "2026-06-28T15:05:59.097359Z"
+closed_at = "2026-06-28T15:05:59.097359Z"
+
+[[comments]]
+id = "019f0ec4-1439-7290-a72f-4bf299f84c76"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T15:05:59.097359Z"
