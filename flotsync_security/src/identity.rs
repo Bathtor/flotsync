@@ -13,7 +13,7 @@ use crate::{
 use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use flotsync_core::MemberIdentity;
 use flotsync_messages::{
-    buffa::{EnumValue, Message as _, MessageField},
+    buffa::{EnumValue, MessageField, MessageFieldView, UnknownFieldsView, ViewEncode as _},
     proto::{DecodeProtoViewWith, DecodeProtoWith, EncodeProto, FromProtoDecodeError},
     security as security_proto,
 };
@@ -21,7 +21,7 @@ use hpke::{Deserializable, Kem, Serializable};
 use rand_core::{OsRng, TryRngCore};
 use snafu::prelude::*;
 use std::fmt;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// Generate fresh local-private and public member key bundles.
 ///
@@ -64,9 +64,33 @@ pub fn public_member_keys_from_public_bundle(
 pub fn encode_local_private_key_bundle(
     local_keys: &LocalMemberKeys,
 ) -> EncodedLocalPrivateKeyBundle {
-    let mut proto = local_keys.encode_proto();
-    let bytes = proto.encode_to_vec();
-    zeroize_local_private_key_bundle_proto(&mut proto);
+    // hpke's X25519 wrapper only exposes serialization, not borrowed key bytes.
+    let mut encryption_public = [0u8; X25519_KEY_LENGTH];
+    local_keys
+        .public_keys
+        .hpke_public_key
+        .write_exact(&mut encryption_public);
+    let mut encryption_private = Zeroizing::new([0u8; X25519_KEY_LENGTH]);
+    local_keys
+        .hpke_private_key
+        .write_exact(encryption_private.as_mut_slice());
+    let view = security_proto::LocalPrivateKeyBundleView {
+        format_version: KEY_BUNDLE_FORMAT_VERSION_V1,
+        signing_key: MessageFieldView::some(security_proto::PrivateKeyView {
+            scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_ED25519),
+            public_key: local_keys.public_keys.signing_key.as_bytes().as_slice(),
+            private_key: local_keys.signing_key.as_bytes().as_slice(),
+            __buffa_unknown_fields: UnknownFieldsView::new(),
+        }),
+        encryption_key: MessageFieldView::some(security_proto::PrivateKeyView {
+            scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_X25519),
+            public_key: encryption_public.as_slice(),
+            private_key: encryption_private.as_slice(),
+            __buffa_unknown_fields: UnknownFieldsView::new(),
+        }),
+        __buffa_unknown_fields: UnknownFieldsView::new(),
+    };
+    let bytes = view.encode_to_vec();
     EncodedLocalPrivateKeyBundle::new(bytes)
 }
 
@@ -140,37 +164,6 @@ impl fmt::Debug for LocalMemberKeys {
             .field("signing_key", &"<redacted>")
             .field("hpke_private_key", &"<redacted>")
             .finish()
-    }
-}
-
-impl EncodeProto for LocalMemberKeys {
-    type Proto = security_proto::LocalPrivateKeyBundle;
-
-    fn encode_proto(&self) -> Self::Proto {
-        let mut hpke_private_bytes = self.hpke_private_key.to_bytes();
-        let proto = security_proto::LocalPrivateKeyBundle {
-            format_version: KEY_BUNDLE_FORMAT_VERSION_V1,
-            signing_key: MessageField::some(security_proto::PrivateKey {
-                scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_ED25519),
-                public_key: self.public_keys.signing_key.to_bytes().to_vec(),
-                private_key: self.signing_key.to_bytes().to_vec(),
-                ..security_proto::PrivateKey::default()
-            }),
-            encryption_key: MessageField::some(security_proto::PrivateKey {
-                scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_X25519),
-                public_key: self
-                    .public_keys
-                    .hpke_public_key
-                    .to_bytes()
-                    .as_slice()
-                    .to_vec(),
-                private_key: hpke_private_bytes.to_vec(),
-                ..security_proto::PrivateKey::default()
-            }),
-            ..security_proto::LocalPrivateKeyBundle::default()
-        };
-        hpke_private_bytes.zeroize();
-        proto
     }
 }
 
@@ -502,14 +495,4 @@ fn fixed_key_bytes<const N: usize>(field: &'static str, bytes: &[u8]) -> Result<
             expected: N,
             actual: bytes.len(),
         })
-}
-
-/// Zeroise private fields held in a generated protobuf value after encoding.
-fn zeroize_local_private_key_bundle_proto(proto: &mut security_proto::LocalPrivateKeyBundle) {
-    if let Some(mut signing_key) = proto.signing_key.take() {
-        signing_key.private_key.zeroize();
-    }
-    if let Some(mut encryption_key) = proto.encryption_key.take() {
-        encryption_key.private_key.zeroize();
-    }
 }

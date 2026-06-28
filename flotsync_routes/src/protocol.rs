@@ -167,7 +167,10 @@ pub fn decode_endpoint_discovery_frame(
             })?;
     match boundary {
         endpoint_frame::BoundaryView::Discovery(discovery) => {
-            Ok(Some(discovery.to_owned_message()))
+            let discovery = discovery
+                .to_owned_message()
+                .context(discovery_protocol_error::DecodeSnafu)?;
+            Ok(Some(discovery))
         }
         endpoint_frame::BoundaryView::GroupBroadcast(_)
         | endpoint_frame::BoundaryView::ReliableDelivery(_) => Ok(None),

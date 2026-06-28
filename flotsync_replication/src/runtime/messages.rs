@@ -1593,7 +1593,8 @@ impl DecodeProtoView for DatasetUpdateMessage {
             .operations
             .iter()
             .map(flotsync_messages::buffa::MessageView::to_owned_message)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .context(DecodeSnafu)?;
         Ok(Self {
             dataset_id,
             operations,

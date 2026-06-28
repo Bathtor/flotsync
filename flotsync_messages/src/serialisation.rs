@@ -69,7 +69,7 @@ where
     ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
         async move {
             let proto = self.value.encode_proto();
-            let reserved_bytes = proto.compute_size() as usize;
+            let reserved_bytes = proto.encoded_len() as usize;
             let mut reserved = writer
                 .write_with_reserved(reserved_bytes)
                 .await
@@ -86,7 +86,7 @@ where
     M: BuffaMessage + Send + Sync + 'static,
 {
     fn serialized_size_hint(&self) -> SizeHint {
-        SizeHint::Exact(self.compute_size() as usize)
+        SizeHint::Exact(self.encoded_len() as usize)
     }
 
     fn serialize_into<'a>(
@@ -94,7 +94,7 @@ where
         writer: &'a mut EgressAsyncWriter,
     ) -> BoxFuture<'a, Result<(), FlotsyncSerializeError>> {
         async move {
-            let reserved_bytes = self.compute_size() as usize;
+            let reserved_bytes = self.encoded_len() as usize;
             let mut reserved = writer
                 .write_with_reserved(reserved_bytes)
                 .await

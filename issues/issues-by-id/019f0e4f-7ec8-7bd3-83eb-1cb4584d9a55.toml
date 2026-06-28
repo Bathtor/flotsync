@@ -12,10 +12,18 @@ P04. Keep LocalPrivateKeyBundle decode on borrowed views.
 P05. Add focused tests or assertions covering private-bundle roundtrip and malformed private bundle handling after the upgrade.
 
 Origin: review follow-up from flotsync-ist.2. This is intentionally separate from the current key-bundle slice because the Buffa upgrade has broader API fallout."""
-status = "in-progress"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 assignee = "Codex"
 parent = "019f097b-ba0f-7002-944a-8efa67884f15"
 created_at = "2026-06-28T12:58:38.664799Z"
-updated_at = "2026-06-28T13:35:44.119837Z"
+updated_at = "2026-06-28T14:12:02.920969Z"
+closed_at = "2026-06-28T14:12:02.920969Z"
+
+[[comments]]
+id = "019f0e92-b2e8-7141-b717-7888185f0adc"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T14:12:02.920969Z"
