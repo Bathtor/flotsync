@@ -1,12 +1,14 @@
 #[cfg(test)]
 use super::messages::UpdateBatchMessage;
 use super::{
+    DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
     catch_up_manager::{
         CatchUpManagerMessage,
         NeedVersions,
         ObservedAvailable,
         subtract_available_ranges,
     },
+    config_keys,
     errors::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
@@ -44,7 +46,7 @@ use super::{
     messages::{
         BootstrapGroupKey,
         BootstrapGroupMessage,
-        BootstrapMemberPublicKeysMessage,
+        BootstrapMemberKeyMessage,
         RuntimeMessage,
         SummaryMessage,
         SummaryRequestMessage,
@@ -144,6 +146,20 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Security records and plaintext bootstrap message prepared for group creation.
+pub(super) struct PreparedGroupBootstrap {
+    security_material: EncryptedGroupSecurityMaterial,
+    bootstrap_message: Arc<BootstrapGroupMessage>,
+}
+
+impl PreparedGroupBootstrap {
+    /// Return the plaintext bootstrap message prepared for group creation.
+    #[cfg(test)]
+    pub(super) fn bootstrap_message(&self) -> &BootstrapGroupMessage {
+        self.bootstrap_message.as_ref()
+    }
+}
+
 /// One local publish batch after local apply, encoding, and delivery-envelope preparation.
 struct PreparedLocalPublish {
     group_id: GroupId,
@@ -151,12 +167,6 @@ struct PreparedLocalPublish {
     read_token: ReadToken,
     payload: bytes::Bytes,
     row_changes: Vec<RowChange>,
-}
-
-/// Security records and plaintext bootstrap message prepared for group creation.
-struct PreparedGroupBootstrap {
-    security_material: EncryptedGroupSecurityMaterial,
-    bootstrap_message: BootstrapGroupMessage,
 }
 
 /// Source-specific sender validation for an inbound update.
@@ -529,6 +539,8 @@ pub struct ReplicationRuntimeComponent {
     group_memberships: SharedGroupMemberships,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
+    /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
+    max_inline_bootstrap_public_key_bundles: usize,
 }
 
 impl ReplicationRuntimeComponent {
@@ -553,6 +565,8 @@ impl ReplicationRuntimeComponent {
             group_memberships,
             summary_request_manager,
             catch_up_manager,
+            max_inline_bootstrap_public_key_bundles:
+                DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
         }
     }
 
@@ -1025,7 +1039,7 @@ impl ReplicationRuntimeComponent {
     }
 
     /// Submit reliable bootstrap messages after the group is locally installed.
-    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: &BootstrapGroupMessage) {
+    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: Arc<BootstrapGroupMessage>) {
         let local_member = self.local_member.clone();
         for recipient in bootstrap_message
             .members()
@@ -1033,7 +1047,7 @@ impl ReplicationRuntimeComponent {
             .filter(|member| *member != &local_member)
             .cloned()
         {
-            let message = RuntimeMessage::BootstrapGroup(bootstrap_message.clone());
+            let message = RuntimeMessage::BootstrapGroup(Arc::clone(&bootstrap_message));
             self.submit_reliable_runtime_message(recipient, &message);
         }
     }
@@ -1061,8 +1075,29 @@ impl ReplicationRuntimeComponent {
         Ok((group_id, members))
     }
 
-    async fn prepare_group_bootstrap(
+    /// Read the maximum group size for inlining bootstrap public key bundles.
+    fn read_max_inline_bootstrap_public_key_bundles(&self) -> usize {
+        match self
+            .ctx
+            .config()
+            .read_or_default(&config_keys::BOOTSTRAP_MAX_INLINE_PUBLIC_KEY_BUNDLES)
+        {
+            Ok(limit) => limit,
+            Err(error) => {
+                warn!(
+                    self.log(),
+                    "failed to read bootstrap inline public-key bundle limit config; using default {}: {}",
+                    DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
+                    error
+                );
+                DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES
+            }
+        }
+    }
+
+    pub(super) async fn prepare_group_bootstrap(
         security: &DeliverySecurity,
+        max_inline_public_key_bundles: usize,
         group_id: GroupId,
         members: &GroupMembers,
     ) -> Result<PreparedGroupBootstrap, CreateGroupError> {
@@ -1074,8 +1109,14 @@ impl ReplicationRuntimeComponent {
             .await
             .boxed()
             .context(SecuritySnafu)?;
-        let bootstrap_member_keys =
-            public_keys.map_values(BootstrapMemberPublicKeysMessage::from_public_keys);
+        let inline_public_bundles = members.len() <= max_inline_public_key_bundles;
+        let bootstrap_member_keys = public_keys.map_values(|public_keys| {
+            if inline_public_bundles {
+                BootstrapMemberKeyMessage::from_public_keys(public_keys)
+            } else {
+                BootstrapMemberKeyMessage::from_fingerprint(public_keys.fingerprint())
+            }
+        });
         let security_material = security
             .seal_group_secret(group_id.0, &group_key)
             .boxed()
@@ -1091,7 +1132,7 @@ impl ReplicationRuntimeComponent {
         .context(SecuritySnafu)?;
         Ok(PreparedGroupBootstrap {
             security_material,
-            bootstrap_message,
+            bootstrap_message: Arc::new(bootstrap_message),
         })
     }
 
@@ -1312,7 +1353,7 @@ impl ReplicationRuntimeComponent {
             .await
             .context(publish::StoreAccessSnafu)?;
 
-        let message = RuntimeMessage::Update(UpdateMessage {
+        let message = RuntimeMessage::Update(Box::new(UpdateMessage {
             group_id,
             update_id,
             read_versions,
@@ -1321,7 +1362,7 @@ impl ReplicationRuntimeComponent {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
-        });
+        }));
         let payload = message.encode_proto_to_bytes();
         Ok(PreparedLocalPublish {
             group_id,
@@ -1388,7 +1429,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         context: InboundDeliveryContext,
         deliver: ReliableDeliveryDeliver,
-        message: BootstrapGroupMessage,
+        message: Arc<BootstrapGroupMessage>,
     ) -> HandlerResult {
         let sender = deliver.envelope.header.sender.clone();
         Handled::block_on(self, async move |mut async_self| {
@@ -1407,7 +1448,7 @@ impl ReplicationRuntimeComponent {
     async fn install_bootstrap_group_delivery(
         &mut self,
         deliver: ReliableDeliveryDeliver,
-        message: BootstrapGroupMessage,
+        message: Arc<BootstrapGroupMessage>,
         sender: MemberIdentity,
     ) -> Result<(), InboundDeliveryError> {
         let group_id = message.group_id();
@@ -1416,7 +1457,7 @@ impl ReplicationRuntimeComponent {
         Self::validate_bootstrap_membership(group_id, &members, &self.local_member, &sender)?;
         let security_material = self
             .security
-            .prepare_security_material_from_bootstrap_msg(&message, &sender)
+            .prepare_security_material_from_bootstrap_msg(message.as_ref(), &sender)
             .await
             .boxed()
             .context(inbound::BootstrapSecuritySnafu)?;
@@ -2034,8 +2075,13 @@ impl ReplicationRuntimeComponent {
             }
         };
         Handled::block_on(self, async move |mut async_self| {
-            let prepared_bootstrap =
-                Self::prepare_group_bootstrap(&async_self.security, group_id, &members).await;
+            let prepared_bootstrap = Self::prepare_group_bootstrap(
+                &async_self.security,
+                async_self.max_inline_bootstrap_public_key_bundles,
+                group_id,
+                &members,
+            )
+            .await;
             let prepared_bootstrap = match prepared_bootstrap {
                 Ok(prepared_bootstrap) => prepared_bootstrap,
                 Err(error) => {
@@ -2055,7 +2101,7 @@ impl ReplicationRuntimeComponent {
                     match async_self.install_group_membership_view(persisted_group) {
                         Ok(()) => {
                             async_self.submit_group_bootstrap_messages(
-                                &prepared_bootstrap.bootstrap_message,
+                                prepared_bootstrap.bootstrap_message,
                             );
                             Ok::<GroupId, GroupInstallError>(group_id)
                                 .boxed()
@@ -2170,6 +2216,8 @@ impl ReplicationRuntimeComponent {
 
 impl ComponentLifecycle for ReplicationRuntimeComponent {
     fn on_start(&mut self) -> HandlerResult {
+        self.max_inline_bootstrap_public_key_bundles =
+            self.read_max_inline_bootstrap_public_key_bundles();
         Handled::block_on(self, async move |mut async_self| {
             let hydrated_memberships = async_self.load_hydrated_runtime_memberships().await;
             match hydrated_memberships {

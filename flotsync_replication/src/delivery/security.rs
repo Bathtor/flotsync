@@ -5,6 +5,9 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
         LocalMemberPrivateKeysRecord,
+        MemberPublicKeysRecord,
+        PermissionDecision,
+        PermissionDenialReason,
         StoreError,
         StoreSecretKeyId,
     },
@@ -13,7 +16,12 @@ use crate::{
         reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
         shared::{DetachedSignature, MessageId, SignatureScheme},
     },
-    runtime::messages::{BootstrapGroupMessage, BootstrapMemberPublicKeysMessage},
+    runtime::messages::{
+        BootstrapGroupMessage,
+        BootstrapMemberKeyMessage,
+        RuntimeMessageError,
+        validate_bootstrap_public_key_bundle_matches_fingerprint,
+    },
     security_store::{SecurityStore, SecurityStoreError},
 };
 use bytes::Bytes;
@@ -27,6 +35,7 @@ use flotsync_security::{
     FrameSignature,
     GroupKey,
     GroupMessageContext,
+    KeyFingerprint,
     LocalMemberKeys,
     PublicMemberKeys,
     ReliablePayloadContext,
@@ -53,6 +62,7 @@ use flotsync_security::{
     verify_discovery_payload_signature,
     verify_frame_signature,
 };
+use itertools::Itertools;
 use snafu::{Location, prelude::*};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -138,12 +148,33 @@ pub(crate) enum DeliverySecurityError {
         group_id: GroupId,
         sender: MemberIdentity,
     },
-    #[snafu(display("Bootstrap payload is missing public keys for member {member_id}."))]
-    MissingBootstrapPublicKeys { member_id: MemberIdentity },
-    #[snafu(display("Bootstrap public keys for member {member_id} do not match permitted keys."))]
-    BootstrapPublicKeysMismatch { member_id: MemberIdentity },
-    #[snafu(display("Bootstrap public keys included non-member {member_id}."))]
-    UnexpectedBootstrapPublicKeys { member_id: MemberIdentity },
+    #[snafu(display("Bootstrap payload is missing a key reference for member {member_id}."))]
+    MissingBootstrapMemberKey { member_id: MemberIdentity },
+    #[snafu(display(
+        "Bootstrap key fingerprint for member {member_id} was {actual}, expected {expected}."
+    ))]
+    BootstrapKeyFingerprintMismatch {
+        member_id: MemberIdentity,
+        expected: KeyFingerprint,
+        actual: KeyFingerprint,
+    },
+    #[snafu(display(
+        "Bootstrap sender {member_id} key fingerprint {fingerprint} lacks BootstrapActivation permission: {reason:?}."
+    ))]
+    BootstrapSenderPermissionDenied {
+        member_id: MemberIdentity,
+        fingerprint: KeyFingerprint,
+        reason: PermissionDenialReason,
+    },
+    #[snafu(display("Bootstrap key references included non-member {member_id}."))]
+    UnexpectedBootstrapMemberKey { member_id: MemberIdentity },
+    #[snafu(display(
+        "Bootstrap inline public key bundle for member {member_id} failed validation: {source}"
+    ))]
+    InvalidBootstrapPublicKeyBundle {
+        member_id: MemberIdentity,
+        source: RuntimeMessageError,
+    },
     #[snafu(display("Encrypted secret used unsupported crypto version {version}."))]
     UnsupportedStoreSecretVersion { version: u16 },
     #[snafu(display(
@@ -235,9 +266,11 @@ impl DeliverySecurityError {
             // Group sender mismatches are local routing or membership violations.
             Self::UnexpectedGroupSender { .. } | Self::GroupSenderNotInGroup { .. } => false,
             // Bootstrap payload membership and key mismatches are permanent for this payload.
-            Self::MissingBootstrapPublicKeys { .. }
-            | Self::BootstrapPublicKeysMismatch { .. }
-            | Self::UnexpectedBootstrapPublicKeys { .. } => false,
+            Self::MissingBootstrapMemberKey { .. }
+            | Self::BootstrapKeyFingerprintMismatch { .. }
+            | Self::BootstrapSenderPermissionDenied { .. }
+            | Self::UnexpectedBootstrapMemberKey { .. }
+            | Self::InvalidBootstrapPublicKeyBundle { .. } => false,
             // Stored secret encoding/version problems need data repair or a code change.
             Self::UnsupportedStoreSecretVersion { .. } | Self::InvalidStoreSecretNonce { .. } => {
                 false
@@ -562,19 +595,20 @@ impl DeliverySecurity {
         })
     }
 
-    /// Validate bootstrap public keys and prepare encrypted group-security material.
+    /// Validate bootstrap member keys and prepare encrypted group-security material.
     pub(crate) async fn prepare_security_material_from_bootstrap_msg(
         &self,
         payload: &BootstrapGroupMessage,
         bootstrap_sender: &MemberIdentity,
     ) -> Result<EncryptedGroupSecurityMaterial, DeliverySecurityError> {
-        self.validate_bootstrap_payload_public_keys(payload, bootstrap_sender)
+        self.validate_bootstrap_payload_member_keys(payload, bootstrap_sender)
             .await?;
+        self.store_bootstrap_inline_public_keys(payload).await?;
         self.seal_group_secret(payload.group_id().0, payload.group_key().as_group_key())
     }
 
-    fn local_public_bootstrap_keys(&self) -> BootstrapMemberPublicKeysMessage {
-        BootstrapMemberPublicKeysMessage::from_public_keys(self.local_keys.public_keys())
+    fn local_public_bootstrap_key(&self) -> BootstrapMemberKeyMessage {
+        BootstrapMemberKeyMessage::from_public_keys(self.local_keys.public_keys())
     }
 
     async fn load_group_security(
@@ -694,46 +728,123 @@ impl DeliverySecurity {
             .context(SecurityStoreSnafu)
     }
 
-    /// Compare bootstrap payload keys against locally provisioned trust records.
-    pub(crate) async fn validate_bootstrap_payload_public_keys(
+    /// Compare bootstrap payload key references against locally provisioned trust records.
+    pub(crate) async fn validate_bootstrap_payload_member_keys(
         &self,
         payload: &BootstrapGroupMessage,
         bootstrap_sender: &MemberIdentity,
     ) -> Result<(), DeliverySecurityError> {
         for member_id in payload.members() {
-            if payload.member_public_keys().get(member_id).is_none() {
-                return Err(DeliverySecurityError::MissingBootstrapPublicKeys {
+            if payload.member_keys().get(member_id).is_none() {
+                return Err(DeliverySecurityError::MissingBootstrapMemberKey {
                     member_id: member_id.clone(),
                 });
             }
         }
-        if payload.member_public_keys().len() != payload.members().len() {
-            for (member_id, _) in payload.member_public_keys().owned_entries() {
+        if payload.member_keys().len() != payload.members().len() {
+            for (member_id, _) in payload.member_keys().owned_entries() {
                 if !payload.members().contains(&member_id) {
-                    return Err(DeliverySecurityError::UnexpectedBootstrapPublicKeys { member_id });
+                    return Err(DeliverySecurityError::UnexpectedBootstrapMemberKey { member_id });
                 }
             }
         }
-        let Some(sender_keys) = payload.member_public_keys().get(bootstrap_sender) else {
-            return Err(DeliverySecurityError::MissingBootstrapPublicKeys {
+        let Some(sender_key) = payload.member_keys().get(bootstrap_sender) else {
+            return Err(DeliverySecurityError::MissingBootstrapMemberKey {
                 member_id: bootstrap_sender.clone(),
             });
         };
-        let trusted_sender_keys = if bootstrap_sender == &self.local_member {
-            self.local_public_bootstrap_keys()
+        if bootstrap_sender == &self.local_member {
+            let expected_fingerprint = self.local_public_bootstrap_key().fingerprint();
+            ensure!(
+                sender_key.fingerprint() == expected_fingerprint,
+                BootstrapKeyFingerprintMismatchSnafu {
+                    member_id: bootstrap_sender.clone(),
+                    expected: expected_fingerprint,
+                    actual: sender_key.fingerprint(),
+                }
+            );
         } else {
-            let trusted = self
-                .load_permitted_public_keys_for_scope(
-                    bootstrap_sender,
-                    AuthorityScope::BootstrapActivation,
-                )
+            self.request_bootstrap_sender_permission(bootstrap_sender, sender_key.fingerprint())
                 .await?;
-            BootstrapMemberPublicKeysMessage::from_public_keys(&trusted)
-        };
-        if &trusted_sender_keys != sender_keys {
-            return Err(DeliverySecurityError::BootstrapPublicKeysMismatch {
-                member_id: bootstrap_sender.clone(),
-            });
+        }
+        for (member_id, member_key) in payload.member_keys().owned_entries() {
+            if let Some(public_keys) = member_key.public_keys() {
+                validate_bootstrap_public_key_bundle_matches_fingerprint(
+                    &member_id,
+                    member_key.fingerprint(),
+                    public_keys,
+                )
+                .context(InvalidBootstrapPublicKeyBundleSnafu { member_id })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Request `BootstrapActivation` permission for one advertised sender key.
+    async fn request_bootstrap_sender_permission(
+        &self,
+        bootstrap_sender: &MemberIdentity,
+        fingerprint: KeyFingerprint,
+    ) -> Result<(), DeliverySecurityError> {
+        let decision = self
+            .security_store
+            .request_member_key_permission_for(
+                bootstrap_sender,
+                fingerprint,
+                AuthorityScope::BootstrapActivation,
+            )
+            .await
+            .context(SecurityStoreSnafu)?;
+        match decision {
+            PermissionDecision::Permit => Ok(()),
+            PermissionDecision::Deny(reason) => {
+                Err(DeliverySecurityError::BootstrapSenderPermissionDenied {
+                    member_id: bootstrap_sender.clone(),
+                    fingerprint,
+                    reason,
+                })
+            }
+        }
+    }
+
+    /// Store valid inline bootstrap public bundles as observed key material.
+    async fn store_bootstrap_inline_public_keys(
+        &self,
+        payload: &BootstrapGroupMessage,
+    ) -> Result<(), DeliverySecurityError> {
+        let inline_public_keys = payload
+            .member_keys()
+            .owned_entries()
+            .filter_map(|(member_id, member_key)| {
+                member_key
+                    .public_keys()
+                    .map(|public_keys| (member_id, member_key.fingerprint(), public_keys.clone()))
+            })
+            .collect_vec();
+        if !inline_public_keys.is_empty() {
+            let mut transaction = self
+                .security_store
+                .replication_store()
+                .begin_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            for (member_id, expected_fingerprint, public_keys) in inline_public_keys {
+                validate_bootstrap_public_key_bundle_matches_fingerprint(
+                    &member_id,
+                    expected_fingerprint,
+                    &public_keys,
+                )
+                .context(InvalidBootstrapPublicKeyBundleSnafu {
+                    member_id: member_id.clone(),
+                })?;
+                transaction
+                    .ensure_member_public_keys(MemberPublicKeysRecord::from_public_keys(
+                        &public_keys,
+                    ))
+                    .await
+                    .context(StoreAccessSnafu)?;
+            }
+            transaction.commit().await.context(StoreAccessSnafu)?;
         }
         Ok(())
     }

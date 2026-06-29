@@ -333,6 +333,30 @@ impl DecodeProtoWith<MemberIdentity> for PublicMemberKeys {
     }
 }
 
+impl DecodeProtoViewWith<MemberIdentity> for PublicMemberKeys {
+    type ProtoView<'a> = security_proto::PublicKeyBundleView<'a>;
+    type Error = SecurityError;
+
+    fn decode_proto_view_with(
+        proto: &Self::ProtoView<'_>,
+        member_id: MemberIdentity,
+    ) -> Result<Self> {
+        validate_bundle_version(proto.format_version)?;
+        let signing = required_field_view(proto.signing_key.as_option(), "signing_key")?;
+        let encryption = required_field_view(proto.encryption_key.as_option(), "encryption_key")?;
+        validate_key_scheme(KeyRole::Signing, signing.scheme)?;
+        validate_key_scheme(KeyRole::Encryption, encryption.scheme)?;
+
+        let signing_key =
+            fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.public_key", signing.public_key)?;
+        let encryption_key = fixed_key_bytes::<X25519_KEY_LENGTH>(
+            "encryption_key.public_key",
+            encryption.public_key,
+        )?;
+        Self::from_key_bytes(member_id, signing_key, encryption_key)
+    }
+}
+
 /// Encoded local private-key bundle bytes.
 ///
 /// The inner buffer is zeroised on drop and redacted in debug output. Use

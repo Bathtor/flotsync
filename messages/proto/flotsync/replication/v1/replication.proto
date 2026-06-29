@@ -4,6 +4,7 @@ package flotsync.replication.v1;
 
 import "flotsync/datamodel/v1/datamodel.proto";
 import "flotsync/discovery/v1/discovery.proto";
+import "flotsync/security/v1/security.proto";
 import "flotsync/versions/v1/versions.proto";
 
 // Internal replication-runtime payloads carried inside delivery envelopes.
@@ -27,12 +28,12 @@ message RuntimeMessage {
 message BootstrapGroup {
   bytes group_id = 1;
 
-  // Canonical group-member order and public identity keys.
+  // Canonical group-member order and expected public identity key fingerprints.
   //
   // This repeated field is semantically ordered. The replication runtime uses
   // the preserved protobuf element order as the canonical member index order
   // for the group.
-  repeated BootstrapMemberPublicKeys member_public_keys = 2;
+  repeated BootstrapMemberKey member_keys = 2;
 
   // Symmetric group-message cipher suite identifier.
   uint32 group_cipher_suite = 4;
@@ -41,10 +42,10 @@ message BootstrapGroup {
   bytes group_key = 5;
 }
 
-message BootstrapMemberPublicKeys {
+message BootstrapMemberKey {
   flotsync.discovery.v1.Identifier member_id = 1;
-  bytes signing_public_key = 2;
-  bytes encryption_public_key = 3;
+  bytes key_fingerprint = 2;
+  optional flotsync.security.v1.PublicKeyBundle public_key_bundle = 3;
 }
 
 // One causal replication update delivered through GroupBroadcast.

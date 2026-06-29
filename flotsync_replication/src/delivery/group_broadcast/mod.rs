@@ -569,6 +569,21 @@ mod tests {
             group_memberships: GroupMemberships,
             bind_external_socket: bool,
         ) -> Self {
+            let trusted_members = trusted_members_for(&local_member, &group_memberships);
+            Self::new_with_trusted_members(
+                local_member,
+                group_memberships,
+                bind_external_socket,
+                trusted_members,
+            )
+        }
+
+        fn new_with_trusted_members(
+            local_member: MemberIdentity,
+            group_memberships: GroupMemberships,
+            bind_external_socket: bool,
+            trusted_members: HashSet<MemberIdentity>,
+        ) -> Self {
             let system = build_delivery_test_system();
             let manager_owned_udp_sockets = usize::from(!bind_external_socket);
             let core = TransportHarnessCore::with_socket_budgets(
@@ -578,7 +593,11 @@ mod tests {
                 &[],
                 manager_owned_udp_sockets,
             );
-            let security = test_group_security(&local_member, &group_memberships);
+            let security = test_group_security_with_trusted_members(
+                &local_member,
+                &group_memberships,
+                trusted_members,
+            );
             let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
             let manager_ref = core.manager_ref();
             let ingress_group_memberships = shared_group_memberships.clone();
@@ -956,6 +975,51 @@ mod tests {
     }
 
     #[test]
+    fn inbound_group_wire_with_missing_sender_keys_is_dropped_before_delivery() {
+        let group_id = GroupId(Uuid::from_u128(35));
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let bob_security =
+            test_group_security_with_trusted_members(&bob, &memberships, HashSet::new());
+        let receiver_bob = FullStackHarness::new_with_trusted_members(
+            bob.clone(),
+            memberships,
+            false,
+            HashSet::new(),
+        );
+
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(34)),
+            b"valid before missing keys",
+        );
+        let wire = sealed_inbound_wire(
+            &alice_security,
+            group_id,
+            alice,
+            MessageId(Uuid::from_u128(36)),
+            b"group payload",
+        );
+
+        receiver_bob.inject_inbound_envelope(wire);
+
+        receiver_bob.expect_no_delivery(Duration::from_millis(500));
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(37)),
+            b"valid after missing keys",
+        );
+    }
+
+    #[test]
     fn inbound_tampered_group_wire_is_dropped_before_delivery() {
         let group_id = GroupId(Uuid::from_u128(41));
         let alice = member_identity(&["alice"]);
@@ -969,6 +1033,14 @@ mod tests {
             InboundWireTamper::Ciphertext,
             InboundWireTamper::PublicHeader,
         ] {
+            inject_sealed_wire_and_expect_delivery(
+                &receiver_bob,
+                &alice_security,
+                group_id,
+                &alice,
+                MessageId(Uuid::from_u128(50 + tamper.offset())),
+                b"valid before tamper",
+            );
             let message_id = MessageId(Uuid::from_u128(42 + tamper.offset()));
             let mut wire = sealed_inbound_wire(
                 &alice_security,
@@ -981,7 +1053,49 @@ mod tests {
 
             receiver_bob.inject_inbound_envelope(wire);
             receiver_bob.expect_no_delivery(Duration::from_millis(500));
+            inject_sealed_wire_and_expect_delivery(
+                &receiver_bob,
+                &alice_security,
+                group_id,
+                &alice,
+                MessageId(Uuid::from_u128(60 + tamper.offset())),
+                b"valid after tamper",
+            );
         }
+    }
+
+    fn inject_sealed_wire_and_expect_delivery(
+        receiver: &FullStackHarness,
+        sender_security: &DeliverySecurity,
+        group_id: GroupId,
+        sender: &MemberIdentity,
+        message_id: MessageId,
+        payload: &'static [u8],
+    ) {
+        let wire = sealed_inbound_wire(
+            sender_security,
+            group_id,
+            sender.clone(),
+            message_id,
+            payload,
+        );
+
+        receiver.inject_inbound_envelope(wire);
+
+        let deliver = receiver.wait_for_delivery();
+        assert_eq!(
+            deliver.envelope,
+            GroupMessageEnvelope {
+                header: GroupMessageHeader {
+                    group_id,
+                    sender: sender.clone(),
+                    message_id,
+                },
+                payload: PlaintextPayload {
+                    bytes: Bytes::from_static(payload),
+                },
+            }
+        );
     }
 
     fn group_memberships(
@@ -997,11 +1111,19 @@ mod tests {
         local_member: &MemberIdentity,
         group_memberships: &GroupMemberships,
     ) -> DeliverySecurity {
+        let trusted_members = trusted_members_for(local_member, group_memberships);
+        test_group_security_with_trusted_members(local_member, group_memberships, trusted_members)
+    }
+
+    fn test_group_security_with_trusted_members(
+        local_member: &MemberIdentity,
+        group_memberships: &GroupMemberships,
+        trusted_members: HashSet<MemberIdentity>,
+    ) -> DeliverySecurity {
         let store = Arc::new(
             SqliteReplicationStore::in_memory(local_member.clone())
                 .expect("security store should build"),
         );
-        let trusted_members = trusted_members_for(local_member, group_memberships);
         block_on(provision_test_security(
             local_member.clone(),
             store.as_ref(),

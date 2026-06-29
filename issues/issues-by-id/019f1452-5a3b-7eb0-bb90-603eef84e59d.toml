@@ -1,0 +1,13 @@
+id = "019f1452-5a3b-7eb0-bb90-603eef84e59d"
+ref = "flotsync-git-car"
+title = "Add shared Kompact config-read fallback helper"
+body = "Several Kompact components repeat the same pattern: read_or_default from component context, log a warning on config read failure, and continue with the declared default. Introduce a shared helper with consistent logging and value/default handling, then migrate existing call sites once the API shape is agreed. Discovered during flotsync-ist.4 review; keep separate from bootstrap key-fingerprint work."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-06-29T16:59:29.211918Z"
+updated_at = "2026-06-29T16:59:37.408449Z"
+
+[[links]]
+target = "019f09b9-acd8-70c2-ac78-8e18220ad6d7"
+label = "discovered from"

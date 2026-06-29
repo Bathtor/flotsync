@@ -45,10 +45,6 @@ impl SecurityStore {
     }
 
     /// Request permission for one exact member-key binding.
-    #[allow(
-        dead_code,
-        reason = "kept as the internal exact permission API and future cache boundary"
-    )]
     pub(crate) fn request_member_key_permission<'a>(
         &'a self,
         key_id: &'a MemberKeyId,
@@ -69,6 +65,24 @@ impl SecurityStore {
             .await?;
             transaction.release().await.context(StoreAccessSnafu)?;
             Ok(decision)
+        }
+        .boxed()
+    }
+
+    /// Request permission for one exact member/fingerprint binding.
+    pub(crate) fn request_member_key_permission_for<'a>(
+        &'a self,
+        member_id: &'a MemberIdentity,
+        fingerprint: KeyFingerprint,
+        authority_scope: AuthorityScope,
+    ) -> BoxFuture<'a, Result<PermissionDecision, SecurityStoreError>> {
+        async move {
+            let key_id = MemberKeyId {
+                member_id: member_id.clone(),
+                fingerprint,
+            };
+            self.request_member_key_permission(&key_id, authority_scope)
+                .await
         }
         .boxed()
     }
