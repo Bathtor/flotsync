@@ -22,7 +22,7 @@ use flotsync_core::{
     versions::UpdateId,
 };
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
-use flotsync_utils::{OptionExt as _, ResultExt as _};
+use flotsync_utils::{OptionExt as _, ResultExt as _, kompact_config::ConfigReadExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
 use kompact::{KompactLogger, prelude::*};
@@ -314,43 +314,18 @@ impl CatchUpManagerComponent {
 
     /// Read the retry delay from the component's Kompact config.
     fn read_retry_delay_from_config(&self) -> Duration {
-        match self
-            .ctx
+        self.ctx
             .config()
-            .read_or_default(&config_keys::CATCH_UP_NEED_RANGE_RETRY_DELAY)
-        {
-            Ok(delay) => delay,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "failed to read catch-up retry delay config; using default {:?}: {}",
-                    DEFAULT_RETRY_DELAY,
-                    error
-                );
-                DEFAULT_RETRY_DELAY
-            }
-        }
+            .read_or_default_warn(self.log(), &config_keys::CATCH_UP_NEED_RANGE_RETRY_DELAY)
     }
 
     /// Read the per-response batch limit; config value `0` means unlimited.
     fn read_max_updates_per_batch_from_config(&self) -> Option<NonZeroUsize> {
-        match self
+        let limit = self
             .ctx
             .config()
-            .read_or_default(&config_keys::CATCH_UP_MAX_UPDATES_PER_BATCH)
-        {
-            Ok(0) => None,
-            Ok(limit) => NonZeroUsize::new(limit),
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "failed to read catch-up batch size config; using default {}: {}",
-                    DEFAULT_MAX_UPDATES_PER_BATCH,
-                    error
-                );
-                NonZeroUsize::new(DEFAULT_MAX_UPDATES_PER_BATCH)
-            }
-        }
+            .read_or_default_warn(self.log(), &config_keys::CATCH_UP_MAX_UPDATES_PER_BATCH);
+        NonZeroUsize::new(limit)
     }
 
     fn broadcast_need_range(&mut self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {

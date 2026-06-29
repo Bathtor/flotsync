@@ -44,7 +44,13 @@ use flotsync_routes::{
     TransportRouteKey,
 };
 use flotsync_security::SealedHPKEPayload;
-use flotsync_utils::{KClaimablePromise, NonOwningPhantomData, OptionExt as _, ResultExt as _};
+use flotsync_utils::{
+    KClaimablePromise,
+    NonOwningPhantomData,
+    OptionExt as _,
+    ResultExt as _,
+    kompact_config::ConfigReadExt as _,
+};
 use kompact::{kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
@@ -303,39 +309,15 @@ impl ReliableDeliveryComponent {
     }
 
     fn load_retry_delay(&self) -> Duration {
-        match self.ctx.config().read_or_default(&config_keys::RETRY_DELAY) {
-            Ok(delay) => delay,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load reliable-delivery retry delay from {}: {}. Falling back to {:?}",
-                    config_keys::RETRY_DELAY.key,
-                    error,
-                    DEFAULT_RETRY_DELAY
-                );
-                DEFAULT_RETRY_DELAY
-            }
-        }
+        self.ctx
+            .config()
+            .read_or_default_warn(self.log(), &config_keys::RETRY_DELAY)
     }
 
     fn load_recipient_ack_timeout(&self) -> Duration {
-        match self
-            .ctx
+        self.ctx
             .config()
-            .read_or_default(&config_keys::RECIPIENT_ACK_TIMEOUT)
-        {
-            Ok(timeout) => timeout,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load reliable-delivery recipient ack timeout from {}: {}. Falling back to {:?}",
-                    config_keys::RECIPIENT_ACK_TIMEOUT.key,
-                    error,
-                    DEFAULT_RECIPIENT_ACK_TIMEOUT
-                );
-                DEFAULT_RECIPIENT_ACK_TIMEOUT
-            }
-        }
+            .read_or_default_warn(self.log(), &config_keys::RECIPIENT_ACK_TIMEOUT)
     }
 
     fn handle_submit_request(&mut self, submit: ReliableDeliverySubmit) -> HandlerResult {

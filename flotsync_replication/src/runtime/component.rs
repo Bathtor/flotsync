@@ -134,7 +134,12 @@ use flotsync_core::{
 use flotsync_data_types::OwnedRow;
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
-use flotsync_utils::{BoxFuture, KClaimablePromise, ResultExt as _};
+use flotsync_utils::{
+    BoxFuture,
+    KClaimablePromise,
+    ResultExt as _,
+    kompact_config::ConfigReadExt as _,
+};
 use futures_util::FutureExt;
 use itertools::Itertools;
 use kompact::prelude::*;
@@ -1039,7 +1044,7 @@ impl ReplicationRuntimeComponent {
     }
 
     /// Submit reliable bootstrap messages after the group is locally installed.
-    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: Arc<BootstrapGroupMessage>) {
+    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: &Arc<BootstrapGroupMessage>) {
         let local_member = self.local_member.clone();
         for recipient in bootstrap_message
             .members()
@@ -1047,7 +1052,7 @@ impl ReplicationRuntimeComponent {
             .filter(|member| *member != &local_member)
             .cloned()
         {
-            let message = RuntimeMessage::BootstrapGroup(Arc::clone(&bootstrap_message));
+            let message = RuntimeMessage::BootstrapGroup(Arc::clone(bootstrap_message));
             self.submit_reliable_runtime_message(recipient, &message);
         }
     }
@@ -1077,22 +1082,10 @@ impl ReplicationRuntimeComponent {
 
     /// Read the maximum group size for inlining bootstrap public key bundles.
     fn read_max_inline_bootstrap_public_key_bundles(&self) -> usize {
-        match self
-            .ctx
-            .config()
-            .read_or_default(&config_keys::BOOTSTRAP_MAX_INLINE_PUBLIC_KEY_BUNDLES)
-        {
-            Ok(limit) => limit,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "failed to read bootstrap inline public-key bundle limit config; using default {}: {}",
-                    DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
-                    error
-                );
-                DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES
-            }
-        }
+        self.ctx.config().read_or_default_warn(
+            self.log(),
+            &config_keys::BOOTSTRAP_MAX_INLINE_PUBLIC_KEY_BUNDLES,
+        )
     }
 
     pub(super) async fn prepare_group_bootstrap(
@@ -2101,7 +2094,7 @@ impl ReplicationRuntimeComponent {
                     match async_self.install_group_membership_view(persisted_group) {
                         Ok(()) => {
                             async_self.submit_group_bootstrap_messages(
-                                prepared_bootstrap.bootstrap_message,
+                                &prepared_bootstrap.bootstrap_message,
                             );
                             Ok::<GroupId, GroupInstallError>(group_id)
                                 .boxed()
