@@ -35,6 +35,7 @@ use crate::{
         DatasetId,
         DatasetRowPatch,
         DatasetRowSlice,
+        DatasetRowsBatch,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         ListenerError,
@@ -203,7 +204,7 @@ struct FailingStoreTransaction {
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
 }
 
-impl ReplicationStoreTransaction for FailingStoreTransaction {
+impl ReplicationStoreReadTransaction for FailingStoreTransaction {
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -233,16 +234,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_replication_groups_for_ids(group_ids)
     }
 
-    fn insert_replication_group(
-        &mut self,
-        group: ReplicationGroupRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .insert_replication_group(group)
-    }
-
     fn load_local_member_private_keys<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
@@ -251,16 +242,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_local_member_private_keys(member_id)
-    }
-
-    fn ensure_local_member_private_keys(
-        &mut self,
-        record: LocalMemberPrivateKeysRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .ensure_local_member_private_keys(record)
     }
 
     fn load_member_public_keys<'a>(
@@ -301,6 +282,95 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .is_key_fingerprint_blocked(fingerprint)
+    }
+
+    fn load_dataset_rows<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_dataset_rows(group_id, dataset_id, row_keys)
+    }
+
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update(group_id, update_id)
+    }
+
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_updates(group_id, filter, limit)
+    }
+
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update_ids(group_id, filter, limit)
+    }
+
+    fn scan_dataset_row_batch<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .scan_dataset_row_batch(group_id, dataset_id, after, limit)
+    }
+
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        let Self { inner, .. } = *self;
+        inner
+            .expect("failing store transaction must remain open until release")
+            .rollback()
+    }
+}
+
+impl ReplicationStoreTransaction for FailingStoreTransaction {
+    fn insert_replication_group(
+        &mut self,
+        group: ReplicationGroupRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .insert_replication_group(group)
+    }
+
+    fn ensure_local_member_private_keys(
+        &mut self,
+        record: LocalMemberPrivateKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_local_member_private_keys(record)
     }
 
     fn ensure_member_public_keys(
@@ -344,18 +414,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .update_replication_group_version_vector(group_id, version_vector)
     }
 
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_dataset_rows(group_id, dataset_id, row_keys)
-    }
-
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowPatch,
@@ -392,41 +450,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                 .await
         }
         .boxed()
-    }
-
-    fn load_replication_update<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update(group_id, update_id)
-    }
-
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_updates(group_id, filter, limit)
-    }
-
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update_ids(group_id, filter, limit)
     }
 
     fn append_replication_update(

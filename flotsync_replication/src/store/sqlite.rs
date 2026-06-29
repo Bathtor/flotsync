@@ -397,6 +397,26 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn load_dataset_rows<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            load_dataset_rows(
+                self.assert_open_connection(),
+                schema_sources.as_ref(),
+                group_id,
+                dataset_id,
+                row_keys,
+            )
+            .await
+        }
+        .boxed()
+    }
+
     fn scan_dataset_row_batch<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -433,27 +453,6 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
 }
 
 impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
-    fn load_replication_group<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
-    }
-
-    fn load_replication_groups(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
-    }
-
-    fn load_replication_groups_for_ids<'a>(
-        &'a mut self,
-        group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
-            .boxed()
-    }
-
     fn insert_replication_group(
         &mut self,
         group: ReplicationGroupRecord,
@@ -461,50 +460,11 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
     }
 
-    fn load_local_member_private_keys<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
-        async move { load_local_member_private_keys(self.assert_open_connection(), member_id).await }
-            .boxed()
-    }
-
     fn ensure_local_member_private_keys(
         &mut self,
         record: LocalMemberPrivateKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { ensure_local_member_private_keys(self.assert_open_connection(), &record).await }
-            .boxed()
-    }
-
-    fn load_member_public_keys<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>> {
-        async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
-    }
-
-    fn load_member_public_keys_for_member<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
-        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
-            .boxed()
-    }
-
-    fn load_member_key_trust_evidence<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
-        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
-            .boxed()
-    }
-
-    fn is_key_fingerprint_blocked<'a>(
-        &'a mut self,
-        fingerprint: &'a KeyFingerprint,
-    ) -> BoxFuture<'a, Result<bool, StoreError>> {
-        async move { is_key_fingerprint_blocked(self.assert_open_connection(), fingerprint).await }
             .boxed()
     }
 
@@ -548,26 +508,6 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
-        let schema_sources = self.schema_sources.clone();
-        async move {
-            load_dataset_rows(
-                self.assert_open_connection(),
-                schema_sources.as_ref(),
-                group_id,
-                dataset_id,
-                row_keys,
-            )
-            .await
-        }
-        .boxed()
-    }
-
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowPatch,
@@ -580,42 +520,6 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
                 &patch,
             )
             .await
-        }
-        .boxed()
-    }
-
-    fn load_replication_update<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        async move {
-            load_replication_update(self.assert_open_connection(), group_id, update_id).await
-        }
-        .boxed()
-    }
-
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        async move {
-            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
-        }
-        .boxed()
-    }
-
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        async move {
-            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
-                .await
         }
         .boxed()
     }

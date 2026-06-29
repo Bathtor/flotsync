@@ -1288,6 +1288,17 @@ pub trait ReplicationStoreReadTransaction: Send {
         limit: Option<NonZeroUsize>,
     ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>>;
 
+    /// Load the stored state for the requested dataset row keys.
+    ///
+    /// Implementations must include every iterated `row_key` exactly once in
+    /// `DatasetRowSlice.rows`.
+    fn load_dataset_rows<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
+
     /// Scan one ordered batch of stored dataset rows.
     ///
     /// `after` is an exclusive lower bound over row keys. `None` starts before
@@ -1370,68 +1381,23 @@ pub enum ReplicationUpdateFilter {
 /// `rollback` remains part of the API so callers can release store resources
 /// early and observe rollback failures explicitly when the backend can report
 /// them.
-pub trait ReplicationStoreTransaction: Send {
-    /// Load one persisted replication group by id.
-    fn load_replication_group<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>>;
-
-    /// Load all persisted replication groups currently known to the store.
-    fn load_replication_groups(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
-
-    /// Load persisted replication groups whose ids are included in `group_ids`.
-    ///
-    /// Missing ids are omitted from the returned vector so callers can decide
-    /// whether absence is expected or an error.
-    fn load_replication_groups_for_ids<'a>(
-        &'a mut self,
-        group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
-
+///
+/// Mutable transactions inherit the read API from
+/// [`ReplicationStoreReadTransaction`]. The inherited `release` operation is a
+/// rollback-style release path for mutable transactions; write callers should
+/// still use [`Self::commit`] or [`Self::rollback`] to make intent explicit.
+pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     /// Insert one new persisted replication group.
     fn insert_replication_group(
         &mut self,
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Load encrypted local-private key material for one member identity.
-    fn load_local_member_private_keys<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>>;
-
     /// Insert encrypted local-private key material or confirm it is already stored unchanged.
     fn ensure_local_member_private_keys(
         &mut self,
         record: LocalMemberPrivateKeysRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
-
-    /// Load public key material for one exact member-key binding.
-    fn load_member_public_keys<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
-
-    /// Load every observed public key material record for one member identity.
-    fn load_member_public_keys_for_member<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
-
-    /// Load trust evidence for one exact member-key binding.
-    fn load_member_key_trust_evidence<'a>(
-        &'a mut self,
-        key_id: &'a MemberKeyId,
-    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>>;
-
-    /// Return whether a fingerprint is globally blocked.
-    fn is_key_fingerprint_blocked<'a>(
-        &'a mut self,
-        fingerprint: &'a KeyFingerprint,
-    ) -> BoxFuture<'a, Result<bool, StoreError>>;
 
     /// Insert public key material or confirm it is already stored unchanged.
     fn ensure_member_public_keys(
@@ -1458,49 +1424,11 @@ pub trait ReplicationStoreTransaction: Send {
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Load the stored state for the requested dataset row keys.
-    ///
-    /// Implementations must include every iterated `row_key` exactly once in
-    /// `DatasetRowSlice.rows`.
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
-
     /// Apply one explicit set of row-level dataset storage actions.
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowPatch,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
-
-    /// Load one persisted replication update by `(group_id, update_id)`.
-    fn load_replication_update<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>>;
-
-    /// Load persisted replication updates for one group using the given filter and optional limit.
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>>;
-
-    /// Load only persisted replication update ids for one group.
-    ///
-    /// This is for availability/frontier checks that must not decode full
-    /// update payloads. Returned ids follow the same ordering and filtering
-    /// rules as [`Self::load_replication_updates`].
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>>;
 
     /// Append one new persisted replication update record.
     ///
@@ -1518,7 +1446,7 @@ pub trait ReplicationStoreTransaction: Send {
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
-    /// Durably commit all writes performed in this transaction.
+    /// Commit all writes performed in this transaction.
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
 
     /// Explicitly roll back all writes performed in this transaction.
