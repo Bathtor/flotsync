@@ -9,6 +9,7 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupMemberKeys,
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
         MemberKeyTrustEvidenceKind,
@@ -598,6 +599,7 @@ CREATE TABLE IF NOT EXISTS group_members (
     group_id TEXT NOT NULL,
     member_index INTEGER NOT NULL,
     member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
     PRIMARY KEY (group_id, member_index),
     UNIQUE (group_id, member_identity),
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
@@ -718,11 +720,11 @@ WHERE group_id = ?1
     let security_material = EncryptedGroupSecurityMaterial {
         encrypted_group_secret,
     };
-    let members = load_group_members(connection, group_id, member_count).await?;
+    let member_keys = load_group_member_keys(connection, group_id, member_count).await?;
 
     Ok(Some(ReplicationGroupRecord {
         group_id: *group_id,
-        members,
+        member_keys,
         local_member_index,
         version_vector,
         security_material,
@@ -850,17 +852,18 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     .await
     .context(SqlxSnafu)?;
 
-    for (member_index, member) in group.members.iter().enumerate() {
+    for (member_index, member_key) in group.member_keys.ordered_member_keys().iter().enumerate() {
         let member_index = i64::try_from(member_index).context(MemberCountOverflowSnafu)?;
         sqlx::query(
             "
-INSERT INTO group_members (group_id, member_index, member_identity)
-VALUES (?1, ?2, ?3)
+INSERT INTO group_members (group_id, member_index, member_identity, key_fingerprint)
+VALUES (?1, ?2, ?3, ?4)
 ",
         )
         .bind(group.group_id.to_string())
         .bind(member_index)
-        .bind(member.to_string())
+        .bind(member_key.member_id.to_string())
+        .bind(member_key.fingerprint.as_ref())
         .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
@@ -1624,14 +1627,14 @@ WHERE group_id = ?1
     Ok(())
 }
 
-async fn load_group_members(
+async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
     expected_member_count: NonZeroUsize,
-) -> Result<Vec<MemberIdentity>, StoreError> {
-    let raw_members = sqlx::query_scalar::<_, String>(
+) -> Result<GroupMemberKeys, StoreError> {
+    let rows = sqlx::query(
         "
-SELECT member_identity
+SELECT member_identity, key_fingerprint
 FROM group_members
 WHERE group_id = ?1
 ORDER BY member_index
@@ -1642,19 +1645,27 @@ ORDER BY member_index
     .await
     .context(SqlxSnafu)?;
     ensure!(
-        raw_members.len() == expected_member_count.get(),
+        rows.len() == expected_member_count.get(),
         StoredGroupMemberCountMismatchSnafu {
             group_id: *group_id,
             expected_member_count: expected_member_count.get(),
-            actual_member_count: raw_members.len(),
+            actual_member_count: rows.len(),
         }
     );
 
-    let mut members = Vec::with_capacity(raw_members.len());
-    for raw_member in raw_members {
-        members.push(decode_member_identity(&raw_member)?);
+    let mut member_keys = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_member = row.get::<String, _>("member_identity");
+        let raw_fingerprint = row.get::<Vec<u8>, _>("key_fingerprint");
+        let member_id = decode_member_identity(&raw_member)?;
+        let fingerprint = decode_key_fingerprint(&raw_fingerprint)?;
+        member_keys.push(MemberKeyId {
+            member_id,
+            fingerprint,
+        });
     }
-    Ok(members)
+    GroupMemberKeys::from_ordered_member_keys(member_keys)
+        .map_err(|source| invalid_stored_object("group member keys", source))
 }
 
 async fn load_group_member_count(
@@ -2166,12 +2177,20 @@ mod tests {
     }
 
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
-        let members = vec![local_member(), remote_member()];
+        let member_keys = [local_member(), remote_member()]
+            .into_iter()
+            .map(|member_id| MemberKeyId {
+                fingerprint: test_public_member_keys(&member_id).fingerprint(),
+                member_id,
+            })
+            .collect::<Vec<_>>();
+        let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
+            .expect("test group member keys should build");
         let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
         version_vector.increment_at(0);
         ReplicationGroupRecord {
             group_id,
-            members,
+            member_keys,
             local_member_index: MemberIndex::new(0),
             version_vector,
             security_material: current_slice_placeholder_group_security_material(group_id),
@@ -2382,7 +2401,7 @@ mod tests {
             .expect("group should load")
             .expect("group should exist");
         assert_eq!(loaded_group.group_id, group.group_id);
-        assert_eq!(loaded_group.members, group.members);
+        assert_eq!(loaded_group.member_keys, group.member_keys);
         assert_eq!(loaded_group.security_material, group.security_material);
         assert_eq!(
             loaded_group.version_vector.iter().collect::<Vec<_>>(),

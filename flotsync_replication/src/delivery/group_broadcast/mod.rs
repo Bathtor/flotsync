@@ -522,15 +522,28 @@ mod tests {
     use super::*;
     use crate::{
         SqliteReplicationStore,
-        api::{ReplicationGroupRecord, ReplicationStore},
+        api::{
+            GroupMemberKeys,
+            MemberKeyId,
+            MemberKeyTrustEvidenceKind,
+            MemberKeyTrustEvidenceRecord,
+            MemberPublicKeysRecord,
+            ReplicationGroupRecord,
+            ReplicationStore,
+        },
         delivery::{
             ingress::{DeliveryIngressComponent, DeliveryInterestConfig, DeliveryTargetHint},
             wire::{group_id_from_wire, message_id_from_wire},
         },
-        test_support::{load_test_delivery_security, provision_test_security, test_group_key},
+        test_support::{
+            load_test_delivery_security,
+            provision_test_security,
+            test_group_key,
+            test_public_member_keys,
+        },
     };
     use bytes::Bytes;
-    use flotsync_core::{MemberIndex, membership::GroupMemberships, versions::VersionVector};
+    use flotsync_core::{membership::GroupMemberships, versions::VersionVector};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
@@ -549,8 +562,16 @@ mod tests {
             member_identity,
         },
     };
+    use flotsync_security::KeyFingerprint;
     use flotsync_utils::kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt};
-    use std::{cell::Cell, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+    use std::{
+        cell::Cell,
+        collections::{HashMap, HashSet},
+        net::SocketAddr,
+        num::NonZeroUsize,
+        sync::Arc,
+        time::Duration,
+    };
 
     struct FullStackHarness {
         core: TransportHarnessCore,
@@ -559,6 +580,8 @@ mod tests {
         broadcast: Arc<Component<GroupBroadcastComponent>>,
         discovery_source: Arc<Component<PortTesterComponent<TransportRouteDiscoveryPort>>>,
         client: Arc<Component<PortTesterComponent<GroupBroadcastPort>>>,
+        /// Backing store handle used by tests that mutate key evidence after startup.
+        security_store: Arc<SqliteReplicationStore>,
         client_cursor: Cell<usize>,
         local_addr: Option<SocketAddr>,
     }
@@ -584,6 +607,23 @@ mod tests {
             bind_external_socket: bool,
             trusted_members: HashSet<MemberIdentity>,
         ) -> Self {
+            Self::new_with_member_key_fingerprint_overrides(
+                local_member,
+                group_memberships,
+                bind_external_socket,
+                trusted_members,
+                HashMap::new(),
+            )
+        }
+
+        /// Build a harness whose persisted group expects selected non-default key fingerprints.
+        fn new_with_member_key_fingerprint_overrides(
+            local_member: MemberIdentity,
+            group_memberships: GroupMemberships,
+            bind_external_socket: bool,
+            trusted_members: HashSet<MemberIdentity>,
+            member_key_fingerprint_overrides: HashMap<MemberIdentity, KeyFingerprint>,
+        ) -> Self {
             let system = build_delivery_test_system();
             let manager_owned_udp_sockets = usize::from(!bind_external_socket);
             let core = TransportHarnessCore::with_socket_budgets(
@@ -593,10 +633,11 @@ mod tests {
                 &[],
                 manager_owned_udp_sockets,
             );
-            let security = test_group_security_with_trusted_members(
+            let (security, security_store) = test_group_security_with_trusted_members_and_store(
                 &local_member,
                 &group_memberships,
                 trusted_members,
+                &member_key_fingerprint_overrides,
             );
             let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
             let manager_ref = core.manager_ref();
@@ -670,6 +711,7 @@ mod tests {
                 broadcast,
                 discovery_source,
                 client,
+                security_store,
                 client_cursor: Cell::new(0),
                 local_addr,
             }
@@ -728,6 +770,85 @@ mod tests {
                 .expect("group-broadcast absence check should complete")
                 .expect("group-broadcast client probe should stay live")
                 .expect("group-broadcast client should stay silent");
+        }
+
+        /// Store local-explicit trust for the member's deterministic test public keys.
+        fn trust_member_public_keys(&self, member_id: &MemberIdentity) {
+            self.trust_member_public_keys_from(member_id, member_id);
+        }
+
+        /// Store local-explicit trust for `member_id` using another test member's key bytes.
+        fn trust_member_public_keys_from(
+            &self,
+            member_id: &MemberIdentity,
+            source_member: &MemberIdentity,
+        ) {
+            let public_keys = test_public_member_keys(source_member);
+            let mut record = MemberPublicKeysRecord::from_public_keys(&public_keys);
+            record.key_id.member_id = member_id.clone();
+            let key_id = record.key_id.clone();
+            block_on(async {
+                let mut transaction = self
+                    .security_store
+                    .begin_transaction()
+                    .await
+                    .expect("security transaction should start");
+                transaction
+                    .ensure_member_public_keys(record)
+                    .await
+                    .expect("member public keys should store");
+                transaction
+                    .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                        key_id,
+                        evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+                    })
+                    .await
+                    .expect("member key trust evidence should store");
+                transaction
+                    .commit()
+                    .await
+                    .expect("security transaction should commit");
+            });
+        }
+
+        /// Store observed public keys without adding trust evidence.
+        fn observe_member_public_keys(&self, member_id: &MemberIdentity) {
+            let public_keys = test_public_member_keys(member_id);
+            let record = MemberPublicKeysRecord::from_public_keys(&public_keys);
+            block_on(async {
+                let mut transaction = self
+                    .security_store
+                    .begin_transaction()
+                    .await
+                    .expect("security transaction should start");
+                transaction
+                    .ensure_member_public_keys(record)
+                    .await
+                    .expect("member public keys should store");
+                transaction
+                    .commit()
+                    .await
+                    .expect("security transaction should commit");
+            });
+        }
+
+        /// Store a global block for one key fingerprint.
+        fn block_key_fingerprint(&self, fingerprint: KeyFingerprint) {
+            block_on(async {
+                let mut transaction = self
+                    .security_store
+                    .begin_transaction()
+                    .await
+                    .expect("security transaction should start");
+                transaction
+                    .ensure_blocked_key_fingerprint(fingerprint)
+                    .await
+                    .expect("blocked fingerprint should store");
+                transaction
+                    .commit()
+                    .await
+                    .expect("security transaction should commit");
+            });
         }
 
         fn wait_for_known_submit(&self, message_id: MessageId) {
@@ -1001,7 +1122,7 @@ mod tests {
         let wire = sealed_inbound_wire(
             &alice_security,
             group_id,
-            alice,
+            alice.clone(),
             MessageId(Uuid::from_u128(36)),
             b"group payload",
         );
@@ -1016,6 +1137,176 @@ mod tests {
             &bob,
             MessageId(Uuid::from_u128(37)),
             b"valid after missing keys",
+        );
+        receiver_bob.trust_member_public_keys(&alice);
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &alice_security,
+            group_id,
+            &alice,
+            MessageId(Uuid::from_u128(38)),
+            b"valid after key resolution",
+        );
+    }
+
+    #[test]
+    fn inbound_group_wire_with_multiple_trusted_sender_keys_uses_group_expected_fingerprint() {
+        let group_id = GroupId(Uuid::from_u128(65));
+        let alice = member_identity(&["alice"]);
+        let alice_phone = member_identity(&["alice", "phone"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let receiver_bob = FullStackHarness::new(bob, memberships, false);
+
+        receiver_bob.trust_member_public_keys_from(&alice, &alice_phone);
+
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &alice_security,
+            group_id,
+            &alice,
+            MessageId(Uuid::from_u128(66)),
+            b"canonical key still wins",
+        );
+    }
+
+    #[test]
+    fn inbound_group_wire_with_untrusted_sender_keys_is_dropped_before_delivery() {
+        let group_id = GroupId(Uuid::from_u128(39));
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let bob_security =
+            test_group_security_with_trusted_members(&bob, &memberships, HashSet::new());
+        let receiver_bob = FullStackHarness::new_with_trusted_members(
+            bob.clone(),
+            memberships,
+            false,
+            HashSet::new(),
+        );
+
+        receiver_bob.observe_member_public_keys(&alice);
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(43)),
+            b"valid before untrusted keys",
+        );
+        let wire = sealed_inbound_wire(
+            &alice_security,
+            group_id,
+            alice,
+            MessageId(Uuid::from_u128(44)),
+            b"group payload",
+        );
+
+        receiver_bob.inject_inbound_envelope(wire);
+
+        receiver_bob.expect_no_delivery(Duration::from_millis(500));
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(45)),
+            b"valid after untrusted keys",
+        );
+    }
+
+    #[test]
+    fn inbound_group_wire_with_blocked_sender_fingerprint_is_dropped_before_delivery() {
+        let group_id = GroupId(Uuid::from_u128(46));
+        let alice = member_identity(&["alice"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let bob_security = test_group_security(&bob, &memberships);
+        let receiver_bob = FullStackHarness::new(bob.clone(), memberships, false);
+
+        receiver_bob.block_key_fingerprint(test_public_member_keys(&alice).fingerprint());
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(47)),
+            b"valid before blocked key",
+        );
+        let wire = sealed_inbound_wire(
+            &alice_security,
+            group_id,
+            alice,
+            MessageId(Uuid::from_u128(48)),
+            b"group payload",
+        );
+
+        receiver_bob.inject_inbound_envelope(wire);
+
+        receiver_bob.expect_no_delivery(Duration::from_millis(500));
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(49)),
+            b"valid after blocked key",
+        );
+    }
+
+    #[test]
+    fn inbound_group_wire_with_wrong_expected_sender_fingerprint_is_dropped_before_delivery() {
+        let group_id = GroupId(Uuid::from_u128(61));
+        let alice = member_identity(&["alice"]);
+        let alice_phone = member_identity(&["alice", "phone"]);
+        let bob = member_identity(&["bob"]);
+        let memberships = group_memberships(group_id, [alice.clone(), bob.clone()]);
+        let alice_security = test_group_security(&alice, &memberships);
+        let bob_security =
+            test_group_security_with_trusted_members(&bob, &memberships, HashSet::new());
+        let mut fingerprint_overrides = HashMap::new();
+        fingerprint_overrides.insert(
+            alice.clone(),
+            test_public_member_keys(&alice_phone).fingerprint(),
+        );
+        let receiver_bob = FullStackHarness::new_with_member_key_fingerprint_overrides(
+            bob.clone(),
+            memberships,
+            false,
+            HashSet::new(),
+            fingerprint_overrides,
+        );
+
+        receiver_bob.trust_member_public_keys_from(&alice, &alice_phone);
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(62)),
+            b"valid before wrong fingerprint",
+        );
+        let wire = sealed_inbound_wire(
+            &alice_security,
+            group_id,
+            alice,
+            MessageId(Uuid::from_u128(63)),
+            b"group payload",
+        );
+
+        receiver_bob.inject_inbound_envelope(wire);
+
+        receiver_bob.expect_no_delivery(Duration::from_millis(500));
+        inject_sealed_wire_and_expect_delivery(
+            &receiver_bob,
+            &bob_security,
+            group_id,
+            &bob,
+            MessageId(Uuid::from_u128(64)),
+            b"valid after wrong fingerprint",
         );
     }
 
@@ -1120,6 +1411,22 @@ mod tests {
         group_memberships: &GroupMemberships,
         trusted_members: HashSet<MemberIdentity>,
     ) -> DeliverySecurity {
+        let (security, _) = test_group_security_with_trusted_members_and_store(
+            local_member,
+            group_memberships,
+            trusted_members,
+            &HashMap::new(),
+        );
+        security
+    }
+
+    /// Build delivery security plus its backing store so tests can mutate evidence later.
+    fn test_group_security_with_trusted_members_and_store(
+        local_member: &MemberIdentity,
+        group_memberships: &GroupMemberships,
+        trusted_members: HashSet<MemberIdentity>,
+        member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
+    ) -> (DeliverySecurity, Arc<SqliteReplicationStore>) {
         let store = Arc::new(
             SqliteReplicationStore::in_memory(local_member.clone())
                 .expect("security store should build"),
@@ -1138,8 +1445,14 @@ mod tests {
             local_member,
         ))
         .expect("test security should load");
-        persist_group_security(store.as_ref(), local_member, group_memberships, &security);
-        security
+        persist_group_security(
+            store.as_ref(),
+            local_member,
+            group_memberships,
+            &security,
+            member_key_fingerprint_overrides,
+        );
+        (security, store)
     }
 
     fn trusted_members_for(
@@ -1160,41 +1473,61 @@ mod tests {
         trusted_members
     }
 
+    /// Persist group security with optional expected-fingerprint overrides per member.
     fn persist_group_security(
         store: &dyn ReplicationStore,
         local_member: &MemberIdentity,
         group_memberships: &GroupMemberships,
         security: &DeliverySecurity,
+        member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
     ) {
-        let mut transaction =
-            block_on(store.begin_transaction()).expect("security transaction should start");
-        for group_id in group_memberships.group_ids() {
-            let members = group_memberships
-                .members(group_id)
-                .expect("group id came from the same membership snapshot");
-            let ordered_members = members.ordered_members();
-            let local_member_index = ordered_members
-                .iter()
-                .position(|member| member == local_member)
-                .expect("test local member should belong to every hosted group");
-            let security_material = security
-                .seal_group_secret(group_id.0, &test_group_key(*group_id))
-                .expect("test group secret should seal");
-            let group = ReplicationGroupRecord {
-                group_id: *group_id,
-                members: ordered_members,
-                local_member_index: MemberIndex::new(
-                    u32::try_from(local_member_index).expect("test group index should fit u32"),
-                ),
-                version_vector: VersionVector::initial(
-                    NonZeroUsize::new(members.len()).expect("test group must have members"),
-                ),
-                security_material,
-            };
-            block_on(transaction.insert_replication_group(group))
-                .expect("test group security should persist");
-        }
-        block_on(transaction.commit()).expect("security transaction should commit");
+        block_on(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("security transaction should start");
+            for group_id in group_memberships.group_ids() {
+                let members = group_memberships
+                    .members(group_id)
+                    .expect("group id came from the same membership snapshot");
+                let ordered_members = members.ordered_members();
+                let member_keys = ordered_members
+                    .iter()
+                    .map(|member_id| MemberKeyId {
+                        member_id: member_id.clone(),
+                        fingerprint: member_key_fingerprint_overrides
+                            .get(member_id)
+                            .copied()
+                            .unwrap_or_else(|| test_public_member_keys(member_id).fingerprint()),
+                    })
+                    .collect::<Vec<_>>();
+                let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
+                    .expect("test group member keys should build");
+                let local_member_index = member_keys
+                    .member_index(local_member)
+                    .expect("test local member should belong to every hosted group");
+                let security_material = security
+                    .seal_group_secret(group_id.0, &test_group_key(*group_id))
+                    .expect("test group secret should seal");
+                let group = ReplicationGroupRecord {
+                    group_id: *group_id,
+                    member_keys,
+                    local_member_index,
+                    version_vector: VersionVector::initial(
+                        NonZeroUsize::new(members.len()).expect("test group must have members"),
+                    ),
+                    security_material,
+                };
+                transaction
+                    .insert_replication_group(group)
+                    .await
+                    .expect("test group security should persist");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("security transaction should commit");
+        });
     }
 
     fn submit(

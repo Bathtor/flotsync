@@ -1,6 +1,13 @@
 use crate::{
     MAX_VERSION_VALUE,
-    api::{DatasetId, DatasetIdError, DatasetUpdateRecord, ReplicationUpdateRecord, Summary},
+    api::{
+        DatasetId,
+        DatasetIdError,
+        DatasetUpdateRecord,
+        MemberKeyId,
+        ReplicationUpdateRecord,
+        Summary,
+    },
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -419,6 +426,23 @@ impl BootstrapGroupMessage {
 
     pub(crate) fn member_keys(&self) -> &TrieMap<BootstrapMemberKeyMessage> {
         &self.member_keys
+    }
+
+    /// Return ordered exact member-key references for persisted group metadata.
+    pub(crate) fn ordered_member_key_ids(&self) -> Vec<MemberKeyId> {
+        self.members
+            .iter()
+            .map(|member_id| {
+                let member_key = self
+                    .member_keys
+                    .get(member_id)
+                    .expect("bootstrap member-key coverage is validated at construction");
+                MemberKeyId {
+                    member_id: member_id.clone(),
+                    fingerprint: member_key.fingerprint(),
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn group_key(&self) -> &BootstrapGroupKey {

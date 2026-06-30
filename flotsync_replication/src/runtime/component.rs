@@ -61,7 +61,9 @@ use super::{
     summary_request_manager::SummaryRequestManagerMessage,
 };
 #[cfg(any(test, feature = "test-support"))]
-use crate::test_support::test_group_key;
+use crate::api::MemberKeyId;
+#[cfg(any(test, feature = "test-support"))]
+use crate::test_support::{test_group_key, test_public_member_keys};
 use crate::{
     MAX_VERSION_VALUE,
     api::{
@@ -75,6 +77,7 @@ use crate::{
         DatasetRowWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupMemberKeys,
         GroupMigration,
         ProviderExternalSnafu,
         PublishChangesRequest,
@@ -695,22 +698,22 @@ impl ReplicationRuntimeComponent {
         Ok(())
     }
 
-    /// Build the canonical persisted record for one group definition that has
-    /// already passed local membership validation.
+    /// Build the canonical persisted record for one group definition whose
+    /// exact member keys have already passed local membership validation.
     fn build_replication_group_record(
         &self,
         group_id: GroupId,
-        members: &GroupMembers,
+        member_keys: GroupMemberKeys,
         security_material: crate::api::EncryptedGroupSecurityMaterial,
     ) -> ReplicationGroupRecord {
-        let member_count = NonZeroUsize::new(members.len())
+        let member_count = NonZeroUsize::new(member_keys.len())
             .expect("group installation must keep members non-empty");
-        let local_member_index = members
+        let local_member_index = member_keys
             .member_index(&self.local_member)
             .expect("group installation validates the local member before persistence");
         ReplicationGroupRecord {
             group_id,
-            members: members.ordered_members(),
+            member_keys,
             local_member_index,
             version_vector: VersionVector::initial(member_count),
             security_material,
@@ -941,7 +944,7 @@ impl ReplicationRuntimeComponent {
                 .await
                 .context(StoreGroupSnafu { group_id })?;
             ensure!(
-                existing.members == record.members
+                existing.member_keys == record.member_keys
                     && existing.local_member_index == record.local_member_index,
                 ConflictingExistingGroupSnafu { group_id }
             );
@@ -1454,7 +1457,10 @@ impl ReplicationRuntimeComponent {
             .await
             .boxed()
             .context(inbound::BootstrapSecuritySnafu)?;
-        let record = self.build_replication_group_record(group_id, &members, security_material);
+        let member_keys =
+            GroupMemberKeys::from_ordered_member_keys(message.ordered_member_key_ids())
+                .context(inbound::InvalidBootstrapMembersSnafu)?;
+        let record = self.build_replication_group_record(group_id, member_keys, security_material);
         let persisted_group = self
             .store_new_replication_group(record)
             .await
@@ -2083,9 +2089,23 @@ impl ReplicationRuntimeComponent {
                     return Handled::OK;
                 }
             };
+            let member_keys = match GroupMemberKeys::from_ordered_member_keys(
+                prepared_bootstrap
+                    .bootstrap_message
+                    .ordered_member_key_ids(),
+            ) {
+                Ok(member_keys) => member_keys,
+                Err(source) => {
+                    let reply = Err(CreateGroupError::InvalidMembers { source })
+                        .boxed()
+                        .context(ApiExternalSnafu);
+                    async_self.reply_api(promise, "create_group", reply);
+                    return Handled::OK;
+                }
+            };
             let record = async_self.build_replication_group_record(
                 group_id,
-                &members,
+                member_keys,
                 prepared_bootstrap.security_material,
             );
             let persisted_group = async_self.store_new_replication_group(record).await;
@@ -2140,7 +2160,17 @@ impl ReplicationRuntimeComponent {
                 return Handled::OK;
             }
         };
-        let record = self.build_replication_group_record(group_id, &members, security_material);
+        let member_keys = members
+            .ordered_members()
+            .into_iter()
+            .map(|member_id| MemberKeyId {
+                fingerprint: test_public_member_keys(&member_id).fingerprint(),
+                member_id,
+            })
+            .collect::<Vec<_>>();
+        let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
+            .expect("test install group members were already validated");
+        let record = self.build_replication_group_record(group_id, member_keys, security_material);
         Handled::block_on(self, async move |mut async_self| {
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {

@@ -19,7 +19,6 @@ use flotsync_core::{
     MemberIdentity,
     MemberIndex,
     membership::{GroupMembers, GroupMembersError},
-    versions::VersionVector,
 };
 use flotsync_replication::{
     ApiError,
@@ -45,7 +44,6 @@ use flotsync_replication::{
     StoreSecretKeyId,
     SummaryRequest,
     load_replication_runtime_with_runtime_config_toml,
-    prepare_initial_group_security_material,
     validate_initial_group_security_material,
 };
 use flotsync_security::{STORE_SECRET_KEY_LENGTH, StoreSecretKey};
@@ -289,6 +287,11 @@ pub enum StaticGroupError {
         group_id: GroupId,
         source: ProvisionSecurityError,
     },
+    /// New checklist key setup commands must provision missing static-group metadata.
+    #[snafu(display(
+        "Checklist static-group key setup is deferred until the new key commands are available."
+    ))]
+    KeySetupDeferred,
 }
 
 struct ChecklistListener {
@@ -726,8 +729,7 @@ async fn ensure_configured_group(
     config: &ChecklistAppConfig,
     replication_security: &ReplicationSecuritySecrets,
 ) -> Result<(), StaticGroupError> {
-    let member_count =
-        NonZeroUsize::new(config.ordered_members.len()).ok_or(StaticGroupError::EmptyMembers)?;
+    NonZeroUsize::new(config.ordered_members.len()).ok_or(StaticGroupError::EmptyMembers)?;
     let members = GroupMembers::from_ordered_members(config.ordered_members.clone())
         .context(static_group_error::InvalidMembersSnafu)?;
     let local_member_index =
@@ -757,31 +759,7 @@ async fn ensure_configured_group(
         return Ok(());
     }
 
-    let security_material = prepare_initial_group_security_material(
-        config.group_id,
-        replication_security,
-        config.group_key.as_ref(),
-    )
-    .context(static_group_error::InitialGroupSecuritySnafu)?;
-    let mut transaction = store
-        .begin_transaction()
-        .await
-        .context(static_group_error::StoreSnafu)?;
-    transaction
-        .insert_replication_group(ReplicationGroupRecord {
-            group_id: config.group_id,
-            members: config.ordered_members.clone(),
-            local_member_index,
-            version_vector: VersionVector::initial(member_count),
-            security_material,
-        })
-        .await
-        .context(static_group_error::StoreSnafu)?;
-    transaction
-        .commit()
-        .await
-        .context(static_group_error::StoreSnafu)?;
-    Ok(())
+    static_group_error::KeySetupDeferredSnafu.fail()
 }
 
 /// Validate an existing static group's encrypted key against current config.
@@ -826,6 +804,7 @@ fn validate_existing_static_group(
     config: &ChecklistAppConfig,
     local_member_index: MemberIndex,
 ) -> Result<(), StaticGroupError> {
+    let actual_members = existing_group.member_ids().cloned().collect::<Vec<_>>();
     ensure!(
         existing_group.group_id == config.group_id,
         static_group_error::UnexpectedGroupSnafu {
@@ -834,11 +813,11 @@ fn validate_existing_static_group(
         }
     );
     ensure!(
-        existing_group.members == config.ordered_members,
+        actual_members.as_slice() == config.ordered_members.as_slice(),
         static_group_error::MemberMismatchSnafu {
             group_id: config.group_id,
             expected: config.ordered_members.clone(),
-            actual: existing_group.members.clone(),
+            actual: actual_members,
         }
     );
     ensure!(
@@ -894,7 +873,13 @@ fn format_timestamp(timestamp: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_replication::test_support::test_replication_security_secrets;
+    use flotsync_core::versions::VersionVector;
+    use flotsync_replication::{
+        GroupMemberKeys,
+        MemberKeyId,
+        prepare_initial_group_security_material,
+        test_support::{test_public_member_keys, test_replication_security_secrets},
+    };
     use flotsync_security::{GROUP_KEY_LENGTH, GroupKey};
     use uuid::Uuid;
 
@@ -929,6 +914,54 @@ mod tests {
 
     fn test_group_key(seed: u8) -> Arc<GroupKey> {
         Arc::new(GroupKey::from_bytes([seed; GROUP_KEY_LENGTH]))
+    }
+
+    /// Build exact member-key groups for tests that manually insert static-group records.
+    fn test_group_member_keys(ordered_members: &[MemberIdentity]) -> GroupMemberKeys {
+        let member_keys = ordered_members
+            .iter()
+            .cloned()
+            .map(|member_id| MemberKeyId {
+                fingerprint: test_public_member_keys(&member_id).fingerprint(),
+                member_id,
+            })
+            .collect::<Vec<_>>();
+        GroupMemberKeys::from_ordered_member_keys(member_keys)
+            .expect("test group member keys should build")
+    }
+
+    /// Insert an existing static-group record for reload-path tests while setup is deferred.
+    fn insert_configured_group(
+        store: &SqliteReplicationStore,
+        config: &ChecklistAppConfig,
+        replication_security: &ReplicationSecuritySecrets,
+    ) {
+        let members = GroupMembers::from_ordered_members(config.ordered_members.clone())
+            .expect("test members should build");
+        let local_member_index = members
+            .member_index(&config.local_member)
+            .expect("test local member should belong to group");
+        let member_count = NonZeroUsize::new(config.ordered_members.len())
+            .expect("test group should not be empty");
+        let security_material = prepare_initial_group_security_material(
+            config.group_id,
+            replication_security,
+            config.group_key.as_ref(),
+        )
+        .expect("test group security should prepare");
+        let mut transaction =
+            block_on(store.begin_transaction()).expect("transaction should start");
+        block_on(
+            transaction.insert_replication_group(ReplicationGroupRecord {
+                group_id: config.group_id,
+                member_keys: test_group_member_keys(&config.ordered_members),
+                local_member_index,
+                version_vector: VersionVector::initial(member_count),
+                security_material,
+            }),
+        )
+        .expect("test group should insert");
+        block_on(transaction.commit()).expect("transaction should commit");
     }
 
     // TODO(flotsync-lsi8): Remove these unsafe profile tests with the temporary
@@ -974,34 +1007,25 @@ mod tests {
     }
 
     #[test]
-    fn ensure_configured_group_inserts_missing_static_group() {
+    fn ensure_configured_group_rejects_missing_static_group_while_key_setup_is_deferred() {
         let group_id = GroupId(Uuid::from_u128(100));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
         let replication_security = test_replication_security_secrets();
         let store = SqliteReplicationStore::in_memory(config.local_member.clone())
             .expect("store should build");
 
-        block_on(ensure_configured_group(
+        let result = block_on(ensure_configured_group(
             &store,
             &config,
             &replication_security,
-        ))
-        .expect("group should be prepared");
+        ));
         let mut transaction =
             block_on(store.begin_transaction()).expect("transaction should start");
         let groups = block_on(transaction.load_replication_groups()).expect("groups should load");
         block_on(transaction.rollback()).expect("transaction should roll back");
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].group_id, group_id);
-        assert_eq!(groups[0].members, config.ordered_members);
-        validate_initial_group_security_material(
-            group_id,
-            &replication_security,
-            config.group_key.as_ref(),
-            &groups[0].security_material,
-        )
-        .expect("stored group key should match config");
+        assert!(matches!(result, Err(StaticGroupError::KeySetupDeferred)));
+        assert!(groups.is_empty());
     }
 
     #[test]
@@ -1016,12 +1040,7 @@ mod tests {
             MemberIdentity::from_array(["alice"]),
             MemberIdentity::from_array(["carol"]),
         ];
-        block_on(ensure_configured_group(
-            &store,
-            &existing,
-            &replication_security,
-        ))
-        .expect("existing group should be inserted");
+        insert_configured_group(&store, &existing, &replication_security);
 
         let result = block_on(ensure_configured_group(
             &store,
@@ -1042,12 +1061,7 @@ mod tests {
         let replication_security = test_replication_security_secrets();
         let store = SqliteReplicationStore::in_memory(insert_config.local_member.clone())
             .expect("store should build");
-        block_on(ensure_configured_group(
-            &store,
-            &insert_config,
-            &replication_security,
-        ))
-        .expect("existing group should be inserted");
+        insert_configured_group(&store, &insert_config, &replication_security);
         let mut mismatched_config = insert_config.clone();
         mismatched_config.group_key = test_group_key(2);
 

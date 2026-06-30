@@ -38,6 +38,7 @@ use crate::{
         DatasetRowsBatch,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupMemberKeys,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
@@ -652,6 +653,21 @@ fn test_public_keys(member: &MemberIdentity) -> PublicMemberKeys {
     test_public_member_keys(member)
 }
 
+/// Build the deterministic exact member-key id used by runtime store fixtures.
+fn test_member_key_id(member_id: MemberIdentity) -> MemberKeyId {
+    let fingerprint = test_public_keys(&member_id).fingerprint();
+    MemberKeyId {
+        member_id,
+        fingerprint,
+    }
+}
+
+/// Convert ordered member identities into exact member-key groups for store fixtures.
+fn test_group_member_keys(members: Vec<MemberIdentity>) -> GroupMemberKeys {
+    GroupMemberKeys::from_ordered_member_keys(members.into_iter().map(test_member_key_id))
+        .expect("test group members should build")
+}
+
 fn bootstrap_member_keys(
     entries: impl IntoIterator<Item = (MemberIdentity, BootstrapMemberKeyMessage)>,
 ) -> TrieMap<BootstrapMemberKeyMessage> {
@@ -919,7 +935,7 @@ fn persist_group_membership_for_member<S>(
         store,
         ReplicationGroupRecord {
             group_id,
-            members,
+            member_keys: test_group_member_keys(members),
             local_member_index: MemberIndex::new(local_member_index),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(member_count).expect("group should not be empty"),
@@ -938,7 +954,7 @@ fn persist_alice_group_with_security_material(
         store,
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member()],
+            member_keys: test_group_member_keys(vec![alice_member()]),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
             security_material,
@@ -1398,8 +1414,7 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 }
 
 #[test]
-fn load_replication_runtime_rejects_missing_permitted_keys_for_stored_groups() {
-    let application_id = app_probe_id();
+fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let store = Arc::new(
@@ -1408,11 +1423,12 @@ fn load_replication_runtime_rejects_missing_permitted_keys_for_stored_groups() {
     provision_test_security(store.as_ref(), &alice_member, []);
     let group_id = GroupId(Uuid::from_u128(50_401));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
+    let member_keys = test_group_member_keys(vec![alice_member.clone(), bob_member]);
     persist_group_in_store(
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member.clone(), bob_member.clone()],
+            member_keys: member_keys.clone(),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material_with_key_id(
@@ -1423,30 +1439,17 @@ fn load_replication_runtime_rejects_missing_permitted_keys_for_stored_groups() {
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        store,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
-    let Err(error) = loaded_runtime else {
-        panic!("public runtime loading should reject missing permitted keys for stored group");
-    };
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
-    let error = security_load_error(error, &application_id);
-    assert!(matches!(
-        &error,
-        LoadSecurityError::StoredGroupMissingPermittedPublicKeys {
-            group_id: error_group_id,
-            member_id,
-        } if error_group_id == &group_id && member_id == &bob_member
-    ));
+    wait_for_group_install(&runtime, group_id);
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).member_keys,
+        member_keys
+    );
 }
 
 #[test]
-fn load_replication_runtime_rejects_ambiguous_permitted_keys_for_stored_groups() {
-    let application_id = app_probe_id();
+fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_key() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let store = Arc::new(
@@ -1473,11 +1476,12 @@ fn load_replication_runtime_rejects_ambiguous_permitted_keys_for_stored_groups()
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
     let group_id = GroupId(Uuid::from_u128(50_402));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
+    let member_keys = test_group_member_keys(vec![alice_member.clone(), bob_member]);
     persist_group_in_store(
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member.clone(), bob_member.clone()],
+            member_keys: member_keys.clone(),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material_with_key_id(
@@ -1488,26 +1492,13 @@ fn load_replication_runtime_rejects_ambiguous_permitted_keys_for_stored_groups()
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        store,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
-    let Err(error) = loaded_runtime else {
-        panic!("public runtime loading should reject ambiguous permitted keys for stored group");
-    };
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
-    let error = security_load_error(error, &application_id);
-    assert!(matches!(
-        &error,
-        LoadSecurityError::StoredGroupAmbiguousPermittedPublicKeys {
-            group_id: error_group_id,
-            member_id,
-            permitted_count: 2,
-        } if error_group_id == &group_id && member_id == &bob_member
-    ));
+    wait_for_group_install(&runtime, group_id);
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).member_keys,
+        member_keys
+    );
 }
 
 #[test]
@@ -1650,7 +1641,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: members.ordered_members(),
+            member_keys: test_group_member_keys(members.ordered_members()),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(2).expect("group should have two members"),
@@ -2201,7 +2192,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member.clone(), bob_member],
+            member_keys: test_group_member_keys(vec![alice_member.clone(), bob_member]),
             local_member_index: MemberIndex::new(0),
             version_vector: version_vector.clone(),
             security_material: current_slice_placeholder_group_security_material(group_id),

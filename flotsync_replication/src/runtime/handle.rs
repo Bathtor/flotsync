@@ -149,7 +149,6 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         application_id.clone(),
         store.clone(),
         security_secrets.store_secret_key_id(),
-        &security,
     );
     validation_f
         .await

@@ -4,7 +4,8 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     MemberIndex,
-    member::Identifier,
+    member::{Identifier, TrieMap},
+    membership::{GroupMembers, GroupMembersError},
     versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
@@ -739,6 +740,127 @@ pub(crate) const STORE_SECRET_CRYPTO_V1: StoreSecretCryptoVersion =
 /// Nonce width used by [`STORE_SECRET_CRYPTO_V1`] implementation.
 const STORE_SECRET_CRYPTO_NONCE_LENGTH_V1: usize = 24;
 
+/// Canonical ordered member-key set for one persisted replication group.
+#[derive(Clone)]
+pub struct GroupMemberKeys {
+    /// Exact member-key bindings in canonical group order.
+    ordered_member_keys: Vec<MemberKeyId>,
+    /// Member identity to canonical index lookup derived from `ordered_member_keys`.
+    member_indices: TrieMap<MemberIndex>,
+}
+
+impl GroupMemberKeys {
+    /// Build one indexed member-key set from canonical group member-key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupMembersError`] when the member-key list is empty, contains
+    /// duplicate member identities, or exceeds the supported member count.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a member index cannot be found after the same member keys
+    /// were already accepted by [`GroupMembers`].
+    pub fn from_ordered_member_keys(
+        ordered_member_keys: impl IntoIterator<Item = MemberKeyId>,
+    ) -> Result<Self, GroupMembersError> {
+        let ordered_member_keys: Vec<_> = ordered_member_keys.into_iter().collect();
+        let members = GroupMembers::from_ordered_members(
+            ordered_member_keys
+                .iter()
+                .map(|member_key| member_key.member_id.clone()),
+        )?;
+        let mut member_indices = TrieMap::new();
+        for member_key in &ordered_member_keys {
+            let member_index = members
+                .member_index(&member_key.member_id)
+                .expect("member index exists after building members from the same keys");
+            member_indices.insert(member_key.member_id.clone(), member_index);
+        }
+        Ok(Self {
+            ordered_member_keys,
+            member_indices,
+        })
+    }
+
+    /// Return the exact member-key bindings in canonical group order.
+    #[must_use]
+    pub fn ordered_member_keys(&self) -> &[MemberKeyId] {
+        &self.ordered_member_keys
+    }
+
+    /// Return the member identities in canonical group order.
+    #[must_use]
+    pub fn member_ids(&self) -> impl ExactSizeIterator<Item = &MemberIdentity> + '_ {
+        self.ordered_member_keys
+            .iter()
+            .map(|member_key| &member_key.member_id)
+    }
+
+    /// Convert this exact key set into an identity-only indexed group view.
+    ///
+    /// # Errors
+    ///
+    /// See [`GroupMembersError`] for failure conditions. Construction should
+    /// only fail if this value was built from inconsistent internal state.
+    pub fn to_group_members(&self) -> Result<GroupMembers, GroupMembersError> {
+        GroupMembers::from_ordered_members(self.member_ids().cloned())
+    }
+
+    /// Return whether this group contains `member_id`.
+    #[must_use]
+    pub fn contains_member(&self, member_id: &MemberIdentity) -> bool {
+        self.member_indices.get(member_id).is_some()
+    }
+
+    /// Return the canonical member index assigned to `member_id`, if present.
+    #[must_use]
+    pub fn member_index(&self, member_id: &MemberIdentity) -> Option<MemberIndex> {
+        self.member_indices.get(member_id).copied()
+    }
+
+    /// Return the exact key binding for `member_id`, if present.
+    #[must_use]
+    pub fn member_key(&self, member_id: &MemberIdentity) -> Option<&MemberKeyId> {
+        let member_index = self.member_index(member_id)?;
+        self.member_key_at_index(member_index)
+    }
+
+    /// Return the exact key binding assigned to one canonical group index.
+    #[must_use]
+    pub fn member_key_at_index(&self, index: MemberIndex) -> Option<&MemberKeyId> {
+        self.ordered_member_keys.get(index.as_u32() as usize)
+    }
+
+    /// Return whether this member-key set is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ordered_member_keys.is_empty()
+    }
+
+    /// Return the number of exact member-key bindings in this group.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ordered_member_keys.len()
+    }
+}
+
+impl fmt::Debug for GroupMemberKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupMemberKeys")
+            .field("ordered_member_keys", &self.ordered_member_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GroupMemberKeys {
+    fn eq(&self, other: &Self) -> bool {
+        self.ordered_member_keys == other.ordered_member_keys
+    }
+}
+
+impl Eq for GroupMemberKeys {}
+
 /// One persisted replication group together with its local progress.
 ///
 /// This is the group-level record that anchors dataset snapshots and persisted
@@ -750,9 +872,9 @@ const STORE_SECRET_CRYPTO_NONCE_LENGTH_V1: usize = 24;
 pub struct ReplicationGroupRecord {
     /// Stable replication-group identifier.
     pub group_id: GroupId,
-    /// Canonical member order for the group.
-    pub members: Vec<MemberIdentity>,
-    /// Position of the local member within `members`.
+    /// Canonical exact member-key order for the group.
+    pub member_keys: GroupMemberKeys,
+    /// Position of the local member within `member_keys`.
     pub local_member_index: MemberIndex,
     /// Last applied version vector stored for this group.
     pub version_vector: VersionVector,
@@ -768,17 +890,32 @@ impl ReplicationGroupRecord {
     /// Panics if the record contains an empty member set.
     #[must_use]
     pub fn member_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.members.len())
+        NonZeroUsize::new(self.member_keys.len())
             .expect("replication group records must not contain an empty member set")
+    }
+
+    /// Return member identities in canonical group order.
+    #[must_use]
+    pub fn member_ids(&self) -> impl ExactSizeIterator<Item = &MemberIdentity> + '_ {
+        self.member_keys.member_ids()
     }
 
     /// Return the local member identity referenced by `local_member_index`.
     ///
-    /// Store implementations must preserve the invariant that
-    /// `local_member_index < members.len()`.
+    /// Store implementations must preserve the invariant that `local_member_index
+    /// < member_keys.len()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored local member index is outside the stored member-key
+    /// order.
     #[must_use]
     pub fn local_member(&self) -> &MemberIdentity {
-        &self.members[self.local_member_index.as_u32() as usize]
+        &self
+            .member_keys
+            .member_key_at_index(self.local_member_index)
+            .expect("replication group local member index must be in bounds")
+            .member_id
     }
 }
 
@@ -786,7 +923,7 @@ impl std::fmt::Debug for ReplicationGroupRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationGroupRecord")
             .field("group_id", &self.group_id)
-            .field("members", &self.members)
+            .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
             .field("version_vector", &self.version_vector)
             .field("security_material", &self.security_material)
@@ -1483,6 +1620,13 @@ pub trait ReplicationStore: Send + Sync {
 mod tests {
     use super::*;
 
+    fn member_key_id<const N: usize>(segments: [&str; N], fingerprint_seed: u8) -> MemberKeyId {
+        MemberKeyId {
+            member_id: MemberIdentity::from_array(segments),
+            fingerprint: KeyFingerprint::from_bytes([fingerprint_seed; 32]),
+        }
+    }
+
     fn member_public_keys_record() -> MemberPublicKeysRecord {
         MemberPublicKeysRecord {
             key_id: MemberKeyId {
@@ -1492,6 +1636,55 @@ mod tests {
             signing_public_key: Box::from([1_u8, 2, 3]),
             encryption_public_key: Box::from([4_u8, 5, 6]),
         }
+    }
+
+    #[test]
+    fn group_member_keys_preserve_order_indices_and_exact_keys() {
+        let alice_key = member_key_id(["debug", "alice"], 1);
+        let bob_key = member_key_id(["debug", "bob"], 2);
+
+        let member_keys =
+            GroupMemberKeys::from_ordered_member_keys([alice_key.clone(), bob_key.clone()])
+                .expect("group member keys should build");
+
+        assert_eq!(
+            member_keys.member_ids().cloned().collect::<Vec<_>>(),
+            vec![alice_key.member_id.clone(), bob_key.member_id.clone()]
+        );
+        assert_eq!(
+            member_keys.member_index(&alice_key.member_id),
+            Some(MemberIndex::new(0))
+        );
+        assert_eq!(
+            member_keys.member_index(&bob_key.member_id),
+            Some(MemberIndex::new(1))
+        );
+        assert_eq!(
+            member_keys.member_key(&alice_key.member_id),
+            Some(&alice_key)
+        );
+        assert_eq!(
+            member_keys.member_key_at_index(MemberIndex::new(1)),
+            Some(&bob_key)
+        );
+        assert_eq!(
+            member_keys
+                .to_group_members()
+                .expect("identity group view should build")
+                .ordered_members(),
+            vec![alice_key.member_id, bob_key.member_id]
+        );
+    }
+
+    #[test]
+    fn group_member_keys_reject_duplicate_member_identities() {
+        let first_key = member_key_id(["debug", "alice"], 1);
+        let second_key = member_key_id(["debug", "alice"], 2);
+
+        let error = GroupMemberKeys::from_ordered_member_keys([first_key, second_key])
+            .expect_err("duplicate member identity should be rejected");
+
+        assert!(matches!(error, GroupMembersError::DuplicateMember { .. }));
     }
 
     #[test]

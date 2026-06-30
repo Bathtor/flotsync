@@ -4,7 +4,9 @@ use crate::{
         BoxError,
         EncryptedGroupSecurityMaterial,
         EncryptedStoreSecret,
+        GroupMemberKeys,
         LocalMemberPrivateKeysRecord,
+        MemberKeyId,
         MemberPublicKeysRecord,
         PermissionDecision,
         PermissionDenialReason,
@@ -25,12 +27,7 @@ use crate::{
     security_store::{SecurityStore, SecurityStoreError},
 };
 use bytes::Bytes;
-use flotsync_core::{
-    GroupId,
-    MemberIdentity,
-    member::TrieMap,
-    membership::{GroupMembers, GroupMembersError},
-};
+use flotsync_core::{GroupId, MemberIdentity, member::TrieMap, membership::GroupMembers};
 use flotsync_security::{
     FrameSignature,
     GroupKey,
@@ -94,11 +91,6 @@ pub(crate) enum DeliverySecurityError {
     MissingLocalPrivateKeys { member_id: MemberIdentity },
     #[snafu(display("Security material for group {group_id} is not provisioned."))]
     MissingGroupSecurity { group_id: GroupId },
-    #[snafu(display("Stored group {group_id} has invalid members: {source}"))]
-    InvalidGroupMembers {
-        group_id: GroupId,
-        source: GroupMembersError,
-    },
     #[snafu(display("Reliable delivery cannot send a message from {member_id} to itself."))]
     ReliableSelfMessage { member_id: MemberIdentity },
     #[snafu(display(
@@ -147,6 +139,15 @@ pub(crate) enum DeliverySecurityError {
     GroupSenderNotInGroup {
         group_id: GroupId,
         sender: MemberIdentity,
+    },
+    /// The stored group record names a different sender key than the verified payload used.
+    #[snafu(display(
+        "Group broadcast sender {sender} key fingerprint was {actual}, expected {expected}."
+    ))]
+    GroupSenderKeyFingerprintMismatch {
+        sender: MemberIdentity,
+        expected: KeyFingerprint,
+        actual: KeyFingerprint,
     },
     #[snafu(display("Bootstrap payload is missing a key reference for member {member_id}."))]
     MissingBootstrapMemberKey { member_id: MemberIdentity },
@@ -251,8 +252,8 @@ impl DeliverySecurityError {
             Self::StoreAccess { .. } => true,
             // Missing local provisioning is configuration state, not a retry condition.
             Self::MissingLocalPrivateKeys { .. } => false,
-            // Missing or malformed group-security state requires provisioning or data repair.
-            Self::MissingGroupSecurity { .. } | Self::InvalidGroupMembers { .. } => false,
+            // Missing group-security state requires provisioning or data repair.
+            Self::MissingGroupSecurity { .. } => false,
             // Reliable self-send is a caller bug.
             Self::ReliableSelfMessage { .. } => false,
             // Sender/recipient mismatches are local routing or authenticity violations.
@@ -264,7 +265,9 @@ impl DeliverySecurityError {
             | Self::UnexpectedRecipientAckRecipient { .. }
             | Self::InvalidRecipientAckSignatureLength { .. } => false,
             // Group sender mismatches are local routing or membership violations.
-            Self::UnexpectedGroupSender { .. } | Self::GroupSenderNotInGroup { .. } => false,
+            Self::UnexpectedGroupSender { .. }
+            | Self::GroupSenderNotInGroup { .. }
+            | Self::GroupSenderKeyFingerprintMismatch { .. } => false,
             // Bootstrap payload membership and key mismatches are permanent for this payload.
             Self::MissingBootstrapMemberKey { .. }
             | Self::BootstrapKeyFingerprintMismatch { .. }
@@ -543,7 +546,7 @@ impl DeliverySecurity {
         );
         let group_security = self.load_group_security(&header.group_id).await?;
         ensure!(
-            group_security.members.contains(&header.sender),
+            group_security.member_keys.contains_member(&header.sender),
             GroupSenderNotInGroupSnafu {
                 group_id: header.group_id,
                 sender: header.sender.clone(),
@@ -571,16 +574,30 @@ impl DeliverySecurity {
     ) -> Result<Bytes, DeliverySecurityError> {
         let group_security = self.load_group_security(&header.group_id).await?;
         ensure!(
-            group_security.members.contains(&header.sender),
+            group_security.member_keys.contains_member(&header.sender),
             GroupSenderNotInGroupSnafu {
                 group_id: header.group_id,
                 sender: header.sender.clone(),
             }
         );
+        let expected_sender_key = group_security
+            .member_keys
+            .member_key(&header.sender)
+            .expect("sender membership was checked against the same key set");
         let sender_keys = if header.sender == self.local_member {
-            self.local_keys.public_keys().clone()
+            let local_public_keys = self.local_keys.public_keys().clone();
+            ensure!(
+                local_public_keys.fingerprint() == expected_sender_key.fingerprint,
+                GroupSenderKeyFingerprintMismatchSnafu {
+                    sender: header.sender.clone(),
+                    expected: expected_sender_key.fingerprint,
+                    actual: local_public_keys.fingerprint(),
+                }
+            );
+            local_public_keys
         } else {
-            self.load_permitted_public_keys(&header.sender).await?
+            self.load_public_keys_for_key_if_permitted(expected_sender_key)
+                .await?
         };
         open_group_payload(
             &sender_keys,
@@ -629,13 +646,11 @@ impl DeliverySecurity {
                 group_id: *group_id,
             })?;
         transaction.release().await.context(StoreAccessSnafu)?;
-        let members = GroupMembers::from_ordered_members(record.members).context(
-            InvalidGroupMembersSnafu {
-                group_id: record.group_id,
-            },
-        )?;
         let group_key = self.open_group_secret(record.group_id, &record.security_material)?;
-        Ok(GroupSecurityMaterial { members, group_key })
+        Ok(GroupSecurityMaterial {
+            member_keys: record.member_keys,
+            group_key,
+        })
     }
 
     fn open_group_secret(
@@ -724,6 +739,17 @@ impl DeliverySecurity {
     ) -> Result<PublicMemberKeys, DeliverySecurityError> {
         self.security_store
             .load_permitted_member_public_keys(member_id, authority_scope)
+            .await
+            .context(SecurityStoreSnafu)
+    }
+
+    /// Load and decode public keys for one exact member-key binding if permitted.
+    async fn load_public_keys_for_key_if_permitted(
+        &self,
+        key_id: &MemberKeyId,
+    ) -> Result<PublicMemberKeys, DeliverySecurityError> {
+        self.security_store
+            .load_member_key_public_keys_if_permitted(key_id, AuthorityScope::ReplicationRuntime)
             .await
             .context(SecurityStoreSnafu)
     }
@@ -881,7 +907,9 @@ fn recipient_ack_frame_signature(
 
 /// Decrypted group security state needed for one group-broadcast frame.
 struct GroupSecurityMaterial {
-    members: GroupMembers,
+    /// Exact member-key bindings expected by the persisted group record.
+    member_keys: GroupMemberKeys,
+    /// Symmetric group key used to open or seal group payloads.
     group_key: GroupKey,
 }
 

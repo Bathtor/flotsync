@@ -87,6 +87,52 @@ impl SecurityStore {
         .boxed()
     }
 
+    /// Load this exact member key's public material if it exists and is permitted.
+    pub(crate) fn load_member_key_public_keys_if_permitted<'a>(
+        &'a self,
+        key_id: &'a MemberKeyId,
+        authority_scope: AuthorityScope,
+    ) -> BoxFuture<'a, Result<PublicMemberKeys, SecurityStoreError>> {
+        async move {
+            let mut transaction = self
+                .store
+                .begin_read_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            let record = transaction
+                .load_member_public_keys(key_id)
+                .await
+                .context(StoreAccessSnafu)?;
+            let Some(record) = record else {
+                transaction.release().await.context(StoreAccessSnafu)?;
+                return Err(SecurityStoreError::MemberKeyPublicKeysUnavailable {
+                    key_id: key_id.clone(),
+                    authority_scope,
+                    denial_reasons: vec![PermissionDenialReason::MissingKeyMaterial],
+                });
+            };
+            let decision = request_stored_member_key_permission_from_transaction(
+                transaction.as_mut(),
+                &self.trust_policy,
+                authority_scope,
+                key_id,
+            )
+            .await?;
+            transaction.release().await.context(StoreAccessSnafu)?;
+            match decision {
+                PermissionDecision::Permit => public_keys_from_record(record),
+                PermissionDecision::Deny(reason) => {
+                    Err(SecurityStoreError::MemberKeyPublicKeysUnavailable {
+                        key_id: key_id.clone(),
+                        authority_scope,
+                        denial_reasons: vec![reason],
+                    })
+                }
+            }
+        }
+        .boxed()
+    }
+
     /// Load the single permitted public key bundle for one member and authority scope.
     pub(crate) fn load_permitted_member_public_keys<'a>(
         &'a self,
@@ -163,6 +209,15 @@ pub(crate) enum SecurityStoreError {
     ))]
     NoPermittedMemberPublicKeys {
         member_id: MemberIdentity,
+        authority_scope: AuthorityScope,
+        denial_reasons: Vec<PermissionDenialReason>,
+    },
+    /// One exact member key cannot be used for the requested authority.
+    #[snafu(display(
+        "Member key {key_id:?} cannot be used for {authority_scope:?}: {denial_reasons:?}."
+    ))]
+    MemberKeyPublicKeysUnavailable {
+        key_id: MemberKeyId,
         authority_scope: AuthorityScope,
         denial_reasons: Vec<PermissionDenialReason>,
     },
@@ -250,6 +305,16 @@ async fn request_member_key_permission_from_transaction(
             PermissionDenialReason::MissingKeyMaterial,
         ));
     }
+    request_stored_member_key_permission_from_transaction(transaction, policy, scope, key_id).await
+}
+
+/// Request one member-key permission after key material has already been found.
+async fn request_stored_member_key_permission_from_transaction(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    policy: &TrustPolicy,
+    scope: AuthorityScope,
+    key_id: &MemberKeyId,
+) -> Result<PermissionDecision, SecurityStoreError> {
     let evidence = transaction
         .load_member_key_trust_evidence(key_id)
         .await
@@ -527,6 +592,34 @@ mod tests {
                 denial_reasons,
                 ..
             } if denial_reasons.contains(&PermissionDenialReason::MissingTrustEvidence)
+        ));
+    }
+
+    #[test]
+    fn security_store_exact_key_unavailable_reports_member_key_id() {
+        let store = sqlite_store();
+        let key_id = MemberKeyId {
+            member_id: remote_member(),
+            fingerprint: test_public_member_keys(&remote_member()).fingerprint(),
+        };
+        let security_store = security_store(store);
+
+        let error = wait_for_security_store_future(
+            security_store.load_member_key_public_keys_if_permitted(
+                &key_id,
+                AuthorityScope::ReplicationRuntime,
+            ),
+        )
+        .expect_err("missing exact member key should not be permitted");
+
+        assert!(matches!(
+            error,
+            SecurityStoreError::MemberKeyPublicKeysUnavailable {
+                key_id: error_key_id,
+                denial_reasons,
+                ..
+            } if error_key_id == key_id
+                && denial_reasons.contains(&PermissionDenialReason::MissingKeyMaterial)
         ));
     }
 

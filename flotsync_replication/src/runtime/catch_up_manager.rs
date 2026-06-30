@@ -795,10 +795,13 @@ mod tests {
         api::{
             DatasetId,
             DatasetUpdateRecord,
+            GroupMemberKeys,
+            MemberKeyId,
             ReplicationGroupRecord,
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
+        test_support::test_public_member_keys,
     };
     use flotsync_core::{member::Identifier, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
@@ -839,9 +842,22 @@ mod tests {
     }
 
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
+        let local_member = local_member();
+        let remote_member = remote_member();
+        let member_keys = GroupMemberKeys::from_ordered_member_keys([
+            MemberKeyId {
+                fingerprint: test_public_member_keys(&local_member).fingerprint(),
+                member_id: local_member,
+            },
+            MemberKeyId {
+                fingerprint: test_public_member_keys(&remote_member).fingerprint(),
+                member_id: remote_member,
+            },
+        ])
+        .expect("test group member keys should build");
         ReplicationGroupRecord {
             group_id,
-            members: vec![local_member(), remote_member()],
+            member_keys,
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material(group_id),
