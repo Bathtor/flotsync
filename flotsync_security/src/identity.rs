@@ -1,5 +1,6 @@
 use crate::{
     error::{
+        DecodePasteablePublicKeyBundleSnafu,
         InvalidEd25519PublicKeySnafu,
         InvalidHpkeKeySnafu,
         MissingKeyBundleFieldSnafu,
@@ -11,11 +12,19 @@ use crate::{
     hpke::{HpkeKem, HpkePrivateKey, HpkePublicKey},
     util::fixed_array,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use flotsync_core::MemberIdentity;
 use flotsync_messages::{
     buffa::{EnumValue, MessageField, MessageFieldView, UnknownFieldsView, ViewEncode as _},
-    proto::{DecodeProtoViewWith, DecodeProtoWith, EncodeProto, FromProtoDecodeError},
+    proto::{
+        DecodeProto,
+        DecodeProtoView,
+        DecodeProtoViewWith,
+        DecodeProtoWith,
+        EncodeProto,
+        FromProtoDecodeError,
+    },
     security as security_proto,
 };
 use hpke::{Deserializable, Kem, Serializable};
@@ -41,7 +50,7 @@ pub fn generate_member_key_bundles(member_id: MemberIdentity) -> Result<Generate
 /// Encode public member keys as a canonical protobuf public key bundle.
 #[must_use]
 pub fn encode_public_key_bundle(public_keys: &PublicMemberKeys) -> Vec<u8> {
-    public_keys.encode_proto_to_vec()
+    public_keys.public_key_bundle().to_bytes()
 }
 
 /// Decode a canonical protobuf public key bundle for `member_id`.
@@ -57,7 +66,7 @@ pub fn public_member_keys_from_public_bundle(
     input: &[u8],
     member_id: MemberIdentity,
 ) -> Result<PublicMemberKeys> {
-    PublicMemberKeys::decode_proto_from_slice_with(input, member_id)
+    PublicKeyBundle::from_bytes(input).map(|bundle| bundle.bind_member(member_id))
 }
 
 /// Encode local private keys as canonical protobuf private key bundle bytes.
@@ -65,12 +74,7 @@ pub fn public_member_keys_from_public_bundle(
 pub fn encode_local_private_key_bundle(
     local_keys: &LocalMemberKeys,
 ) -> EncodedLocalPrivateKeyBundle {
-    // hpke's X25519 wrapper only exposes serialization, not borrowed key bytes.
-    let mut encryption_public = [0u8; X25519_KEY_LENGTH];
-    local_keys
-        .public_keys
-        .hpke_public_key
-        .write_exact(&mut encryption_public);
+    let encryption_public = local_keys.public_keys.hpke_public_key.as_slice();
     let mut encryption_private = Zeroizing::new([0u8; X25519_KEY_LENGTH]);
     local_keys
         .hpke_private_key
@@ -85,7 +89,7 @@ pub fn encode_local_private_key_bundle(
         }),
         encryption_key: MessageFieldView::some(security_proto::PrivateKeyView {
             scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_X25519),
-            public_key: encryption_public.as_slice(),
+            public_key: encryption_public,
             private_key: encryption_private.as_slice(),
             __buffa_unknown_fields: UnknownFieldsView::new(),
         }),
@@ -127,6 +131,43 @@ impl fmt::Display for KeyRole {
             Self::Signing => write!(f, "signing"),
             Self::Encryption => write!(f, "encryption"),
         }
+    }
+}
+
+/// Validated HPKE public key bytes owned by Flotsync public key types.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HpkePublicKeyBytes([u8; X25519_KEY_LENGTH]);
+
+impl HpkePublicKeyBytes {
+    /// Validate and store raw HPKE public key bytes from a decoded source field.
+    pub(crate) fn from_slice(field: &'static str, bytes: &[u8]) -> Result<Self> {
+        let bytes = fixed_key_bytes::<X25519_KEY_LENGTH>(field, bytes)?;
+        Self::from_array(bytes)
+    }
+
+    /// Validate and store fixed-width HPKE public key bytes.
+    fn from_array(bytes: [u8; X25519_KEY_LENGTH]) -> Result<Self> {
+        HpkePublicKey::from_bytes(&bytes).context(InvalidHpkeKeySnafu {
+            role: KeyRole::Encryption,
+        })?;
+        Ok(Self(bytes))
+    }
+
+    /// Store a library HPKE public key as Flotsync-owned bytes.
+    fn from_hpke_public_key(public_key: &HpkePublicKey) -> Self {
+        Self(fixed_array(public_key.to_bytes().as_slice()))
+    }
+
+    /// Borrow the canonical public key bytes.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
+    /// Convert to the HPKE library type for a cryptographic operation.
+    pub(crate) fn to_hpke_public_key(&self) -> Result<HpkePublicKey> {
+        HpkePublicKey::from_bytes(&self.0).context(InvalidHpkeKeySnafu {
+            role: KeyRole::Encryption,
+        })
     }
 }
 
@@ -214,6 +255,7 @@ impl DecodeProtoViewWith<MemberIdentity> for LocalMemberKeys {
                 role: KeyRole::Encryption,
             });
         }
+        let hpke_public_key = HpkePublicKeyBytes::from_array(encryption_public)?;
         Ok(Self {
             public_keys: PublicMemberKeys {
                 member_id,
@@ -226,72 +268,119 @@ impl DecodeProtoViewWith<MemberIdentity> for LocalMemberKeys {
     }
 }
 
-/// Public member keys copied to trusted peers.
+/// Shareable public key material without a member identity.
+///
+/// A public key bundle is the material an application can show, copy, encode,
+/// or send to another user before any member identity or local trust decision
+/// has been attached. It deliberately contains no member identity, trust
+/// evidence, private key material, policy state, or presentation metadata.
+/// Bind it to a [`MemberIdentity`] with [`Self::bind_member`] only after the
+/// application has decided which member the bundle should represent.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublicMemberKeys {
-    member_id: MemberIdentity,
-    /// Public Ed25519 verifying key for this member.
+pub struct PublicKeyBundle {
+    /// Public Ed25519 verifying key for detached frame signatures.
     pub(crate) signing_key: VerifyingKey,
-    /// Public HPKE encryption key for member-targeted payloads.
-    pub(crate) hpke_public_key: HpkePublicKey,
+    /// Public X25519 HPKE key for member-targeted encryption.
+    pub(crate) hpke_public_key: HpkePublicKeyBytes,
 }
 
-impl PublicMemberKeys {
-    /// Build public member keys from raw public key bytes.
+impl PublicKeyBundle {
+    /// Build an identity-free public key bundle from raw public key bytes.
     ///
     /// # Errors
     ///
     /// Returns [`SecurityError`] if either public key cannot be decoded for the
     /// selected cryptographic primitive.
-    pub fn from_key_bytes(
-        member_id: MemberIdentity,
-        signing_key: [u8; ED25519_KEY_LENGTH],
-        encryption_key: [u8; X25519_KEY_LENGTH],
-    ) -> Result<Self> {
+    fn from_key_bytes(signing_key: &[u8], encryption_key: &[u8]) -> Result<Self> {
+        let signing_key =
+            fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.public_key", signing_key)?;
         let signing_key =
             VerifyingKey::from_bytes(&signing_key).context(InvalidEd25519PublicKeySnafu {
                 role: KeyRole::Signing,
             })?;
         let hpke_public_key =
-            HpkePublicKey::from_bytes(&encryption_key).context(InvalidHpkeKeySnafu {
-                role: KeyRole::Encryption,
-            })?;
+            HpkePublicKeyBytes::from_slice("encryption_key.public_key", encryption_key)?;
         Ok(Self {
-            member_id,
             signing_key,
             hpke_public_key,
         })
     }
 
-    /// Return the member identity associated with these public keys.
+    /// Build an identity-free bundle from existing identity-bound public member keys.
     #[must_use]
-    pub fn member_id(&self) -> &MemberIdentity {
-        &self.member_id
+    pub fn from_public_member_keys(public_keys: &PublicMemberKeys) -> Self {
+        Self {
+            signing_key: public_keys.signing_key,
+            hpke_public_key: public_keys.hpke_public_key.clone(),
+        }
     }
 
-    /// Return the raw Ed25519 verifying key bytes.
+    /// Bind this public key bundle to an explicit member identity.
+    ///
+    /// Binding does not record trust or make the member authoritative. It only
+    /// produces typed member-key material that higher-level APIs can assess or
+    /// store according to their own policy.
     #[must_use]
-    pub fn signing_key_bytes(&self) -> [u8; ED25519_KEY_LENGTH] {
-        self.signing_key.to_bytes()
-    }
-
-    /// Return the raw X25519 HPKE public key bytes.
-    #[must_use]
-    pub fn encryption_key_bytes(&self) -> [u8; X25519_KEY_LENGTH] {
-        fixed_array(self.hpke_public_key.to_bytes().as_slice())
+    pub fn bind_member(self, member_id: MemberIdentity) -> PublicMemberKeys {
+        PublicMemberKeys {
+            member_id,
+            signing_key: self.signing_key,
+            hpke_public_key: self.hpke_public_key,
+        }
     }
 
     /// Derive the stable fingerprint for this exact public key material.
+    ///
+    /// The fingerprint is safe to show to users for comparison. It is derived
+    /// only from the public key material and is independent of member identity.
     #[must_use]
     pub fn fingerprint(&self) -> KeyFingerprint {
         derive_public_key_fingerprint(
             self.signing_key.as_bytes().as_slice(),
-            self.hpke_public_key.to_bytes().as_slice(),
+            self.hpke_public_key.as_slice(),
         )
+    }
+
+    /// Encode this bundle as canonical Flotsync public-key-bundle bytes.
+    ///
+    /// Use this form when the bytes will be stored or transported by another
+    /// structured format.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.encode_proto_to_vec()
+    }
+
+    /// Decode a bundle from canonical Flotsync public-key-bundle bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError`] when the bundle is malformed, uses an
+    /// unsupported version or scheme, or contains invalid public key bytes.
+    pub fn from_bytes(input: &[u8]) -> Result<Self> {
+        Self::decode_proto_from_slice(input)
+    }
+
+    /// Encode this bundle as recommended pasteable text for users and CLIs.
+    #[must_use]
+    pub fn to_pasteable_string(&self) -> String {
+        STANDARD.encode(self.to_bytes())
+    }
+
+    /// Decode a bundle from recommended pasteable text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError`] when the string is not valid base64 or does
+    /// not contain a valid public key bundle.
+    pub fn from_pasteable_string(input: &str) -> Result<Self> {
+        let bytes = STANDARD
+            .decode(input)
+            .context(DecodePasteablePublicKeyBundleSnafu)?;
+        Self::from_bytes(&bytes)
     }
 }
 
-impl EncodeProto for PublicMemberKeys {
+impl EncodeProto for PublicKeyBundle {
     type Proto = security_proto::PublicKeyBundle;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -304,7 +393,7 @@ impl EncodeProto for PublicMemberKeys {
             }),
             encryption_key: MessageField::some(security_proto::PublicKey {
                 scheme: EnumValue::from(security_proto::KeyScheme::KEY_SCHEME_X25519),
-                public_key: self.hpke_public_key.to_bytes().as_slice().to_vec(),
+                public_key: self.hpke_public_key.as_slice().to_vec(),
                 ..security_proto::PublicKey::default()
             }),
             ..security_proto::PublicKeyBundle::default()
@@ -312,24 +401,112 @@ impl EncodeProto for PublicMemberKeys {
     }
 }
 
-impl DecodeProtoWith<MemberIdentity> for PublicMemberKeys {
+impl DecodeProto for PublicKeyBundle {
     type Proto = security_proto::PublicKeyBundle;
     type Error = SecurityError;
 
-    fn decode_proto_with(mut proto: Self::Proto, member_id: MemberIdentity) -> Result<Self> {
+    fn decode_proto(mut proto: Self::Proto) -> Result<Self> {
         validate_bundle_version(proto.format_version)?;
         let signing = take_required_field(&mut proto.signing_key, "signing_key")?;
         let encryption = take_required_field(&mut proto.encryption_key, "encryption_key")?;
         validate_key_scheme(KeyRole::Signing, signing.scheme)?;
         validate_key_scheme(KeyRole::Encryption, encryption.scheme)?;
 
-        let signing_key =
-            fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.public_key", &signing.public_key)?;
-        let encryption_key = fixed_key_bytes::<X25519_KEY_LENGTH>(
-            "encryption_key.public_key",
-            &encryption.public_key,
-        )?;
-        Self::from_key_bytes(member_id, signing_key, encryption_key)
+        Self::from_key_bytes(&signing.public_key, &encryption.public_key)
+    }
+}
+
+impl DecodeProtoView for PublicKeyBundle {
+    type ProtoView<'a> = security_proto::PublicKeyBundleView<'a>;
+    type Error = SecurityError;
+
+    fn decode_proto_view(proto: &Self::ProtoView<'_>) -> Result<Self> {
+        validate_bundle_version(proto.format_version)?;
+        let signing = required_field_view(proto.signing_key.as_option(), "signing_key")?;
+        let encryption = required_field_view(proto.encryption_key.as_option(), "encryption_key")?;
+        validate_key_scheme(KeyRole::Signing, signing.scheme)?;
+        validate_key_scheme(KeyRole::Encryption, encryption.scheme)?;
+
+        Self::from_key_bytes(signing.public_key, encryption.public_key)
+    }
+}
+
+/// Public member keys copied to trusted peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicMemberKeys {
+    member_id: MemberIdentity,
+    /// Public Ed25519 verifying key for this member.
+    pub(crate) signing_key: VerifyingKey,
+    /// Public HPKE encryption key for member-targeted payloads.
+    pub(crate) hpke_public_key: HpkePublicKeyBytes,
+}
+
+impl PublicMemberKeys {
+    /// Build identity-bound public member keys from raw public key bytes.
+    ///
+    /// This is a low-level constructor for typed records that already separate
+    /// key bytes from member identity, such as local store records. Most
+    /// application code should receive or decode a [`PublicKeyBundle`] first
+    /// and bind it with [`PublicKeyBundle::bind_member`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError`] if either public key cannot be decoded for the
+    /// selected cryptographic primitive.
+    pub fn from_key_bytes(
+        member_id: MemberIdentity,
+        signing_key: &[u8],
+        encryption_key: &[u8],
+    ) -> Result<Self> {
+        PublicKeyBundle::from_key_bytes(signing_key, encryption_key)
+            .map(|bundle| bundle.bind_member(member_id))
+    }
+
+    /// Return the member identity associated with these public keys.
+    #[must_use]
+    pub fn member_id(&self) -> &MemberIdentity {
+        &self.member_id
+    }
+
+    /// Return the raw Ed25519 verifying key bytes.
+    #[must_use]
+    pub fn signing_key_bytes(&self) -> &[u8] {
+        self.signing_key.as_bytes()
+    }
+
+    /// Return the raw X25519 HPKE public key bytes.
+    #[must_use]
+    pub fn encryption_key_bytes(&self) -> &[u8] {
+        self.hpke_public_key.as_slice()
+    }
+
+    /// Derive the stable fingerprint for this exact public key material.
+    #[must_use]
+    pub fn fingerprint(&self) -> KeyFingerprint {
+        self.public_key_bundle().fingerprint()
+    }
+
+    /// Return an identity-free view of this member's public key material.
+    #[must_use]
+    pub fn public_key_bundle(&self) -> PublicKeyBundle {
+        PublicKeyBundle::from_public_member_keys(self)
+    }
+}
+
+impl EncodeProto for PublicMemberKeys {
+    type Proto = security_proto::PublicKeyBundle;
+
+    fn encode_proto(&self) -> Self::Proto {
+        self.public_key_bundle().encode_proto()
+    }
+}
+
+impl DecodeProtoWith<MemberIdentity> for PublicMemberKeys {
+    type Proto = security_proto::PublicKeyBundle;
+    type Error = SecurityError;
+
+    fn decode_proto_with(proto: Self::Proto, member_id: MemberIdentity) -> Result<Self> {
+        PublicKeyBundle::decode_proto(proto).map(|bundle| bundle.bind_member(member_id))
     }
 }
 
@@ -341,19 +518,7 @@ impl DecodeProtoViewWith<MemberIdentity> for PublicMemberKeys {
         proto: &Self::ProtoView<'_>,
         member_id: MemberIdentity,
     ) -> Result<Self> {
-        validate_bundle_version(proto.format_version)?;
-        let signing = required_field_view(proto.signing_key.as_option(), "signing_key")?;
-        let encryption = required_field_view(proto.encryption_key.as_option(), "encryption_key")?;
-        validate_key_scheme(KeyRole::Signing, signing.scheme)?;
-        validate_key_scheme(KeyRole::Encryption, encryption.scheme)?;
-
-        let signing_key =
-            fixed_key_bytes::<ED25519_KEY_LENGTH>("signing_key.public_key", signing.public_key)?;
-        let encryption_key = fixed_key_bytes::<X25519_KEY_LENGTH>(
-            "encryption_key.public_key",
-            encryption.public_key,
-        )?;
-        Self::from_key_bytes(member_id, signing_key, encryption_key)
+        PublicKeyBundle::decode_proto_view(proto).map(|bundle| bundle.bind_member(member_id))
     }
 }
 
@@ -451,6 +616,7 @@ fn local_member_keys_from_seed(
     let signing_key = SigningKey::from_bytes(&signing_seed);
     let signing_public_key = signing_key.verifying_key();
     let (hpke_private_key, hpke_public_key) = HpkeKem::derive_keypair(hpke_seed);
+    let hpke_public_key = HpkePublicKeyBytes::from_hpke_public_key(&hpke_public_key);
     let public_keys = PublicMemberKeys {
         member_id,
         signing_key: signing_public_key,

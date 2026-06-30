@@ -31,8 +31,9 @@ pub const HPKE_ENCAPSULATED_KEY_LENGTH: usize = 32;
 ///
 /// # Errors
 ///
-/// Returns [`crate::SecurityError::HpkeSeal`] if HPKE setup or encryption
-/// fails.
+/// Returns [`crate::SecurityError::InvalidHpkeKey`] if the recipient public key
+/// bytes cannot be converted to the HPKE library type, or
+/// [`crate::SecurityError::HpkeSeal`] if HPKE setup or encryption fails.
 pub fn hpke_seal<R>(
     recipient: &PublicMemberKeys,
     info: &[u8],
@@ -46,9 +47,10 @@ where
     // Follow-up flotsync-icw: replace raw info/aad slices with a typed HPKE
     // context that canonicalises purpose, member identities, group/message ids,
     // and authenticated public metadata inside this crate.
+    let recipient_public_key = recipient.hpke_public_key.to_hpke_public_key()?;
     let (encapsulated_key, ciphertext) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem, R>(
         &OpModeS::Base,
-        &recipient.hpke_public_key,
+        &recipient_public_key,
         info,
         plaintext,
         aad,

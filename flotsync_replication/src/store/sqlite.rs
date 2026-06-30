@@ -52,7 +52,7 @@ use flotsync_messages::{
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
 };
-use flotsync_security::{ED25519_KEY_LENGTH, KeyFingerprint, PublicMemberKeys, X25519_KEY_LENGTH};
+use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
 use kompact::prelude::block_on;
@@ -344,6 +344,17 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
     ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
         async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
             .boxed()
+    }
+
+    fn load_member_public_keys_for_fingerprint<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move {
+            load_member_public_keys_for_fingerprint(self.assert_open_connection(), fingerprint)
+                .await
+        }
+        .boxed()
     }
 
     fn load_member_key_trust_evidence<'a>(
@@ -998,6 +1009,42 @@ ORDER BY key_fingerprint
             key_id: MemberKeyId {
                 member_id: member_id.clone(),
                 fingerprint,
+            },
+            signing_public_key: row
+                .get::<Vec<u8>, _>("signing_public_key")
+                .into_boxed_slice(),
+            encryption_public_key: row
+                .get::<Vec<u8>, _>("encryption_public_key")
+                .into_boxed_slice(),
+        });
+    }
+    Ok(records)
+}
+
+async fn load_member_public_keys_for_fingerprint(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT member_identity, signing_public_key, encryption_public_key
+FROM member_public_keys
+WHERE key_fingerprint = ?1
+ORDER BY member_identity
+",
+    )
+    .bind(fingerprint.as_ref())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let member_id = decode_member_identity(&row.get::<String, _>("member_identity"))?;
+        records.push(MemberPublicKeysRecord {
+            key_id: MemberKeyId {
+                member_id,
+                fingerprint: *fingerprint,
             },
             signing_public_key: row
                 .get::<Vec<u8>, _>("signing_public_key")
@@ -1954,29 +2001,12 @@ fn validate_member_public_keys_record(record: &MemberPublicKeysRecord) -> Result
 fn public_keys_from_member_record(
     record: &MemberPublicKeysRecord,
 ) -> Result<PublicMemberKeys, StoreError> {
-    let signing_public_key = fixed_member_public_key::<ED25519_KEY_LENGTH>(
-        "member signing public key",
-        record.signing_public_key.as_ref(),
-    )?;
-    let encryption_public_key = fixed_member_public_key::<X25519_KEY_LENGTH>(
-        "member encryption public key",
-        record.encryption_public_key.as_ref(),
-    )?;
     PublicMemberKeys::from_key_bytes(
         record.key_id.member_id.clone(),
-        signing_public_key,
-        encryption_public_key,
+        record.signing_public_key.as_ref(),
+        record.encryption_public_key.as_ref(),
     )
     .map_err(|source| invalid_stored_object("member public keys", source))
-}
-
-fn fixed_member_public_key<const N: usize>(
-    object: &'static str,
-    bytes: &[u8],
-) -> Result<[u8; N], StoreError> {
-    bytes
-        .try_into()
-        .map_err(|source| invalid_stored_object(object, source))
 }
 
 fn invalid_stored_object(

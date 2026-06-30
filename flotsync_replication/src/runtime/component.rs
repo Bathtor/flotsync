@@ -106,6 +106,11 @@ use crate::{
         Summary,
         SummaryRequest,
         providers::VecRowProvider,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleReport,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::{
         contracts::{
@@ -136,7 +141,7 @@ use flotsync_core::{
 };
 use flotsync_data_types::OwnedRow;
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
-use flotsync_security::GROUP_CIPHER_SUITE_CHACHA20_POLY1305;
+use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
     BoxFuture,
     KClaimablePromise,
@@ -438,6 +443,14 @@ impl BatchProvider for StoreSnapshotRowProvider {
 /// handle and the Kompact-hosted replication component.
 #[derive(Debug)]
 pub enum ReplicationRuntimeMessage {
+    /// Return the local member's shareable public key bundle through the component interface.
+    LocalPublicKeyBundle(Ask<(), Result<PublicKeyBundle, ApiError>>),
+    /// Assess one decoded public key bundle through the component interface.
+    AssessPublicKeyBundle(
+        Ask<AssessPublicKeyBundleRequest, Result<PublicKeyBundleReport, ApiError>>,
+    ),
+    /// Record public key bundle feedback through the component interface.
+    RecordPublicKeyBundleFeedback(Ask<RecordPublicKeyBundleFeedbackRequest, Result<(), ApiError>>),
     /// Submit one local publish request through the component interface.
     PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
     /// Request a local snapshot stream through the component interface.
@@ -1924,6 +1937,52 @@ impl ReplicationRuntimeComponent {
         })
     }
 
+    fn handle_assess_public_key_bundle(
+        &mut self,
+        ask: Ask<AssessPublicKeyBundleRequest, Result<PublicKeyBundleReport, ApiError>>,
+    ) -> HandlerResult {
+        let (promise, request) = ask.take();
+        let security = self.security.clone();
+        self.spawn_local(move |async_self| async move {
+            let reply = security
+                .assess_public_key_bundle(request)
+                .await
+                .boxed()
+                .context(ApiExternalSnafu);
+            async_self.reply_api(promise, "assess_public_key_bundle", reply);
+            Handled::OK
+        });
+        Handled::OK
+    }
+
+    fn handle_record_public_key_bundle_feedback(
+        &mut self,
+        ask: Ask<RecordPublicKeyBundleFeedbackRequest, Result<(), ApiError>>,
+    ) -> HandlerResult {
+        let (promise, request) = ask.take();
+        let security = self.security.clone();
+        self.spawn_local(move |async_self| async move {
+            let reply = security
+                .record_public_key_bundle_feedback(request)
+                .await
+                .boxed()
+                .context(ApiExternalSnafu);
+            async_self.reply_api(promise, "record_public_key_bundle_feedback", reply);
+            Handled::OK
+        });
+        Handled::OK
+    }
+
+    fn handle_local_public_key_bundle(
+        &mut self,
+        ask: Ask<(), Result<PublicKeyBundle, ApiError>>,
+    ) -> HandlerResult {
+        let (promise, ()) = ask.take();
+        let reply = Ok(self.security.local_public_key_bundle());
+        self.reply_api(promise, "local_public_key_bundle", reply);
+        Handled::OK
+    }
+
     fn handle_snapshot_rows(
         &mut self,
         ask: Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>,
@@ -2299,6 +2358,15 @@ impl Actor for ReplicationRuntimeComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
+            ReplicationRuntimeMessage::LocalPublicKeyBundle(ask) => {
+                self.handle_local_public_key_bundle(ask)
+            }
+            ReplicationRuntimeMessage::AssessPublicKeyBundle(ask) => {
+                self.handle_assess_public_key_bundle(ask)
+            }
+            ReplicationRuntimeMessage::RecordPublicKeyBundleFeedback(ask) => {
+                self.handle_record_public_key_bundle_feedback(ask)
+            }
             ReplicationRuntimeMessage::PublishChanges(ask) => self.handle_publish_changes(ask),
             ReplicationRuntimeMessage::SnapshotRows(ask) => self.handle_snapshot_rows(ask),
             ReplicationRuntimeMessage::RequestSummary(ask) => self.handle_request_summary(ask),

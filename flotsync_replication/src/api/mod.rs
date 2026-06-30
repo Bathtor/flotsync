@@ -11,6 +11,7 @@ use flotsync_core::{
 use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
 use flotsync_security::{
     KeyFingerprint,
+    PublicKeyBundle,
     PublicMemberKeys,
     StoreSecretKey,
     load_local_store_secret,
@@ -30,6 +31,7 @@ use std::{
 mod errors;
 mod ids;
 pub mod providers;
+pub mod security;
 
 pub use errors::*;
 pub use flotsync_data_types::{
@@ -642,6 +644,36 @@ pub trait ReplicationEventListener: Send + Sync {
 
 /// Application-facing replication control surface.
 pub trait ReplicationApi: Send + Sync {
+    /// Return the local member's shareable identity-free public key bundle.
+    ///
+    /// Applications can encode this bundle for transfer to another user or
+    /// device. The returned key material is public; it does not include member
+    /// identity, local trust evidence, private keys, or policy state.
+    fn local_public_key_bundle(&self) -> BoxFuture<'_, Result<PublicKeyBundle, ApiError>>;
+
+    /// Assess one decoded public key bundle against the running system's local security state.
+    ///
+    /// Read-only assessment does not store observed key material, record trust
+    /// evidence, or change blocked-key state. Requests may instead ask the
+    /// running system to store candidate member bindings before reporting, still
+    /// without adding trust evidence. Applications use the returned report to
+    /// present fingerprint, known identity bindings, local trust, blocked status,
+    /// and authority decisions before recording user feedback.
+    fn assess_public_key_bundle(
+        &self,
+        request: security::AssessPublicKeyBundleRequest,
+    ) -> BoxFuture<'_, Result<security::PublicKeyBundleReport, ApiError>>;
+
+    /// Record user/application feedback for one decoded public key bundle.
+    ///
+    /// Trust feedback records local trust for an explicit member identity plus
+    /// the bundle fingerprint. Block feedback records the fingerprint as
+    /// globally blocked.
+    fn record_public_key_bundle_feedback(
+        &self,
+        request: security::RecordPublicKeyBundleFeedbackRequest,
+    ) -> BoxFuture<'_, Result<(), ApiError>>;
+
     /// Publish one local set of row mutations from a known read token.
     ///
     /// The request token is the read position of the application state used to
@@ -1068,6 +1100,20 @@ pub enum AuthorityScope {
     BootstrapActivation,
 }
 
+impl AuthorityScope {
+    /// Authority scopes included in public key bundle assessment reports.
+    pub const VALUES: [Self; 2] = [Self::ReplicationRuntime, Self::BootstrapActivation];
+}
+
+impl fmt::Display for AuthorityScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ReplicationRuntime => f.write_str("replication runtime"),
+            Self::BootstrapActivation => f.write_str("bootstrap activation"),
+        }
+    }
+}
+
 /// Runtime policy that maps stored trust evidence to permission decisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustPolicy {
@@ -1091,6 +1137,8 @@ impl Default for TrustPolicy {
 pub enum MemberKeyTrustRequirement {
     /// Require locally recorded explicit trust for the exact member key.
     LocalExplicitTrust,
+    /// Require only that public key material is stored for the exact member key.
+    StoredPublicKeyMaterial,
     /// Deny every permission request for this authority scope.
     DenyAll,
 }
@@ -1104,6 +1152,15 @@ pub enum PermissionDecision {
     Deny(PermissionDenialReason),
 }
 
+impl fmt::Display for PermissionDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Permit => f.write_str("permit"),
+            Self::Deny(reason) => write!(f, "deny ({reason})"),
+        }
+    }
+}
+
 /// Reason one member key permission request was denied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PermissionDenialReason {
@@ -1115,6 +1172,17 @@ pub enum PermissionDenialReason {
     FingerprintBlocked,
     /// The active policy denies the requested authority scope.
     PolicyDenied,
+}
+
+impl fmt::Display for PermissionDenialReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingKeyMaterial => f.write_str("missing key material"),
+            Self::MissingTrustEvidence => f.write_str("missing trust evidence"),
+            Self::FingerprintBlocked => f.write_str("fingerprint blocked"),
+            Self::PolicyDenied => f.write_str("policy denied"),
+        }
+    }
 }
 
 /// Identity of one exact member-key binding.
@@ -1384,6 +1452,12 @@ pub trait ReplicationStoreReadTransaction: Send {
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
+
+    /// Load every observed public key material record for one key fingerprint.
+    fn load_member_public_keys_for_fingerprint<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
     ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>>;
 
     /// Load trust evidence for one exact member-key binding.

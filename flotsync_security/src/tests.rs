@@ -12,6 +12,7 @@ use crate::{
     LocalStoreSecretError,
     LocalStoreSecretProfile,
     MemberIdentity,
+    PublicKeyBundle,
     ReliablePayloadContext,
     SecurityError,
     SignedFrameParts,
@@ -40,7 +41,10 @@ use crate::{
     test_support::rng_from_seed,
     verify_frame_signature,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE},
+};
 use bytes::Bytes;
 use flotsync_core::member::Identifier;
 use flotsync_messages::{
@@ -198,6 +202,53 @@ fn public_key_bundle_encoding_roundtrips_public_keys() {
 
     assert_eq!(public.member_id(), &alice);
     assert_eq!(&public, local.public_keys());
+}
+
+#[test]
+fn identity_free_public_key_bundle_roundtrips_bytes() {
+    let local = local_member("alice", ALICE_SEED);
+    let bundle = PublicKeyBundle::from_public_member_keys(local.public_keys());
+    let encoded = bundle.to_bytes();
+
+    let decoded = PublicKeyBundle::from_bytes(&encoded).unwrap();
+
+    assert_eq!(decoded, bundle);
+    assert_eq!(decoded.fingerprint(), local.public_keys().fingerprint());
+}
+
+#[test]
+fn identity_free_public_key_bundle_binds_to_explicit_member() {
+    let local = local_member("alice", ALICE_SEED);
+    let bundle = PublicKeyBundle::from_public_member_keys(local.public_keys());
+    let bob = member("bob");
+
+    let public_keys = bundle.bind_member(bob.clone());
+
+    assert_eq!(public_keys.member_id(), &bob);
+    assert_eq!(public_keys.fingerprint(), local.public_keys().fingerprint());
+}
+
+#[test]
+fn pasteable_public_key_bundle_roundtrips() {
+    let local = local_member("alice", ALICE_SEED);
+    let bundle = local.public_keys().public_key_bundle();
+
+    let pasteable = bundle.to_pasteable_string();
+    let decoded = PublicKeyBundle::from_pasteable_string(&pasteable).unwrap();
+
+    assert_eq!(pasteable, STANDARD.encode(bundle.to_bytes()));
+    assert!(!pasteable.starts_with("flotsync-key-v1"));
+    assert_eq!(decoded, bundle);
+}
+
+#[test]
+fn pasteable_public_key_bundle_rejects_malformed_base64() {
+    let err = PublicKeyBundle::from_pasteable_string("not base64!").unwrap_err();
+
+    assert!(matches!(
+        err,
+        SecurityError::DecodePasteablePublicKeyBundle { .. }
+    ));
 }
 
 #[test]

@@ -12,6 +12,11 @@ use crate::{
         PermissionDenialReason,
         StoreError,
         StoreSecretKeyId,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleReport,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::{
         group_broadcast::GroupMessageHeader,
@@ -34,6 +39,7 @@ use flotsync_security::{
     GroupMessageContext,
     KeyFingerprint,
     LocalMemberKeys,
+    PublicKeyBundle,
     PublicMemberKeys,
     ReliablePayloadContext,
     SIGNATURE_LENGTH,
@@ -346,6 +352,33 @@ impl DeliverySecurity {
 
     pub(crate) fn local_keys(&self) -> &LocalMemberKeys {
         &self.local_keys
+    }
+
+    /// Return the local member's shareable public key bundle.
+    pub(crate) fn local_public_key_bundle(&self) -> PublicKeyBundle {
+        self.local_keys.public_keys().public_key_bundle()
+    }
+
+    /// Assess one decoded public key bundle against local security state.
+    pub(crate) async fn assess_public_key_bundle(
+        &self,
+        request: AssessPublicKeyBundleRequest,
+    ) -> Result<PublicKeyBundleReport, DeliverySecurityError> {
+        self.security_store
+            .assess_public_key_bundle(request)
+            .await
+            .context(SecurityStoreSnafu)
+    }
+
+    /// Record public key bundle feedback.
+    pub(crate) async fn record_public_key_bundle_feedback(
+        &self,
+        request: RecordPublicKeyBundleFeedbackRequest,
+    ) -> Result<(), DeliverySecurityError> {
+        self.security_store
+            .record_public_key_bundle_feedback(request)
+            .await
+            .context(SecurityStoreSnafu)
     }
 
     /// Generate a fresh group key for runtime bootstrap material.

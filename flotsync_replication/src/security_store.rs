@@ -4,6 +4,7 @@ use crate::api::{
     AuthorityScope,
     MemberKeyId,
     MemberKeyTrustEvidenceKind,
+    MemberKeyTrustEvidenceRecord,
     MemberKeyTrustEvidenceSet,
     MemberKeyTrustRequirement,
     MemberPublicKeysRecord,
@@ -11,15 +12,28 @@ use crate::api::{
     PermissionDenialReason,
     ReplicationStore,
     ReplicationStoreReadTransaction,
+    ReplicationStoreTransaction,
     StoreError,
     TrustPolicy,
+    security::{
+        AssessPublicKeyBundleRequest,
+        CandidateMemberKeyReport,
+        MemberKeyAuthorityReport,
+        MemberKeyBindingReport,
+        MemberKeyTrustReport,
+        PublicKeyBundleAssessmentStorage,
+        PublicKeyBundleFeedback,
+        PublicKeyBundleReport,
+        PublicKeyBundleSchemeReport,
+        RecordPublicKeyBundleFeedbackRequest,
+    },
 };
 use flotsync_core::MemberIdentity;
-use flotsync_security::{ED25519_KEY_LENGTH, KeyFingerprint, PublicMemberKeys, X25519_KEY_LENGTH};
+use flotsync_security::{KeyFingerprint, PublicKeyBundle, PublicMemberKeys};
 use flotsync_utils::{BoxError, BoxFuture};
 use futures_util::FutureExt as _;
 use snafu::{Location, prelude::*};
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 /// Public security-state facade used by runtime security code.
 #[derive(Clone)]
@@ -120,7 +134,7 @@ impl SecurityStore {
             .await?;
             transaction.release().await.context(StoreAccessSnafu)?;
             match decision {
-                PermissionDecision::Permit => public_keys_from_record(record),
+                PermissionDecision::Permit => public_keys_from_record(&record),
                 PermissionDecision::Deny(reason) => {
                     Err(SecurityStoreError::MemberKeyPublicKeysUnavailable {
                         key_id: key_id.clone(),
@@ -186,7 +200,83 @@ impl SecurityStore {
             let record = permitted
                 .pop()
                 .expect("permitted length is checked to contain exactly one key");
-            public_keys_from_record(record)
+            public_keys_from_record(&record)
+        }
+        .boxed()
+    }
+
+    /// Assess one decoded public key bundle against local trust and block state.
+    pub(crate) fn assess_public_key_bundle(
+        &self,
+        request: AssessPublicKeyBundleRequest,
+    ) -> BoxFuture<'_, Result<PublicKeyBundleReport, SecurityStoreError>> {
+        async move {
+            let fingerprint = request.bundle.fingerprint();
+            match request.material_storage {
+                PublicKeyBundleAssessmentStorage::ReadOnly => {
+                    let mut transaction = self
+                        .store
+                        .begin_read_transaction()
+                        .await
+                        .context(StoreAccessSnafu)?;
+                    let report = public_key_bundle_report_from_transaction(
+                        transaction.as_mut(),
+                        &self.trust_policy,
+                        fingerprint,
+                        request.candidate_member_ids,
+                    )
+                    .await?;
+                    transaction.release().await.context(StoreAccessSnafu)?;
+                    Ok(report)
+                }
+                PublicKeyBundleAssessmentStorage::StoreCandidateBindings => {
+                    let mut transaction = self
+                        .store
+                        .begin_transaction()
+                        .await
+                        .context(StoreAccessSnafu)?;
+                    ensure_candidate_public_key_bindings(
+                        transaction.as_mut(),
+                        &request.bundle,
+                        &request.candidate_member_ids,
+                    )
+                    .await?;
+                    let report = public_key_bundle_report_from_transaction(
+                        transaction.as_mut(),
+                        &self.trust_policy,
+                        fingerprint,
+                        request.candidate_member_ids,
+                    )
+                    .await?;
+                    transaction.commit().await.context(StoreAccessSnafu)?;
+                    Ok(report)
+                }
+            }
+        }
+        .boxed()
+    }
+
+    /// Record user/application feedback for one public key bundle.
+    pub(crate) fn record_public_key_bundle_feedback(
+        &self,
+        request: RecordPublicKeyBundleFeedbackRequest,
+    ) -> BoxFuture<'_, Result<(), SecurityStoreError>> {
+        async move {
+            let fingerprint = request.bundle.fingerprint();
+            let mut transaction = self
+                .store
+                .begin_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            record_public_key_bundle_feedback_in_transaction(
+                transaction.as_mut(),
+                &request.bundle,
+                request.feedback,
+                fingerprint,
+            )
+            .await?;
+            transaction.commit().await.context(StoreAccessSnafu)?;
+            Ok(())
         }
         .boxed()
     }
@@ -230,16 +320,6 @@ pub(crate) enum SecurityStoreError {
         authority_scope: AuthorityScope,
         permitted_count: usize,
     },
-    /// Stored public key bytes had the wrong fixed length.
-    #[snafu(display(
-        "Stored public key bytes for member {member_id} fingerprint {fingerprint} had invalid length {actual}; expected {expected}."
-    ))]
-    InvalidMemberPublicKeyLength {
-        member_id: MemberIdentity,
-        fingerprint: KeyFingerprint,
-        expected: usize,
-        actual: usize,
-    },
     /// Stored public key bytes could not be decoded.
     #[snafu(display(
         "Stored public keys for member {member_id} fingerprint {fingerprint} were invalid: {source}"
@@ -257,6 +337,14 @@ pub(crate) enum SecurityStoreError {
         member_id: MemberIdentity,
         expected: KeyFingerprint,
         actual: KeyFingerprint,
+    },
+    /// A globally blocked key fingerprint cannot be trusted again.
+    #[snafu(display(
+        "Public key bundle fingerprint {fingerprint} is globally blocked and cannot be trusted for member {member_id}."
+    ))]
+    BlockedKeyTrust {
+        member_id: MemberIdentity,
+        fingerprint: KeyFingerprint,
     },
 }
 
@@ -286,6 +374,7 @@ pub(crate) fn request_member_key_permission(
                 PermissionDecision::Deny(PermissionDenialReason::MissingTrustEvidence)
             }
         }
+        MemberKeyTrustRequirement::StoredPublicKeyMaterial => PermissionDecision::Permit,
     }
 }
 
@@ -332,20 +421,206 @@ async fn request_stored_member_key_permission_from_transaction(
     ))
 }
 
-/// Decode one opaque public-key store record into typed security keys.
+/// Build a public bundle report from an already-open store transaction.
+async fn public_key_bundle_report_from_transaction(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    policy: &TrustPolicy,
+    fingerprint: KeyFingerprint,
+    candidate_member_ids: HashSet<MemberIdentity>,
+) -> Result<PublicKeyBundleReport, SecurityStoreError> {
+    let globally_blocked = transaction
+        .is_key_fingerprint_blocked(&fingerprint)
+        .await
+        .context(StoreAccessSnafu)?;
+    let known_records = transaction
+        .load_member_public_keys_for_fingerprint(&fingerprint)
+        .await
+        .context(StoreAccessSnafu)?;
+    let mut known_bindings = Vec::with_capacity(known_records.len());
+    for record in known_records {
+        public_keys_from_record(&record)?;
+        let report = member_key_binding_report_from_transaction(
+            transaction,
+            policy,
+            &record.key_id,
+            globally_blocked,
+        )
+        .await?;
+        known_bindings.push(report);
+    }
+
+    let mut candidate_member_ids = candidate_member_ids.into_iter().collect::<Vec<_>>();
+    candidate_member_ids.sort();
+    let mut candidate_members = Vec::with_capacity(candidate_member_ids.len());
+    for member_id in candidate_member_ids {
+        let candidate_report = candidate_member_key_report_from_transaction(
+            transaction,
+            policy,
+            member_id,
+            fingerprint,
+            globally_blocked,
+        )
+        .await?;
+        candidate_members.push(candidate_report);
+    }
+
+    Ok(PublicKeyBundleReport {
+        fingerprint,
+        schemes: PublicKeyBundleSchemeReport::SUPPORTED,
+        globally_blocked,
+        known_bindings,
+        candidate_members,
+    })
+}
+
+/// Build a report for one candidate identity supplied by the application.
+async fn candidate_member_key_report_from_transaction(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    policy: &TrustPolicy,
+    member_id: MemberIdentity,
+    fingerprint: KeyFingerprint,
+    globally_blocked: bool,
+) -> Result<CandidateMemberKeyReport, SecurityStoreError> {
+    let records = transaction
+        .load_member_public_keys_for_member(&member_id)
+        .await
+        .context(StoreAccessSnafu)?;
+    let mut binding_for_bundle = None;
+    let mut other_known_fingerprints = Vec::new();
+    for record in records {
+        public_keys_from_record(&record)?;
+        if record.key_id.fingerprint == fingerprint {
+            let report = member_key_binding_report_from_transaction(
+                transaction,
+                policy,
+                &record.key_id,
+                globally_blocked,
+            )
+            .await?;
+            binding_for_bundle = Some(report);
+        } else {
+            other_known_fingerprints.push(record.key_id.fingerprint);
+        }
+    }
+    Ok(CandidateMemberKeyReport {
+        member_id,
+        binding_for_bundle,
+        other_known_fingerprints,
+    })
+}
+
+/// Build a local trust and authority report for one exact member-key binding.
+async fn member_key_binding_report_from_transaction(
+    transaction: &mut dyn ReplicationStoreReadTransaction,
+    policy: &TrustPolicy,
+    key_id: &MemberKeyId,
+    globally_blocked: bool,
+) -> Result<MemberKeyBindingReport, SecurityStoreError> {
+    let evidence = transaction
+        .load_member_key_trust_evidence(key_id)
+        .await
+        .context(StoreAccessSnafu)?;
+    let trust = MemberKeyTrustReport {
+        has_local_explicit_trust: evidence.contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust),
+    };
+    let authority = AuthorityScope::VALUES
+        .iter()
+        .map(|scope| MemberKeyAuthorityReport {
+            scope: *scope,
+            decision: request_member_key_permission(
+                policy,
+                *scope,
+                key_id,
+                evidence,
+                globally_blocked,
+            ),
+        })
+        .collect();
+    Ok(MemberKeyBindingReport {
+        key_id: key_id.clone(),
+        trust,
+        authority,
+    })
+}
+
+/// Store one observed public-key binding for each candidate member identity.
+async fn ensure_candidate_public_key_bindings(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    bundle: &PublicKeyBundle,
+    candidate_member_ids: &HashSet<MemberIdentity>,
+) -> Result<(), SecurityStoreError> {
+    for member_id in candidate_member_ids {
+        let record = member_public_keys_record_from_bundle(bundle, member_id.clone());
+        transaction
+            .ensure_member_public_keys(record)
+            .await
+            .context(StoreAccessSnafu)?;
+    }
+    Ok(())
+}
+
+/// Persist one feedback action in an already-open write transaction.
+async fn record_public_key_bundle_feedback_in_transaction(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    bundle: &PublicKeyBundle,
+    feedback: PublicKeyBundleFeedback,
+    fingerprint: KeyFingerprint,
+) -> Result<(), SecurityStoreError> {
+    match feedback {
+        PublicKeyBundleFeedback::TrustMember { member_id } => {
+            let fingerprint_blocked = transaction
+                .is_key_fingerprint_blocked(&fingerprint)
+                .await
+                .context(StoreAccessSnafu)?;
+            ensure!(
+                !fingerprint_blocked,
+                BlockedKeyTrustSnafu {
+                    member_id: member_id.clone(),
+                    fingerprint,
+                }
+            );
+            let record = member_public_keys_record_from_bundle(bundle, member_id);
+            let key_id = record.key_id.clone();
+            transaction
+                .ensure_member_public_keys(record)
+                .await
+                .context(StoreAccessSnafu)?;
+            transaction
+                .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                    key_id: key_id.clone(),
+                    evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+                })
+                .await
+                .context(StoreAccessSnafu)?;
+            Ok(())
+        }
+        PublicKeyBundleFeedback::BlockFingerprint => {
+            transaction
+                .ensure_blocked_key_fingerprint(fingerprint)
+                .await
+                .context(StoreAccessSnafu)?;
+            Ok(())
+        }
+    }
+}
+
+/// Build a member-public-keys store record by binding one public bundle to a member.
+fn member_public_keys_record_from_bundle(
+    bundle: &PublicKeyBundle,
+    member_id: MemberIdentity,
+) -> MemberPublicKeysRecord {
+    let public_keys = bundle.clone().bind_member(member_id);
+    MemberPublicKeysRecord::from_public_keys(&public_keys)
+}
+
+/// Decode one borrowed opaque public-key store record into typed security keys.
 pub(crate) fn public_keys_from_record(
-    record: MemberPublicKeysRecord,
+    record: &MemberPublicKeysRecord,
 ) -> Result<PublicMemberKeys, SecurityStoreError> {
-    let signing_public_key =
-        fixed_public_key::<ED25519_KEY_LENGTH>(&record.key_id, record.signing_public_key.as_ref())?;
-    let encryption_public_key = fixed_public_key::<X25519_KEY_LENGTH>(
-        &record.key_id,
-        record.encryption_public_key.as_ref(),
-    )?;
     let public_keys = PublicMemberKeys::from_key_bytes(
         record.key_id.member_id.clone(),
-        signing_public_key,
-        encryption_public_key,
+        record.signing_public_key.as_ref(),
+        record.encryption_public_key.as_ref(),
     )
     .boxed()
     .context(InvalidMemberPublicKeysSnafu {
@@ -355,7 +630,7 @@ pub(crate) fn public_keys_from_record(
     ensure!(
         public_keys.fingerprint() == record.key_id.fingerprint,
         MemberPublicKeyFingerprintMismatchSnafu {
-            member_id: record.key_id.member_id,
+            member_id: record.key_id.member_id.clone(),
             expected: record.key_id.fingerprint,
             actual: public_keys.fingerprint(),
         }
@@ -363,31 +638,28 @@ pub(crate) fn public_keys_from_record(
     Ok(public_keys)
 }
 
-/// Validate and copy fixed-width public key bytes from store records.
-fn fixed_public_key<const N: usize>(
-    key_id: &MemberKeyId,
-    bytes: &[u8],
-) -> Result<[u8; N], SecurityStoreError> {
-    bytes
-        .try_into()
-        .map_err(|_| SecurityStoreError::InvalidMemberPublicKeyLength {
-            member_id: key_id.member_id.clone(),
-            fingerprint: key_id.fingerprint,
-            expected: N,
-            actual: bytes.len(),
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         SqliteReplicationStore,
-        api::{MemberKeyTrustEvidenceRecord, MemberPublicKeysRecord, ReplicationStore},
+        api::{
+            MemberKeyTrustEvidenceRecord,
+            MemberPublicKeysRecord,
+            ReplicationStore,
+            security::{
+                AssessPublicKeyBundleRequest,
+                MemberKeyBindingReport,
+                PublicKeyBundleAssessmentStorage,
+                PublicKeyBundleFeedback,
+                PublicKeyBundleReport,
+                RecordPublicKeyBundleFeedbackRequest,
+            },
+        },
         test_support::test_public_member_keys,
     };
     use flotsync_core::member::Identifier;
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -454,6 +726,29 @@ mod tests {
         }
         wait_for_security_store_future(transaction.commit()).expect("transaction commits");
         record
+    }
+
+    fn binding_report<'a>(
+        report: &'a PublicKeyBundleReport,
+        key_id: &MemberKeyId,
+    ) -> &'a MemberKeyBindingReport {
+        report
+            .known_bindings
+            .iter()
+            .find(|binding| &binding.key_id == key_id)
+            .expect("binding report should exist")
+    }
+
+    fn authority_decision(
+        binding: &MemberKeyBindingReport,
+        scope: AuthorityScope,
+    ) -> PermissionDecision {
+        binding
+            .authority
+            .iter()
+            .find(|authority| authority.scope == scope)
+            .expect("authority report should exist")
+            .decision
     }
 
     #[test]
@@ -650,6 +945,273 @@ mod tests {
                 denial_reasons,
                 ..
             } if denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
+        ));
+    }
+
+    #[test]
+    fn public_key_bundle_assessment_does_not_store_or_trust_unknown_bundle() {
+        let store = sqlite_store();
+        let security_store = security_store(store.clone());
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+
+        let report = wait_for_security_store_future(security_store.assess_public_key_bundle(
+            AssessPublicKeyBundleRequest {
+                bundle,
+                candidate_member_ids: HashSet::from([remote_member()]),
+                material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+            },
+        ))
+        .expect("bundle assessment should succeed");
+
+        assert!(report.known_bindings.is_empty());
+        assert_eq!(report.candidate_members.len(), 1);
+        assert!(report.candidate_members[0].binding_for_bundle.is_none());
+
+        let mut transaction =
+            wait_for_security_store_future(store.begin_read_transaction()).expect("read starts");
+        let stored = wait_for_security_store_future(
+            transaction.load_member_public_keys_for_member(&remote_member()),
+        )
+        .expect("member keys should load");
+        wait_for_security_store_future(transaction.release()).expect("release succeeds");
+        assert!(stored.is_empty());
+    }
+
+    #[test]
+    fn public_key_bundle_assessment_stores_candidate_bindings_without_trust() {
+        let store = sqlite_store();
+        let security_store = security_store_with_policy(
+            store.clone(),
+            TrustPolicy {
+                replication_runtime: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
+                bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+            },
+        );
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+
+        let report = wait_for_security_store_future(security_store.assess_public_key_bundle(
+            AssessPublicKeyBundleRequest {
+                bundle,
+                candidate_member_ids: HashSet::from([remote_member(), alternate_member()]),
+                material_storage: PublicKeyBundleAssessmentStorage::StoreCandidateBindings,
+            },
+        ))
+        .expect("bundle assessment should store candidate bindings");
+
+        assert_eq!(report.known_bindings.len(), 2);
+        for candidate in &report.candidate_members {
+            let binding = candidate
+                .binding_for_bundle
+                .as_ref()
+                .expect("candidate binding should be reported");
+            assert!(!binding.trust.has_local_explicit_trust);
+            assert_eq!(
+                authority_decision(binding, AuthorityScope::ReplicationRuntime),
+                PermissionDecision::Permit
+            );
+            assert_eq!(
+                authority_decision(binding, AuthorityScope::BootstrapActivation),
+                PermissionDecision::Deny(PermissionDenialReason::MissingTrustEvidence)
+            );
+        }
+
+        let mut transaction =
+            wait_for_security_store_future(store.begin_read_transaction()).expect("read starts");
+        let stored = wait_for_security_store_future(
+            transaction.load_member_public_keys_for_member(&remote_member()),
+        )
+        .expect("member keys should load");
+        wait_for_security_store_future(transaction.release()).expect("release succeeds");
+        assert_eq!(stored.len(), 1);
+    }
+
+    #[test]
+    fn public_key_bundle_assessment_reports_ambiguous_bindings_and_candidate_keys() {
+        let store = sqlite_store();
+        let trusted_record =
+            provision_member_public_keys(store.as_ref(), remote_member(), &remote_member(), true);
+        let ambiguous_record = provision_member_public_keys(
+            store.as_ref(),
+            alternate_member(),
+            &remote_member(),
+            false,
+        );
+        let other_remote_record = provision_member_public_keys(
+            store.as_ref(),
+            remote_member(),
+            &alternate_member(),
+            false,
+        );
+        let security_store = security_store(store);
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+
+        let report = wait_for_security_store_future(security_store.assess_public_key_bundle(
+            AssessPublicKeyBundleRequest {
+                bundle,
+                candidate_member_ids: HashSet::from([remote_member(), alternate_member()]),
+                material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+            },
+        ))
+        .expect("bundle assessment should succeed");
+
+        assert_eq!(report.fingerprint, trusted_record.key_id.fingerprint);
+        assert!(!report.globally_blocked);
+        assert_eq!(report.known_bindings.len(), 2);
+        assert!(
+            report
+                .known_bindings
+                .iter()
+                .any(|binding| binding.key_id == trusted_record.key_id)
+        );
+        assert!(
+            report
+                .known_bindings
+                .iter()
+                .any(|binding| binding.key_id == ambiguous_record.key_id)
+        );
+        let trusted_binding = binding_report(&report, &trusted_record.key_id);
+        assert!(trusted_binding.trust.has_local_explicit_trust);
+        assert_eq!(
+            authority_decision(trusted_binding, AuthorityScope::ReplicationRuntime),
+            PermissionDecision::Permit
+        );
+
+        let remote_candidate = report
+            .candidate_members
+            .iter()
+            .find(|candidate| candidate.member_id == remote_member())
+            .expect("remote candidate should be reported");
+        assert_eq!(
+            remote_candidate
+                .binding_for_bundle
+                .as_ref()
+                .expect("remote binding should be reported")
+                .key_id,
+            trusted_record.key_id
+        );
+        assert_eq!(
+            remote_candidate.other_known_fingerprints,
+            vec![other_remote_record.key_id.fingerprint]
+        );
+    }
+
+    #[test]
+    fn public_key_bundle_feedback_trusts_member() {
+        let store = sqlite_store();
+        let security_store = security_store(store.clone());
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+        let fingerprint = bundle.fingerprint();
+
+        wait_for_security_store_future(security_store.record_public_key_bundle_feedback(
+            RecordPublicKeyBundleFeedbackRequest {
+                bundle: bundle.clone(),
+                feedback: PublicKeyBundleFeedback::TrustMember {
+                    member_id: remote_member(),
+                },
+            },
+        ))
+        .expect("trust feedback should store");
+
+        let key_id = MemberKeyId {
+            member_id: remote_member(),
+            fingerprint,
+        };
+        let report = wait_for_security_store_future(security_store.assess_public_key_bundle(
+            AssessPublicKeyBundleRequest {
+                bundle,
+                candidate_member_ids: HashSet::from([remote_member()]),
+                material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+            },
+        ))
+        .expect("bundle assessment should succeed");
+        let binding = binding_report(&report, &key_id);
+        assert!(binding.trust.has_local_explicit_trust);
+        assert_eq!(
+            authority_decision(binding, AuthorityScope::ReplicationRuntime),
+            PermissionDecision::Permit
+        );
+
+        let mut transaction =
+            wait_for_security_store_future(store.begin_read_transaction()).expect("read starts");
+        let evidence =
+            wait_for_security_store_future(transaction.load_member_key_trust_evidence(&key_id))
+                .expect("trust evidence should load");
+        wait_for_security_store_future(transaction.release()).expect("release succeeds");
+        assert!(evidence.contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust));
+    }
+
+    #[test]
+    fn public_key_bundle_feedback_blocks_fingerprint() {
+        let store = sqlite_store();
+        let security_store = security_store(store);
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+        let fingerprint = bundle.fingerprint();
+        wait_for_security_store_future(security_store.record_public_key_bundle_feedback(
+            RecordPublicKeyBundleFeedbackRequest {
+                bundle: bundle.clone(),
+                feedback: PublicKeyBundleFeedback::TrustMember {
+                    member_id: remote_member(),
+                },
+            },
+        ))
+        .expect("trust feedback should store");
+
+        wait_for_security_store_future(security_store.record_public_key_bundle_feedback(
+            RecordPublicKeyBundleFeedbackRequest {
+                bundle: bundle.clone(),
+                feedback: PublicKeyBundleFeedback::BlockFingerprint,
+            },
+        ))
+        .expect("block feedback should store");
+
+        let report = wait_for_security_store_future(security_store.assess_public_key_bundle(
+            AssessPublicKeyBundleRequest {
+                bundle,
+                candidate_member_ids: HashSet::from([remote_member()]),
+                material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+            },
+        ))
+        .expect("bundle assessment should succeed");
+        assert!(report.globally_blocked);
+        assert_eq!(report.fingerprint, fingerprint);
+        let binding = &report.known_bindings[0];
+        assert_eq!(
+            authority_decision(binding, AuthorityScope::ReplicationRuntime),
+            PermissionDecision::Deny(PermissionDenialReason::FingerprintBlocked)
+        );
+    }
+
+    #[test]
+    fn public_key_bundle_feedback_rejects_trust_for_blocked_fingerprint() {
+        let store = sqlite_store();
+        let security_store = security_store(store);
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+        let fingerprint = bundle.fingerprint();
+        wait_for_security_store_future(security_store.record_public_key_bundle_feedback(
+            RecordPublicKeyBundleFeedbackRequest {
+                bundle: bundle.clone(),
+                feedback: PublicKeyBundleFeedback::BlockFingerprint,
+            },
+        ))
+        .expect("block feedback should store");
+
+        let error =
+            wait_for_security_store_future(security_store.record_public_key_bundle_feedback(
+                RecordPublicKeyBundleFeedbackRequest {
+                    bundle,
+                    feedback: PublicKeyBundleFeedback::TrustMember {
+                        member_id: remote_member(),
+                    },
+                },
+            ))
+            .expect_err("trust feedback should reject blocked key material");
+
+        assert!(matches!(
+            error,
+            SecurityStoreError::BlockedKeyTrust {
+                member_id,
+                fingerprint: error_fingerprint,
+            } if member_id == remote_member() && error_fingerprint == fingerprint
         ));
     }
 

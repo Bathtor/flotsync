@@ -26,6 +26,7 @@ pub use identity::{
     KeyRole,
     LocalMemberKeys,
     MemberIdentity,
+    PublicKeyBundle,
     PublicMemberKeys,
     X25519_KEY_LENGTH,
     encode_local_private_key_bundle,

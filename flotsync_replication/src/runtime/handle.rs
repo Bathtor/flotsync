@@ -28,6 +28,11 @@ use crate::{
         SnapshotRowsRequest,
         Summary,
         SummaryRequest,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleReport,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::security::DeliverySecurity,
     security_store::SecurityStore,
@@ -37,6 +42,7 @@ use flotsync_core::MemberIdentity;
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_core::membership::GroupMembers;
 use flotsync_core::{GroupId, member::Identifier};
+use flotsync_security::PublicKeyBundle;
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use kompact::prelude::*;
@@ -274,6 +280,28 @@ impl Drop for ReplicationRuntime {
 }
 
 impl ReplicationApi for ReplicationRuntime {
+    fn local_public_key_bundle(&self) -> ApiFuture<'_, PublicKeyBundle> {
+        self.ask(|promise| ReplicationRuntimeMessage::LocalPublicKeyBundle(Ask::new(promise, ())))
+    }
+
+    fn assess_public_key_bundle(
+        &self,
+        request: AssessPublicKeyBundleRequest,
+    ) -> ApiFuture<'_, PublicKeyBundleReport> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::AssessPublicKeyBundle(Ask::new(promise, request))
+        })
+    }
+
+    fn record_public_key_bundle_feedback(
+        &self,
+        request: RecordPublicKeyBundleFeedbackRequest,
+    ) -> ApiFuture<'_, ()> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::RecordPublicKeyBundleFeedback(Ask::new(promise, request))
+        })
+    }
+
     fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, request))

@@ -84,6 +84,12 @@ use crate::{
         current_slice_placeholder_group_security_material,
         current_slice_placeholder_group_security_material_with_key_id,
         process_batches,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleAssessmentStorage,
+            PublicKeyBundleFeedback,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
     security_store::{SecurityStore, SecurityStoreError},
@@ -263,6 +269,16 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_member_public_keys_for_member(member_id)
+    }
+
+    fn load_member_public_keys_for_fingerprint<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_keys_for_fingerprint(fingerprint)
     }
 
     fn load_member_key_trust_evidence<'a>(
@@ -789,6 +805,97 @@ where
         listener,
         store,
     }
+}
+
+#[test]
+fn runtime_api_returns_local_public_key_bundle() {
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+
+    let bundle = wait_for_test_reply(fixture.runtime.local_public_key_bundle())
+        .expect("local public key bundle should load");
+
+    assert_eq!(
+        bundle,
+        test_public_keys(&alice_member()).public_key_bundle()
+    );
+}
+
+#[test]
+fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
+    let bob = bob_member();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let bundle = test_public_keys(&bob).public_key_bundle();
+    let fingerprint = bundle.fingerprint();
+    let key_id = MemberKeyId {
+        member_id: bob.clone(),
+        fingerprint,
+    };
+
+    let initial_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle: bundle.clone(),
+            candidate_member_ids: HashSet::from([bob.clone()]),
+            material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+        },
+    ))
+    .expect("assessment should succeed");
+
+    assert!(initial_report.known_bindings.is_empty());
+    assert!(
+        initial_report.candidate_members[0]
+            .binding_for_bundle
+            .is_none()
+    );
+
+    let stored_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle: bundle.clone(),
+            candidate_member_ids: HashSet::from([bob.clone()]),
+            material_storage: PublicKeyBundleAssessmentStorage::StoreCandidateBindings,
+        },
+    ))
+    .expect("assessment should store candidate key material");
+
+    let stored_binding = stored_report
+        .known_bindings
+        .iter()
+        .find(|binding| binding.key_id == key_id)
+        .expect("stored binding should be reported");
+    assert!(!stored_binding.trust.has_local_explicit_trust);
+
+    wait_for_test_reply(fixture.runtime.record_public_key_bundle_feedback(
+        RecordPublicKeyBundleFeedbackRequest {
+            bundle: bundle.clone(),
+            feedback: PublicKeyBundleFeedback::TrustMember {
+                member_id: bob.clone(),
+            },
+        },
+    ))
+    .expect("feedback should store");
+
+    let updated_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle,
+            candidate_member_ids: HashSet::from([bob]),
+            material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+        },
+    ))
+    .expect("updated assessment should succeed");
+
+    let updated_binding = updated_report
+        .known_bindings
+        .iter()
+        .find(|binding| binding.key_id == key_id)
+        .expect("trusted binding should be reported");
+    assert!(updated_binding.trust.has_local_explicit_trust);
 }
 
 fn load_title_runtime_pair_with_trust(

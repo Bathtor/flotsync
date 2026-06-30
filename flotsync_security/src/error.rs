@@ -16,6 +16,8 @@ pub enum SecurityError {
     DecodeKeyBundle {
         source: flotsync_messages::buffa::DecodeError,
     },
+    #[snafu(display("Failed to decode pasteable public key bundle base64: {source}"))]
+    DecodePasteablePublicKeyBundle { source: base64::DecodeError },
     #[snafu(display("Key bundle format version {actual} is unsupported; expected {expected}."))]
     UnsupportedKeyBundleVersion { expected: u32, actual: u32 },
     #[snafu(display("Key bundle is missing required field '{field}'."))]
