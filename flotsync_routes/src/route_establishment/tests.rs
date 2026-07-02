@@ -60,7 +60,7 @@ use flotsync_messages::{
     serialisation::{FlotsyncSerializable, encode_message_payload},
     wire::{group_id_to_wire_bytes, member_identity_to_wire_format, uuid_to_wire_bytes},
 };
-use flotsync_security::{FrameSignature, SIGNATURE_LENGTH};
+use flotsync_security::{FrameSignature, KeyFingerprint, SIGNATURE_LENGTH};
 use flotsync_utils::{
     BoxError,
     kompact_testing::{PortTesterComponent, PortTestingExt, PortTestingRefExt},
@@ -85,6 +85,8 @@ fn group_id(value: u128) -> GroupId {
     GroupId(Uuid::from_u128(value))
 }
 
+const TEST_DISCOVERY_KEY_FINGERPRINT: KeyFingerprint = KeyFingerprint::from_bytes([7; 32]);
+
 fn group_members(members: impl IntoIterator<Item = MemberIdentity>) -> GroupMembers {
     GroupMembers::from_ordered_members(members).expect("group members should build")
 }
@@ -100,6 +102,10 @@ fn member_set(members: impl IntoIterator<Item = MemberIdentity>) -> TrieSet {
 struct NoopDiscoveryCredentials;
 
 impl DiscoveryCredentials for NoopDiscoveryCredentials {
+    fn local_discovery_key_fingerprint(&self) -> KeyFingerprint {
+        TEST_DISCOVERY_KEY_FINGERPRINT
+    }
+
     fn sign_discovery_claim_payload(&self, _payload: &[u8]) -> Result<FrameSignature, BoxError> {
         Ok(FrameSignature::from_bytes([0; SIGNATURE_LENGTH]))
     }
@@ -107,8 +113,17 @@ impl DiscoveryCredentials for NoopDiscoveryCredentials {
     fn verify_discovery_claim_payload<'a>(
         &'a self,
         _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
         _payload: &'a [u8],
         _signature: &'a FrameSignature,
+    ) -> DiscoveryCredentialFuture<'a> {
+        std::future::ready(Ok(())).boxed()
+    }
+
+    fn permit_member_route_publication<'a>(
+        &'a self,
+        _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
     ) -> DiscoveryCredentialFuture<'a> {
         std::future::ready(Ok(())).boxed()
     }
@@ -117,6 +132,10 @@ impl DiscoveryCredentials for NoopDiscoveryCredentials {
 struct RejectingDiscoveryCredentials;
 
 impl DiscoveryCredentials for RejectingDiscoveryCredentials {
+    fn local_discovery_key_fingerprint(&self) -> KeyFingerprint {
+        TEST_DISCOVERY_KEY_FINGERPRINT
+    }
+
     fn sign_discovery_claim_payload(&self, _payload: &[u8]) -> Result<FrameSignature, BoxError> {
         Ok(FrameSignature::from_bytes([0; SIGNATURE_LENGTH]))
     }
@@ -124,11 +143,53 @@ impl DiscoveryCredentials for RejectingDiscoveryCredentials {
     fn verify_discovery_claim_payload<'a>(
         &'a self,
         _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
         _payload: &'a [u8],
         _signature: &'a FrameSignature,
     ) -> DiscoveryCredentialFuture<'a> {
         std::future::ready(Err(
             Box::new(io::Error::other("signature rejected")) as BoxError
+        ))
+        .boxed()
+    }
+
+    fn permit_member_route_publication<'a>(
+        &'a self,
+        _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
+    ) -> DiscoveryCredentialFuture<'a> {
+        std::future::ready(Ok(())).boxed()
+    }
+}
+
+struct RejectingRoutePublicationCredentials;
+
+impl DiscoveryCredentials for RejectingRoutePublicationCredentials {
+    fn local_discovery_key_fingerprint(&self) -> KeyFingerprint {
+        TEST_DISCOVERY_KEY_FINGERPRINT
+    }
+
+    fn sign_discovery_claim_payload(&self, _payload: &[u8]) -> Result<FrameSignature, BoxError> {
+        Ok(FrameSignature::from_bytes([0; SIGNATURE_LENGTH]))
+    }
+
+    fn verify_discovery_claim_payload<'a>(
+        &'a self,
+        _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
+        _payload: &'a [u8],
+        _signature: &'a FrameSignature,
+    ) -> DiscoveryCredentialFuture<'a> {
+        std::future::ready(Ok(())).boxed()
+    }
+
+    fn permit_member_route_publication<'a>(
+        &'a self,
+        _member: &'a MemberIdentity,
+        _key_fingerprint: KeyFingerprint,
+    ) -> DiscoveryCredentialFuture<'a> {
+        std::future::ready(Err(
+            Box::new(io::Error::other("route publication rejected")) as BoxError,
         ))
         .boxed()
     }
@@ -298,6 +359,7 @@ fn test_egress_pool() -> EgressPool {
 /// Builds introduction replies while keeping each mismatch case explicit.
 struct IntroductionSpec<'a> {
     member: &'a MemberIdentity,
+    key_fingerprint: KeyFingerprint,
     top_level_instance_id: Uuid,
     claim_instance_id: Uuid,
     top_level_nonce: Option<Vec<u8>>,
@@ -315,6 +377,7 @@ impl<'a> IntroductionSpec<'a> {
     ) -> Self {
         Self {
             member,
+            key_fingerprint: TEST_DISCOVERY_KEY_FINGERPRINT,
             top_level_instance_id: instance_id,
             claim_instance_id: instance_id,
             top_level_nonce: None,
@@ -347,6 +410,7 @@ impl<'a> IntroductionSpec<'a> {
     fn encode(self, request_nonce: Vec<u8>) -> IoPayload {
         let Self {
             member,
+            key_fingerprint,
             top_level_instance_id,
             claim_instance_id,
             top_level_nonce,
@@ -363,6 +427,8 @@ impl<'a> IntroductionSpec<'a> {
             request_nonce: claim_nonce,
             route: MessageField::some(DiscoveryRoute::Udp(claimed_route).encode_proto()),
             group_ids: group_ids.into_iter().map(group_id_to_wire_bytes).collect(),
+            member_id: MessageField::some(member_identity_to_wire_format(member)),
+            key_fingerprint: key_fingerprint.as_ref().to_vec(),
             ..discovery_proto::IntroductionClaimPayload::default()
         };
         let claim_payload = claim_payload.encode_to_vec();
@@ -371,7 +437,6 @@ impl<'a> IntroductionSpec<'a> {
             instance_uuid,
             request_nonce: top_level_nonce,
             claims: vec![discovery_proto::SignedIntroductionClaim {
-                member_id: MessageField::some(member_identity_to_wire_format(member)),
                 claim_payload,
                 signature: MessageField::some(signature.encode_proto()),
                 ..discovery_proto::SignedIntroductionClaim::default()
@@ -425,6 +490,8 @@ fn assert_introduction_claims_route(
     send: &RouteTransportSend<TransportRouteKey>,
     expected_local_bind: SocketAddr,
     expected_target: SocketAddr,
+    expected_member: &MemberIdentity,
+    expected_key_fingerprint: KeyFingerprint,
     expected_nonce: &[u8],
     expected_route: SocketAddr,
 ) {
@@ -445,6 +512,15 @@ fn assert_introduction_claims_route(
         &introduction.claims[0].claim_payload,
     )
     .expect("claim payload should decode");
+    let member_id = claim_payload
+        .member_id
+        .take()
+        .expect("claim payload member should be present");
+    assert_eq!(member_id, member_identity_to_wire_format(expected_member));
+    assert_eq!(
+        claim_payload.key_fingerprint,
+        expected_key_fingerprint.as_ref()
+    );
     let route = claim_payload
         .route
         .take()
@@ -801,7 +877,7 @@ fn endpoint_selection_port_updates_introduction_claim_routes() {
     let selected_endpoint = SocketAddr::from(([192, 168, 1, 20], 45_100));
     let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_100));
     let request_nonce = uuid_to_wire_bytes(Uuid::from_u128(42_100));
-    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+    let harness = RouteEstablishmentHarness::new(local_member.clone(), memberships);
 
     harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
     harness.bind_endpoint(SocketId(42), local_endpoint);
@@ -815,6 +891,8 @@ fn endpoint_selection_port_updates_introduction_claim_routes() {
         &response,
         local_endpoint,
         remote_route,
+        &local_member,
+        TEST_DISCOVERY_KEY_FINGERPRINT,
         &request_nonce,
         selected_endpoint,
     );
@@ -830,7 +908,7 @@ fn oversized_introduction_response_is_submitted_through_route_transport() {
     let selected_endpoint = SocketAddr::from(([192, 168, 1, 21], 45_101));
     let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_101));
     let request_nonce = uuid_to_wire_bytes(Uuid::from_u128(42_101));
-    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+    let harness = RouteEstablishmentHarness::new(local_member.clone(), memberships);
 
     harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
     harness.bind_endpoint(SocketId(43), local_endpoint);
@@ -844,6 +922,8 @@ fn oversized_introduction_response_is_submitted_through_route_transport() {
         &response,
         local_endpoint,
         remote_route,
+        &local_member,
+        TEST_DISCOVERY_KEY_FINGERPRINT,
         &request_nonce,
         selected_endpoint,
     );
@@ -1140,6 +1220,37 @@ fn manual_route_watch_rejects_unverifiable_claim() {
     harness.receive_transport(remote_route, payload);
 
     harness.expect_no_route_update("unverifiable claim should not publish a watched route");
+    harness.shutdown();
+}
+
+#[test]
+fn manual_route_watch_rejects_claim_without_route_publication_permission() {
+    let local_member = member(["alice"]);
+    let remote_member = member(["bob"]);
+    let memberships = shared_memberships(&local_member, &remote_member);
+    let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 49122));
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62183));
+    let remote_instance = Uuid::from_u128(83);
+    let harness = RouteEstablishmentHarness::with_credentials(
+        local_member,
+        memberships,
+        Arc::new(RejectingRoutePublicationCredentials),
+    );
+    let nonce = harness.probe_manual_route(
+        SocketId(103),
+        local_endpoint,
+        [watched_udp_route(remote_route, Some(remote_member.clone()))],
+        remote_route,
+    );
+    let payload =
+        IntroductionSpec::new(&remote_member, remote_instance, remote_route, [group_id(1)])
+            .encode(nonce);
+
+    harness.receive_transport(remote_route, payload);
+
+    harness.expect_no_route_update(
+        "claim without route-publication permission should not publish a watched route",
+    );
     harness.shutdown();
 }
 

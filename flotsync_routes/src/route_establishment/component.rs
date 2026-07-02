@@ -21,8 +21,10 @@ use crate::{
     UdpRouteKey,
     config_keys,
     protocol::{
+        DecodedIntroductionClaimPayload,
         decode_endpoint_discovery_frame_from_buf,
-        decode_introduction_claim_group_ids,
+        decode_introduction_claim_payload_view,
+        encode_claim_payload_selector_fields,
         introduction_endpoint_frame,
         introduction_request_endpoint_frame,
     },
@@ -42,18 +44,13 @@ use flotsync_io::prelude::{IoPayload, SocketId};
 use flotsync_messages::{
     buffa::{Message as _, MessageField},
     discovery as discovery_proto,
-    proto::EncodeProto,
+    proto::{DecodeProtoView, EncodeProto},
     serialisation::FlotsyncSerializable,
-    wire::{
-        group_id_to_wire_bytes,
-        member_identity_to_wire_format,
-        uuid_from_wire_bytes,
-        uuid_to_wire_bytes,
-    },
+    wire::{group_id_to_wire_bytes, uuid_from_wire_bytes, uuid_to_wire_bytes},
 };
 use flotsync_utils::{BoxError, option_when};
 use kompact::prelude::*;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     net::SocketAddr,
@@ -98,6 +95,25 @@ enum RouteEstablishmentStartupError {
         key: &'static str,
         /// Human-readable config lookup failure.
         reason: String,
+    },
+}
+
+/// Failures after a claim signature has already verified.
+#[derive(Debug, Snafu)]
+enum VerifiedIntroductionClaimError {
+    /// Full payload decoding disagreed with the selector decoded before signature verification.
+    #[snafu(display(
+        "verified introduction claim selector field '{field}' changed during full decode"
+    ))]
+    SelectorMismatch {
+        /// Selector field that disagreed.
+        field: &'static str,
+    },
+    /// Full payload decoding failed after signature verification.
+    #[snafu(display("verified introduction claim payload could not be decoded: {source}"))]
+    DecodePayload {
+        /// Protocol-level payload decode failure.
+        source: flotsync_discovery::protocol::DiscoveryProtocolError,
     },
 }
 
@@ -629,7 +645,10 @@ impl RouteEstablishmentComponent {
             .copied()
             .map(group_id_to_wire_bytes)
             .collect::<Vec<_>>();
-        let member_id = member_identity_to_wire_format(&self.local_member);
+        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(
+            &self.local_member,
+            self.credentials.local_discovery_key_fingerprint(),
+        );
         let mut claims = Vec::with_capacity(self.claim_routes.len());
         for route in self.claim_routes.iter() {
             let route = DiscoveryRoute::Udp(*route).encode_proto();
@@ -638,6 +657,8 @@ impl RouteEstablishmentComponent {
                 request_nonce: request_nonce.clone(),
                 route: MessageField::some(route),
                 group_ids: group_ids.clone(),
+                member_id: MessageField::some(member_id.clone()),
+                key_fingerprint: key_fingerprint.clone(),
                 ..discovery_proto::IntroductionClaimPayload::default()
             };
             let claim_payload = claim_payload.encode_to_vec();
@@ -655,7 +676,6 @@ impl RouteEstablishmentComponent {
                 }
             };
             claims.push(discovery_proto::SignedIntroductionClaim {
-                member_id: MessageField::some(member_id.clone()),
                 claim_payload,
                 signature: MessageField::some(signature.encode_proto()),
                 ..discovery_proto::SignedIntroductionClaim::default()
@@ -704,7 +724,26 @@ impl RouteEstablishmentComponent {
                     ) && self
                         .route_interest_permits_member(prepared.route, &verified_claim.member)
                     {
-                        accepted_members.insert(verified_claim.member);
+                        let route_publication = self
+                            .credentials
+                            .permit_member_route_publication(
+                                &verified_claim.member,
+                                verified_claim.key_fingerprint,
+                            )
+                            .await;
+                        match route_publication {
+                            Ok(()) => {
+                                accepted_members.insert(verified_claim.member);
+                            }
+                            Err(error) => {
+                                debug!(
+                                    self.log(),
+                                    "ignored introduction claim from {} without route-publication permission: {}",
+                                    source,
+                                    error
+                                );
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -1080,13 +1119,33 @@ async fn verify_prepared_claim(
     credentials: &dyn DiscoveryCredentials,
     claim: PendingClaimVerification,
 ) -> Result<VerifiedIntroductionClaim, BoxError> {
+    let PendingClaimVerification {
+        member,
+        key_fingerprint,
+        claim,
+        signature,
+    } = claim;
     credentials
-        .verify_discovery_claim_payload(&claim.member, &claim.claim.claim_payload, &claim.signature)
+        .verify_discovery_claim_payload(&member, key_fingerprint, &claim.claim_payload, &signature)
         .await?;
-    let group_ids = decode_introduction_claim_group_ids(&claim.claim.claim_payload)?;
+    let payload =
+        decode_introduction_claim_payload_view(&claim.claim_payload).context(DecodePayloadSnafu)?;
+    let decoded =
+        DecodedIntroductionClaimPayload::decode_proto_view(&payload).context(DecodePayloadSnafu)?;
+    if decoded.member != member {
+        return Err(Box::new(VerifiedIntroductionClaimError::SelectorMismatch {
+            field: "member_id",
+        }));
+    }
+    if decoded.key_fingerprint != key_fingerprint {
+        return Err(Box::new(VerifiedIntroductionClaimError::SelectorMismatch {
+            field: "key_fingerprint",
+        }));
+    }
     Ok(VerifiedIntroductionClaim {
-        member: claim.member,
-        group_ids,
+        member,
+        key_fingerprint,
+        group_ids: decoded.group_ids,
     })
 }
 
@@ -1122,8 +1181,10 @@ pub(super) fn claim_matches_group_memberships(
 
 /// Introduction claim whose signature matched its claimed member.
 struct VerifiedIntroductionClaim {
-    /// Member whose trusted key verified the signed claim payload.
+    /// Member whose selected key material verified the signed claim payload.
     member: MemberIdentity,
+    /// Exact public key bundle fingerprint that verified the signed claim payload.
+    key_fingerprint: flotsync_security::KeyFingerprint,
     /// Decoded claim group ids after the signature check succeeded.
     group_ids: HashSet<GroupId>,
 }

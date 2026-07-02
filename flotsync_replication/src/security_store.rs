@@ -35,6 +35,26 @@ use futures_util::FutureExt as _;
 use snafu::{Location, prelude::*};
 use std::{collections::HashSet, sync::Arc};
 
+/// Policy for loading exact member-key public material before a separate authority decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberPublicKeyLoadPolicy {
+    /// Return stored key material even if the fingerprint is blocked.
+    #[allow(
+        dead_code,
+        reason = "Production signature verification currently rejects blocked keys; tests exercise this policy and future exact-key inspection paths may need it."
+    )]
+    AllowBlocked,
+    /// Reject stored key material when the fingerprint is globally blocked.
+    RejectBlocked,
+}
+
+impl MemberPublicKeyLoadPolicy {
+    /// Return whether this policy rejects globally blocked fingerprints.
+    const fn rejects_blocked(self) -> bool {
+        matches!(self, Self::RejectBlocked)
+    }
+}
+
 /// Public security-state facade used by runtime security code.
 #[derive(Clone)]
 pub(crate) struct SecurityStore {
@@ -133,16 +153,57 @@ impl SecurityStore {
             )
             .await?;
             transaction.release().await.context(StoreAccessSnafu)?;
-            match decision {
-                PermissionDecision::Permit => public_keys_from_record(&record),
-                PermissionDecision::Deny(reason) => {
-                    Err(SecurityStoreError::MemberKeyPublicKeysUnavailable {
-                        key_id: key_id.clone(),
-                        authority_scope,
-                        denial_reasons: vec![reason],
-                    })
-                }
+            decision.ok().map_err(
+                |reason| SecurityStoreError::MemberKeyPublicKeysUnavailable {
+                    key_id: key_id.clone(),
+                    authority_scope,
+                    denial_reasons: vec![reason],
+                },
+            )?;
+            public_keys_from_record(&record)
+        }
+        .boxed()
+    }
+
+    /// Load this exact member key's public material.
+    pub(crate) fn load_member_key_public_keys<'a>(
+        &'a self,
+        key_id: &'a MemberKeyId,
+        load_policy: MemberPublicKeyLoadPolicy,
+    ) -> BoxFuture<'a, Result<PublicMemberKeys, SecurityStoreError>> {
+        async move {
+            let mut transaction = self
+                .store
+                .begin_read_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            let record = transaction
+                .load_member_public_keys(key_id)
+                .await
+                .context(StoreAccessSnafu)?;
+            let Some(record) = record else {
+                transaction.release().await.context(StoreAccessSnafu)?;
+                return Err(SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                    key_id: key_id.clone(),
+                    denial_reasons: vec![PermissionDenialReason::MissingKeyMaterial],
+                });
+            };
+            let reject_blocked_fingerprint = if load_policy.rejects_blocked() {
+                transaction
+                    .is_key_fingerprint_blocked(&key_id.fingerprint)
+                    .await
+                    .context(StoreAccessSnafu)?
+            } else {
+                false
+            };
+            transaction.release().await.context(StoreAccessSnafu)?;
+            if reject_blocked_fingerprint {
+                return Err(SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                    key_id: key_id.clone(),
+                    denial_reasons: vec![PermissionDenialReason::FingerprintBlocked],
+                });
             }
+            public_keys_from_record(&record)
         }
         .boxed()
     }
@@ -311,6 +372,12 @@ pub(crate) enum SecurityStoreError {
         authority_scope: AuthorityScope,
         denial_reasons: Vec<PermissionDenialReason>,
     },
+    /// One exact member key's public material is unavailable.
+    #[snafu(display("Member key {key_id:?} public material is unavailable: {denial_reasons:?}."))]
+    ExactMemberKeyPublicKeysUnavailable {
+        key_id: MemberKeyId,
+        denial_reasons: Vec<PermissionDenialReason>,
+    },
     /// More than one observed member key had permission where one key was required.
     #[snafu(display(
         "{permitted_count} public keys for member {member_id} have {authority_scope:?} permission."
@@ -362,6 +429,7 @@ pub(crate) fn request_member_key_permission(
     let requirement = match scope {
         AuthorityScope::ReplicationRuntime => policy.replication_runtime,
         AuthorityScope::BootstrapActivation => policy.bootstrap_activation,
+        AuthorityScope::MemberRoutePublication => policy.member_route_publication,
     };
     match requirement {
         MemberKeyTrustRequirement::DenyAll => {
@@ -774,6 +842,25 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_permits_member_route_publication_for_stored_material_by_default() {
+        let key_id = MemberKeyId {
+            member_id: remote_member(),
+            fingerprint: test_public_member_keys(&remote_member()).fingerprint(),
+        };
+        let evidence = MemberKeyTrustEvidenceSet::empty();
+
+        let decision = request_member_key_permission(
+            &TrustPolicy::default(),
+            AuthorityScope::MemberRoutePublication,
+            &key_id,
+            evidence,
+            false,
+        );
+
+        assert_eq!(decision, PermissionDecision::Permit);
+    }
+
+    #[test]
     fn evaluator_denies_blocked_fingerprint_before_positive_evidence() {
         let key_id = MemberKeyId {
             member_id: remote_member(),
@@ -807,6 +894,7 @@ mod tests {
         let policy = TrustPolicy {
             replication_runtime: MemberKeyTrustRequirement::DenyAll,
             bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+            member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
         };
 
         let decision = request_member_key_permission(
@@ -834,6 +922,7 @@ mod tests {
         let policy = TrustPolicy {
             replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
             bootstrap_activation: MemberKeyTrustRequirement::DenyAll,
+            member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
         };
 
         let decision = request_member_key_permission(
@@ -919,6 +1008,48 @@ mod tests {
     }
 
     #[test]
+    fn security_store_loads_exact_member_key_public_keys_without_trust_evidence() {
+        let store = sqlite_store();
+        let record =
+            provision_member_public_keys(store.as_ref(), remote_member(), &remote_member(), false);
+        let security_store = security_store(store);
+
+        let public_keys =
+            wait_for_security_store_future(security_store.load_member_key_public_keys(
+                &record.key_id,
+                MemberPublicKeyLoadPolicy::RejectBlocked,
+            ))
+            .expect("stored exact public keys should load without trust evidence");
+
+        assert_eq!(public_keys.fingerprint(), record.key_id.fingerprint);
+    }
+
+    #[test]
+    fn security_store_exact_member_key_public_keys_unavailable_reports_member_key_id() {
+        let store = sqlite_store();
+        let key_id = MemberKeyId {
+            member_id: remote_member(),
+            fingerprint: test_public_member_keys(&remote_member()).fingerprint(),
+        };
+        let security_store = security_store(store);
+
+        let error = wait_for_security_store_future(
+            security_store
+                .load_member_key_public_keys(&key_id, MemberPublicKeyLoadPolicy::RejectBlocked),
+        )
+        .expect_err("missing exact public keys should be unavailable");
+
+        assert!(matches!(
+            error,
+            SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                key_id: error_key_id,
+                denial_reasons,
+            } if error_key_id == key_id
+                && denial_reasons.contains(&PermissionDenialReason::MissingKeyMaterial)
+        ));
+    }
+
+    #[test]
     fn security_store_denies_globally_blocked_fingerprint() {
         let store = sqlite_store();
         let record =
@@ -942,6 +1073,45 @@ mod tests {
         assert!(matches!(
             error,
             SecurityStoreError::NoPermittedMemberPublicKeys {
+                denial_reasons,
+                ..
+            } if denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
+        ));
+    }
+
+    #[test]
+    fn security_store_rejects_blocked_exact_member_key_public_keys() {
+        let store = sqlite_store();
+        let record =
+            provision_member_public_keys(store.as_ref(), remote_member(), &remote_member(), false);
+        let mut transaction =
+            wait_for_security_store_future(store.begin_transaction()).expect("transaction starts");
+        wait_for_security_store_future(
+            transaction.ensure_blocked_key_fingerprint(record.key_id.fingerprint),
+        )
+        .expect("blocked fingerprint stores");
+        wait_for_security_store_future(transaction.commit()).expect("transaction commits");
+        let security_store = security_store(store);
+
+        let public_keys = wait_for_security_store_future(
+            security_store.load_member_key_public_keys(
+                &record.key_id,
+                MemberPublicKeyLoadPolicy::AllowBlocked,
+            ),
+        )
+        .expect("blocked exact public keys should load when the caller allows blocked material");
+        assert_eq!(public_keys.fingerprint(), record.key_id.fingerprint);
+
+        let error =
+            wait_for_security_store_future(security_store.load_member_key_public_keys(
+                &record.key_id,
+                MemberPublicKeyLoadPolicy::RejectBlocked,
+            ))
+            .expect_err("blocked exact public keys should be unavailable when rejected");
+
+        assert!(matches!(
+            error,
+            SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
                 denial_reasons,
                 ..
             } if denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
@@ -985,6 +1155,7 @@ mod tests {
             TrustPolicy {
                 replication_runtime: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
                 bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+                member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
             },
         );
         let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
@@ -1225,6 +1396,7 @@ mod tests {
             TrustPolicy {
                 replication_runtime: MemberKeyTrustRequirement::DenyAll,
                 bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+                member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
             },
         );
 
@@ -1254,6 +1426,7 @@ mod tests {
             TrustPolicy {
                 replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
                 bootstrap_activation: MemberKeyTrustRequirement::DenyAll,
+                member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
             },
         );
 

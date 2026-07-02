@@ -16,6 +16,7 @@ pub fn rng_from_seed(seed: [u8; 32]) -> ChaCha20Rng {
 }
 
 /// Generate deterministic member key bundles for repeatable crypto tests.
+#[must_use]
 pub fn member_key_bundles_from_seed(
     member_id: MemberIdentity,
     seed: &[u8; TEST_MEMBER_KEY_SEED_LENGTH],

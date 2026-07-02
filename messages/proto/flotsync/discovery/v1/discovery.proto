@@ -80,25 +80,28 @@ message DiscoverySignature {
 // The encoded bytes of this message are signed exactly as transmitted inside
 // SignedIntroductionClaim.claim_payload.
 message IntroductionClaimPayload {
+  // Member identity whose key signs this claim.
+  Identifier member_id = 1;
+
+  // Raw 32 byte KeyFingerprint of the signing public key bundle.
+  bytes key_fingerprint = 2;
+
   // A 16 byte UUID of the peer instance making this claim.
-  bytes instance_uuid = 1;
+  bytes instance_uuid = 3;
 
   // Receiver-generated nonce from the IntroductionRequest being answered.
-  bytes request_nonce = 2;
+  bytes request_nonce = 4;
 
   // The exact route endpoint the receiver probed.
-  SocketAddress route = 3;
+  SocketAddress route = 5;
 
   // A 16 byte UUID for each replication group in this route claim.
-  repeated bytes group_ids = 4;
+  repeated bytes group_ids = 6;
 }
 
 // One signed introduction claim.
 message SignedIntroductionClaim {
-  // Claimed member identity and untrusted key selector for signature verification.
-  Identifier member_id = 1;
-
   // Encoded IntroductionClaimPayload bytes. Signatures cover these exact bytes.
-  bytes claim_payload = 2;
-  DiscoverySignature signature = 3;
+  bytes claim_payload = 1;
+  DiscoverySignature signature = 2;
 }

@@ -8,7 +8,6 @@ use crate::{
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
         MemberPublicKeysRecord,
-        PermissionDecision,
         PermissionDenialReason,
         StoreError,
         StoreSecretKeyId,
@@ -29,7 +28,7 @@ use crate::{
         RuntimeMessageError,
         validate_bootstrap_public_key_bundle_matches_fingerprint,
     },
-    security_store::{SecurityStore, SecurityStoreError},
+    security_store::{MemberPublicKeyLoadPolicy, SecurityStore, SecurityStoreError},
 };
 use bytes::Bytes;
 use flotsync_core::{GroupId, MemberIdentity, member::TrieMap, membership::GroupMembers};
@@ -166,11 +165,12 @@ pub(crate) enum DeliverySecurityError {
         actual: KeyFingerprint,
     },
     #[snafu(display(
-        "Bootstrap sender {member_id} key fingerprint {fingerprint} lacks BootstrapActivation permission: {reason:?}."
+        "Member {member_id} key fingerprint {fingerprint} lacks {authority_scope} permission: {reason:?}."
     ))]
-    BootstrapSenderPermissionDenied {
+    MemberKeyPermissionDenied {
         member_id: MemberIdentity,
         fingerprint: KeyFingerprint,
+        authority_scope: AuthorityScope,
         reason: PermissionDenialReason,
     },
     #[snafu(display("Bootstrap key references included non-member {member_id}."))]
@@ -213,23 +213,18 @@ pub(crate) enum DeliverySecurityError {
         source: BoxError,
     },
     #[snafu(display("Failed to sign discovery claim payload: {source}"))]
-    #[allow(
-        dead_code,
-        reason = "used by the route establishment adapter once host wiring lands"
-    )]
     SignDiscoveryClaim { source: BoxError },
     #[snafu(display("Failed to verify recipient ack from recipient {recipient}: {source}"))]
     VerifyRecipientAck {
         recipient: MemberIdentity,
         source: BoxError,
     },
-    #[snafu(display("Failed to verify discovery claim for member {member_id}: {source}"))]
-    #[allow(
-        dead_code,
-        reason = "used by the route establishment adapter once host wiring lands"
-    )]
+    #[snafu(display(
+        "Failed to verify discovery claim for member {member_id} fingerprint {fingerprint}: {source}"
+    ))]
     VerifyDiscoveryClaim {
         member_id: MemberIdentity,
+        fingerprint: KeyFingerprint,
         source: BoxError,
     },
     #[snafu(display("Public key permission lookup failed: {source}"))]
@@ -277,9 +272,10 @@ impl DeliverySecurityError {
             // Bootstrap payload membership and key mismatches are permanent for this payload.
             Self::MissingBootstrapMemberKey { .. }
             | Self::BootstrapKeyFingerprintMismatch { .. }
-            | Self::BootstrapSenderPermissionDenied { .. }
             | Self::UnexpectedBootstrapMemberKey { .. }
             | Self::InvalidBootstrapPublicKeyBundle { .. } => false,
+            // Member-key permission denials need policy, trust, or stored key state to change.
+            Self::MemberKeyPermissionDenied { .. } => false,
             // Stored secret encoding/version problems need data repair or a code change.
             Self::UnsupportedStoreSecretVersion { .. } | Self::InvalidStoreSecretNonce { .. } => {
                 false
@@ -357,6 +353,11 @@ impl DeliverySecurity {
     /// Return the local member's shareable public key bundle.
     pub(crate) fn local_public_key_bundle(&self) -> PublicKeyBundle {
         self.local_keys.public_keys().public_key_bundle()
+    }
+
+    /// Return the local public key bundle fingerprint used for discovery signatures.
+    pub(crate) fn local_discovery_key_fingerprint(&self) -> KeyFingerprint {
+        self.local_keys.public_keys().fingerprint()
     }
 
     /// Assess one decoded public key bundle against local security state.
@@ -490,10 +491,6 @@ impl DeliverySecurity {
     }
 
     /// Sign one exact encoded discovery claim payload with the local member key.
-    #[allow(
-        dead_code,
-        reason = "used by the route establishment adapter once host wiring lands"
-    )]
     pub(crate) fn sign_discovery_claim_payload(
         &self,
         payload: &[u8],
@@ -540,26 +537,33 @@ impl DeliverySecurity {
         })
     }
 
-    /// Verify one exact encoded discovery claim payload against a trusted member key.
-    #[allow(
-        dead_code,
-        reason = "used by the route establishment adapter once host wiring lands"
-    )]
+    /// Verify one exact encoded discovery claim payload against selected member key material.
     pub(crate) async fn verify_discovery_claim_payload(
         &self,
         member_id: &MemberIdentity,
+        key_fingerprint: KeyFingerprint,
         payload: &[u8],
         signature: &FrameSignature,
     ) -> Result<(), DeliverySecurityError> {
-        let public_keys = if member_id == &self.local_member {
+        let public_keys = if member_id == &self.local_member
+            && key_fingerprint == self.local_keys.public_keys().fingerprint()
+        {
             self.local_keys.public_keys().clone()
         } else {
-            self.load_permitted_public_keys(member_id).await?
+            let key_id = MemberKeyId {
+                member_id: member_id.clone(),
+                fingerprint: key_fingerprint,
+            };
+            self.security_store
+                .load_member_key_public_keys(&key_id, MemberPublicKeyLoadPolicy::RejectBlocked)
+                .await
+                .context(SecurityStoreSnafu)?
         };
         verify_discovery_payload_signature(&public_keys, payload, signature)
             .boxed()
             .with_context(|_| VerifyDiscoveryClaimSnafu {
                 member_id: member_id.clone(),
+                fingerprint: key_fingerprint,
             })
     }
 
@@ -823,8 +827,12 @@ impl DeliverySecurity {
                 }
             );
         } else {
-            self.request_bootstrap_sender_permission(bootstrap_sender, sender_key.fingerprint())
-                .await?;
+            self.require_member_key_permission(
+                bootstrap_sender,
+                sender_key.fingerprint(),
+                AuthorityScope::BootstrapActivation,
+            )
+            .await?;
         }
         for (member_id, member_key) in payload.member_keys().owned_entries() {
             if let Some(public_keys) = member_key.public_keys() {
@@ -839,31 +847,26 @@ impl DeliverySecurity {
         Ok(())
     }
 
-    /// Request `BootstrapActivation` permission for one advertised sender key.
-    async fn request_bootstrap_sender_permission(
+    /// Require one exact member key to have the requested authority scope.
+    pub(crate) async fn require_member_key_permission(
         &self,
-        bootstrap_sender: &MemberIdentity,
+        member_id: &MemberIdentity,
         fingerprint: KeyFingerprint,
+        authority_scope: AuthorityScope,
     ) -> Result<(), DeliverySecurityError> {
         let decision = self
             .security_store
-            .request_member_key_permission_for(
-                bootstrap_sender,
-                fingerprint,
-                AuthorityScope::BootstrapActivation,
-            )
+            .request_member_key_permission_for(member_id, fingerprint, authority_scope)
             .await
             .context(SecurityStoreSnafu)?;
-        match decision {
-            PermissionDecision::Permit => Ok(()),
-            PermissionDecision::Deny(reason) => {
-                Err(DeliverySecurityError::BootstrapSenderPermissionDenied {
-                    member_id: bootstrap_sender.clone(),
-                    fingerprint,
-                    reason,
-                })
-            }
-        }
+        decision
+            .ok()
+            .map_err(|reason| DeliverySecurityError::MemberKeyPermissionDenied {
+                member_id: member_id.clone(),
+                fingerprint,
+                authority_scope,
+                reason,
+            })
     }
 
     /// Store valid inline bootstrap public bundles as observed key material.
@@ -987,5 +990,303 @@ impl EncryptedStoreSecret {
             nonce,
             ciphertext: self.ciphertext.as_ref().to_vec(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        SqliteReplicationStore,
+        api::{MemberKeyTrustRequirement, ReplicationStore, TrustPolicy},
+        test_support::{
+            provision_test_security,
+            provision_test_trusted_public_keys,
+            test_public_member_keys,
+            test_replication_security_secrets,
+        },
+    };
+    use flotsync_core::member::Identifier;
+    use std::{future::Future, sync::Arc, time::Duration};
+
+    const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn wait_for_delivery_security_future<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        flotsync_io::test_support::wait_for_future(
+            TEST_WAIT_TIMEOUT,
+            future,
+            "timed out waiting for delivery-security future",
+        )
+    }
+
+    fn application_id() -> Identifier {
+        Identifier::from_array(["delivery-security", "application"])
+    }
+
+    fn alice_member() -> MemberIdentity {
+        Identifier::from_array(["delivery-security", "alice"])
+    }
+
+    fn bob_member() -> MemberIdentity {
+        Identifier::from_array(["delivery-security", "bob"])
+    }
+
+    fn charlie_member() -> MemberIdentity {
+        Identifier::from_array(["delivery-security", "charlie"])
+    }
+
+    fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
+        Arc::new(SqliteReplicationStore::in_memory(local_member).expect("store should build"))
+    }
+
+    fn provision_security(
+        store: &dyn ReplicationStore,
+        local_member: &MemberIdentity,
+        trusted_members: Vec<MemberIdentity>,
+    ) {
+        wait_for_delivery_security_future(provision_test_security(
+            application_id(),
+            store,
+            local_member,
+            trusted_members,
+        ))
+        .expect("test security should provision");
+    }
+
+    fn load_delivery_security_with_policy(
+        store: Arc<SqliteReplicationStore>,
+        local_member: &MemberIdentity,
+        trust_policy: TrustPolicy,
+    ) -> DeliverySecurity {
+        let store: Arc<dyn ReplicationStore> = store;
+        let security_secrets = test_replication_security_secrets();
+        wait_for_delivery_security_future(DeliverySecurity::load(
+            SecurityStore::new(store, trust_policy),
+            local_member,
+            Arc::clone(security_secrets.store_secret_key()),
+            *security_secrets.store_secret_key_id(),
+        ))
+        .expect("delivery security should load")
+    }
+
+    fn load_delivery_security(
+        store: Arc<SqliteReplicationStore>,
+        local_member: &MemberIdentity,
+    ) -> DeliverySecurity {
+        load_delivery_security_with_policy(store, local_member, TrustPolicy::default())
+    }
+
+    fn signing_security() -> DeliverySecurity {
+        let alice = alice_member();
+        let store = sqlite_store(alice.clone());
+        provision_security(store.as_ref(), &alice, Vec::new());
+        load_delivery_security(store, &alice)
+    }
+
+    #[test]
+    fn discovery_claim_verifies_with_exact_stored_key_material() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let alice_security = signing_security();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let payload = b"signed introduction claim";
+        let signature = alice_security
+            .sign_discovery_claim_payload(payload)
+            .expect("claim should sign");
+        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
+
+        wait_for_delivery_security_future(bob_security.verify_discovery_claim_payload(
+            &alice,
+            alice_fingerprint,
+            payload,
+            &signature,
+        ))
+        .expect("claim should verify with exact stored key material");
+    }
+
+    #[test]
+    fn discovery_claim_rejects_unknown_fingerprint() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let alice_security = signing_security();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, Vec::new());
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let payload = b"signed introduction claim";
+        let signature = alice_security
+            .sign_discovery_claim_payload(payload)
+            .expect("claim should sign");
+        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
+
+        let error = wait_for_delivery_security_future(bob_security.verify_discovery_claim_payload(
+            &alice,
+            alice_fingerprint,
+            payload,
+            &signature,
+        ))
+        .expect_err("unknown fingerprint should not verify");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::SecurityStore {
+                source: SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                    denial_reasons,
+                    ..
+                },
+            } if denial_reasons.contains(&PermissionDenialReason::MissingKeyMaterial)
+        ));
+    }
+
+    #[test]
+    fn discovery_claim_rejects_rebound_fingerprint() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let charlie = charlie_member();
+        let alice_security = signing_security();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, Vec::new());
+        wait_for_delivery_security_future(provision_test_trusted_public_keys(
+            application_id(),
+            bob_store.as_ref(),
+            alice.clone(),
+            &test_public_member_keys(&charlie),
+        ))
+        .expect("rebound public keys should provision");
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let payload = b"signed introduction claim";
+        let signature = alice_security
+            .sign_discovery_claim_payload(payload)
+            .expect("claim should sign");
+        let rebound_fingerprint = test_public_member_keys(&charlie).fingerprint();
+
+        let error = wait_for_delivery_security_future(bob_security.verify_discovery_claim_payload(
+            &alice,
+            rebound_fingerprint,
+            payload,
+            &signature,
+        ))
+        .expect_err("signature should not verify with rebound key material");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::VerifyDiscoveryClaim {
+                member_id,
+                fingerprint,
+                ..
+            } if member_id == alice && fingerprint == rebound_fingerprint
+        ));
+    }
+
+    #[test]
+    fn discovery_claim_rejects_signed_payload_tampering() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let alice_security = signing_security();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let signed_payload = b"signed introduction claim";
+        let tampered_payload = b"signed introduction claim with swapped selector";
+        let signature = alice_security
+            .sign_discovery_claim_payload(signed_payload)
+            .expect("claim should sign");
+        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
+
+        let error = wait_for_delivery_security_future(bob_security.verify_discovery_claim_payload(
+            &alice,
+            alice_fingerprint,
+            tampered_payload,
+            &signature,
+        ))
+        .expect_err("tampered payload should not verify");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::VerifyDiscoveryClaim {
+                member_id,
+                fingerprint,
+                ..
+            } if member_id == alice && fingerprint == alice_fingerprint
+        ));
+    }
+
+    #[test]
+    fn discovery_claim_rejects_blocked_fingerprint() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let alice_security = signing_security();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
+        let mut transaction = wait_for_delivery_security_future(bob_store.begin_transaction())
+            .expect("transaction starts");
+        wait_for_delivery_security_future(
+            transaction.ensure_blocked_key_fingerprint(alice_fingerprint),
+        )
+        .expect("blocked fingerprint stores");
+        wait_for_delivery_security_future(transaction.commit()).expect("transaction commits");
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let payload = b"signed introduction claim";
+        let signature = alice_security
+            .sign_discovery_claim_payload(payload)
+            .expect("claim should sign");
+
+        let error = wait_for_delivery_security_future(bob_security.verify_discovery_claim_payload(
+            &alice,
+            alice_fingerprint,
+            payload,
+            &signature,
+        ))
+        .expect_err("blocked fingerprint should not verify");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::SecurityStore {
+                source: SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                    denial_reasons,
+                    ..
+                },
+            } if denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
+        ));
+    }
+
+    #[test]
+    fn route_publication_permission_rejects_policy_denial() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let bob_security = load_delivery_security_with_policy(
+            bob_store,
+            &bob,
+            TrustPolicy {
+                replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
+                bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+                member_route_publication: MemberKeyTrustRequirement::DenyAll,
+            },
+        );
+        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
+
+        let error = wait_for_delivery_security_future(bob_security.require_member_key_permission(
+            &alice,
+            alice_fingerprint,
+            AuthorityScope::MemberRoutePublication,
+        ))
+        .expect_err("route-publication policy should deny the claim");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::MemberKeyPermissionDenied {
+                member_id,
+                fingerprint,
+                authority_scope: AuthorityScope::MemberRoutePublication,
+                reason: PermissionDenialReason::PolicyDenied,
+            } if member_id == alice && fingerprint == alice_fingerprint
+        ));
     }
 }

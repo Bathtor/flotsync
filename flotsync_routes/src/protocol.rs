@@ -1,6 +1,6 @@
 //! Route-establishment introduction protocol helpers.
 
-use flotsync_core::GroupId;
+use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_discovery::protocol::{DiscoveryProtocolError, discovery_protocol_error};
 use flotsync_messages::{
     buffa::{self, Message, MessageView},
@@ -14,17 +14,38 @@ use flotsync_messages::{
     },
     endpoint::{EndpointFrame, EndpointFrameView, endpoint_frame},
     proto::{DecodeProto, DecodeProtoView},
-    wire::{UUID_BYTE_LENGTH, fixed_bytes_field, group_id_from_wire_bytes},
+    wire::{
+        UUID_BYTE_LENGTH,
+        fixed_bytes_field,
+        group_id_from_wire_bytes,
+        member_identity_from_wire_format,
+        member_identity_from_wire_view,
+        member_identity_to_wire_format,
+    },
 };
+use flotsync_security::{KEY_FINGERPRINT_LENGTH, KeyFingerprint};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use uuid::Uuid;
 
 pub use flotsync_discovery::protocol::DiscoveryRoute;
 
+/// Maximum encoded size accepted by default for safe route-protocol view decoding.
+pub const ROUTE_SAFE_DECODE_MAX_BYTES: usize = 16 * 1024;
+
+/// Maximum nested protobuf message depth accepted for safe route-protocol view decoding.
+pub const ROUTE_SAFE_DECODE_RECURSION_LIMIT: u32 = 8;
+
+/// Maximum number of unknown fields accepted for safe route-protocol view decoding.
+pub const ROUTE_SAFE_DECODE_UNKNOWN_FIELD_LIMIT: usize = 8;
+
 /// A decoded signed-claim payload before signature verification.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedIntroductionClaimPayload {
+    /// Member identity whose key signs this claim.
+    pub member: MemberIdentity,
+    /// Fingerprint of the public key bundle whose signing key signs this claim.
+    pub key_fingerprint: KeyFingerprint,
     /// Running process id for the peer instance making this claim.
     pub instance_id: Uuid,
     /// Receiver-generated freshness challenge echoed by this claim.
@@ -40,6 +61,23 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
     type Proto = IntroductionClaimPayload;
 
     fn decode_proto(mut payload: Self::Proto) -> Result<Self, Self::Error> {
+        let member_id =
+            payload
+                .member_id
+                .take()
+                .context(discovery_protocol_error::MissingFieldSnafu {
+                    message: "IntroductionClaimPayload",
+                    field: "member_id",
+                })?;
+        let member =
+            member_identity_from_wire_format(member_id, "IntroductionClaimPayload.member_id")
+                .context(discovery_protocol_error::InvalidMemberIdentitySnafu {
+                    field: "IntroductionClaimPayload.member_id",
+                })?;
+        let key_fingerprint = key_fingerprint_from_wire(
+            &payload.key_fingerprint,
+            "IntroductionClaimPayload.key_fingerprint",
+        )?;
         let instance_id = uuid_from_wire(
             &payload.instance_uuid,
             "IntroductionClaimPayload.instance_uuid",
@@ -63,6 +101,8 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
             payload.group_ids.len(),
         )?;
         Ok(Self {
+            member,
+            key_fingerprint,
             instance_id,
             request_nonce: payload.request_nonce,
             route,
@@ -76,6 +116,23 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
     type ProtoView<'a> = IntroductionClaimPayloadView<'a>;
 
     fn decode_proto_view(payload: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let member_id =
+            payload
+                .member_id
+                .as_option()
+                .context(discovery_protocol_error::MissingFieldSnafu {
+                    message: "IntroductionClaimPayload",
+                    field: "member_id",
+                })?;
+        let member =
+            member_identity_from_wire_view(member_id, "IntroductionClaimPayload.member_id")
+                .context(discovery_protocol_error::InvalidMemberIdentitySnafu {
+                    field: "IntroductionClaimPayload.member_id",
+                })?;
+        let key_fingerprint = key_fingerprint_from_wire(
+            payload.key_fingerprint,
+            "IntroductionClaimPayload.key_fingerprint",
+        )?;
         let instance_id = uuid_from_wire(
             payload.instance_uuid,
             "IntroductionClaimPayload.instance_uuid",
@@ -98,12 +155,81 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
         let group_ids =
             decode_claim_group_ids(payload.group_ids.iter().copied(), payload.group_ids.len())?;
         Ok(Self {
+            member,
+            key_fingerprint,
             instance_id,
             request_nonce: payload.request_nonce.to_vec(),
             route,
             group_ids,
         })
     }
+}
+
+/// Member and key-material selector extracted from a signed claim payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntroductionClaimSelector {
+    /// Member identity whose stored key material should verify the claim.
+    pub member: MemberIdentity,
+    /// Fingerprint of the exact stored public key bundle used for verification.
+    pub key_fingerprint: KeyFingerprint,
+}
+
+/// Decode one signed introduction claim payload using route-establishment limits.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryProtocolError`] when the payload bytes are malformed or exceed the
+/// route safe-decode limits.
+pub fn decode_introduction_claim_payload_view(
+    bytes: &[u8],
+) -> Result<IntroductionClaimPayloadView<'_>, DiscoveryProtocolError> {
+    safe_decode_options()
+        .decode_view(bytes)
+        .context(discovery_protocol_error::DecodeSnafu)
+}
+
+/// Build conservative decode options for untrusted route-protocol borrowed views.
+///
+/// Use this when route/discovery code needs to decode untrusted protobuf bytes into a borrowed
+/// view before authentication or full semantic validation. Callers must still verify or validate
+/// the original bytes before trusting the contents; this helper only applies the shared route
+/// protocol size, recursion, and unknown-field limits.
+#[must_use]
+pub fn safe_decode_options() -> buffa::DecodeOptions {
+    buffa::DecodeOptions::new()
+        .with_max_message_size(ROUTE_SAFE_DECODE_MAX_BYTES)
+        .with_recursion_limit(ROUTE_SAFE_DECODE_RECURSION_LIMIT)
+        .with_unknown_field_limit(ROUTE_SAFE_DECODE_UNKNOWN_FIELD_LIMIT)
+}
+
+/// Decode the member/key selector from one already-decoded signed claim payload view.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryProtocolError`] when either selector field is absent or malformed.
+pub fn introduction_claim_selector(
+    payload: &IntroductionClaimPayloadView<'_>,
+) -> Result<IntroductionClaimSelector, DiscoveryProtocolError> {
+    let member_id =
+        payload
+            .member_id
+            .as_option()
+            .context(discovery_protocol_error::MissingFieldSnafu {
+                message: "IntroductionClaimPayload",
+                field: "member_id",
+            })?;
+    let member = member_identity_from_wire_view(member_id, "IntroductionClaimPayload.member_id")
+        .context(discovery_protocol_error::InvalidMemberIdentitySnafu {
+            field: "IntroductionClaimPayload.member_id",
+        })?;
+    let key_fingerprint = key_fingerprint_from_wire(
+        payload.key_fingerprint,
+        "IntroductionClaimPayload.key_fingerprint",
+    )?;
+    Ok(IntroductionClaimSelector {
+        member,
+        key_fingerprint,
+    })
 }
 
 /// Decode and validate the group ids in one signed claim payload.
@@ -115,9 +241,20 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
 pub fn decode_introduction_claim_group_ids(
     bytes: &[u8],
 ) -> Result<HashSet<GroupId>, DiscoveryProtocolError> {
-    let payload = IntroductionClaimPayloadView::decode_view(bytes)
-        .context(discovery_protocol_error::DecodeSnafu)?;
+    let payload = decode_introduction_claim_payload_view(bytes)?;
     decode_claim_group_ids(payload.group_ids.iter().copied(), payload.group_ids.len())
+}
+
+/// Encode the exact member/key selector fields for one signed introduction claim payload.
+#[must_use]
+pub fn encode_claim_payload_selector_fields(
+    member: &MemberIdentity,
+    key_fingerprint: KeyFingerprint,
+) -> (flotsync_messages::discovery::Identifier, Vec<u8>) {
+    (
+        member_identity_to_wire_format(member),
+        key_fingerprint.as_ref().to_vec(),
+    )
 }
 
 /// Encode one discovery introduction request into the shared endpoint envelope.
@@ -231,6 +368,20 @@ fn group_id_from_wire(
     })
 }
 
+fn key_fingerprint_from_wire(
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<KeyFingerprint, DiscoveryProtocolError> {
+    let bytes = fixed_bytes_field::<KEY_FINGERPRINT_LENGTH>(field, bytes).map_err(|_| {
+        DiscoveryProtocolError::InvalidByteLength {
+            field,
+            expected: KEY_FINGERPRINT_LENGTH,
+            actual: bytes.len(),
+        }
+    })?;
+    Ok(KeyFingerprint::from_bytes(bytes))
+}
+
 /// Decode and validate the repeated group-id field shared by owned and view payload decoders.
 fn decode_claim_group_ids<'a>(
     raw_group_ids: impl IntoIterator<Item = &'a [u8]>,
@@ -269,6 +420,9 @@ mod tests {
         let route = DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156)));
         let first_group = GroupId(Uuid::from_u128(0x1111));
         let second_group = GroupId(Uuid::from_u128(0x2222));
+        let member = MemberIdentity::from_array(["test", "alice"]);
+        let key = KeyFingerprint::from_bytes([7; KEY_FINGERPRINT_LENGTH]);
+        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(&member, key);
         let payload = IntroductionClaimPayload {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
             request_nonce: vec![0x42; 16],
@@ -277,6 +431,8 @@ mod tests {
                 group_id_to_wire_bytes(first_group),
                 group_id_to_wire_bytes(second_group),
             ],
+            member_id: MessageField::some(member_id),
+            key_fingerprint,
             ..IntroductionClaimPayload::default()
         };
 
@@ -287,6 +443,8 @@ mod tests {
             .expect("claim payload view should decode");
 
         assert_eq!(decoded.instance_id, Uuid::from_u128(0x1234));
+        assert_eq!(decoded.member, member);
+        assert_eq!(decoded.key_fingerprint, key);
         assert_eq!(decoded.request_nonce, vec![0x42; 16]);
         assert_eq!(decoded.route, route);
         assert_eq!(
@@ -303,6 +461,9 @@ mod tests {
     #[test]
     fn rejects_claim_payload_with_duplicate_groups() {
         let group = GroupId(Uuid::from_u128(0x1111));
+        let member = MemberIdentity::from_array(["test", "alice"]);
+        let key = KeyFingerprint::from_bytes([7; KEY_FINGERPRINT_LENGTH]);
+        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(&member, key);
         let payload = IntroductionClaimPayload {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
             request_nonce: vec![0x42; 16],
@@ -310,6 +471,8 @@ mod tests {
                 DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).encode_proto(),
             ),
             group_ids: vec![group_id_to_wire_bytes(group), group_id_to_wire_bytes(group)],
+            member_id: MessageField::some(member_id),
+            key_fingerprint,
             ..IntroductionClaimPayload::default()
         };
 

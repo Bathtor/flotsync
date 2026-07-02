@@ -31,6 +31,7 @@ use crate::{
     SqliteReplicationStore,
     api::{
         ApiError,
+        AuthorityScope,
         CreateGroupRequest,
         DatasetId,
         DatasetRowPatch,
@@ -2427,9 +2428,10 @@ fn bootstrap_payload_validation_rejects_unpermitted_sender_fingerprint() {
     .expect_err("mismatched bootstrap keys should reject payload");
 
     match err {
-        DeliverySecurityError::BootstrapSenderPermissionDenied {
+        DeliverySecurityError::MemberKeyPermissionDenied {
             member_id,
             fingerprint,
+            authority_scope: AuthorityScope::BootstrapActivation,
             reason,
         } => {
             assert_eq!(member_id, alice_member);
@@ -2502,6 +2504,7 @@ fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_perm
     let policy = TrustPolicy {
         replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
         bootstrap_activation: MemberKeyTrustRequirement::DenyAll,
+        member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
     };
     let security = wait_for_test_reply(DeliverySecurity::load(
         SecurityStore::new(store_for_security, policy),
@@ -2530,9 +2533,10 @@ fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_perm
     .expect_err("bootstrap activation permission should reject payload");
 
     match err {
-        DeliverySecurityError::BootstrapSenderPermissionDenied {
+        DeliverySecurityError::MemberKeyPermissionDenied {
             member_id,
             fingerprint,
+            authority_scope: AuthorityScope::BootstrapActivation,
             reason,
         } => {
             assert_eq!(member_id, alice_member);

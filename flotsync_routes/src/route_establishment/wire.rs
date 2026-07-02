@@ -1,20 +1,16 @@
 //! Wire-level validation helpers for signed route-establishment introductions.
 
 use flotsync_core::MemberIdentity;
-use flotsync_discovery::protocol::{
-    DiscoveryProtocolError,
-    DiscoveryRoute,
-    discovery_protocol_error,
-};
+use flotsync_discovery::protocol::{DiscoveryProtocolError, DiscoveryRoute};
 use flotsync_messages::{
-    buffa::MessageView as _,
     discovery::{self as discovery_proto, IntroductionClaimPayloadView},
     proto::{DecodeProto, DecodeProtoView},
-    wire::{WireValueDecodeError, member_identity_from_wire_format},
 };
 use flotsync_security::{FrameSignature, FrameSignatureProtoError};
 use snafu::prelude::*;
 use uuid::Uuid;
+
+use crate::protocol::{decode_introduction_claim_payload_view, introduction_claim_selector};
 
 /// Decode and validation errors for route establishment frames.
 #[derive(Debug, Snafu)]
@@ -25,9 +21,6 @@ pub enum RouteEstablishmentError {
         message: &'static str,
         field: &'static str,
     },
-    /// A claimed member id could not be decoded into the local identity type.
-    #[snafu(display("member identity could not be decoded: {source}"))]
-    DecodeMember { source: WireValueDecodeError },
     /// The exact signed payload bytes were not a valid claim payload.
     #[snafu(display("claim payload could not be decoded: {source}"))]
     DecodeClaimPayload { source: DiscoveryProtocolError },
@@ -42,8 +35,8 @@ pub enum RouteEstablishmentError {
 /// Decode and validate one signed introduction claim before asynchronous signature verification.
 ///
 /// Returns `Ok(Some(_))` when the claim was made by a non-local member, matches the active probe,
-/// and is ready for asynchronous signature verification. Returns `Ok(None)` for a structurally
-/// valid claim made by the local member, because self-claims do not prove a remote route.
+/// and is ready for asynchronous signature verification. Returns `Ok(None)` when the signed
+/// payload selector names the local member, because self-claims do not prove a remote route.
 ///
 /// # Errors
 ///
@@ -56,27 +49,19 @@ pub fn prepare_claim_for_verification(
     local_member: &MemberIdentity,
     claim: discovery_proto::SignedIntroductionClaim,
 ) -> Result<Option<super::state::PendingClaimVerification>, RouteEstablishmentError> {
-    let member_id = claim.member_id.as_option().context(MissingFieldSnafu {
-        message: "SignedIntroductionClaim",
-        field: "member_id",
-    })?;
-    let member =
-        member_identity_from_wire_format(member_id.clone(), "SignedIntroductionClaim.member_id")
-            .context(DecodeMemberSnafu)?;
+    let payload = decode_introduction_claim_payload_view(&claim.claim_payload)
+        .context(DecodeClaimPayloadSnafu)?;
+    let selector = introduction_claim_selector(&payload).context(DecodeClaimPayloadSnafu)?;
+    let member = selector.member;
     if member == *local_member {
         return Ok(None);
     }
-    {
-        let payload = IntroductionClaimPayloadView::decode_view(&claim.claim_payload)
-            .context(discovery_protocol_error::DecodeSnafu)
-            .context(DecodeClaimPayloadSnafu)?;
-        validate_claim_payload(
-            expected_route,
-            expected_instance_id,
-            expected_nonce,
-            &payload,
-        )?;
-    }
+    validate_claim_payload(
+        expected_route,
+        expected_instance_id,
+        expected_nonce,
+        &payload,
+    )?;
     let signature = claim.signature.as_option().context(MissingFieldSnafu {
         message: "SignedIntroductionClaim",
         field: "signature",
@@ -85,6 +70,7 @@ pub fn prepare_claim_for_verification(
         FrameSignature::decode_proto(signature.clone()).context(DecodeSignatureSnafu)?;
     Ok(Some(super::state::PendingClaimVerification {
         member,
+        key_fingerprint: selector.key_fingerprint,
         claim,
         signature,
     }))

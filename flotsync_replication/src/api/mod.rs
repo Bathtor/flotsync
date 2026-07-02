@@ -1098,11 +1098,17 @@ pub enum AuthorityScope {
     ReplicationRuntime,
     /// Accept a bootstrap message from this member key for local group activation.
     BootstrapActivation,
+    /// Publish a discovered route candidate for this member identity.
+    MemberRoutePublication,
 }
 
 impl AuthorityScope {
     /// Authority scopes included in public key bundle assessment reports.
-    pub const VALUES: [Self; 2] = [Self::ReplicationRuntime, Self::BootstrapActivation];
+    pub const VALUES: [Self; 3] = [
+        Self::ReplicationRuntime,
+        Self::BootstrapActivation,
+        Self::MemberRoutePublication,
+    ];
 }
 
 impl fmt::Display for AuthorityScope {
@@ -1110,6 +1116,7 @@ impl fmt::Display for AuthorityScope {
         match self {
             Self::ReplicationRuntime => f.write_str("replication runtime"),
             Self::BootstrapActivation => f.write_str("bootstrap activation"),
+            Self::MemberRoutePublication => f.write_str("member route publication"),
         }
     }
 }
@@ -1121,6 +1128,8 @@ pub struct TrustPolicy {
     pub replication_runtime: MemberKeyTrustRequirement,
     /// Evidence requirement for accepting a bootstrap activation from a sender key.
     pub bootstrap_activation: MemberKeyTrustRequirement,
+    /// Evidence requirement for publishing discovered routes for a member identity.
+    pub member_route_publication: MemberKeyTrustRequirement,
 }
 
 impl Default for TrustPolicy {
@@ -1128,6 +1137,7 @@ impl Default for TrustPolicy {
         Self {
             replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
             bootstrap_activation: MemberKeyTrustRequirement::LocalExplicitTrust,
+            member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
         }
     }
 }
@@ -1150,6 +1160,23 @@ pub enum PermissionDecision {
     Permit,
     /// The key does not have the requested permission.
     Deny(PermissionDenialReason),
+}
+
+impl PermissionDecision {
+    /// Convert this permission decision into a plain result.
+    ///
+    /// Use this when the caller already knows the requested member key and authority scope and
+    /// only needs to branch on permit versus denial.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason when this decision is [`Self::Deny`].
+    pub const fn ok(self) -> Result<(), PermissionDenialReason> {
+        match self {
+            Self::Permit => Ok(()),
+            Self::Deny(reason) => Err(reason),
+        }
+    }
 }
 
 impl fmt::Display for PermissionDecision {

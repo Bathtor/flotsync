@@ -14,7 +14,7 @@ use flotsync_messages::{
         socket_address,
     },
     proto::{self, DecodeProto, DecodeProtoView},
-    wire::{UUID_BYTE_LENGTH, fixed_bytes_field},
+    wire::{UUID_BYTE_LENGTH, WireValueDecodeError, fixed_bytes_field},
 };
 use snafu::prelude::*;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -200,6 +200,12 @@ pub enum DiscoveryProtocolError {
     /// A byte field that must not be empty was empty.
     #[snafu(display("Field '{field}' must not be empty."))]
     EmptyBytes { field: &'static str },
+    /// A member identity selector was malformed.
+    #[snafu(display("Field '{field}' did not contain a valid member identity: {source}"))]
+    InvalidMemberIdentity {
+        field: &'static str,
+        source: WireValueDecodeError,
+    },
     /// A route used an unsupported transport protocol.
     #[snafu(display("Field '{field}' used unsupported route protocol value {value}."))]
     UnsupportedRouteProtocol { field: &'static str, value: i32 },

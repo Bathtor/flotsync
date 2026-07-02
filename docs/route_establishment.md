@@ -56,8 +56,9 @@ families can be introduced later.
 
 ### 2.3 Introduction Claim
 
-An introduction claim says that one `member_id` is reachable through one probed
-route for one or more replication groups.
+An introduction claim says that one `member_id` and public-key bundle
+fingerprint is reachable through one probed route for one or more replication
+groups.
 
 Claims are signed per member identity. This lets one discovery component
 advertise different identities and group memberships on different routes without
@@ -258,10 +259,17 @@ the signed claim fields are authoritative for verification.
 
 It contains:
 
+- `member_id`
+- `key_fingerprint`
 - `instance_uuid`
 - `request_nonce`
 - `route`
 - `group_ids`
+
+`member_id` and `key_fingerprint` are signed selector fields. Receivers use
+them to find the exact stored public key material that must verify the claim.
+`key_fingerprint` is the raw 32 byte `KeyFingerprint` of the member public key
+bundle.
 
 `group_ids` contains one or more 16 byte replication group ids. Repeating groups
 inside one claim is invalid. The same member may appear in several signed claims
@@ -269,8 +277,9 @@ when the route context differs.
 
 ### 4.5 `SignedIntroductionClaim`
 
-`SignedIntroductionClaim` contains one claimed `member_id`, one encoded
-`IntroductionClaimPayload`, and a `DiscoverySignature`.
+`SignedIntroductionClaim` contains one encoded `IntroductionClaimPayload` and a
+`DiscoverySignature`. Identity selectors live inside the signed payload, not in
+outer duplicated fields.
 
 For the first release, the only valid signature scheme is `SCHEME_ED25519PH`.
 
@@ -283,15 +292,26 @@ The signature is computed over `SignedIntroductionClaim.claim_payload` exactly
 as received. `claim_payload` is the protobuf encoding of one
 `IntroductionClaimPayload`.
 
-Receivers use the outer `SignedIntroductionClaim.member_id` as an untrusted key
-selector. They must not trust or act on that member id or any decoded payload
-field until the signature over the original `claim_payload` bytes has been
-verified. They must not decode and re-encode the claim for verification.
+Receivers first decode a conservative borrowed view of `claim_payload` only far
+enough to extract `member_id` and `key_fingerprint`. Those fields are untrusted
+key selectors at this point. The receiver uses the exact `(member_id,
+key_fingerprint)` pair to find stored public key material and verifies the
+signature over the original `claim_payload` bytes. It must not decode and
+re-encode the claim for verification.
+
+After signature verification, receivers fully decode the payload and confirm
+that the fully decoded `member_id` and `key_fingerprint` match the pre-verification
+selectors. Unknown fields may be ignored within the bounded conservative decode
+limits because the original payload bytes, including unknown fields, are covered
+by the signature.
 
 Receivers must reject a claim when:
 
 - `member_id` is empty or malformed
+- `key_fingerprint` is not exactly 32 bytes
 - `claim_payload` does not decode as an `IntroductionClaimPayload`
+- the conservative selector decode exceeds its recursion, unknown-field, or
+  payload-size limits
 - `instance_uuid` is not exactly 16 bytes
 - `instance_uuid` does not match the active probe or top-level `Introduction`
 - `request_nonce` is empty or does not match the active probe
@@ -300,8 +320,12 @@ Receivers must reject a claim when:
 - any `group_id` is not exactly 16 bytes
 - any group id is repeated inside the claim
 - the signature scheme is unsupported
-- the signature over `claim_payload` does not verify against the trusted public
-  signing key for `member_id`
+- no stored, unblocked public key material exists for the exact `(member_id,
+  key_fingerprint)` pair
+- the signature over `claim_payload` does not verify against that exact public
+  signing key
+- the fully decoded `member_id` or `key_fingerprint` differs from the
+  pre-verification selector
 
 ## 6. Receiver-Driven Exchange
 
@@ -335,6 +359,13 @@ Accepted claims are checked against the shared group membership snapshot. A
 claim is relevant only when it names a group that the local runtime knows and
 where `member_id` is a member. The same membership snapshot supplies the local
 group ids placed into outgoing claims for groups hosted by the local member.
+
+Publishing a route candidate from a verified claim requires
+`MemberRoutePublication` authority for the exact `(member_id, key_fingerprint)`
+pair. This authority covers only publishing the discovered route for that member
+identity. It does not grant signature-verification capability, replication
+runtime traffic authority, bootstrap activation, group installation, member
+introduction, or trust promotion.
 
 ### 6.4 Freshness Refresh
 

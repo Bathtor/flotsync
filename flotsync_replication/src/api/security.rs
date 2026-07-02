@@ -279,6 +279,10 @@ mod tests {
                         PermissionDenialReason::MissingTrustEvidence,
                     ),
                 },
+                MemberKeyAuthorityReport {
+                    scope: AuthorityScope::MemberRoutePublication,
+                    decision: PermissionDecision::Permit,
+                },
             ],
         };
         let report = PublicKeyBundleReport {
@@ -300,6 +304,7 @@ mod tests {
         assert!(display.contains("globally blocked: no"));
         assert!(display.contains("replication runtime=permit"));
         assert!(display.contains("bootstrap activation=deny (missing trust evidence)"));
+        assert!(display.contains("member route publication=permit"));
         assert!(display.contains("other known fingerprints:"));
     }
 

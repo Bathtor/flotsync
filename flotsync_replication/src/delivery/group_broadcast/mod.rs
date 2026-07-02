@@ -612,7 +612,7 @@ mod tests {
                 group_memberships,
                 bind_external_socket,
                 trusted_members,
-                HashMap::new(),
+                &HashMap::new(),
             )
         }
 
@@ -622,7 +622,7 @@ mod tests {
             group_memberships: GroupMemberships,
             bind_external_socket: bool,
             trusted_members: HashSet<MemberIdentity>,
-            member_key_fingerprint_overrides: HashMap<MemberIdentity, KeyFingerprint>,
+            member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
         ) -> Self {
             let system = build_delivery_test_system();
             let manager_owned_udp_sockets = usize::from(!bind_external_socket);
@@ -637,7 +637,7 @@ mod tests {
                 &local_member,
                 &group_memberships,
                 trusted_members,
-                &member_key_fingerprint_overrides,
+                member_key_fingerprint_overrides,
             );
             let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
             let manager_ref = core.manager_ref();
@@ -1277,7 +1277,7 @@ mod tests {
             memberships,
             false,
             HashSet::new(),
-            fingerprint_overrides,
+            &fingerprint_overrides,
         );
 
         receiver_bob.trust_member_public_keys_from(&alice, &alice_phone);
