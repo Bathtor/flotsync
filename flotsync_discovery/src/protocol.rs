@@ -206,6 +206,12 @@ pub enum DiscoveryProtocolError {
         field: &'static str,
         source: WireValueDecodeError,
     },
+    /// A shared protobuf wire value was malformed.
+    #[snafu(display("Discovery wire value was invalid: {source}"))]
+    InvalidWireValue {
+        /// Shared wire-value decode failure.
+        source: WireValueDecodeError,
+    },
     /// A route used an unsupported transport protocol.
     #[snafu(display("Field '{field}' used unsupported route protocol value {value}."))]
     UnsupportedRouteProtocol { field: &'static str, value: i32 },

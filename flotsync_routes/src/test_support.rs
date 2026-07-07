@@ -5,19 +5,31 @@
 //! small: semantic-owner probes still live next to the tests that use them.
 
 use crate::{
+    DatagramRouteScope,
     ExternalUdpSocketRegistration,
+    RouteSharingKind,
     RouteTransportActorMessage,
+    RouteTransportPort,
+    RouteTransportSend,
+    RouteTransportSubmitResult,
     TransportRouteKey,
     manager::{RouteTransportManager, configure_replication_runtime},
 };
-use flotsync_core::{MemberIdentity, member::IdentifierBuf};
+use flotsync_core::{
+    MemberIdentity,
+    member::{Identifier, IdentifierBuf},
+};
 use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{
         DriverConfig,
+        EgressPool,
         IoBridge,
         IoBridgeHandle,
+        IoBufferConfig,
+        IoBufferPools,
         IoDriverComponent,
+        IoPayload,
         SocketId,
         UdpBindOptions,
         UdpIndication,
@@ -40,6 +52,14 @@ use flotsync_io::{
         start_component,
     },
 };
+use flotsync_messages::serialisation::{FlotsyncSerializable, encode_message_payload};
+use flotsync_security::{
+    GeneratedMemberKeyBundles,
+    LocalMemberKeys,
+    PublicKeyBundle,
+    generate_member_key_bundles,
+    local_member_keys_from_private_bundle,
+};
 use flotsync_udpour::UDPourConfig;
 use kompact::prelude::*;
 use std::{
@@ -54,6 +74,118 @@ use std::{
     },
     time::Duration,
 };
+
+/// Concrete route-transport test port used for inbound route-component deliveries.
+pub type TestRouteTransportPort = RouteTransportPort<TransportRouteKey>;
+
+/// Build one member identity from static path segments.
+#[must_use]
+pub fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
+    Identifier::from_array(segments)
+}
+
+/// Build an egress buffer pool for endpoint-frame encoding in route-component tests.
+#[must_use]
+pub fn test_egress_pool() -> EgressPool {
+    IoBufferPools::new(IoBufferConfig::default())
+        .expect("test IO buffers should build")
+        .egress()
+}
+
+/// Encode one route-transport payload into an IO payload for test inspection.
+#[must_use]
+pub fn encode_transport_payload(payload: &Arc<dyn FlotsyncSerializable>) -> IoPayload {
+    block_on(encode_message_payload(
+        &test_egress_pool(),
+        payload.as_ref(),
+    ))
+    .expect("route transport payload should encode")
+}
+
+/// Encode one endpoint-discovery frame into an IO payload.
+#[must_use]
+pub fn endpoint_payload(frame: &impl FlotsyncSerializable) -> IoPayload {
+    block_on(encode_message_payload(&test_egress_pool(), frame))
+        .expect("endpoint frame should encode")
+}
+
+/// Build deterministic local and public keys for one member identity.
+#[must_use]
+pub fn generated_keys(member: MemberIdentity) -> (LocalMemberKeys, PublicKeyBundle) {
+    let GeneratedMemberKeyBundles {
+        local_private_bundle,
+        public_bundle,
+    } = generate_member_key_bundles(member.clone()).expect("test key generation should work");
+    let local_keys = local_member_keys_from_private_bundle(local_private_bundle.as_bytes(), member)
+        .expect("private key bundle should decode");
+    let public_bundle =
+        PublicKeyBundle::from_bytes(&public_bundle).expect("public key bundle should decode");
+    (local_keys, public_bundle)
+}
+
+/// Assert that one route-transport submit targets the expected exclusive UDP route.
+pub fn assert_udp_transport_route(
+    send: &RouteTransportSend<TransportRouteKey>,
+    expected_local_bind: SocketAddr,
+    expected_target: SocketAddr,
+) {
+    assert_eq!(send.route.sharing, RouteSharingKind::Exclusive);
+    match send.route.coverage_key {
+        TransportRouteKey::Udp(route) => {
+            assert_eq!(route.remote_addr, expected_target);
+            assert_eq!(route.scope, DatagramRouteScope::Unicast);
+            assert_eq!(route.local_bind, Some(expected_local_bind));
+        }
+        TransportRouteKey::Tcp(route) => {
+            panic!("expected UDP route transport key, got TCP route {route:?}");
+        }
+    }
+}
+
+/// Actor test double that records outbound route-transport submits and acknowledges them.
+#[derive(ComponentDefinition)]
+pub struct RouteTransportRecorderComponent {
+    /// Kompact component context for the recorder actor.
+    ctx: ComponentContext<Self>,
+    /// Channel receiving every route-transport submit issued by the component under test.
+    submits: mpsc::Sender<RouteTransportSend<TransportRouteKey>>,
+}
+
+impl RouteTransportRecorderComponent {
+    /// Build one route-transport recorder.
+    #[must_use]
+    pub fn new(submits: mpsc::Sender<RouteTransportSend<TransportRouteKey>>) -> Self {
+        Self {
+            ctx: ComponentContext::uninitialised(),
+            submits,
+        }
+    }
+}
+
+ignore_lifecycle!(RouteTransportRecorderComponent);
+
+impl Actor for RouteTransportRecorderComponent {
+    type Message = RouteTransportActorMessage<TransportRouteKey>;
+
+    fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
+        match msg {
+            RouteTransportActorMessage::Submit(ask) => {
+                let (promise, send) = ask.take();
+                let coverage_key = send.route.coverage_key;
+                self.submits
+                    .send(send)
+                    .expect("route transport recorder receiver should stay live");
+                let _ = promise.fulfil(RouteTransportSubmitResult::Sent { coverage_key });
+                Handled::OK
+            }
+            RouteTransportActorMessage::RegisterExternalUdpSocket(ask) => {
+                let (promise, _registration) = ask.take();
+                let _ = promise.fulfil(Ok(()));
+                Handled::OK
+            }
+        }
+    }
+}
 
 /// Longer timeout used by the semantic full-stack delivery tests.
 pub const FULL_STACK_WAIT_TIMEOUT: Duration = Duration::from_secs(20);

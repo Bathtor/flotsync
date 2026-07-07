@@ -1,10 +1,15 @@
 //! Wire-level validation helpers for signed route-establishment introductions.
 
 use flotsync_core::MemberIdentity;
-use flotsync_discovery::protocol::{DiscoveryProtocolError, DiscoveryRoute};
+use flotsync_discovery::protocol::{
+    DiscoveryProtocolError,
+    DiscoveryRoute,
+    discovery_protocol_error,
+};
 use flotsync_messages::{
     discovery::{self as discovery_proto, IntroductionClaimPayloadView},
     proto::{DecodeProto, DecodeProtoView},
+    wire::uuid_from_wire_bytes,
 };
 use flotsync_security::{FrameSignature, FrameSignatureProtoError};
 use snafu::prelude::*;
@@ -45,7 +50,7 @@ pub enum RouteEstablishmentError {
 pub fn prepare_claim_for_verification(
     expected_route: DiscoveryRoute,
     expected_instance_id: Uuid,
-    expected_nonce: &[u8],
+    expected_nonce: Uuid,
     local_member: &MemberIdentity,
     claim: discovery_proto::SignedIntroductionClaim,
 ) -> Result<Option<super::state::PendingClaimVerification>, RouteEstablishmentError> {
@@ -80,24 +85,29 @@ pub fn prepare_claim_for_verification(
 pub fn validate_claim_payload(
     expected_route: DiscoveryRoute,
     expected_instance_id: Uuid,
-    expected_nonce: &[u8],
+    expected_nonce: Uuid,
     payload: &IntroductionClaimPayloadView<'_>,
 ) -> Result<(), RouteEstablishmentError> {
+    let instance_id = uuid_from_wire_bytes(
+        payload.instance_uuid,
+        "IntroductionClaimPayload.instance_uuid",
+    )
+    .context(discovery_protocol_error::InvalidWireValueSnafu)
+    .context(DecodeClaimPayloadSnafu)?;
     ensure!(
-        payload.instance_uuid == expected_instance_id.as_bytes().as_slice(),
+        instance_id == expected_instance_id,
         ClaimMismatchSnafu {
             field: "instance_uuid"
         }
     );
-    if payload.request_nonce.is_empty() {
-        return Err(RouteEstablishmentError::DecodeClaimPayload {
-            source: DiscoveryProtocolError::EmptyBytes {
-                field: "IntroductionClaimPayload.request_nonce",
-            },
-        });
-    }
+    let request_nonce = uuid_from_wire_bytes(
+        payload.request_nonce,
+        "IntroductionClaimPayload.request_nonce",
+    )
+    .context(discovery_protocol_error::InvalidWireValueSnafu)
+    .context(DecodeClaimPayloadSnafu)?;
     ensure!(
-        payload.request_nonce == expected_nonce,
+        request_nonce == expected_nonce,
         ClaimMismatchSnafu {
             field: "request_nonce"
         }

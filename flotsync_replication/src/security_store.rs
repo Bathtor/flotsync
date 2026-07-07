@@ -317,6 +317,31 @@ impl SecurityStore {
         .boxed()
     }
 
+    /// Ensure one directly discovered public-key bundle binding if it is still useful.
+    ///
+    /// This operation is intentionally transactional: if the exact member/fingerprint binding is
+    /// already present, the method leaves the store unchanged and returns success. Otherwise it
+    /// records the candidate binding without adding trust evidence. Blocked fingerprints are
+    /// rejected.
+    pub(crate) fn ensure_discovery_public_key_bundle<'a>(
+        &'a self,
+        member_id: &'a MemberIdentity,
+        bundle: PublicKeyBundle,
+    ) -> BoxFuture<'a, Result<(), SecurityStoreError>> {
+        async move {
+            let mut transaction = self
+                .store
+                .begin_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            ensure_discovery_public_key_binding(transaction.as_mut(), &bundle, member_id.clone())
+                .await?;
+            transaction.commit().await.context(StoreAccessSnafu)?;
+            Ok(())
+        }
+        .boxed()
+    }
+
     /// Record user/application feedback for one public key bundle.
     pub(crate) fn record_public_key_bundle_feedback(
         &self,
@@ -618,13 +643,57 @@ async fn ensure_candidate_public_key_bindings(
     candidate_member_ids: &HashSet<MemberIdentity>,
 ) -> Result<(), SecurityStoreError> {
     for member_id in candidate_member_ids {
-        let record = member_public_keys_record_from_bundle(bundle, member_id.clone());
-        transaction
-            .ensure_member_public_keys(record)
-            .await
-            .context(StoreAccessSnafu)?;
+        ensure_candidate_public_key_binding(transaction, bundle, member_id.clone()).await?;
     }
     Ok(())
+}
+
+/// Store one observed public-key binding for a candidate member identity.
+async fn ensure_candidate_public_key_binding(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    bundle: &PublicKeyBundle,
+    member_id: MemberIdentity,
+) -> Result<(), SecurityStoreError> {
+    let record = member_public_keys_record_from_bundle(bundle, member_id);
+    transaction
+        .ensure_member_public_keys(record)
+        .await
+        .context(StoreAccessSnafu)?;
+    Ok(())
+}
+
+/// Ensure one directly discovered public-key binding when exact material is still missing.
+async fn ensure_discovery_public_key_binding(
+    transaction: &mut dyn ReplicationStoreTransaction,
+    bundle: &PublicKeyBundle,
+    member_id: MemberIdentity,
+) -> Result<(), SecurityStoreError> {
+    let fingerprint = bundle.fingerprint();
+    let key_id = MemberKeyId {
+        member_id: member_id.clone(),
+        fingerprint,
+    };
+    let existing = transaction
+        .load_member_public_keys(&key_id)
+        .await
+        .context(StoreAccessSnafu)?;
+    if existing.is_some() {
+        // The member/fingerprint binding is already present. The fingerprint identifies the
+        // public-key material, so an existing exact binding is necessarily identical to the bundle
+        // this lookup returned.
+        return Ok(());
+    }
+    let fingerprint_blocked = transaction
+        .is_key_fingerprint_blocked(&fingerprint)
+        .await
+        .context(StoreAccessSnafu)?;
+    if fingerprint_blocked {
+        return Err(SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+            key_id,
+            denial_reasons: vec![PermissionDenialReason::FingerprintBlocked],
+        });
+    }
+    ensure_candidate_public_key_binding(transaction, bundle, member_id).await
 }
 
 /// Persist one feedback action in an already-open write transaction.
@@ -1116,6 +1185,44 @@ mod tests {
                 ..
             } if denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
         ));
+    }
+
+    #[test]
+    fn direct_discovery_key_bundle_rejects_blocked_fingerprint() {
+        let store = sqlite_store();
+        let bundle = test_public_member_keys(&remote_member()).public_key_bundle();
+        let fingerprint = bundle.fingerprint();
+        let key_id = MemberKeyId {
+            member_id: remote_member(),
+            fingerprint,
+        };
+        let mut transaction =
+            wait_for_security_store_future(store.begin_transaction()).expect("transaction starts");
+        wait_for_security_store_future(transaction.ensure_blocked_key_fingerprint(fingerprint))
+            .expect("blocked fingerprint stores");
+        wait_for_security_store_future(transaction.commit()).expect("transaction commits");
+        let security_store = security_store(store.clone());
+
+        let error = wait_for_security_store_future(
+            security_store.ensure_discovery_public_key_bundle(&remote_member(), bundle),
+        )
+        .expect_err("blocked direct discovery material should be rejected");
+
+        assert!(matches!(
+            error,
+            SecurityStoreError::ExactMemberKeyPublicKeysUnavailable {
+                key_id: error_key_id,
+                denial_reasons,
+            } if error_key_id == key_id
+                && denial_reasons.contains(&PermissionDenialReason::FingerprintBlocked)
+        ));
+
+        let mut transaction =
+            wait_for_security_store_future(store.begin_read_transaction()).expect("read starts");
+        let stored = wait_for_security_store_future(transaction.load_member_public_keys(&key_id))
+            .expect("member keys should load");
+        wait_for_security_store_future(transaction.release()).expect("release succeeds");
+        assert!(stored.is_none());
     }
 
     #[test]

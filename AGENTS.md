@@ -24,6 +24,7 @@
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
+- Document the semantics of non-obvious boolean return values, especially helper methods where `true` means success, accepted, retained, skipped, or a no-op rather than simply returning a predicate.
 - Document all modules, even if not public. But especially thoroughly if public.
 - Add loop labels when control flow spans non-trivial nested loops or retries.
 - Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep.

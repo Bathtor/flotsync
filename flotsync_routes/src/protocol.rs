@@ -3,17 +3,20 @@
 use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_discovery::protocol::{DiscoveryProtocolError, discovery_protocol_error};
 use flotsync_messages::{
-    buffa::{self, Message, MessageView},
+    buffa::{self, Message, MessageField, MessageView},
     discovery::{
         DiscoveryFrame,
         Introduction,
         IntroductionClaimPayload,
         IntroductionClaimPayloadView,
         IntroductionRequest,
+        KeyBundleLookupRequest,
+        KeyBundleLookupResponsePayload,
+        SignedKeyBundleLookupResponse,
         discovery_frame,
     },
     endpoint::{EndpointFrame, EndpointFrameView, endpoint_frame},
-    proto::{DecodeProto, DecodeProtoView},
+    proto::{DecodeProto, DecodeProtoView, EncodeProto, FromProtoDecodeError},
     wire::{
         UUID_BYTE_LENGTH,
         fixed_bytes_field,
@@ -21,9 +24,11 @@ use flotsync_messages::{
         member_identity_from_wire_format,
         member_identity_from_wire_view,
         member_identity_to_wire_format,
+        uuid_from_wire_bytes,
+        uuid_to_wire_bytes,
     },
 };
-use flotsync_security::{KEY_FINGERPRINT_LENGTH, KeyFingerprint};
+use flotsync_security::{KEY_FINGERPRINT_LENGTH, KeyFingerprint, PublicKeyBundle, SecurityError};
 use snafu::prelude::*;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -49,11 +54,161 @@ pub struct DecodedIntroductionClaimPayload {
     /// Running process id for the peer instance making this claim.
     pub instance_id: Uuid,
     /// Receiver-generated freshness challenge echoed by this claim.
-    pub request_nonce: Vec<u8>,
+    pub request_nonce: Uuid,
     /// Route endpoint covered by this claim.
     pub route: DiscoveryRoute,
     /// Replication group ids covered by this claim.
     pub group_ids: HashSet<GroupId>,
+}
+
+/// Decoded direct key-bundle lookup request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedKeyBundleLookupRequest {
+    /// Member identity whose public key bundle is requested.
+    pub member: MemberIdentity,
+    /// Exact public key bundle fingerprint requested.
+    pub key_fingerprint: KeyFingerprint,
+    /// Receiver-generated freshness challenge to echo in the signed response.
+    pub request_nonce: Uuid,
+}
+
+impl DecodeProto for DecodedKeyBundleLookupRequest {
+    type Error = DiscoveryProtocolError;
+    type Proto = KeyBundleLookupRequest;
+
+    fn decode_proto(mut request: Self::Proto) -> Result<Self, Self::Error> {
+        let member_id =
+            request
+                .member_id
+                .take()
+                .context(discovery_protocol_error::MissingFieldSnafu {
+                    message: "KeyBundleLookupRequest",
+                    field: "member_id",
+                })?;
+        let member =
+            member_identity_from_wire_format(member_id, "KeyBundleLookupRequest.member_id")
+                .context(discovery_protocol_error::InvalidMemberIdentitySnafu {
+                    field: "KeyBundleLookupRequest.member_id",
+                })?;
+        let key_fingerprint = key_fingerprint_from_wire(
+            &request.key_fingerprint,
+            "KeyBundleLookupRequest.key_fingerprint",
+        )?;
+        let request_nonce = uuid_from_wire_bytes(
+            &request.request_nonce,
+            "KeyBundleLookupRequest.request_nonce",
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)?;
+        Ok(Self {
+            member,
+            key_fingerprint,
+            request_nonce,
+        })
+    }
+}
+
+/// Decoded direct key-bundle lookup response payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedKeyBundleLookupResponsePayload {
+    /// Member identity supplied by the requester.
+    pub member: MemberIdentity,
+    /// Exact public key bundle fingerprint requested by the requester.
+    pub key_fingerprint: KeyFingerprint,
+    /// Freshness challenge echoed from the request.
+    pub request_nonce: Uuid,
+    /// Identity-free public key bundle returned by the responder.
+    pub public_key_bundle: PublicKeyBundle,
+}
+
+impl DecodeProto for DecodedKeyBundleLookupResponsePayload {
+    type Error = KeyBundleLookupPayloadError;
+    type Proto = KeyBundleLookupResponsePayload;
+
+    fn decode_proto(mut payload: Self::Proto) -> Result<Self, Self::Error> {
+        let member_id = payload
+            .member_id
+            .take()
+            .context(discovery_protocol_error::MissingFieldSnafu {
+                message: "KeyBundleLookupResponsePayload",
+                field: "member_id",
+            })
+            .context(key_bundle_lookup_payload_error::DiscoverySnafu)?;
+        let member =
+            member_identity_from_wire_format(member_id, "KeyBundleLookupResponsePayload.member_id")
+                .context(discovery_protocol_error::InvalidMemberIdentitySnafu {
+                    field: "KeyBundleLookupResponsePayload.member_id",
+                })
+                .context(key_bundle_lookup_payload_error::DiscoverySnafu)?;
+        let key_fingerprint = key_fingerprint_from_wire(
+            &payload.key_fingerprint,
+            "KeyBundleLookupResponsePayload.key_fingerprint",
+        )
+        .context(key_bundle_lookup_payload_error::DiscoverySnafu)?;
+        let request_nonce = uuid_from_wire_bytes(
+            &payload.request_nonce,
+            "KeyBundleLookupResponsePayload.request_nonce",
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)
+        .context(key_bundle_lookup_payload_error::DiscoverySnafu)?;
+        let public_key_bundle = payload
+            .public_key_bundle
+            .take()
+            .context(discovery_protocol_error::MissingFieldSnafu {
+                message: "KeyBundleLookupResponsePayload",
+                field: "public_key_bundle",
+            })
+            .context(key_bundle_lookup_payload_error::DiscoverySnafu)?;
+        let public_key_bundle = PublicKeyBundle::decode_proto(public_key_bundle)
+            .context(key_bundle_lookup_payload_error::PublicKeyBundleSnafu)?;
+        let derived_fingerprint = public_key_bundle.fingerprint();
+        ensure!(
+            derived_fingerprint == key_fingerprint,
+            key_bundle_lookup_payload_error::FingerprintMismatchSnafu {
+                declared: key_fingerprint,
+                derived: derived_fingerprint,
+            }
+        );
+        Ok(Self {
+            member,
+            key_fingerprint,
+            request_nonce,
+            public_key_bundle,
+        })
+    }
+}
+
+/// Decode and validation errors for key-bundle lookup response payloads.
+#[derive(Debug, Snafu)]
+#[snafu(module(key_bundle_lookup_payload_error), visibility(pub))]
+pub enum KeyBundleLookupPayloadError {
+    /// The response payload bytes could not be decoded as protobuf.
+    #[snafu(display("key-bundle lookup response payload bytes were malformed: {source}"))]
+    Decode {
+        /// Generated protobuf decode failure.
+        source: buffa::DecodeError,
+    },
+    /// The discovery selector or nonce fields were malformed.
+    #[snafu(display("key-bundle lookup response discovery fields were invalid: {source}"))]
+    Discovery { source: DiscoveryProtocolError },
+    /// The returned public key bundle was malformed.
+    #[snafu(display("key-bundle lookup response public key bundle was invalid: {source}"))]
+    PublicKeyBundle { source: SecurityError },
+    /// The returned public key bundle did not derive to the declared fingerprint.
+    #[snafu(display(
+        "key-bundle lookup response declared fingerprint {declared}, but returned bundle derives to {derived}"
+    ))]
+    FingerprintMismatch {
+        /// Fingerprint named by the response selector.
+        declared: KeyFingerprint,
+        /// Fingerprint derived from the returned public key bundle.
+        derived: KeyFingerprint,
+    },
+}
+
+impl FromProtoDecodeError for KeyBundleLookupPayloadError {
+    fn from_proto_decode_error(source: buffa::DecodeError) -> Self {
+        Self::Decode { source }
+    }
 }
 
 impl DecodeProto for DecodedIntroductionClaimPayload {
@@ -78,16 +233,16 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
             &payload.key_fingerprint,
             "IntroductionClaimPayload.key_fingerprint",
         )?;
-        let instance_id = uuid_from_wire(
+        let instance_id = uuid_from_wire_bytes(
             &payload.instance_uuid,
             "IntroductionClaimPayload.instance_uuid",
-        )?;
-        ensure!(
-            !payload.request_nonce.is_empty(),
-            discovery_protocol_error::EmptyBytesSnafu {
-                field: "IntroductionClaimPayload.request_nonce"
-            }
-        );
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)?;
+        let request_nonce = uuid_from_wire_bytes(
+            &payload.request_nonce,
+            "IntroductionClaimPayload.request_nonce",
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)?;
         let route = payload
             .route
             .take()
@@ -104,7 +259,7 @@ impl DecodeProto for DecodedIntroductionClaimPayload {
             member,
             key_fingerprint,
             instance_id,
-            request_nonce: payload.request_nonce,
+            request_nonce,
             route,
             group_ids,
         })
@@ -133,16 +288,16 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
             payload.key_fingerprint,
             "IntroductionClaimPayload.key_fingerprint",
         )?;
-        let instance_id = uuid_from_wire(
+        let instance_id = uuid_from_wire_bytes(
             payload.instance_uuid,
             "IntroductionClaimPayload.instance_uuid",
-        )?;
-        ensure!(
-            !payload.request_nonce.is_empty(),
-            discovery_protocol_error::EmptyBytesSnafu {
-                field: "IntroductionClaimPayload.request_nonce"
-            }
-        );
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)?;
+        let request_nonce = uuid_from_wire_bytes(
+            payload.request_nonce,
+            "IntroductionClaimPayload.request_nonce",
+        )
+        .context(discovery_protocol_error::InvalidWireValueSnafu)?;
         let route =
             payload
                 .route
@@ -158,7 +313,7 @@ impl DecodeProtoView for DecodedIntroductionClaimPayload {
             member,
             key_fingerprint,
             instance_id,
-            request_nonce: payload.request_nonce.to_vec(),
+            request_nonce,
             route,
             group_ids,
         })
@@ -245,9 +400,9 @@ pub fn decode_introduction_claim_group_ids(
     decode_claim_group_ids(payload.group_ids.iter().copied(), payload.group_ids.len())
 }
 
-/// Encode the exact member/key selector fields for one signed introduction claim payload.
+/// Encode the exact member/key selector fields shared by endpoint discovery payloads.
 #[must_use]
-pub fn encode_claim_payload_selector_fields(
+pub fn encode_member_key_selector_fields(
     member: &MemberIdentity,
     key_fingerprint: KeyFingerprint,
 ) -> (flotsync_messages::discovery::Identifier, Vec<u8>) {
@@ -257,29 +412,100 @@ pub fn encode_claim_payload_selector_fields(
     )
 }
 
-/// Encode one discovery introduction request into the shared endpoint envelope.
-#[must_use]
-pub fn introduction_request_endpoint_frame(request_nonce: Vec<u8>) -> EndpointFrame {
-    let discovery = DiscoveryFrame {
-        body: Some(discovery_frame::Body::IntroductionRequest(Box::new(
-            IntroductionRequest {
-                request_nonce,
-                ..IntroductionRequest::default()
-            },
-        ))),
-        ..DiscoveryFrame::default()
-    };
-    discovery_endpoint_frame(discovery)
+/// Source for encoding one discovery message into the shared endpoint envelope.
+pub enum DiscoveryEndpointFrameSrc<'a> {
+    /// Introduction request for probing one candidate route.
+    IntroductionRequest {
+        /// Request freshness challenge that the signed response must echo.
+        request_nonce: Uuid,
+    },
+    /// Introduction response with signed route claims.
+    Introduction {
+        /// Introduction payload to wrap in the endpoint envelope.
+        introduction: &'a Introduction,
+    },
+    /// Direct key-bundle lookup request.
+    KeyBundleLookupRequest {
+        /// Member identity whose public key bundle is requested.
+        member: &'a MemberIdentity,
+        /// Exact public key bundle fingerprint requested.
+        key_fingerprint: KeyFingerprint,
+        /// Request freshness challenge that the signed response must echo.
+        request_nonce: Uuid,
+    },
+    /// Signed direct key-bundle lookup response.
+    KeyBundleLookupResponse {
+        /// Signed response to wrap in the endpoint envelope.
+        response: &'a SignedKeyBundleLookupResponse,
+    },
 }
 
-/// Encode one discovery introduction into the shared endpoint envelope.
-#[must_use]
-pub fn introduction_endpoint_frame(introduction: Introduction) -> EndpointFrame {
-    let discovery = DiscoveryFrame {
-        body: Some(discovery_frame::Body::Introduction(Box::new(introduction))),
-        ..DiscoveryFrame::default()
-    };
-    discovery_endpoint_frame(discovery)
+impl EncodeProto for DiscoveryEndpointFrameSrc<'_> {
+    type Proto = EndpointFrame;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let body = match self {
+            Self::IntroductionRequest { request_nonce } => {
+                discovery_frame::Body::IntroductionRequest(Box::new(IntroductionRequest {
+                    request_nonce: uuid_to_wire_bytes(*request_nonce),
+                    ..IntroductionRequest::default()
+                }))
+            }
+            Self::Introduction { introduction } => {
+                discovery_frame::Body::Introduction(Box::new((**introduction).clone()))
+            }
+            Self::KeyBundleLookupRequest {
+                member,
+                key_fingerprint,
+                request_nonce,
+            } => {
+                let (member_id, key_fingerprint) =
+                    encode_member_key_selector_fields(member, *key_fingerprint);
+                discovery_frame::Body::KeyBundleLookupRequest(Box::new(KeyBundleLookupRequest {
+                    member_id: MessageField::some(member_id),
+                    key_fingerprint,
+                    request_nonce: uuid_to_wire_bytes(*request_nonce),
+                    ..KeyBundleLookupRequest::default()
+                }))
+            }
+            Self::KeyBundleLookupResponse { response } => {
+                discovery_frame::Body::KeyBundleLookupResponse(Box::new((**response).clone()))
+            }
+        };
+        let discovery = DiscoveryFrame {
+            body: Some(body),
+            ..DiscoveryFrame::default()
+        };
+        discovery_endpoint_frame(discovery)
+    }
+}
+
+/// Source for encoding the signed payload of one direct key-bundle lookup response.
+pub struct KeyBundleLookupResponsePayloadSrc<'a> {
+    /// Member identity supplied by the requester.
+    pub member: &'a MemberIdentity,
+    /// Exact public key bundle fingerprint requested.
+    pub key_fingerprint: KeyFingerprint,
+    /// Request freshness challenge echoed by the response.
+    pub request_nonce: Uuid,
+    /// Public key bundle returned by the responder.
+    pub public_key_bundle: &'a PublicKeyBundle,
+}
+
+impl EncodeProto for KeyBundleLookupResponsePayloadSrc<'_> {
+    type Proto = KeyBundleLookupResponsePayload;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let (member_id, key_fingerprint) =
+            encode_member_key_selector_fields(self.member, self.key_fingerprint);
+        KeyBundleLookupResponsePayload {
+            member_id: MessageField::some(member_id),
+            key_fingerprint,
+            request_nonce: uuid_to_wire_bytes(self.request_nonce),
+            public_key_bundle: MessageField::some(self.public_key_bundle.encode_proto()),
+            ..KeyBundleLookupResponsePayload::default()
+        }
+    }
 }
 
 /// Decode one discovery frame from a shared endpoint envelope.
@@ -343,18 +569,6 @@ fn discovery_endpoint_frame(discovery: DiscoveryFrame) -> EndpointFrame {
         boundary: Some(endpoint_frame::Boundary::Discovery(Box::new(discovery))),
         ..EndpointFrame::default()
     }
-}
-
-/// Decode one fixed-width UUID byte field from a discovery protobuf value.
-fn uuid_from_wire(bytes: &[u8], field: &'static str) -> Result<Uuid, DiscoveryProtocolError> {
-    let bytes = fixed_bytes_field::<UUID_BYTE_LENGTH>(field, bytes).map_err(|_| {
-        DiscoveryProtocolError::InvalidByteLength {
-            field,
-            expected: UUID_BYTE_LENGTH,
-            actual: bytes.len(),
-        }
-    })?;
-    Ok(Uuid::from_bytes(bytes))
 }
 
 fn group_id_from_wire(
@@ -422,10 +636,11 @@ mod tests {
         let second_group = GroupId(Uuid::from_u128(0x2222));
         let member = MemberIdentity::from_array(["test", "alice"]);
         let key = KeyFingerprint::from_bytes([7; KEY_FINGERPRINT_LENGTH]);
-        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(&member, key);
+        let request_nonce = Uuid::from_bytes([0x42; 16]);
+        let (member_id, key_fingerprint) = encode_member_key_selector_fields(&member, key);
         let payload = IntroductionClaimPayload {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
-            request_nonce: vec![0x42; 16],
+            request_nonce: uuid_to_wire_bytes(request_nonce),
             route: MessageField::some(route.encode_proto()),
             group_ids: vec![
                 group_id_to_wire_bytes(first_group),
@@ -445,7 +660,7 @@ mod tests {
         assert_eq!(decoded.instance_id, Uuid::from_u128(0x1234));
         assert_eq!(decoded.member, member);
         assert_eq!(decoded.key_fingerprint, key);
-        assert_eq!(decoded.request_nonce, vec![0x42; 16]);
+        assert_eq!(decoded.request_nonce, request_nonce);
         assert_eq!(decoded.route, route);
         assert_eq!(
             decoded.group_ids,
@@ -463,10 +678,10 @@ mod tests {
         let group = GroupId(Uuid::from_u128(0x1111));
         let member = MemberIdentity::from_array(["test", "alice"]);
         let key = KeyFingerprint::from_bytes([7; KEY_FINGERPRINT_LENGTH]);
-        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(&member, key);
+        let (member_id, key_fingerprint) = encode_member_key_selector_fields(&member, key);
         let payload = IntroductionClaimPayload {
             instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
-            request_nonce: vec![0x42; 16],
+            request_nonce: uuid_to_wire_bytes(Uuid::from_bytes([0x42; 16])),
             route: MessageField::some(
                 DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52156))).encode_proto(),
             ),
@@ -514,7 +729,9 @@ mod tests {
 
     #[test]
     fn endpoint_decoder_returns_discovery_frame() {
-        let request = introduction_request_endpoint_frame(vec![0x42; 16]);
+        let request_nonce = Uuid::from_bytes([0x42; 16]);
+        let request =
+            DiscoveryEndpointFrameSrc::IntroductionRequest { request_nonce }.encode_proto();
 
         let decoded = decode_endpoint_discovery_frame(&request.encode_to_vec())
             .expect("endpoint frame should decode")
@@ -523,7 +740,7 @@ mod tests {
         assert!(matches!(
             decoded.body,
             Some(discovery_frame::Body::IntroductionRequest(request))
-                if request.request_nonce == vec![0x42; 16]
+                if request.request_nonce == uuid_to_wire_bytes(request_nonce)
         ));
     }
 

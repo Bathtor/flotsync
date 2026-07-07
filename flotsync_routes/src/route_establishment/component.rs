@@ -1,6 +1,6 @@
 //! Kompact component implementing route establishment probes and introductions.
 
-use super::DiscoveryCredentials;
+use super::{DiscoveryCredentials, DiscoveryKeyMaterialStatus};
 use crate::{
     DatagramRouteScope,
     RouteDiscoveryPort,
@@ -9,24 +9,27 @@ use crate::{
     RouteEndpointLifecyclePort,
     RouteEndpointUnavailableReason,
     RoutePreferenceRank,
-    RouteSendId,
     RouteSharingKind,
     RouteTransportActorMessage,
     RouteTransportInboundDeliver,
     RouteTransportPort,
-    RouteTransportSend,
-    RouteTransportSubmitResult,
     SendRouteCandidate,
     TransportRouteKey,
     UdpRouteKey,
     config_keys,
+    endpoint_discovery::{
+        LocalUdpEndpointBinding,
+        LocalUdpEndpointState,
+        route_transport_inbound_source,
+        submit_endpoint_discovery_frame,
+    },
+    key_material_discovery::{FetchKeyMaterial, KeyMaterialDiscoveryPort},
     protocol::{
         DecodedIntroductionClaimPayload,
+        DiscoveryEndpointFrameSrc,
         decode_endpoint_discovery_frame_from_buf,
         decode_introduction_claim_payload_view,
-        encode_claim_payload_selector_fields,
-        introduction_endpoint_frame,
-        introduction_request_endpoint_frame,
+        encode_member_key_selector_fields,
     },
 };
 use flotsync_core::{
@@ -40,7 +43,7 @@ use flotsync_discovery::{
     protocol::DiscoveryRoute,
     services::{PeerAnnouncementObservationPort, PeerAnnouncementObserved},
 };
-use flotsync_io::prelude::{IoPayload, SocketId};
+use flotsync_io::prelude::IoPayload;
 use flotsync_messages::{
     buffa::{Message as _, MessageField},
     discovery as discovery_proto,
@@ -124,6 +127,8 @@ pub struct RouteEstablishmentComponent {
     ctx: ComponentContext<Self>,
     /// Route source port where verified peer routes are published.
     discovery_port: ProvidedPort<RouteDiscoveryPort<TransportRouteKey>>,
+    /// Key-material fetch request path for direct key-material discovery.
+    key_material_discovery_port: RequiredPort<KeyMaterialDiscoveryPort>,
     /// Peer-announcement input from one or more announcement protocols.
     announcement_port: RequiredPort<PeerAnnouncementObservationPort>,
     /// Reassembled route-transport payloads sharing the runtime endpoint.
@@ -170,6 +175,7 @@ impl RouteEstablishmentComponent {
         Self {
             ctx: ComponentContext::uninitialised(),
             discovery_port: ProvidedPort::uninitialised(),
+            key_material_discovery_port: RequiredPort::uninitialised(),
             announcement_port: RequiredPort::uninitialised(),
             route_transport_port: RequiredPort::uninitialised(),
             route_endpoint_lifecycle_port: RequiredPort::uninitialised(),
@@ -453,7 +459,10 @@ impl RouteEstablishmentComponent {
         let DiscoveryRoute::Udp(target) = route;
 
         let nonce = Uuid::new_v4();
-        let frame = introduction_request_endpoint_frame(uuid_to_wire_bytes(nonce));
+        let frame = DiscoveryEndpointFrameSrc::IntroductionRequest {
+            request_nonce: nonce,
+        }
+        .encode_proto();
         if !self
             .submit_endpoint_frame(endpoint, target, Arc::new(frame), "introduction request")
             .await
@@ -488,46 +497,16 @@ impl RouteEstablishmentComponent {
         payload: Arc<dyn FlotsyncSerializable>,
         label: &'static str,
     ) -> bool {
-        let route = udp_route_transport_candidate(endpoint, target);
-        let send = RouteTransportSend {
-            send_id: RouteSendId(Uuid::new_v4()),
-            route,
+        submit_endpoint_discovery_frame(
+            &self.route_transport,
+            self.log(),
+            "route establishment",
+            endpoint,
+            target,
             payload,
-        };
-        let future = self
-            .route_transport
-            .ask_with(|promise| RouteTransportActorMessage::Submit(Ask::new(promise, send)));
-        match future.await {
-            Ok(RouteTransportSubmitResult::Sent { coverage_key }) => {
-                trace!(
-                    self.log(),
-                    "route establishment submitted {} through route transport via {:?}",
-                    label,
-                    coverage_key
-                );
-                true
-            }
-            Ok(RouteTransportSubmitResult::SendFailed {
-                coverage_key,
-                reason,
-            }) => {
-                debug!(
-                    self.log(),
-                    "route establishment {} transport submit failed via {:?}: {:?}",
-                    label,
-                    coverage_key,
-                    reason
-                );
-                false
-            }
-            Err(_error) => {
-                error!(
-                    self.log(),
-                    "route establishment {} transport submit promise was dropped", label
-                );
-                false
-            }
-        }
+            label,
+        )
+        .await
     }
 
     /// Expire one active introduction probe if the nonce and timer still match.
@@ -576,6 +555,16 @@ impl RouteEstablishmentComponent {
                     Handled::OK
                 })
             }
+            Some(
+                discovery_proto::discovery_frame::Body::KeyBundleLookupRequest(_)
+                | discovery_proto::discovery_frame::Body::KeyBundleLookupResponse(_),
+            ) => {
+                trace!(
+                    self.log(),
+                    "route establishment ignored key-material discovery frame from {}", source
+                );
+                Handled::OK
+            }
             None => {
                 debug!(
                     self.log(),
@@ -607,13 +596,20 @@ impl RouteEstablishmentComponent {
         source: SocketAddr,
         request: discovery_proto::IntroductionRequest,
     ) -> HandlerResult {
-        if request.request_nonce.is_empty() {
-            trace!(
-                self.log(),
-                "ignored introduction request from {} with empty nonce", source
-            );
-            return Handled::OK;
-        }
+        let request_nonce =
+            match uuid_from_wire_bytes(&request.request_nonce, "IntroductionRequest.request_nonce")
+            {
+                Ok(request_nonce) => request_nonce,
+                Err(error) => {
+                    trace!(
+                        self.log(),
+                        "ignored introduction request from {} with malformed nonce: {}",
+                        source,
+                        error
+                    );
+                    return Handled::OK;
+                }
+            };
         let Some(endpoint) = self.local_endpoint.binding() else {
             debug!(
                 self.log(),
@@ -639,13 +635,13 @@ impl RouteEstablishmentComponent {
         }
 
         let instance_uuid = uuid_to_wire_bytes(self.config.instance_id);
-        let request_nonce = request.request_nonce;
+        let request_nonce = uuid_to_wire_bytes(request_nonce);
         let group_ids = group_ids
             .iter()
             .copied()
             .map(group_id_to_wire_bytes)
             .collect::<Vec<_>>();
-        let (member_id, key_fingerprint) = encode_claim_payload_selector_fields(
+        let (member_id, key_fingerprint) = encode_member_key_selector_fields(
             &self.local_member,
             self.credentials.local_discovery_key_fingerprint(),
         );
@@ -662,10 +658,7 @@ impl RouteEstablishmentComponent {
                 ..discovery_proto::IntroductionClaimPayload::default()
             };
             let claim_payload = claim_payload.encode_to_vec();
-            let signature = match self
-                .credentials
-                .sign_discovery_claim_payload(&claim_payload)
-            {
+            let signature = match self.credentials.sign_discovery_payload(&claim_payload) {
                 Ok(signature) => signature,
                 Err(error) => {
                     error!(
@@ -687,7 +680,10 @@ impl RouteEstablishmentComponent {
             claims,
             ..discovery_proto::Introduction::default()
         };
-        let frame = introduction_endpoint_frame(introduction);
+        let frame = DiscoveryEndpointFrameSrc::Introduction {
+            introduction: &introduction,
+        }
+        .encode_proto();
         self.submit_endpoint_frame(endpoint, source, Arc::new(frame), "introduction response")
             .await;
         Handled::OK
@@ -715,43 +711,16 @@ impl RouteEstablishmentComponent {
         let memberships = self.group_memberships.snapshot();
         let mut accepted_members = TrieSet::new();
         for claim in prepared.claims {
-            match verify_prepared_claim(self.credentials.as_ref(), claim).await {
-                Ok(verified_claim) => {
-                    if claim_matches_group_memberships(
-                        memberships.as_ref(),
-                        &verified_claim.member,
-                        &verified_claim.group_ids,
-                    ) && self
-                        .route_interest_permits_member(prepared.route, &verified_claim.member)
-                    {
-                        let route_publication = self
-                            .credentials
-                            .permit_member_route_publication(
-                                &verified_claim.member,
-                                verified_claim.key_fingerprint,
-                            )
-                            .await;
-                        match route_publication {
-                            Ok(()) => {
-                                accepted_members.insert(verified_claim.member);
-                            }
-                            Err(error) => {
-                                debug!(
-                                    self.log(),
-                                    "ignored introduction claim from {} without route-publication permission: {}",
-                                    source,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    debug!(
-                        self.log(),
-                        "ignored unverifiable introduction claim from {}: {}", source, error
-                    );
-                }
+            if let Some(member) = self
+                .accept_prepared_introduction_claim(
+                    source,
+                    prepared.route,
+                    memberships.as_ref(),
+                    claim,
+                )
+                .await
+            {
+                accepted_members.insert(member);
             }
         }
         if accepted_members.is_empty() {
@@ -764,6 +733,110 @@ impl RouteEstablishmentComponent {
             return;
         }
         self.mark_route_reachable(prepared.route, accepted_members);
+    }
+
+    /// Return the claim member when one prepared claim verifies and is publishable.
+    async fn accept_prepared_introduction_claim(
+        &mut self,
+        source: SocketAddr,
+        route: DiscoveryRoute,
+        memberships: &GroupMemberships,
+        claim: PendingClaimVerification,
+    ) -> Option<MemberIdentity> {
+        if !self.route_interest_permits_member(route, &claim.member) {
+            debug!(
+                self.log(),
+                "ignored introduction claim from {} for uninterested member {} on route {:?}",
+                source,
+                claim.member,
+                route
+            );
+            return None;
+        }
+        match self
+            .credentials
+            .discovery_key_material_status(&claim.member, claim.key_fingerprint)
+            .await
+        {
+            Ok(DiscoveryKeyMaterialStatus::Available) => {
+                // Key material is present; continue to signature verification below.
+            }
+            Ok(DiscoveryKeyMaterialStatus::Missing) => {
+                debug!(
+                    self.log(),
+                    "requested missing key material for introduction claim from {}: {} {}",
+                    source,
+                    claim.member,
+                    claim.key_fingerprint
+                );
+                self.fetch_key_material(route, &claim.member, claim.key_fingerprint);
+                return None;
+            }
+            Ok(DiscoveryKeyMaterialStatus::Unusable) => {
+                debug!(
+                    self.log(),
+                    "ignored introduction claim from {} with unusable key material {} {}",
+                    source,
+                    claim.member,
+                    claim.key_fingerprint
+                );
+                return None;
+            }
+            Err(error) => {
+                debug!(
+                    self.log(),
+                    "ignored introduction claim from {} after key-material status check failed: {}",
+                    source,
+                    error
+                );
+                return None;
+            }
+        }
+        match verify_prepared_claim(self.credentials.as_ref(), claim).await {
+            Ok(verified_claim) => {
+                self.member_accepted_for_route_publication(source, memberships, verified_claim)
+                    .await
+            }
+            Err(error) => {
+                debug!(
+                    self.log(),
+                    "ignored unverifiable introduction claim from {}: {}", source, error
+                );
+                None
+            }
+        }
+    }
+
+    /// Return the claim member if membership and route-publication policy both accept it.
+    async fn member_accepted_for_route_publication(
+        &mut self,
+        source: SocketAddr,
+        memberships: &GroupMemberships,
+        verified_claim: VerifiedIntroductionClaim,
+    ) -> Option<MemberIdentity> {
+        if !claim_matches_group_memberships(
+            memberships,
+            &verified_claim.member,
+            &verified_claim.group_ids,
+        ) {
+            return None;
+        }
+        let route_publication = self
+            .credentials
+            .permit_member_route_publication(&verified_claim.member, verified_claim.key_fingerprint)
+            .await;
+        match route_publication {
+            Ok(()) => Some(verified_claim.member),
+            Err(error) => {
+                debug!(
+                    self.log(),
+                    "ignored introduction claim from {} without route-publication permission: {}",
+                    source,
+                    error
+                );
+                None
+            }
+        }
     }
 
     /// Collect introduction claims that match the currently active probe.
@@ -796,8 +869,16 @@ impl RouteEstablishmentComponent {
             );
             return None;
         };
-        let probe_nonce = uuid_to_wire_bytes(probe.nonce);
-        if introduction.request_nonce != probe_nonce {
+        let Ok(introduction_nonce) =
+            uuid_from_wire_bytes(&introduction.request_nonce, "Introduction.request_nonce")
+        else {
+            trace!(
+                self.log(),
+                "ignored introduction from {} with malformed probe nonce", source
+            );
+            return None;
+        };
+        if introduction_nonce != probe.nonce {
             trace!(
                 self.log(),
                 "ignored introduction from {} with mismatched probe nonce", source
@@ -812,7 +893,7 @@ impl RouteEstablishmentComponent {
                 match prepare_claim_for_verification(
                     route,
                     instance_id,
-                    &probe_nonce,
+                    probe.nonce,
                     &self.local_member,
                     claim,
                 ) {
@@ -828,6 +909,20 @@ impl RouteEstablishmentComponent {
             })
             .collect();
         Some(super::state::PartiallyVerifiedIntroduction { route, claims })
+    }
+
+    /// Request one direct key-material fetch.
+    fn fetch_key_material(
+        &mut self,
+        route: DiscoveryRoute,
+        member: &MemberIdentity,
+        key_fingerprint: flotsync_security::KeyFingerprint,
+    ) {
+        self.key_material_discovery_port.trigger(FetchKeyMaterial {
+            route,
+            member: member.clone(),
+            key_fingerprint,
+        });
     }
 
     /// Publish one route for the verified members until the reachable lease expires.
@@ -994,6 +1089,7 @@ ignore_requests!(
     RouteDiscoveryPort<TransportRouteKey>,
     RouteEstablishmentComponent
 );
+ignore_indications!(KeyMaterialDiscoveryPort, RouteEstablishmentComponent);
 
 impl Require<RouteTransportPort<TransportRouteKey>> for RouteEstablishmentComponent {
     fn handle(
@@ -1084,36 +1180,6 @@ fn manual_filters_from_watches(
     Ok(filters)
 }
 
-/// Build the route-transport candidate used for one UDP introduction send.
-fn udp_route_transport_candidate(
-    endpoint: LocalUdpEndpointBinding,
-    remote_addr: SocketAddr,
-) -> SendRouteCandidate<TransportRouteKey> {
-    SendRouteCandidate {
-        coverage_key: TransportRouteKey::Udp(UdpRouteKey {
-            remote_addr,
-            scope: DatagramRouteScope::Unicast,
-            local_bind: Some(endpoint.local_addr),
-        }),
-        sharing: RouteSharingKind::Exclusive,
-        preference_rank: RoutePreferenceRank::new(1),
-    }
-}
-
-/// Extract the remote UDP source from one inbound route-transport delivery.
-fn route_transport_inbound_source(
-    inbound: &RouteTransportInboundDeliver<TransportRouteKey>,
-) -> Option<SocketAddr> {
-    if let Some(remote_addr) = inbound.transport.remote_addr {
-        Some(remote_addr)
-    } else {
-        match inbound.transport.route {
-            TransportRouteKey::Udp(route) => Some(route.remote_addr),
-            TransportRouteKey::Tcp(_) => None,
-        }
-    }
-}
-
 /// Verify the signature on a prepared claim and keep its group ids with its member.
 async fn verify_prepared_claim(
     credentials: &dyn DiscoveryCredentials,
@@ -1187,32 +1253,6 @@ struct VerifiedIntroductionClaim {
     key_fingerprint: flotsync_security::KeyFingerprint,
     /// Decoded claim group ids after the signature check succeeded.
     group_ids: HashSet<GroupId>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct LocalUdpEndpointBinding {
-    /// Socket id owned by the shared UDP runtime endpoint.
-    pub(super) socket_id: SocketId,
-    /// Concrete local address observed after bind.
-    pub(super) local_addr: SocketAddr,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum LocalUdpEndpointState {
-    /// The shared UDP runtime endpoint has not been observed yet.
-    #[default]
-    Unbound,
-    /// The shared UDP runtime endpoint is available for discovery traffic.
-    Bound(LocalUdpEndpointBinding),
-}
-
-impl LocalUdpEndpointState {
-    pub(super) fn binding(self) -> Option<LocalUdpEndpointBinding> {
-        match self {
-            Self::Bound(binding) => Some(binding),
-            Self::Unbound => None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
