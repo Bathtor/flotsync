@@ -1,79 +1,38 @@
-use crate::{STORE_SECRET_KEY_LENGTH, SecurityError, StoreSecretKey, StoreSecretKeyId};
+//! OS secret-manager backed local store-secret loading.
+
+use super::{
+    AccountTooLongSnafu,
+    BuildEntrySnafu,
+    GenerateKeySnafu,
+    InitialiseStorageSnafu,
+    InvalidRecordSnafu,
+    LoadedLocalStoreSecret,
+    LocalStoreSecretError,
+    LocalStoreSecretProfile,
+    LocalStoreSecretResult,
+    WriteSnafu,
+    ensure_portable_selector,
+};
+use crate::{STORE_SECRET_KEY_LENGTH, StoreSecretKey, StoreSecretKeyId};
 use flotsync_core::member::Identifier;
 use keyring_core::{Entry, Error as KeyringError};
 use snafu::prelude::*;
-use std::fmt;
 use zeroize::Zeroizing;
 
-/// Result type for loading or creating the device-local store secret.
-pub type LocalStoreSecretResult<T> = std::result::Result<T, LocalStoreSecretError>;
-
-/// Application-local profile that selects one device-local store secret.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct LocalStoreSecretProfile(String);
-
-impl LocalStoreSecretProfile {
-    /// Build a profile from a caller-provided local selector.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LocalStoreSecretError::EmptyProfile`] if the selector is empty
-    /// after trimming whitespace, or [`LocalStoreSecretError::ProfileWhitespace`]
-    /// if it has leading or trailing whitespace. Returns
-    /// [`LocalStoreSecretError::ProfileNotPortable`] if the selector cannot be
-    /// used consistently by all supported keyring backends.
-    pub fn new(value: impl Into<String>) -> LocalStoreSecretResult<Self> {
-        let value = value.into();
-        let trimmed = value.trim();
-        ensure!(!trimmed.is_empty(), EmptyProfileSnafu);
-        ensure!(
-            trimmed == value,
-            ProfileWhitespaceSnafu {
-                value: value.clone(),
-            }
-        );
-        ensure_portable_selector(trimmed).map_err(|message| {
-            LocalStoreSecretError::ProfileNotPortable {
-                value: value.clone(),
-                message,
-            }
-        })?;
-        Ok(Self(value))
-    }
-
-    /// Return the profile selector as provided by the caller.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for LocalStoreSecretProfile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Store-secret key loaded from local application profile storage.
-#[derive(Debug)]
-pub struct LoadedLocalStoreSecret {
-    key_id: StoreSecretKeyId,
-    store_secret_key: StoreSecretKey,
-}
+/// Keyring service name that scopes all flotsync local store-secret entries.
+const LOCAL_STORE_SECRET_SERVICE: &str = "flotsync.local-store-secret.v1";
+/// Prefix used to make flotsync-owned account names recognisable in keyring tools.
+const LOCAL_STORE_SECRET_ACCOUNT_PREFIX: &str = "flotsync";
+/// Short marker that distinguishes this binary record from unrelated keyring bytes.
+const LOCAL_STORE_SECRET_RECORD_MAGIC: &[u8] = b"fs-lss";
+/// Binary record version for the current magic-prefixed local secret payload.
+const LOCAL_STORE_SECRET_RECORD_VERSION: u8 = 1;
+/// Length of the generated key id stored before the secret key bytes.
+const LOCAL_STORE_SECRET_KEY_ID_LENGTH: usize = StoreSecretKeyId::BYTE_LENGTH;
+/// Conservative account-name limit shared by the currently supported keyring backends.
+const LOCAL_STORE_SECRET_ACCOUNT_MAX_BYTES: usize = 512;
 
 impl LoadedLocalStoreSecret {
-    /// Return the generated key id stored next to encrypted replication cells.
-    #[must_use]
-    pub fn key_id(&self) -> StoreSecretKeyId {
-        self.key_id
-    }
-
-    /// Consume this value into its generated key id and secret key.
-    #[must_use]
-    pub fn into_parts(self) -> (StoreSecretKeyId, StoreSecretKey) {
-        (self.key_id, self.store_secret_key)
-    }
-
     /// Encode the keyring record format for this generated local secret.
     fn encode_record(&self) -> Zeroizing<Vec<u8>> {
         let mut record = Zeroizing::new(Vec::with_capacity(
@@ -153,92 +112,6 @@ impl LoadedLocalStoreSecret {
     }
 }
 
-/// Errors from application-local store-secret loading and first-run creation.
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
-pub enum LocalStoreSecretError {
-    /// The profile selector is empty and cannot identify a local secret slot.
-    #[snafu(display("Local store-secret profile must not be empty."))]
-    EmptyProfile,
-    /// The profile selector would be ambiguous after ordinary config whitespace cleanup.
-    #[snafu(display("Local store-secret profile {value:?} must not have surrounding whitespace."))]
-    ProfileWhitespace { value: String },
-    /// The profile selector cannot be represented consistently by supported keyring backends.
-    #[snafu(display("Local store-secret profile {value:?} is not portable: {message}"))]
-    ProfileNotPortable {
-        value: String,
-        message: &'static str,
-    },
-    /// The application id cannot be represented consistently by supported keyring backends.
-    #[snafu(display(
-        "Application id '{application_id}' cannot select a local store secret: {message}"
-    ))]
-    ApplicationIdNotPortable {
-        application_id: String,
-        message: &'static str,
-    },
-    /// The readable account name would exceed the smallest supported backend limit.
-    #[snafu(display(
-        "Local store-secret account is {actual} bytes, but supported keyring backends allow at most {maximum} bytes."
-    ))]
-    AccountTooLong { maximum: usize, actual: usize },
-    /// The process could not initialise the configured local secret storage.
-    #[snafu(display("Failed to initialise local store-secret storage: {source}"))]
-    InitialiseStorage { source: KeyringError },
-    /// No persistent keyring store has been selected for the current target.
-    #[snafu(display(
-        "No persistent local store-secret keyring is configured for target '{target_os}'. Add a target-specific persistent keyring backend before enabling local store-secret loading on this platform."
-    ))]
-    UnsupportedPersistentStore { target_os: &'static str },
-    /// The selected local secret entry could not be built.
-    #[snafu(display(
-        "Failed to build local store-secret entry for application '{application_id}' and profile '{profile}': {source}"
-    ))]
-    BuildEntry {
-        application_id: Identifier,
-        profile: LocalStoreSecretProfile,
-        source: KeyringError,
-    },
-    /// The selected application/profile slot has not yet been initialised.
-    #[snafu(display(
-        "No local store secret exists for application '{application_id}' and profile '{profile}'."
-    ))]
-    Missing {
-        application_id: Identifier,
-        profile: LocalStoreSecretProfile,
-    },
-    /// Reading the selected local secret failed.
-    #[snafu(display(
-        "Failed to read local store secret for application '{application_id}' and profile '{profile}': {source}"
-    ))]
-    Read {
-        application_id: Identifier,
-        profile: LocalStoreSecretProfile,
-        source: KeyringError,
-    },
-    /// First-run generation of a store-secret key failed.
-    #[snafu(display("Failed to generate local store-secret key: {source}"))]
-    GenerateKey { source: SecurityError },
-    /// Writing the newly generated local secret failed.
-    #[snafu(display(
-        "Failed to write local store secret for application '{application_id}' and profile '{profile}': {source}"
-    ))]
-    Write {
-        application_id: Identifier,
-        profile: LocalStoreSecretProfile,
-        source: KeyringError,
-    },
-    /// The selected local secret entry exists but does not match the expected record format.
-    #[snafu(display(
-        "Stored local secret for application '{application_id}' and profile '{profile}' is invalid: {message}"
-    ))]
-    InvalidRecord {
-        application_id: Identifier,
-        profile: LocalStoreSecretProfile,
-        message: String,
-    },
-}
-
 /// Load an existing store secret for one application/profile slot.
 ///
 /// # Errors
@@ -289,33 +162,6 @@ pub fn load_or_create_local_store_secret(
         Err(error) => Err(error),
     }
 }
-
-/// Keyring service name that scopes all flotsync local store-secret entries.
-const LOCAL_STORE_SECRET_SERVICE: &str = "flotsync.local-store-secret.v1";
-/// Prefix used to make flotsync-owned account names recognisable in keyring tools.
-const LOCAL_STORE_SECRET_ACCOUNT_PREFIX: &str = "flotsync";
-/// Short marker that distinguishes this binary record from unrelated keyring bytes.
-const LOCAL_STORE_SECRET_RECORD_MAGIC: &[u8] = b"fs-lss";
-/// Binary record version for the current magic-prefixed local secret payload.
-const LOCAL_STORE_SECRET_RECORD_VERSION: u8 = 1;
-/// Length of the generated key id stored before the secret key bytes.
-const LOCAL_STORE_SECRET_KEY_ID_LENGTH: usize = StoreSecretKeyId::BYTE_LENGTH;
-/// Separator chosen for our readable account string: `flotsync/<application>/<profile>`.
-const LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR: char = '/';
-/// Conservative account-name limit shared by the currently supported keyring backends.
-const LOCAL_STORE_SECRET_ACCOUNT_MAX_BYTES: usize = 512;
-/// Android's native keyring backend internally joins service and account with this divider.
-///
-/// It is not our account separator. We reject it inside caller-controlled
-/// account components so Android cannot reinterpret two distinct selectors as
-/// the same native key.
-const ANDROID_NATIVE_STORE_DIVIDER: &str = "\u{FEFF}@\u{FEFF}";
-const PORTABLE_SELECTOR_ANDROID_DIVIDER_MESSAGE: &str =
-    "must not contain the Android keyring divider";
-const PORTABLE_SELECTOR_ACCOUNT_SEPARATOR_MESSAGE: &str =
-    "must not contain the local account separator '/'";
-const PORTABLE_SELECTOR_CHARACTER_SET_MESSAGE: &str =
-    "must contain only lower-case ASCII letters, digits, '.', ':', '_', or '-'";
 
 /// Build the keyring entry address for one application/profile slot.
 fn local_store_secret_entry(
@@ -397,7 +243,7 @@ fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
     target_os = "windows",
 )))]
 fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
-    UnsupportedPersistentStoreSnafu {
+    super::UnsupportedPersistentStoreSnafu {
         target_os: std::env::consts::OS,
     }
     .fail()
@@ -445,8 +291,9 @@ fn local_store_secret_account(
             message,
         }
     })?;
+    let separator = super::LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR;
     let account = format!(
-        "{LOCAL_STORE_SECRET_ACCOUNT_PREFIX}{LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR}{application_id}{LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR}{profile}"
+        "{LOCAL_STORE_SECRET_ACCOUNT_PREFIX}{separator}{application_id}{separator}{profile}"
     );
     ensure!(
         account.len() <= LOCAL_STORE_SECRET_ACCOUNT_MAX_BYTES,
@@ -456,26 +303,6 @@ fn local_store_secret_account(
         }
     );
     Ok(account)
-}
-
-/// Validate one selector component against the portable keyring account subset.
-fn ensure_portable_selector(value: &str) -> Result<(), &'static str> {
-    fn is_portable_account_char(character: char) -> bool {
-        character.is_ascii_lowercase()
-            || character.is_ascii_digit()
-            || matches!(character, '.' | ':' | '_' | '-')
-    }
-
-    if value.contains(ANDROID_NATIVE_STORE_DIVIDER) {
-        return Err(PORTABLE_SELECTOR_ANDROID_DIVIDER_MESSAGE);
-    }
-    if value.contains(LOCAL_STORE_SECRET_ACCOUNT_SEPARATOR) {
-        return Err(PORTABLE_SELECTOR_ACCOUNT_SEPARATOR_MESSAGE);
-    }
-    if !value.chars().all(is_portable_account_char) {
-        return Err(PORTABLE_SELECTOR_CHARACTER_SET_MESSAGE);
-    }
-    Ok(())
 }
 
 /// Install the keyring sample store for tests before creating local entries.

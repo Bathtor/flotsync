@@ -35,7 +35,7 @@ pub use identity::{
     local_member_keys_from_private_bundle,
     public_member_keys_from_public_bundle,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "local-secret-manager"))]
 pub use local_store_secret::install_local_store_secret_test_store;
 pub use local_store_secret::{
     LoadedLocalStoreSecret,
