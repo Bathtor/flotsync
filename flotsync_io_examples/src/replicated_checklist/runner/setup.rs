@@ -10,7 +10,7 @@ pub(super) struct ChecklistStoreSetup {
 }
 
 /// Load config, local store secret, and the `SQLite` store for a checklist command.
-pub(super) fn load_checklist_store_setup(
+pub(super) async fn load_checklist_store_setup(
     config_path: &Path,
 ) -> Result<ChecklistStoreSetup, ReplicatedChecklistError> {
     let config = ChecklistAppConfig::load(config_path).context(repl_error::ConfigSnafu)?;
@@ -23,6 +23,7 @@ pub(super) fn load_checklist_store_setup(
             &config.store_path,
             [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
         )
+        .await
         .context(repl_error::StoreSnafu)?,
     );
     Ok(ChecklistStoreSetup {

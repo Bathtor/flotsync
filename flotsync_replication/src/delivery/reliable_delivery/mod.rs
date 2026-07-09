@@ -1761,10 +1761,9 @@ mod tests {
     }
 
     fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
-        let store = Arc::new(
-            SqliteReplicationStore::in_memory(local_member.clone())
-                .expect("security store should build"),
-        );
+        let store = block_on(SqliteReplicationStore::in_memory(local_member.clone()))
+            .expect("security store should build");
+        let store = Arc::new(store);
         let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
             .into_iter()
             .filter(|member| member != local_member);

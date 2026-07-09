@@ -117,7 +117,7 @@ pub async fn load_replication_runtime_with_test_security_toml(
 }
 
 /// Wait for one test future to resolve within the standard replication timeout.
-pub fn wait_for_test_reply<F>(future: F) -> F::Output
+pub fn wait_for_test_future<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
@@ -125,6 +125,18 @@ where
         TEST_WAIT_TIMEOUT,
         future,
         "timed out waiting for test future to resolve",
+    )
+}
+
+/// Wait for one test reply to resolve within the standard replication timeout.
+pub fn wait_for_test_reply<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    flotsync_io::test_support::wait_for_future(
+        TEST_WAIT_TIMEOUT,
+        future,
+        "timed out waiting for test reply",
     )
 }
 
@@ -566,10 +578,12 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    Arc::new(
-        SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
-            .expect("store should build"),
-    )
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        local_member,
+        schemas,
+    ))
+    .expect("store should build");
+    Arc::new(store)
 }
 
 /// Provision deterministic local-private keys and trusted peer keys into one store.

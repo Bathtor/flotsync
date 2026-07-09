@@ -340,7 +340,7 @@ where
     flotsync_io::test_support::wait_for_future(
         TEST_REPLY_TIMEOUT,
         future,
-        "timed out waiting for test future to resolve",
+        "timed out waiting for test reply",
     )
 }
 

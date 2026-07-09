@@ -55,7 +55,6 @@ use flotsync_messages::{
 use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
-use kompact::prelude::block_on;
 use log::warn;
 use snafu::prelude::*;
 use sqlx::{
@@ -101,11 +100,12 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
+    pub async fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
         Self::in_memory_with_schema_sources(
             local_member,
             std::iter::empty::<(DatasetId, SchemaSource)>(),
         )
+        .await
     }
 
     /// Open one disk-backed `SQLite` store for `local_member`.
@@ -113,12 +113,16 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub async fn file(
+        local_member: MemberIdentity,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, StoreError> {
         Self::file_with_schema_sources(
             local_member,
             path,
             std::iter::empty::<(DatasetId, SchemaSource)>(),
         )
+        .await
     }
 
     /// Create one in-memory store with the provided application schema sources.
@@ -126,7 +130,7 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn in_memory_with_schema_sources<I, S>(
+    pub async fn in_memory_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         schema_sources: I,
     ) -> Result<Self, StoreError>
@@ -134,6 +138,7 @@ impl SqliteReplicationStore {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
+        let schema_sources = collect_schema_sources(schema_sources);
         let database_url = format!(
             "sqlite:file:flotsync-replication-{}?mode=memory&cache=shared",
             Uuid::new_v4()
@@ -144,7 +149,7 @@ impl SqliteReplicationStore {
             })?
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options)
+        Self::from_connect_options(local_member, schema_sources, connect_options).await
     }
 
     /// Open one disk-backed `SQLite` store with the provided application schema sources.
@@ -152,7 +157,7 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn file_with_schema_sources<I, S>(
+    pub async fn file_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         path: impl AsRef<Path>,
         schema_sources: I,
@@ -161,47 +166,50 @@ impl SqliteReplicationStore {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
+        let schema_sources = collect_schema_sources(schema_sources);
         let connect_options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options)
+        Self::from_connect_options(local_member, schema_sources, connect_options).await
     }
 
-    fn from_connect_options<I, S>(
+    async fn from_connect_options(
         local_member: MemberIdentity,
-        schema_sources: I,
+        schema_sources: HashMap<DatasetId, SchemaSource>,
         connect_options: SqliteConnectOptions,
-    ) -> Result<Self, StoreError>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let pool = block_on(
-            SqlitePoolOptions::new()
-                .min_connections(1)
-                .max_connections(8)
-                .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-                .idle_timeout(None)
-                .max_lifetime(None)
-                .connect_with(connect_options),
-        )
-        .context(SqlxSnafu)?;
-        let mut connection = block_on(pool.acquire()).context(SqlxSnafu)?;
-        block_on(initialise_schema(&mut connection))?;
+    ) -> Result<Self, StoreError> {
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(8)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(connect_options)
+            .await
+            .context(SqlxSnafu)?;
+        let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+        initialise_schema(&mut connection).await?;
         drop(connection);
 
-        let schema_sources = schema_sources
-            .into_iter()
-            .map(|(dataset_id, schema)| (dataset_id, schema.into()))
-            .collect();
         Ok(Self {
             local_member,
             schema_sources: Arc::new(schema_sources),
             pool: Arc::new(pool),
         })
     }
+}
+
+fn collect_schema_sources<I, S>(schema_sources: I) -> HashMap<DatasetId, SchemaSource>
+where
+    I: IntoIterator<Item = (DatasetId, S)>,
+    S: Into<SchemaSource>,
+{
+    schema_sources
+        .into_iter()
+        .map(|(dataset_id, schema)| (dataset_id, schema.into()))
+        .collect()
 }
 
 impl ReplicationStore for SqliteReplicationStore {
@@ -2181,6 +2189,26 @@ mod tests {
         )
     }
 
+    fn in_memory_store(local_member: MemberIdentity) -> SqliteReplicationStore {
+        wait_for_store_future(SqliteReplicationStore::in_memory(local_member))
+            .expect("store should build")
+    }
+
+    fn in_memory_store_with_schema_sources<I, S>(
+        local_member: MemberIdentity,
+        schema_sources: I,
+    ) -> SqliteReplicationStore
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        wait_for_store_future(SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member,
+            schema_sources,
+        ))
+        .expect("store should build")
+    }
+
     fn docs_dataset_id() -> DatasetId {
         DatasetId::try_new("docs").expect("dataset id should build")
     }
@@ -2325,7 +2353,7 @@ mod tests {
 
     #[test]
     fn dropping_open_sqlite_transaction_releases_store() {
-        let store = Arc::new(SqliteReplicationStore::in_memory(local_member()).unwrap());
+        let store = Arc::new(in_memory_store(local_member()));
         let transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         drop(transaction);
@@ -2355,11 +2383,10 @@ mod tests {
     fn sqlite_store_roundtrips_group_dataset_and_update_records() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(101));
         let row_key = RowKey(Uuid::from_u128(202));
         let group = sample_group(group_id);
@@ -2476,7 +2503,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_loads_replication_groups_by_requested_ids() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let first_group_id = GroupId(Uuid::from_u128(10_001));
         let second_group_id = GroupId(Uuid::from_u128(10_002));
         let missing_group_id = GroupId(Uuid::from_u128(10_003));
@@ -2525,7 +2552,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_roundtrips_local_member_private_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
@@ -2559,7 +2586,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_rejects_conflicting_local_member_private_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
@@ -2590,7 +2617,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_roundtrips_member_public_keys_and_trust_evidence() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let record =
             MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
         let evidence = MemberKeyTrustEvidenceRecord {
@@ -2635,7 +2662,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_rejects_member_public_keys_with_mismatched_fingerprint() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let mut record =
             MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
         record.key_id.fingerprint = test_public_member_keys(&local_member()).fingerprint();
@@ -2654,7 +2681,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_roundtrips_blocked_key_fingerprints() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let fingerprint = test_public_member_keys(&remote_member()).fingerprint();
 
         let mut transaction =
@@ -2678,11 +2705,10 @@ mod tests {
     fn sqlite_store_filters_replication_updates_by_producer_range() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(10_011));
         let group = sample_group(group_id);
         let encoded_operation = encoded_insert_snapshot("range query", &schema);
@@ -2773,11 +2799,10 @@ mod tests {
     fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(104));
         let row_key = RowKey(Uuid::from_u128(204));
         let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
@@ -2846,11 +2871,10 @@ mod tests {
     fn sqlite_store_scans_dataset_rows_in_key_order() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(106));
         let first_row_key = RowKey(Uuid::from_u128(206));
         let second_row_key = RowKey(Uuid::from_u128(207));
@@ -2905,11 +2929,10 @@ mod tests {
     fn sqlite_store_rejects_tombstone_to_active_row_transition() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(105));
         let row_key = RowKey(Uuid::from_u128(205));
         let tombstone_snapshot = title_snapshot(&schema, row_key, "deleted");
@@ -2953,11 +2976,7 @@ mod tests {
     fn sqlite_store_rejects_duplicate_group_insert() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
-            local_member(),
-            [(dataset_id, schema)],
-        )
-        .expect("store should build");
+        let store = in_memory_store_with_schema_sources(local_member(), [(dataset_id, schema)]);
         let group_id = GroupId(Uuid::from_u128(303));
         let group = sample_group(group_id);
 
@@ -2978,11 +2997,10 @@ mod tests {
     fn sqlite_store_rejects_duplicate_update_insert_but_allows_applied_toggle() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(404));
         let group = sample_group(group_id);
         let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());

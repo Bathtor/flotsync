@@ -308,6 +308,10 @@ mod tests {
         (generated, bundle)
     }
 
+    fn test_store(local_member: MemberIdentity) -> SqliteReplicationStore {
+        block_on(SqliteReplicationStore::in_memory(local_member)).expect("store should build")
+    }
+
     fn provision_local_test_keys(
         store: &SqliteReplicationStore,
         config: &ChecklistAppConfig,
@@ -484,8 +488,7 @@ mod tests {
             ],
         );
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let local_bundle = provision_local_test_keys(&store, &config, &replication_security, 1);
 
         let loaded = block_on(load_local_public_key_bundle(
@@ -517,8 +520,7 @@ mod tests {
             vec![MemberIdentity::from_array(["alice"]), bob.clone()],
         );
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let local_bundle = provision_local_test_keys(&store, &config, &replication_security, 2);
         let (_, bob_bundle) = generated_test_bundle(bob.clone(), 3);
 
@@ -555,8 +557,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(103));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let local_bundle = provision_local_test_keys(&store, &config, &replication_security, 6);
         block_test_fingerprint(&store, local_bundle.fingerprint());
 
@@ -596,8 +597,7 @@ mod tests {
             ],
         );
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let _local_bundle = provision_local_test_keys(&store, &config, &replication_security, 7);
         let (_, bob_bundle) = generated_test_bundle(bob.clone(), 8);
         let (_, carol_bundle) = generated_test_bundle(carol.clone(), 9);
@@ -642,8 +642,7 @@ mod tests {
             PathBuf::from("unused.sqlite"),
             vec![MemberIdentity::from_array(["alice"]), bob.clone()],
         );
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let (_, bob_bundle) = generated_test_bundle(bob.clone(), 4);
         block_on(store_observed_public_key_binding(
             &store,
@@ -687,8 +686,7 @@ mod tests {
             PathBuf::from("unused.sqlite"),
             vec![MemberIdentity::from_array(["alice"]), bob.clone()],
         );
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         let (_, bob_bundle) = generated_test_bundle(bob.clone(), 5);
         block_on(store_observed_public_key_binding(
             &store,
@@ -759,8 +757,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(103));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
 
         let result = block_on(ensure_configured_group(
             &store,
@@ -777,8 +774,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(101));
         let config = test_config(group_id, PathBuf::from("unused.sqlite"));
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(config.local_member.clone());
         provision_local_test_keys(&store, &config, &replication_security, 6);
         let mut existing = config.clone();
         existing.ordered_members = vec![
@@ -804,8 +800,7 @@ mod tests {
         let group_id = GroupId(Uuid::from_u128(104));
         let insert_config = test_config(group_id, PathBuf::from("unused.sqlite"));
         let replication_security = test_replication_security_secrets();
-        let store = SqliteReplicationStore::in_memory(insert_config.local_member.clone())
-            .expect("store should build");
+        let store = test_store(insert_config.local_member.clone());
         provision_local_test_keys(&store, &insert_config, &replication_security, 7);
         insert_configured_group(&store, &insert_config, &replication_security);
         let mut mismatched_config = insert_config.clone();

@@ -85,6 +85,10 @@ pub fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
 }
 
 /// Build an egress buffer pool for endpoint-frame encoding in route-component tests.
+///
+/// # Panics
+///
+/// Panics if the default test IO buffer configuration cannot build an egress pool.
 #[must_use]
 pub fn test_egress_pool() -> EgressPool {
     IoBufferPools::new(IoBufferConfig::default())
@@ -93,6 +97,10 @@ pub fn test_egress_pool() -> EgressPool {
 }
 
 /// Encode one route-transport payload into an IO payload for test inspection.
+///
+/// # Panics
+///
+/// Panics if the test egress pool cannot be built or the payload cannot be encoded.
 #[must_use]
 pub fn encode_transport_payload(payload: &Arc<dyn FlotsyncSerializable>) -> IoPayload {
     block_on(encode_message_payload(
@@ -103,6 +111,10 @@ pub fn encode_transport_payload(payload: &Arc<dyn FlotsyncSerializable>) -> IoPa
 }
 
 /// Encode one endpoint-discovery frame into an IO payload.
+///
+/// # Panics
+///
+/// Panics if the test egress pool cannot be built or the frame cannot be encoded.
 #[must_use]
 pub fn endpoint_payload(frame: &impl FlotsyncSerializable) -> IoPayload {
     block_on(encode_message_payload(&test_egress_pool(), frame))
@@ -110,6 +122,10 @@ pub fn endpoint_payload(frame: &impl FlotsyncSerializable) -> IoPayload {
 }
 
 /// Build deterministic local and public keys for one member identity.
+///
+/// # Panics
+///
+/// Panics if test key generation fails or the generated key bundles cannot be decoded.
 #[must_use]
 pub fn generated_keys(member: MemberIdentity) -> (LocalMemberKeys, PublicKeyBundle) {
     let GeneratedMemberKeyBundles {
@@ -124,6 +140,10 @@ pub fn generated_keys(member: MemberIdentity) -> (LocalMemberKeys, PublicKeyBund
 }
 
 /// Assert that one route-transport submit targets the expected exclusive UDP route.
+///
+/// # Panics
+///
+/// Panics if the submit does not use an exclusive UDP route with the expected addresses.
 pub fn assert_udp_transport_route(
     send: &RouteTransportSend<TransportRouteKey>,
     expected_local_bind: SocketAddr,

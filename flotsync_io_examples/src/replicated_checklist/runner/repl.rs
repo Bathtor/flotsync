@@ -5,7 +5,7 @@ use super::{setup::load_checklist_store_setup, static_group::ensure_configured_g
 pub(super) async fn run_configured_peer(
     config_path: &Path,
 ) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     ensure_configured_group(
         setup.store.as_ref(),
         &setup.config,

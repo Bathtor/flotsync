@@ -67,6 +67,7 @@ group.
 
 <!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
 proper local store-secret backend exists. -->
+
 On headless Linux machines without a working Secret Service keyring, use an
 explicitly unsafe profile such as `unsafe:raspberrypi`. This skips OS keyring
 storage and derives the local store secret from the profile string. Changing

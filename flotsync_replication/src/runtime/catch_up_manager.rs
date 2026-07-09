@@ -942,7 +942,8 @@ mod tests {
     fn load_update_batch_honours_unlimited_batch_mode() {
         let group_id = GroupId(Uuid::from_u128(80_001));
         let store: Arc<dyn ReplicationStore> = Arc::new(
-            SqliteReplicationStore::in_memory(local_member()).expect("store should build"),
+            wait_for_store_future(SqliteReplicationStore::in_memory(local_member()))
+                .expect("store should build"),
         );
         persist_group_with_updates(&store, group_id, 20);
         let system = build_test_kompact_system();

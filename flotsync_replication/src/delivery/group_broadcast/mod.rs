@@ -1427,10 +1427,9 @@ mod tests {
         trusted_members: HashSet<MemberIdentity>,
         member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
     ) -> (DeliverySecurity, Arc<SqliteReplicationStore>) {
-        let store = Arc::new(
-            SqliteReplicationStore::in_memory(local_member.clone())
-                .expect("security store should build"),
-        );
+        let store = block_on(SqliteReplicationStore::in_memory(local_member.clone()))
+            .expect("security store should build");
+        let store = Arc::new(store);
         block_on(provision_test_security(
             local_member.clone(),
             store.as_ref(),

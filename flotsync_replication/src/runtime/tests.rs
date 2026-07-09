@@ -99,6 +99,7 @@ use crate::{
         provision_test_security as provision_shared_test_security,
         test_public_member_keys,
         test_replication_security_secrets,
+        wait_for_test_future,
     },
 };
 use flotsync_core::{
@@ -776,14 +777,22 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
-            .expect("store should build"),
-    );
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        local_member,
+        schemas,
+    ))
+    .expect("store should build");
+    let store = Arc::new(store);
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
     provision_test_security(store.as_ref(), &local_member, []);
     store
+}
+
+fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory(local_member))
+        .expect("store should build");
+    Arc::new(store)
 }
 
 fn load_runtime_fixture<I, S>(
@@ -931,9 +940,7 @@ fn load_title_runtime_pair_with_trust(
 }
 
 fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(local_member.clone());
     provision_test_security(store.as_ref(), local_member, []);
     let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
@@ -1320,8 +1327,7 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
 fn load_replication_runtime_accepts_store_provisioned_security() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
@@ -1355,8 +1361,7 @@ fn replication_security_secrets_load_or_create_reuses_local_profile() {
 #[test]
 fn load_replication_runtime_rejects_missing_local_private_keys() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     let listener = Arc::new(ListenerStub::default());
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
@@ -1381,8 +1386,7 @@ fn load_replication_runtime_rejects_missing_local_private_keys() {
 #[test]
 fn load_replication_runtime_rejects_wrong_store_secret_key() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let test_security = test_replication_security_secrets();
@@ -1413,8 +1417,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
 #[test]
 fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_402));
     persist_alice_group_with_security_material(
@@ -1448,8 +1451,7 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
 #[test]
 fn load_replication_runtime_rejects_unsupported_stored_group_security_version() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_403));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
@@ -1486,8 +1488,7 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
 #[test]
 fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_404));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
@@ -1525,9 +1526,7 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let group_id = GroupId(Uuid::from_u128(50_401));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
@@ -1560,9 +1559,7 @@ fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
 fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_key() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let alternate_bob_keys =
         MemberPublicKeysRecord::from_public_keys(&test_public_keys(&Identifier::from_array([
@@ -1623,8 +1620,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let remote_addr = remote_endpoint_lease.addr(0);
     let bob_member = bob_member();
     let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts_and_runtime_config_toml(
@@ -1646,18 +1642,14 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     let bob_member = bob_member();
     let group_id = GroupId(Uuid::from_u128(35));
     let members = vec![alice_member.clone(), bob_member.clone()];
-    let bob_store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let bob_store = sqlite_store(bob_member.clone());
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     persist_group_membership_for_member(bob_store.as_ref(), group_id, members.clone(), 1);
     let bob_listener = Arc::new(ListenerStub::default());
     let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store, bob_listener);
     wait_for_group_install(&bob_runtime, group_id);
 
-    let alice_store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let alice_store = sqlite_store(alice_member.clone());
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     persist_group_membership_for_member(alice_store.as_ref(), group_id, members, 0);
     let alice_listener = Arc::new(ListenerStub::default());
@@ -1683,9 +1675,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
@@ -1709,9 +1699,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
 #[test]
 fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let alice_member = alice_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
@@ -2356,9 +2344,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
 fn create_group_rejects_missing_permitted_keys_without_storing_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let runtime = load_runtime_with_parts(
         app_alice_id(),
@@ -2400,9 +2386,7 @@ fn create_group_rejects_missing_permitted_keys_without_storing_group() {
 fn bootstrap_payload_validation_rejects_unpermitted_sender_fingerprint() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, []);
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &bob_member);
@@ -2447,9 +2431,7 @@ fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multi
  {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let alternate_alice_source = test_public_keys(&Identifier::from_array(["alice", "phone"]));
     let alternate_alice_keys = PublicMemberKeys::from_key_bytes(
@@ -2494,9 +2476,7 @@ fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multi
 fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_permission() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, []);
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let store_for_security: Arc<dyn ReplicationStore> = store;
@@ -2552,9 +2532,7 @@ fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let charlie_member = Identifier::from_array(["charlie", "laptop"]);
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &bob_member);
     let alice_keys = test_public_keys(&alice_member);
@@ -2600,9 +2578,7 @@ fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let charlie_member = Identifier::from_array(["charlie", "laptop"]);
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(
         store.as_ref(),
         &alice_member,
@@ -2637,9 +2613,7 @@ fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
 fn bootstrap_preparation_inlines_bundles_at_configured_limit() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let security = load_test_runtime_security(store, &alice_member);
     let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])

@@ -824,7 +824,10 @@ mod tests {
     }
 
     fn sqlite_store() -> Arc<SqliteReplicationStore> {
-        Arc::new(SqliteReplicationStore::in_memory(local_member()).expect("store should build"))
+        Arc::new(
+            wait_for_security_store_future(SqliteReplicationStore::in_memory(local_member()))
+                .expect("store should build"),
+        )
     }
 
     fn security_store(store: Arc<SqliteReplicationStore>) -> SecurityStore {

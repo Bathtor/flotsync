@@ -1069,7 +1069,10 @@ mod tests {
     }
 
     fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
-        Arc::new(SqliteReplicationStore::in_memory(local_member).expect("store should build"))
+        Arc::new(
+            wait_for_delivery_security_future(SqliteReplicationStore::in_memory(local_member))
+                .expect("store should build"),
+        )
     }
 
     fn provision_security(

@@ -31,7 +31,7 @@ pub(super) async fn run_key_command(
 
 /// Create local identity keys if absent and print the local public bundle.
 async fn init_local_keys(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     let existing_bundle = load_local_public_key_bundle(
         setup.store.as_ref(),
         &setup.config.local_member,
@@ -94,7 +94,7 @@ async fn init_local_keys(config_path: &Path) -> Result<(), ReplicatedChecklistEr
 
 /// Print the local public bundle from encrypted local-key storage.
 async fn export_local_keys(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     let bundle = load_local_public_key_bundle(
         setup.store.as_ref(),
         &setup.config.local_member,
@@ -116,7 +116,7 @@ async fn inspect_public_bundle(
     config_path: &Path,
     public_bundle: &str,
 ) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let report =
         public_bundle_inspection_report(setup.store.as_ref(), &setup.config, &bundle).await?;
@@ -130,7 +130,7 @@ async fn trust_public_bundle(
     member_id: &MemberIdentity,
     public_bundle: &str,
 ) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let fingerprint = bundle.fingerprint();
     let warnings =
@@ -156,7 +156,7 @@ async fn block_fingerprint(
     config_path: &Path,
     fingerprint: KeyFingerprint,
 ) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path)?;
+    let setup = load_checklist_store_setup(config_path).await?;
     let mut transaction = setup
         .store
         .begin_transaction()
