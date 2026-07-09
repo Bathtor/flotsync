@@ -2,39 +2,48 @@ id = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"
 ref = "flotsync-ist.9"
 title = "Add replicated-checklist store-native key setup commands"
 body = """
-Implement the agreed replicated-checklist key setup convenience flow from flotsync-ist.1.10. This removes the example dependency on JWKS key files and gives manual testing a store-native path for local keys, public bundles, trust, blocking, and inspection.
+Implement the agreed replicated-checklist store-native key setup flow from flotsync-ist.1.10, narrowed after planning to the commands needed for the first manual setup CUJ. The goal is to remove the example dependency on JWKS key files and provide a store-native path to initialise local keys, export a copyable public bundle, inspect received bundles, record explicit trust, record global blocks, and run the checklist peer from stored key material.
 
-Agreed direction:
-A01. Replace the current generate-keys JWKS flow with a top-level keys command family on the replicated-checklist binary.
-A02. Key setup commands stay outside the REPL because they must work before the replication runtime starts.
-A03. The first command set is: run <config>, keys init-local <config>, keys export-local <config>, keys inspect <config> <public-bundle>, keys trust <config> <member-id> <public-bundle>, keys list <config>, and keys block <config> <fingerprint>.
-A04. No reset-local command in this slice. Manual recovery can remain deleting the whole example store followed by keys init-local.
-A05. run <config> must fail loudly when local identity keys are missing, with an actionable message pointing to keys init-local <config>. It must not silently create fresh local identity keys.
-A06. keys init-local <config> creates local private key material in the configured store for local-member if absent, then prints the local public bundle and fingerprint. Existing matching keys are reused and printed.
-A07. keys export-local <config> prints the local member id, canonical public bundle string, canonical padded fingerprint string, and grouped display fingerprint. Output must clearly mark the public bundle as the copy-paste value needed for manual setup and mark fingerprints/member id as informational verification context.
-A08. keys inspect <config> <public-bundle> decodes without trusting. It prints schemes, fingerprint, display fingerprint, known identity bindings, whether the fingerprint is globally blocked, whether any binding is trusted/untrusted, and conflicts with current local knowledge.
-A09. keys trust <config> <member-id> <public-bundle> decodes, derives the fingerprint, stores the bundle if needed, and records positive trust/evidence for exactly (member-id, fingerprint). It accepts bundles, not fingerprint-only approvals, in this slice.
-A10. keys trust warns if the fingerprint is already bound to another identity or the identity already has other fingerprints.
-A11. keys list <config> prints local keys and known remote key bindings, including untrusted and blocked entries by default.
-A12. keys block <config> <fingerprint> records a global blocked-key decision by fingerprint. It must not delete key material or identity bindings.
-A13. The config stops carrying local-private-jwks-path and trusted-public-jwks-paths. It keeps local-member, store-path, store-secret-profile, group-id, ordered-members, and runtime networking config.
-A14. The example remains exact-device-identity only. Names like alice.phone are just explicit MemberIdentity values; no parent trust inheritance or generated subidentity mechanism is implied.
+Agreed scope:
+P01. Keep run <config>.
+P02. Add top-level keys init-local <config>, keys export-local <config>, keys inspect <config> <public-bundle>, keys trust <config> <member-id> <public-bundle>, and keys block <config> <fingerprint>.
+P03. Do not implement keys list in this slice. Full key-state inventory belongs to a later diagnostic/manual-test CUJ and would require new enumeration APIs that are not needed yet.
+P04. Key setup commands stay outside the REPL because they must work before the replication runtime starts.
+P05. No reset-local command in this slice. Manual recovery can remain deleting the whole example store followed by keys init-local.
+P06. run <config> must fail loudly when local identity keys or the configured static group are missing, with an actionable message pointing to keys init-local <config>. It must not silently create fresh local identity keys.
+P07. keys init-local <config> creates local private key material in the configured store for local-member if absent, initialises the configured static group when missing, then prints the local public bundle and fingerprints. Existing matching keys are reused and printed.
+P08. keys export-local <config> prints the local member id, canonical public bundle string, canonical padded fingerprint string, and grouped display fingerprint. Output clearly marks the public bundle as the copy-paste value and marks fingerprints/member id as informational verification context.
+P09. keys inspect <config> <public-bundle> decodes without trusting. It prints schemes, fingerprint forms, known identity bindings for that fingerprint, whether the fingerprint is globally blocked, trust/untrusted status for reported bindings, permission decisions, and conflicts with current local knowledge.
+P10. keys trust <config> <member-id> <public-bundle> decodes, derives the fingerprint, stores the bundle if needed, and records positive trust/evidence for exactly (member-id, fingerprint). It accepts bundles, not fingerprint-only approvals, in this slice.
+P11. keys trust warns if the fingerprint is already bound to another identity or the identity already has other fingerprints.
+P12. keys block <config> <fingerprint> records a global blocked-key decision by fingerprint. It must not delete key material or identity bindings.
+P13. The config remains store-native: local-member, store-path, store-secret-profile, group-secret-password while the temporary static-group bridge exists, group-id, ordered-members, and runtime networking config. local-private-jwks-path and trusted-public-jwks-paths remain absent.
+P14. The example remains exact-device-identity only. Names like alice.phone are explicit MemberIdentity values; no parent trust inheritance or generated subidentity mechanism is implied.
+
+Implementation plan:
+P15. Add the top-level keys command parser and dispatch.
+P16. Add shared setup helpers for config loading, store-secret loading, store opening, and pre-runtime command execution.
+P17. Add local-key initialisation and static-group initialisation for fresh stores, reusing existing key-generation, encryption, and group-security helpers.
+P18. Add export, inspect, trust, and block command handlers using existing PublicKeyBundle, fingerprint, trust evidence, blocked-fingerprint, and permission-reporting APIs.
+P19. Keep key-state enumeration/listing out of this task.
+P20. Add focused tests for command parsing, config cleanup, missing setup run failure, init/export roundtrip, inspect without trust, trust with explicit identity, and global block handling.
 
 Acceptance criteria:
-B01. The replicated-checklist CLI exposes the agreed keys subcommands and removes the JWKS generate-keys command.
-B02. Example config parsing no longer requires local-private-jwks-path or trusted-public-jwks-paths.
-B03. run <config> fails with an actionable error when local key material is missing instead of generating keys implicitly.
-B04. init-local and export-local support manual copy-paste setup and clearly distinguish copyable public bundle output from informational verification output.
-B05. inspect reports decoded bundle metadata, fingerprint strings, known bindings, trust summaries, conflicts, and global blocked status without granting trust.
-B06. trust records positive trust for an explicit MemberIdentity plus bundle-derived fingerprint and rejects or warns on ambiguous/conflicting local state as appropriate.
-B07. block records global blocked state by fingerprint and authority checks treat blocked fingerprints as rejected everywhere.
-B08. list includes trusted, untrusted, and blocked state so manual tests do not hide security-relevant records.
-B09. Tests cover command parsing, config cleanup, missing-local-key run failure, init/export roundtrip, inspect without trust, trust with explicit identity, global block, and removed JWKS config paths.
+P21. The replicated-checklist CLI exposes the agreed commands and has no JWKS generate-keys command.
+P22. Example config parsing does not require or accept local-private-jwks-path or trusted-public-jwks-paths as first-class example config.
+P23. run <config> fails with an actionable key setup error when local key material or static-group setup is missing.
+P24. init-local and export-local support manual copy-paste setup and clearly distinguish copyable public bundle output from informational verification output.
+P25. inspect reports decoded bundle metadata, fingerprint strings, known bindings for that fingerprint, trust summaries, conflicts, and global blocked status without granting trust.
+P26. trust records positive trust for an explicit MemberIdentity plus bundle-derived fingerprint and warns on ambiguous/conflicting local state where relevant.
+P27. block records global blocked state by fingerprint and existing authority checks continue to reject blocked fingerprints everywhere.
+P28. Tests cover the agreed command and setup behaviours.
 
-Estimate: roughly 400-800 LOC across CLI parsing, runner plumbing, config cleanup, trust/store API calls, output formatting, and focused tests."""
-status = "open"
+Estimate: roughly 650-950 LOC across CLI parsing, runner plumbing, setup commands, output formatting, and focused tests. The removed keys list scope avoids the expected extra store enumeration APIs and keeps the slice below the 1000 LOC warning line unless test scaffolding grows unexpectedly."""
+status = "in-progress"
+status_reason = "in review"
 type = "task"
 priority = 2
+assignee = "Codex"
 blocked_by = [
     "019f097b-ba0f-7002-944a-8efa67884f15",
     "019f098b-8001-7fc0-92ed-86392e41fb7d",
@@ -42,4 +51,10 @@ blocked_by = [
 ]
 parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
 created_at = "2026-06-28T10:28:20.582661Z"
-updated_at = "2026-06-28T10:28:26.775498Z"
+updated_at = "2026-07-08T06:59:38.247834Z"
+
+[[comments]]
+id = "019f4086-6887-7ad1-a78b-149c25a333c7"
+author = "lkroll"
+body = "Applied review follow-ups: consolidated top-level sync/async boundaries for the checklist runner, differentiated security error messages, marked load_local_public_key_bundle as temporary and linked cleanup task flotsync-git-1i3, updated store-native key setup scenarios/configs, and split the oversized runner module into key setup, static-group setup, REPL/runtime, and local setup modules. Validation passed locally."
+created_at = "2026-07-08T06:59:38.247834Z"

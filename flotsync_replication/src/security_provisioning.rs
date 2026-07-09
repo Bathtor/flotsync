@@ -30,6 +30,7 @@ use crate::{
 use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_security::{
     GroupKey,
+    PublicKeyBundle,
     PublicMemberKeys,
     STORE_SECRET_CRYPTO_VERSION_V1,
     StoreSecretContext,
@@ -189,6 +190,53 @@ pub async fn provision_replication_security<'a>(
     })
 }
 
+/// Load the local member's shareable public key bundle from encrypted local-key storage.
+///
+/// This is application setup support for pre-runtime commands that need to
+/// print or inspect the local public bundle without starting a replication
+/// runtime.
+///
+/// Stability: this is a temporary setup bridge for the current fixed
+/// static-group provisioning slice. It may move behind a narrower setup API or
+/// disappear once key management is decoupled from static-group setup; see
+/// flotsync-git-1i3.
+///
+/// # Errors
+///
+/// Returns [`ProvisionSecurityError`] when store access fails, the stored
+/// private-key record uses a different store-secret key id, stored key material
+/// cannot be opened, or the opened bundle fails validation.
+pub async fn load_local_public_key_bundle(
+    store: &dyn ReplicationStore,
+    local_member: &MemberIdentity,
+    security: &ReplicationSecuritySecrets,
+) -> Result<Option<PublicKeyBundle>, ProvisionSecurityError> {
+    let mut transaction = store
+        .begin_read_transaction()
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    let record = transaction
+        .load_local_member_private_keys(local_member)
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    transaction
+        .release()
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+
+    let plaintext = open_local_private_key_bundle(local_member, security, &record)?;
+    let local_keys =
+        local_member_keys_from_private_bundle(plaintext.as_ref(), local_member.clone())
+            .boxed()
+            .context(provision_security_error::InvalidLocalPrivateBundleSnafu {
+                member_id: local_member.clone(),
+            })?;
+    Ok(Some(local_keys.public_keys().public_key_bundle()))
+}
+
 /// Temporarily prepare encrypted group-security material for an initial static group.
 ///
 /// This helper is intentionally narrow and temporary: it exists so the
@@ -328,6 +376,22 @@ fn confirm_existing_local_private_keys(
     expected_bundle: &[u8],
     existing: &LocalMemberPrivateKeysRecord,
 ) -> Result<(), ProvisionSecurityError> {
+    let plaintext = open_local_private_key_bundle(local_member, security, existing)?;
+    ensure!(
+        plaintext.as_ref() == expected_bundle,
+        provision_security_error::LocalPrivateKeysMismatchSnafu {
+            member_id: local_member.clone(),
+        }
+    );
+    Ok(())
+}
+
+/// Open one encrypted local-private key bundle from a store record.
+fn open_local_private_key_bundle(
+    local_member: &MemberIdentity,
+    security: &ReplicationSecuritySecrets,
+    existing: &LocalMemberPrivateKeysRecord,
+) -> Result<impl AsRef<[u8]>, ProvisionSecurityError> {
     let secret = &existing.private_keys.secret;
     ensure!(
         &secret.key_id == security.store_secret_key_id(),
@@ -350,18 +414,11 @@ fn confirm_existing_local_private_keys(
         key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
-    let plaintext = open_store_secret(security.store_secret_key(), context, &sealed)
+    open_store_secret(security.store_secret_key(), context, &sealed)
         .boxed()
         .context(provision_security_error::OpenStoredLocalPrivateKeysSnafu {
             member_id: local_member.clone(),
-        })?;
-    ensure!(
-        plaintext.as_slice() == expected_bundle,
-        provision_security_error::LocalPrivateKeysMismatchSnafu {
-            member_id: local_member.clone(),
-        }
-    );
-    Ok(())
+        })
 }
 
 /// Build the encrypted local-private key record for first-time setup.

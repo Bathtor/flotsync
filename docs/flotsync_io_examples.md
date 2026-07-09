@@ -152,22 +152,36 @@ Add `--verbose` if you want the raw `h11` event dump after each case summary.
 
 ## Replicated Checklist
 
-Generate one local identity key pair per peer:
+Prepare one local identity key bundle per peer:
+
+```bash
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local bob.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local bob.toml
+```
+
+`keys init-local` creates or reuses the peer's local identity keys in its
+configured store. Copy each peer's `public bundle (copy this value)` output to
+the other peer, optionally inspect it, then trust it for the exact member
+identity before first run:
 
 ```bash
 cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  generate-keys alice ./alice-keys
+  keys inspect alice.toml BOB_PUBLIC_BUNDLE
 cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  generate-keys bob ./bob-keys
+  keys inspect bob.toml ALICE_PUBLIC_BUNDLE
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  keys trust alice.toml bob BOB_PUBLIC_BUNDLE
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 ```
 
-Each command writes `private.jwks` and `public.jwks` in the selected directory.
-Copy each peer's `public.jwks` to the other peer and reference those copied
-public files from the peer config below. `store-secret-profile` selects the
-device-local store secret for this application profile; the current
-implementation keeps that secret in OS-backed local storage and creates it on
-first run. `group-secret-password` remains a temporary shared static-group setup
-input and must match across peers in the same group.
+`store-secret-profile` selects the device-local store secret for this
+application profile; the current implementation keeps that secret in OS-backed
+local storage and creates it on first use. `group-secret-password` remains a
+temporary shared static-group setup input and must match across peers in the
+same group.
 
 Start two checklist peers with node-specific configs. The normal custom UDP discovery path does not
 need `static-peer-routes`: each peer announces its local delivery endpoint on the peer-announcement
@@ -181,8 +195,6 @@ local-member = "alice"
 store-path = "alice.sqlite"
 store-secret-profile = "alice-dev"
 group-secret-password = "temporary-shared-group-password"
-local-private-jwks-path = "alice-keys/private.jwks"
-trusted-public-jwks-paths = ["bob-keys/public.jwks"]
 group-id = 123
 ordered-members = ["alice", "bob"]
 ```
@@ -194,8 +206,6 @@ local-member = "bob"
 store-path = "bob.sqlite"
 store-secret-profile = "bob-dev"
 group-secret-password = "temporary-shared-group-password"
-local-private-jwks-path = "bob-keys/private.jwks"
-trusted-public-jwks-paths = ["alice-keys/public.jwks"]
 group-id = 123
 ordered-members = ["alice", "bob"]
 ```
