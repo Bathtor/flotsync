@@ -3,8 +3,9 @@
 use super::*;
 use crate::{
     protocol::{
-        DiscoveryEndpointFrameSrc,
-        KeyBundleLookupResponsePayloadSrc,
+        DiscoveryEndpointFrameView,
+        KeyBundleLookupResponsePayload,
+        KeyBundleLookupResponsePayloadView,
         decode_endpoint_discovery_frame_from_buf,
     },
     route_establishment::{DiscoveryCredentialFuture, DiscoveryKeyMaterialStatusFuture},
@@ -91,7 +92,7 @@ fn signed_lookup_response(
     bundle: &PublicKeyBundle,
     signer: &LocalMemberKeys,
 ) -> discovery_proto::SignedKeyBundleLookupResponse {
-    let payload = KeyBundleLookupResponsePayloadSrc {
+    let payload = KeyBundleLookupResponsePayloadView {
         member,
         key_fingerprint: fingerprint,
         request_nonce: nonce,
@@ -612,7 +613,7 @@ fn responder_ignores_non_local_lookup_request() {
     let remote_endpoint = loopback(62193);
     let harness = KeyMaterialDiscoveryHarness::new(local_member);
     harness.bind_endpoint(SocketId(133), local_endpoint);
-    let request = DiscoveryEndpointFrameSrc::KeyBundleLookupRequest {
+    let request = DiscoveryEndpointFrameView::KeyBundleLookupRequest {
         member: &remote_member,
         key_fingerprint: remote_bundle.fingerprint(),
         request_nonce: Uuid::from_u128(1330),
@@ -633,7 +634,7 @@ fn responder_ignores_lookup_request_on_non_endpoint_socket() {
     let remote_endpoint = loopback(62193);
     let harness = KeyMaterialDiscoveryHarness::new(local_member.clone());
     harness.bind_endpoint(SocketId(144), local_endpoint);
-    let request = DiscoveryEndpointFrameSrc::KeyBundleLookupRequest {
+    let request = DiscoveryEndpointFrameView::KeyBundleLookupRequest {
         member: &local_member,
         key_fingerprint: harness.credentials.local_discovery_key_fingerprint(),
         request_nonce: Uuid::from_u128(1440),
@@ -673,7 +674,7 @@ fn local_lookup_request_sends_signed_response() {
     let harness = KeyMaterialDiscoveryHarness::new(local_member.clone());
     harness.bind_endpoint(SocketId(134), local_endpoint);
     let request_nonce = Uuid::from_u128(1340);
-    let request = DiscoveryEndpointFrameSrc::KeyBundleLookupRequest {
+    let request = DiscoveryEndpointFrameView::KeyBundleLookupRequest {
         member: &local_member,
         key_fingerprint: harness.credentials.local_discovery_key_fingerprint(),
         request_nonce,
@@ -693,10 +694,9 @@ fn local_lookup_request_sends_signed_response() {
         Some(discovery_frame::Body::KeyBundleLookupResponse(response)) => *response,
         other => panic!("expected lookup response, got {other:?}"),
     };
-    let decoded = DecodedKeyBundleLookupResponsePayload::try_decode_proto_from_slice(
-        &response.response_payload,
-    )
-    .expect("response payload should validate");
+    let decoded =
+        KeyBundleLookupResponsePayload::try_decode_proto_from_slice(&response.response_payload)
+            .expect("response payload should validate");
     assert_eq!(decoded.member, local_member);
     assert_eq!(decoded.request_nonce, request_nonce);
     assert_eq!(
@@ -729,7 +729,7 @@ fn valid_lookup_response_stores_candidate_bundle() {
         &remote_bundle,
         &remote_keys,
     );
-    let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupResponse {
+    let frame = DiscoveryEndpointFrameView::KeyBundleLookupResponse {
         response: &response,
     }
     .encode_proto();
@@ -782,7 +782,7 @@ fn assert_invalid_lookup_response_is_not_stored(
         request.request_nonce,
         requested_fingerprint,
     );
-    let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupResponse {
+    let frame = DiscoveryEndpointFrameView::KeyBundleLookupResponse {
         response: &response,
     }
     .encode_proto();

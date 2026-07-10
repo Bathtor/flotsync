@@ -7,6 +7,7 @@ edition = "2024"
 test-support = ["flotsync_io/test-support"]
 
 [dependencies]
+borrowize = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_discovery = { path = "../flotsync_discovery", default-features = false, features = ["peer-announcement-via-kompact"] }
 flotsync_io = { path = "../flotsync_io", default-features = false }

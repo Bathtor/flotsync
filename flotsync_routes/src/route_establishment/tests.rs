@@ -20,7 +20,7 @@ use crate::{
     TransportRouteKey,
     UdpRouteKey,
     key_material_discovery::{FetchKeyMaterial, KeyMaterialDiscoveryPort},
-    protocol::{DiscoveryEndpointFrameSrc, decode_endpoint_discovery_frame_from_buf},
+    protocol::{DiscoveryEndpointFrameView, decode_endpoint_discovery_frame_from_buf},
     test_support::{
         RouteTransportRecorderComponent,
         TestRouteTransportPort,
@@ -375,7 +375,7 @@ impl<'a> IntroductionSpec<'a> {
             }],
             ..discovery_proto::Introduction::default()
         };
-        let frame = DiscoveryEndpointFrameSrc::Introduction {
+        let frame = DiscoveryEndpointFrameView::Introduction {
             introduction: &introduction,
         }
         .encode_proto();
@@ -852,7 +852,7 @@ fn endpoint_selection_port_updates_introduction_claim_routes() {
 
     harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
     harness.bind_endpoint(SocketId(42), local_endpoint);
-    let frame = DiscoveryEndpointFrameSrc::IntroductionRequest { request_nonce }.encode_proto();
+    let frame = DiscoveryEndpointFrameView::IntroductionRequest { request_nonce }.encode_proto();
     let payload = endpoint_payload(&frame);
     harness.receive_transport(remote_route, payload);
     let response = harness.recv_transport_submit();
@@ -882,7 +882,7 @@ fn oversized_introduction_response_is_submitted_through_route_transport() {
 
     harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
     harness.bind_endpoint(SocketId(43), local_endpoint);
-    let frame = DiscoveryEndpointFrameSrc::IntroductionRequest { request_nonce }.encode_proto();
+    let frame = DiscoveryEndpointFrameView::IntroductionRequest { request_nonce }.encode_proto();
     let payload = endpoint_payload(&frame);
     harness.receive_transport(remote_route, payload);
     let response = harness.recv_transport_submit();

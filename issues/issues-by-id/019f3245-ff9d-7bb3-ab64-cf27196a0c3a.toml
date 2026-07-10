@@ -4,36 +4,29 @@ title = "Generate borrowed view types for structs"
 body = """
 # Generate borrowed view types for structs
 
-Implement a proc-macro derive (e.g. `#[derive(View)]`) that generates a borrowed view variant of a struct, where owned fields become borrowed equivalents.
+Use the published `borrowize` crate to replace suitable manual borrowed protobuf source structs with generated borrowed view types.
 
-Example:
+Agreed scope:
+- Add `borrowize` as a workspace dependency and use it from `flotsync_routes` and `flotsync_replication`.
+- In `flotsync_routes`, rename the owned decoded key-bundle lookup response payload to the natural domain name and let `borrowize` generate the default borrowed view type. Update current response-payload source use-sites to the generated default name.
+- Keep `DiscoveryEndpointFrameSrc` manual for now. Follow-up `flotsync-git-g8w` tracks replacing it when `borrowize` supports enums.
+- In `flotsync_replication`, derive borrowed views for the runtime protobuf source structs where there is a clear owned named-field source shape. Keep manual enum and record adapters where `borrowize` cannot represent the shape cleanly.
+- Keep `RuntimeVersionVectorProtoSource` as an explicit adapter; a direct `EncodeProto` impl for `&VersionVector` is blocked in this crate by the orphan rule and moving the impl elsewhere is out of scope.
+- Preserve existing protobuf bytes and tests around owned and borrowed source encodings.
 
-```rust
-#[derive(View)]
-struct User {
-    id: u64,
-    name: String,
-    tags: Vec<Tag>,
-}
-```
-
-expands to:
-
-```rust
-struct UserView<'a> {
-    id: &'a u64,
-    name: &'a str,
-    tags: &'a [Tag],
-}
-
-impl User {
-    fn view(&self) -> UserView<'_>;
-}
-```
-
-The derive should map common owned types to their ergonomic borrowed forms (`String -> &str`, `Vec<T> -> &[T]`, etc.) while leaving other types as `&T`."""
-status = "open"
+Estimated touched production code remains well below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
+children = ["019f4c3e-6791-7b91-8e6b-506242515e22"]
 created_at = "2026-07-05T12:34:36.061281Z"
-updated_at = "2026-07-09T13:29:35.217617Z"
+updated_at = "2026-07-10T13:59:11.579796Z"
+closed_at = "2026-07-10T13:59:11.579796Z"
+
+[[comments]]
+id = "019f4c53-3ddb-7052-80ff-b5eb8b5f5530"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-10T13:59:11.579796Z"

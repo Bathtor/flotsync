@@ -9,10 +9,10 @@ use crate::{
     endpoint_discovery::{LocalUdpEndpointBinding, LocalUdpEndpointState},
     protocol::{
         DecodedKeyBundleLookupRequest,
-        DecodedKeyBundleLookupResponsePayload,
-        DiscoveryEndpointFrameSrc,
+        DiscoveryEndpointFrameView,
         DiscoveryRoute,
-        KeyBundleLookupResponsePayloadSrc,
+        KeyBundleLookupResponsePayload,
+        KeyBundleLookupResponsePayloadView,
         classify_shared_endpoint_discovery_frame_from_buf,
     },
     route_establishment::{DiscoveryCredentials, DiscoveryKeyMaterialStatus},
@@ -171,7 +171,7 @@ impl KeyMaterialDiscoveryComponent {
         }
         let DiscoveryRoute::Udp(target) = request.route;
         let nonce = Uuid::new_v4();
-        let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupRequest {
+        let frame = DiscoveryEndpointFrameView::KeyBundleLookupRequest {
             member: &request.member,
             key_fingerprint: request.key_fingerprint,
             request_nonce: nonce,
@@ -339,7 +339,7 @@ impl KeyMaterialDiscoveryComponent {
             );
             return Handled::OK;
         };
-        let payload = KeyBundleLookupResponsePayloadSrc {
+        let payload = KeyBundleLookupResponsePayloadView {
             member: &request.member,
             key_fingerprint: request.key_fingerprint,
             request_nonce: request.request_nonce,
@@ -362,7 +362,7 @@ impl KeyMaterialDiscoveryComponent {
             signature: MessageField::some(signature.encode_proto()),
             ..discovery_proto::SignedKeyBundleLookupResponse::default()
         };
-        let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupResponse {
+        let frame = DiscoveryEndpointFrameView::KeyBundleLookupResponse {
             response: &response,
         }
         .encode_proto();
@@ -386,7 +386,7 @@ impl KeyMaterialDiscoveryComponent {
         source: SocketAddr,
         response: discovery_proto::SignedKeyBundleLookupResponse,
     ) -> HandlerResult {
-        let decoded = match DecodedKeyBundleLookupResponsePayload::try_decode_proto_from_slice(
+        let decoded = match KeyBundleLookupResponsePayload::try_decode_proto_from_slice(
             &response.response_payload,
         ) {
             Ok(decoded) => decoded,
@@ -437,7 +437,7 @@ impl KeyMaterialDiscoveryComponent {
         key: PendingLookupKey,
         response_payload: Vec<u8>,
         signature: FrameSignature,
-        decoded: DecodedKeyBundleLookupResponsePayload,
+        decoded: KeyBundleLookupResponsePayload,
     ) {
         let public_keys = decoded
             .public_key_bundle
