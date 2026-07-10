@@ -12,11 +12,13 @@ use crate::{
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
         LocalMemberPrivateKeysRecord,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberPublicKeysRecord,
         ReplicationSecuritySecrets,
         ReplicationStore,
         ReplicationStoreTransaction,
         StoreError,
-        TrustedMemberPublicKeysRecord,
     },
     delivery::security::{
         LOGICAL_GROUP_SECRET_COLUMN,
@@ -28,13 +30,14 @@ use crate::{
 use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_security::{
     GroupKey,
+    PublicKeyBundle,
     PublicMemberKeys,
     STORE_SECRET_CRYPTO_VERSION_V1,
     StoreSecretContext,
-    local_member_keys_from_jwks,
+    local_member_keys_from_private_bundle,
     open_store_secret,
     open_stored_group_key,
-    public_member_keys_from_jwks,
+    public_member_keys_from_public_bundle,
     seal_store_secret,
 };
 use snafu::prelude::*;
@@ -45,7 +48,7 @@ use std::collections::HashSet;
 pub struct ProvisionedReplicationSecurity {
     /// Local member whose private key bundle was provisioned or confirmed.
     pub local_member: MemberIdentity,
-    /// Trusted remote/public members parsed from the supplied public JWKS inputs.
+    /// Trusted remote/public members decoded from the supplied public bundles.
     pub trusted_members: Vec<MemberIdentity>,
 }
 
@@ -56,21 +59,26 @@ pub enum ProvisionSecurityError {
     /// Store access failed while writing or checking provisioned security records.
     #[snafu(display("Failed to access replication store while provisioning security: {source}"))]
     StoreAccess { source: StoreError },
-    /// The configured local private JWKS did not parse or did not match the configured member.
-    #[snafu(display("Local private JWKS for member {member_id} is invalid: {source}"))]
-    InvalidLocalPrivateJwks {
+    /// The configured local private key bundle did not decode for the configured member.
+    #[snafu(display("Local private key bundle for member {member_id} is invalid: {source}"))]
+    InvalidLocalPrivateBundle {
         member_id: MemberIdentity,
         source: BoxError,
     },
-    /// One configured trusted public JWKS did not parse into usable public member keys.
-    #[snafu(display("Trusted public JWKS is invalid: {source}"))]
-    InvalidTrustedPublicJwks { source: BoxError },
+    /// One configured trusted public bundle did not decode into usable public member keys.
+    #[snafu(display("Trusted public key bundle for member {member_id} is invalid: {source}"))]
+    InvalidTrustedPublicBundle {
+        member_id: MemberIdentity,
+        source: BoxError,
+    },
     /// The same trusted public member identity was supplied more than once.
-    #[snafu(display("Trusted public JWKS for member {member_id} was supplied more than once."))]
-    DuplicateTrustedPublicJwks { member_id: MemberIdentity },
+    #[snafu(display(
+        "Trusted public key bundle for member {member_id} was supplied more than once."
+    ))]
+    DuplicateTrustedPublicBundle { member_id: MemberIdentity },
     /// The store already contains different local private-key material.
     #[snafu(display(
-        "Stored local private keys for member {member_id} differ from configured JWKS."
+        "Stored local private keys for member {member_id} differ from configured key bundle."
     ))]
     LocalPrivateKeysMismatch { member_id: MemberIdentity },
     /// The stored local private-key record uses a different store-secret key id.
@@ -125,22 +133,22 @@ pub enum ProvisionSecurityError {
 ///
 /// # Errors
 ///
-/// Returns [`ProvisionSecurityError`] when key parsing fails, store access
+/// Returns [`ProvisionSecurityError`] when key decoding fails, store access
 /// fails, configured trusted members are duplicated, or existing local key
-/// material conflicts with the supplied local private JWKS.
+/// material conflicts with the supplied local private bundle.
 pub async fn provision_replication_security<'a>(
     store: &dyn ReplicationStore,
     local_member: &MemberIdentity,
     security: &ReplicationSecuritySecrets,
-    local_private_jwks: &str,
-    trusted_public_jwks: impl IntoIterator<Item = &'a str>,
+    local_private_bundle: &[u8],
+    trusted_public_bundles: impl IntoIterator<Item = (&'a MemberIdentity, &'a [u8])>,
 ) -> Result<ProvisionedReplicationSecurity, ProvisionSecurityError> {
-    local_member_keys_from_jwks(local_private_jwks, Some(local_member))
+    local_member_keys_from_private_bundle(local_private_bundle, local_member.clone())
         .boxed()
-        .context(provision_security_error::InvalidLocalPrivateJwksSnafu {
+        .context(provision_security_error::InvalidLocalPrivateBundleSnafu {
             member_id: local_member.clone(),
         })?;
-    let trusted_public_keys = parse_trusted_public_keys(trusted_public_jwks)?;
+    let trusted_public_keys = decode_trusted_public_keys(trusted_public_bundles)?;
 
     let mut transaction = store
         .begin_transaction()
@@ -150,12 +158,21 @@ pub async fn provision_replication_security<'a>(
         transaction.as_mut(),
         local_member,
         security,
-        local_private_jwks,
+        local_private_bundle,
     )
     .await?;
     for public_keys in &trusted_public_keys {
+        let public_keys_record = MemberPublicKeysRecord::from_public_keys(public_keys);
+        let key_id = public_keys_record.key_id.clone();
         transaction
-            .ensure_trusted_member_public_keys(trusted_public_keys_record(public_keys))
+            .ensure_member_public_keys(public_keys_record)
+            .await
+            .context(provision_security_error::StoreAccessSnafu)?;
+        transaction
+            .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                key_id,
+                evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+            })
             .await
             .context(provision_security_error::StoreAccessSnafu)?;
     }
@@ -171,6 +188,53 @@ pub async fn provision_replication_security<'a>(
             .map(|keys| keys.member_id().clone())
             .collect(),
     })
+}
+
+/// Load the local member's shareable public key bundle from encrypted local-key storage.
+///
+/// This is application setup support for pre-runtime commands that need to
+/// print or inspect the local public bundle without starting a replication
+/// runtime.
+///
+/// Stability: this is a temporary setup bridge for the current fixed
+/// static-group provisioning slice. It may move behind a narrower setup API or
+/// disappear once key management is decoupled from static-group setup; see
+/// flotsync-git-1i3.
+///
+/// # Errors
+///
+/// Returns [`ProvisionSecurityError`] when store access fails, the stored
+/// private-key record uses a different store-secret key id, stored key material
+/// cannot be opened, or the opened bundle fails validation.
+pub async fn load_local_public_key_bundle(
+    store: &dyn ReplicationStore,
+    local_member: &MemberIdentity,
+    security: &ReplicationSecuritySecrets,
+) -> Result<Option<PublicKeyBundle>, ProvisionSecurityError> {
+    let mut transaction = store
+        .begin_read_transaction()
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    let record = transaction
+        .load_local_member_private_keys(local_member)
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    transaction
+        .release()
+        .await
+        .context(provision_security_error::StoreAccessSnafu)?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+
+    let plaintext = open_local_private_key_bundle(local_member, security, &record)?;
+    let local_keys =
+        local_member_keys_from_private_bundle(plaintext.as_ref(), local_member.clone())
+            .boxed()
+            .context(provision_security_error::InvalidLocalPrivateBundleSnafu {
+                member_id: local_member.clone(),
+            })?;
+    Ok(Some(local_keys.public_keys().public_key_bundle()))
 }
 
 /// Temporarily prepare encrypted group-security material for an initial static group.
@@ -254,22 +318,21 @@ pub fn validate_initial_group_security_material(
     Ok(())
 }
 
-/// Parse all trusted public JWKS inputs and reject duplicate member identities.
-fn parse_trusted_public_keys<'a>(
-    trusted_public_jwks: impl IntoIterator<Item = &'a str>,
+/// Decode all trusted public bundle inputs and reject duplicate member identities.
+fn decode_trusted_public_keys<'a>(
+    trusted_public_bundles: impl IntoIterator<Item = (&'a MemberIdentity, &'a [u8])>,
 ) -> Result<Vec<PublicMemberKeys>, ProvisionSecurityError> {
     let mut seen_members = HashSet::new();
     let mut parsed = Vec::new();
-    for jwks in trusted_public_jwks {
-        // Temporary MVP limitation: file/path context lives in the example layer,
-        // while this helper only sees JWKS text. Keep this intentionally simple
-        // until `flotsync-uohh` removes the application-side provisioning path.
-        let public_keys = public_member_keys_from_jwks(jwks, None)
+    for (member_id, bundle) in trusted_public_bundles {
+        let public_keys = public_member_keys_from_public_bundle(bundle, member_id.clone())
             .boxed()
-            .context(provision_security_error::InvalidTrustedPublicJwksSnafu)?;
+            .context(provision_security_error::InvalidTrustedPublicBundleSnafu {
+                member_id: member_id.clone(),
+            })?;
         ensure!(
             seen_members.insert(public_keys.member_id().clone()),
-            provision_security_error::DuplicateTrustedPublicJwksSnafu {
+            provision_security_error::DuplicateTrustedPublicBundleSnafu {
                 member_id: public_keys.member_id().clone(),
             }
         );
@@ -283,31 +346,52 @@ async fn provision_local_private_keys(
     transaction: &mut dyn ReplicationStoreTransaction,
     local_member: &MemberIdentity,
     security: &ReplicationSecuritySecrets,
-    local_private_jwks: &str,
+    local_private_bundle: &[u8],
 ) -> Result<(), ProvisionSecurityError> {
     let existing = transaction
         .load_local_member_private_keys(local_member)
         .await
         .context(provision_security_error::StoreAccessSnafu)?;
     if let Some(existing) = existing {
-        confirm_existing_local_private_keys(local_member, security, local_private_jwks, &existing)?;
+        confirm_existing_local_private_keys(
+            local_member,
+            security,
+            local_private_bundle,
+            &existing,
+        )?;
         return Ok(());
     }
 
-    let record = local_private_keys_record(local_member, security, local_private_jwks)?;
+    let record = local_private_keys_record(local_member, security, local_private_bundle)?;
     transaction
         .ensure_local_member_private_keys(record)
         .await
         .context(provision_security_error::StoreAccessSnafu)
 }
 
-/// Confirm that an existing encrypted local-key record matches the configured JWKS.
+/// Confirm that an existing encrypted local-key record matches the configured bundle.
 fn confirm_existing_local_private_keys(
     local_member: &MemberIdentity,
     security: &ReplicationSecuritySecrets,
-    expected_jwks: &str,
+    expected_bundle: &[u8],
     existing: &LocalMemberPrivateKeysRecord,
 ) -> Result<(), ProvisionSecurityError> {
+    let plaintext = open_local_private_key_bundle(local_member, security, existing)?;
+    ensure!(
+        plaintext.as_ref() == expected_bundle,
+        provision_security_error::LocalPrivateKeysMismatchSnafu {
+            member_id: local_member.clone(),
+        }
+    );
+    Ok(())
+}
+
+/// Open one encrypted local-private key bundle from a store record.
+fn open_local_private_key_bundle(
+    local_member: &MemberIdentity,
+    security: &ReplicationSecuritySecrets,
+    existing: &LocalMemberPrivateKeysRecord,
+) -> Result<impl AsRef<[u8]>, ProvisionSecurityError> {
     let secret = &existing.private_keys.secret;
     ensure!(
         &secret.key_id == security.store_secret_key_id(),
@@ -330,25 +414,18 @@ fn confirm_existing_local_private_keys(
         key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
-    let plaintext = open_store_secret(security.store_secret_key(), context, &sealed)
+    open_store_secret(security.store_secret_key(), context, &sealed)
         .boxed()
         .context(provision_security_error::OpenStoredLocalPrivateKeysSnafu {
             member_id: local_member.clone(),
-        })?;
-    ensure!(
-        plaintext.as_slice() == expected_jwks.as_bytes(),
-        provision_security_error::LocalPrivateKeysMismatchSnafu {
-            member_id: local_member.clone(),
-        }
-    );
-    Ok(())
+        })
 }
 
 /// Build the encrypted local-private key record for first-time setup.
 fn local_private_keys_record(
     local_member: &MemberIdentity,
     security: &ReplicationSecuritySecrets,
-    local_private_jwks: &str,
+    local_private_bundle: &[u8],
 ) -> Result<LocalMemberPrivateKeysRecord, ProvisionSecurityError> {
     let row_id = local_member.to_string();
     let context = StoreSecretContext {
@@ -358,15 +435,11 @@ fn local_private_keys_record(
         key_id: security.store_secret_key_id().as_bytes(),
         crypto_version: STORE_SECRET_CRYPTO_VERSION_V1,
     };
-    let sealed = seal_store_secret(
-        security.store_secret_key(),
-        context,
-        local_private_jwks.as_bytes(),
-    )
-    .boxed()
-    .context(provision_security_error::SealLocalPrivateKeysSnafu {
-        member_id: local_member.clone(),
-    })?;
+    let sealed = seal_store_secret(security.store_secret_key(), context, local_private_bundle)
+        .boxed()
+        .context(provision_security_error::SealLocalPrivateKeysSnafu {
+            member_id: local_member.clone(),
+        })?;
     Ok(LocalMemberPrivateKeysRecord {
         member_id: local_member.clone(),
         private_keys: EncryptedLocalMemberPrivateKeys {
@@ -376,13 +449,4 @@ fn local_private_keys_record(
             ),
         },
     })
-}
-
-/// Convert typed public member keys into the store's opaque trusted-key record.
-fn trusted_public_keys_record(public_keys: &PublicMemberKeys) -> TrustedMemberPublicKeysRecord {
-    TrustedMemberPublicKeysRecord {
-        member_id: public_keys.member_id().clone(),
-        signing_public_key: public_keys.signing_key_bytes().into(),
-        encryption_public_key: public_keys.encryption_key_bytes().into(),
-    }
 }

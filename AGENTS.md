@@ -8,7 +8,7 @@
 
 - For OKF-style design documentation work, use the project-local skill at `.codex/skills/flotsync-okf/SKILL.md` and its `references/doc-conventions.md` before editing `docs/`, `docs/index.md`, or `scripts/okf-docs.sc`.
 - Use `.agent_local_docs/tmp/` for temporary agent working notes that should survive ordinary machine uptime. Do not put this kind of state in `/tmp` or `/private/tmp` unless the user explicitly asks for OS-level temporary storage.
-- Review-feedback working notes are temporary coordination state, not project issue tracking. Keep them under `.agent_local_docs/tmp/`, not in `bd`.
+- Review-feedback working notes are temporary coordination state, not project issue tracking. Keep them under `.agent_local_docs/tmp/`, not in `gitrack`.
 - When the user provides substantial review feedback, capture every comment in a working note before implementation. Include stable IDs, file context, the feedback, current status, and the intended direction.
 - After plan alignment, update the working note with the agreed direction before editing production files.
 - During and after implementation, use the working note as the checklist. Before final response, double-check every captured feedback item and report any item that remains unresolved or intentionally deferred.
@@ -24,6 +24,7 @@
 - When splitting a single-file Rust module into a folder module, move the original module contents to `mod.rs` in the new folder.
 - Avoid nesting `?` into expressions. It's easier to read if they only occur at the end of a line. Refactor the expression into a field where needed.
 - Document non-public Rust helpers, fields, variants, and local types whenever their role, invariants, lifecycle, or preconditions are non-trivial or non-obvious. Prefer documenting what the item is supposed to do before adding code that explains how it does it.
+- Document the semantics of non-obvious boolean return values, especially helper methods where `true` means success, accepted, retained, skipped, or a no-op rather than simply returning a predicate.
 - Document all modules, even if not public. But especially thoroughly if public.
 - Add loop labels when control flow spans non-trivial nested loops or retries.
 - Only use the early-return-pattern if it reduces branches that are over 5 lines long or 3 nesting levels deep.
@@ -78,6 +79,9 @@ This project uses [`gitrack`](https://github.com/Bathtor/gitrack) for Git-native
 - Use `gitrack` for project issue tracking.
 - Prefer `--json` for agent-driven workflows.
 - Use `gitrack ready --json` to find unblocked open work.
+- Check `stats.skipped` in `gitrack list --json` and `gitrack ready --json` output; rerun with `-n <COUNT>` when the default limit hides needed work.
+- Use `gitrack create "<title>" --body "<body>" --json` to record new work and let gitrack generate the ref when possible.
+- Avoid manual `--ref` naming where possible; it is mainly for child tasks or rare cases where a human-chosen ref improves clarity.
 - Use `gitrack show <ref> --json` before changing an issue.
 - Use `gitrack claim <ref> --assignee <name> --json` before starting assigned work.
 - Use `gitrack update <ref> --body <text> --json` to keep the current issue description and plan up to date.

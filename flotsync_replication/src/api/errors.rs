@@ -53,6 +53,8 @@ pub enum ApiError {
     ApiExternal { source: BoxError },
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
+    #[snafu(display("Replication runtime lifecycle state was poisoned while {operation}."))]
+    RuntimeLifecyclePoisoned { operation: &'static str },
     #[snafu(display("Timed out waiting for summary from member {target} in group {group_id}."))]
     SummaryTimedOut {
         group_id: GroupId,
@@ -94,29 +96,38 @@ pub enum LoadSecurityError {
         group_id: GroupId,
         source: GroupMembersError,
     },
-    /// A persisted group references a member without locally trusted public keys.
+    /// A persisted group references a member without a permitted public key bundle.
     #[snafu(display(
-        "Stored replication group {group_id} is missing trusted public keys for member {member_id}."
+        "Stored replication group {group_id} does not have permitted public keys for member {member_id}."
     ))]
-    StoredGroupMissingTrustedPublicKeys {
+    StoredGroupMissingPermittedPublicKeys {
         group_id: GroupId,
         member_id: MemberIdentity,
     },
-    /// A persisted group references trusted key bytes with the wrong fixed length.
+    /// A persisted group references a member with multiple permitted public key bundles.
     #[snafu(display(
-        "Stored replication group {group_id} has trusted public key bytes for member {member_id} with invalid length {actual}; expected {expected}."
+        "Stored replication group {group_id} has {permitted_count} permitted public keys for member {member_id}."
     ))]
-    StoredGroupInvalidTrustedPublicKeyLength {
+    StoredGroupAmbiguousPermittedPublicKeys {
+        group_id: GroupId,
+        member_id: MemberIdentity,
+        permitted_count: usize,
+    },
+    /// A persisted group references member public-key bytes with the wrong fixed length.
+    #[snafu(display(
+        "Stored replication group {group_id} has public-key bytes for member {member_id} with invalid length {actual}; expected {expected}."
+    ))]
+    StoredGroupInvalidMemberPublicKeyLength {
         group_id: GroupId,
         member_id: MemberIdentity,
         expected: usize,
         actual: usize,
     },
-    /// A persisted group references trusted public keys that cannot be decoded.
+    /// A persisted group references member public keys that cannot be decoded.
     #[snafu(display(
-        "Stored replication group {group_id} has invalid trusted public keys for member {member_id}: {source}"
+        "Stored replication group {group_id} has invalid public keys for member {member_id}: {source}"
     ))]
-    StoredGroupInvalidTrustedPublicKeys {
+    StoredGroupInvalidMemberPublicKeys {
         group_id: GroupId,
         member_id: MemberIdentity,
         source: BoxError,

@@ -1,0 +1,48 @@
+id = "019f0d59-827c-7780-ae76-9a426ab8b278"
+ref = "flotsync-ist.8"
+title = "Expose pasteable public key bundle encoding"
+body = """
+Implement public-key bundle sharing, assessment, and trust feedback against the current generic PublicKey wrapper design.
+
+Agreed public API direction:
+- Expose local_public_key_bundle on ReplicationApi so applications can ask the live runtime for the local member's shareable identity-free PublicKeyBundle.
+- Keep assess_public_key_bundle as the read/report API for decoded identity-free PublicKeyBundle material.
+- Assess requests include a unique candidate_member_ids set and a material_storage mode. ReadOnly performs no writes; StoreCandidateBindings stores the bundle as observed public key material for every candidate identity before reporting, without adding trust evidence.
+- Keep record_public_key_bundle_feedback as the trust-feedback API. TrustMember stores the member binding if needed and records LocalExplicitTrust unless the fingerprint is already globally blocked. BlockFingerprint records the bundle fingerprint as globally blocked.
+- Trust feedback returns unit on success; the application already knows which feedback it submitted.
+- Do not change the protobuf schema. Use the existing generic PublicKey wrappers and keep public scheme reporting at the cryptography level, not proto format details.
+- Add Display support for PublicKeyBundleReport and child report types so CLI applications get useful formatting by default. Shared display vocabulary lives on the owning public API types, including AuthorityScope, PermissionDecision, and PermissionDenialReason.
+- Keep identity-free PublicKeyBundle byte and pasteable APIs as methods on the type itself, not duplicate free helper functions.
+- Public raw key byte APIs should be slice-based, not fixed-array based. Internally, Flotsync stores its own validated HPKE public-key byte wrapper and converts to the HPKE library type only at cryptographic use sites.
+
+Implementation notes:
+- Public API types live in flotsync_replication::api::security.
+- Running-system methods live on ReplicationApi, with runtime and security-store wiring behind them.
+- Security report constants live with their owning public API types: PublicKeyBundleSchemeReport::SUPPORTED and AuthorityScope::VALUES.
+- Runtime security handlers that do not mutate component state use spawn_local rather than block_on.
+- Validation covers local bundle retrieval, read-only assessment, store-and-report assessment, trust feedback, block feedback, blocked-then-trust rejection, runtime API wiring, Display formatting, slice-based public key byte APIs, and default policy behaviour."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "codex"
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f0e9b-3aa5-7a11-ac0c-f80947626449",
+]
+blocks = [
+    "019f0d0b-67ec-7381-b786-a3ab8a185843",
+    "019f0d0b-ae5c-75b3-8753-759878367b9a",
+    "019f0dc5-e3e6-7001-adf5-d3958d34f82f",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-28T08:29:57.75622Z"
+updated_at = "2026-06-30T18:47:45.364927Z"
+closed_at = "2026-06-30T18:47:45.364927Z"
+
+[[comments]]
+id = "019f19db-d5d4-7e10-a23d-3f711a07db41"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-30T18:47:45.364927Z"

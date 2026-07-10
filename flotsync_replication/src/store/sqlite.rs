@@ -9,7 +9,13 @@ use crate::{
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupMemberKeys,
         LocalMemberPrivateKeysRecord,
+        MemberKeyId,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberKeyTrustEvidenceSet,
+        MemberPublicKeysRecord,
         ReplicationGroupRecord,
         ReplicationRowRecord,
         ReplicationRowSnapshot,
@@ -24,7 +30,6 @@ use crate::{
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
-        TrustedMemberPublicKeysRecord,
     },
     runtime::messages::{
         MemberCountContext,
@@ -47,9 +52,9 @@ use flotsync_messages::{
     datamodel as datamodel_proto,
     proto::{DecodeProto, DecodeProtoWith, EncodeProto, ProtoInputDecodeError},
 };
+use flotsync_security::{KeyFingerprint, PublicMemberKeys};
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
-use kompact::prelude::block_on;
 use log::warn;
 use snafu::prelude::*;
 use sqlx::{
@@ -95,11 +100,12 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
+    pub async fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
         Self::in_memory_with_schema_sources(
             local_member,
             std::iter::empty::<(DatasetId, SchemaSource)>(),
         )
+        .await
     }
 
     /// Open one disk-backed `SQLite` store for `local_member`.
@@ -107,12 +113,16 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn file(local_member: MemberIdentity, path: impl AsRef<Path>) -> Result<Self, StoreError> {
+    pub async fn file(
+        local_member: MemberIdentity,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, StoreError> {
         Self::file_with_schema_sources(
             local_member,
             path,
             std::iter::empty::<(DatasetId, SchemaSource)>(),
         )
+        .await
     }
 
     /// Create one in-memory store with the provided application schema sources.
@@ -120,7 +130,7 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn in_memory_with_schema_sources<I, S>(
+    pub async fn in_memory_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         schema_sources: I,
     ) -> Result<Self, StoreError>
@@ -128,6 +138,7 @@ impl SqliteReplicationStore {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
+        let schema_sources = collect_schema_sources(schema_sources);
         let database_url = format!(
             "sqlite:file:flotsync-replication-{}?mode=memory&cache=shared",
             Uuid::new_v4()
@@ -138,7 +149,7 @@ impl SqliteReplicationStore {
             })?
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options)
+        Self::from_connect_options(local_member, schema_sources, connect_options).await
     }
 
     /// Open one disk-backed `SQLite` store with the provided application schema sources.
@@ -146,7 +157,7 @@ impl SqliteReplicationStore {
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub fn file_with_schema_sources<I, S>(
+    pub async fn file_with_schema_sources<I, S>(
         local_member: MemberIdentity,
         path: impl AsRef<Path>,
         schema_sources: I,
@@ -155,47 +166,50 @@ impl SqliteReplicationStore {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
+        let schema_sources = collect_schema_sources(schema_sources);
         let connect_options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options)
+        Self::from_connect_options(local_member, schema_sources, connect_options).await
     }
 
-    fn from_connect_options<I, S>(
+    async fn from_connect_options(
         local_member: MemberIdentity,
-        schema_sources: I,
+        schema_sources: HashMap<DatasetId, SchemaSource>,
         connect_options: SqliteConnectOptions,
-    ) -> Result<Self, StoreError>
-    where
-        I: IntoIterator<Item = (DatasetId, S)>,
-        S: Into<SchemaSource>,
-    {
-        let pool = block_on(
-            SqlitePoolOptions::new()
-                .min_connections(1)
-                .max_connections(8)
-                .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-                .idle_timeout(None)
-                .max_lifetime(None)
-                .connect_with(connect_options),
-        )
-        .context(SqlxSnafu)?;
-        let mut connection = block_on(pool.acquire()).context(SqlxSnafu)?;
-        block_on(initialise_schema(&mut connection))?;
+    ) -> Result<Self, StoreError> {
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .max_connections(8)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(connect_options)
+            .await
+            .context(SqlxSnafu)?;
+        let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+        initialise_schema(&mut connection).await?;
         drop(connection);
 
-        let schema_sources = schema_sources
-            .into_iter()
-            .map(|(dataset_id, schema)| (dataset_id, schema.into()))
-            .collect();
         Ok(Self {
             local_member,
             schema_sources: Arc::new(schema_sources),
             pool: Arc::new(pool),
         })
     }
+}
+
+fn collect_schema_sources<I, S>(schema_sources: I) -> HashMap<DatasetId, SchemaSource>
+where
+    I: IntoIterator<Item = (DatasetId, S)>,
+    S: Into<SchemaSource>,
+{
+    schema_sources
+        .into_iter()
+        .map(|(dataset_id, schema)| (dataset_id, schema.into()))
+        .collect()
 }
 
 impl ReplicationStore for SqliteReplicationStore {
@@ -325,11 +339,45 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_trusted_member_public_keys<'a>(
+    fn load_member_public_keys<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
+    }
+
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
-        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move { load_member_public_keys_for_member(self.assert_open_connection(), member_id).await }
+            .boxed()
+    }
+
+    fn load_member_public_keys_for_fingerprint<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        async move {
+            load_member_public_keys_for_fingerprint(self.assert_open_connection(), fingerprint)
+                .await
+        }
+        .boxed()
+    }
+
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
+        async move { load_member_key_trust_evidence(self.assert_open_connection(), key_id).await }
+            .boxed()
+    }
+
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        async move { is_key_fingerprint_blocked(self.assert_open_connection(), fingerprint).await }
             .boxed()
     }
 
@@ -365,6 +413,26 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move {
             load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
                 .await
+        }
+        .boxed()
+    }
+
+    fn load_dataset_rows<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        row_keys: &'a mut RowKeyIterator<'a>,
+    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            load_dataset_rows(
+                self.assert_open_connection(),
+                schema_sources.as_ref(),
+                group_id,
+                dataset_id,
+                row_keys,
+            )
+            .await
         }
         .boxed()
     }
@@ -405,40 +473,11 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
 }
 
 impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
-    fn load_replication_group<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_group(self.assert_open_connection(), group_id).await }.boxed()
-    }
-
-    fn load_replication_groups(
-        &mut self,
-    ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
-    }
-
-    fn load_replication_groups_for_ids<'a>(
-        &'a mut self,
-        group_ids: &'a HashSet<GroupId>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>> {
-        async move { load_replication_groups_for_ids(self.assert_open_connection(), group_ids).await }
-            .boxed()
-    }
-
     fn insert_replication_group(
         &mut self,
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
-    }
-
-    fn load_local_member_private_keys<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
-        async move { load_local_member_private_keys(self.assert_open_connection(), member_id).await }
-            .boxed()
     }
 
     fn ensure_local_member_private_keys(
@@ -449,21 +488,27 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
-    fn load_trusted_member_public_keys<'a>(
-        &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
-        async move { load_trusted_member_public_keys(self.assert_open_connection(), member_id).await }
+    fn ensure_member_public_keys(
+        &mut self,
+        record: MemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { ensure_member_public_keys(self.assert_open_connection(), &record).await }
             .boxed()
     }
 
-    fn ensure_trusted_member_public_keys(
+    fn ensure_member_key_trust_evidence(
         &mut self,
-        record: TrustedMemberPublicKeysRecord,
+        record: MemberKeyTrustEvidenceRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
-        async move {
-            ensure_trusted_member_public_keys(self.assert_open_connection(), &record).await
-        }
+        async move { ensure_member_key_trust_evidence(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn ensure_blocked_key_fingerprint(
+        &mut self,
+        fingerprint: KeyFingerprint,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { ensure_blocked_key_fingerprint(self.assert_open_connection(), &fingerprint).await }
         .boxed()
     }
 
@@ -483,26 +528,6 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
-    fn load_dataset_rows<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        dataset_id: &'a DatasetId,
-        row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
-        let schema_sources = self.schema_sources.clone();
-        async move {
-            load_dataset_rows(
-                self.assert_open_connection(),
-                schema_sources.as_ref(),
-                group_id,
-                dataset_id,
-                row_keys,
-            )
-            .await
-        }
-        .boxed()
-    }
-
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowPatch,
@@ -515,42 +540,6 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
                 &patch,
             )
             .await
-        }
-        .boxed()
-    }
-
-    fn load_replication_update<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        async move {
-            load_replication_update(self.assert_open_connection(), group_id, update_id).await
-        }
-        .boxed()
-    }
-
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        async move {
-            load_replication_updates(self.assert_open_connection(), group_id, filter, limit).await
-        }
-        .boxed()
-    }
-
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        async move {
-            load_replication_update_ids(self.assert_open_connection(), group_id, filter, limit)
-                .await
         }
         .boxed()
     }
@@ -629,6 +618,7 @@ CREATE TABLE IF NOT EXISTS group_members (
     group_id TEXT NOT NULL,
     member_index INTEGER NOT NULL,
     member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
     PRIMARY KEY (group_id, member_index),
     UNIQUE (group_id, member_identity),
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
@@ -676,10 +666,27 @@ CREATE TABLE IF NOT EXISTS local_members (
 );
 ",
         "
-CREATE TABLE IF NOT EXISTS known_peers (
-    member_identity TEXT PRIMARY KEY NOT NULL,
+CREATE TABLE IF NOT EXISTS member_public_keys (
+    member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
     signing_public_key BLOB NOT NULL,
-    encryption_public_key BLOB NOT NULL
+    encryption_public_key BLOB NOT NULL,
+    PRIMARY KEY (member_identity, key_fingerprint)
+);
+",
+        "
+CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
+    member_identity TEXT NOT NULL,
+    key_fingerprint BLOB NOT NULL,
+    evidence_kind TEXT NOT NULL,
+    PRIMARY KEY (member_identity, key_fingerprint, evidence_kind),
+    FOREIGN KEY (member_identity, key_fingerprint)
+        REFERENCES member_public_keys(member_identity, key_fingerprint) ON DELETE RESTRICT
+);
+",
+        "
+CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
+    key_fingerprint BLOB PRIMARY KEY NOT NULL
 );
 ",
     ];
@@ -732,11 +739,11 @@ WHERE group_id = ?1
     let security_material = EncryptedGroupSecurityMaterial {
         encrypted_group_secret,
     };
-    let members = load_group_members(connection, group_id, member_count).await?;
+    let member_keys = load_group_member_keys(connection, group_id, member_count).await?;
 
     Ok(Some(ReplicationGroupRecord {
         group_id: *group_id,
-        members,
+        member_keys,
         local_member_index,
         version_vector,
         security_material,
@@ -864,17 +871,18 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     .await
     .context(SqlxSnafu)?;
 
-    for (member_index, member) in group.members.iter().enumerate() {
+    for (member_index, member_key) in group.member_keys.ordered_member_keys().iter().enumerate() {
         let member_index = i64::try_from(member_index).context(MemberCountOverflowSnafu)?;
         sqlx::query(
             "
-INSERT INTO group_members (group_id, member_index, member_identity)
-VALUES (?1, ?2, ?3)
+INSERT INTO group_members (group_id, member_index, member_identity, key_fingerprint)
+VALUES (?1, ?2, ?3, ?4)
 ",
         )
         .bind(group.group_id.to_string())
         .bind(member_index)
-        .bind(member.to_string())
+        .bind(member_key.member_id.to_string())
+        .bind(member_key.fingerprint.as_ref())
         .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
@@ -954,18 +962,19 @@ VALUES (?1, ?2, ?3, ?4, ?5)
     Ok(())
 }
 
-async fn load_trusted_member_public_keys(
+async fn load_member_public_keys(
     connection: &mut SqliteStoreConnection,
-    member_id: &MemberIdentity,
-) -> Result<Option<TrustedMemberPublicKeysRecord>, StoreError> {
+    key_id: &MemberKeyId,
+) -> Result<Option<MemberPublicKeysRecord>, StoreError> {
     let row = sqlx::query(
         "
 SELECT signing_public_key, encryption_public_key
-FROM known_peers
-WHERE member_identity = ?1
+FROM member_public_keys
+WHERE member_identity = ?1 AND key_fingerprint = ?2
 ",
     )
-    .bind(member_id.to_string())
+    .bind(key_id.member_id.to_string())
+    .bind(key_id.fingerprint.as_ref())
     .fetch_optional(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -973,8 +982,8 @@ WHERE member_identity = ?1
         return Ok(None);
     };
 
-    Ok(Some(TrustedMemberPublicKeysRecord {
-        member_id: member_id.clone(),
+    Ok(Some(MemberPublicKeysRecord {
+        key_id: key_id.clone(),
         signing_public_key: row
             .get::<Vec<u8>, _>("signing_public_key")
             .into_boxed_slice(),
@@ -984,16 +993,89 @@ WHERE member_identity = ?1
     }))
 }
 
-async fn ensure_trusted_member_public_keys(
+async fn load_member_public_keys_for_member(
     connection: &mut SqliteStoreConnection,
-    record: &TrustedMemberPublicKeysRecord,
+    member_id: &MemberIdentity,
+) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT key_fingerprint, signing_public_key, encryption_public_key
+FROM member_public_keys
+WHERE member_identity = ?1
+ORDER BY key_fingerprint
+",
+    )
+    .bind(member_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let fingerprint = decode_key_fingerprint(&row.get::<Vec<u8>, _>("key_fingerprint"))?;
+        records.push(MemberPublicKeysRecord {
+            key_id: MemberKeyId {
+                member_id: member_id.clone(),
+                fingerprint,
+            },
+            signing_public_key: row
+                .get::<Vec<u8>, _>("signing_public_key")
+                .into_boxed_slice(),
+            encryption_public_key: row
+                .get::<Vec<u8>, _>("encryption_public_key")
+                .into_boxed_slice(),
+        });
+    }
+    Ok(records)
+}
+
+async fn load_member_public_keys_for_fingerprint(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<Vec<MemberPublicKeysRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT member_identity, signing_public_key, encryption_public_key
+FROM member_public_keys
+WHERE key_fingerprint = ?1
+ORDER BY member_identity
+",
+    )
+    .bind(fingerprint.as_ref())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let member_id = decode_member_identity(&row.get::<String, _>("member_identity"))?;
+        records.push(MemberPublicKeysRecord {
+            key_id: MemberKeyId {
+                member_id,
+                fingerprint: *fingerprint,
+            },
+            signing_public_key: row
+                .get::<Vec<u8>, _>("signing_public_key")
+                .into_boxed_slice(),
+            encryption_public_key: row
+                .get::<Vec<u8>, _>("encryption_public_key")
+                .into_boxed_slice(),
+        });
+    }
+    Ok(records)
+}
+
+async fn ensure_member_public_keys(
+    connection: &mut SqliteStoreConnection,
+    record: &MemberPublicKeysRecord,
 ) -> Result<(), StoreError> {
-    if let Some(existing) = load_trusted_member_public_keys(connection, &record.member_id).await? {
+    validate_member_public_keys_record(record)?;
+    if let Some(existing) = load_member_public_keys(connection, &record.key_id).await? {
         ensure!(
             existing == *record,
             ConflictingMemberSecurityMaterialSnafu {
-                object: "trusted member public keys",
-                member_id: record.member_id.clone(),
+                object: "member public keys",
+                member_id: record.key_id.member_id.clone(),
             }
         );
         return Ok(());
@@ -1001,17 +1083,101 @@ async fn ensure_trusted_member_public_keys(
 
     sqlx::query(
         "
-INSERT INTO known_peers (
+INSERT INTO member_public_keys (
     member_identity,
+    key_fingerprint,
     signing_public_key,
     encryption_public_key
+)
+VALUES (?1, ?2, ?3, ?4)
+",
+    )
+    .bind(record.key_id.member_id.to_string())
+    .bind(record.key_id.fingerprint.as_ref())
+    .bind(record.signing_public_key.as_ref())
+    .bind(record.encryption_public_key.as_ref())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn load_member_key_trust_evidence(
+    connection: &mut SqliteStoreConnection,
+    key_id: &MemberKeyId,
+) -> Result<MemberKeyTrustEvidenceSet, StoreError> {
+    let evidence_kinds = sqlx::query_scalar::<_, String>(
+        "
+SELECT evidence_kind
+FROM member_key_trust_evidence
+WHERE member_identity = ?1 AND key_fingerprint = ?2
+",
+    )
+    .bind(key_id.member_id.to_string())
+    .bind(key_id.fingerprint.as_ref())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let mut evidence = MemberKeyTrustEvidenceSet::empty();
+    for evidence_kind in evidence_kinds {
+        let evidence_kind = decode_member_key_trust_evidence_kind(&evidence_kind)?;
+        evidence.insert(evidence_kind);
+    }
+    Ok(evidence)
+}
+
+async fn ensure_member_key_trust_evidence(
+    connection: &mut SqliteStoreConnection,
+    record: &MemberKeyTrustEvidenceRecord,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+INSERT OR IGNORE INTO member_key_trust_evidence (
+    member_identity,
+    key_fingerprint,
+    evidence_kind
 )
 VALUES (?1, ?2, ?3)
 ",
     )
-    .bind(record.member_id.to_string())
-    .bind(record.signing_public_key.as_ref())
-    .bind(record.encryption_public_key.as_ref())
+    .bind(record.key_id.member_id.to_string())
+    .bind(record.key_id.fingerprint.as_ref())
+    .bind(record.evidence_kind.as_str())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn is_key_fingerprint_blocked(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<bool, StoreError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "
+SELECT COUNT(*)
+FROM blocked_key_fingerprints
+WHERE key_fingerprint = ?1
+",
+    )
+    .bind(fingerprint.as_ref())
+    .fetch_one(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(count > 0)
+}
+
+async fn ensure_blocked_key_fingerprint(
+    connection: &mut SqliteStoreConnection,
+    fingerprint: &KeyFingerprint,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+INSERT OR IGNORE INTO blocked_key_fingerprints (key_fingerprint)
+VALUES (?1)
+",
+    )
+    .bind(fingerprint.as_ref())
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -1516,14 +1682,14 @@ WHERE group_id = ?1
     Ok(())
 }
 
-async fn load_group_members(
+async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
     expected_member_count: NonZeroUsize,
-) -> Result<Vec<MemberIdentity>, StoreError> {
-    let raw_members = sqlx::query_scalar::<_, String>(
+) -> Result<GroupMemberKeys, StoreError> {
+    let rows = sqlx::query(
         "
-SELECT member_identity
+SELECT member_identity, key_fingerprint
 FROM group_members
 WHERE group_id = ?1
 ORDER BY member_index
@@ -1534,19 +1700,27 @@ ORDER BY member_index
     .await
     .context(SqlxSnafu)?;
     ensure!(
-        raw_members.len() == expected_member_count.get(),
+        rows.len() == expected_member_count.get(),
         StoredGroupMemberCountMismatchSnafu {
             group_id: *group_id,
             expected_member_count: expected_member_count.get(),
-            actual_member_count: raw_members.len(),
+            actual_member_count: rows.len(),
         }
     );
 
-    let mut members = Vec::with_capacity(raw_members.len());
-    for raw_member in raw_members {
-        members.push(decode_member_identity(&raw_member)?);
+    let mut member_keys = Vec::with_capacity(rows.len());
+    for row in rows {
+        let raw_member = row.get::<String, _>("member_identity");
+        let raw_fingerprint = row.get::<Vec<u8>, _>("key_fingerprint");
+        let member_id = decode_member_identity(&raw_member)?;
+        let fingerprint = decode_key_fingerprint(&raw_fingerprint)?;
+        member_keys.push(MemberKeyId {
+            member_id,
+            fingerprint,
+        });
     }
-    Ok(members)
+    GroupMemberKeys::from_ordered_member_keys(member_keys)
+        .map_err(|source| invalid_stored_object("group member keys", source))
 }
 
 async fn load_group_member_count(
@@ -1808,6 +1982,41 @@ fn decode_member_identity(raw: &str) -> Result<MemberIdentity, StoreError> {
     })?)
 }
 
+fn decode_key_fingerprint(raw: &[u8]) -> Result<KeyFingerprint, StoreError> {
+    KeyFingerprint::try_from_slice(raw)
+        .map_err(|source| invalid_stored_object("key fingerprint", source))
+}
+
+fn decode_member_key_trust_evidence_kind(
+    raw: &str,
+) -> Result<MemberKeyTrustEvidenceKind, StoreError> {
+    raw.parse()
+        .map_err(|source| invalid_stored_object("member key trust evidence kind", source))
+}
+
+fn validate_member_public_keys_record(record: &MemberPublicKeysRecord) -> Result<(), StoreError> {
+    let public_keys = public_keys_from_member_record(record)?;
+    ensure!(
+        public_keys.fingerprint() == record.key_id.fingerprint,
+        ConflictingMemberSecurityMaterialSnafu {
+            object: "member public keys fingerprint",
+            member_id: record.key_id.member_id.clone(),
+        }
+    );
+    Ok(())
+}
+
+fn public_keys_from_member_record(
+    record: &MemberPublicKeysRecord,
+) -> Result<PublicMemberKeys, StoreError> {
+    PublicMemberKeys::from_key_bytes(
+        record.key_id.member_id.clone(),
+        record.signing_public_key.as_ref(),
+        record.encryption_public_key.as_ref(),
+    )
+    .map_err(|source| invalid_stored_object("member public keys", source))
+}
+
 fn invalid_stored_object(
     object: &'static str,
     source: impl StdError + Send + Sync + 'static,
@@ -1949,12 +2158,18 @@ impl From<SqliteStoreError> for StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{
-        DatasetRowPatch,
-        DatasetRowWrite,
-        ReplicationRowRecord,
-        ReplicationUpdateFilter,
-        current_slice_placeholder_group_security_material,
+    use crate::{
+        api::{
+            DatasetRowPatch,
+            DatasetRowWrite,
+            MemberKeyTrustEvidenceKind,
+            MemberKeyTrustEvidenceRecord,
+            MemberPublicKeysRecord,
+            ReplicationRowRecord,
+            ReplicationUpdateFilter,
+            current_slice_placeholder_group_security_material,
+        },
+        test_support::test_public_member_keys,
     };
     use flotsync_core::member::Identifier;
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
@@ -1972,6 +2187,26 @@ mod tests {
             future,
             "timed out waiting for sqlite store future",
         )
+    }
+
+    fn in_memory_store(local_member: MemberIdentity) -> SqliteReplicationStore {
+        wait_for_store_future(SqliteReplicationStore::in_memory(local_member))
+            .expect("store should build")
+    }
+
+    fn in_memory_store_with_schema_sources<I, S>(
+        local_member: MemberIdentity,
+        schema_sources: I,
+    ) -> SqliteReplicationStore
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        wait_for_store_future(SqliteReplicationStore::in_memory_with_schema_sources(
+            local_member,
+            schema_sources,
+        ))
+        .expect("store should build")
     }
 
     fn docs_dataset_id() -> DatasetId {
@@ -2000,12 +2235,20 @@ mod tests {
     }
 
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
-        let members = vec![local_member(), remote_member()];
+        let member_keys = [local_member(), remote_member()]
+            .into_iter()
+            .map(|member_id| MemberKeyId {
+                fingerprint: test_public_member_keys(&member_id).fingerprint(),
+                member_id,
+            })
+            .collect::<Vec<_>>();
+        let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
+            .expect("test group member keys should build");
         let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
         version_vector.increment_at(0);
         ReplicationGroupRecord {
             group_id,
-            members,
+            member_keys,
             local_member_index: MemberIndex::new(0),
             version_vector,
             security_material: current_slice_placeholder_group_security_material(group_id),
@@ -2110,7 +2353,7 @@ mod tests {
 
     #[test]
     fn dropping_open_sqlite_transaction_releases_store() {
-        let store = Arc::new(SqliteReplicationStore::in_memory(local_member()).unwrap());
+        let store = Arc::new(in_memory_store(local_member()));
         let transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         drop(transaction);
@@ -2140,11 +2383,10 @@ mod tests {
     fn sqlite_store_roundtrips_group_dataset_and_update_records() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(101));
         let row_key = RowKey(Uuid::from_u128(202));
         let group = sample_group(group_id);
@@ -2216,7 +2458,7 @@ mod tests {
             .expect("group should load")
             .expect("group should exist");
         assert_eq!(loaded_group.group_id, group.group_id);
-        assert_eq!(loaded_group.members, group.members);
+        assert_eq!(loaded_group.member_keys, group.member_keys);
         assert_eq!(loaded_group.security_material, group.security_material);
         assert_eq!(
             loaded_group.version_vector.iter().collect::<Vec<_>>(),
@@ -2261,7 +2503,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_loads_replication_groups_by_requested_ids() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let first_group_id = GroupId(Uuid::from_u128(10_001));
         let second_group_id = GroupId(Uuid::from_u128(10_002));
         let missing_group_id = GroupId(Uuid::from_u128(10_003));
@@ -2310,7 +2552,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_roundtrips_local_member_private_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
@@ -2344,7 +2586,7 @@ mod tests {
 
     #[test]
     fn sqlite_store_rejects_conflicting_local_member_private_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
+        let store = in_memory_store(local_member());
         let record = LocalMemberPrivateKeysRecord {
             member_id: local_member(),
             private_keys: EncryptedLocalMemberPrivateKeys {
@@ -2374,65 +2616,88 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_store_roundtrips_trusted_member_public_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: remote_member(),
-            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
+    fn sqlite_store_roundtrips_member_public_keys_and_trust_evidence() {
+        let store = in_memory_store(local_member());
+        let record =
+            MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+        let evidence = MemberKeyTrustEvidenceRecord {
+            key_id: record.key_id.clone(),
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
         };
 
         let mut transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("trusted public keys should store");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("same trusted public keys should be accepted");
-        let loaded =
-            wait_for_store_future(transaction.load_trusted_member_public_keys(&record.member_id))
-                .expect("trusted public keys should load")
-                .expect("trusted public keys should exist");
+        wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect("member public keys should store");
+        wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect("same member public keys should be accepted");
+        wait_for_store_future(transaction.ensure_member_key_trust_evidence(evidence.clone()))
+            .expect("trust evidence should store");
+        wait_for_store_future(transaction.ensure_member_key_trust_evidence(evidence.clone()))
+            .expect("same trust evidence should be accepted");
+        let loaded = wait_for_store_future(transaction.load_member_public_keys(&record.key_id))
+            .expect("member public keys should load")
+            .expect("member public keys should exist");
         assert_eq!(loaded, record);
+        let loaded_for_member = wait_for_store_future(
+            transaction.load_member_public_keys_for_member(&record.key_id.member_id),
+        )
+        .expect("member public keys should load by member");
+        assert_eq!(loaded_for_member, vec![record.clone()]);
+        let loaded_evidence =
+            wait_for_store_future(transaction.load_member_key_trust_evidence(&record.key_id))
+                .expect("trust evidence should load");
+        assert!(loaded_evidence.contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust));
         wait_for_store_future(transaction.commit()).expect("commit should succeed");
 
         let mut read_transaction = wait_for_store_future(store.begin_read_transaction())
             .expect("transaction should start");
-        let loaded = wait_for_store_future(
-            read_transaction.load_trusted_member_public_keys(&record.member_id),
-        )
-        .expect("trusted public keys should load through read transaction")
-        .expect("trusted public keys should exist");
+        let loaded =
+            wait_for_store_future(read_transaction.load_member_public_keys(&record.key_id))
+                .expect("member public keys should load through read transaction")
+                .expect("member public keys should exist");
         assert_eq!(loaded, record);
         wait_for_store_future(read_transaction.release()).expect("release should succeed");
     }
 
     #[test]
-    fn sqlite_store_rejects_conflicting_trusted_member_public_keys() {
-        let store = SqliteReplicationStore::in_memory(local_member()).unwrap();
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: remote_member(),
-            signing_public_key: Vec::from([1_u8, 2, 3, 4]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
-        };
-        let conflicting_record = TrustedMemberPublicKeysRecord {
-            member_id: record.member_id.clone(),
-            signing_public_key: Vec::from([9_u8, 8, 7, 6]).into_boxed_slice(),
-            encryption_public_key: Vec::from([5_u8, 6, 7, 8, 9]).into_boxed_slice(),
-        };
+    fn sqlite_store_rejects_member_public_keys_with_mismatched_fingerprint() {
+        let store = in_memory_store(local_member());
+        let mut record =
+            MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+        record.key_id.fingerprint = test_public_member_keys(&local_member()).fingerprint();
 
         let mut transaction =
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
-        wait_for_store_future(transaction.ensure_trusted_member_public_keys(record.clone()))
-            .expect("trusted public keys should store");
-        let error = wait_for_store_future(
-            transaction.ensure_trusted_member_public_keys(conflicting_record),
-        )
-        .expect_err("conflicting trusted public keys should fail");
+        let error = wait_for_store_future(transaction.ensure_member_public_keys(record.clone()))
+            .expect_err("mismatched member public keys should fail");
         assert!(is_conflicting_member_security_material(
             &error,
-            "trusted member public keys",
-            &record.member_id,
+            "member public keys fingerprint",
+            &record.key_id.member_id,
         ));
+        wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_blocked_key_fingerprints() {
+        let store = in_memory_store(local_member());
+        let fingerprint = test_public_member_keys(&remote_member()).fingerprint();
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        assert!(
+            !wait_for_store_future(transaction.is_key_fingerprint_blocked(&fingerprint))
+                .expect("blocked fingerprint should load")
+        );
+        wait_for_store_future(transaction.ensure_blocked_key_fingerprint(fingerprint))
+            .expect("blocked fingerprint should store");
+        wait_for_store_future(transaction.ensure_blocked_key_fingerprint(fingerprint))
+            .expect("same blocked fingerprint should be accepted");
+        assert!(
+            wait_for_store_future(transaction.is_key_fingerprint_blocked(&fingerprint))
+                .expect("blocked fingerprint should load")
+        );
         wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
     }
 
@@ -2440,11 +2705,10 @@ mod tests {
     fn sqlite_store_filters_replication_updates_by_producer_range() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(10_011));
         let group = sample_group(group_id);
         let encoded_operation = encoded_insert_snapshot("range query", &schema);
@@ -2535,11 +2799,10 @@ mod tests {
     fn sqlite_store_roundtrips_tombstoned_dataset_rows() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(104));
         let row_key = RowKey(Uuid::from_u128(204));
         let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
@@ -2608,11 +2871,10 @@ mod tests {
     fn sqlite_store_scans_dataset_rows_in_key_order() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(106));
         let first_row_key = RowKey(Uuid::from_u128(206));
         let second_row_key = RowKey(Uuid::from_u128(207));
@@ -2667,11 +2929,10 @@ mod tests {
     fn sqlite_store_rejects_tombstone_to_active_row_transition() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(105));
         let row_key = RowKey(Uuid::from_u128(205));
         let tombstone_snapshot = title_snapshot(&schema, row_key, "deleted");
@@ -2715,11 +2976,7 @@ mod tests {
     fn sqlite_store_rejects_duplicate_group_insert() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
-            local_member(),
-            [(dataset_id, schema)],
-        )
-        .expect("store should build");
+        let store = in_memory_store_with_schema_sources(local_member(), [(dataset_id, schema)]);
         let group_id = GroupId(Uuid::from_u128(303));
         let group = sample_group(group_id);
 
@@ -2740,11 +2997,10 @@ mod tests {
     fn sqlite_store_rejects_duplicate_update_insert_but_allows_applied_toggle() {
         let dataset_id = docs_dataset_id();
         let schema = title_schema();
-        let store = SqliteReplicationStore::in_memory_with_schema_sources(
+        let store = in_memory_store_with_schema_sources(
             local_member(),
             [(dataset_id.clone(), schema.clone())],
-        )
-        .expect("store should build");
+        );
         let group_id = GroupId(Uuid::from_u128(404));
         let group = sample_group(group_id);
         let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());

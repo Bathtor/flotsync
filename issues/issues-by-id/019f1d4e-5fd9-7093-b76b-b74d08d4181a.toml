@@ -1,0 +1,23 @@
+id = "019f1d4e-5fd9-7093-b76b-b74d08d4181a"
+ref = "flotsync-git-mtr"
+title = "Audit signed-payload-only selector pattern"
+body = """
+Investigate whether the signed-payload-only selector pattern introduced for route-establishment IntroductionClaimPayloads should be applied to other signed protocol messages.
+
+Scope:
+- Review signed payloads that currently duplicate selector or routing metadata inside and outside the signed bytes.
+- Identify where selectors can safely live only inside the signed payload and be extracted through conservative borrowed-view decoding before signature verification.
+- Exclude encrypted payloads unless their authenticated plaintext/signature structure provides the same property; this pattern is not generally applicable to encrypted-only messages.
+- Preserve cheap rejection fields where they are useful and not security-sensitive, unless removing them simplifies the wire contract without losing observability.
+- Review signed-payload view decoders for reusable conservative buffa DecodeOptions helpers, so new untrusted-view decoding does not reinvent recursion, unknown-field, and size limits.
+
+Outcome should be a short design recommendation plus follow-up implementation tasks where worthwhile."""
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-07-01T10:51:43.449222Z"
+updated_at = "2026-07-02T06:48:54.430831Z"
+
+[[links]]
+target = "019f0d0b-67ec-7381-b786-a3ab8a185843"
+label = "follow-up from"

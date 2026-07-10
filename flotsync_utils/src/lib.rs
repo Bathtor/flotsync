@@ -7,6 +7,7 @@ use std::{error::Error, fmt, future::Future, marker::PhantomData, pin::Pin, time
 pub mod claimable_promise;
 pub mod debugging;
 pub mod err;
+pub mod kompact_config;
 pub mod kompact_fsm;
 pub mod kompact_testing;
 pub mod testing;

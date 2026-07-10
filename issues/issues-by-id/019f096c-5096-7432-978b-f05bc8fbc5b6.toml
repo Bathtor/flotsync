@@ -1,0 +1,33 @@
+id = "019f096c-5096-7432-978b-f05bc8fbc5b6"
+ref = "flotsync-ist.1.5"
+title = "Design bootstrap-carried member keys"
+body = """
+Design how group bootstrap carries member key material and how recipients decide whether that material is trusted enough to install group state.
+
+Questions:
+Q01. Which keys must every bootstrap payload carry for all group members?
+Q02. Which policy decides who is allowed to invite a local member into a group and at what trust level?
+Q03. Can bootstrap-installed keys ever create first trust, or must they match existing trust unless a policy explicitly permits invited trust?
+Q04. How do we prevent invalid keys from spreading through group creation or re-bootstrap flows?
+Q05. If a bootstrap names device identities such as bob.phone, does trust apply only to that exact device, to the parent bob, or according to a configurable inheritance policy?"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:12:01.302681Z"
+updated_at = "2026-06-27T15:37:17.873873Z"
+closed_at = "2026-06-27T15:37:17.873873Z"
+
+[[comments]]
+id = "019f09ba-46ec-77b1-8410-ce73b00b91d4"
+author = "lkroll"
+body = "Outcome agreed. Bootstrap should cover exact individual device/member identities and expected canonical key bundle fingerprints. Full public bundles are optional evidence, not mandatory payload, and cannot silently create or overwrite trust. Conservative policy treats contained or resolved keys as authorised only through local trust evaluation. Group metadata installation may proceed with unresolved non-local member keys once the inviter/bootstrap sender is trusted enough; unresolved members are blocked from runtime traffic until their exact key material resolves and becomes authorised. Created implementation tasks flotsync-ist.4 for bootstrap fingerprints/optional bundles and flotsync-ist.5 for unresolved-key install plus runtime gating."
+created_at = "2026-06-27T15:37:10.63696Z"
+
+[[comments]]
+id = "019f09ba-6331-70f2-b4da-c7fb3dff9003"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T15:37:17.873873Z"

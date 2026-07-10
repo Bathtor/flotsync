@@ -1,0 +1,58 @@
+id = "019f0d0b-67ec-7381-b786-a3ab8a185843"
+ref = "flotsync-ist.6"
+title = "Verify introduction claims by key fingerprint"
+body = """
+Implement the minimum discovery key-material layer from flotsync-ist.1.3 and flotsync-ist.1.7: IntroductionClaims must identify the concrete key material used for the signature by carrying the KeyFingerprint of the signing public key bundle alongside the member identity, and route establishment must only publish routes from claims verified against that exact key material.
+
+Agreed direction:
+A01. Route establishment must verify introduction claims against exact stored key material, not only member_id.
+A02. Signed IntroductionClaimPayloads carry member_id, route claim, group ids, and the signer public key bundle KeyFingerprint.
+A03. The wire/protobuf representation carries the 32 raw fingerprint bytes. Padded base64url canonical strings and grouped display strings are API/display helpers from flotsync-ist.8, not discovery-wire payloads.
+A04. The member_id and KeyFingerprint used to select verification key material must be authenticated by the claim signature. They must not be swappable by rewriting unsigned wrapper fields after signing.
+A05. If the exact key material for (member_id, fingerprint) is stored and not blocked, route establishment may publish the route only when policy permits the narrow MemberRoutePublication authority.
+A06. MemberRoutePublication covers only publishing a route candidate for that member identity from a verified introduction claim. It does not grant permission to verify signatures, access replication runtime traffic, install groups, introduce members, accept bootstrap activation, or promote trust.
+A07. MemberRoutePublication defaults to StoredPublicKeyMaterial. ReplicationRuntime and BootstrapActivation remain separate authority scopes and continue to default to LocalExplicitTrust.
+A08. Unknown fingerprints produce untrusted observations and do not publish the route until matching key material is acquired and policy permits MemberRoutePublication.
+A09. Parent/child identity inheritance is not applied; fingerprints bind exact device/member identities.
+
+Payload decoding direction:
+C01. SignedIntroductionClaim carries only claim_payload and signature. member_id and KeyFingerprint are extracted from the signed IntroductionClaimPayload via a borrowed protobuf view before signature verification. This avoids duplicating selectors inside and outside claim_payload, while still authenticating the selectors because the same bytes are verified before any route publication.
+C02. Pre-verification selector extraction uses buffa::DecodeOptions::decode_view over the claim_payload bytes, not a raw MessageView::decode_view call.
+C03. Use conservative decode options: recursion_limit = 8, unknown_field_limit = 8, and a small route-establishment claim-payload max size. The size cap is primarily a local protocol invariant and early rejection point, not the main memory protection, because route establishment already holds the full claim_payload bytes before view decoding.
+C04. Unknown fields are allowed within the low allowance and ignored by route-establishment semantics. They remain covered by the signature because verification uses the original claim_payload bytes.
+C05. After signature verification, full claim decoding must compare the authenticated member_id and KeyFingerprint against the pre-verification selector values before route publication, so selector extraction and publication cannot diverge silently.
+
+Acceptance criteria:
+B01. Discovery wire/protobuf introduction claims include the signing key bundle fingerprint bytes and member identity in the signed claim payload.
+B02. Claim verification selects stored key material by exact member_id plus fingerprint extracted from the claim payload.
+B03. Unknown, blocked, policy-denied, mismatched, or wrong-key fingerprints reject route publication and record/emit an untrusted observation where appropriate.
+B04. Route establishment tests cover known fingerprint acceptance, unknown fingerprint rejection, wrong-key rejection, blocked-key rejection, signed selector tampering/rebinding rejection, and MemberRoutePublication policy denial.
+B05. No ReplicationRuntime or BootstrapActivation authority is granted by this path alone.
+
+Estimate: roughly 750-950 LOC across discovery protobuf, route establishment verification, trust lookup integration, authority-scope policy updates, and tests. If untrusted-observation plumbing grows beyond a small signal for flotsync-ist.7, split that part into a follow-up child task."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "codex"
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f0d59-827c-7780-ae76-9a426ab8b278",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-28T07:04:39.14862Z"
+updated_at = "2026-07-02T16:11:17.359574Z"
+closed_at = "2026-07-02T16:11:17.359574Z"
+
+[[comments]]
+id = "019f1d6b-3d6d-7883-84c9-f15eef3be779"
+author = "lkroll"
+body = "Implementation note: this slice now rejects unknown, blocked, wrong-key, and policy-denied introduction claim selectors before route publication. It does not add a new route-establishment observation/acquisition channel; direct key-bundle acquisition and route-establishment coordination for unknown fingerprints remain tracked by flotsync-ist.7."
+created_at = "2026-07-01T11:23:15.181801Z"
+
+[[comments]]
+id = "019f2399-4def-7ba1-9c6a-aefe11c33e86"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-02T16:11:17.359574Z"

@@ -3,7 +3,7 @@
 use flotsync_core::{MemberIdentity, member::TrieSet};
 use flotsync_discovery::protocol::DiscoveryRoute;
 use flotsync_messages::discovery as discovery_proto;
-use flotsync_security::FrameSignature;
+use flotsync_security::{FrameSignature, KeyFingerprint};
 use kompact::prelude::ScheduledTimer;
 use snafu::Snafu;
 use std::borrow::Cow;
@@ -397,8 +397,10 @@ pub struct PartiallyVerifiedIntroduction {
 
 /// Signed claim material awaiting trusted-key verification.
 pub struct PendingClaimVerification {
-    /// Claimed member whose trusted key should verify this payload.
+    /// Claimed member whose exact stored key material should verify this payload.
     pub member: MemberIdentity,
+    /// Fingerprint of the exact public key bundle that should verify this payload.
+    pub key_fingerprint: KeyFingerprint,
     /// Original signed claim, including the exact encoded payload covered by `signature`.
     pub claim: discovery_proto::SignedIntroductionClaim,
     /// Detached signature over `claim.claim_payload`.

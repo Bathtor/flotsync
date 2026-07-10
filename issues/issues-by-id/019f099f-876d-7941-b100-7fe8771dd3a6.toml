@@ -1,0 +1,46 @@
+id = "019f099f-876d-7941-b100-7fe8771dd3a6"
+ref = "flotsync-hitr"
+title = "Hierarchical identity trust and revocation model"
+body = """
+Deferred epic for the north-star hierarchical identity trust and revocation model discussed during flotsync-ist.1.8 and flotsync-ist.1.11. This is intentionally outside flotsync-ist because it will need multiple design and implementation subtasks beyond the current public-key discovery slice.
+
+North-star direction:
+A01. Concrete device identities are cryptographic principals, for example bob.phone and bob.macbook.
+A02. A parent identity such as bob is primarily a policy namespace over exact device identities, not automatically a key that can sign everything.
+A03. Trust is evaluated from signed evidence plus local policy; remote statements are evidence, not commands.
+A04. Introduction and revocation are not symmetric. Adding authority should be harder than removing or suspending authority.
+A05. Trust evidence delegates specific capabilities. A device introduced for replication_runtime should not automatically gain introduce_sibling or revoke_sibling authority.
+A06. Self-revocation for an exact key fingerprint is final and should create a permanent local tombstone for that key material.
+A07. Non-self revocation is negative evidence. Local policy decides whether it suspends, blocks, or requires user/application approval.
+A08. Revocation statements should identify exact key material, not remote-selected local authority scopes. Local policy maps revocation evidence to local consequences.
+A09. A compromised single device must not be able to mint a new majority of trusted devices or make itself the only canonical device for a parent identity.
+A10. Single-device migration needs an explicit policy story, such as out-of-band pairing, a recovery/parent key, or limited successor introduction.
+A11. Trust records and authority checks must bind exact keys so a compromised or stale device cannot silently replace parent, child, or sibling key material.
+A12. Group bootstrap and group invitation evidence must be analysed as possible authority sources, but should not automatically imply broad parent or sibling trust.
+A13. Displayed fingerprints and identity labels must make the exact device key under evaluation visible enough that applications can avoid confusing parent identity trust with device-key trust.
+
+Likely child work:
+B01. Evidence record model for introductions, self-revocations, sibling revocations, group bootstrap approvals, invitation evidence, and local approvals.
+B02. Capability attenuation rules for introduced child and sibling devices.
+B03. Permanent revoked-key tombstones and conflict handling.
+B04. Policy evaluation for parent namespace trust over child devices.
+B05. User/application APIs for resolving suspensions and migration/recovery flows.
+B06. Replicated-checklist scenarios that exercise multi-device identities.
+B07. Identity display and fingerprint presentation rules for parent/device approval flows.
+B08. Group invitation policy: who may introduce or invite devices into a group, and what authority that grants.
+
+Estimate: over 1000 LOC and should be split into multiple self-contained child tasks after the deferred epic is resumed."""
+status = "open"
+type = "epic"
+priority = 3
+blocked_by = ["019f097c-3969-7f71-8635-21d59788b5d1"]
+created_at = "2026-06-27T15:07:57.677833Z"
+updated_at = "2026-06-28T10:52:21.168262Z"
+
+[[links]]
+target = "019f096c-f47b-7d40-89b6-df9312491494"
+label = "deferred from"
+
+[[links]]
+target = "019f097c-3969-7f71-8635-21d59788b5d1"
+label = "deferred from"

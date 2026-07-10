@@ -26,6 +26,7 @@ use flotsync_replication::{
         publish_changes,
         snapshot_read_token,
         test_public_member_keys,
+        wait_for_test_future,
         wait_for_test_reply,
     },
 };
@@ -267,13 +268,12 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
         [(dataset_id.clone(), title_schema_shared())],
         [bob_member.clone()],
     );
-    let bob_store = Arc::new(
-        SqliteReplicationStore::in_memory_with_schema_sources(
-            bob_member.clone(),
-            [(dataset_id.clone(), title_schema_shared())],
-        )
-        .expect("store should build"),
-    );
+    let bob_store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_shared())],
+    ))
+    .expect("store should build");
+    let bob_store = Arc::new(bob_store);
     wait_for_test_reply(provision_test_security(
         app_bob_id(),
         bob_store.as_ref(),

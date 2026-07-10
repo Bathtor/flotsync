@@ -22,7 +22,7 @@ use flotsync_core::{
     versions::UpdateId,
 };
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
-use flotsync_utils::{OptionExt as _, ResultExt as _};
+use flotsync_utils::{OptionExt as _, ResultExt as _, kompact_config::ConfigReadExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
 use kompact::{KompactLogger, prelude::*};
@@ -314,43 +314,18 @@ impl CatchUpManagerComponent {
 
     /// Read the retry delay from the component's Kompact config.
     fn read_retry_delay_from_config(&self) -> Duration {
-        match self
-            .ctx
+        self.ctx
             .config()
-            .read_or_default(&config_keys::CATCH_UP_NEED_RANGE_RETRY_DELAY)
-        {
-            Ok(delay) => delay,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "failed to read catch-up retry delay config; using default {:?}: {}",
-                    DEFAULT_RETRY_DELAY,
-                    error
-                );
-                DEFAULT_RETRY_DELAY
-            }
-        }
+            .read_or_default_warn(self.log(), &config_keys::CATCH_UP_NEED_RANGE_RETRY_DELAY)
     }
 
     /// Read the per-response batch limit; config value `0` means unlimited.
     fn read_max_updates_per_batch_from_config(&self) -> Option<NonZeroUsize> {
-        match self
+        let limit = self
             .ctx
             .config()
-            .read_or_default(&config_keys::CATCH_UP_MAX_UPDATES_PER_BATCH)
-        {
-            Ok(0) => None,
-            Ok(limit) => NonZeroUsize::new(limit),
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "failed to read catch-up batch size config; using default {}: {}",
-                    DEFAULT_MAX_UPDATES_PER_BATCH,
-                    error
-                );
-                NonZeroUsize::new(DEFAULT_MAX_UPDATES_PER_BATCH)
-            }
-        }
+            .read_or_default_warn(self.log(), &config_keys::CATCH_UP_MAX_UPDATES_PER_BATCH);
+        NonZeroUsize::new(limit)
     }
 
     fn broadcast_need_range(&mut self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {
@@ -820,10 +795,13 @@ mod tests {
         api::{
             DatasetId,
             DatasetUpdateRecord,
+            GroupMemberKeys,
+            MemberKeyId,
             ReplicationGroupRecord,
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
+        test_support::test_public_member_keys,
     };
     use flotsync_core::{member::Identifier, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
@@ -864,9 +842,22 @@ mod tests {
     }
 
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
+        let local_member = local_member();
+        let remote_member = remote_member();
+        let member_keys = GroupMemberKeys::from_ordered_member_keys([
+            MemberKeyId {
+                fingerprint: test_public_member_keys(&local_member).fingerprint(),
+                member_id: local_member,
+            },
+            MemberKeyId {
+                fingerprint: test_public_member_keys(&remote_member).fingerprint(),
+                member_id: remote_member,
+            },
+        ])
+        .expect("test group member keys should build");
         ReplicationGroupRecord {
             group_id,
-            members: vec![local_member(), remote_member()],
+            member_keys,
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material(group_id),
@@ -951,7 +942,8 @@ mod tests {
     fn load_update_batch_honours_unlimited_batch_mode() {
         let group_id = GroupId(Uuid::from_u128(80_001));
         let store: Arc<dyn ReplicationStore> = Arc::new(
-            SqliteReplicationStore::in_memory(local_member()).expect("store should build"),
+            wait_for_store_future(SqliteReplicationStore::in_memory(local_member()))
+                .expect("store should build"),
         );
         persist_group_with_updates(&store, group_id, 20);
         let system = build_test_kompact_system();

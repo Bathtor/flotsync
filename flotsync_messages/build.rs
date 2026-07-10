@@ -17,6 +17,7 @@ fn main() {
         "flotsync/discovery/v1/discovery.proto",
         "flotsync/endpoint/v1/endpoint.proto",
         "flotsync/replication/v1/replication.proto",
+        "flotsync/security/v1/security.proto",
         "flotsync/versions/v1/versions.proto",
     ];
 

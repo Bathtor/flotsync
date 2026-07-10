@@ -1,0 +1,13 @@
+id = "019f4076-d998-7720-94b8-6cc1bddd76aa"
+ref = "flotsync-git-1i3"
+title = "Reassess temporary local public key bundle provisioning API"
+body = "Review load_local_public_key_bundle after replicated-checklist key setup no longer depends on the temporary fixed static-group setup bridge. Decide whether this should remain a replication provisioning API, move behind a narrower example/setup boundary, or disappear in favour of a later key-management surface."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-07-08T06:42:38.616686Z"
+updated_at = "2026-07-08T06:42:45.687434Z"
+
+[[links]]
+target = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"
+label = "discovered from"

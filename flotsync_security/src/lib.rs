@@ -1,6 +1,7 @@
 //! Cryptographic building blocks for authenticated encrypted replication frames.
 
 pub use error::{Result, SecurityError};
+pub use fingerprint::{KEY_FINGERPRINT_LENGTH, KeyFingerprint, KeyFingerprintParseError};
 #[cfg(any(test, feature = "test-support"))]
 pub use group::test_group_key_from_id;
 pub use group::{
@@ -20,18 +21,21 @@ pub use group::{
 pub use hpke::{HPKE_ENCAPSULATED_KEY_LENGTH, HpkeCiphertext, hpke_open, hpke_seal};
 pub use identity::{
     ED25519_KEY_LENGTH,
-    GeneratedMemberKeyFiles,
+    EncodedLocalPrivateKeyBundle,
+    GeneratedMemberKeyBundles,
     KeyRole,
     LocalMemberKeys,
     MemberIdentity,
-    PrivateJwks,
+    PublicKeyBundle,
     PublicMemberKeys,
     X25519_KEY_LENGTH,
-    generate_member_key_files,
-    local_member_keys_from_jwks,
-    public_member_keys_from_jwks,
+    encode_local_private_key_bundle,
+    encode_public_key_bundle,
+    generate_member_key_bundles,
+    local_member_keys_from_private_bundle,
+    public_member_keys_from_public_bundle,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "local-secret-manager"))]
 pub use local_store_secret::install_local_store_secret_test_store;
 pub use local_store_secret::{
     LoadedLocalStoreSecret,
@@ -76,6 +80,7 @@ pub use store_secret::{
 };
 
 mod error;
+mod fingerprint;
 mod group;
 mod hpke;
 mod identity;

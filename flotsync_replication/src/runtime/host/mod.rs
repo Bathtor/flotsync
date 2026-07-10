@@ -32,6 +32,14 @@ use flotsync_discovery::{
         PeerAnnouncementSocketMaintenance,
     },
 };
+use flotsync_io::prelude::{
+    DriverConfig,
+    EgressPool,
+    IoBridge,
+    IoBridgeHandle,
+    IoDriverComponent,
+    UdpPort,
+};
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_io::test_support::{
     ReservedSocketKind,
@@ -40,10 +48,6 @@ use flotsync_io::test_support::{
     reserve_sockets,
     set_test_system_label,
 };
-use flotsync_io::{
-    kompact::shutdown_system_bounded,
-    prelude::{DriverConfig, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
-};
 use flotsync_routes::{
     RouteDiscoveryPort,
     RouteEndpointLifecyclePort,
@@ -51,6 +55,7 @@ use flotsync_routes::{
     RouteTransportPort,
     TransportRouteKey,
     UDPourConfig,
+    key_material_discovery::{KeyMaterialDiscoveryComponent, KeyMaterialDiscoveryPort},
     manager::{RouteTransportManager, configure_replication_runtime},
     route_establishment::{
         ManualRouteWatchError,
@@ -175,6 +180,8 @@ pub(crate) enum RuntimeHostError {
         component: &'static str,
         source: RuntimeControlError,
     },
+    #[snafu(display("Failed to shut down replication runtime system: {source}"))]
+    ShutdownSystem { source: RuntimeControlError },
     #[snafu(display("Failed to connect runtime bridge UDP to '{component}': {message}"))]
     ConnectUdp {
         component: &'static str,
@@ -348,11 +355,11 @@ trait RuntimeLifecycleComponent: Send + Sync {
         control_timeout: Duration,
     ) -> BoxFuture<'a, Result<(), RuntimeHostError>>;
 
-    fn stop(
-        &self,
-        system: &KompactSystem,
+    fn stop<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError>;
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>>;
 }
 
 /// A component topology that can expose its concrete lifecycle nodes in start order.
@@ -376,14 +383,16 @@ trait ComponentTopology {
         Ok(())
     }
 
-    /// Stop every lifecycle node in the reverse order exposed by `nodes`.
-    fn stop_all(
+    /// Stop every lifecycle node in reverse dependency order.
+    async fn stop_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
+        // Stop sequentially because later-started components depend on
+        // earlier-started providers during shutdown.
         for component in self.nodes().rev() {
-            component.stop(system, control_timeout)?;
+            component.stop(system, control_timeout).await?;
         }
         Ok(())
     }
@@ -460,20 +469,22 @@ where
         .boxed()
     }
 
-    fn stop(
-        &self,
-        system: &KompactSystem,
+    fn stop<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError> {
-        block_on(
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
+        async move {
             system
                 .stop_notify(self)
                 .map(|result| result.boxed().context(ControlFutureSnafu))
-                .timeout_fold_err(control_timeout),
-        )
-        .context(StopComponentSnafu {
-            component: C::type_name(),
-        })
+                .timeout_fold_err(control_timeout)
+                .await
+                .context(StopComponentSnafu {
+                    component: C::type_name(),
+                })
+        }
+        .boxed()
     }
 }
 
@@ -491,6 +502,7 @@ struct BuiltRuntimeSystem {
 ///        |
 ///    IoBridge --UdpPort--+--> RouteTransportManager
 ///                         +--> LocalEndpointManager
+///                         +--> KeyMaterialDiscoveryComponent
 ///                         +--> PeerAnnouncementComponent
 ///                         +--> PeerAnnouncementObservationComponent
 /// ```
@@ -516,6 +528,7 @@ impl IoTopology {
         let udp_connect_handle = IoBridgeHandle::from_component(&self.bridge);
         connect_udp_component(&udp_connect_handle, transport.route_transport_manager()).await?;
         connect_udp_component(&udp_connect_handle, discovery.local_endpoint_manager()).await?;
+        connect_udp_component(&udp_connect_handle, &discovery.key_material_discovery).await?;
         connect_udp_component(&udp_connect_handle, &discovery.peer_announcement).await?;
         connect_udp_component(
             &udp_connect_handle,
@@ -694,25 +707,38 @@ impl ComponentTopology for DeliveryTopology {
 /// LocalEndpointManager
 ///   |--EndpointSelectionPort------+--> PeerAnnouncementComponent
 ///   |                              |
-///   |                              +--------------------------+
-///   |                                                         v
+///   |                              +--------------------------+--------------------+
+///   |                                                         v                    |
 ///   +--RouteEndpointLifecyclePort--> RouteTransportManager    |
-///                                  |--RouteEndpointLifecyclePort--+
-///                                  +--RouteTransportPort----------+
+///   |                              |--RouteEndpointLifecyclePort-------------------+
+///   |                                                                             |
+///   +--RouteEndpointLifecyclePort--------------------------------------------+    |
 /// PeerAnnouncementObservationComponent --------------------------+
 ///                                                                 v
-///                                               RouteEstablishmentComponent --RouteDiscoveryPort--> semantic delivery
+///                                               RouteEstablishmentComponent
+///                                                    |--RouteDiscoveryPort--> semantic delivery
+///                                                    |
+///                              KeyMaterialDiscoveryComponent <--KeyMaterialDiscoveryPort--+
 /// ```
 struct DiscoveryTopology {
     peer_announcement: Arc<Component<PeerAnnouncementComponent>>,
     peer_announcement_observation: Arc<Component<PeerAnnouncementObservationComponent>>,
     route_establishment: Arc<Component<RouteEstablishmentComponent>>,
+    key_material_discovery: Arc<Component<KeyMaterialDiscoveryComponent>>,
     #[cfg(any(test, feature = "test-support"))]
     manual_route_discovery: Arc<Component<PortTesterComponent<ManualRouteDiscoveryPort>>>,
     #[cfg(any(test, feature = "test-support"))]
     manual_route_discovery_ref: ActorRef<PortTestMsg<ManualRouteDiscoveryPort>>,
     local_endpoint_manager: Arc<Component<LocalEndpointManager>>,
     static_route_hints: PreconfiguredPeerRoutesConfig,
+}
+
+/// Shared transport handles needed by discovery-side runtime components.
+struct DiscoveryTransportHandles {
+    /// Actor interface used by route establishment for UDPour-capable discovery frames.
+    route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+    /// Egress pool used by direct UDP discovery components for payload encoding.
+    egress_pool: EgressPool,
 }
 
 impl DiscoveryTopology {
@@ -722,9 +748,13 @@ impl DiscoveryTopology {
         group_memberships: SharedGroupMemberships,
         local_member: MemberIdentity,
         security: DeliverySecurity,
-        route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
+        transport_handles: DiscoveryTransportHandles,
         static_route_hints: PreconfiguredPeerRoutesConfig,
     ) -> Self {
+        let DiscoveryTransportHandles {
+            route_transport,
+            egress_pool,
+        } = transport_handles;
         let route_config = route_establishment_config(host_config.peer_announcement_bind_addr);
         let peer_options = PeerAnnouncementOptions::DEFAULT
             .with_socket_bind_addr(route_config.peer_announcement_bind_addr)
@@ -737,6 +767,15 @@ impl DiscoveryTopology {
             PeerAnnouncementObservationComponent::with_socket_maintenance(
                 peer_observation_bind_addr,
                 PeerAnnouncementSocketMaintenance::Observe,
+            )
+        });
+        let key_material_member = local_member.clone();
+        let key_material_security = security.clone();
+        let key_material_discovery = system.create(move || {
+            KeyMaterialDiscoveryComponent::new(
+                key_material_member,
+                Arc::new(key_material_security),
+                egress_pool,
             )
         });
         let route_establishment = system.create(move || {
@@ -760,6 +799,7 @@ impl DiscoveryTopology {
             peer_announcement,
             peer_announcement_observation,
             route_establishment,
+            key_material_discovery,
             #[cfg(any(test, feature = "test-support"))]
             manual_route_discovery,
             #[cfg(any(test, feature = "test-support"))]
@@ -800,7 +840,8 @@ impl DiscoveryTopology {
             transport.route_transport_manager(),
             &self.route_establishment,
             "route transport endpoint lifecycle -> route establishment",
-        )
+        )?;
+        Ok(())
     }
 
     fn connect_internal_routes(&self) -> Result<(), RuntimeHostError> {
@@ -818,6 +859,16 @@ impl DiscoveryTopology {
             &self.local_endpoint_manager,
             &self.route_establishment,
             "local endpoint selection -> route establishment",
+        )?;
+        connect_components::<RouteEndpointLifecyclePort, _, _>(
+            &self.local_endpoint_manager,
+            &self.key_material_discovery,
+            "local endpoint lifecycle -> key material discovery",
+        )?;
+        connect_components::<KeyMaterialDiscoveryPort, _, _>(
+            &self.key_material_discovery,
+            &self.route_establishment,
+            "route establishment -> key material discovery",
         )
     }
 
@@ -887,6 +938,7 @@ impl ComponentTopology for DiscoveryTopology {
             &self.peer_announcement as &dyn RuntimeLifecycleComponent,
             &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
             &self.route_establishment as &dyn RuntimeLifecycleComponent,
+            &self.key_material_discovery as &dyn RuntimeLifecycleComponent,
             &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
         ]
         .into_iter()
@@ -898,6 +950,7 @@ impl ComponentTopology for DiscoveryTopology {
             &self.peer_announcement as &dyn RuntimeLifecycleComponent,
             &self.peer_announcement_observation as &dyn RuntimeLifecycleComponent,
             &self.route_establishment as &dyn RuntimeLifecycleComponent,
+            &self.key_material_discovery as &dyn RuntimeLifecycleComponent,
             &self.manual_route_discovery as &dyn RuntimeLifecycleComponent,
             &self.local_endpoint_manager as &dyn RuntimeLifecycleComponent,
         ]
@@ -1038,7 +1091,14 @@ impl RuntimeTopology {
     fn build(system: &KompactSystem, input: RuntimeTopologyBuildInput) -> Self {
         let io = IoTopology::build(system);
         let transport = TransportTopology::build(system, &io.bridge);
+        let egress_pool = IoBridgeHandle::from_component(&io.bridge)
+            .egress_pool()
+            .clone();
         let manager_ref = transport.manager_ref();
+        let discovery_transport_handles = DiscoveryTransportHandles {
+            route_transport: manager_ref.clone(),
+            egress_pool,
+        };
         let delivery = DeliveryTopology::build(
             system,
             input.group_memberships.clone(),
@@ -1052,7 +1112,7 @@ impl RuntimeTopology {
             input.group_memberships.clone(),
             input.local_member.clone(),
             input.security.clone(),
-            manager_ref,
+            discovery_transport_handles,
             input.static_route_hints,
         );
         let runtime = RuntimeLogicTopology::build(
@@ -1099,16 +1159,16 @@ impl RuntimeTopology {
         Ok(())
     }
 
-    fn stop_all(
+    async fn stop_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.runtime.stop_all(system, control_timeout)?;
-        self.discovery.stop_all(system, control_timeout)?;
-        self.delivery.stop_all(system, control_timeout)?;
-        self.transport.stop_all(system, control_timeout)?;
-        self.io.stop_all(system, control_timeout)?;
+        self.runtime.stop_all(system, control_timeout).await?;
+        self.discovery.stop_all(system, control_timeout).await?;
+        self.delivery.stop_all(system, control_timeout).await?;
+        self.transport.stop_all(system, control_timeout).await?;
+        self.io.stop_all(system, control_timeout).await?;
         Ok(())
     }
 }
@@ -1269,24 +1329,30 @@ impl DeliveryRuntimeHost {
         .await
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> Result<(), RuntimeHostError> {
         let Some(topology) = self.topology.take() else {
-            return;
+            return Ok(());
         };
         let Some(system) = self.system.take() else {
-            return;
+            return Ok(());
         };
-        let stop_result = topology.stop_all(&system, self.control_timeout);
+        let stop_result = topology.stop_all(&system, self.control_timeout).await;
         drop(topology);
         if let Err(error) = stop_result {
-            shutdown_system_bounded(system, self.control_timeout, true);
+            system.shutdown_async();
             #[cfg(any(test, feature = "test-support"))]
             rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
-            panic!("failed to stop delivery runtime host cleanly: {error}");
+            return Err(error);
         }
-        shutdown_system_bounded(system, self.control_timeout, false);
+        system
+            .shutdown()
+            .map(|result| result.boxed().context(ControlFutureSnafu))
+            .timeout_fold_err(self.control_timeout)
+            .await
+            .context(ShutdownSystemSnafu)?;
         #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
+        Ok(())
     }
 
     /// Replace the authoritative shared group-membership snapshot.
@@ -1331,18 +1397,14 @@ impl DeliveryRuntimeHost {
 
 impl Drop for DeliveryRuntimeHost {
     fn drop(&mut self) {
-        let Some(topology) = self.topology.take() else {
-            return;
-        };
+        drop(self.topology.take());
         let Some(system) = self.system.take() else {
             return;
         };
-        let stop_result = topology.stop_all(&system, self.control_timeout);
-        drop(topology);
-        if let Err(error) = stop_result {
-            log::error!("delivery runtime host drop stop_all failed before forced kill: {error}");
-        }
-        shutdown_system_bounded(system, self.control_timeout, true);
+        log::warn!(
+            "replication runtime host dropped without graceful shutdown; call ReplicationApi::shutdown().await before dropping the runtime handle"
+        );
+        system.shutdown_async();
         #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }

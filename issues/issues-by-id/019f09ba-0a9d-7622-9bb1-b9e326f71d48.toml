@@ -1,0 +1,65 @@
+id = "019f09ba-0a9d-7622-9bb1-b9e326f71d48"
+ref = "flotsync-ist.5"
+title = "Allow bootstrap install with unresolved member keys"
+body = """
+Finish the remaining unresolved-member-key install behaviour after flotsync-ist.3 and flotsync-ist.4 moved most trust and bootstrap-key work into place.
+
+Already covered by completed predecessor work:
+D01. Bootstrap payloads carry exact member identities plus expected key fingerprints, with optional inline public key bundles.
+D02. Bootstrap acceptance checks BootstrapActivation permission for the sender's exact advertised member key.
+D03. Inline public bundles are stored as observed key material only; they do not create trust evidence.
+D04. Active group traffic from a sender with missing keys is dropped cleanly instead of reaching plaintext delivery.
+
+Remaining agreed scope:
+A01. Persist each hosted group member as an ordered MemberKeyId, so member identity and expected key fingerprint are stored as one value instead of parallel vectors.
+A02. Bootstrap install may persist group metadata when non-sender, non-local member key material is missing or unauthorised locally.
+A03. Runtime startup must not require ReplicationRuntime-authorised public key material for every persisted group member before loading.
+A04. Runtime message verification must use the exact expected MemberKeyId for the group member, then request ReplicationRuntime permission for that exact key.
+A05. Missing, unauthorised, conflicting, or blocked key material must fail closed for that sender's traffic without corrupting group state or crashing the runtime.
+A06. Once matching key material and trust evidence are later stored, later messages/catch-up for that member can be processed.
+A07. Resolution state should be derived from stored expected fingerprints, observed key material, trust evidence, blocked fingerprints, and permission denial reasons in this slice; no operator-facing inspection/reporting API is included here.
+A08. Local create remains strict for this slice: CreateGroupRequest only names identities, so group creation must still load permitted keys for all members to derive their ordered MemberKeyId values.
+
+Implementation plan:
+B01. Replace ReplicationGroupRecord.members with ordered Vec<MemberKeyId>, and derive GroupMembers where identity-only membership views are needed.
+B02. Update SQLite group-member storage to store member identity plus key fingerprint per ordered group member row.
+B03. Populate ordered MemberKeyId values during local group creation from permitted public keys, and during bootstrap install from the bootstrap member-key map.
+B04. Adjust store validation/startup security checks so persisted group loading validates group secret metadata and member-key shape, but does not require every remote member key to be authorised upfront.
+B05. Add an exact expected-key lookup path for inbound group verification and use SecurityStore permission checks for AuthorityScope::ReplicationRuntime on the expected key id.
+B06. Add tests for bootstrap install with missing non-local key material, runtime load with unresolved member keys, rejecting unresolved/untrusted/blocked/mismatched-fingerprint traffic, and accepting later traffic after the matching key becomes authorised.
+
+Acceptance criteria:
+C01. Bootstrap installation can persist ordered MemberKeyId group membership when some non-local key bundles are absent.
+C02. Runtime load succeeds for persisted groups with unresolved remote member keys.
+C03. Inbound verification accepts only the expected member fingerprint for the group and only when that exact key has ReplicationRuntime permission.
+C04. Traffic from missing, unauthorised, conflicting, blocked, or fingerprint-mismatched key material is rejected cleanly.
+C05. Tests cover install with missing non-local key, runtime load with missing authorised key material, rejecting unresolved sender traffic, rejecting mismatched fingerprint traffic, rejecting blocked/unauthorised key traffic, and accepting after matching key resolution/trust evidence.
+
+Aligned review-fix plan:
+R01. Introduce a GroupMemberKeys abstraction that keeps ordered MemberKeyId values, borrowed member identity projections, and member-index lookup together.
+R02. Use GroupMemberKeys in ReplicationGroupRecord so callers do not rebuild identity/order/index views manually.
+R03. Remove eager ordered-member cloning from ReplicationGroupRecord; callers that need owned identities clone explicitly from borrowed projections.
+R04. Keep only GroupMemberKeys plus the decrypted group key in DeliverySecurity's loaded group-security state.
+R05. Collapse repeated block_on calls in group-broadcast test security helpers into one internal async transaction sequence per helper.
+R06. Rename the exact-key security-store load API and exact-key error wording around "if permitted" semantics, since a MemberKeyId identifies at most one stored key.
+
+Estimate: roughly 500-900 LOC. This stays below the 1000 LOC split threshold, but the storage-record shape and runtime verification path should be implemented in one coherent slice because the ordered MemberKeyId is the contract between both."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = [
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+    "019f09b9-acd8-70c2-ac78-8e18220ad6d7",
+]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T15:36:55.197626Z"
+updated_at = "2026-06-30T15:58:17.973741Z"
+closed_at = "2026-06-30T15:58:17.973741Z"
+
+[[comments]]
+id = "019f1940-b175-7da0-a1f2-16b41bcb5386"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-30T15:58:17.973741Z"

@@ -1,0 +1,19 @@
+id = "019f0f89-b72d-7813-9d33-31a4981d9834"
+ref = "flotsync-git-52p"
+title = "Make write store transactions extend read transactions"
+body = 'Follow-up from flotsync-ist.3 review.\n\nRefactor ReplicationStoreTransaction so mutable transactions inherit the read API from ReplicationStoreReadTransaction instead of duplicating every read method declaration and implementation.\n\nPlan:\nA01. Change ReplicationStoreTransaction to extend ReplicationStoreReadTransaction.\nA02. Remove read method declarations from ReplicationStoreTransaction, leaving only write-specific methods plus commit and rollback.\nA03. Document that write transactions inherit read operations and inherit release as a rollback-style release path; runtime write call sites should keep using commit or rollback explicitly.\nA04. Delete duplicate read method bodies from the SQLite write-transaction implementation; keep the existing read implementation as the single read surface.\nA05. Split FailingStoreTransaction in tests into a read-transaction impl for delegated reads and a write-transaction impl for write/failure/commit/rollback behaviour.\nA06. Keep call sites unchanged unless compilation shows an object-safety or dispatch issue.\n\nValidation:\nB01. Run cargo fmt --all.\nB02. Run cargo check --workspace.\nB03. Run cargo test -p flotsync_replication -- --test-threads=1.\nB04. Run cargo clippy --workspace -- -W clippy::pedantic.\n\nEstimate: roughly 120-220 LOC touched, mostly deletion. No behaviour or schema change intended.'
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "Codex"
+parent = "019f098b-8001-7fc0-92ed-86392e41fb7d"
+created_at = "2026-06-28T18:41:51.405184Z"
+updated_at = "2026-06-29T08:24:07.607488Z"
+closed_at = "2026-06-29T08:24:07.607488Z"
+
+[[comments]]
+id = "019f127a-86b7-77c0-9985-77d4d79c2b67"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-29T08:24:07.607488Z"

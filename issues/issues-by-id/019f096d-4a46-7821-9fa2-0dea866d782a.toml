@@ -1,0 +1,64 @@
+id = "019f096d-4a46-7821-9fa2-0dea866d782a"
+ref = "flotsync-ist.1.10"
+title = "Design replicated-checklist key setup convenience"
+body = """
+Design replicated-checklist convenience flows for key setup, testing, and fast reset after JWKS files are removed. The public key bundle format is settled by flotsync-ist.1.2 and implemented by flotsync-ist.8, so this task focuses on commands and example workflow ergonomics.
+
+Settled inputs from flotsync-ist.1.2:
+RC01. The example should stop relying on JWKS files once PublicKeyBundle support from flotsync-ist.8 exists.
+RC02. Convenience commands should expose and accept pasteable base64 PublicKeyBundle strings produced by the flotsync_security helper APIs.
+RC03. The bundle string does not contain MemberIdentity; the example supplies identity through config, command arguments, or explicit user choice.
+RC04. Inspect commands should decode a bundle without granting trust and report fingerprint, algorithms, known identity bindings, ambiguity, mismatches, blocked status, and current trust/evidence summaries where available.
+RC05. Trust commands should record evidence for an explicit MemberIdentity plus fingerprint. Decoding, importing, or displaying a bundle must not grant authority by itself.
+RC06. Multiple fingerprints per identity and reused fingerprints across identities must remain visible in the example so manual tests can cover blocked keys and ambiguous bindings.
+
+Remaining questions:
+RC07. Which concrete commands should create local keys, export local public bundles, inspect pasted bundles, trust explicit identity/fingerprint pairs, list trust state, and reset example state?
+RC08. What is the fastest manual recovery path after deleting the store or changing incompatible test data, now that key material lives in the store?
+RC09. Which mechanisms should the example exercise first: pasteable invite, QR-ready bundle, untrusted discovery, introducer, or bootstrap trust policy?
+RC10. Should the example model one identity per device initially, or also expose parent/device examples such as bob and bob.laptop for future hierarchy design?
+RC11. How should the example surface blocked keys so users can recover test state intentionally without hiding the semantics we want in production?"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:13:05.222769Z"
+updated_at = "2026-06-28T10:29:02.216368Z"
+closed_at = "2026-06-28T10:29:02.216368Z"
+
+[[links]]
+target = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"
+label = "resolved by"
+
+[[links]]
+target = "019f0d59-827c-7780-ae76-9a426ab8b278"
+label = "uses bundle format"
+
+[[comments]]
+id = "019f0dc6-742f-7a00-8043-f71cf10ec6b3"
+author = "lkroll"
+body = """
+Resolved as implementation work in flotsync-ist.9, with supporting updates in flotsync-ist.3 and flotsync-ist.8.
+
+Decision summary:
+CK01. The replicated-checklist binary gets a top-level keys command family, not REPL-only setup commands.
+CK02. The first command set is keys init-local, keys export-local, keys inspect, keys trust, keys list, and keys block.
+CK03. The current generate-keys JWKS flow is replaced rather than extended.
+CK04. export-local must clearly distinguish the public bundle value that needs copy-pasting from informational member id and fingerprint output.
+CK05. run fails loudly when local identity keys are missing and points users to keys init-local; it does not silently generate new identity keys.
+CK06. No reset-local command in this slice. Manual recovery can remain deleting the store and running keys init-local.
+CK07. Positive trust remains exact MemberIdentity plus fingerprint and requires a bundle in this slice. Fingerprint-only positive trust approval is deferred.
+CK08. Blocking is global by fingerprint, not by identity plus fingerprint. Blocked key material is rejected everywhere and must not be hidden by deleting an identity binding.
+CK09. keys block is included, but depends on the basic known/trusted/blocked key-state support in flotsync-ist.3.
+CK10. The checklist config drops local-private-jwks-path and trusted-public-jwks-paths once the new store-native flow exists.
+CK11. The example remains exact-device-identity only. Names such as alice.phone are explicit MemberIdentity values, not generated subidentities or inherited parent trust.
+CK12. No existing dedicated task covered fresh user ids, device ids, and readable aliases; created deferred task flotsync-git-h13 and linked it to flotsync-hitr."""
+created_at = "2026-06-28T10:28:57.519807Z"
+
+[[comments]]
+id = "019f0dc6-8688-7e70-b7ba-197daba3b38f"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T10:29:02.216368Z"

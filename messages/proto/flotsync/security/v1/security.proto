@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package flotsync.security.v1;
+
+// Flotsync-owned canonical public key bundle.
+//
+// The bundle is deliberately identity-free. Callers bind it to a
+// MemberIdentity through local database rows, provisioning APIs, or higher
+// protocol context.
+message PublicKeyBundle {
+  uint32 format_version = 1;
+  PublicKey signing_key = 2;
+  PublicKey encryption_key = 3;
+}
+
+// Flotsync-owned canonical local private-key bundle.
+//
+// This bundle is the plaintext stored inside the encrypted local_members
+// store-secret cell. The enclosing row supplies the MemberIdentity.
+message LocalPrivateKeyBundle {
+  uint32 format_version = 1;
+  PrivateKey signing_key = 2;
+  PrivateKey encryption_key = 3;
+}
+
+message PublicKey {
+  KeyScheme scheme = 1;
+  bytes public_key = 2;
+}
+
+message PrivateKey {
+  KeyScheme scheme = 1;
+  bytes public_key = 2;
+  bytes private_key = 3;
+}
+
+enum KeyScheme {
+  KEY_SCHEME_UNSPECIFIED = 0;
+  KEY_SCHEME_ED25519 = 1;
+  KEY_SCHEME_X25519 = 2;
+}
+
+enum SignatureScheme {
+  SIGNATURE_SCHEME_UNSPECIFIED = 0;
+  SIGNATURE_SCHEME_ED25519PH = 1;
+}

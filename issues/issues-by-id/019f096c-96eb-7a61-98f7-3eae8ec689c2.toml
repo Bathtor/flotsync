@@ -1,0 +1,26 @@
+id = "019f096c-96eb-7a61-98f7-3eae8ec689c2"
+ref = "flotsync-ist.1.6"
+title = "Design relay-assisted key store discovery"
+body = """
+Design relay-assisted public key discovery where relays may act as key stores similar to public keyservers.
+
+Questions:
+Q01. Are relay-stored keys only untrusted observations, or can relays be configured as trusted introducers?
+Q02. What upload, lookup, freshness, deletion, and abuse-resistance properties are required?
+Q03. How does a local policy distinguish a key learned from a relay from one learned through direct discovery or user pairing?
+Q04. Can relay key storage be optional without fragmenting interoperability?
+Q05. Should relay lookup support parent identities, exact device identities, or both, and how does that affect trust inheritance?"""
+status = "closed"
+status_reason = "deferred to flotsync-relay-keys"
+type = "task"
+priority = 2
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:12:19.307101Z"
+updated_at = "2026-06-28T10:52:24.886287Z"
+closed_at = "2026-06-28T10:52:24.886287Z"
+
+[[comments]]
+id = "019f0ddb-edb6-7041-af8f-c2d1b6a40ef6"
+author = "lkroll"
+body = "deferred to flotsync-relay-keys"
+created_at = "2026-06-28T10:52:24.886287Z"

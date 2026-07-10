@@ -1,0 +1,33 @@
+id = "019f0dc4-7f47-76a2-94ec-f761f6691c3b"
+ref = "flotsync-git-h13"
+title = "Design local identity naming and device allocation"
+body = """
+Deferred design task outside flotsync-ist for application-facing identity lifecycle and naming.
+
+Context:
+A01. flotsync-ist intentionally works with caller-supplied exact MemberIdentity values and key fingerprints.
+A02. flotsync-hitr covers hierarchy trust inheritance and revocation, but not the mechanics of minting, naming, aliasing, and presenting identities.
+
+Design questions:
+B01. How should applications create fresh conceptual user identities and concrete device identities?
+B02. Should Flotsync provide random opaque identity segments, readable aliases, or both?
+B03. How are stable device ids assigned under a user namespace without pretending parent trust exists before policy allows it?
+B04. How do readable aliases map to exact MemberIdentity values, and are aliases local-only or shareable evidence?
+B05. How should applications present multiple local identities/devices sharing one store-secret profile?
+B06. How does identity lifecycle interact with flotsync-hitr trust inheritance, migration, recovery, and revocation?
+
+Potential direction:
+C01. Keep cryptographic authority bound to exact MemberIdentity plus key fingerprint.
+C02. Treat aliases as display metadata unless a later signed evidence model gives them authority.
+C03. Keep this outside flotsync-ist so the current key-material discovery slice can remain exact-identity only.
+
+Estimate: design first; implementation likely needs several subtasks once hierarchy and recovery policy are clearer."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-06-28T10:26:49.287356Z"
+updated_at = "2026-06-28T10:26:54.782296Z"
+
+[[links]]
+target = "019f099f-876d-7941-b100-7fe8771dd3a6"
+label = "related to"

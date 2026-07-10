@@ -27,6 +27,7 @@ pub use generated::{
         discovery::v1 as discovery,
         endpoint::v1 as endpoint,
         replication::v1 as replication,
+        security::v1 as security,
         versions::v1 as versions,
     },
 };

@@ -63,7 +63,7 @@ use flotsync_udpour::{
     UDPourSendFailureReason,
     UDPourSubmitResult,
 };
-use flotsync_utils::OptionExt as _;
+use flotsync_utils::{OptionExt as _, kompact_config::ConfigReadExt as _};
 use kompact::{config::UsizeValue, kompact_config, prelude::*};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Mutex;
@@ -180,22 +180,10 @@ impl RouteTransportManager {
     }
 
     fn load_udp_activation_policy(&self) -> UdpActivationPolicy {
-        let raw = match self
+        let raw = self
             .ctx
             .config()
-            .read_or_default(&config_keys::UDP_ACTIVATION_POLICY)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load route-transport UDP activation policy from {}: {}. Falling back to OnBind",
-                    config_keys::UDP_ACTIVATION_POLICY.key,
-                    error
-                );
-                return UdpActivationPolicy::OnBind;
-            }
-        };
+            .read_or_default_warn(self.log(), &config_keys::UDP_ACTIVATION_POLICY);
         match raw {
             0 => UdpActivationPolicy::OnBind,
             1 => UdpActivationPolicy::OnFirstUse,

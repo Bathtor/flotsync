@@ -18,7 +18,7 @@ zeroconf-via-kompact = [
 flotsync_core = { path = "../flotsync_core" }
 flotsync_io = { path = "../flotsync_io", default-features = false, optional = true }
 flotsync_messages = { path = "../flotsync_messages" }
-flotsync_security = { path = "../flotsync_security" }
+flotsync_security = { path = "../flotsync_security", default-features = false }
 flotsync_utils = { path = "../flotsync_utils" }
 # socket2 = "0.5"
 derive_more = { version = "2", features = ["deref", "display", "from"] }

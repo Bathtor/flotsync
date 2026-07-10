@@ -1,0 +1,32 @@
+id = "019f1452-5a3b-7eb0-bb90-603eef84e59d"
+ref = "flotsync-git-car"
+title = "Add shared Kompact config-read fallback helper"
+body = """
+Several Kompact components repeat the same pattern: read_or_default from component context, log a warning on config read failure, and continue with the declared default. Introduce a shared helper with consistent logging and value/default handling, then migrate existing call sites once the API shape is agreed. Discovered during flotsync-ist.4 review; keep separate from bootstrap key-fingerprint work.
+
+Agreed plan:
+P01. Add flotsync_utils::kompact_config with a Config extension trait for warning-and-default reads.
+P02. Provide read_or_default_warn(logger, key) for fallback reads where invalid configured values should warn with the config key and use the declared default.
+P03. Keep ordinary Kompact read_or_default behaviour for absent keys: use the declared default without warning.
+P04. Migrate only intentional runtime fallback sites first: UDP activation policy, UDPour send-rate controls, reliable-delivery retry and ack timeouts, catch-up retry and batch limit, and bootstrap inline public-key bundle limit.
+P05. Leave fail-fast startup and construction reads unchanged: route establishment timing, discovery bind options, I/O driver bind reuse, runtime host config, and local endpoint refresh interval.
+P06. Add focused flotsync_utils tests for configured values, missing keys, and invalid configured values falling back.
+P07. Expected implementation size is roughly 120-190 LOC, well under 1000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 3
+assignee = "codex"
+created_at = "2026-06-29T16:59:29.211918Z"
+updated_at = "2026-06-29T17:57:34.081452Z"
+closed_at = "2026-06-29T17:57:34.081452Z"
+
+[[links]]
+target = "019f09b9-acd8-70c2-ac78-8e18220ad6d7"
+label = "discovered from"
+
+[[comments]]
+id = "019f1487-8701-7373-a5e6-56eb2aab363a"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-29T17:57:34.081452Z"

@@ -1,3 +1,5 @@
+#[cfg(any(test, feature = "test-support"))]
+use super::host::DeliveryRuntimeHostTestExt;
 use super::{
     ReplicationRuntimeMessage,
     host::DeliveryRuntimeHost,
@@ -11,6 +13,7 @@ use super::{
 use crate::{
     api::{
         ApiError,
+        ApiExternalSnafu,
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
@@ -28,19 +31,26 @@ use crate::{
         SnapshotRowsRequest,
         Summary,
         SummaryRequest,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleReport,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::security::DeliverySecurity,
+    security_store::SecurityStore,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use flotsync_core::MemberIdentity;
 #[cfg(any(test, feature = "test-support"))]
-use flotsync_core::membership::GroupMembers;
+use flotsync_core::membership::{GroupMembers, GroupMemberships};
 use flotsync_core::{GroupId, member::Identifier};
+use flotsync_security::PublicKeyBundle;
 use flotsync_utils::BoxFuture;
-use futures_util::FutureExt;
-use kompact::prelude::*;
+use futures_util::{FutureExt, future};
+use kompact::{KompactLogger, prelude::*};
 use snafu::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 #[cfg(any(test, feature = "test-support"))]
 use super::errors::GroupInstallError;
@@ -133,8 +143,9 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
+    let security_store = SecurityStore::new(store.clone(), config.trust_policy.clone());
     let security_f = DeliverySecurity::load(
-        store.clone(),
+        security_store,
         &local_member,
         security_secrets.store_secret_key().clone(),
         *security_secrets.store_secret_key_id(),
@@ -147,7 +158,6 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
         application_id.clone(),
         store.clone(),
         security_secrets.store_secret_key_id(),
-        &security,
     );
     validation_f
         .await
@@ -216,11 +226,11 @@ async fn load_replication_runtime_typed_with_security(
         .actor_ref()
         .hold()
         .expect("replication runtime component must expose a strong actor ref");
-    let host = Arc::new(host);
+    let logger = host.logger().clone();
     Ok(Arc::new(ReplicationRuntime {
         _application_id: application_id,
-        runtime_ref: Some(runtime_ref),
-        host,
+        lifecycle: RwLock::new(Some(RuntimeLifecycle { runtime_ref, host })),
+        logger,
         _config: config,
     }))
 }
@@ -228,17 +238,32 @@ async fn load_replication_runtime_typed_with_security(
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
 pub(crate) struct ReplicationRuntime {
     _application_id: Identifier,
-    runtime_ref: Option<ActorRefStrong<ReplicationRuntimeMessage>>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    host: Arc<DeliveryRuntimeHost>,
+    /// Live runtime ownership, taken exactly once during graceful shutdown.
+    lifecycle: RwLock<Option<RuntimeLifecycle>>,
+    /// Logger clone kept outside the lifecycle lock for hot-path diagnostics.
+    logger: KompactLogger,
     _config: ReplicationConfig,
 }
 
+/// Live runtime resources that are created and shut down as one unit.
+struct RuntimeLifecycle {
+    /// Strong actor ref used by public API calls while the runtime is live.
+    runtime_ref: ActorRefStrong<ReplicationRuntimeMessage>,
+    /// Internal Kompact runtime host that owns component topology and system shutdown.
+    host: DeliveryRuntimeHost,
+}
+
 impl ReplicationRuntime {
-    fn runtime_ref(&self) -> &ActorRefStrong<ReplicationRuntimeMessage> {
-        self.runtime_ref
+    fn runtime_ref(
+        &self,
+        operation: &'static str,
+    ) -> ApiResult<Option<ActorRefStrong<ReplicationRuntimeMessage>>> {
+        let Ok(lifecycle) = self.lifecycle.read() else {
+            return Err(ApiError::RuntimeLifecyclePoisoned { operation });
+        };
+        Ok(lifecycle
             .as_ref()
-            .expect("replication runtime shut down already")
+            .map(|lifecycle| lifecycle.runtime_ref.clone()))
     }
 
     fn ask<T>(
@@ -248,8 +273,13 @@ impl ReplicationRuntime {
     where
         T: Send + 'static,
     {
-        let future = self.runtime_ref().ask_with(build);
-        let logger = self.host.logger().clone();
+        let runtime_ref = match self.runtime_ref("sending runtime request") {
+            Ok(Some(runtime_ref)) => runtime_ref,
+            Ok(None) => return future::ready(Err(ApiError::RuntimeUnavailable)).boxed(),
+            Err(error) => return future::ready(Err(error)).boxed(),
+        };
+        let future = runtime_ref.ask_with(build);
+        let logger = self.logger.clone();
         async move {
             match future.await {
                 Ok(reply) => reply,
@@ -265,14 +295,61 @@ impl ReplicationRuntime {
 
 impl Drop for ReplicationRuntime {
     fn drop(&mut self) {
-        self.runtime_ref.take();
-        if let Some(host) = Arc::get_mut(&mut self.host) {
-            host.shutdown();
-        }
+        let lifecycle = match self.lifecycle.get_mut() {
+            Ok(lifecycle) => lifecycle.take(),
+            Err(poisoned) => {
+                warn!(
+                    self.logger,
+                    "replication runtime lifecycle lock was poisoned during drop; continuing best-effort cleanup"
+                );
+                poisoned.into_inner().take()
+            }
+        };
+        drop(lifecycle);
     }
 }
 
 impl ReplicationApi for ReplicationRuntime {
+    fn shutdown(&self) -> ApiFuture<'_, ()> {
+        async move {
+            let lifecycle = {
+                let Ok(mut lifecycle) = self.lifecycle.write() else {
+                    return Err(ApiError::RuntimeLifecyclePoisoned {
+                        operation: "shutting runtime down",
+                    });
+                };
+                lifecycle.take()
+            };
+            let Some(RuntimeLifecycle { mut host, .. }) = lifecycle else {
+                return Ok(());
+            };
+            host.shutdown().await.boxed().context(ApiExternalSnafu)
+        }
+        .boxed()
+    }
+
+    fn local_public_key_bundle(&self) -> ApiFuture<'_, PublicKeyBundle> {
+        self.ask(|promise| ReplicationRuntimeMessage::LocalPublicKeyBundle(Ask::new(promise, ())))
+    }
+
+    fn assess_public_key_bundle(
+        &self,
+        request: AssessPublicKeyBundleRequest,
+    ) -> ApiFuture<'_, PublicKeyBundleReport> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::AssessPublicKeyBundle(Ask::new(promise, request))
+        })
+    }
+
+    fn record_public_key_bundle_feedback(
+        &self,
+        request: RecordPublicKeyBundleFeedbackRequest,
+    ) -> ApiFuture<'_, ()> {
+        self.ask(move |promise| {
+            ReplicationRuntimeMessage::RecordPublicKeyBundleFeedback(Ask::new(promise, request))
+        })
+    }
+
     fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, request))
@@ -311,14 +388,49 @@ where
     flotsync_io::test_support::wait_for_future(
         TEST_REPLY_TIMEOUT,
         future,
-        "timed out waiting for test future to resolve",
+        "timed out waiting for test reply",
     )
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl ReplicationRuntime {
-    pub(crate) fn host(&self) -> &DeliveryRuntimeHost {
-        self.host.as_ref()
+    fn with_host_for_test<T>(&self, read: impl FnOnce(&DeliveryRuntimeHost) -> T) -> T {
+        let lifecycle = self
+            .lifecycle
+            .read()
+            .expect("replication runtime lifecycle lock should not be poisoned");
+        let lifecycle = lifecycle
+            .as_ref()
+            .expect("replication runtime host should be live during test access");
+        read(&lifecycle.host)
+    }
+
+    pub(crate) fn membership_snapshot_for_test(&self) -> Arc<GroupMemberships> {
+        self.with_host_for_test(DeliveryRuntimeHost::membership_snapshot)
+    }
+
+    pub(crate) fn advertised_loopback_udp_addr_for_test(&self) -> std::net::SocketAddr {
+        self.with_host_for_test(DeliveryRuntimeHostTestExt::advertised_loopback_udp_addr)
+    }
+
+    pub(crate) fn publish_direct_peer_route_for_test(
+        &self,
+        peer: MemberIdentity,
+        remote_addr: std::net::SocketAddr,
+    ) {
+        self.with_host_for_test(|host| host.publish_direct_peer_route(peer, remote_addr));
+    }
+
+    // These route assertion helpers are only used by in-crate runtime tests.
+    // Building them for the broader `test-support` feature leaves dead code.
+    #[cfg(test)]
+    pub(crate) fn knows_direct_peer_route_for_test(&self, peer: &MemberIdentity) -> bool {
+        self.with_host_for_test(|host| host.knows_direct_peer_route(peer))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_direct_peer_route_for_test(&self, peer: &MemberIdentity) {
+        self.with_host_for_test(|host| host.wait_for_direct_peer_route(peer));
     }
 
     pub(crate) fn install_group_for_test(
@@ -326,7 +438,11 @@ impl ReplicationRuntime {
         group_id: GroupId,
         members: GroupMembers,
     ) -> Result<(), GroupInstallError> {
-        let future = self.runtime_ref().ask_with(|promise| {
+        let runtime_ref = self
+            .runtime_ref("installing test group")
+            .expect("replication runtime lifecycle should be readable during test install")
+            .expect("replication runtime should be live during test install");
+        let future = runtime_ref.ask_with(|promise| {
             ReplicationRuntimeMessage::test_install_group(promise, group_id, members)
         });
         match wait_for_test_reply(future) {
@@ -345,7 +461,11 @@ impl ReplicationRuntime {
         sender: MemberIdentity,
         message: UpdateMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let future = self.runtime_ref().ask_with(|promise| {
+        let runtime_ref = self
+            .runtime_ref("injecting test update")
+            .expect("replication runtime lifecycle should be readable during test update injection")
+            .expect("replication runtime should be live during test update injection");
+        let future = runtime_ref.ask_with(|promise| {
             ReplicationRuntimeMessage::test_apply_update(promise, sender, message)
         });
         match wait_for_test_reply(future) {
@@ -364,7 +484,11 @@ impl ReplicationRuntime {
         sender: MemberIdentity,
         message: UpdateBatchMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let future = self.runtime_ref().ask_with(|promise| {
+        let runtime_ref = self
+            .runtime_ref("injecting test batch")
+            .expect("replication runtime lifecycle should be readable during test batch injection")
+            .expect("replication runtime should be live during test batch injection");
+        let future = runtime_ref.ask_with(|promise| {
             ReplicationRuntimeMessage::test_apply_update_batch(promise, sender, message)
         });
         match wait_for_test_reply(future) {

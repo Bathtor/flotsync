@@ -1,0 +1,28 @@
+id = "019f097c-3969-7f71-8635-21d59788b5d1"
+ref = "flotsync-ist.1.11"
+title = "Design hierarchical identity trust inheritance"
+body = """
+Design hierarchical member identity trust and inheritance for segmented MemberIdentity values such as bob and bob.phone.
+
+Questions:
+Q01. What is the semantic difference between a conceptual user identity and a device/subidentity?
+Q02. Can trust granted to a parent identity imply trust in child identities, and under which policies?
+Q03. What evidence is required before accepting a child identity: parent signature, existing trusted device signature, explicit user approval, group bootstrap, or another mechanism?
+Q04. Can one trusted child device introduce sibling devices or parent-level trust, or is trust directional and capped by the authority that signed it?
+Q05. How should trust records bind to exact keys so a compromised device cannot silently replace parent or sibling keys?
+Q06. How does hierarchy interact with revocation, key rotation, group invitation policies, and displayed fingerprints?"""
+status = "closed"
+status_reason = "deferred to flotsync-hitr"
+type = "task"
+priority = 2
+blocks = ["019f099f-876d-7941-b100-7fe8771dd3a6"]
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:29:23.94531Z"
+updated_at = "2026-06-28T10:52:31.328922Z"
+closed_at = "2026-06-28T10:52:31.328922Z"
+
+[[comments]]
+id = "019f0ddc-06e0-7731-b215-5a0daa08d99e"
+author = "lkroll"
+body = "deferred to flotsync-hitr"
+created_at = "2026-06-28T10:52:31.328922Z"

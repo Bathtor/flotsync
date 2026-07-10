@@ -4,18 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+default = ["local-secret-manager"]
+local-secret-manager = ["flotsync_security/local-secret-manager"]
 test-support = ["flotsync_security/test-support"]
 
 [dependencies]
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+enumset = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
 flotsync_discovery = { path = "../flotsync_discovery", default-features = false, features = ["peer-announcement-via-kompact"] }
 flotsync_messages = { path = "../flotsync_messages" }
 flotsync_routes = { path = "../flotsync_routes" }
-flotsync_security = { path = "../flotsync_security" }
+flotsync_security = { path = "../flotsync_security", default-features = false }
 flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 futures-util = { workspace = true }

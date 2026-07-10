@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-buffa = "0.3"
+buffa = "0.8"
 bytes = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }
 flotsync_data_types = { path = "../flotsync_data_types" }
@@ -16,7 +16,7 @@ snafu = { workspace = true }
 uuid = { workspace = true }
 
 [build-dependencies]
-buffa-build = "0.3"
+buffa-build = "0.8"
 
 [dev-dependencies]
 criterion = "0.8"

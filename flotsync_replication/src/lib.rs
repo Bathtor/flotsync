@@ -10,6 +10,7 @@ pub mod api;
 pub mod delivery;
 pub mod runtime;
 pub mod security_provisioning;
+pub(crate) mod security_store;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -19,6 +20,7 @@ pub use runtime::{load_replication_runtime, load_replication_runtime_with_runtim
 pub use security_provisioning::{
     ProvisionSecurityError,
     ProvisionedReplicationSecurity,
+    load_local_public_key_bundle,
     prepare_initial_group_security_material,
     provision_replication_security,
     validate_initial_group_security_material,

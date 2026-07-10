@@ -1,0 +1,37 @@
+id = "019f096b-9999-7cb0-a59c-779d53f448d7"
+ref = "flotsync-ist.1.1"
+title = "Design QR and out-of-band pairing key exchange"
+body = """
+Design the out-of-band pairing mechanism for exchanging member key material through application-owned UI such as QR codes.
+
+Resolution:
+QR01. No separate QR-specific implementation task is needed in this slice.
+QR02. flotsync-ist.8 owns the single public bundle presentation payload: base64 of the protobuf PublicKeyBundle bytes.
+QR03. The same payload is suitable for manual copy-paste, application-defined URIs, QR codes, files, and other application channels.
+QR04. Live Flotsync APIs still expose raw protobuf bytes and typed values; the presentation helper is an auxiliary stateless API.
+QR05. QR rendering, QR scanning, camera permissions, URI scheme registration, and all UI remain application-owned.
+QR06. QR/manual/URI exchange all follow the same Flotsync flow: decode string, validate bundle, derive fingerprint, inspect known identity bindings and blocked/trust state, application supplies or selects an exact MemberIdentity, user approves, then trust/evidence is recorded for that identity and fingerprint.
+QR07. PublicKeyBundle intentionally excludes MemberIdentity and other application metadata, keeping QR size predictable and avoiding application-controlled identity length in the QR payload.
+QR08. Importing or decoding QR content does not grant authority; authority remains derived by policy from stored trust/evidence and global blocked-key state.
+
+Outcome:
+QR09. QR support is folded into flotsync-ist.8 via transport-agnostic pasteable public bundle encode/decode and inspect APIs."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Lars Kroll"
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:11:14.457278Z"
+updated_at = "2026-06-28T10:46:56.437208Z"
+closed_at = "2026-06-28T10:46:56.437208Z"
+
+[[links]]
+target = "019f0d59-827c-7780-ae76-9a426ab8b278"
+label = "uses bundle format"
+
+[[comments]]
+id = "019f0dd6-eab5-7150-a71f-00a5618ac17e"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-28T10:46:56.437208Z"

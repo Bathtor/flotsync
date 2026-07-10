@@ -8,6 +8,9 @@ use crate::{
         ListenerExternalSnafu,
         LoadError,
         LocalMemberPrivateKeysRecord,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberPublicKeysRecord,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -27,18 +30,15 @@ use crate::{
         SnapshotRow,
         SnapshotRowsRequest,
         StoreSecretKeyId,
-        TrustedMemberPublicKeysRecord,
         process_batches,
     },
     delivery::security::DeliverySecurity,
-    runtime::{
-        handle::{
-            ReplicationRuntime,
-            load_replication_runtime_typed_with_security_for_test,
-            load_replication_runtime_with_runtime_config_toml,
-        },
-        host::DeliveryRuntimeHostTestExt,
+    runtime::handle::{
+        ReplicationRuntime,
+        load_replication_runtime_typed_with_security_for_test,
+        load_replication_runtime_with_runtime_config_toml,
     },
+    security_store::SecurityStore,
 };
 use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
 use flotsync_data_types::RowOperations;
@@ -49,10 +49,10 @@ use flotsync_security::{
     STORE_SECRET_NONCE_LENGTH,
     StoreSecretContext,
     StoreSecretKey,
-    public_member_keys_from_jwks,
+    public_member_keys_from_public_bundle,
     seal_store_secret_for_test,
     test_group_key_from_id,
-    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_files_from_seed},
+    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_bundles_from_seed},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
@@ -114,7 +114,7 @@ pub async fn load_replication_runtime_with_test_security_toml(
 }
 
 /// Wait for one test future to resolve within the standard replication timeout.
-pub fn wait_for_test_reply<F>(future: F) -> F::Output
+pub fn wait_for_test_future<F>(future: F) -> F::Output
 where
     F: std::future::Future,
 {
@@ -122,6 +122,18 @@ where
         TEST_WAIT_TIMEOUT,
         future,
         "timed out waiting for test future to resolve",
+    )
+}
+
+/// Wait for one test reply to resolve within the standard replication timeout.
+pub fn wait_for_test_reply<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    flotsync_io::test_support::wait_for_future(
+        TEST_WAIT_TIMEOUT,
+        future,
+        "timed out waiting for test reply",
     )
 }
 
@@ -492,13 +504,13 @@ impl RuntimeTestFixture {
 
     /// Publish direct peer routes between this fixture and another runtime.
     pub fn connect_direct_peer_routes(&self, peer: &Self) {
-        self.runtime.host().publish_direct_peer_route(
+        self.runtime.publish_direct_peer_route_for_test(
             peer.local_member.clone(),
-            peer.runtime.host().advertised_loopback_udp_addr(),
+            peer.runtime.advertised_loopback_udp_addr_for_test(),
         );
-        peer.runtime.host().publish_direct_peer_route(
+        peer.runtime.publish_direct_peer_route_for_test(
             self.local_member.clone(),
-            self.runtime.host().advertised_loopback_udp_addr(),
+            self.runtime.advertised_loopback_udp_addr_for_test(),
         );
     }
 
@@ -524,8 +536,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn contains_group(&self, group_id: GroupId) -> bool {
         self.runtime
-            .host()
-            .membership_snapshot()
+            .membership_snapshot_for_test()
             .contains_group(&group_id)
     }
 
@@ -533,8 +544,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn group_members(&self, group_id: GroupId) -> Option<GroupMembers> {
         self.runtime
-            .host()
-            .membership_snapshot()
+            .membership_snapshot_for_test()
             .members(&group_id)
             .cloned()
     }
@@ -563,18 +573,20 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    Arc::new(
-        SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
-            .expect("store should build"),
-    )
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        local_member,
+        schemas,
+    ))
+    .expect("store should build");
+    Arc::new(store)
 }
 
 /// Provision deterministic local-private keys and trusted peer keys into one store.
 ///
 /// # Errors
 ///
-/// Returns [`LoadError`] when deterministic test key generation, store-secret
-/// sealing, or any store transaction operation fails.
+/// Returns [`LoadError`] when store-secret sealing or any store transaction
+/// operation fails.
 pub async fn provision_test_security(
     application_id: Identifier,
     store: &dyn ReplicationStore,
@@ -582,11 +594,7 @@ pub async fn provision_test_security(
     trusted_members: impl IntoIterator<Item = MemberIdentity>,
 ) -> Result<(), LoadError> {
     let local_seed = test_member_seed(local_member);
-    let generated = member_key_files_from_seed(local_member.clone(), &local_seed)
-        .boxed()
-        .context(RuntimeSnafu {
-            application_id: application_id.clone(),
-        })?;
+    let generated = member_key_bundles_from_seed(local_member.clone(), &local_seed);
     let row_id = local_member.to_string();
     let context = StoreSecretContext {
         table: "local_member",
@@ -598,7 +606,7 @@ pub async fn provision_test_security(
     let sealed = seal_store_secret_for_test(
         &test_store_secret_key(),
         context,
-        generated.local_private_jwks.as_str().as_bytes(),
+        generated.local_private_bundle.as_bytes(),
         test_store_secret_nonce(local_member),
     )
     .boxed()
@@ -630,13 +638,20 @@ pub async fn provision_test_security(
         })?;
     for trusted_member in trusted_members {
         let trusted_keys = test_public_member_keys(&trusted_member);
-        let record = TrustedMemberPublicKeysRecord {
-            member_id: trusted_member,
-            signing_public_key: trusted_keys.signing_key_bytes().into(),
-            encryption_public_key: trusted_keys.encryption_key_bytes().into(),
-        };
+        let record = MemberPublicKeysRecord::from_public_keys(&trusted_keys);
+        let key_id = record.key_id.clone();
         transaction
-            .ensure_trusted_member_public_keys(record)
+            .ensure_member_public_keys(record)
+            .await
+            .boxed()
+            .context(RuntimeSnafu {
+                application_id: application_id.clone(),
+            })?;
+        transaction
+            .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+                key_id,
+                evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+            })
             .await
             .boxed()
             .context(RuntimeSnafu {
@@ -657,18 +672,16 @@ pub async fn provision_test_security(
 ///
 /// # Errors
 ///
-/// Returns [`LoadError`] when the store transaction or trusted-key write fails.
+/// Returns [`LoadError`] when the store transaction or trust-evidence write fails.
 pub async fn provision_test_trusted_public_keys(
     application_id: Identifier,
     store: &dyn ReplicationStore,
     member_id: MemberIdentity,
     public_keys: &PublicMemberKeys,
 ) -> Result<(), LoadError> {
-    let record = TrustedMemberPublicKeysRecord {
-        member_id,
-        signing_public_key: public_keys.signing_key_bytes().into(),
-        encryption_public_key: public_keys.encryption_key_bytes().into(),
-    };
+    let mut record = MemberPublicKeysRecord::from_public_keys(public_keys);
+    record.key_id.member_id = member_id;
+    let key_id = record.key_id.clone();
     let mut transaction = store
         .begin_transaction()
         .await
@@ -677,7 +690,17 @@ pub async fn provision_test_trusted_public_keys(
             application_id: application_id.clone(),
         })?;
     transaction
-        .ensure_trusted_member_public_keys(record)
+        .ensure_member_public_keys(record)
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    transaction
+        .ensure_member_key_trust_evidence(MemberKeyTrustEvidenceRecord {
+            key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        })
         .await
         .boxed()
         .context(RuntimeSnafu {
@@ -698,7 +721,7 @@ pub(crate) async fn load_test_delivery_security(
     local_member: &MemberIdentity,
 ) -> Result<DeliverySecurity, LoadError> {
     DeliverySecurity::load(
-        store,
+        SecurityStore::new(store, ReplicationConfig::default().trust_policy),
         local_member,
         Arc::new(test_store_secret_key()),
         TEST_STORE_SECRET_KEY_ID,
@@ -730,13 +753,12 @@ fn test_member_seed(member: &Identifier) -> [u8; TEST_MEMBER_KEY_SEED_LENGTH] {
 ///
 /// # Panics
 ///
-/// Panics if deterministic key generation or public-key parsing fails.
+/// Panics if public-key parsing fails.
 #[must_use]
 pub fn test_public_member_keys(member: &MemberIdentity) -> PublicMemberKeys {
     let seed = test_member_seed(member);
-    let generated = member_key_files_from_seed(member.clone(), &seed)
-        .expect("test member keys should generate");
-    public_member_keys_from_jwks(&generated.public_jwks, Some(member))
+    let generated = member_key_bundles_from_seed(member.clone(), &seed);
+    public_member_keys_from_public_bundle(&generated.public_bundle, member.clone())
         .expect("test public keys should parse")
 }
 

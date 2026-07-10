@@ -1,0 +1,32 @@
+id = "019f096d-1f63-7d50-99c3-d00b52b3e9b7"
+ref = "flotsync-ist.1.9"
+title = "Design DB-native key format and remove JWKS"
+body = """
+Design DB-native key records and the path to remove JWKS files and jose-jwk dependency entirely.
+
+Questions:
+Q01. What minimal typed private-key and public-key records should be stored in SQLite instead of encrypted JWKS text?
+Q02. What canonical binary format should Flotsync use for key bundles on the wire and in QR/pasteable invites?
+Q03. Which algorithm identifiers, version fields, and compatibility rules are needed for future key changes?
+Q04. Can all current JWKS config, parsing, generation, tests, and dependencies be removed rather than retained as import/export?
+Q05. What reset/recovery path replaces separate key files when stores are deleted or incompatible?"""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+parent = "019f096b-586a-7072-afcb-b729d3fddee4"
+created_at = "2026-06-27T14:12:54.243964Z"
+updated_at = "2026-06-27T14:29:11.601722Z"
+closed_at = "2026-06-27T14:29:11.601722Z"
+
+[[comments]]
+id = "019f097b-f2d6-7ea2-b2e5-eb1c7f17f56d"
+author = "lkroll"
+body = "Outcome agreed: create implementation task flotsync-ist.2. The design decision is to use Flotsync-owned protobuf formats for public key bundles and encrypted local-private key payloads, with both Ed25519 signing and X25519 encryption keys mandatory in v1. Base64url/QR/text wrappers are left to the exchange-mechanism tasks. Hierarchical MemberIdentity segments must be preserved by the format, while trust inheritance is handled in the separate hierarchy/policy design."
+created_at = "2026-06-27T14:29:05.878096Z"
+
+[[comments]]
+id = "019f097c-0931-7e80-b162-c95a89394e4b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-27T14:29:11.601722Z"

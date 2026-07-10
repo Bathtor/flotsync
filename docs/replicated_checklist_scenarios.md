@@ -25,10 +25,18 @@ traffic between the peers.
 Build or run the checklist binary from the repository root:
 
 ```bash
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local bob.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local alice.toml
+cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local bob.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  generate-keys alice ./alice-keys
+  keys inspect alice.toml BOB_PUBLIC_BUNDLE
 cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  generate-keys bob ./bob-keys
+  keys inspect bob.toml ALICE_PUBLIC_BUNDLE
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  keys trust alice.toml bob BOB_PUBLIC_BUNDLE
+cargo run -p flotsync_io_examples --bin replicated_checklist -- \
+  keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
 ```
@@ -36,21 +44,30 @@ cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
 For a release binary:
 
 ```bash
-target/release/replicated_checklist generate-keys alice ./alice-keys
-target/release/replicated_checklist generate-keys bob ./bob-keys
+target/release/replicated_checklist keys init-local alice.toml
+target/release/replicated_checklist keys init-local bob.toml
+target/release/replicated_checklist keys export-local alice.toml
+target/release/replicated_checklist keys export-local bob.toml
+target/release/replicated_checklist keys inspect alice.toml BOB_PUBLIC_BUNDLE
+target/release/replicated_checklist keys inspect bob.toml ALICE_PUBLIC_BUNDLE
+target/release/replicated_checklist keys trust alice.toml bob BOB_PUBLIC_BUNDLE
+target/release/replicated_checklist keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 target/release/replicated_checklist run alice.toml
 target/release/replicated_checklist run bob.toml
 ```
 
-The generated `public.jwks` files must be copied or otherwise made available to
-the opposite peer before first run. Each config needs `store-secret-profile`,
-the temporary `group-secret-password`, `local-private-jwks-path`, and
-`trusted-public-jwks-paths` values. The profile selects a device-local
-store-secret slot; the group password and this application-side provisioning
-step are temporary for the current security MVP.
+Each peer first creates or reuses local identity keys in its configured store.
+Copy the `public bundle (copy this value)` output from `keys export-local` to
+the opposite peer, inspect it if desired, then trust it for the exact peer
+identity before first `run`. Each config needs `store-secret-profile` and the
+temporary `group-secret-password`. The profile selects a device-local
+store-secret slot. The group password remains a temporary static-group setup
+bridge for the current security MVP and must match across peers in the same
+group.
 
 <!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
 proper local store-secret backend exists. -->
+
 On headless Linux machines without a working Secret Service keyring, use an
 explicitly unsafe profile such as `unsafe:raspberrypi`. This skips OS keyring
 storage and derives the local store secret from the profile string. Changing

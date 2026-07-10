@@ -51,7 +51,7 @@ impl fmt::Debug for PlaintextPayload {
 /// messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignatureScheme {
-    Ed25519,
+    Ed25519Ph,
 }
 
 /// Signature-only authentication bytes carried by control frames without an

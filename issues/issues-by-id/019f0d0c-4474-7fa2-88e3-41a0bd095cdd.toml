@@ -1,0 +1,40 @@
+id = "019f0d0c-4474-7fa2-88e3-41a0bd095cdd"
+ref = "flotsync-relay-keys"
+title = "Design relay key bundle storage and lookup"
+body = """
+Deferred design task for relay-assisted key bundle storage and lookup. Relays may eventually act as key stores, but their trust role and authentication model need separate design before implementation.
+
+Design questions:
+A01. Are relay-stored bundles only untrusted bytes, or can a relay become a trusted introducer for stored key material?
+A02. Can relay TLS/SSL certificates establish relay authority over stored bundles, and if so which local policy grants that authority?
+A03. Who is allowed to upload or update key material for a member identity and fingerprint?
+A04. How are uploads authenticated: self-signature, existing trusted peer statement, relay account identity, group membership, or another credential?
+A05. How does the relay prevent spam, conflicting bundles, stale entries, and denial-of-service through key lookup?
+A06. Does relay lookup return only the canonical public bundle, or also trust/evidence statements?
+A07. How are revocation tombstones and blocked fingerprints represented in a relay key store?
+A08. How does relay storage interact with parent/device identity inheritance from flotsync-hitr?
+A09. How does local policy distinguish relay-learned key material from material learned through direct endpoint fetch, trusted-peer exchange, group bootstrap, manual copy-paste, URI, or QR?
+A10. Should relay lookup support exact device identities, parent identities, fingerprint-only lookup, or some combination, and what trust inheritance rules apply to each?
+A11. What freshness, deletion, and replacement semantics are visible to clients, especially when old relay entries conflict with newer direct or trusted-peer evidence?
+
+Potential direction:
+B01. Treat relay results as untrusted by default.
+B02. Allow local policy to grant stronger authority to specific relay certificates only when explicitly configured.
+B03. Require stored bundles and evidence to bind exact member identity plus exact fingerprint.
+B04. Keep relay key storage optional so core direct and trusted-peer acquisition still work without it.
+B05. Preserve source provenance for relay-learned material so policy and diagnostics can distinguish relay observations from user-approved trust and peer-signed evidence.
+
+Estimate: design first; implementation likely exceeds 1000 LOC if relay storage, authentication, lookup, and tests are bundled together."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-06-28T07:05:35.604895Z"
+updated_at = "2026-06-28T10:52:18.171034Z"
+
+[[links]]
+target = "019f096b-fc82-7150-9691-60b40da56502"
+label = "deferred from"
+
+[[links]]
+target = "019f096c-96eb-7a61-98f7-3eae8ec689c2"
+label = "deferred from"

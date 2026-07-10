@@ -12,26 +12,19 @@ use crate::{
         SecuritySnafu,
         StoreError,
         StoreSecretKeyId,
-        StoredGroupInvalidTrustedPublicKeysSnafu,
     },
-    delivery::security::{DeliverySecurity, DeliverySecurityError},
+    delivery::security::DeliverySecurityError,
 };
-use flotsync_core::{
-    GroupId,
-    MemberIdentity,
-    member::Identifier,
-    membership::{GroupMembers, GroupMembersError},
-};
+use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembersError};
 use flotsync_security::STORE_SECRET_NONCE_LENGTH;
 use snafu::{IntoError, prelude::*};
 use std::sync::Arc;
 
-/// Validate that every persisted group can load the security records required at runtime.
+/// Validate persisted group security metadata required during runtime startup.
 pub(super) async fn validate_loaded_group_security(
     application_id: Identifier,
     store: Arc<dyn ReplicationStore>,
     expected_store_secret_key_id: &StoreSecretKeyId,
-    security: &DeliverySecurity,
 ) -> Result<(), RuntimeSecurityLoadError> {
     let mut transaction = store
         .begin_read_transaction()
@@ -50,8 +43,8 @@ pub(super) async fn validate_loaded_group_security(
         .await
         .context(StoreAccessSnafu { application_id })?;
 
-    for group in groups {
-        validate_replication_group_security(security, expected_store_secret_key_id, group).await?;
+    for group in &groups {
+        validate_replication_group_security(expected_store_secret_key_id, group)?;
     }
     Ok(())
 }
@@ -76,8 +69,7 @@ pub(super) fn load_security_error_from_local_member(
         DeliverySecurityError::MissingLocalPrivateKeys { member_id } => {
             LoadSecurityError::MissingLocalPrivateKeys { member_id }
         }
-        DeliverySecurityError::InvalidLocalPrivateKeyUtf8 { .. }
-        | DeliverySecurityError::InvalidLocalPrivateKeys { .. }
+        DeliverySecurityError::InvalidLocalPrivateKeys { .. }
         | DeliverySecurityError::OpenLocalPrivateKeys { .. }
         | DeliverySecurityError::UnsupportedStoreSecretVersion { .. }
         | DeliverySecurityError::InvalidStoreSecretNonce { .. } => {
@@ -95,9 +87,6 @@ pub(super) fn load_security_error_from_runtime(
     match source {
         RuntimeSecurityLoadError::InvalidGroupMembers { group_id, source } => {
             LoadSecurityError::StoredGroupInvalidMembers { group_id, source }
-        }
-        RuntimeSecurityLoadError::GroupSecurity { group_id, source } => {
-            load_security_error_from_group(group_id, source)
         }
         RuntimeSecurityLoadError::KeyIdMismatch {
             group_id,
@@ -130,11 +119,10 @@ pub(super) fn load_security_error_from_runtime(
     }
 }
 
-/// Validate one stored group's security metadata and member trust records.
-async fn validate_replication_group_security(
-    security: &DeliverySecurity,
+/// Validate one stored group's security metadata and member identity shape.
+fn validate_replication_group_security(
     expected_store_secret_key_id: &StoreSecretKeyId,
-    group: ReplicationGroupRecord,
+    group: &ReplicationGroupRecord,
 ) -> Result<(), RuntimeSecurityLoadError> {
     let group_id = group.group_id;
     validate_stored_group_security_material(
@@ -142,12 +130,10 @@ async fn validate_replication_group_security(
         expected_store_secret_key_id,
         &group.security_material,
     )?;
-    let members = GroupMembers::from_ordered_members(group.members)
+    group
+        .member_keys
+        .to_group_members()
         .context(InvalidGroupMembersSnafu { group_id })?;
-    security
-        .public_keys_for_members(&members)
-        .await
-        .context(GroupSecuritySnafu { group_id })?;
     Ok(())
 }
 
@@ -188,36 +174,6 @@ fn validate_stored_group_security_material(
     Ok(())
 }
 
-/// Translate group-member trust failures into public load errors.
-#[track_caller]
-fn load_security_error_from_group(
-    group_id: GroupId,
-    source: DeliverySecurityError,
-) -> LoadSecurityError {
-    match source {
-        DeliverySecurityError::MissingTrustedPublicKeys { member_id } => {
-            LoadSecurityError::StoredGroupMissingTrustedPublicKeys {
-                group_id,
-                member_id,
-            }
-        }
-        DeliverySecurityError::InvalidTrustedPublicKeyLength {
-            member_id,
-            expected,
-            actual,
-        } => LoadSecurityError::StoredGroupInvalidTrustedPublicKeyLength {
-            group_id,
-            member_id,
-            expected,
-            actual,
-        },
-        DeliverySecurityError::InvalidTrustedPublicKeys { member_id, source } => {
-            invalid_stored_group_trusted_public_keys(group_id, member_id, source)
-        }
-        other => other_load_security_error(other),
-    }
-}
-
 /// Attach the original local-key failure as non-public source context.
 #[track_caller]
 fn invalid_local_private_keys(
@@ -226,20 +182,6 @@ fn invalid_local_private_keys(
 ) -> LoadSecurityError {
     let source: BoxError = source.into();
     InvalidLocalPrivateKeysSnafu { member_id }.into_error(source)
-}
-
-/// Attach the original trusted-key decode failure as non-public source context.
-#[track_caller]
-fn invalid_stored_group_trusted_public_keys(
-    group_id: GroupId,
-    member_id: MemberIdentity,
-    source: BoxError,
-) -> LoadSecurityError {
-    StoredGroupInvalidTrustedPublicKeysSnafu {
-        group_id,
-        member_id,
-    }
-    .into_error(source)
 }
 
 /// Preserve non-actionable internals as source context without making them public API.
@@ -267,14 +209,6 @@ pub(super) enum RuntimeSecurityLoadError {
     InvalidGroupMembers {
         group_id: GroupId,
         source: GroupMembersError,
-    },
-    /// A persisted group references members whose key material is unavailable or invalid.
-    #[snafu(display(
-        "Stored replication group {group_id} cannot load security material: {source}"
-    ))]
-    GroupSecurity {
-        group_id: GroupId,
-        source: DeliverySecurityError,
     },
     /// A persisted group's encrypted group secret uses a different key id.
     #[snafu(display(

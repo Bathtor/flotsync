@@ -162,7 +162,8 @@ pub(crate) enum PublishChangesError {
     #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
-        source: GroupInstallError,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
         #[snafu(implicit)]
         location: Location,
     },
@@ -273,7 +274,8 @@ pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to install inbound bootstrap group {group_id} locally: {source}"))]
     InstallBootstrapGroup {
         group_id: GroupId,
-        source: GroupInstallError,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
     },
     #[snafu(display("Failed to complete the processed promise for group {group_id}: {source}"))]
     CompleteProcessedPromise {
@@ -285,7 +287,8 @@ pub(crate) enum InboundDeliveryError {
     #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
-        source: GroupInstallError,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
         #[snafu(implicit)]
         location: Location,
     },

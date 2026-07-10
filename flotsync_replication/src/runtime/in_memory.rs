@@ -75,7 +75,9 @@ impl LoadedGroupMeta {
         group: ReplicationGroupRecord,
     ) -> Result<Self, GroupInstallError> {
         let group_id = group.group_id;
-        let members = GroupMembers::from_ordered_members(group.members)
+        let members = group
+            .member_keys
+            .to_group_members()
             .context(InvalidPersistedMembersSnafu { group_id })?;
         let local_member_index =
             members

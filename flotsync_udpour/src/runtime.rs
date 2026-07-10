@@ -23,7 +23,7 @@ use crate::{
     wire::EncodeToBufMut,
 };
 use flotsync_io::prelude::*;
-use flotsync_utils::ResultExt as _;
+use flotsync_utils::{ResultExt as _, kompact_config::ConfigReadExt as _};
 use kompact::{
     config::{DurationValue, UsizeValue},
     kompact_config,
@@ -499,54 +499,18 @@ impl UDPourComponent {
     }
 
     fn load_send_rate_control(&self) -> UDPourSendRateControl {
-        let defaults = UDPourSendRateControl::default();
-        let send_delay = match self.ctx.config().read_or_default(&config_keys::SEND_DELAY) {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load UDPour send-delay config from {}: {}. Falling back to {:?}",
-                    config_keys::SEND_DELAY.key,
-                    error,
-                    defaults.send_delay
-                );
-                defaults.send_delay
-            }
-        };
-        let backpressure_retry_delay = match self
+        let send_delay = self
             .ctx
             .config()
-            .read_or_default(&config_keys::BACKPRESSURE_RETRY_DELAY)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load UDPour backpressure-retry-delay config from {}: {}. Falling back to {:?}",
-                    config_keys::BACKPRESSURE_RETRY_DELAY.key,
-                    error,
-                    defaults.backpressure_retry_delay
-                );
-                defaults.backpressure_retry_delay
-            }
-        };
-        let max_in_flight_datagrams = match self
+            .read_or_default_warn(self.log(), &config_keys::SEND_DELAY);
+        let backpressure_retry_delay = self
             .ctx
             .config()
-            .read_or_default(&config_keys::MAX_IN_FLIGHT_DATAGRAMS)
-        {
-            Ok(value) => value,
-            Err(error) => {
-                warn!(
-                    self.log(),
-                    "Failed to load UDPour max-in-flight-datagrams config from {}: {}. Falling back to {}",
-                    config_keys::MAX_IN_FLIGHT_DATAGRAMS.key,
-                    error,
-                    defaults.max_in_flight_datagrams
-                );
-                defaults.max_in_flight_datagrams
-            }
-        };
+            .read_or_default_warn(self.log(), &config_keys::BACKPRESSURE_RETRY_DELAY);
+        let max_in_flight_datagrams = self
+            .ctx
+            .config()
+            .read_or_default_warn(self.log(), &config_keys::MAX_IN_FLIGHT_DATAGRAMS);
         UDPourSendRateControl {
             send_delay,
             backpressure_retry_delay,

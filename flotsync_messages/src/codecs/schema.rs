@@ -144,7 +144,11 @@ pub fn encode_schema_definition(schema: &Schema) -> SchemaResult<proto::SchemaDe
         .into_iter()
         .map(encode_field_definition)
         .try_collect()?;
-    encoded.metadata.clone_from(&schema.metadata);
+    encoded.metadata = schema
+        .metadata
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
     Ok(encoded)
 }
 
@@ -164,7 +168,7 @@ pub fn decode_schema_definition(mut schema: proto::SchemaDefinition) -> SchemaRe
     }
     Ok(Schema {
         columns,
-        metadata: schema.metadata,
+        metadata: schema.metadata.into_iter().collect(),
     })
 }
 
@@ -174,11 +178,16 @@ fn encode_field_definition(field: &Field) -> SchemaResult<proto::FieldDefinition
         .as_ref()
         .map(|default_value| encode_nullable_basic_value(default_value.as_ref()))
         .into();
+    let data_type = encode_replicated_data_type(&field.data_type)?;
     Ok(proto::FieldDefinition {
         name: field.name.clone(),
-        data_type: MessageField::some(encode_replicated_data_type(&field.data_type)?),
+        data_type: MessageField::some(data_type),
         default_value,
-        metadata: field.metadata.clone(),
+        metadata: field
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
         ..proto::FieldDefinition::default()
     })
 }
@@ -198,7 +207,7 @@ fn decode_field_definition(mut field: proto::FieldDefinition) -> SchemaResult<Fi
         name: field.name,
         data_type,
         default_value,
-        metadata: field.metadata,
+        metadata: field.metadata.into_iter().collect(),
     };
     if let Some(default_value) = decoded_field.default_value.clone() {
         decoded_field

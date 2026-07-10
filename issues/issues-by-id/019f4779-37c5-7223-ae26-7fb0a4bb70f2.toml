@@ -1,0 +1,9 @@
+id = "019f4779-37c5-7223-ae26-7fb0a4bb70f2"
+ref = "flotsync-git-h6w"
+title = "Explore async-std block_on for sync boundaries"
+body = "Evaluate whether replacing selected futures-executor block_on usage with async_std::task::block_on would reduce nested-executor failures or improve runtime integration. Compare scheduling and stdout/REPL effects, especially in CLI and test-support boundaries, before making any broad migration."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-07-09T15:22:34.309727Z"
+updated_at = "2026-07-09T15:22:34.309727Z"

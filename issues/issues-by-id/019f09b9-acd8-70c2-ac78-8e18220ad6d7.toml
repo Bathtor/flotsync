@@ -1,0 +1,62 @@
+id = "019f09b9-acd8-70c2-ac78-8e18220ad6d7"
+ref = "flotsync-ist.4"
+title = "Carry bootstrap member key fingerprints"
+body = """
+Implement the agreed bootstrap key-reference format from flotsync-ist.1.5: bootstrap metadata names exact device/member identities and expected key fingerprints, with full public key bundles optional as a bounded optimisation.
+
+Agreed direction:
+A01. Bootstrap covers exact individual device/member identities. It does not expand parent identities or apply hierarchy inheritance.
+A02. Bootstrap member metadata carries each member identity plus the expected canonical public key bundle fingerprint.
+A03. Full canonical public key bundles may be included inline, but they are optional and must match the advertised fingerprint.
+A04. Inline bundles are observed public key material for local policy evaluation; they do not create authority unless policy explicitly allows that through separate evidence.
+A05. Missing inline bundles require later key resolution from local DB, invite payloads, direct exchange, relay lookup, discovery observation, or another approved mechanism.
+A06. Inline bundle inclusion is controlled by Kompact config key flotsync.replication.runtime.bootstrap.max-inline-public-key-bundles, default 10. If group size is greater than the configured limit, the bootstrap message elides all inline public bundles and carries only fingerprints. A value of 0 always emits fingerprint-only entries.
+A07. Runtime components should read this limit from their Kompact component context; do not thread it through DeliveryRuntimeHostConfig.
+A08. Validation re-checks every inline bundle fingerprint defensively, including during bootstrap security validation, before storing observed key material.
+A09. Sender activation remains exact: request BootstrapActivation permission for the sender member identity and advertised key fingerprint. Inline bundle material alone is not trust evidence.
+A10. Active groups with missing sender keys must fail closed without crashing: unverifiable group-broadcast packages are ignored for now.
+
+Implementation plan:
+B01. Update replication.proto BootstrapGroup entries to carry member_id, key_fingerprint, and optional flotsync.security.v1.PublicKeyBundle.
+B02. Replace the runtime bootstrap member-key domain type with a fingerprint-first type carrying Option<PublicMemberKeys>.
+B03. Update owned and view protobuf encode/decode to validate member id, 32-byte fingerprint, optional inline bundle decode, and inline fingerprint equality.
+B04. Add a runtime config key and make create-group bootstrap generation include all inline bundles only when members.len() <= configured limit.
+B05. Update bootstrap validation to compare the sender advertised fingerprint against the locally permitted BootstrapActivation key and to re-check every inline bundle before observation.
+B06. Store valid inline bundles as MemberPublicKeysRecord through the replication store without adding MemberKeyTrustEvidenceRecord.
+B07. Preserve current create-group strictness: group creation still requires permitted keys for all named members because CreateGroupRequest only contains identities and the creator must derive fingerprints.
+B08. Add regression coverage for active group operation when sender keys are missing: inbound group packages should be dropped benignly and not reach the runtime plaintext path.
+
+Acceptance criteria:
+C01. Bootstrap payloads encode exact member identities plus expected key fingerprints for all group members.
+C02. Inline public bundles, when present, are validated against identity and fingerprint at decode and validation time.
+C03. Inline bundles that are unknown locally are stored as observed public key material, not trusted evidence.
+C04. Conflicting inline bundles are rejected without changing existing trusted material.
+C05. Tests cover fingerprint-only metadata, valid inline bundle, inline bundle fingerprint mismatch, sender advertised fingerprint mismatch, observed-inline storage without trust evidence, conflicting existing key material, configured inline elision, and active-group missing-key drop.
+
+Estimate: roughly 600-950 LOC touched. This is close to but still below the 1000 LOC split threshold."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = [
+    "019f097b-ba0f-7002-944a-8efa67884f15",
+    "019f098b-8001-7fc0-92ed-86392e41fb7d",
+]
+blocks = ["019f09ba-0a9d-7622-9bb1-b9e326f71d48"]
+parent = "019f0542-b0cc-70a2-9d97-5af18230aab4"
+created_at = "2026-06-27T15:36:31.192872Z"
+updated_at = "2026-06-29T17:34:06.457484Z"
+closed_at = "2026-06-29T17:34:06.457484Z"
+
+[[comments]]
+id = "019f1452-bf1d-7433-ae33-36c625dbbaf6"
+author = "lkroll"
+body = "Review-fix plan agreed: extend missing-key and tampered-wire tests with valid delivery before and after; add a SecurityStore permission facade taking member identity and fingerprint separately; make the new bootstrap inline-bundle config key publicly reachable and track the broader config-read helper as flotsync-git-car; read the inline-bundle limit once during component start; switch bootstrap runtime message ownership to Arc while keeping Update boxed; mark the inline bootstrap public-key bundle proto field explicitly optional; validate with fmt, focused tests, workspace check, clippy pedantic, and diff check."
+created_at = "2026-06-29T16:59:55.037438Z"
+
+[[comments]]
+id = "019f1472-0c79-7550-a9ed-163731164c4a"
+author = "lkroll"
+body = "completed"
+created_at = "2026-06-29T17:34:06.457484Z"

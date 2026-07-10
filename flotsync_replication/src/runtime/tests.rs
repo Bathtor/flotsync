@@ -1,4 +1,5 @@
 use super::{
+    component::ReplicationRuntimeComponent,
     errors::{CreateGroupError, InboundDeliveryError, PublishChangesError},
     handle::{
         ReplicationRuntime,
@@ -19,7 +20,7 @@ use super::{
     messages::{
         BootstrapGroupKey,
         BootstrapGroupMessage,
-        BootstrapMemberPublicKeysMessage,
+        BootstrapMemberKeyMessage,
         DatasetUpdateMessage,
         UpdateBatchMessage,
         UpdateMessage,
@@ -30,18 +31,28 @@ use crate::{
     SqliteReplicationStore,
     api::{
         ApiError,
+        AuthorityScope,
         CreateGroupRequest,
         DatasetId,
         DatasetRowPatch,
         DatasetRowSlice,
+        DatasetRowsBatch,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupMemberKeys,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
         LoadSecurityError,
         LocalMemberPrivateKeysRecord,
         LocalStoreSecretProfile,
+        MemberKeyId,
+        MemberKeyTrustEvidenceKind,
+        MemberKeyTrustEvidenceRecord,
+        MemberKeyTrustEvidenceSet,
+        MemberKeyTrustRequirement,
+        MemberPublicKeysRecord,
+        PermissionDenialReason,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -70,17 +81,25 @@ use crate::{
         StoreExternalSnafu,
         StoreSecretCryptoVersion,
         SummaryRequest,
-        TrustedMemberPublicKeysRecord,
+        TrustPolicy,
         current_slice_placeholder_group_security_material,
         current_slice_placeholder_group_security_material_with_key_id,
         process_batches,
+        security::{
+            AssessPublicKeyBundleRequest,
+            PublicKeyBundleAssessmentStorage,
+            PublicKeyBundleFeedback,
+            RecordPublicKeyBundleFeedbackRequest,
+        },
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
+    security_store::{SecurityStore, SecurityStoreError},
     test_support::{
         load_test_delivery_security,
         provision_test_security as provision_shared_test_security,
         test_public_member_keys,
         test_replication_security_secrets,
+        wait_for_test_future,
     },
 };
 use flotsync_core::{
@@ -95,6 +114,7 @@ use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+    KeyFingerprint,
     PublicMemberKeys,
     StoreSecretKey,
     install_local_store_secret_test_store,
@@ -193,7 +213,7 @@ struct FailingStoreTransaction {
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
 }
 
-impl ReplicationStoreTransaction for FailingStoreTransaction {
+impl ReplicationStoreReadTransaction for FailingStoreTransaction {
     fn load_replication_group<'a>(
         &'a mut self,
         group_id: &'a GroupId,
@@ -223,16 +243,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_replication_groups_for_ids(group_ids)
     }
 
-    fn insert_replication_group(
-        &mut self,
-        group: ReplicationGroupRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .insert_replication_group(group)
-    }
-
     fn load_local_member_private_keys<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
@@ -243,45 +253,54 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .load_local_member_private_keys(member_id)
     }
 
-    fn ensure_local_member_private_keys(
-        &mut self,
-        record: LocalMemberPrivateKeysRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .ensure_local_member_private_keys(record)
-    }
-
-    fn load_trusted_member_public_keys<'a>(
+    fn load_member_public_keys<'a>(
         &'a mut self,
-        member_id: &'a MemberIdentity,
-    ) -> BoxFuture<'a, Result<Option<TrustedMemberPublicKeysRecord>, StoreError>> {
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
-            .load_trusted_member_public_keys(member_id)
+            .load_member_public_keys(key_id)
     }
 
-    fn ensure_trusted_member_public_keys(
-        &mut self,
-        record: TrustedMemberPublicKeysRecord,
-    ) -> BoxFuture<'_, Result<(), StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .ensure_trusted_member_public_keys(record)
-    }
-
-    fn update_replication_group_version_vector<'a>(
+    fn load_member_public_keys_for_member<'a>(
         &'a mut self,
-        group_id: &'a GroupId,
-        version_vector: VersionVector,
-    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        member_id: &'a MemberIdentity,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
         self.inner
             .as_mut()
-            .expect("failing store transaction must remain open during delegated writes")
-            .update_replication_group_version_vector(group_id, version_vector)
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_keys_for_member(member_id)
+    }
+
+    fn load_member_public_keys_for_fingerprint<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<Vec<MemberPublicKeysRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_keys_for_fingerprint(fingerprint)
+    }
+
+    fn load_member_key_trust_evidence<'a>(
+        &'a mut self,
+        key_id: &'a MemberKeyId,
+    ) -> BoxFuture<'a, Result<MemberKeyTrustEvidenceSet, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_key_trust_evidence(key_id)
+    }
+
+    fn is_key_fingerprint_blocked<'a>(
+        &'a mut self,
+        fingerprint: &'a KeyFingerprint,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .is_key_fingerprint_blocked(fingerprint)
     }
 
     fn load_dataset_rows<'a>(
@@ -294,6 +313,124 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_dataset_rows(group_id, dataset_id, row_keys)
+    }
+
+    fn load_replication_update<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        update_id: UpdateId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update(group_id, update_id)
+    }
+
+    fn load_replication_updates<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_updates(group_id, filter, limit)
+    }
+
+    fn load_replication_update_ids<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        filter: ReplicationUpdateFilter,
+        limit: Option<NonZeroUsize>,
+    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_update_ids(group_id, filter, limit)
+    }
+
+    fn scan_dataset_row_batch<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+        after: Option<RowKey>,
+        limit: NonZeroUsize,
+    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .scan_dataset_row_batch(group_id, dataset_id, after, limit)
+    }
+
+    fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
+        let Self { inner, .. } = *self;
+        inner
+            .expect("failing store transaction must remain open until release")
+            .rollback()
+    }
+}
+
+impl ReplicationStoreTransaction for FailingStoreTransaction {
+    fn insert_replication_group(
+        &mut self,
+        group: ReplicationGroupRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .insert_replication_group(group)
+    }
+
+    fn ensure_local_member_private_keys(
+        &mut self,
+        record: LocalMemberPrivateKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_local_member_private_keys(record)
+    }
+
+    fn ensure_member_public_keys(
+        &mut self,
+        record: MemberPublicKeysRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_member_public_keys(record)
+    }
+
+    fn ensure_member_key_trust_evidence(
+        &mut self,
+        record: MemberKeyTrustEvidenceRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_member_key_trust_evidence(record)
+    }
+
+    fn ensure_blocked_key_fingerprint(
+        &mut self,
+        fingerprint: KeyFingerprint,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_blocked_key_fingerprint(fingerprint)
+    }
+
+    fn update_replication_group_version_vector<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .update_replication_group_version_vector(group_id, version_vector)
     }
 
     fn apply_dataset_row_patch(
@@ -332,41 +469,6 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
                 .await
         }
         .boxed()
-    }
-
-    fn load_replication_update<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        update_id: UpdateId,
-    ) -> BoxFuture<'a, Result<Option<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update(group_id, update_id)
-    }
-
-    fn load_replication_updates<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<ReplicationUpdateRecord>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_updates(group_id, filter, limit)
-    }
-
-    fn load_replication_update_ids<'a>(
-        &'a mut self,
-        group_id: &'a GroupId,
-        filter: ReplicationUpdateFilter,
-        limit: Option<NonZeroUsize>,
-    ) -> BoxFuture<'a, Result<Vec<UpdateId>, StoreError>> {
-        self.inner
-            .as_mut()
-            .expect("failing store transaction must remain open during delegated reads")
-            .load_replication_update_ids(group_id, filter, limit)
     }
 
     fn append_replication_update(
@@ -569,22 +671,37 @@ fn test_public_keys(member: &MemberIdentity) -> PublicMemberKeys {
     test_public_member_keys(member)
 }
 
-fn bootstrap_public_keys(
-    entries: impl IntoIterator<Item = (MemberIdentity, BootstrapMemberPublicKeysMessage)>,
-) -> TrieMap<BootstrapMemberPublicKeysMessage> {
-    let mut public_keys = TrieMap::new();
-    for (member_id, entry) in entries {
-        public_keys.insert(member_id, entry);
+/// Build the deterministic exact member-key id used by runtime store fixtures.
+fn test_member_key_id(member_id: MemberIdentity) -> MemberKeyId {
+    let fingerprint = test_public_keys(&member_id).fingerprint();
+    MemberKeyId {
+        member_id,
+        fingerprint,
     }
-    public_keys
 }
 
-fn bootstrap_member_public_keys(
+/// Convert ordered member identities into exact member-key groups for store fixtures.
+fn test_group_member_keys(members: Vec<MemberIdentity>) -> GroupMemberKeys {
+    GroupMemberKeys::from_ordered_member_keys(members.into_iter().map(test_member_key_id))
+        .expect("test group members should build")
+}
+
+fn bootstrap_member_keys(
+    entries: impl IntoIterator<Item = (MemberIdentity, BootstrapMemberKeyMessage)>,
+) -> TrieMap<BootstrapMemberKeyMessage> {
+    let mut member_keys = TrieMap::new();
+    for (member_id, entry) in entries {
+        member_keys.insert(member_id, entry);
+    }
+    member_keys
+}
+
+fn bootstrap_member_key(
     public_keys: &PublicMemberKeys,
-) -> (MemberIdentity, BootstrapMemberPublicKeysMessage) {
+) -> (MemberIdentity, BootstrapMemberKeyMessage) {
     (
         public_keys.member_id().clone(),
-        BootstrapMemberPublicKeysMessage::from_public_keys(public_keys),
+        BootstrapMemberKeyMessage::from_public_keys(public_keys),
     )
 }
 
@@ -660,14 +777,22 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory_with_schema_sources(local_member, schemas)
-            .expect("store should build"),
-    );
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        local_member,
+        schemas,
+    ))
+    .expect("store should build");
+    let store = Arc::new(store);
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
     provision_test_security(store.as_ref(), &local_member, []);
     store
+}
+
+fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory(local_member))
+        .expect("store should build");
+    Arc::new(store)
 }
 
 fn load_runtime_fixture<I, S>(
@@ -690,6 +815,97 @@ where
         listener,
         store,
     }
+}
+
+#[test]
+fn runtime_api_returns_local_public_key_bundle() {
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+
+    let bundle = wait_for_test_reply(fixture.runtime.local_public_key_bundle())
+        .expect("local public key bundle should load");
+
+    assert_eq!(
+        bundle,
+        test_public_keys(&alice_member()).public_key_bundle()
+    );
+}
+
+#[test]
+fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
+    let bob = bob_member();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let bundle = test_public_keys(&bob).public_key_bundle();
+    let fingerprint = bundle.fingerprint();
+    let key_id = MemberKeyId {
+        member_id: bob.clone(),
+        fingerprint,
+    };
+
+    let initial_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle: bundle.clone(),
+            candidate_member_ids: HashSet::from([bob.clone()]),
+            material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+        },
+    ))
+    .expect("assessment should succeed");
+
+    assert!(initial_report.known_bindings.is_empty());
+    assert!(
+        initial_report.candidate_members[0]
+            .binding_for_bundle
+            .is_none()
+    );
+
+    let stored_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle: bundle.clone(),
+            candidate_member_ids: HashSet::from([bob.clone()]),
+            material_storage: PublicKeyBundleAssessmentStorage::StoreCandidateBindings,
+        },
+    ))
+    .expect("assessment should store candidate key material");
+
+    let stored_binding = stored_report
+        .known_bindings
+        .iter()
+        .find(|binding| binding.key_id == key_id)
+        .expect("stored binding should be reported");
+    assert!(!stored_binding.trust.has_local_explicit_trust);
+
+    wait_for_test_reply(fixture.runtime.record_public_key_bundle_feedback(
+        RecordPublicKeyBundleFeedbackRequest {
+            bundle: bundle.clone(),
+            feedback: PublicKeyBundleFeedback::TrustMember {
+                member_id: bob.clone(),
+            },
+        },
+    ))
+    .expect("feedback should store");
+
+    let updated_report = wait_for_test_reply(fixture.runtime.assess_public_key_bundle(
+        AssessPublicKeyBundleRequest {
+            bundle,
+            candidate_member_ids: HashSet::from([bob]),
+            material_storage: PublicKeyBundleAssessmentStorage::ReadOnly,
+        },
+    ))
+    .expect("updated assessment should succeed");
+
+    let updated_binding = updated_report
+        .known_bindings
+        .iter()
+        .find(|binding| binding.key_id == key_id)
+        .expect("trusted binding should be reported");
+    assert!(updated_binding.trust.has_local_explicit_trust);
 }
 
 fn load_title_runtime_pair_with_trust(
@@ -724,9 +940,7 @@ fn load_title_runtime_pair_with_trust(
 }
 
 fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(local_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(local_member.clone());
     provision_test_security(store.as_ref(), local_member, []);
     let security = load_test_runtime_security(store.clone(), local_member);
     let listener = Arc::new(ListenerStub::default());
@@ -836,7 +1050,7 @@ fn persist_group_membership_for_member<S>(
         store,
         ReplicationGroupRecord {
             group_id,
-            members,
+            member_keys: test_group_member_keys(members),
             local_member_index: MemberIndex::new(local_member_index),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(member_count).expect("group should not be empty"),
@@ -855,7 +1069,7 @@ fn persist_alice_group_with_security_material(
         store,
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member()],
+            member_keys: test_group_member_keys(vec![alice_member()]),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
             security_material,
@@ -999,13 +1213,13 @@ fn publish_direct_peer_routes(
     bob_runtime: &Arc<ReplicationRuntime>,
     bob_member: &MemberIdentity,
 ) {
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
 }
 
@@ -1085,8 +1299,7 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
         TEST_WAIT_TIMEOUT,
         || {
             runtime
-                .host()
-                .membership_snapshot()
+                .membership_snapshot_for_test()
                 .contains_group(&group_id)
         },
         "timed out waiting for runtime to install group",
@@ -1106,15 +1319,14 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
     host.replace_group_memberships(memberships);
 
     assert!(host.membership_snapshot().contains_group(&group_id));
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
 fn load_replication_runtime_accepts_store_provisioned_security() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
@@ -1128,6 +1340,33 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
         &runtime_config_toml,
     ))
     .expect("public runtime loading should accept provisioned security");
+}
+
+#[test]
+fn runtime_shutdown_is_graceful_idempotent_and_marks_runtime_unavailable() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down gracefully");
+    wait_for_test_reply(runtime.shutdown()).expect("second shutdown should be a no-op");
+
+    let error = wait_for_test_reply(runtime.local_public_key_bundle())
+        .expect_err("runtime API should be unavailable after shutdown");
+    assert!(matches!(error, ApiError::RuntimeUnavailable));
+}
+
+#[test]
+fn dropping_runtime_inside_test_executor_does_not_reenter_local_pool() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    wait_for_test_future(async move {
+        drop(runtime);
+    });
 }
 
 #[test]
@@ -1148,8 +1387,7 @@ fn replication_security_secrets_load_or_create_reuses_local_profile() {
 #[test]
 fn load_replication_runtime_rejects_missing_local_private_keys() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     let listener = Arc::new(ListenerStub::default());
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
@@ -1174,8 +1412,7 @@ fn load_replication_runtime_rejects_missing_local_private_keys() {
 #[test]
 fn load_replication_runtime_rejects_wrong_store_secret_key() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let test_security = test_replication_security_secrets();
@@ -1206,8 +1443,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
 #[test]
 fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_402));
     persist_alice_group_with_security_material(
@@ -1241,8 +1477,7 @@ fn load_replication_runtime_rejects_stored_group_security_key_id_mismatch() {
 #[test]
 fn load_replication_runtime_rejects_unsupported_stored_group_security_version() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_403));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
@@ -1279,8 +1514,7 @@ fn load_replication_runtime_rejects_unsupported_stored_group_security_version() 
 #[test]
 fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length() {
     let application_id = app_probe_id();
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let group_id = GroupId(Uuid::from_u128(50_404));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
@@ -1315,21 +1549,19 @@ fn load_replication_runtime_rejects_invalid_stored_group_security_nonce_length()
 }
 
 #[test]
-fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
-    let application_id = app_probe_id();
+fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let group_id = GroupId(Uuid::from_u128(50_401));
     let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
+    let member_keys = test_group_member_keys(vec![alice_member.clone(), bob_member]);
     persist_group_in_store(
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member.clone(), bob_member.clone()],
+            member_keys: member_keys.clone(),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material_with_key_id(
@@ -1340,25 +1572,64 @@ fn load_replication_runtime_rejects_missing_trusted_keys_for_stored_groups() {
     );
     let listener = Arc::new(ListenerStub::default());
 
-    let loaded_runtime = wait_for_test_reply(load_replication_runtime(
-        application_id.clone(),
-        store,
-        listener,
-        ReplicationConfig::default(),
-        test_replication_security_secrets(),
-    ));
-    let Err(error) = loaded_runtime else {
-        panic!("public runtime loading should reject missing trusted keys for stored group");
-    };
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
 
-    let error = security_load_error(error, &application_id);
-    assert!(matches!(
-        &error,
-        LoadSecurityError::StoredGroupMissingTrustedPublicKeys {
-            group_id: error_group_id,
-            member_id,
-        } if error_group_id == &group_id && member_id == &bob_member
-    ));
+    wait_for_group_install(&runtime, group_id);
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).member_keys,
+        member_keys
+    );
+}
+
+#[test]
+fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_key() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
+    let alternate_bob_keys =
+        MemberPublicKeysRecord::from_public_keys(&test_public_keys(&Identifier::from_array([
+            "bob", "phone",
+        ])));
+    let mut alternate_bob_record = alternate_bob_keys;
+    alternate_bob_record.key_id.member_id = bob_member.clone();
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.ensure_member_public_keys(alternate_bob_record.clone()))
+        .expect("alternate member public keys should store");
+    wait_for_test_reply(transaction.ensure_member_key_trust_evidence(
+        MemberKeyTrustEvidenceRecord {
+            key_id: alternate_bob_record.key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        },
+    ))
+    .expect("alternate trust evidence should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    let group_id = GroupId(Uuid::from_u128(50_402));
+    let store_secret_key_id = *test_replication_security_secrets().store_secret_key_id();
+    let member_keys = test_group_member_keys(vec![alice_member.clone(), bob_member]);
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            member_keys: member_keys.clone(),
+            local_member_index: MemberIndex::new(0),
+            version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            security_material: current_slice_placeholder_group_security_material_with_key_id(
+                group_id,
+                store_secret_key_id,
+            ),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener);
+
+    wait_for_group_install(&runtime, group_id);
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).member_keys,
+        member_keys
+    );
 }
 
 #[test]
@@ -1366,7 +1637,7 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
     let mut host = start_host(&Identifier::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -1375,8 +1646,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     let remote_addr = remote_endpoint_lease.addr(0);
     let bob_member = bob_member();
     let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
-    let store =
-        Arc::new(SqliteReplicationStore::in_memory(alice_member()).expect("store should build"));
+    let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts_and_runtime_config_toml(
@@ -1387,7 +1657,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     );
 
     assert!(
-        !runtime.host().knows_direct_peer_route(&bob_member),
+        !runtime.knows_direct_peer_route_for_test(&bob_member),
         "static route hints must not publish before route establishment verifies them"
     );
 }
@@ -1398,24 +1668,20 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     let bob_member = bob_member();
     let group_id = GroupId(Uuid::from_u128(35));
     let members = vec![alice_member.clone(), bob_member.clone()];
-    let bob_store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let bob_store = sqlite_store(bob_member.clone());
     provision_test_security(bob_store.as_ref(), &bob_member, [alice_member.clone()]);
     persist_group_membership_for_member(bob_store.as_ref(), group_id, members.clone(), 1);
     let bob_listener = Arc::new(ListenerStub::default());
     let bob_runtime = load_runtime_with_parts(app_bob_id(), bob_store, bob_listener);
     wait_for_group_install(&bob_runtime, group_id);
 
-    let alice_store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let alice_store = sqlite_store(alice_member.clone());
     provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
     persist_group_membership_for_member(alice_store.as_ref(), group_id, members, 0);
     let alice_listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = static_peer_route_toml(
         &bob_member,
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
@@ -1425,7 +1691,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     );
     wait_for_group_install(&alice_runtime, group_id);
 
-    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
+    alice_runtime.wait_for_direct_peer_route_for_test(&bob_member);
 }
 
 #[test]
@@ -1435,9 +1701,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let runtime_config_toml = static_peer_route_toml(&bob_member, remote_addr);
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
@@ -1455,15 +1719,13 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
 
     host.publish_preconfigured_peer_routes();
     host.wait_for_direct_peer_route(&bob_member);
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
 fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
     let alice_member = alice_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let security = load_test_runtime_security(store.clone(), &alice_member);
     let listener = Arc::new(ListenerStub::default());
@@ -1483,7 +1745,7 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
         ))
         .expect("zero catch-up batch size should mean unlimited");
     host.wait_for_runtime_startup();
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -1501,7 +1763,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: members.ordered_members(),
+            member_keys: test_group_member_keys(members.ordered_members()),
             local_member_index: MemberIndex::new(0),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(2).expect("group should have two members"),
@@ -2052,7 +2314,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
         store.as_ref(),
         ReplicationGroupRecord {
             group_id,
-            members: vec![alice_member.clone(), bob_member],
+            member_keys: test_group_member_keys(vec![alice_member.clone(), bob_member]),
             local_member_index: MemberIndex::new(0),
             version_vector: version_vector.clone(),
             security_material: current_slice_placeholder_group_security_material(group_id),
@@ -2105,12 +2367,10 @@ fn publish_changes_rejects_reserved_local_update_version() {
 }
 
 #[test]
-fn create_group_rejects_missing_trusted_keys_without_storing_group() {
+fn create_group_rejects_missing_permitted_keys_without_storing_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(alice_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, []);
     let runtime = load_runtime_with_parts(
         app_alice_id(),
@@ -2122,7 +2382,7 @@ fn create_group_rejects_missing_trusted_keys_without_storing_group() {
         members: vec![alice_member, bob_member.clone()],
         initial_state: None,
     }))
-    .expect_err("missing trusted keys should reject group creation");
+    .expect_err("missing permitted keys should reject group creation");
 
     match error {
         ApiError::ApiExternal { source } => match source.downcast_ref::<CreateGroupError>() {
@@ -2130,7 +2390,12 @@ fn create_group_rejects_missing_trusted_keys_without_storing_group() {
                 assert!(
                     matches!(
                         source.downcast_ref::<DeliverySecurityError>(),
-                        Some(DeliverySecurityError::MissingTrustedPublicKeys { member_id })
+                        Some(DeliverySecurityError::SecurityStore {
+                            source: SecurityStoreError::NoPermittedMemberPublicKeys {
+                                member_id,
+                                ..
+                            },
+                        })
                             if member_id == &bob_member
                     ),
                     "unexpected security source: {source:?}"
@@ -2144,43 +2409,257 @@ fn create_group_rejects_missing_trusted_keys_without_storing_group() {
 }
 
 #[test]
-fn bootstrap_payload_validation_rejects_trusted_public_key_mismatch() {
+fn bootstrap_payload_validation_rejects_unpermitted_sender_fingerprint() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let store = Arc::new(
-        SqliteReplicationStore::in_memory(bob_member.clone()).expect("store should build"),
-    );
+    let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, []);
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &bob_member);
-    let alice_keys = test_public_keys(&alice_member);
     let bob_keys = test_public_keys(&bob_member);
     let probe_keys = test_public_keys(&Identifier::from_array(["probe", "laptop"]));
-    let mismatched_bob_keys = BootstrapMemberPublicKeysMessage {
-        signing_public_key: probe_keys.signing_key_bytes(),
-        encryption_public_key: bob_keys.encryption_key_bytes(),
-    };
+    let mismatched_alice_key =
+        BootstrapMemberKeyMessage::from_fingerprint(probe_keys.fingerprint());
     let payload = BootstrapGroupMessage::new(
         GroupId(Uuid::from_u128(70_001)),
         vec![alice_member.clone(), bob_member.clone()],
-        bootstrap_public_keys([
-            bootstrap_member_public_keys(&alice_keys),
-            (bob_member.clone(), mismatched_bob_keys),
+        bootstrap_member_keys([
+            (alice_member.clone(), mismatched_alice_key),
+            bootstrap_member_key(&bob_keys),
         ]),
         GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
         BootstrapGroupKey::from_bytes([70; 32]),
     )
     .expect("bootstrap payload should build");
 
-    let err = wait_for_test_reply(security.validate_bootstrap_payload_public_keys(&payload))
-        .expect_err("mismatched trusted keys should reject payload");
+    let err = wait_for_test_reply(
+        security.validate_bootstrap_payload_member_keys(&payload, &alice_member),
+    )
+    .expect_err("mismatched bootstrap keys should reject payload");
 
     match err {
-        DeliverySecurityError::TrustedPublicKeysMismatch { member_id } => {
-            assert_eq!(member_id, bob_member);
+        DeliverySecurityError::MemberKeyPermissionDenied {
+            member_id,
+            fingerprint,
+            authority_scope: AuthorityScope::BootstrapActivation,
+            reason,
+        } => {
+            assert_eq!(member_id, alice_member);
+            assert_eq!(fingerprint, probe_keys.fingerprint());
+            assert_eq!(reason, PermissionDenialReason::MissingKeyMaterial);
         }
         other => panic!("unexpected bootstrap validation error: {other:?}"),
     }
+}
+
+#[test]
+fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multiple_keys_are_permitted()
+ {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = sqlite_store(bob_member.clone());
+    provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
+    let alternate_alice_source = test_public_keys(&Identifier::from_array(["alice", "phone"]));
+    let alternate_alice_keys = PublicMemberKeys::from_key_bytes(
+        alice_member.clone(),
+        alternate_alice_source.signing_key_bytes(),
+        alternate_alice_source.encryption_key_bytes(),
+    )
+    .expect("alternate alice public keys should build");
+    let alternate_alice_record = MemberPublicKeysRecord::from_public_keys(&alternate_alice_keys);
+    let alternate_alice_key_id = alternate_alice_record.key_id.clone();
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.ensure_member_public_keys(alternate_alice_record))
+        .expect("alternate alice public keys should store");
+    wait_for_test_reply(transaction.ensure_member_key_trust_evidence(
+        MemberKeyTrustEvidenceRecord {
+            key_id: alternate_alice_key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        },
+    ))
+    .expect("alternate alice trust evidence should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    let security = load_test_runtime_security(store, &bob_member);
+    let bob_keys = test_public_keys(&bob_member);
+    let payload = BootstrapGroupMessage::new(
+        GroupId(Uuid::from_u128(70_006)),
+        vec![alice_member.clone(), bob_member.clone()],
+        bootstrap_member_keys([
+            bootstrap_member_key(&alternate_alice_keys),
+            bootstrap_member_key(&bob_keys),
+        ]),
+        GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+        BootstrapGroupKey::from_bytes([73; 32]),
+    )
+    .expect("bootstrap payload should build");
+
+    wait_for_test_reply(security.validate_bootstrap_payload_member_keys(&payload, &alice_member))
+        .expect("advertised permitted sender key should validate");
+}
+
+#[test]
+fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_permission() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = sqlite_store(bob_member.clone());
+    provision_test_security(store.as_ref(), &bob_member, []);
+    provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
+    let store_for_security: Arc<dyn ReplicationStore> = store;
+    let security_secrets = test_replication_security_secrets();
+    let policy = TrustPolicy {
+        replication_runtime: MemberKeyTrustRequirement::LocalExplicitTrust,
+        bootstrap_activation: MemberKeyTrustRequirement::DenyAll,
+        member_route_publication: MemberKeyTrustRequirement::StoredPublicKeyMaterial,
+    };
+    let security = wait_for_test_reply(DeliverySecurity::load(
+        SecurityStore::new(store_for_security, policy),
+        &bob_member,
+        Arc::clone(security_secrets.store_secret_key()),
+        *security_secrets.store_secret_key_id(),
+    ))
+    .expect("runtime security state should load");
+    let alice_keys = test_public_keys(&alice_member);
+    let bob_keys = test_public_keys(&bob_member);
+    let payload = BootstrapGroupMessage::new(
+        GroupId(Uuid::from_u128(70_002)),
+        vec![alice_member.clone(), bob_member.clone()],
+        bootstrap_member_keys([
+            bootstrap_member_key(&alice_keys),
+            bootstrap_member_key(&bob_keys),
+        ]),
+        GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+        BootstrapGroupKey::from_bytes([71; 32]),
+    )
+    .expect("bootstrap payload should build");
+
+    let err = wait_for_test_reply(
+        security.validate_bootstrap_payload_member_keys(&payload, &alice_member),
+    )
+    .expect_err("bootstrap activation permission should reject payload");
+
+    match err {
+        DeliverySecurityError::MemberKeyPermissionDenied {
+            member_id,
+            fingerprint,
+            authority_scope: AuthorityScope::BootstrapActivation,
+            reason,
+        } => {
+            assert_eq!(member_id, alice_member);
+            assert_eq!(fingerprint, alice_keys.fingerprint());
+            assert_eq!(reason, PermissionDenialReason::PolicyDenied);
+        }
+        other => panic!("unexpected bootstrap validation error: {other:?}"),
+    }
+}
+
+#[test]
+fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let charlie_member = Identifier::from_array(["charlie", "laptop"]);
+    let store = sqlite_store(bob_member.clone());
+    provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
+    let security = load_test_runtime_security(store.clone(), &bob_member);
+    let alice_keys = test_public_keys(&alice_member);
+    let bob_keys = test_public_keys(&bob_member);
+    let charlie_keys = test_public_keys(&charlie_member);
+    let charlie_record = MemberPublicKeysRecord::from_public_keys(&charlie_keys);
+    let payload = BootstrapGroupMessage::new(
+        GroupId(Uuid::from_u128(70_003)),
+        vec![
+            alice_member.clone(),
+            bob_member.clone(),
+            charlie_member.clone(),
+        ],
+        bootstrap_member_keys([
+            bootstrap_member_key(&alice_keys),
+            bootstrap_member_key(&bob_keys),
+            bootstrap_member_key(&charlie_keys),
+        ]),
+        GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+        BootstrapGroupKey::from_bytes([72; 32]),
+    )
+    .expect("bootstrap payload should build");
+
+    wait_for_test_reply(
+        security.prepare_security_material_from_bootstrap_msg(&payload, &alice_member),
+    )
+    .expect("bootstrap security material should prepare");
+
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    let loaded = wait_for_test_reply(transaction.load_member_public_keys(&charlie_record.key_id))
+        .expect("observed charlie keys should load");
+    let evidence =
+        wait_for_test_reply(transaction.load_member_key_trust_evidence(&charlie_record.key_id))
+            .expect("trust evidence should load");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+    assert_eq!(loaded, Some(charlie_record));
+    assert!(!evidence.contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust));
+}
+
+#[test]
+fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let charlie_member = Identifier::from_array(["charlie", "laptop"]);
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(
+        store.as_ref(),
+        &alice_member,
+        [bob_member.clone(), charlie_member.clone()],
+    );
+    let security = load_test_runtime_security(store, &alice_member);
+    let members = GroupMembers::from_ordered_members(vec![
+        alice_member.clone(),
+        bob_member.clone(),
+        charlie_member.clone(),
+    ])
+    .expect("group members should build");
+
+    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_bootstrap(
+        &security,
+        2,
+        GroupId(Uuid::from_u128(70_004)),
+        &members,
+    ))
+    .expect("bootstrap should prepare");
+
+    assert!(
+        prepared
+            .bootstrap_message()
+            .member_keys()
+            .owned_entries()
+            .all(|(_, member_key)| member_key.public_keys().is_none())
+    );
+}
+
+#[test]
+fn bootstrap_preparation_inlines_bundles_at_configured_limit() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
+    let security = load_test_runtime_security(store, &alice_member);
+    let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+        .expect("group members should build");
+
+    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_bootstrap(
+        &security,
+        2,
+        GroupId(Uuid::from_u128(70_005)),
+        &members,
+    ))
+    .expect("bootstrap should prepare");
+
+    assert!(
+        prepared
+            .bootstrap_message()
+            .member_keys()
+            .owned_entries()
+            .all(|(_, member_key)| member_key.public_keys().is_some())
+    );
 }
 
 #[test]
@@ -2218,11 +2697,11 @@ fn pending_apply_need_retries_after_route_appears() {
             },
         }],
     );
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
+    alice_runtime.wait_for_direct_peer_route_for_test(&bob_member);
     let second_receipt = publish_changes(
         alice_runtime.as_ref(),
         first_receipt.read_token,
@@ -2254,9 +2733,9 @@ fn pending_apply_need_retries_after_route_appears() {
     );
     assert!(bob_fixture.listener.captured_data_changes().is_empty());
 
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member,
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
     bob_fixture.listener.wait_for_data_change_count(2);
     assert_eq!(
@@ -2459,13 +2938,13 @@ fn request_summary_returns_remote_current_version_vector() {
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
 
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
 
     let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {

@@ -27,6 +27,7 @@ use flotsync_messages::{
     delivery as proto,
     discovery as discovery_proto,
     endpoint as endpoint_proto,
+    security as security_proto,
     wire as message_wire,
 };
 use flotsync_utils::option_when;
@@ -79,7 +80,9 @@ pub(crate) fn detached_signature_to_wire_format(
 ) -> proto::DetachedSignature {
     proto::DetachedSignature {
         scheme: flotsync_messages::buffa::EnumValue::from(match signature.scheme {
-            SignatureScheme::Ed25519 => proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519,
+            SignatureScheme::Ed25519Ph => {
+                security_proto::SignatureScheme::SIGNATURE_SCHEME_ED25519PH
+            }
         }),
         signature_bytes: signature.bytes.clone(),
         ..proto::DetachedSignature::default()
@@ -99,8 +102,8 @@ pub(crate) fn detached_signature_from_wire(
                 value: wire.scheme.to_i32(),
             })?;
     let scheme = match scheme {
-        proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_ED25519 => SignatureScheme::Ed25519,
-        proto::KnownSignatureScheme::KNOWN_SIGNATURE_SCHEME_UNSPECIFIED => {
+        security_proto::SignatureScheme::SIGNATURE_SCHEME_ED25519PH => SignatureScheme::Ed25519Ph,
+        security_proto::SignatureScheme::SIGNATURE_SCHEME_UNSPECIFIED => {
             return UnspecifiedSignatureSchemeSnafu { field }.fail();
         }
     };

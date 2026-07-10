@@ -228,6 +228,8 @@ impl StoreSecretKeyId {
         self.0.as_bytes()
     }
 
+    /// Generate a fresh store-secret key id for local secret-manager records.
+    #[cfg(feature = "local-secret-manager")]
     #[must_use]
     pub(crate) fn generate() -> Self {
         Self(Uuid::new_v4())

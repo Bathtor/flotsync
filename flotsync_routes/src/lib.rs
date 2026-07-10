@@ -22,6 +22,9 @@
 
 pub use kompact;
 
+mod endpoint_discovery;
+
+pub mod key_material_discovery;
 pub mod manager;
 pub mod protocol;
 pub mod route_establishment;
@@ -48,6 +51,15 @@ pub mod config_keys {
         type = DurationValue,
         default = Duration::from_secs(30),
         doc = "Time for which one verified route remains published before refresh is required.",
+        version = "0.1.0"
+    }
+
+    kompact_config! {
+        KEY_MATERIAL_DISCOVERY_SUPPRESSION_LEASE,
+        key = "flotsync.discovery.key-material.suppression-lease",
+        type = DurationValue,
+        default = Duration::from_secs(2),
+        doc = "Time for which one in-flight direct key-material lookup suppresses duplicate requests.",
         version = "0.1.0"
     }
 }
