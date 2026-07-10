@@ -7,8 +7,8 @@ Follow-up after the flotsync_security MVP: move beyond configured trusted public
 ## Acceptance Criteria
 
 Discovery or a defined adjacent trust path can advertise member public keys or references; recipients can authenticate them before use; DB-native provisioned trust remains available as a bootstrap or override path; JWKS files and jose-jwk are removed by the agreed key-format implementation path; and tests cover spoofed announcements, key mismatch rejection, and policy-sensitive trust decisions."""
-status = "in-progress"
-status_reason = "planning"
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
 assignee = "Lars Kroll"
@@ -25,4 +25,11 @@ children = [
     "019f0e9b-3aa5-7a11-ac0c-f80947626449",
 ]
 created_at = "2026-05-14T16:33:46Z"
-updated_at = "2026-06-28T14:21:31.074756Z"
+updated_at = "2026-07-10T13:19:53.682348Z"
+closed_at = "2026-07-10T13:19:53.682348Z"
+
+[[comments]]
+id = "019f4c2f-4352-79b0-af54-ae00ad0bdba8"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-10T13:19:53.682348Z"
