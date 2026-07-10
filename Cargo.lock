@@ -529,9 +529,9 @@ dependencies = [
 
 [[package]]
 name = "borrowize"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e37314172574994f42727457564668f2e4fae3730881511daf74e1481a5997ca"
+checksum = "5a0f8deffb2be4786419b2deb84a9612e1ab5a577675728e188f3b4f2c57f8f7"
 dependencies = [
  "nom 8.0.0",
  "proc-macro2",

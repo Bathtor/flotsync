@@ -1,10 +1,31 @@
 id = "019f4c3e-6791-7b91-8e6b-506242515e22"
 ref = "flotsync-git-g8w"
 title = "Apply borrowize enum support to discovery endpoint frames"
-body = "When borrowize supports enum view derivation, revisit DiscoveryEndpointFrameSrc in flotsync_routes::protocol and replace the manual borrowed enum source where practical."
-status = "open"
+body = """
+Apply borrowize enum view support to the discovery endpoint frame source.
+
+Agreed scope:
+- Keep working on the current branch; do not create a new branch.
+- Use `borrowize = "0.2.0"` and keep the lockfile pinned to 0.2.0.
+- Replace the hand-written borrowed `DiscoveryEndpointFrameSrc` enum with an owned `DiscoveryEndpointFrame` enum deriving `View`.
+- Use the generated default `DiscoveryEndpointFrameView` at existing route-establishment and key-material-discovery call sites.
+- Add field overrides so copy fields such as `Uuid` and `KeyFingerprint` remain copied in the generated view.
+- Implement endpoint-frame protobuf encoding for `DiscoveryEndpointFrameView`; optionally let owned `DiscoveryEndpointFrame` delegate through `.view()` if useful.
+- Do not convert `DatasetUpdateProtoSources` or broader data-model `*Ref` enum pairs in this task because they are either intentional dual-source adapters or tuple-variant refs outside borrowize 0.2.0 support.
+
+Validation plan: run `cargo fmt`, focused route/replication checks/tests, and pedantic clippy for affected crates."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 3
+assignee = "codex"
 parent = "019f3245-ff9d-7bb3-ab64-cf27196a0c3a"
 created_at = "2026-07-10T13:36:26.001867Z"
-updated_at = "2026-07-10T13:36:33.474491Z"
+updated_at = "2026-07-10T14:21:05.366314Z"
+closed_at = "2026-07-10T14:21:05.366314Z"
+
+[[comments]]
+id = "019f4c67-49d6-7f62-8011-879f128c7dd6"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-10T14:21:05.366314Z"

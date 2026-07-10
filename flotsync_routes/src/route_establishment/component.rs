@@ -26,7 +26,7 @@ use crate::{
     key_material_discovery::{FetchKeyMaterial, KeyMaterialDiscoveryPort},
     protocol::{
         DecodedIntroductionClaimPayload,
-        DiscoveryEndpointFrameSrc,
+        DiscoveryEndpointFrameView,
         decode_endpoint_discovery_frame_from_buf,
         decode_introduction_claim_payload_view,
         encode_member_key_selector_fields,
@@ -459,7 +459,7 @@ impl RouteEstablishmentComponent {
         let DiscoveryRoute::Udp(target) = route;
 
         let nonce = Uuid::new_v4();
-        let frame = DiscoveryEndpointFrameSrc::IntroductionRequest {
+        let frame = DiscoveryEndpointFrameView::IntroductionRequest {
             request_nonce: nonce,
         }
         .encode_proto();
@@ -680,7 +680,7 @@ impl RouteEstablishmentComponent {
             claims,
             ..discovery_proto::Introduction::default()
         };
-        let frame = DiscoveryEndpointFrameSrc::Introduction {
+        let frame = DiscoveryEndpointFrameView::Introduction {
             introduction: &introduction,
         }
         .encode_proto();

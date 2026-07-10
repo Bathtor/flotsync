@@ -9,7 +9,7 @@ use crate::{
     endpoint_discovery::{LocalUdpEndpointBinding, LocalUdpEndpointState},
     protocol::{
         DecodedKeyBundleLookupRequest,
-        DiscoveryEndpointFrameSrc,
+        DiscoveryEndpointFrameView,
         DiscoveryRoute,
         KeyBundleLookupResponsePayload,
         KeyBundleLookupResponsePayloadView,
@@ -171,7 +171,7 @@ impl KeyMaterialDiscoveryComponent {
         }
         let DiscoveryRoute::Udp(target) = request.route;
         let nonce = Uuid::new_v4();
-        let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupRequest {
+        let frame = DiscoveryEndpointFrameView::KeyBundleLookupRequest {
             member: &request.member,
             key_fingerprint: request.key_fingerprint,
             request_nonce: nonce,
@@ -362,7 +362,7 @@ impl KeyMaterialDiscoveryComponent {
             signature: MessageField::some(signature.encode_proto()),
             ..discovery_proto::SignedKeyBundleLookupResponse::default()
         };
-        let frame = DiscoveryEndpointFrameSrc::KeyBundleLookupResponse {
+        let frame = DiscoveryEndpointFrameView::KeyBundleLookupResponse {
             response: &response,
         }
         .encode_proto();
