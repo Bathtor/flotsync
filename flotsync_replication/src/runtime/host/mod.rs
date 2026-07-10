@@ -32,6 +32,14 @@ use flotsync_discovery::{
         PeerAnnouncementSocketMaintenance,
     },
 };
+use flotsync_io::prelude::{
+    DriverConfig,
+    EgressPool,
+    IoBridge,
+    IoBridgeHandle,
+    IoDriverComponent,
+    UdpPort,
+};
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_io::test_support::{
     ReservedSocketKind,
@@ -39,10 +47,6 @@ use flotsync_io::test_support::{
     enable_bind_reuse_address,
     reserve_sockets,
     set_test_system_label,
-};
-use flotsync_io::{
-    kompact::shutdown_system_bounded,
-    prelude::{DriverConfig, EgressPool, IoBridge, IoBridgeHandle, IoDriverComponent, UdpPort},
 };
 use flotsync_routes::{
     RouteDiscoveryPort,
@@ -176,6 +180,8 @@ pub(crate) enum RuntimeHostError {
         component: &'static str,
         source: RuntimeControlError,
     },
+    #[snafu(display("Failed to shut down replication runtime system: {source}"))]
+    ShutdownSystem { source: RuntimeControlError },
     #[snafu(display("Failed to connect runtime bridge UDP to '{component}': {message}"))]
     ConnectUdp {
         component: &'static str,
@@ -349,11 +355,11 @@ trait RuntimeLifecycleComponent: Send + Sync {
         control_timeout: Duration,
     ) -> BoxFuture<'a, Result<(), RuntimeHostError>>;
 
-    fn stop(
-        &self,
-        system: &KompactSystem,
+    fn stop<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError>;
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>>;
 }
 
 /// A component topology that can expose its concrete lifecycle nodes in start order.
@@ -377,14 +383,16 @@ trait ComponentTopology {
         Ok(())
     }
 
-    /// Stop every lifecycle node in the reverse order exposed by `nodes`.
-    fn stop_all(
+    /// Stop every lifecycle node in reverse dependency order.
+    async fn stop_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
+        // Stop sequentially because later-started components depend on
+        // earlier-started providers during shutdown.
         for component in self.nodes().rev() {
-            component.stop(system, control_timeout)?;
+            component.stop(system, control_timeout).await?;
         }
         Ok(())
     }
@@ -461,20 +469,22 @@ where
         .boxed()
     }
 
-    fn stop(
-        &self,
-        system: &KompactSystem,
+    fn stop<'a>(
+        &'a self,
+        system: &'a KompactSystem,
         control_timeout: Duration,
-    ) -> Result<(), RuntimeHostError> {
-        block_on(
+    ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
+        async move {
             system
                 .stop_notify(self)
                 .map(|result| result.boxed().context(ControlFutureSnafu))
-                .timeout_fold_err(control_timeout),
-        )
-        .context(StopComponentSnafu {
-            component: C::type_name(),
-        })
+                .timeout_fold_err(control_timeout)
+                .await
+                .context(StopComponentSnafu {
+                    component: C::type_name(),
+                })
+        }
+        .boxed()
     }
 }
 
@@ -1149,16 +1159,16 @@ impl RuntimeTopology {
         Ok(())
     }
 
-    fn stop_all(
+    async fn stop_all(
         &self,
         system: &KompactSystem,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.runtime.stop_all(system, control_timeout)?;
-        self.discovery.stop_all(system, control_timeout)?;
-        self.delivery.stop_all(system, control_timeout)?;
-        self.transport.stop_all(system, control_timeout)?;
-        self.io.stop_all(system, control_timeout)?;
+        self.runtime.stop_all(system, control_timeout).await?;
+        self.discovery.stop_all(system, control_timeout).await?;
+        self.delivery.stop_all(system, control_timeout).await?;
+        self.transport.stop_all(system, control_timeout).await?;
+        self.io.stop_all(system, control_timeout).await?;
         Ok(())
     }
 }
@@ -1319,24 +1329,30 @@ impl DeliveryRuntimeHost {
         .await
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> Result<(), RuntimeHostError> {
         let Some(topology) = self.topology.take() else {
-            return;
+            return Ok(());
         };
         let Some(system) = self.system.take() else {
-            return;
+            return Ok(());
         };
-        let stop_result = topology.stop_all(&system, self.control_timeout);
+        let stop_result = topology.stop_all(&system, self.control_timeout).await;
         drop(topology);
         if let Err(error) = stop_result {
-            shutdown_system_bounded(system, self.control_timeout, true);
+            system.shutdown_async();
             #[cfg(any(test, feature = "test-support"))]
             rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
-            panic!("failed to stop delivery runtime host cleanly: {error}");
+            return Err(error);
         }
-        shutdown_system_bounded(system, self.control_timeout, false);
+        system
+            .shutdown()
+            .map(|result| result.boxed().context(ControlFutureSnafu))
+            .timeout_fold_err(self.control_timeout)
+            .await
+            .context(ShutdownSystemSnafu)?;
         #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
+        Ok(())
     }
 
     /// Replace the authoritative shared group-membership snapshot.
@@ -1381,18 +1397,14 @@ impl DeliveryRuntimeHost {
 
 impl Drop for DeliveryRuntimeHost {
     fn drop(&mut self) {
-        let Some(topology) = self.topology.take() else {
-            return;
-        };
+        drop(self.topology.take());
         let Some(system) = self.system.take() else {
             return;
         };
-        let stop_result = topology.stop_all(&system, self.control_timeout);
-        drop(topology);
-        if let Err(error) = stop_result {
-            log::error!("delivery runtime host drop stop_all failed before forced kill: {error}");
-        }
-        shutdown_system_bounded(system, self.control_timeout, true);
+        log::warn!(
+            "replication runtime host dropped without graceful shutdown; call ReplicationApi::shutdown().await before dropping the runtime handle"
+        );
+        system.shutdown_async();
         #[cfg(any(test, feature = "test-support"))]
         rebind_reserved_runtime_local_endpoint_binding(&mut self.local_endpoint_lease);
     }

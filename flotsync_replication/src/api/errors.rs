@@ -53,6 +53,8 @@ pub enum ApiError {
     ApiExternal { source: BoxError },
     #[snafu(display("Replication runtime component became unavailable."))]
     RuntimeUnavailable,
+    #[snafu(display("Replication runtime lifecycle state was poisoned while {operation}."))]
+    RuntimeLifecyclePoisoned { operation: &'static str },
     #[snafu(display("Timed out waiting for summary from member {target} in group {group_id}."))]
     SummaryTimedOut {
         group_id: GroupId,

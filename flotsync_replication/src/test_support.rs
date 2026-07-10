@@ -33,13 +33,10 @@ use crate::{
         process_batches,
     },
     delivery::security::DeliverySecurity,
-    runtime::{
-        handle::{
-            ReplicationRuntime,
-            load_replication_runtime_typed_with_security_for_test,
-            load_replication_runtime_with_runtime_config_toml,
-        },
-        host::DeliveryRuntimeHostTestExt,
+    runtime::handle::{
+        ReplicationRuntime,
+        load_replication_runtime_typed_with_security_for_test,
+        load_replication_runtime_with_runtime_config_toml,
     },
     security_store::SecurityStore,
 };
@@ -507,13 +504,13 @@ impl RuntimeTestFixture {
 
     /// Publish direct peer routes between this fixture and another runtime.
     pub fn connect_direct_peer_routes(&self, peer: &Self) {
-        self.runtime.host().publish_direct_peer_route(
+        self.runtime.publish_direct_peer_route_for_test(
             peer.local_member.clone(),
-            peer.runtime.host().advertised_loopback_udp_addr(),
+            peer.runtime.advertised_loopback_udp_addr_for_test(),
         );
-        peer.runtime.host().publish_direct_peer_route(
+        peer.runtime.publish_direct_peer_route_for_test(
             self.local_member.clone(),
-            self.runtime.host().advertised_loopback_udp_addr(),
+            self.runtime.advertised_loopback_udp_addr_for_test(),
         );
     }
 
@@ -539,8 +536,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn contains_group(&self, group_id: GroupId) -> bool {
         self.runtime
-            .host()
-            .membership_snapshot()
+            .membership_snapshot_for_test()
             .contains_group(&group_id)
     }
 
@@ -548,8 +544,7 @@ impl RuntimeTestFixture {
     #[must_use]
     pub fn group_members(&self, group_id: GroupId) -> Option<GroupMembers> {
         self.runtime
-            .host()
-            .membership_snapshot()
+            .membership_snapshot_for_test()
             .members(&group_id)
             .cloned()
     }

@@ -29,7 +29,10 @@ pub(super) async fn run_configured_peer(
 
     let working_set = load_checklist_working_set(replication.as_ref(), group_id).await?;
     let mut repl = ChecklistRepl::new(setup.config, replication, listener_receiver, working_set);
-    repl.run()
+    let run_result = repl.run().await;
+    let shutdown_result = repl.shutdown().await;
+    run_result?;
+    shutdown_result
 }
 
 struct ChecklistListener {
@@ -112,7 +115,7 @@ impl ChecklistRepl {
         clippy::needless_continue,
         reason = "The REPL loop uses explicit continues to make command-processing outcomes obvious."
     )]
-    fn run(&mut self) -> Result<(), ReplicatedChecklistError> {
+    async fn run(&mut self) -> Result<(), ReplicatedChecklistError> {
         println!("replicated checklist group {}", self.config.group_id);
         println!("type 'help' for commands");
 
@@ -142,7 +145,7 @@ impl ChecklistRepl {
                     continue 'repl;
                 }
             };
-            match self.handle_command(command) {
+            match self.handle_command(command).await {
                 Ok(true) => continue 'repl,
                 Ok(false) => break 'repl,
                 Err(error) => {
@@ -154,7 +157,7 @@ impl ChecklistRepl {
         Ok(())
     }
 
-    fn handle_command(
+    async fn handle_command(
         &mut self,
         command: ChecklistCommand,
     ) -> Result<bool, ReplicatedChecklistError> {
@@ -223,9 +226,9 @@ impl ChecklistRepl {
             ChecklistCommand::List => self.print_list(),
             ChecklistCommand::Show { item } => self.print_item(item)?,
             ChecklistCommand::Events { limit } => self.print_events(limit),
-            ChecklistCommand::Sync => self.sync()?,
+            ChecklistCommand::Sync => self.sync().await?,
             ChecklistCommand::Members => self.print_members(),
-            ChecklistCommand::Check => self.check_members(),
+            ChecklistCommand::Check => self.check_members().await,
             ChecklistCommand::Me => self.print_me(),
             ChecklistCommand::Help => println!("{}", checklist_help()),
             ChecklistCommand::Quit => return Ok(false),
@@ -257,7 +260,7 @@ impl ChecklistRepl {
         Ok(())
     }
 
-    fn sync(&mut self) -> Result<(), ReplicatedChecklistError> {
+    async fn sync(&mut self) -> Result<(), ReplicatedChecklistError> {
         let plan = self
             .working_set
             .prepare_sync()
@@ -267,11 +270,14 @@ impl ChecklistRepl {
                 .working_set
                 .read_token()
                 .context(repl_error::WorkingSetSnafu)?;
-            let receipt = block_on(self.replication.publish_changes(PublishChangesRequest {
-                read_token,
-                changes: plan.mutations.clone(),
-            }))
-            .context(repl_error::ReplicationSnafu)?;
+            let receipt = self
+                .replication
+                .publish_changes(PublishChangesRequest {
+                    read_token,
+                    changes: plan.mutations.clone(),
+                })
+                .await
+                .context(repl_error::ReplicationSnafu)?;
             // The receipt token is our previous application read position with
             // this local writer position advanced. Keeping it here makes the
             // next local sync causally depend on the write we just published
@@ -365,7 +371,7 @@ impl ChecklistRepl {
         }
     }
 
-    fn check_members(&self) {
+    async fn check_members(&self) {
         println!("group {}", self.config.group_id);
         let requests =
             self.config
@@ -385,7 +391,7 @@ impl ChecklistRepl {
                         (index, member, result)
                     }
                 });
-        let summaries = block_on(join_all(requests));
+        let summaries = join_all(requests).await;
         let local_member = self.config.local_member.clone();
         for (index, member, result) in summaries {
             let marker = if member == local_member { " (me)" } else { "" };
@@ -398,6 +404,13 @@ impl ChecklistRepl {
                 }
             }
         }
+    }
+
+    async fn shutdown(&self) -> Result<(), ReplicatedChecklistError> {
+        self.replication
+            .shutdown()
+            .await
+            .context(repl_error::ReplicationSnafu)
     }
 
     fn print_me(&self) {

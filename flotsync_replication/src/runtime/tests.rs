@@ -1213,13 +1213,13 @@ fn publish_direct_peer_routes(
     bob_runtime: &Arc<ReplicationRuntime>,
     bob_member: &MemberIdentity,
 ) {
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
 }
 
@@ -1299,8 +1299,7 @@ fn wait_for_group_install(runtime: &Arc<ReplicationRuntime>, group_id: GroupId) 
         TEST_WAIT_TIMEOUT,
         || {
             runtime
-                .host()
-                .membership_snapshot()
+                .membership_snapshot_for_test()
                 .contains_group(&group_id)
         },
         "timed out waiting for runtime to install group",
@@ -1320,7 +1319,7 @@ fn delivery_runtime_host_updates_shared_group_memberships() {
     host.replace_group_memberships(memberships);
 
     assert!(host.membership_snapshot().contains_group(&group_id));
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -1341,6 +1340,33 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
         &runtime_config_toml,
     ))
     .expect("public runtime loading should accept provisioned security");
+}
+
+#[test]
+fn runtime_shutdown_is_graceful_idempotent_and_marks_runtime_unavailable() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down gracefully");
+    wait_for_test_reply(runtime.shutdown()).expect("second shutdown should be a no-op");
+
+    let error = wait_for_test_reply(runtime.local_public_key_bundle())
+        .expect_err("runtime API should be unavailable after shutdown");
+    assert!(matches!(error, ApiError::RuntimeUnavailable));
+}
+
+#[test]
+fn dropping_runtime_inside_test_executor_does_not_reenter_local_pool() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    wait_for_test_future(async move {
+        drop(runtime);
+    });
 }
 
 #[test]
@@ -1611,7 +1637,7 @@ fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
     let mut host = start_host(&Identifier::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -1631,7 +1657,7 @@ fn runtime_host_treats_static_peer_routes_as_unverified_hints() {
     );
 
     assert!(
-        !runtime.host().knows_direct_peer_route(&bob_member),
+        !runtime.knows_direct_peer_route_for_test(&bob_member),
         "static route hints must not publish before route establishment verifies them"
     );
 }
@@ -1655,7 +1681,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     let alice_listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = static_peer_route_toml(
         &bob_member,
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
     let alice_runtime = load_runtime_with_parts_and_runtime_config_toml(
         app_alice_id(),
@@ -1665,7 +1691,7 @@ fn runtime_host_verifies_static_route_hint_through_route_establishment() {
     );
     wait_for_group_install(&alice_runtime, group_id);
 
-    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
+    alice_runtime.wait_for_direct_peer_route_for_test(&bob_member);
 }
 
 #[test]
@@ -1693,7 +1719,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
 
     host.publish_preconfigured_peer_routes();
     host.wait_for_direct_peer_route(&bob_member);
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -1719,7 +1745,7 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
         ))
         .expect("zero catch-up batch size should mean unlimited");
     host.wait_for_runtime_startup();
-    host.shutdown();
+    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
 }
 
 #[test]
@@ -2671,11 +2697,11 @@ fn pending_apply_need_retries_after_route_appears() {
             },
         }],
     );
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    alice_runtime.host().wait_for_direct_peer_route(&bob_member);
+    alice_runtime.wait_for_direct_peer_route_for_test(&bob_member);
     let second_receipt = publish_changes(
         alice_runtime.as_ref(),
         first_receipt.read_token,
@@ -2707,9 +2733,9 @@ fn pending_apply_need_retries_after_route_appears() {
     );
     assert!(bob_fixture.listener.captured_data_changes().is_empty());
 
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member,
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
     bob_fixture.listener.wait_for_data_change_count(2);
     assert_eq!(
@@ -2912,13 +2938,13 @@ fn request_summary_returns_remote_current_version_vector() {
     let alice_runtime = &alice_fixture.runtime;
     let bob_runtime = &bob_fixture.runtime;
 
-    alice_runtime.host().publish_direct_peer_route(
+    alice_runtime.publish_direct_peer_route_for_test(
         bob_member.clone(),
-        bob_runtime.host().advertised_loopback_udp_addr(),
+        bob_runtime.advertised_loopback_udp_addr_for_test(),
     );
-    bob_runtime.host().publish_direct_peer_route(
+    bob_runtime.publish_direct_peer_route_for_test(
         alice_member.clone(),
-        alice_runtime.host().advertised_loopback_udp_addr(),
+        alice_runtime.advertised_loopback_udp_addr_for_test(),
     );
 
     let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {

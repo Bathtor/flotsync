@@ -644,6 +644,15 @@ pub trait ReplicationEventListener: Send + Sync {
 
 /// Application-facing replication control surface.
 pub trait ReplicationApi: Send + Sync {
+    /// Shut this runtime down gracefully.
+    ///
+    /// Shutdown stops the live replication components in dependency order and
+    /// then shuts down the underlying runtime system. After shutdown starts,
+    /// other API calls on any clone of this runtime handle report
+    /// [`ApiError::RuntimeUnavailable`]. Calling shutdown again after a
+    /// previous shutdown completed is a no-op.
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), ApiError>>;
+
     /// Return the local member's shareable identity-free public key bundle.
     ///
     /// Applications can encode this bundle for transfer to another user or
