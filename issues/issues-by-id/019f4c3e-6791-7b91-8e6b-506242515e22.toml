@@ -1,0 +1,10 @@
+id = "019f4c3e-6791-7b91-8e6b-506242515e22"
+ref = "flotsync-git-g8w"
+title = "Apply borrowize enum support to discovery endpoint frames"
+body = "When borrowize supports enum view derivation, revisit DiscoveryEndpointFrameSrc in flotsync_routes::protocol and replace the manual borrowed enum source where practical."
+status = "open"
+type = "task"
+priority = 3
+parent = "019f3245-ff9d-7bb3-ab64-cf27196a0c3a"
+created_at = "2026-07-10T13:36:26.001867Z"
+updated_at = "2026-07-10T13:36:33.474491Z"

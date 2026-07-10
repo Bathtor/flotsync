@@ -1,5 +1,6 @@
 //! Route-establishment introduction protocol helpers.
 
+use borrowize::View;
 use flotsync_core::{GroupId, MemberIdentity};
 use flotsync_discovery::protocol::{DiscoveryProtocolError, discovery_protocol_error};
 use flotsync_messages::{
@@ -11,7 +12,7 @@ use flotsync_messages::{
         IntroductionClaimPayloadView,
         IntroductionRequest,
         KeyBundleLookupRequest,
-        KeyBundleLookupResponsePayload,
+        KeyBundleLookupResponsePayload as KeyBundleLookupResponsePayloadProto,
         SignedKeyBundleLookupResponse,
         discovery_frame,
     },
@@ -107,22 +108,27 @@ impl DecodeProto for DecodedKeyBundleLookupRequest {
     }
 }
 
-/// Decoded direct key-bundle lookup response payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecodedKeyBundleLookupResponsePayload {
+/// Direct key-bundle lookup response payload.
+#[derive(Clone, Debug, PartialEq, Eq, View)]
+pub struct KeyBundleLookupResponsePayload {
     /// Member identity supplied by the requester.
     pub member: MemberIdentity,
     /// Exact public key bundle fingerprint requested by the requester.
+    #[borrowize(
+        borrowed_type = "KeyFingerprint",
+        generation_expression = "self.key_fingerprint"
+    )]
     pub key_fingerprint: KeyFingerprint,
     /// Freshness challenge echoed from the request.
+    #[borrowize(borrowed_type = "Uuid", generation_expression = "self.request_nonce")]
     pub request_nonce: Uuid,
     /// Identity-free public key bundle returned by the responder.
     pub public_key_bundle: PublicKeyBundle,
 }
 
-impl DecodeProto for DecodedKeyBundleLookupResponsePayload {
+impl DecodeProto for KeyBundleLookupResponsePayload {
     type Error = KeyBundleLookupPayloadError;
-    type Proto = KeyBundleLookupResponsePayload;
+    type Proto = KeyBundleLookupResponsePayloadProto;
 
     fn decode_proto(mut payload: Self::Proto) -> Result<Self, Self::Error> {
         let member_id = payload
@@ -480,30 +486,18 @@ impl EncodeProto for DiscoveryEndpointFrameSrc<'_> {
     }
 }
 
-/// Source for encoding the signed payload of one direct key-bundle lookup response.
-pub struct KeyBundleLookupResponsePayloadSrc<'a> {
-    /// Member identity supplied by the requester.
-    pub member: &'a MemberIdentity,
-    /// Exact public key bundle fingerprint requested.
-    pub key_fingerprint: KeyFingerprint,
-    /// Request freshness challenge echoed by the response.
-    pub request_nonce: Uuid,
-    /// Public key bundle returned by the responder.
-    pub public_key_bundle: &'a PublicKeyBundle,
-}
-
-impl EncodeProto for KeyBundleLookupResponsePayloadSrc<'_> {
-    type Proto = KeyBundleLookupResponsePayload;
+impl EncodeProto for KeyBundleLookupResponsePayloadView<'_> {
+    type Proto = KeyBundleLookupResponsePayloadProto;
 
     fn encode_proto(&self) -> Self::Proto {
         let (member_id, key_fingerprint) =
             encode_member_key_selector_fields(self.member, self.key_fingerprint);
-        KeyBundleLookupResponsePayload {
+        KeyBundleLookupResponsePayloadProto {
             member_id: MessageField::some(member_id),
             key_fingerprint,
             request_nonce: uuid_to_wire_bytes(self.request_nonce),
             public_key_bundle: MessageField::some(self.public_key_bundle.encode_proto()),
-            ..KeyBundleLookupResponsePayload::default()
+            ..KeyBundleLookupResponsePayloadProto::default()
         }
     }
 }

@@ -15,6 +15,7 @@ use crate::{
         member_identity_to_wire_format,
     },
 };
+use borrowize::View;
 use flotsync_core::{
     GroupId,
     MemberIdentity,
@@ -779,7 +780,7 @@ impl fmt::Debug for BootstrapGroupKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, View)]
 pub(crate) struct UpdateMessage {
     pub(crate) group_id: GroupId,
     pub(crate) update_id: UpdateId,
@@ -791,7 +792,7 @@ impl EncodeProto for UpdateMessage {
     type Proto = replication_proto::Update;
 
     fn encode_proto(&self) -> Self::Proto {
-        UpdateMessageProtoSource::from(self).encode_proto()
+        self.view().encode_proto()
     }
 }
 
@@ -1016,7 +1017,7 @@ impl DecodeProtoView for SummaryRequestMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, View)]
 pub(crate) struct SummaryVersionsMessage<V> {
     pub(crate) group_id: GroupId,
     pub(crate) correlation_id: Uuid,
@@ -1040,7 +1041,7 @@ impl EncodeProto for SummaryMessage {
     type Proto = replication_proto::Summary;
 
     fn encode_proto(&self) -> Self::Proto {
-        SummaryMessageProtoSource::from(self).encode_proto()
+        self.view().encode_proto()
     }
 }
 
@@ -1322,7 +1323,7 @@ impl DecodeProtoView for NeedRangeMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, View)]
 pub(crate) struct UpdateBatchMessage {
     pub(crate) group_id: GroupId,
     pub(crate) updates: Vec<UpdateMessage>,
@@ -1332,7 +1333,7 @@ impl EncodeProto for UpdateBatchMessage {
     type Proto = replication_proto::UpdateBatch;
 
     fn encode_proto(&self) -> Self::Proto {
-        UpdateBatchMessageProtoSource::from(self).encode_proto()
+        self.view().encode_proto()
     }
 }
 
@@ -1676,7 +1677,7 @@ impl DecodeProtoView for WireVersionVector {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, View)]
 pub(crate) struct DatasetUpdateMessage {
     pub(crate) dataset_id: DatasetId,
     pub(crate) operations: Vec<datamodel_proto::SchemaOperation>,
@@ -1687,7 +1688,7 @@ impl proto::ProtoCodec for DatasetUpdateMessage {
     type Proto = replication_proto::DatasetUpdate;
 
     fn to_proto(&self) -> Self::Proto {
-        DatasetUpdateProtoSource::from(self).encode_proto()
+        self.view().encode_proto()
     }
 
     fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
@@ -1808,25 +1809,7 @@ impl EncodeProto for RuntimeVersionVectorProtoSource<'_> {
     }
 }
 
-/// Borrowed source for encoding one dataset update from either the runtime
-/// message model or the persisted store-record model.
-pub(crate) struct DatasetUpdateProtoSource<'a> {
-    /// Dataset whose operations are carried by this protobuf entry.
-    dataset_id: &'a DatasetId,
-    /// Already encoded schema operations for this dataset.
-    operations: &'a [datamodel_proto::SchemaOperation],
-}
-
-impl<'a> From<&'a DatasetUpdateMessage> for DatasetUpdateProtoSource<'a> {
-    fn from(message: &'a DatasetUpdateMessage) -> Self {
-        Self {
-            dataset_id: &message.dataset_id,
-            operations: &message.operations,
-        }
-    }
-}
-
-impl<'a> From<&'a DatasetUpdateRecord> for DatasetUpdateProtoSource<'a> {
+impl<'a> From<&'a DatasetUpdateRecord> for DatasetUpdateMessageView<'a> {
     fn from(record: &'a DatasetUpdateRecord) -> Self {
         Self {
             dataset_id: &record.dataset_id,
@@ -1835,7 +1818,7 @@ impl<'a> From<&'a DatasetUpdateRecord> for DatasetUpdateProtoSource<'a> {
     }
 }
 
-impl EncodeProto for DatasetUpdateProtoSource<'_> {
+impl EncodeProto for DatasetUpdateMessageView<'_> {
     type Proto = replication_proto::DatasetUpdate;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -1847,8 +1830,25 @@ impl EncodeProto for DatasetUpdateProtoSource<'_> {
     }
 }
 
-/// Borrowed source for encoding an update from runtime messages or persisted
-/// store records without an intermediate owned `UpdateMessage`.
+impl EncodeProto for UpdateMessageView<'_> {
+    type Proto = replication_proto::Update;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let read_versions =
+            RuntimeVersionVectorProtoSource::from(self.read_versions).encode_proto();
+        replication_proto::Update {
+            group_id: self.group_id.0.as_bytes().to_vec(),
+            update_id: MessageField::some(encode_update_id(*self.update_id)),
+            read_versions: MessageField::some(read_versions),
+            dataset_updates: DatasetUpdateProtoSources::Messages(self.dataset_updates)
+                .encode_proto(),
+            ..replication_proto::Update::default()
+        }
+    }
+}
+
+/// Borrowed source for encoding a persisted store record without an
+/// intermediate owned `UpdateMessage`.
 pub(crate) struct UpdateMessageProtoSource<'a> {
     /// Group whose log contains the update.
     group_id: GroupId,
@@ -1858,17 +1858,6 @@ pub(crate) struct UpdateMessageProtoSource<'a> {
     read_versions: &'a VersionVector,
     /// Dataset updates borrowed from the original source shape.
     dataset_updates: DatasetUpdateProtoSources<'a>,
-}
-
-impl<'a> From<&'a UpdateMessage> for UpdateMessageProtoSource<'a> {
-    fn from(message: &'a UpdateMessage) -> Self {
-        Self {
-            group_id: message.group_id,
-            update_id: message.update_id,
-            read_versions: &message.read_versions,
-            dataset_updates: DatasetUpdateProtoSources::Messages(&message.dataset_updates),
-        }
-    }
 }
 
 impl<'a> From<&'a ReplicationUpdateRecord> for UpdateMessageProtoSource<'a> {
@@ -1898,28 +1887,7 @@ impl EncodeProto for UpdateMessageProtoSource<'_> {
     }
 }
 
-/// Borrowed source for encoding a summary message without constructing compact
-/// owned wire-version state first.
-pub(crate) struct SummaryMessageProtoSource<'a> {
-    /// Group whose version frontier is being reported.
-    group_id: GroupId,
-    /// Request correlation identifier copied into the reply.
-    correlation_id: Uuid,
-    /// Responder version frontier.
-    has_versions: &'a VersionVector,
-}
-
-impl<'a> From<&'a SummaryMessage> for SummaryMessageProtoSource<'a> {
-    fn from(message: &'a SummaryMessage) -> Self {
-        Self {
-            group_id: message.group_id,
-            correlation_id: message.correlation_id,
-            has_versions: &message.has_versions,
-        }
-    }
-}
-
-impl EncodeProto for SummaryMessageProtoSource<'_> {
+impl EncodeProto for SummaryVersionsMessageView<'_, VersionVector> {
     type Proto = replication_proto::Summary;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -1934,24 +1902,7 @@ impl EncodeProto for SummaryMessageProtoSource<'_> {
     }
 }
 
-/// Borrowed source for encoding an update batch from borrowed runtime updates.
-pub(crate) struct UpdateBatchMessageProtoSource<'a> {
-    /// Group whose missing updates are carried in this batch.
-    group_id: GroupId,
-    /// Updates borrowed from the runtime batch.
-    updates: &'a [UpdateMessage],
-}
-
-impl<'a> From<&'a UpdateBatchMessage> for UpdateBatchMessageProtoSource<'a> {
-    fn from(message: &'a UpdateBatchMessage) -> Self {
-        Self {
-            group_id: message.group_id,
-            updates: &message.updates,
-        }
-    }
-}
-
-impl EncodeProto for UpdateBatchMessageProtoSource<'_> {
+impl EncodeProto for UpdateBatchMessageView<'_> {
     type Proto = replication_proto::UpdateBatch;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -1960,7 +1911,7 @@ impl EncodeProto for UpdateBatchMessageProtoSource<'_> {
             updates: self
                 .updates
                 .iter()
-                .map(|update| UpdateMessageProtoSource::from(update).encode_proto())
+                .map(|update| update.view().encode_proto())
                 .collect(),
             ..replication_proto::UpdateBatch::default()
         }
@@ -1981,11 +1932,11 @@ impl DatasetUpdateProtoSources<'_> {
         match self {
             Self::Messages(dataset_updates) => dataset_updates
                 .iter()
-                .map(|message| DatasetUpdateProtoSource::from(message).encode_proto())
+                .map(|message| message.view().encode_proto())
                 .collect(),
             Self::Records(dataset_updates) => dataset_updates
                 .iter()
-                .map(|record| DatasetUpdateProtoSource::from(record).encode_proto())
+                .map(|record| DatasetUpdateMessageView::from(record).encode_proto())
                 .collect(),
         }
     }
@@ -2078,17 +2029,15 @@ mod tests {
         BootstrapGroupMessage,
         BootstrapMemberKeyMessage,
         DatasetUpdateMessage,
-        DatasetUpdateProtoSource,
+        DatasetUpdateMessageView,
         MemberCountContext,
         NeedRangeMessage,
         RuntimeMessage,
         RuntimeMessageError,
         RuntimeVersionVectorProtoSource,
         SummaryMessage,
-        SummaryMessageProtoSource,
         SummaryRequestMessage,
         UpdateBatchMessage,
-        UpdateBatchMessageProtoSource,
         UpdateMessage,
         UpdateMessageProtoSource,
         UpdateRangeMessage,
@@ -2361,27 +2310,22 @@ mod tests {
                 .encode_to_bytes()
         );
         assert_eq!(
-            DatasetUpdateProtoSource::from(&update.dataset_updates[0])
+            update.dataset_updates[0]
+                .view()
                 .encode_proto()
                 .encode_to_bytes(),
             update.dataset_updates[0].encode_proto().encode_to_bytes()
         );
         assert_eq!(
-            UpdateMessageProtoSource::from(&update)
-                .encode_proto()
-                .encode_to_bytes(),
+            update.view().encode_proto().encode_to_bytes(),
             update.encode_proto().encode_to_bytes()
         );
         assert_eq!(
-            SummaryMessageProtoSource::from(&summary)
-                .encode_proto()
-                .encode_to_bytes(),
+            summary.view().encode_proto().encode_to_bytes(),
             summary.encode_proto().encode_to_bytes()
         );
         assert_eq!(
-            UpdateBatchMessageProtoSource::from(&batch)
-                .encode_proto()
-                .encode_to_bytes(),
+            batch.view().encode_proto().encode_to_bytes(),
             batch.encode_proto().encode_to_bytes()
         );
     }
@@ -2409,7 +2353,7 @@ mod tests {
         let owned_message = UpdateMessage::from(update.clone());
 
         assert_eq!(
-            DatasetUpdateProtoSource::from(&update.dataset_updates[0])
+            DatasetUpdateMessageView::from(&update.dataset_updates[0])
                 .encode_proto()
                 .encode_to_bytes(),
             owned_message.dataset_updates[0]

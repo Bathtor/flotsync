@@ -11,6 +11,7 @@ test-support = ["flotsync_security/test-support"]
 [dependencies]
 arc-swap = { workspace = true }
 base64 = { workspace = true }
+borrowize = { workspace = true }
 bytes = { workspace = true }
 enumset = { workspace = true }
 flotsync_core = { path = "../flotsync_core" }

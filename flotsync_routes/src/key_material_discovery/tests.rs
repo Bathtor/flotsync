@@ -4,7 +4,8 @@ use super::*;
 use crate::{
     protocol::{
         DiscoveryEndpointFrameSrc,
-        KeyBundleLookupResponsePayloadSrc,
+        KeyBundleLookupResponsePayload,
+        KeyBundleLookupResponsePayloadView,
         decode_endpoint_discovery_frame_from_buf,
     },
     route_establishment::{DiscoveryCredentialFuture, DiscoveryKeyMaterialStatusFuture},
@@ -91,7 +92,7 @@ fn signed_lookup_response(
     bundle: &PublicKeyBundle,
     signer: &LocalMemberKeys,
 ) -> discovery_proto::SignedKeyBundleLookupResponse {
-    let payload = KeyBundleLookupResponsePayloadSrc {
+    let payload = KeyBundleLookupResponsePayloadView {
         member,
         key_fingerprint: fingerprint,
         request_nonce: nonce,
@@ -693,10 +694,9 @@ fn local_lookup_request_sends_signed_response() {
         Some(discovery_frame::Body::KeyBundleLookupResponse(response)) => *response,
         other => panic!("expected lookup response, got {other:?}"),
     };
-    let decoded = DecodedKeyBundleLookupResponsePayload::try_decode_proto_from_slice(
-        &response.response_payload,
-    )
-    .expect("response payload should validate");
+    let decoded =
+        KeyBundleLookupResponsePayload::try_decode_proto_from_slice(&response.response_payload)
+            .expect("response payload should validate");
     assert_eq!(decoded.member, local_member);
     assert_eq!(decoded.request_nonce, request_nonce);
     assert_eq!(
