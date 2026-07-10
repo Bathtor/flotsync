@@ -16,7 +16,7 @@ use flotsync_messages::{
     proto::{self, DecodeProto, DecodeProtoView},
     wire::{UUID_BYTE_LENGTH, WireValueDecodeError, fixed_bytes_field},
 };
-use snafu::prelude::*;
+use snafu::{Location, prelude::*};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use uuid::Uuid;
 
@@ -177,8 +177,12 @@ impl DecodeProtoView for DecodedPeer {
 #[non_exhaustive]
 pub enum DiscoveryProtocolError {
     /// A protobuf message could not be decoded.
-    #[snafu(display("Failed to decode discovery protobuf message: {source}"))]
-    Decode { source: DecodeError },
+    #[snafu(display("Failed to decode discovery protobuf message at {location}: {source}"))]
+    Decode {
+        source: DecodeError,
+        #[snafu(implicit)]
+        location: Location,
+    },
     /// A required protobuf message field was absent.
     #[snafu(display("Protobuf message '{message}' is missing required field '{field}'."))]
     MissingField {
@@ -227,8 +231,12 @@ pub enum DiscoveryProtocolError {
 }
 
 impl proto::FromProtoDecodeError for DiscoveryProtocolError {
+    #[track_caller]
     fn from_proto_decode_error(source: DecodeError) -> Self {
-        Self::Decode { source }
+        Self::Decode {
+            source,
+            location: snafu::location!(),
+        }
     }
 }
 
@@ -358,7 +366,7 @@ mod tests {
     use super::*;
     use flotsync_messages::{
         buffa::{Message as _, MessageView as _},
-        proto::{DecodeProtoView, EncodeProto},
+        proto::{DecodeProto, DecodeProtoView, EncodeProto},
         wire::uuid_to_wire_bytes,
     };
 
@@ -395,6 +403,26 @@ mod tests {
             DiscoveryRoute::decode_proto_view(&route_view).expect("UDP route view should decode");
 
         assert_eq!(decoded, route);
+    }
+
+    #[test]
+    fn decode_error_display_includes_construction_location() {
+        let error = DecodedPeer::decode_proto_from_slice(b"\0")
+            .expect_err("invalid protobuf bytes should fail");
+        let display = error.to_string();
+
+        assert!(
+            display.contains("Failed to decode discovery protobuf message at "),
+            "display should include the decode location: {display}"
+        );
+        assert!(
+            display.contains("flotsync_discovery/src/protocol.rs"),
+            "display should include this module location: {display}"
+        );
+        assert!(
+            display.contains("invalid field number"),
+            "display should include the source decode error: {display}"
+        );
     }
 
     #[test]

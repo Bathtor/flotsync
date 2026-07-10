@@ -564,6 +564,27 @@ pub fn decode_endpoint_discovery_frame_from_buf(
     }
 }
 
+/// Classify one payload from a shared UDP endpoint as an optional discovery frame.
+///
+/// This helper is intentionally lossy at the byte-decode boundary: runtime UDP
+/// endpoints may receive unrelated datagrams, so bytes that are not even an
+/// endpoint frame are classified as irrelevant traffic. Well-formed endpoint
+/// frames with invalid discovery contents still return an error.
+///
+/// # Errors
+///
+/// Returns [`DiscoveryProtocolError`] when bytes decode as an endpoint frame but
+/// violate endpoint-discovery invariants.
+pub fn classify_shared_endpoint_discovery_frame_from_buf(
+    buf: &mut impl buffa::bytes::Buf,
+) -> Result<Option<DiscoveryFrame>, DiscoveryProtocolError> {
+    match decode_endpoint_discovery_frame_from_buf(buf) {
+        Ok(frame) => Ok(frame),
+        Err(DiscoveryProtocolError::Decode { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn discovery_endpoint_frame(discovery: DiscoveryFrame) -> EndpointFrame {
     EndpointFrame {
         boundary: Some(endpoint_frame::Boundary::Discovery(Box::new(discovery))),
@@ -723,6 +744,16 @@ mod tests {
 
         let decoded = decode_endpoint_discovery_frame(&frame.encode_to_vec())
             .expect("endpoint frame should decode");
+
+        assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn shared_endpoint_classifier_ignores_non_endpoint_bytes() {
+        let mut bytes = &b"\0"[..];
+
+        let decoded = classify_shared_endpoint_discovery_frame_from_buf(&mut bytes)
+            .expect("non-endpoint bytes should classify as irrelevant traffic");
 
         assert!(decoded.is_none());
     }

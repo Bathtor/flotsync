@@ -13,7 +13,7 @@ use crate::{
         DiscoveryEndpointFrameSrc,
         DiscoveryRoute,
         KeyBundleLookupResponsePayloadSrc,
-        decode_endpoint_discovery_frame_from_buf,
+        classify_shared_endpoint_discovery_frame_from_buf,
     },
     route_establishment::{DiscoveryCredentials, DiscoveryKeyMaterialStatus},
 };
@@ -253,7 +253,7 @@ impl KeyMaterialDiscoveryComponent {
     ) -> HandlerResult {
         let mut cursor = payload.cursor();
         let Some(discovery_frame) =
-            decode_endpoint_discovery_frame_from_buf(&mut cursor).benign_err()?
+            classify_shared_endpoint_discovery_frame_from_buf(&mut cursor).benign_err()?
         else {
             return Handled::OK;
         };

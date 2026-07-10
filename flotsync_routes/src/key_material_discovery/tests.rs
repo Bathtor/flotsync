@@ -2,12 +2,16 @@
 
 use super::*;
 use crate::{
-    protocol::{DiscoveryEndpointFrameSrc, KeyBundleLookupResponsePayloadSrc},
+    protocol::{
+        DiscoveryEndpointFrameSrc,
+        KeyBundleLookupResponsePayloadSrc,
+        decode_endpoint_discovery_frame_from_buf,
+    },
     route_establishment::{DiscoveryCredentialFuture, DiscoveryKeyMaterialStatusFuture},
     test_support::{endpoint_payload, generated_keys, member, test_egress_pool},
 };
 use flotsync_io::{
-    prelude::{SocketId, UdpCloseReason},
+    prelude::{IoPayload, SocketId, UdpCloseReason},
     test_support::{
         build_test_kompact_system_with,
         eventually,
@@ -640,6 +644,24 @@ fn responder_ignores_lookup_request_on_non_endpoint_socket() {
     harness.receive_udp(SocketId(145), remote_endpoint, payload);
 
     harness.expect_no_udp_send("traffic on another socket should be ignored");
+    harness.shutdown();
+}
+
+#[test]
+fn responder_ignores_non_endpoint_bytes_on_active_socket() {
+    let local_member = member(["alice"]);
+    let local_endpoint = loopback(49145);
+    let remote_endpoint = loopback(62193);
+    let harness = KeyMaterialDiscoveryHarness::new(local_member);
+    harness.bind_endpoint(SocketId(145), local_endpoint);
+
+    harness.receive_udp(
+        SocketId(145),
+        remote_endpoint,
+        IoPayload::from_static(b"\0"),
+    );
+
+    harness.expect_no_udp_send("non-endpoint bytes should be ignored");
     harness.shutdown();
 }
 

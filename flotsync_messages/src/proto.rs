@@ -37,6 +37,7 @@ impl<E> ProtoInputDecodeError<E> {
 /// `try_*` helpers when callers must keep those phases separate.
 pub trait FromProtoDecodeError {
     /// Build a runtime error from a generated protobuf decode failure.
+    #[track_caller]
     fn from_proto_decode_error(source: buffa::DecodeError) -> Self;
 }
 
@@ -121,12 +122,15 @@ pub trait DecodeProto: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf byte decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_from_slice(bytes: &[u8]) -> Result<Self, Self::Error>
     where
         Self::Error: FromProtoDecodeError,
     {
-        let proto =
-            Self::Proto::decode_from_slice(bytes).map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match Self::Proto::decode_from_slice(bytes) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto(proto)
     }
 
@@ -155,12 +159,16 @@ pub trait DecodeProto: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf buffer decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_from_buf<B>(buf: &mut B) -> Result<Self, Self::Error>
     where
         B: buffa::bytes::Buf,
         Self::Error: FromProtoDecodeError,
     {
-        let proto = Self::Proto::decode(buf).map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match Self::Proto::decode(buf) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto(proto)
     }
 }
@@ -212,12 +220,15 @@ pub trait DecodeProtoWith<Context>: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf byte decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_from_slice_with(bytes: &[u8], context: Context) -> Result<Self, Self::Error>
     where
         Self::Error: FromProtoDecodeError,
     {
-        let proto =
-            Self::Proto::decode_from_slice(bytes).map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match Self::Proto::decode_from_slice(bytes) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto_with(proto, context)
     }
 
@@ -251,12 +262,16 @@ pub trait DecodeProtoWith<Context>: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf buffer decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_from_buf_with<B>(buf: &mut B, context: Context) -> Result<Self, Self::Error>
     where
         B: buffa::bytes::Buf,
         Self::Error: FromProtoDecodeError,
     {
-        let proto = Self::Proto::decode(buf).map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match Self::Proto::decode(buf) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto_with(proto, context)
     }
 }
@@ -308,12 +323,15 @@ pub trait DecodeProtoView: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf view decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_view_from_slice(bytes: &[u8]) -> Result<Self, Self::Error>
     where
         Self::Error: FromProtoDecodeError,
     {
-        let proto = <Self::ProtoView<'_> as buffa::MessageView<'_>>::decode_view(bytes)
-            .map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match <Self::ProtoView<'_> as buffa::MessageView<'_>>::decode_view(bytes) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto_view(&proto)
     }
 }
@@ -369,6 +387,7 @@ pub trait DecodeProtoViewWith<Context>: Sized {
     ///
     /// Returns [`Self::Error`] when either protobuf view decoding or runtime
     /// conversion fails.
+    #[track_caller]
     fn decode_proto_view_from_slice_with(
         bytes: &[u8],
         context: Context,
@@ -376,8 +395,10 @@ pub trait DecodeProtoViewWith<Context>: Sized {
     where
         Self::Error: FromProtoDecodeError,
     {
-        let proto = <Self::ProtoView<'_> as buffa::MessageView<'_>>::decode_view(bytes)
-            .map_err(Self::Error::from_proto_decode_error)?;
+        let proto = match <Self::ProtoView<'_> as buffa::MessageView<'_>>::decode_view(bytes) {
+            Ok(proto) => proto,
+            Err(error) => return Err(Self::Error::from_proto_decode_error(error)),
+        };
         Self::decode_proto_view_with(&proto, context)
     }
 }
