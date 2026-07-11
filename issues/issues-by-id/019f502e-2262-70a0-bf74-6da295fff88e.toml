@@ -1,0 +1,45 @@
+id = "019f502e-2262-70a0-bf74-6da295fff88e"
+ref = "flotsync-git-d03"
+title = "Support dynamic groups in replicated checklist"
+body = """
+Implement the next replicated-checklist slice where checklist peers can move beyond one preconfigured static group and exercise dynamic group creation or membership changes through the replication runtime.
+
+Context:
+D01. The current replicated-checklist runner still has a static-group setup bridge derived from config.
+D02. Store-native key setup is available, but group setup and checklist startup remain coupled to a fixed configured group.
+D03. This slice should start after the migration policy API shape and temporary local-public-bundle provisioning boundary have been settled.
+
+Scope:
+S01. Define the concrete first dynamic-group checklist CUJ, likely creating or accepting a checklist group at runtime rather than pre-inserting one configured static group.
+S02. Update replicated-checklist config and runner flow so identity/trust setup is independent from group creation and group membership.
+S03. Add CLI/REPL commands or startup behaviour needed for the first dynamic group scenario.
+S04. Persist and reload the dynamically created or accepted group through the existing replication store/runtime path.
+S05. Update scenario docs and tests for the chosen dynamic-group checklist flow.
+
+Out of scope:
+O01. Full hierarchical identity trust and revocation.
+O02. Relay-assisted key lookup.
+O03. mDNS discovery unless the selected CUJ explicitly needs it.
+
+Acceptance:
+A01. A replicated-checklist scenario can create or join a non-preconfigured group using stored local identity/trust material.
+A02. Restarting a peer reloads the dynamic group from the store without requiring static ordered-members config to recreate it.
+A03. Existing static-route or custom UDP route discovery assumptions remain explicit in docs.
+A04. Tests cover the new setup boundary and at least one dynamic-group checklist happy path."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = [
+    "019f0542-b0cc-70a2-9d97-5d4d41cf3bbf",
+    "019f4076-d998-7720-94b8-6cc1bddd76aa",
+]
+created_at = "2026-07-11T07:57:08.578406Z"
+updated_at = "2026-07-11T07:57:27.113948Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5a616611082a"
+label = "recommended"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5b42c741ac8c"
+label = "recommended"
