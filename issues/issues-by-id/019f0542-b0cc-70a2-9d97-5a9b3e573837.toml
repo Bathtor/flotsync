@@ -1,9 +1,27 @@
 id = "019f0542-b0cc-70a2-9d97-5a9b3e573837"
 ref = "flotsync-uohh"
-title = "Replace test JWKS key storage with production key provisioning"
-body = "The reliable bootstrap/security refactor still uses deterministic test-support JWKS material and encrypted local-private-key records for runtime tests. Add the production provisioning path for local member private keys, trusted member public keys, and store-secret key handling so test scaffolding is no longer standing in for real key management."
-status = "open"
+title = "Use production key provisioning in setup-boundary tests"
+body = """
+Production key provisioning and store-native replicated-checklist setup are already in place, and active JWKS code/config has been removed. This task is now limited to improving test coverage at setup boundaries rather than replacing deterministic fixtures wholesale.
+
+Scope:
+S01. Keep deterministic test-security helpers for narrow unit tests, low-level store/security tests, and malformed or partial-state scenarios where the production provisioning API would hide the intended setup.
+S02. Identify runtime/integration tests where the behaviour under test includes application-side provisioning or runtime loading from provisioned records.
+S03. For those setup-boundary tests, arrange fixtures through `provision_replication_security` and caller-supplied `ReplicationSecuritySecrets` so drift between provisioning and runtime loading is caught.
+S04. Leave broader removal of `provision_test_security`, deterministic keys, or malformed-state helpers out of scope unless a specific test no longer needs them.
+
+Done when the test suite has explicit production-provisioning coverage for runtime loading/setup-boundary flows, and existing deterministic fixtures are documented or retained for true unit-test and malformed-state coverage."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "codex"
 created_at = "2026-05-17T11:04:50Z"
-updated_at = "2026-05-29T14:42:09Z"
+updated_at = "2026-07-11T07:43:47.710758Z"
+closed_at = "2026-07-11T07:43:47.710758Z"
+
+[[comments]]
+id = "019f5021-e9fe-7070-a14b-cd42a5f76f59"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-11T07:43:47.710758Z"
