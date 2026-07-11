@@ -16,7 +16,7 @@ use crate::{
             ReliableMessageEnvelope,
             ReliableMessageHeader,
         },
-        shared::{MessageId, PlaintextPayload},
+        shared::{MessageId, PlaintextPayload, ReliableMessageScope},
     },
 };
 use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
@@ -165,6 +165,9 @@ impl SummaryRequestManagerComponent {
                             sender: self.local_member.clone(),
                             recipient,
                             message_id: MessageId(Uuid::new_v4()),
+                            scope: ReliableMessageScope::Group {
+                                group_id: message.group_id(),
+                            },
                         },
                         payload: PlaintextPayload { bytes: payload },
                     },

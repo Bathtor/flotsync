@@ -1,4 +1,5 @@
 use bytes::BufMut;
+use flotsync_core::{MemberIdentity, member::IdentifierLike};
 use sha2::Digest;
 
 /// Append a length-prefixed byte slice to protocol input buffers.
@@ -15,6 +16,21 @@ where
 {
     output.put_u64(len_u64(value.len()));
     output.put_slice(value);
+}
+
+/// Append a member identity as a segment count followed by length-prefixed segments.
+///
+/// The segment count uses the same fixed-width `u64` convention as other
+/// protocol transcript lengths. It is not derived from protobuf's repeated-field
+/// representation, which does not encode an explicit count-width invariant.
+pub(crate) fn append_member_identity<B>(output: &mut B, member: &MemberIdentity)
+where
+    B: BufMut,
+{
+    output.put_u64(len_u64(member.len()));
+    for segment in member.segments() {
+        append_len_prefixed(output, segment.as_ref().as_bytes());
+    }
 }
 
 /// Hash a length-prefixed byte slice into protocol digest state.

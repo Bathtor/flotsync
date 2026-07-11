@@ -53,6 +53,20 @@ message ReliableEnvelopeHeader {
   flotsync.discovery.v1.Identifier sender = 1;
   flotsync.discovery.v1.Identifier recipient = 2;
   bytes message_id = 3;
+  // Required. Decoders reject reliable envelopes that do not declare whether
+  // the payload is a direct message or group-scoped message.
+  oneof scope {
+    ReliableDirectMessageScope direct_message = 4;
+    ReliableGroupScope group = 5;
+  }
+}
+
+// Reliable envelope scope for node-to-node direct messages.
+message ReliableDirectMessageScope {}
+
+// Reliable envelope scope for group-bound direct messages.
+message ReliableGroupScope {
+  bytes group_id = 1;
 }
 
 // Payload encrypted to one recipient with HPKE and authenticated with a

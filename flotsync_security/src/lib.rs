@@ -1,6 +1,6 @@
 //! Cryptographic building blocks for authenticated encrypted replication frames.
 
-pub use error::{Result, SecurityError};
+pub use error::{ContextMemberRole, Result, SecurityError};
 pub use fingerprint::{KEY_FINGERPRINT_LENGTH, KeyFingerprint, KeyFingerprintParseError};
 #[cfg(any(test, feature = "test-support"))]
 pub use group::test_group_key_from_id;
@@ -18,7 +18,15 @@ pub use group::{
     seal_group_message,
     seal_group_payload,
 };
-pub use hpke::{HPKE_ENCAPSULATED_KEY_LENGTH, HpkeCiphertext, hpke_open, hpke_seal};
+pub use hpke::{
+    HPKE_ENCAPSULATED_KEY_LENGTH,
+    HpkeCiphertext,
+    HpkeContext,
+    HpkeEnvelopePurpose,
+    HpkeEnvelopeScope,
+    hpke_open,
+    hpke_seal,
+};
 pub use identity::{
     ED25519_KEY_LENGTH,
     EncodedLocalPrivateKeyBundle,

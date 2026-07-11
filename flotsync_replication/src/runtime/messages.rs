@@ -233,6 +233,10 @@ impl MemberCountContext {
     }
 }
 
+/// Replication runtime payload carried by group broadcast or reliable delivery.
+///
+/// All current variants are scoped to one replication group. Non-group runtime
+/// messages should add an explicit scope API rather than reusing [`Self::group_id`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuntimeMessage {
     BootstrapGroup(Arc<BootstrapGroupMessage>),
@@ -241,6 +245,20 @@ pub(crate) enum RuntimeMessage {
     Summary(SummaryMessage),
     NeedRange(NeedRangeMessage),
     UpdateBatch(UpdateBatchMessage),
+}
+
+impl RuntimeMessage {
+    /// Return the replication group that scopes every current runtime message variant.
+    pub(crate) fn group_id(&self) -> GroupId {
+        match self {
+            Self::BootstrapGroup(message) => message.group_id(),
+            Self::Update(message) => message.group_id,
+            Self::SummaryRequest(message) => message.group_id,
+            Self::Summary(message) => message.group_id,
+            Self::NeedRange(message) => message.group_id,
+            Self::UpdateBatch(message) => message.group_id,
+        }
+    }
 }
 
 impl EncodeProto for RuntimeMessage {

@@ -18,6 +18,7 @@ use super::{
         MessageId,
         PendingRouteReason,
         PlaintextPayload,
+        ReliableMessageScope,
         RouteActiveState,
         SignedEnvelopeFooter,
         StableRouteKey,
@@ -73,6 +74,7 @@ pub struct ReliableMessageHeader {
     pub sender: MemberIdentity,
     pub recipient: MemberIdentity,
     pub message_id: MessageId,
+    pub scope: ReliableMessageScope,
 }
 
 /// HPKE-sealed and sender-signed reliable-delivery payload.
@@ -276,6 +278,7 @@ impl ReliableDeliveryComponent {
     fn new_direct_route_record(
         recipient: &MemberIdentity,
         message_id: MessageId,
+        message_scope: ReliableMessageScope,
         state: RouteActiveState,
     ) -> ActiveRouteRecord {
         ActiveRouteRecord {
@@ -283,6 +286,7 @@ impl ReliableDeliveryComponent {
                 scope: WorkScopeKey::Reliable {
                     recipient: recipient.clone(),
                     message_id,
+                    message_scope,
                 },
                 route_id: LogicalRouteId::peer(recipient.clone()),
             },
@@ -293,11 +297,13 @@ impl ReliableDeliveryComponent {
     fn new_sender_work_item(submit: ReliableDeliverySubmit) -> ReliableDeliveryWorkItem {
         let recipient = submit.envelope.header.recipient.clone();
         let message_id = submit.envelope.header.message_id;
+        let message_scope = submit.envelope.header.scope;
         ReliableDeliveryWorkItem {
             submit,
             recipient_route: Self::new_direct_route_record(
                 &recipient,
                 message_id,
+                message_scope,
                 RouteActiveState::PendingRoute {
                     retry_after: None,
                     reason: PendingRouteReason::ReachabilityUnknown,
@@ -1248,7 +1254,10 @@ mod tests {
         delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
         test_support::{load_test_delivery_security, provision_test_security},
     };
-    use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
+    use flotsync_core::{
+        GroupId,
+        membership::{GroupMemberships, SharedGroupMemberships},
+    };
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{
@@ -1752,12 +1761,67 @@ mod tests {
                     sender,
                     recipient,
                     message_id,
+                    scope: ReliableMessageScope::DirectMessage,
                 },
                 payload: PlaintextPayload {
                     bytes: Bytes::from_static(payload),
                 },
             },
         }
+    }
+
+    fn reliable_encrypted_envelope(
+        scope: ReliableMessageScope,
+    ) -> ReliableMessageEnvelope<EncryptedPayload> {
+        ReliableMessageEnvelope::<EncryptedPayload> {
+            header: ReliableMessageHeader {
+                sender: member_identity(&["alice"]),
+                recipient: member_identity(&["bob"]),
+                message_id: MessageId(Uuid::from_u128(909)),
+                scope,
+            },
+            payload: EncryptedPayload {
+                sealed: SealedHPKEPayload {
+                    encapsulated_key: [7_u8; 32],
+                    ciphertext: vec![8_u8, 9_u8],
+                    signature: [10_u8; flotsync_security::SIGNATURE_LENGTH],
+                },
+            },
+        }
+    }
+
+    fn round_trip_reliable_encrypted_envelope(
+        scope: ReliableMessageScope,
+    ) -> ReliableMessageEnvelope<EncryptedPayload> {
+        let envelope = reliable_encrypted_envelope(scope);
+        let endpoint = envelope.to_wire_format();
+        let Some(endpoint_proto::endpoint_frame::Boundary::ReliableDelivery(frame)) =
+            endpoint.boundary
+        else {
+            panic!("reliable envelope should encode as reliable delivery endpoint branch");
+        };
+        let Some(delivery_proto::reliable_delivery_frame::Body::Envelope(wire)) = frame.body else {
+            panic!("reliable envelope should encode as envelope branch");
+        };
+        reliable_envelope_from_wire(*wire).expect("reliable envelope should decode")
+    }
+
+    #[test]
+    fn reliable_envelope_wire_round_trips_direct_message_scope() {
+        let decoded = round_trip_reliable_encrypted_envelope(ReliableMessageScope::DirectMessage);
+
+        assert_eq!(decoded.header.scope, ReliableMessageScope::DirectMessage);
+    }
+
+    #[test]
+    fn reliable_envelope_wire_round_trips_group_scope() {
+        let scope = ReliableMessageScope::Group {
+            group_id: GroupId(Uuid::from_u128(910)),
+        };
+
+        let decoded = round_trip_reliable_encrypted_envelope(scope);
+
+        assert_eq!(decoded.header.scope, scope);
     }
 
     fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
@@ -1849,6 +1913,7 @@ mod tests {
                     sender: alice,
                     recipient: bob,
                     message_id,
+                    scope: ReliableMessageScope::DirectMessage,
                 },
                 payload: PlaintextPayload {
                     bytes: Bytes::from_static(b"bootstrap payload"),
@@ -2128,6 +2193,7 @@ mod tests {
                     sender: alice.clone(),
                     recipient: bob.clone(),
                     message_id,
+                    scope: ReliableMessageScope::DirectMessage,
                 },
                 payload: PlaintextPayload {
                     bytes: Bytes::from_static(b"first payload"),
@@ -2140,6 +2206,7 @@ mod tests {
                     sender: alice,
                     recipient: bob,
                     message_id,
+                    scope: ReliableMessageScope::DirectMessage,
                 },
                 payload: PlaintextPayload {
                     bytes: Bytes::from_static(b"second payload"),

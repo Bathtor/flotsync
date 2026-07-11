@@ -9,7 +9,12 @@ use flotsync_routes::{RelayIdentity, RouteSendId};
 use std::{fmt, time::SystemTime};
 use uuid::Uuid;
 
-/// Stable message identifier reused across retries.
+/// Stable globally unique delivery message identifier reused across retries.
+///
+/// Reliable delivery treats this id as the component-local identity for sender
+/// work, inbound delivery state, and retry scheduling. Callers must therefore
+/// mint a fresh value for each distinct reliable envelope, even when the
+/// sender, recipient, or scope differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct MessageId(pub Uuid);
 
@@ -45,6 +50,18 @@ impl fmt::Debug for PlaintextPayload {
             .field("len", &self.bytes.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Scope that disambiguates direct and group-bound reliable envelopes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReliableMessageScope {
+    /// Node-to-node reliable envelope without replication-group context.
+    DirectMessage,
+    /// Reliable envelope whose plaintext meaning is scoped to one replication group.
+    Group {
+        /// Replication group that scopes the envelope's plaintext meaning.
+        group_id: GroupId,
+    },
 }
 
 /// Detached signature scheme reference used in signed envelopes and control
@@ -114,6 +131,7 @@ pub enum WorkScopeKey {
     Reliable {
         recipient: MemberIdentity,
         message_id: MessageId,
+        message_scope: ReliableMessageScope,
     },
 }
 
