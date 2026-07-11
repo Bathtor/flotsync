@@ -2,23 +2,39 @@ id = "019f51bf-9095-72a0-94f6-bcbd4ca68271"
 ref = "flotsync-git-pow.1"
 title = "Define migration policy API and public types"
 body = """
-Implement the public API model for the agreed migration-policy design.
+Implement the public API model for the agreed migration-policy design. This slice is representation and public contract work only; runtime behaviour may remain unsupported until later child tasks.
 
-Scope:
-A. Add composite MigrationId { old_group_id, new_group_id }.
-B. Add MigrationProposal alongside GroupInvitation rather than replacing it.
-C. Add GroupInvitationSource for direct invitations and migration-derived invitations.
-D. Add InitialSnapshot with Empty, Inline, and Metadata variants.
-E. Add SnapshotRef and InitialSnapshotMetadata with primary/equivalent refs and optional record_count.
-F. Split invitation, migration, and group-close policy types with safe defaults.
-G. Document accepted-but-not-active lifecycle terminology in the API docs.
+Aligned API plan:
+A. Replace the old GroupMigration type with a clean MigrationId type. There is no compatibility alias. MigrationId is structurally { old_group_id, new_group_id }. old_group_id is the authority/signing scope for migration proposals and group close signals; new_group_id is the target replication group/key epoch.
+B. Add SnapshotRef { group_id, versions }. Multiple refs may identify the same logical snapshot. In migrations, old_group_id + final_versions and new_group_id + zero-vector are the important alias pair.
+C. Add InitialSnapshot with Empty, Inline(InitialGroupState), and Metadata(InitialSnapshotMetadata). Empty means the initial dataset state is empty; it does not imply that the group is newly created. Inline reuses InitialGroupState for the first implementation slice. Metadata is representational only until non-inline snapshot fetching lands.
+D. Add InitialSnapshotMetadata { primary_ref, equivalent_refs, record_count }. equivalent_refs should be SmallVec<[SnapshotRef; 1]> because zero or one equivalent ref is expected to be the common case. Do not add digest, encoded size, or table count in this slice.
+E. Reshape GroupInvitation into a true invitation event: { group_id, source, proposed_members, initial_snapshot, group_name, message }. GroupInvitationSource is Creation or Migration { migration_id }. Creation covers ordinary group invitations, including invitations into non-empty existing groups. Migration is the perspective for newly added members who join the new group but are not old-group members.
+F. Add MigrationProposal { migration_id, final_versions, proposed_members, initial_snapshot, group_name, message }. final_versions is the old-group final externally writable frontier for this migration. The initial snapshot represents state at those versions, possibly also referenced as the new group zero vector. MigrationProposal is listener-visible only for members that locally host the old group.
+G. Split listener events into GroupInvitation and MigrationProposal variants. Keep separate responder traits even if later implementation uses the same concrete responder behind different trait object casts.
+H. MigrationProposalResponder::accept takes no close-policy argument. Accepting a migration has fixed lifecycle semantics: the old group becomes externally read-only immediately; the new group is not externally active until initial_snapshot resolution completes; once the new group becomes active, the old group is completely closed for external access. Runtime internals may still read old updates or snapshots for activation, catch-up, or diagnostics.
+I. Add GroupClosePolicy with ObserveOnly, CloseLocalWrites, and CloseReadsAndWrites. It is local policy for handling close signals and external access. CloseReadsAndWrites is intentionally included because accepted migration activation needs that state.
+J. Rename migration-policy behaviour to PolicyDecision with AutoAccept, AskListener, and AutoReject.
+K. Split ReplicationConfig into trust_policy, group_invitation_policy, group_migration_policy, and group_close_policy. Defaults: creation invitations ask listener; migration-added-member invitations ask listener; epoch/device-only migration auto-accepts after validation; top-level add/remove asks listener; local-member removal asks listener.
+L. ChangeGroupMembershipRequest must not expose initial_snapshot. The runtime derives final_versions and the initial snapshot from the current internal state of group_id. It may carry group_name/message for listener display.
+M. change_group_membership returns MigrationId immediately in the public trait shape.
+N. Add RejectionReason::UnsupportedInitialSnapshot.
+O. Do not add pending_* APIs. Pending user-mediated work is represented by re-fired listener events after runtime startup in later implementation slices.
+P. Document accepted-but-not-active lifecycle in API docs. Public writes to the new group must not be based on old-group ReadToken values in this slice; cross-migration ReadToken remapping is deferred to flotsync-git-5la.
 
 Out of scope:
-H. Runtime behaviour beyond unsupported stubs.
-I. Store persistence.
-J. Chunked snapshot transfer."""
-status = "in-progress"
-status_reason = "plan agreed"
+Q. Runtime implementation beyond unsupported stubs and compile-safe public type plumbing.
+R. Store persistence.
+S. Wire protocol changes.
+T. Chunked snapshot transfer.
+
+LOC estimate for this slice:
+U. Public type reshaping and docs: 180-260 LOC.
+V. Runtime/test compile adjustments for renamed event and return types: 40-100 LOC.
+W. Focused tests/docs comments if needed: 40-120 LOC.
+X. Total expected size: 260-480 LOC, well below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
 labels = ["area:replication"]
@@ -29,4 +45,11 @@ blocks = [
 ]
 parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
 created_at = "2026-07-11T15:15:36.725178Z"
-updated_at = "2026-07-11T15:19:33.945928Z"
+updated_at = "2026-07-11T16:07:20.849872Z"
+closed_at = "2026-07-11T16:07:20.849872Z"
+
+[[comments]]
+id = "019f51ee-ee11-74b0-93ed-c25a005fba46"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-11T16:07:20.849872Z"

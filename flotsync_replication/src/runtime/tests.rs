@@ -651,7 +651,8 @@ impl ReplicationEventListener for ListenerStub {
                         })
                         .expect("listener event channel must remain open while tests are running");
                 }
-                ReplicationEvent::GroupInvitation { .. } => {}
+                ReplicationEvent::GroupInvitation { .. }
+                | ReplicationEvent::MigrationProposal { .. } => {}
             }
             Ok(())
         }

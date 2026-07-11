@@ -404,45 +404,139 @@ pub struct InitialGroupState {
     pub datasets: Vec<InitialDatasetState>,
 }
 
-/// How to handle a particular group migration change.
+/// Group/version reference for one materialised snapshot.
+///
+/// Multiple references may identify the same logical snapshot. During
+/// migration, the old group's `final_versions` and the new group's zero vector
+/// are expected to be equivalent references to the initial target-group state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotRef {
+    /// Group whose version vector names the snapshot state.
+    pub group_id: GroupId,
+    /// Version vector that identifies the materialised state in `group_id`.
+    pub versions: VersionVector,
+}
+
+/// Initial dataset state required before a joined or migrated group becomes
+/// externally active.
+#[derive(Default)]
+pub enum InitialSnapshot {
+    /// The initial dataset state is empty.
+    ///
+    /// This does not imply that the group was newly created.
+    #[default]
+    Empty,
+    /// The initial state is carried directly in the invitation or proposal.
+    Inline(InitialGroupState),
+    /// The initial state must be resolved from metadata before activation.
+    Metadata(InitialSnapshotMetadata),
+}
+
+impl fmt::Debug for InitialSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("InitialSnapshot::Empty"),
+            Self::Inline(state) => f
+                .debug_struct("InitialSnapshot::Inline")
+                .field("dataset_count", &state.datasets.len())
+                .finish(),
+            Self::Metadata(metadata) => f
+                .debug_tuple("InitialSnapshot::Metadata")
+                .field(metadata)
+                .finish(),
+        }
+    }
+}
+
+/// Metadata for an initial snapshot that is not carried inline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialSnapshotMetadata {
+    /// Primary reference the recipient should use when reasoning about this snapshot.
+    pub primary_ref: SnapshotRef,
+    /// Other group/version references that identify the same logical snapshot.
+    ///
+    /// Not required to be exhaustive.
+    pub equivalent_refs: SmallVec<[SnapshotRef; 1]>,
+    /// Optional number of row records expected in the snapshot.
+    pub record_count: Option<u64>,
+}
+
+/// Policy decision for one invitation or migration classification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum GroupMigrationPolicyBehaviour {
-    /// Accept incoming invitations automatically.
+pub enum PolicyDecision {
+    /// Accept automatically after validation succeeds.
     AutoAccept,
-    /// Forward invitations to the application listener for an explicit decision.
-    ViaListener,
-    /// Reject incoming invitations automatically.
+    /// Forward to the application listener for an explicit decision.
+    AskListener,
+    /// Reject automatically after validation succeeds.
     AutoReject,
 }
 
-/// Policy for handling membership migration invitations.
+/// Policy for handling group invitations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInvitationPolicy {
+    /// Applied to ordinary group invitations.
+    pub creation: PolicyDecision,
+    /// Applied when this member is added through a migration and receives the
+    /// new group as an invitation rather than as an old-group proposal.
+    pub migration_added_member: PolicyDecision,
+}
+
+impl Default for GroupInvitationPolicy {
+    fn default() -> Self {
+        Self {
+            creation: PolicyDecision::AskListener,
+            migration_added_member: PolicyDecision::AskListener,
+        }
+    }
+}
+
+/// Policy for handling membership migration proposals.
 ///
 /// If more than one behaviour applies to a change, the most restrictive behaviour is used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupMigrationPolicy {
     /// Applied if the migration contains only an epoch change, so that the group does not run out
     /// of change versions.
-    pub epoch_change: GroupMigrationPolicyBehaviour,
+    pub epoch_change: PolicyDecision,
     /// Applied when a new top-level member was added to the group.
-    pub member_added: GroupMigrationPolicyBehaviour,
+    pub member_added: PolicyDecision,
     /// Applied when a member added a new device to the group.
-    pub member_device_added: GroupMigrationPolicyBehaviour,
+    pub member_device_added: PolicyDecision,
     /// Applied when a top-level member is removed from the group.
-    pub member_removed: GroupMigrationPolicyBehaviour,
+    pub member_removed: PolicyDecision,
     /// Applied when a member removes one of their devices from the group.
-    pub member_device_removed: GroupMigrationPolicyBehaviour,
+    pub member_device_removed: PolicyDecision,
+    /// Applied when the local member is removed from the new group.
+    pub local_member_removed: PolicyDecision,
 }
 
 impl Default for GroupMigrationPolicy {
     fn default() -> Self {
         Self {
-            epoch_change: GroupMigrationPolicyBehaviour::AutoAccept,
-            member_added: GroupMigrationPolicyBehaviour::ViaListener,
-            member_device_added: GroupMigrationPolicyBehaviour::AutoAccept,
-            member_removed: GroupMigrationPolicyBehaviour::ViaListener,
-            member_device_removed: GroupMigrationPolicyBehaviour::AutoAccept,
+            epoch_change: PolicyDecision::AutoAccept,
+            member_added: PolicyDecision::AskListener,
+            member_device_added: PolicyDecision::AutoAccept,
+            member_removed: PolicyDecision::AskListener,
+            member_device_removed: PolicyDecision::AutoAccept,
+            local_member_removed: PolicyDecision::AskListener,
         }
     }
+}
+
+/// Local access policy after a group-close signal or migration lifecycle transition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum GroupClosePolicy {
+    /// Keep local external access unchanged and only record/observe the signal.
+    ObserveOnly,
+    /// Reject new external writes while keeping external reads available.
+    #[default]
+    CloseLocalWrites,
+    /// Reject external reads and writes.
+    ///
+    /// Runtime internals may still read stored updates or snapshots for
+    /// activation, catch-up, or diagnostics.
+    CloseReadsAndWrites,
 }
 
 /// Runtime configuration passed during `load`.
@@ -450,8 +544,12 @@ impl Default for GroupMigrationPolicy {
 pub struct ReplicationConfig {
     /// Policy used to derive runtime permissions from stored trust evidence.
     pub trust_policy: TrustPolicy,
-    /// Policy for handling group membership migration invitations.
+    /// Policy for handling group invitations.
+    pub group_invitation_policy: GroupInvitationPolicy,
+    /// Policy for handling group membership migration proposals.
     pub group_migration_policy: GroupMigrationPolicy,
+    /// Local access policy for group close signals.
+    pub group_close_policy: GroupClosePolicy,
 }
 
 /// Device-local security input required while loading one replication runtime.
@@ -578,6 +676,8 @@ pub struct ChangeGroupMembershipRequest {
     pub group_id: GroupId,
     pub add_members: Vec<MemberIdentity>,
     pub remove_members: Vec<MemberIdentity>,
+    pub group_name: Option<String>,
+    pub message: Option<String>,
 }
 
 /// Receipt returned by `publish_changes`.
@@ -587,13 +687,71 @@ pub struct PublishReceipt {
     pub read_token: ReadToken,
 }
 
-/// Invitation details surfaced when migration policy requires listener mediation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Source that explains why a group invitation was received.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GroupInvitationSource {
+    /// Ordinary group creation or invitation into an existing group.
+    Creation,
+    /// The local member is joining the new group as part of a migration.
+    Migration { migration_id: MigrationId },
+}
+
+/// Invitation details surfaced when group-invitation policy requires listener mediation.
 pub struct GroupInvitation {
-    pub migration: GroupMigration,
+    /// Group the recipient is being invited to activate.
+    pub group_id: GroupId,
+    /// Local perspective for this invitation.
+    pub source: GroupInvitationSource,
+    /// Proposed canonical member order for the invited group.
     pub proposed_members: Vec<MemberIdentity>,
+    /// Initial dataset state required before the invited group becomes active.
+    pub initial_snapshot: InitialSnapshot,
+    /// Optional display name supplied by the proposer.
     pub group_name: Option<String>,
+    /// Optional user-facing note supplied by the proposer.
     pub message: Option<String>,
+}
+
+impl fmt::Debug for GroupInvitation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupInvitation")
+            .field("group_id", &self.group_id)
+            .field("source", &self.source)
+            .field("proposed_members", &self.proposed_members)
+            .field("initial_snapshot", &self.initial_snapshot)
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
+/// Old-group member proposal surfaced when migration policy requires listener mediation.
+pub struct MigrationProposal {
+    /// Old-to-new group migration being proposed.
+    pub migration_id: MigrationId,
+    /// Old-group final externally writable version vector for this proposal.
+    pub final_versions: VersionVector,
+    /// Proposed canonical member order for the new group.
+    pub proposed_members: Vec<MemberIdentity>,
+    /// Initial dataset state required before the new group becomes active.
+    pub initial_snapshot: InitialSnapshot,
+    /// Optional display name supplied by the proposer.
+    pub group_name: Option<String>,
+    /// Optional user-facing note supplied by the proposer.
+    pub message: Option<String>,
+}
+
+impl fmt::Debug for MigrationProposal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MigrationProposal")
+            .field("migration_id", &self.migration_id)
+            .field("final_versions", &self.final_versions)
+            .field("proposed_members", &self.proposed_members)
+            .field("initial_snapshot", &self.initial_snapshot)
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 /// Listener-visible replication events.
@@ -613,16 +771,43 @@ pub enum ReplicationEvent {
         invitation: GroupInvitation,
         respond: Box<dyn GroupInvitationResponder>,
     },
+    MigrationProposal {
+        proposal: MigrationProposal,
+        respond: Box<dyn MigrationProposalResponder>,
+    },
 }
 
-/// Callback for applications to accept or reject one migration invitation.
+/// Callback for applications to accept or reject one group invitation.
 ///
 /// The callback is one-shot by construction: calling either method consumes the responder.
 pub trait GroupInvitationResponder: Send {
-    /// Join the new group and consider the old group (if any) closed.
+    /// Accept the invitation into local activation state.
+    ///
+    /// Acceptance does not necessarily make the group externally active
+    /// immediately. If the initial snapshot is not resolved yet, the runtime
+    /// resumes activation internally and exposes the group only after
+    /// activation completes.
     fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
 
-    /// Refuse to join the new group, ignore all its messages.
+    /// Refuse to join the invited group.
+    fn reject(self: Box<Self>, reason: RejectionReason)
+    -> BoxFuture<'static, Result<(), ApiError>>;
+}
+
+/// Callback for applications to accept or reject one migration proposal.
+///
+/// The callback is one-shot by construction: calling either method consumes the responder.
+pub trait MigrationProposalResponder: Send {
+    /// Accept the proposal into local migration activation state.
+    ///
+    /// Acceptance makes the old group externally read-only immediately. The
+    /// new group becomes externally active only after the initial snapshot is
+    /// resolved. Once the new group is active, the old group is closed for
+    /// external reads and writes, while remaining available to runtime internals
+    /// that still need old updates or snapshots.
+    fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
+
+    /// Refuse the proposed migration.
     fn reject(self: Box<Self>, reason: RejectionReason)
     -> BoxFuture<'static, Result<(), ApiError>>;
 }
@@ -632,6 +817,7 @@ pub trait GroupInvitationResponder: Send {
 pub enum RejectionReason {
     PolicyDenied,
     UserDenied,
+    UnsupportedInitialSnapshot,
     UnsupportedSchemaEpoch,
     IncompatibleMembership,
     Other(String),
@@ -755,11 +941,18 @@ pub trait ReplicationApi: Send + Sync {
 
     /// Request a membership migration for an existing replication group.
     ///
-    /// The intended contract is to propose adding and removing members for
-    /// `req.group_id`, persist the accepted migration, and surface any
-    /// application-mediated invitations through [`ReplicationEvent::GroupInvitation`].
-    /// Ordering and compatibility rules are governed by [`ReplicationConfig`]
-    /// and [`GroupMigrationPolicy`].
+    /// The intended contract is to derive final old-group versions from
+    /// `req.group_id`, create a new group for the requested member set,
+    /// surface application-mediated proposals through
+    /// [`ReplicationEvent::MigrationProposal`] for old-group members, and
+    /// surface migration-sourced [`ReplicationEvent::GroupInvitation`] events
+    /// for newly added members.
+    ///
+    /// The runtime derives the migration's initial snapshot from stored group
+    /// state; applications do not supply it in the request. Ordering and
+    /// compatibility rules are governed by [`ReplicationConfig`],
+    /// [`GroupInvitationPolicy`], [`GroupMigrationPolicy`], and
+    /// [`GroupClosePolicy`].
     ///
     /// Membership migration is not implemented in the current manual replication
     /// slice. Current implementations return [`ApiError::UnsupportedOperation`]
@@ -767,7 +960,7 @@ pub trait ReplicationApi: Send + Sync {
     fn change_group_membership(
         &self,
         req: ChangeGroupMembershipRequest,
-    ) -> BoxFuture<'_, Result<GroupMigration, ApiError>>;
+    ) -> BoxFuture<'_, Result<MigrationId, ApiError>>;
 }
 
 /// Current encrypted-store-secret setup for the active security-storage slice.

@@ -78,7 +78,7 @@ use crate::{
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupMemberKeys,
-        GroupMigration,
+        MigrationId,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
@@ -460,7 +460,7 @@ pub enum ReplicationRuntimeMessage {
     /// Create one new fixed-membership group through the component interface.
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     /// Request one group-membership change through the component interface.
-    ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>),
+    ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<MigrationId, ApiError>>),
     /// Test-support command channel for runtime fixture setup and assertions.
     #[cfg(any(test, feature = "test-support"))]
     Test(ReplicationRuntimeTestMessage),
@@ -2194,7 +2194,7 @@ impl ReplicationRuntimeComponent {
 
     fn handle_change_group_membership(
         &mut self,
-        ask: Ask<ChangeGroupMembershipRequest, Result<GroupMigration, ApiError>>,
+        ask: Ask<ChangeGroupMembershipRequest, Result<MigrationId, ApiError>>,
     ) -> HandlerResult {
         let (promise, req) = ask.take();
         let _ = req;

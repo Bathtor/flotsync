@@ -32,7 +32,10 @@ type = "feature"
 priority = 2
 labels = ["area:replication"]
 assignee = "Codex"
-blocks = ["019f502e-2262-70a0-bf74-6da295fff88e"]
+blocks = [
+    "019f502e-2262-70a0-bf74-6da295fff88e",
+    "019f51d6-02d0-7b60-af94-765e99b4ea03",
+]
 children = [
     "019f51bf-9095-72a0-94f6-bcbd4ca68271",
     "019f51bf-be64-7ad2-8489-de9cc110f8cb",
@@ -41,4 +44,4 @@ children = [
     "019f51c0-4c99-72f3-ab68-fc5fa752a914",
 ]
 created_at = "2026-07-11T15:15:25.731747Z"
-updated_at = "2026-07-11T15:19:23.563815Z"
+updated_at = "2026-07-11T15:40:07.760812Z"

@@ -116,9 +116,18 @@ impl std::fmt::Display for RowId {
     }
 }
 
-/// Migration represented as old/new group pair.
+/// Stable identifier for one old-to-new group migration.
+///
+/// The old group is the authority context for the proposal and any close
+/// signal. The new group is the target replication group and group-key epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct GroupMigration {
+pub struct MigrationId {
     pub old_group_id: GroupId,
     pub new_group_id: GroupId,
+}
+
+impl std::fmt::Display for MigrationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}->{}", self.old_group_id, self.new_group_id)
+    }
 }

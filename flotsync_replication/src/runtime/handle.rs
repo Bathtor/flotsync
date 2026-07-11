@@ -17,8 +17,8 @@ use crate::{
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
-        GroupMigration,
         LoadError,
+        MigrationId,
         PublishChangesRequest,
         PublishReceipt,
         ReplicationApi,
@@ -373,7 +373,7 @@ impl ReplicationApi for ReplicationRuntime {
     fn change_group_membership(
         &self,
         req: ChangeGroupMembershipRequest,
-    ) -> ApiFuture<'_, GroupMigration> {
+    ) -> ApiFuture<'_, MigrationId> {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::ChangeGroupMembership(Ask::new(promise, req))
         })
