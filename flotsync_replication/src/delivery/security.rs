@@ -20,7 +20,7 @@ use crate::{
     delivery::{
         group_broadcast::GroupMessageHeader,
         reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
-        shared::{DetachedSignature, MessageId, SignatureScheme},
+        shared::{DetachedSignature, MessageId, ReliableMessageScope, SignatureScheme},
     },
     runtime::messages::{
         BootstrapGroupMessage,
@@ -37,6 +37,7 @@ use flotsync_security::{
     FrameSignature,
     GroupKey,
     GroupMessageContext,
+    HpkeEnvelopeScope,
     KeyFingerprint,
     LocalMemberKeys,
     PublicKeyBundle,
@@ -453,6 +454,7 @@ impl DeliverySecurity {
                 frame_kind: RELIABLE_RUNTIME_MESSAGE_FRAME_KIND,
                 sender: &header.sender,
                 recipient: &header.recipient,
+                scope: header.scope.into(),
                 message_id: header.message_id.0,
             },
             plaintext,
@@ -490,6 +492,7 @@ impl DeliverySecurity {
                 frame_kind: RELIABLE_RUNTIME_MESSAGE_FRAME_KIND,
                 sender: &header.sender,
                 recipient: &header.recipient,
+                scope: header.scope.into(),
                 message_id: header.message_id.0,
             },
             sealed,
@@ -947,6 +950,15 @@ fn group_message_context(header: &GroupMessageHeader) -> GroupMessageContext<'_>
         frame_kind: GROUP_BROADCAST_RUNTIME_MESSAGE_FRAME_KIND,
         sender: &header.sender,
         message_id: header.message_id.0,
+    }
+}
+
+impl From<ReliableMessageScope> for HpkeEnvelopeScope {
+    fn from(scope: ReliableMessageScope) -> Self {
+        match scope {
+            ReliableMessageScope::DirectMessage => Self::DirectMessage,
+            ReliableMessageScope::Group { group_id } => Self::Group { group_id },
+        }
     }
 }
 

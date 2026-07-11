@@ -1,0 +1,26 @@
+id = "019f50bc-d390-7891-9223-ea81dfb126f6"
+ref = "flotsync-git-5gi"
+title = "Limit identifier length to 255 segments"
+body = """
+Priority: P0
+
+Limit identifier lengths to at most 255 segments so protocol transcripts can encode segment counts in a single byte instead of burning fixed-width u64 prefixes.
+
+Rationale:
+- protobuf repeated fields use variable-width encoding, so the current unbounded-ish shape was not painful there.
+- crypto transcripts and other canonical byte encodings need fixed-width prefixes, where large count widths add unnecessary bytes.
+- API consumers on lower-width systems should not be forced to handle very large identifier counts or identifiers.
+
+Expected scope:
+- add a central identifier segment-count invariant of <= 255.
+- use a byte-sized count in fixed-width transcript encodings where member identifiers are written.
+- update constructors/decoders/tests to reject overlong identifiers consistently."""
+status = "open"
+type = "task"
+priority = 0
+created_at = "2026-07-11T10:33:00.048326Z"
+updated_at = "2026-07-11T10:33:04.910938Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-5ac1a8d054f5"
+label = "discovered from"

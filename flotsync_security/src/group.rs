@@ -10,7 +10,7 @@ use crate::{
     sealed_psk_payload::SealedPSKPayload,
     signature::{FrameSignature, SignedFrameParts, sign_frame, verify_frame_signature},
     store_secret::{StoreSecretCiphertext, StoreSecretContext, StoreSecretKey, open_store_secret},
-    util::{append_len_prefixed, fixed_array, hash_len_prefixed, len_u64},
+    util::{append_len_prefixed, append_member_identity, fixed_array, hash_len_prefixed, len_u64},
 };
 use bytes::{BufMut, Bytes};
 use chacha20poly1305::{
@@ -345,14 +345,6 @@ fn hash_member_identity(hasher: &mut Sha256, member: &MemberIdentity) {
     hasher.update(len_u64(member.len()).to_be_bytes());
     for segment in member.segments() {
         hash_len_prefixed(hasher, segment.as_ref().as_bytes());
-    }
-}
-
-/// Append a member identity as a segment count followed by length-prefixed segments.
-fn append_member_identity(output: &mut Vec<u8>, member: &MemberIdentity) {
-    output.put_u64(len_u64(member.len()));
-    for segment in member.segments() {
-        append_len_prefixed(output, segment.as_ref().as_bytes());
     }
 }
 

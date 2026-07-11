@@ -1,13 +1,32 @@
 id = "019f0542-b0cc-70a2-9d97-5ac1a8d054f5"
 ref = "flotsync-icw"
 title = "Introduce typed HPKE context for security APIs"
-body = "Follow-up from flotsync_security review. The raw HPKE helpers currently accept opaque info/aad byte slices, which makes callers responsible for building protocol-domain separation and authenticated context exactly the same way on seal and open. Replace or wrap those arguments with a typed HPKE context owned by flotsync_security. The context should canonicalise the envelope purpose, sender and recipient member identities, group id, delivery message id, and authenticated public metadata into HPKE info/aad internally, so public callers cannot accidentally diverge."
-status = "open"
+body = """
+Follow-up from flotsync_security review. The raw HPKE helpers currently accept opaque info/aad byte slices, which makes callers responsible for building protocol-domain separation and authenticated context exactly the same way on seal and open. Replace or wrap those arguments with a typed HPKE context owned by flotsync_security.
+
+Agreed implementation plan:
+A1. Add a typed HPKE context in flotsync_security with these public shapes: HpkeEnvelopePurpose, HpkeEnvelopeScope::{ DirectMessage, Group { group_id } }, and HpkeContext carrying purpose, sender, recipient, scope, delivery message id, and authenticated public metadata.
+A2. Keep HPKE domain labels and canonical info/aad construction private to flotsync_security. Encode member identities segment-wise and encode scope explicitly so DirectMessage and Group transcripts cannot collide.
+A3. Change public hpke_seal/hpke_open to accept HpkeContext instead of raw info/aad slices. Private raw helpers are acceptable if useful, but raw-context helpers should not remain part of the public API.
+A4. Update ReliablePayloadContext to carry an HpkeEnvelopeScope and build the typed HPKE context internally. Group scope is used only for group-scoped reliable messages; node-to-node reliable messages use DirectMessage.
+A5. Update reliable-delivery proto and wire headers to model scope as a oneof matching the in-memory ReliableMessageScope::{ DirectMessage, Group { group_id } } shape.
+A6. Populate Group scope at current group-scoped runtime submission call sites, while keeping DirectMessage available for future node-to-node reliable messages.
+A7. Add focused tests covering HPKE context mismatch failures, reliable group/direct scope wire round-trips, and existing reliable payload behaviour through the typed context."""
+status = "closed"
+status_reason = "completed"
 type = "task"
-priority = 2
+priority = 1
+assignee = "codex"
 created_at = "2026-05-15T17:21:11Z"
-updated_at = "2026-05-29T14:42:10Z"
+updated_at = "2026-07-11T10:33:09.49439Z"
+closed_at = "2026-07-11T10:33:09.49439Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-55ee94817ff5"
 label = "discovered from"
+
+[[comments]]
+id = "019f50bc-f876-70a3-8303-b7dc7304aa64"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-11T10:33:09.49439Z"
