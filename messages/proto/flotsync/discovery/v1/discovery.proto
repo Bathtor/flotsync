@@ -65,7 +65,12 @@ message Introduction {
   repeated SignedIntroductionClaim claims = 3;
 }
 
-// A hierarchical identifier equivalent to "a.b.c", given as individual segments "a", "b", "c".
+// A hierarchical identifier equivalent to "a.b.c", given as individual segments
+// "a", "b", "c".
+//
+// Identifiers contain at most 255 segments. Decoders must reject messages with
+// more than 255 segments even though protobuf encodes this as an unbounded
+// repeated field.
 message Identifier {
   repeated string segments = 1;
 }

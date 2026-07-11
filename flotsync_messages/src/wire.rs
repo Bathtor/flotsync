@@ -2,7 +2,7 @@ use crate::discovery;
 use flotsync_core::{
     GroupId,
     MemberIdentity,
-    member::{IdentifierBuf, IdentifierError, IdentifierLike},
+    member::{IdentifierBuf, IdentifierError, IdentifierLike, MAX_IDENTIFIER_SEGMENTS},
 };
 use snafu::prelude::*;
 use uuid::Uuid;
@@ -23,6 +23,11 @@ pub enum WireValueDecodeError {
     #[snafu(transparent)]
     InvalidIdentifierSegment {
         source: InvalidIdentifierSegmentWireValue,
+    },
+    /// A protobuf identifier had too many segments for local protocol invariants.
+    #[snafu(transparent)]
+    InvalidIdentifierSegmentCount {
+        source: InvalidIdentifierSegmentCountWireValue,
     },
 }
 
@@ -50,6 +55,17 @@ pub struct InvalidIdentifierSegmentWireValue {
     field: &'static str,
     segment: String,
     source: IdentifierError,
+}
+
+/// Shared body for protobuf identifier segment-count validation failures.
+#[derive(Debug, Snafu)]
+#[snafu(display(
+    "Field '{field}' contains {actual} identifier segments; at most {maximum} are allowed."
+))]
+pub struct InvalidIdentifierSegmentCountWireValue {
+    field: &'static str,
+    maximum: usize,
+    actual: usize,
 }
 
 /// Encode one UUID into the canonical protobuf byte representation.
@@ -122,7 +138,8 @@ pub fn member_identity_to_wire_format(member: &MemberIdentity) -> discovery::Ide
 ///
 /// # Errors
 ///
-/// Returns [`WireValueDecodeError`] when any identifier segment is invalid.
+/// Returns [`WireValueDecodeError`] when any identifier segment is invalid or
+/// the identifier exceeds the segment-count limit.
 pub fn member_identity_from_wire_format(
     identifier: discovery::Identifier,
     field: &'static str,
@@ -134,11 +151,13 @@ pub fn member_identity_from_wire_format(
 ///
 /// # Errors
 ///
-/// Returns [`WireValueDecodeError`] when any identifier segment is invalid.
+/// Returns [`WireValueDecodeError`] when any identifier segment is invalid or
+/// the identifier exceeds the segment-count limit.
 pub fn member_identity_from_wire_view(
     identifier: &discovery::IdentifierView<'_>,
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
+    ensure_identifier_segment_count(field, identifier.segments.len())?;
     let segments = identifier
         .segments
         .iter()
@@ -151,10 +170,101 @@ fn member_identity_from_wire_segments(
     field: &'static str,
 ) -> Result<MemberIdentity, WireValueDecodeError> {
     let mut buffer = IdentifierBuf::new();
+    let mut segment_count = 0usize;
     for segment in segments {
+        segment_count += 1;
+        ensure_identifier_segment_count(field, segment_count)?;
         buffer
             .push_checked(segment.clone())
             .context(InvalidIdentifierSegmentWireValueSnafu { field, segment })?;
     }
     Ok(buffer.into_identifier())
+}
+
+fn ensure_identifier_segment_count(
+    field: &'static str,
+    actual: usize,
+) -> Result<(), WireValueDecodeError> {
+    ensure!(
+        actual <= MAX_IDENTIFIER_SEGMENTS,
+        InvalidIdentifierSegmentCountWireValueSnafu {
+            field,
+            maximum: MAX_IDENTIFIER_SEGMENTS,
+            actual,
+        }
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::*;
+
+    const OVERLONG_IDENTIFIER_SEGMENTS: usize = MAX_IDENTIFIER_SEGMENTS + 1;
+
+    fn proto_identifier(segment_count: usize) -> discovery::Identifier {
+        let segments = (0..segment_count)
+            .map(|index| format!("segment_{index}"))
+            .collect();
+        discovery::Identifier {
+            segments,
+            ..discovery::Identifier::default()
+        }
+    }
+
+    #[test]
+    fn member_identity_wire_format_accepts_maximum_segment_count() {
+        let member = member_identity_from_wire_format(
+            proto_identifier(MAX_IDENTIFIER_SEGMENTS),
+            "member_id",
+        )
+        .unwrap();
+
+        assert_eq!(member.len(), MAX_IDENTIFIER_SEGMENTS);
+        let encoded = member_identity_to_wire_format(&member);
+        assert_eq!(encoded.segments.len(), MAX_IDENTIFIER_SEGMENTS);
+    }
+
+    #[test]
+    fn member_identity_wire_format_rejects_overlong_identifier() {
+        let error = member_identity_from_wire_format(
+            proto_identifier(OVERLONG_IDENTIFIER_SEGMENTS),
+            "member_id",
+        )
+        .unwrap_err();
+
+        assert_matches!(
+            error,
+            WireValueDecodeError::InvalidIdentifierSegmentCount {
+                source: InvalidIdentifierSegmentCountWireValue {
+                    maximum: MAX_IDENTIFIER_SEGMENTS,
+                    actual: OVERLONG_IDENTIFIER_SEGMENTS,
+                    ..
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn member_identity_wire_view_rejects_overlong_identifier_before_cloning_segments() {
+        use crate::buffa::Message as _;
+
+        let identifier = proto_identifier(OVERLONG_IDENTIFIER_SEGMENTS);
+        let view = discovery::IdentifierOwnedView::decode(identifier.encode_to_bytes()).unwrap();
+
+        let error = member_identity_from_wire_view(view.view(), "member_id").unwrap_err();
+
+        assert_matches!(
+            error,
+            WireValueDecodeError::InvalidIdentifierSegmentCount {
+                source: InvalidIdentifierSegmentCountWireValue {
+                    maximum: MAX_IDENTIFIER_SEGMENTS,
+                    actual: OVERLONG_IDENTIFIER_SEGMENTS,
+                    ..
+                }
+            }
+        );
+    }
 }
