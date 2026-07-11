@@ -80,6 +80,7 @@ use crate::{
         StoreError,
         StoreExternalSnafu,
         StoreSecretCryptoVersion,
+        StoreSecretKeyId,
         SummaryRequest,
         TrustPolicy,
         current_slice_placeholder_group_security_material,
@@ -93,6 +94,7 @@ use crate::{
         },
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
+    provision_replication_security,
     security_store::{SecurityStore, SecurityStoreError},
     test_support::{
         load_test_delivery_security,
@@ -115,9 +117,11 @@ use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets}
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     KeyFingerprint,
+    PublicKeyBundle,
     PublicMemberKeys,
     StoreSecretKey,
     install_local_store_secret_test_store,
+    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_bundles_from_seed},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
@@ -719,6 +723,38 @@ fn provision_test_security<S>(
         trusted_members,
     ))
     .expect("test security should provision");
+}
+
+/// Provision local keys through the public setup API so runtime-loading tests
+/// cover the same store records normal application setup writes.
+fn provision_runtime_security_through_setup_api<S>(
+    store: &S,
+    local_member: &MemberIdentity,
+    security: &ReplicationSecuritySecrets,
+) -> PublicKeyBundle
+where
+    S: ReplicationStore,
+{
+    let seed = [37; TEST_MEMBER_KEY_SEED_LENGTH];
+    let generated = member_key_bundles_from_seed(local_member.clone(), &seed);
+    let public_bundle = PublicKeyBundle::from_bytes(&generated.public_bundle)
+        .expect("generated public bundle should decode");
+    wait_for_test_reply(provision_replication_security(
+        store,
+        local_member,
+        security,
+        generated.local_private_bundle.as_bytes(),
+        std::iter::empty(),
+    ))
+    .expect("setup API security should provision");
+    public_bundle
+}
+
+fn setup_api_test_security_secrets() -> ReplicationSecuritySecrets {
+    ReplicationSecuritySecrets::from_unmanaged_store_secret(
+        StoreSecretKeyId::from_bytes(*b"setup-api-test!!"),
+        StoreSecretKey::from_bytes([91; 32]),
+    )
 }
 
 fn load_test_runtime_security<S>(store: Arc<S>, local_member: &MemberIdentity) -> DeliverySecurity
@@ -1327,19 +1363,25 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let application_id = app_probe_id();
     let store = sqlite_store(alice_member());
-    provision_test_security(store.as_ref(), &alice_member(), []);
+    let security = setup_api_test_security_secrets();
+    let expected_public_bundle =
+        provision_runtime_security_through_setup_api(store.as_ref(), &alice_member(), &security);
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
 
-    let _loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
+    let loaded_runtime = wait_for_test_reply(load_replication_runtime_with_runtime_config_toml(
         application_id,
         store,
         listener,
         ReplicationConfig::default(),
-        test_replication_security_secrets(),
+        security,
         &runtime_config_toml,
     ))
     .expect("public runtime loading should accept provisioned security");
+    let loaded_public_bundle = wait_for_test_reply(loaded_runtime.local_public_key_bundle())
+        .expect("runtime should expose setup-provisioned public keys");
+
+    assert_eq!(loaded_public_bundle, expected_public_bundle);
 }
 
 #[test]
