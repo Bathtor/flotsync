@@ -1,7 +1,9 @@
 use crate::{group::GroupCipherSuite, identity::KeyRole};
+use flotsync_core::MemberIdentity;
 use flotsync_messages::security as security_proto;
 use rand_core::OsError;
 use snafu::prelude::*;
+use std::fmt;
 
 /// Result type used by security crate operations.
 pub type Result<T> = std::result::Result<T, SecurityError>;
@@ -87,4 +89,30 @@ pub enum SecurityError {
     HpkeSeal { source: hpke::HpkeError },
     #[snafu(display("HPKE opening failed: {source}"))]
     HpkeOpen { source: hpke::HpkeError },
+    #[snafu(display(
+        "Context {member_role} member {context_member} does not match supplied key member {key_member}."
+    ))]
+    ContextMemberMismatch {
+        member_role: ContextMemberRole,
+        context_member: MemberIdentity,
+        key_member: MemberIdentity,
+    },
+}
+
+/// Member role whose typed context identity must match the supplied key material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextMemberRole {
+    /// Sender identity used for signing or signature verification.
+    Sender,
+    /// Recipient identity used for HPKE sealing or opening.
+    Recipient,
+}
+
+impl fmt::Display for ContextMemberRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Sender => write!(f, "sender"),
+            Self::Recipient => write!(f, "recipient"),
+        }
+    }
 }

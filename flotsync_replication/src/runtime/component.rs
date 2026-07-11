@@ -129,7 +129,7 @@ use crate::{
             ReliableMessageHeader,
         },
         security::DeliverySecurity,
-        shared::{DeliveryClass, MessageId, PlaintextPayload},
+        shared::{DeliveryClass, MessageId, PlaintextPayload, ReliableMessageScope},
     },
 };
 use flotsync_core::{
@@ -1052,6 +1052,9 @@ impl ReplicationRuntimeComponent {
                             sender: self.local_member.clone(),
                             recipient,
                             message_id: MessageId(Uuid::new_v4()),
+                            scope: ReliableMessageScope::Group {
+                                group_id: message.group_id(),
+                            },
                         },
                         payload: PlaintextPayload { bytes: payload },
                     },

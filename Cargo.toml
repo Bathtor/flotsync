@@ -20,7 +20,7 @@ arc-swap = "1"
 async-std = "1"
 base64 = "0.22"
 bitflags = "2"
-borrowize = "0.2.0"
+borrowize = "0.3"
 bytes = "1"
 chrono = "0.4"
 enumset = "1"
@@ -32,4 +32,4 @@ ordered-float = { version = "5.0", default-features = false }
 uuid = "1"
 kompact = "0.12"
 log = "0.4"
-sqlx = { version = "0.9.0-alpha.1", default-features = false, features = ["sqlite", "runtime-async-std"] }
+sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-async-std"] }
