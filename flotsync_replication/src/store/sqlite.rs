@@ -2171,10 +2171,11 @@ mod tests {
         },
         test_support::test_public_member_keys,
     };
-    use flotsync_core::member::Identifier;
+    use flotsync_core::member::{Identifier, MAX_IDENTIFIER_SEGMENTS};
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
-    use std::{collections::HashSet, time::Duration};
+    use itertools::Itertools;
+    use std::{assert_matches, collections::HashSet, time::Duration};
 
     const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2219,6 +2220,30 @@ mod tests {
 
     fn remote_member() -> MemberIdentity {
         Identifier::from_array(["app", "bob"])
+    }
+
+    #[test]
+    fn stored_member_identity_rejects_overlong_identifier() {
+        let raw = std::iter::repeat_n("s", MAX_IDENTIFIER_SEGMENTS + 1).join(".");
+
+        let error = decode_member_identity(&raw).unwrap_err();
+
+        assert_matches!(error, StoreError::StoreExternal { .. });
+        let StoreError::StoreExternal { source } = error;
+        let sqlite_error = source
+            .downcast_ref::<SqliteStoreError>()
+            .expect("store external error should preserve sqlite store error");
+
+        assert_matches!(
+            sqlite_error,
+            SqliteStoreError::InvalidMemberIdentity {
+                source: IdentifierParseError::ParseTooManySegmentsError {
+                    actual,
+                    ..
+                },
+                ..
+            } if *actual == MAX_IDENTIFIER_SEGMENTS + 1
+        );
     }
 
     fn title_schema() -> Arc<Schema> {

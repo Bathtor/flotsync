@@ -20,14 +20,14 @@ where
 
 /// Append a member identity as a segment count followed by length-prefixed segments.
 ///
-/// The segment count uses the same fixed-width `u64` convention as other
-/// protocol transcript lengths. It is not derived from protobuf's repeated-field
+/// The segment count is a single byte because identifiers are centrally limited
+/// to at most 255 segments. It is not derived from protobuf's repeated-field
 /// representation, which does not encode an explicit count-width invariant.
 pub(crate) fn append_member_identity<B>(output: &mut B, member: &MemberIdentity)
 where
     B: BufMut,
 {
-    output.put_u64(len_u64(member.len()));
+    output.put_u8(member.segment_count_u8());
     for segment in member.segments() {
         append_len_prefixed(output, segment.as_ref().as_bytes());
     }
@@ -70,4 +70,26 @@ pub(crate) fn fixed_array<const N: usize>(bytes: &[u8]) -> [u8; N] {
     bytes
         .try_into()
         .expect("source slice length is fixed by the caller")
+}
+
+#[cfg(test)]
+mod tests {
+    use flotsync_core::MemberIdentity;
+
+    use super::*;
+
+    #[test]
+    fn append_member_identity_uses_single_byte_segment_count() {
+        let member = MemberIdentity::from_array(["a", "bb"]);
+        let mut output = Vec::new();
+
+        append_member_identity(&mut output, &member);
+
+        assert_eq!(output[0], 2);
+        assert_eq!(&output[1..9], &1_u64.to_be_bytes());
+        assert_eq!(output[9], b'a');
+        assert_eq!(&output[10..18], &2_u64.to_be_bytes());
+        assert_eq!(&output[18..20], b"bb");
+        assert_eq!(output.len(), 20);
+    }
 }

@@ -14,13 +14,32 @@ Rationale:
 Expected scope:
 - add a central identifier segment-count invariant of <= 255.
 - use a byte-sized count in fixed-width transcript encodings where member identifiers are written.
-- update constructors/decoders/tests to reject overlong identifiers consistently."""
-status = "open"
+- update constructors/decoders/tests to reject overlong identifiers consistently.
+
+Agreed implementation plan:
+1. Add a central max segment constant in flotsync_core::member and enforce it across Identifier/IdentifierBuf constructors, parsing, UUID segment parsing, and mutable buffer extension. Keep usize in memory where convenient.
+2. Document the 255-segment limit on the discovery protobuf Identifier message even though protobuf still represents segments as a repeated string field.
+3. Ensure remote protobuf decoding through flotsync_messages::wire rejects overlong member identifiers and carries an explicit wire decode error.
+4. Ensure storage/user boundaries inherit the central parser/constructor checks: SQLite text decode, checklist config, static peer route config, and clap MemberIdentity parsing.
+5. Change fixed-width security transcripts that encode member identity segment counts from u64 to u8, including both buffer append and group nonce hashing paths.
+6. Add focused tests for accepted boundary length, rejected overlong construction/parsing/wire decode, protobuf documentation-adjacent conversion behaviour, and transcript count width changes.
+
+Estimated implementation size: about 180-320 LOC, primarily tests and error plumbing; comfortably under 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 created_at = "2026-07-11T10:33:00.048326Z"
-updated_at = "2026-07-11T10:33:04.910938Z"
+updated_at = "2026-07-11T12:47:06.195983Z"
+closed_at = "2026-07-11T12:47:06.195983Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5ac1a8d054f5"
 label = "discovered from"
+
+[[comments]]
+id = "019f5137-99d4-7242-bc2d-62ab5044d270"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-11T12:47:06.195983Z"

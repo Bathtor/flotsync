@@ -280,6 +280,8 @@ fn read_string(config: &Config, key: &'static str) -> Result<String, ChecklistCo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flotsync_core::member::MAX_IDENTIFIER_SEGMENTS;
+    use itertools::Itertools;
 
     #[test]
     fn parses_checklist_app_config_from_single_toml() {
@@ -383,6 +385,25 @@ mod tests {
         assert!(matches!(
             result,
             Err(ChecklistConfigError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_overlong_member_identifier_in_config() {
+        let member = std::iter::repeat_n("s", MAX_IDENTIFIER_SEGMENTS + 1).join(".");
+        let config = parse_config_str(&format!(
+            r#"
+            [flotsync.examples.replicated-checklist]
+            local-member = "{member}"
+            "#
+        ))
+        .expect("config should parse");
+
+        let result = read_member(&config, LOCAL_MEMBER_KEY);
+
+        assert!(matches!(
+            result,
+            Err(ChecklistConfigError::InvalidConfig { key, .. }) if key == LOCAL_MEMBER_KEY
         ));
     }
 

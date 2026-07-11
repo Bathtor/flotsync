@@ -635,6 +635,11 @@ pub(crate) enum WireValueDecodeError {
         source: message_wire::InvalidIdentifierSegmentWireValue,
     },
 
+    #[snafu(transparent)]
+    InvalidIdentifierSegmentCount {
+        source: message_wire::InvalidIdentifierSegmentCountWireValue,
+    },
+
     #[snafu(display("Field '{field}' used an unknown signature scheme value {value}"))]
     UnknownSignatureScheme { field: &'static str, value: i32 },
 
@@ -663,6 +668,9 @@ impl From<message_wire::WireValueDecodeError> for WireValueDecodeError {
             }
             message_wire::WireValueDecodeError::InvalidIdentifierSegment { source } => {
                 Self::InvalidIdentifierSegment { source }
+            }
+            message_wire::WireValueDecodeError::InvalidIdentifierSegmentCount { source } => {
+                Self::InvalidIdentifierSegmentCount { source }
             }
         }
     }

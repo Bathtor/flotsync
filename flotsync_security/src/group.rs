@@ -10,7 +10,7 @@ use crate::{
     sealed_psk_payload::SealedPSKPayload,
     signature::{FrameSignature, SignedFrameParts, sign_frame, verify_frame_signature},
     store_secret::{StoreSecretCiphertext, StoreSecretContext, StoreSecretKey, open_store_secret},
-    util::{append_len_prefixed, append_member_identity, fixed_array, hash_len_prefixed, len_u64},
+    util::{append_len_prefixed, append_member_identity, fixed_array, hash_len_prefixed},
 };
 use bytes::{BufMut, Bytes};
 use chacha20poly1305::{
@@ -342,7 +342,7 @@ fn group_aad(context: GroupMessageContext<'_>, public_header: &[u8]) -> Vec<u8> 
 
 /// Hash a member identity as a segment count followed by length-prefixed segments.
 fn hash_member_identity(hasher: &mut Sha256, member: &MemberIdentity) {
-    hasher.update(len_u64(member.len()).to_be_bytes());
+    hasher.update([member.segment_count_u8()]);
     for segment in member.segments() {
         hash_len_prefixed(hasher, segment.as_ref().as_bytes());
     }

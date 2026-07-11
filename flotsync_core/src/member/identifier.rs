@@ -1,5 +1,5 @@
 use crate::{
-    errors::{Errors, ErrorsExt},
+    errors::{Errors, ErrorsExt, ErrorsResultExt},
     uuid_encodings::{UuidEncoding, UuidEncodingError, UuidEncodingExt},
 };
 use flotsync_utils::IString;
@@ -14,6 +14,12 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Maximum number of segments in one hierarchical [`Identifier`].
+///
+/// The limit keeps protocol and storage boundaries able to represent segment
+/// counts in one byte while leaving in-memory APIs free to expose `usize`.
+pub const MAX_IDENTIFIER_SEGMENTS: usize = u8::MAX as usize;
+
 /// One segment of a hierarchical [[Identifier]].
 pub type IdentifierSegment = IString;
 
@@ -23,6 +29,8 @@ pub trait IdentifierLike: fmt::Debug + fmt::Display {
     fn segments(&self) -> impl Iterator<Item = &IdentifierSegment>;
 
     /// The number of segments in `self`.
+    ///
+    /// Valid identifiers never exceed [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     fn len(&self) -> usize;
 
@@ -45,6 +53,10 @@ pub trait IdentifierLike: fmt::Debug + fmt::Display {
 pub enum IdentifierError {
     #[snafu(display("The segment '{segment}' contained an illegal character."))]
     IllegalCharactersError { segment: String },
+    #[snafu(display(
+        "The identifier contains {actual} segments, but at most {MAX_IDENTIFIER_SEGMENTS} are allowed."
+    ))]
+    TooManySegmentsError { actual: usize },
 }
 
 #[derive(Debug, Snafu)]
@@ -71,12 +83,20 @@ pub enum IdentifierUuidDecodeError {
     },
     #[snafu(display("The identifier text '{input}' contains an empty segment."))]
     EmptySegmentError { input: String },
+    #[snafu(display(
+        "The identifier text '{input}' contains {actual} segments, but at most {MAX_IDENTIFIER_SEGMENTS} are allowed."
+    ))]
+    UuidTooManySegmentsError { input: String, actual: usize },
 }
 
 #[derive(Debug, Snafu)]
 pub enum IdentifierParseError {
     #[snafu(display("The identifier text '{input}' contains an empty segment."))]
     ParseEmptySegmentError { input: String },
+    #[snafu(display(
+        "The identifier text '{input}' contains {actual} segments, but at most {MAX_IDENTIFIER_SEGMENTS} are allowed."
+    ))]
+    ParseTooManySegmentsError { input: String, actual: usize },
     #[snafu(display(
         "The identifier text '{input}' contains invalid segment '{segment}': {source}"
     ))]
@@ -98,8 +118,19 @@ impl Identifier {
         self.segments.into_iter()
     }
 
+    /// Return this identifier's segment count in the protocol boundary width.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the central segment-count invariant was bypassed.
+    #[must_use]
+    pub fn segment_count_u8(&self) -> u8 {
+        u8::try_from(self.len()).expect("identifier segment count must fit into u8")
+    }
+
     #[must_use]
     pub(crate) fn from_segments_unchecked(segments: Box<[IdentifierSegment]>) -> Self {
+        debug_assert_valid_segment_count(segments.len());
         Self { segments }
     }
 
@@ -107,7 +138,8 @@ impl Identifier {
     ///
     /// # Errors
     ///
-    /// Otherwise the errors indicate all the segments with illegal characters.
+    /// Otherwise the errors indicate all illegal segments and whether the
+    /// identifier exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     /// See `Errors<IdentifierError>` for failure conditions.
     pub fn try_from_array<I, const N: usize>(
         segments: [I; N],
@@ -116,9 +148,7 @@ impl Identifier {
         I: Into<IdentifierSegment>,
     {
         let id_segments = Box::new(segments.map(Into::into));
-        id_segments
-            .iter()
-            .ensure_for_all(check_that_contains_only_legal_chars)?;
+        check_identifier_segments(&id_segments[..])?;
         Ok(Self {
             segments: id_segments,
         })
@@ -128,12 +158,14 @@ impl Identifier {
     ///
     /// # Panics
     ///
-    /// Panics if it encounters illegal characters in any segment.
+    /// Panics if it encounters illegal characters in any segment or if `N`
+    /// exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_array<I, const N: usize>(segments: [I; N]) -> Self
     where
         I: Into<IdentifierSegment>,
     {
+        assert_valid_segment_count(N);
         let id_segments = segments.map(|i| {
             let s = i.into();
             assert!(
@@ -149,18 +181,27 @@ impl Identifier {
 
     /// An identifier with the given `segments` as components.
     ///
-    /// Uses the string representation of the [[Uuid]], which is always legal, so this never panics.
+    /// Uses the string representation of the [[Uuid]], which is always legal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_uuid_array<const N: usize>(segments: [Uuid; N]) -> Self {
         Self::from_uuid_array_with_encoding(segments, UuidEncoding::Hyphenated)
     }
 
     /// An identifier with the given `segments` as components encoded using `encoding`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_uuid_array_with_encoding<const N: usize>(
         segments: [Uuid; N],
         encoding: UuidEncoding,
     ) -> Self {
+        assert_valid_segment_count(N);
         let id_segments = segments.map(|u| encode_uuid_segment(u, encoding));
         Self {
             segments: Box::new(id_segments),
@@ -172,7 +213,8 @@ impl Identifier {
     ///
     /// # Errors
     ///
-    /// See `IdentifierUuidDecodeError` for failure conditions.
+    /// See `IdentifierUuidDecodeError` for failure conditions, including
+    /// overlong identifiers.
     pub fn decode_uuid_segments(&self) -> Result<Box<[Uuid]>, IdentifierUuidDecodeError> {
         decode_uuid_segments(self.segments().map(AsRef::as_ref))
     }
@@ -181,7 +223,8 @@ impl Identifier {
     ///
     /// # Errors
     ///
-    /// See `IdentifierUuidDecodeError` for failure conditions.
+    /// See `IdentifierUuidDecodeError` for failure conditions, including
+    /// overlong identifiers.
     pub fn decode_uuid_segments_with_encoding(
         &self,
         encoding: UuidEncoding,
@@ -292,6 +335,7 @@ impl<'a> IdentifierRef<'a> {
     /// Materialise this borrowed view as an owned identifier.
     #[must_use]
     pub fn to_owned(&self) -> Identifier {
+        debug_assert_valid_segment_count(self.segments.len());
         let segments = self.segments.iter().copied().cloned().collect_vec();
         Identifier::from_segments_unchecked(segments.into_boxed_slice())
     }
@@ -352,6 +396,7 @@ impl IdentifierBuf {
 
     #[must_use]
     pub fn into_identifier(self) -> Identifier {
+        debug_assert_valid_segment_count(self.segments.len());
         Identifier::from_segments_unchecked(self.segments.into_boxed_slice())
     }
 
@@ -368,7 +413,8 @@ impl IdentifierBuf {
     ///
     /// # Errors
     ///
-    /// Otherwise the errors indicate all the segments with illegal characters.
+    /// Otherwise the errors indicate all illegal segments and whether the
+    /// identifier exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     /// See `Errors<IdentifierError>` for failure conditions.
     pub fn try_from_array<I, const N: usize>(
         segments: [I; N],
@@ -377,9 +423,7 @@ impl IdentifierBuf {
         I: Into<IdentifierSegment>,
     {
         let id_segments = segments.into_iter().map(Into::into).collect_vec();
-        id_segments
-            .iter()
-            .ensure_for_all(check_that_contains_only_legal_chars)?;
+        check_identifier_segments(&id_segments)?;
         Ok(Self {
             segments: id_segments,
         })
@@ -389,12 +433,14 @@ impl IdentifierBuf {
     ///
     /// # Panics
     ///
-    /// Panics if it encounters illegal characters in any segment.
+    /// Panics if it encounters illegal characters in any segment or if `N`
+    /// exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_array<I, const N: usize>(segments: [I; N]) -> Self
     where
         I: Into<IdentifierSegment>,
     {
+        assert_valid_segment_count(N);
         let id_segments = segments
             .into_iter()
             .map(|i| {
@@ -413,19 +459,27 @@ impl IdentifierBuf {
 
     /// An identifier buffer with the given `segments` as components.
     ///
-    /// Uses the string representation of the [[Uuid]], which is always legal, so this never
-    /// panics.
+    /// Uses the string representation of the [[Uuid]], which is always legal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_uuid_array<const N: usize>(segments: [Uuid; N]) -> Self {
         Self::from_uuid_array_with_encoding(segments, UuidEncoding::Hyphenated)
     }
 
     /// An identifier buffer with the given `segments` as components encoded using `encoding`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` exceeds [`MAX_IDENTIFIER_SEGMENTS`].
     #[must_use]
     pub fn from_uuid_array_with_encoding<const N: usize>(
         segments: [Uuid; N],
         encoding: UuidEncoding,
     ) -> Self {
+        assert_valid_segment_count(N);
         let id_segments = segments
             .into_iter()
             .map(|u| encode_uuid_segment(u, encoding))
@@ -439,11 +493,13 @@ impl IdentifierBuf {
     ///
     /// # Panics
     ///
-    /// Panics if `segment` contains illegal characters.
+    /// Panics if `segment` contains illegal characters or if adding it would
+    /// exceed [`MAX_IDENTIFIER_SEGMENTS`].
     pub fn push<I>(&mut self, segment: I)
     where
         I: Into<IdentifierSegment>,
     {
+        assert_can_push_segment(self.segments.len());
         let s = segment.into();
         assert!(
             contains_only_legal_chars(s.as_ref()),
@@ -457,12 +513,12 @@ impl IdentifierBuf {
     ///
     /// # Errors
     ///
-    /// Otherwise returns the input in the error.
     /// See `IdentifierError` for failure conditions.
     pub fn push_checked<I>(&mut self, segment: I) -> Result<(), IdentifierError>
     where
         I: Into<IdentifierSegment>,
     {
+        ensure_can_push_segment(self.segments.len())?;
         let s = segment.into();
         check_that_contains_only_legal_chars(s.as_ref())?;
         self.segments.push(s);
@@ -470,12 +526,21 @@ impl IdentifierBuf {
     }
 
     /// Extend this identifier buffer by adding a new segment to the end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if adding the segment would exceed [`MAX_IDENTIFIER_SEGMENTS`].
     pub fn push_uuid(&mut self, segment: Uuid) {
         self.push_uuid_with_encoding(segment, UuidEncoding::Hyphenated);
     }
 
     /// Extend this identifier buffer by adding a new UUID segment using `encoding`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if adding the segment would exceed [`MAX_IDENTIFIER_SEGMENTS`].
     pub fn push_uuid_with_encoding(&mut self, segment: Uuid, encoding: UuidEncoding) {
+        assert_can_push_segment(self.segments.len());
         self.segments.push(encode_uuid_segment(segment, encoding));
     }
 }
@@ -491,15 +556,19 @@ where
     I: Into<IdentifierSegment>,
 {
     fn extend<T: IntoIterator<Item = I>>(&mut self, iter: T) {
-        let id_segments = iter.into_iter().map(|i| {
+        let mut next_segment_count = self.segments.len();
+        for i in iter {
+            next_segment_count = next_segment_count
+                .checked_add(1)
+                .expect("identifier segment count overflowed usize");
+            assert_valid_segment_count(next_segment_count);
             let s = i.into();
             assert!(
                 contains_only_legal_chars(s.as_ref()),
                 "'{s}' contains illegal characters for an identifier segment"
             );
-            s
-        });
-        self.segments.extend(id_segments);
+            self.segments.push(s);
+        }
     }
 }
 
@@ -527,8 +596,17 @@ impl FromStr for IdentifierBuf {
             return Ok(Self::EMPTY);
         }
 
+        let segments = input.split(SEGMENT_SEPARATOR).collect_vec();
+        if segments.len() > MAX_IDENTIFIER_SEGMENTS {
+            return ParseTooManySegmentsSnafu {
+                input: input.to_owned(),
+                actual: segments.len(),
+            }
+            .fail();
+        }
+
         let mut buffer = IdentifierBuf::new();
-        for segment in input.split(SEGMENT_SEPARATOR) {
+        for segment in segments {
             if segment.is_empty() {
                 return ParseEmptySegmentSnafu {
                     input: input.to_owned(),
@@ -684,6 +762,13 @@ fn split_identifier_text(input: &str) -> Result<Vec<&str>, IdentifierUuidDecodeE
     }
 
     let segments: Vec<_> = input.split(SEGMENT_SEPARATOR).collect();
+    if segments.len() > MAX_IDENTIFIER_SEGMENTS {
+        return UuidTooManySegmentsSnafu {
+            input: input.to_owned(),
+            actual: segments.len(),
+        }
+        .fail();
+    }
     if segments.iter().any(|segment| segment.is_empty()) {
         return EmptySegmentSnafu {
             input: input.to_owned(),
@@ -713,6 +798,57 @@ where
     }
 }
 
+/// Validate segment contents together with the central segment-count invariant.
+fn check_identifier_segments(
+    segments: &[IdentifierSegment],
+) -> Result<(), Errors<IdentifierError>> {
+    let mut validation = segments
+        .iter()
+        .ensure_for_all(check_that_contains_only_legal_chars);
+    if segments.len() > MAX_IDENTIFIER_SEGMENTS {
+        validation.push_err(too_many_segments_error(segments.len()));
+    }
+    validation
+}
+
+/// Return an error if adding one more segment would exceed the identifier limit.
+fn ensure_can_push_segment(current_len: usize) -> Result<(), IdentifierError> {
+    if current_len < MAX_IDENTIFIER_SEGMENTS {
+        Ok(())
+    } else {
+        TooManySegmentsSnafu {
+            actual: current_len + 1,
+        }
+        .fail()
+    }
+}
+
+/// Panic if adding one more segment would exceed the identifier limit.
+fn assert_can_push_segment(current_len: usize) {
+    assert_valid_segment_count(current_len + 1);
+}
+
+/// Panic if an identifier segment count is outside the supported protocol range.
+fn assert_valid_segment_count(segment_count: usize) {
+    assert!(
+        segment_count <= MAX_IDENTIFIER_SEGMENTS,
+        "identifier contains {segment_count} segments, but at most {MAX_IDENTIFIER_SEGMENTS} are allowed"
+    );
+}
+
+/// Debug-only assertion for constructors that rely on an already-checked caller invariant.
+fn debug_assert_valid_segment_count(segment_count: usize) {
+    debug_assert!(
+        segment_count <= MAX_IDENTIFIER_SEGMENTS,
+        "identifier contains {segment_count} segments, but at most {MAX_IDENTIFIER_SEGMENTS} are allowed"
+    );
+}
+
+/// Build the shared segment-count validation error.
+fn too_many_segments_error(actual: usize) -> IdentifierError {
+    IdentifierError::TooManySegmentsError { actual }
+}
+
 fn contains_only_legal_chars<S>(s: S) -> bool
 where
     S: AsRef<str>,
@@ -722,11 +858,28 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::assert_matches;
+    use std::{assert_matches, str::FromStr};
 
     use super::*;
+    use itertools::Itertools;
     use proptest::prelude::*;
     use uuid::Uuid;
+
+    const OVERLONG_IDENTIFIER_SEGMENTS: usize = MAX_IDENTIFIER_SEGMENTS + 1;
+
+    fn repeated_identifier_text(segment: &str, segment_count: usize) -> String {
+        std::iter::repeat_n(segment, segment_count).join(".")
+    }
+
+    fn only_identifier_error(errors: Errors<IdentifierError>) -> IdentifierError {
+        match errors {
+            Errors::Single(error) => error,
+            Errors::Multiple { mut errors } => {
+                assert_eq!(errors.len(), 1);
+                errors.remove(0)
+            }
+        }
+    }
 
     #[test]
     fn segments() {
@@ -813,6 +966,82 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn identifiers_accept_maximum_segment_count() {
+        let identifier = Identifier::try_from_array(["s"; MAX_IDENTIFIER_SEGMENTS]).unwrap();
+        assert_eq!(identifier.len(), MAX_IDENTIFIER_SEGMENTS);
+        assert_eq!(identifier.segment_count_u8(), u8::MAX);
+
+        let identifier = Identifier::from_array(["s"; MAX_IDENTIFIER_SEGMENTS]);
+        assert_eq!(identifier.len(), MAX_IDENTIFIER_SEGMENTS);
+
+        let buffer = IdentifierBuf::try_from_array(["s"; MAX_IDENTIFIER_SEGMENTS]).unwrap();
+        assert_eq!(buffer.segments_iter().count(), MAX_IDENTIFIER_SEGMENTS);
+    }
+
+    #[test]
+    fn identifiers_reject_more_than_maximum_segments() {
+        let error = only_identifier_error(
+            Identifier::try_from_array(["s"; OVERLONG_IDENTIFIER_SEGMENTS]).unwrap_err(),
+        );
+        assert_matches!(
+            error,
+            IdentifierError::TooManySegmentsError {
+                actual: OVERLONG_IDENTIFIER_SEGMENTS,
+            }
+        );
+
+        let error = only_identifier_error(
+            IdentifierBuf::try_from_array(["s"; OVERLONG_IDENTIFIER_SEGMENTS]).unwrap_err(),
+        );
+        assert_matches!(
+            error,
+            IdentifierError::TooManySegmentsError {
+                actual: OVERLONG_IDENTIFIER_SEGMENTS,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 255")]
+    fn infallible_array_constructor_panics_for_overlong_identifier() {
+        let _ = Identifier::from_array(["s"; OVERLONG_IDENTIFIER_SEGMENTS]);
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 255")]
+    fn infallible_uuid_array_constructor_panics_for_overlong_identifier() {
+        let _ = Identifier::from_uuid_array([Uuid::nil(); OVERLONG_IDENTIFIER_SEGMENTS]);
+    }
+
+    #[test]
+    fn push_checked_rejects_overlong_identifier() {
+        let mut identifier = IdentifierBuf::new();
+        for _ in 0..MAX_IDENTIFIER_SEGMENTS {
+            identifier.push_checked("s").unwrap();
+        }
+
+        assert_matches!(
+            identifier.push_checked("s"),
+            Err(IdentifierError::TooManySegmentsError {
+                actual: OVERLONG_IDENTIFIER_SEGMENTS,
+            })
+        );
+    }
+
+    #[test]
+    fn from_str_rejects_overlong_identifier_text() {
+        let input = repeated_identifier_text("s", OVERLONG_IDENTIFIER_SEGMENTS);
+
+        assert_matches!(
+            Identifier::from_str(&input),
+            Err(IdentifierParseError::ParseTooManySegmentsError {
+                actual: OVERLONG_IDENTIFIER_SEGMENTS,
+                ..
+            })
+        );
     }
 
     #[test]
@@ -941,6 +1170,20 @@ mod tests {
         assert_matches!(
             Identifier::parse_uuid_segments("abc..def"),
             Err(IdentifierUuidDecodeError::EmptySegmentError { .. })
+        );
+    }
+
+    #[test]
+    fn parse_uuid_segments_rejects_overlong_identifier_text() {
+        let segment = Uuid::nil().hyphenated().to_string();
+        let input = repeated_identifier_text(&segment, OVERLONG_IDENTIFIER_SEGMENTS);
+
+        assert_matches!(
+            Identifier::parse_uuid_segments(&input),
+            Err(IdentifierUuidDecodeError::UuidTooManySegmentsError {
+                actual: OVERLONG_IDENTIFIER_SEGMENTS,
+                ..
+            })
         );
     }
 
