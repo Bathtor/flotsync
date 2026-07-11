@@ -28,8 +28,15 @@ group fan-out/storage, and replication semantics separate.
 - **UpdateId**: `(version, producer_index)`.
 - **ReadVV**: VV captured by an update producer at creation time.
 - **VV**: one version per group member.
-- **Snapshot**: full materialized state at a VV cut.
+- **Snapshot**: full materialized state at a group/version reference.
+- **SnapshotRef**: `(group_id, VV)` reference to one group state. Multiple
+  refs may describe the same logical snapshot, for example an old group at a
+  migration cut and a new group at its zero vector.
+- **InitialSnapshot**: initial dataset state required before activating a
+  joined or migrated group. It may be empty, inline, or described by metadata
+  for later retrieval.
 - **Migration**: creation of a new replication group from a state cut of an old group.
+- **MigrationId**: `(old_group_id, new_group_id)`.
 
 ## 3. System Model and Assumptions
 
@@ -432,18 +439,52 @@ Must convey:
 #### `Snapshot`
 
 Purpose:
-Send full state at a VV cut as catch-up optimization or migration seed.
+Send full state at a group/version reference as a catch-up optimization or
+activation input.
 
 Must convey:
 
-- group id (or new group id in migration context)
-- `snapshotVV`
+- snapshot ref:
+    - group id
+    - VV
 - snapshot payload
 
 Notes:
 
 - relays may forward stored snapshots
 - relays cannot synthesize snapshots from update history
+- far-behind members may fetch a snapshot instead of replaying many deltas
+- large snapshot transfer must be chunked by the replication layer so transport
+  reassembly does not need to hold a complete snapshot in memory
+
+#### `InitialSnapshot`
+
+Purpose:
+Describe the initial state required before a group invitation or migration can
+become active locally.
+
+Must convey one of:
+
+- `Empty`: the initial dataset state is empty
+- `Inline`: the initial snapshot payload is carried directly
+- `Metadata`: the initial snapshot exists elsewhere and must be resolved before
+  activation
+
+`Metadata` must convey:
+
+- primary snapshot ref
+- zero or more equivalent snapshot refs
+- optional record count
+
+Notes:
+
+- `Empty` does not imply that the group is newly created
+- in a migration, existing old-group members may receive an old-group/cut ref
+  while newly added members receive a new-group/zero-vector ref
+- equivalent refs let runtimes deduplicate local snapshot state even when
+  transfer encryption or recipient perspective differs
+- digest, encoded size, and table count are intentionally deferred until their
+  canonical semantics are designed
 
 #### `Ack`
 
@@ -460,20 +501,20 @@ Notes:
 - steady state: usually ack each `Update`
 - catch-up: coarse ack (for example once synced) is acceptable
 
-#### `MigrationInit`
+#### `MigrationProposal`
 
 Purpose:
 Propose/initiate migration to new group.
 
 Must convey:
 
-- migration id
+- migration id `(old_group_id, new_group_id)`
 - old group id
 - new group id
 - migration cut VV in old group
 - new group membership
 - new shared key material (encrypted per recipient)
-- initial snapshot for new group
+- initial snapshot
 
 Notes:
 
@@ -481,6 +522,13 @@ Notes:
   not yet share the new group key
 - recipients should verify sender signatures before accepting the bootstrap
   material
+- `MigrationProposal` is signed/scoped to the old group because the old group is
+  the authority context for superseding its state
+- newly added members that are not in the old group receive a `GroupInvitation`
+  with migration source context rather than a listener-visible
+  `MigrationProposal`
+- inline initial snapshot payloads for the new group are encrypted with the new
+  group key
 
 #### `GroupClose`
 
@@ -493,12 +541,20 @@ Must convey:
 - old group id
 - close mode/policy marker
 
+Notes:
+
+- `GroupClose` is signed/scoped to the old group
+- it is a lifecycle signal, not remote command authority
+- local policy decides whether to close writes, keep read-only access, or only
+  observe the signal
+- unauthorised or unsupported close signals are ignored
+
 ## 10. Cross-Protocol Flows
 
 ### 10.1 Bootstrap / Invitation
 
 1. higher-layer logic prepares recipient-addressed bootstrap material (for
-   example a migration invitation or key package).
+   example a migration proposal, group invitation, or key package).
 2. `SingleRecipientDurableDelivery`: attempt direct delivery and relay mailbox
    storage.
 3. recipient checks in with configured relay mailboxes using `MailboxFetch`.
@@ -539,16 +595,26 @@ Same wire behavior as initial sync: VV is the cursor.
 
 ### 10.6 Migration
 
-1. `Replication`: emit `MigrationInit` or equivalent recipient-addressed
-   invitation material.
+1. `Replication`: emit old-group-scoped `MigrationProposal` messages for
+   existing members and migration-sourced `GroupInvitation` messages for newly
+   added members.
 2. `SingleRecipientDurableDelivery`: deliver per-recipient invitation packages
    directly or through relay mailboxes until `RecipientAck`.
-3. receivers accept or ignore migration (policy/user mediated).
-4. accepting receivers join new group and start sync there.
-5. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
+3. receivers accept, reject, or leave the proposal pending according to policy
+   or user mediation. Pending decisions are persisted and re-surfaced after
+   restart until decided.
+4. after acceptance, the receiver sends the semantic recipient acknowledgement
+   and moves into accepted-but-not-active activation state.
+5. the receiver resolves `initial_snapshot`: empty state can activate
+   immediately, inline state can be applied locally, and metadata state requires
+   local reconstruction, delta catch-up, or a future snapshot fetch protocol.
+6. once the initial snapshot is resolved, accepting receivers activate the new
+   group and start sync there.
+7. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
    within that group as normal.
-6. optional `GroupClose` updates old-group write/read policy.
-7. ignoring migration can intentionally split old/new group activity.
+8. optional `GroupClose` informs old-group write/read lifecycle policy.
+9. rejecting or ignoring migration can intentionally split old/new group
+   activity.
 
 ## 11. Error Handling and Compatibility
 

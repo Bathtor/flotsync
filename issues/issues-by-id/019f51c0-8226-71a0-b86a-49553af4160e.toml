@@ -1,0 +1,33 @@
+id = "019f51c0-8226-71a0-b86a-49553af4160e"
+ref = "flotsync-git-qsg"
+title = "Implement chunked snapshot fetch and resumable activation"
+body = """
+Implement the larger non-inline snapshot transfer slice for group invitations, migration proposals, and far-behind existing members.
+
+Scope:
+A. Add a general snapshot fetch protocol that can request a snapshot by SnapshotRef.
+B. Transfer snapshot data in replication-level chunks so transport layers never need to assemble multi-GB payloads in memory.
+C. Persist chunk progress and resume fetch after restart.
+D. Allow accepted invitations/proposals with Metadata initial_snapshot to activate after the full snapshot is fetched and applied.
+E. Allow existing group members to choose full snapshot fetch instead of replaying many deltas when policy decides it is cheaper.
+
+Dependencies:
+F. Requires pending activation/store lifecycle groundwork.
+G. Requires snapshot metadata/wire groundwork.
+
+Out of scope:
+H. This task is intentionally outside the inline-snapshot migration policy parent."""
+status = "open"
+type = "task"
+priority = 3
+labels = ["area:replication"]
+blocked_by = [
+    "019f51bf-be64-7ad2-8489-de9cc110f8cb",
+    "019f51bf-e9f0-7eb3-96ff-fc754675ca7d",
+]
+created_at = "2026-07-11T15:16:38.566463Z"
+updated_at = "2026-07-11T15:16:48.018216Z"
+
+[[links]]
+target = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+label = "deferred from"

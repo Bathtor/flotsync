@@ -1,0 +1,24 @@
+id = "019f51c0-4c99-72f3-ab68-fc5fa752a914"
+ref = "flotsync-git-pow.5"
+title = "Validate and document inline migration policy flow"
+body = """
+Add focused validation and documentation coverage for the inline-snapshot migration policy implementation.
+
+Scope:
+A. Unit tests for policy classification and safe defaults.
+B. Store/restart tests for pending decision replay and accepted activation resume.
+C. Runtime tests for GroupInvitation, MigrationProposal, GroupClose, and inline initial_snapshot activation.
+D. Tests that Metadata-only snapshots are represented but not activated until non-inline snapshot transfer exists.
+E. Update protocol/API/scenario docs to match implemented inline behaviour.
+
+Out of scope:
+F. Dynamic checklist product workflow changes beyond documentation hooks.
+G. Chunked snapshot transfer tests."""
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-11T15:16:24.85732Z"
+updated_at = "2026-07-11T15:16:29.021394Z"

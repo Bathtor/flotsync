@@ -1,0 +1,44 @@
+id = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+ref = "flotsync-git-pow"
+title = "Implement migration policy API with inline initial snapshots"
+body = """
+Implement the agreed first migration-policy implementation slice for the replication API and runtime.
+
+Scope:
+A. Public API model for group invitations, migration proposals, migration policy, group close policy, and initial snapshots.
+B. Pending decision persistence and startup event replay.
+C. Wire/runtime message support for migration proposals, group close, and inline/metadata initial snapshots.
+D. Runtime handling for migration proposals using Empty or Inline initial snapshots.
+E. Tests and documentation for the inline-snapshot flow.
+
+Out of scope:
+F. Chunked snapshot fetch/resume for large snapshots. The API and wire metadata may acknowledge non-inline snapshots, but activation may stay unsupported until the separate large-snapshot task lands.
+G. Reworking temporary public key bundle provisioning.
+
+Design summary:
+H. Keep GroupInvitation and add MigrationProposal.
+I. MigrationId is { old_group_id, new_group_id }.
+J. Existing old-group members see MigrationProposal; newly added members see GroupInvitation with Migration source.
+K. MigrationProposal and GroupClose are signed/scoped to the old group.
+L. Pending user-mediated decisions are persisted and re-fired on startup until accepted or rejected.
+M. Accepted-but-not-active invitations resume internal activation work without re-asking.
+N. InitialSnapshot is Empty, Inline, or Metadata. Empty means empty state, not necessarily new group.
+O. Snapshot refs are { group_id, versions }, and equivalent refs may alias the same logical snapshot.
+P. New-group activation snapshots are encrypted with the new group key.
+Q. Inline transfer is sufficient for this parent; chunked snapshot transfer is tracked separately."""
+status = "in-progress"
+status_reason = "plan agreed"
+type = "feature"
+priority = 2
+labels = ["area:replication"]
+assignee = "Codex"
+blocks = ["019f502e-2262-70a0-bf74-6da295fff88e"]
+children = [
+    "019f51bf-9095-72a0-94f6-bcbd4ca68271",
+    "019f51bf-be64-7ad2-8489-de9cc110f8cb",
+    "019f51bf-e9f0-7eb3-96ff-fc754675ca7d",
+    "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
+    "019f51c0-4c99-72f3-ab68-fc5fa752a914",
+]
+created_at = "2026-07-11T15:15:25.731747Z"
+updated_at = "2026-07-11T15:19:23.563815Z"

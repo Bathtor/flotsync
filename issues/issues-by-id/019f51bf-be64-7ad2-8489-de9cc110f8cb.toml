@@ -1,0 +1,29 @@
+id = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
+ref = "flotsync-git-pow.2"
+title = "Persist and replay pending invitation decisions"
+body = """
+Persist pending GroupInvitation and MigrationProposal decisions and replay unresolved listener events on startup.
+
+Scope:
+A. Store pending decision records for direct invitations and migration proposals.
+B. Store accepted-but-not-active activation state separately from pending user decisions.
+C. Re-fire pending listener events after restart until accepted or rejected.
+D. Resume accepted activation work after restart without re-asking the listener.
+E. Make responder decisions idempotent by group invitation identity or MigrationId.
+F. Preserve enough initial_snapshot metadata for later activation work.
+
+Out of scope:
+G. Chunked snapshot payload persistence.
+H. Full migration runtime behaviour beyond state transitions needed by this slice."""
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+blocked_by = ["019f51bf-9095-72a0-94f6-bcbd4ca68271"]
+blocks = [
+    "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
+    "019f51c0-8226-71a0-b86a-49553af4160e",
+]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-11T15:15:48.452392Z"
+updated_at = "2026-07-11T15:16:38.566463Z"

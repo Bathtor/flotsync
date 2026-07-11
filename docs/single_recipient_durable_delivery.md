@@ -12,7 +12,7 @@ one specific recipient outside normal `GroupBroadcast` fan-out.
 
 Its primary use is bootstrap traffic such as:
 
-- migration invitations
+- migration proposals
 - new-group establishment
 - recipient-specific key packages
 
@@ -68,6 +68,7 @@ Replication owns:
 - the logical meaning of the payload
 - whether a payload should be sent via this protocol or via `GroupBroadcast`
 - invitation acceptance and rejection policy
+- accepted-but-not-active group activation and initial snapshot resolution
 
 This protocol owns:
 
@@ -173,8 +174,8 @@ Must convey:
     - sender identity
     - recipient identity
     - `message_ref`, for example:
-        - `MigrationInit(migration_id)`
-        - `GroupInvite(group_id)`
+        - `MigrationProposal(migration_id)`
+        - `GroupInvitation(group_id)`
         - `BootstrapKeyPackage(group_id)`
     - `message_id`
     - sender signature metadata
@@ -207,6 +208,9 @@ Notes:
 - this is the only completion signal that satisfies the sender-side work item
 - it may itself be delivered directly or via relay mailbox using this same
   protocol
+- for replication bootstrap payloads, recipient acknowledgement means the
+  proposal or invitation was accepted into local activation state; it does not
+  necessarily mean the target group is active yet
 
 ## 5. Relay Mailbox Contract
 
@@ -340,12 +344,14 @@ bootstrap material before a shared group key exists.
 Typical examples:
 
 - first invitation into a new replication group
-- migration invitation for a recipient not yet in the new group
+- migration proposal for an existing old-group member
+- migration-derived group invitation for a recipient not yet in the new group
 - one recipient's encrypted share of new group key material
 
 ### 9.2 Transition to Group Protocols
 
-Once the recipient accepts and joins the group:
+Once the recipient accepts, resolves any required initial snapshot, and
+activates the group:
 
 - group-scoped traffic moves to `GroupBroadcast`
 - state synchronization uses `Replication`

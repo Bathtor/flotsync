@@ -1,0 +1,32 @@
+id = "019f51bf-9095-72a0-94f6-bcbd4ca68271"
+ref = "flotsync-git-pow.1"
+title = "Define migration policy API and public types"
+body = """
+Implement the public API model for the agreed migration-policy design.
+
+Scope:
+A. Add composite MigrationId { old_group_id, new_group_id }.
+B. Add MigrationProposal alongside GroupInvitation rather than replacing it.
+C. Add GroupInvitationSource for direct invitations and migration-derived invitations.
+D. Add InitialSnapshot with Empty, Inline, and Metadata variants.
+E. Add SnapshotRef and InitialSnapshotMetadata with primary/equivalent refs and optional record_count.
+F. Split invitation, migration, and group-close policy types with safe defaults.
+G. Document accepted-but-not-active lifecycle terminology in the API docs.
+
+Out of scope:
+H. Runtime behaviour beyond unsupported stubs.
+I. Store persistence.
+J. Chunked snapshot transfer."""
+status = "in-progress"
+status_reason = "plan agreed"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+assignee = "Codex"
+blocks = [
+    "019f51bf-be64-7ad2-8489-de9cc110f8cb",
+    "019f51bf-e9f0-7eb3-96ff-fc754675ca7d",
+]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-11T15:15:36.725178Z"
+updated_at = "2026-07-11T15:19:33.945928Z"
