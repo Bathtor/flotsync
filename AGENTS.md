@@ -12,6 +12,17 @@
 - When the user provides substantial review feedback, capture every comment in a working note before implementation. Include stable IDs, file context, the feedback, current status, and the intended direction.
 - After plan alignment, update the working note with the agreed direction before editing production files.
 - During and after implementation, use the working note as the checklist. Before final response, double-check every captured feedback item and report any item that remains unresolved or intentionally deferred.
+- Review-feedback working notes and gitrack issue bodies serve different purposes:
+    - The working note is chronological review bookkeeping. Capture each review comment there with stable IDs, status, and intended disposition.
+    - The gitrack issue body is the current holistic task plan. Do not replace it with only the latest review-fix delta.
+- When review feedback changes the implementation plan, first record the review delta in the working note, then update the gitrack issue body by integrating the new understanding into the full remaining plan. Preserve still-valid original goals, accepted constraints, explicit deferrals, and linked follow-up work.
+- If a review comment creates a TODO or future design concern, record it as a gitrack comment or follow-up issue and link it from the source issue. Do not rely on overwriting the issue body to remember what changed.
+- Before implementation after substantial review feedback, perform this sequence:
+    1. Capture every review comment in the working note.
+    2. Propose or confirm the updated holistic plan with the user.
+    3. Update the gitrack issue body with the full current plan, not just the review delta.
+    4. Add a gitrack comment summarising the review delta when useful.
+    5. Only then edit production files.
 
 ## Rust Rules
 
@@ -118,7 +129,7 @@ This project uses [`gitrack`](https://github.com/Bathtor/gitrack) for Git-native
 3. Read the issue with `gitrack show <ref> --json`.
 4. Set `status_reason = "planning"` while preparing the implementation plan.
 5. Align on a concrete plan with the user before implementation.
-6. Store the agreed plan in the issue body.
+6. Store the agreed holistic plan in the issue body. When review feedback arrives, update that body by integrating the new understanding into the full plan instead of replacing it with a narrow list of latest review fixes.
 7. Once the user agrees, set `status_reason = "plan agreed"`.
 8. Implement against the agreed plan.
 9. Before handing work over for review, compare the result against the issue body and agreed plan.

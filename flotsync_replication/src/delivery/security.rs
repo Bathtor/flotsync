@@ -17,16 +17,16 @@ use crate::{
             RecordPublicKeyBundleFeedbackRequest,
         },
     },
-    delivery::{
-        group_broadcast::GroupMessageHeader,
-        reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
-        shared::{DetachedSignature, MessageId, ReliableMessageScope, SignatureScheme},
-    },
-    runtime::messages::{
+    codecs::messages::{
         BootstrapGroupMessage,
         BootstrapMemberKeyMessage,
         RuntimeMessageError,
         validate_bootstrap_public_key_bundle_matches_fingerprint,
+    },
+    delivery::{
+        group_broadcast::GroupMessageHeader,
+        reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
+        shared::{DetachedSignature, MessageId, ReliableMessageScope, SignatureScheme},
     },
     security_store::{MemberPublicKeyLoadPolicy, SecurityStore, SecurityStoreError},
 };

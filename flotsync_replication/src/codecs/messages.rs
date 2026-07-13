@@ -3,11 +3,14 @@ use crate::{
     api::{
         DatasetId,
         DatasetIdError,
+        DatasetSchema,
         DatasetUpdateRecord,
+        GroupSchema,
         MemberKeyId,
         ReplicationUpdateRecord,
         Summary,
     },
+    codecs::pending_group::PendingGroupPayloadError,
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -29,10 +32,13 @@ use flotsync_messages::{
     proto::{
         self,
         DecodeProto,
+        DecodeProtoOneof,
         DecodeProtoView,
         DecodeProtoViewWith,
         DecodeProtoWith,
         EncodeProto,
+        EncodeProtoOneof,
+        MissingRequiredProto,
     },
     replication as replication_proto,
     security as security_proto,
@@ -97,6 +103,8 @@ pub(crate) enum RuntimeMessageError {
         member_id: MemberIdentity,
         public_key_member_id: MemberIdentity,
     },
+    #[snafu(display("Bootstrap group schema was invalid: {source}"))]
+    InvalidBootstrapGroupSchema { source: PendingGroupPayloadError },
     #[snafu(display("Bootstrap group cipher suite {actual} is unsupported; expected {expected}."))]
     UnsupportedBootstrapGroupCipherSuite { actual: u32, expected: u16 },
     #[snafu(display(
@@ -214,6 +222,23 @@ impl proto::FromProtoDecodeError for RuntimeMessageError {
     }
 }
 
+/// Required-oneof contexts in runtime delivery messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeMessageOneofContext {
+    /// `RuntimeMessage.body`.
+    Body,
+}
+
+impl MissingRequiredProto for RuntimeMessageError {
+    type Context = RuntimeMessageOneofContext;
+
+    fn missing_required(context: Self::Context) -> Self {
+        match context {
+            RuntimeMessageOneofContext::Body => Self::MissingBody,
+        }
+    }
+}
+
 /// Hosted-group member count needed by compact runtime protobuf decoders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MemberCountContext {
@@ -265,43 +290,32 @@ impl EncodeProto for RuntimeMessage {
     type Proto = replication_proto::RuntimeMessage;
 
     fn encode_proto(&self) -> Self::Proto {
+        replication_proto::RuntimeMessage {
+            body: Some(EncodeProtoOneof::encode_proto(self)),
+            ..replication_proto::RuntimeMessage::default()
+        }
+    }
+}
+
+impl EncodeProtoOneof for RuntimeMessage {
+    type Proto = replication_proto::runtime_message::Body;
+
+    fn encode_proto(&self) -> Self::Proto {
         match self {
-            RuntimeMessage::BootstrapGroup(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
-                    Box::new(message.encode_proto()),
-                )),
-                ..replication_proto::RuntimeMessage::default()
-            },
-            RuntimeMessage::Update(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::Update(Box::new(
-                    message.encode_proto(),
-                ))),
-                ..replication_proto::RuntimeMessage::default()
-            },
-            RuntimeMessage::SummaryRequest(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::SummaryRequest(
-                    Box::new(message.encode_proto()),
-                )),
-                ..replication_proto::RuntimeMessage::default()
-            },
-            RuntimeMessage::Summary(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::Summary(Box::new(
-                    message.encode_proto(),
-                ))),
-                ..replication_proto::RuntimeMessage::default()
-            },
-            RuntimeMessage::NeedRange(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::NeedRange(
-                    Box::new(message.encode_proto()),
-                )),
-                ..replication_proto::RuntimeMessage::default()
-            },
-            RuntimeMessage::UpdateBatch(message) => replication_proto::RuntimeMessage {
-                body: Some(replication_proto::runtime_message::Body::UpdateBatch(
-                    Box::new(message.encode_proto()),
-                )),
-                ..replication_proto::RuntimeMessage::default()
-            },
+            RuntimeMessage::BootstrapGroup(message) => {
+                Self::Proto::BootstrapGroup(message.as_ref().encode_proto_boxed())
+            }
+            RuntimeMessage::Update(message) => Self::Proto::Update(message.encode_proto_boxed()),
+            RuntimeMessage::SummaryRequest(message) => {
+                Self::Proto::SummaryRequest(message.encode_proto_boxed())
+            }
+            RuntimeMessage::Summary(message) => Self::Proto::Summary(message.encode_proto_boxed()),
+            RuntimeMessage::NeedRange(message) => {
+                Self::Proto::NeedRange(message.encode_proto_boxed())
+            }
+            RuntimeMessage::UpdateBatch(message) => {
+                Self::Proto::UpdateBatch(message.encode_proto_boxed())
+            }
         }
     }
 }
@@ -327,9 +341,18 @@ impl DecodeProto for WireRuntimeMessage {
     type Proto = replication_proto::RuntimeMessage;
 
     fn decode_proto(message: Self::Proto) -> Result<Self, Self::Error> {
-        let Some(body) = message.body else {
-            return MissingBodySnafu.fail();
-        };
+        <Self as DecodeProtoOneof>::decode_required_proto(
+            message.body,
+            RuntimeMessageOneofContext::Body,
+        )
+    }
+}
+
+impl DecodeProtoOneof for WireRuntimeMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::runtime_message::Body;
+
+    fn decode_proto(body: Self::Proto) -> Result<Self, Self::Error> {
         match body {
             replication_proto::runtime_message::Body::BootstrapGroup(message) => {
                 let bootstrap_message = BootstrapGroupMessage::decode_proto(*message)?;
@@ -405,6 +428,7 @@ pub(crate) struct BootstrapGroupMessage {
     group_id: GroupId,
     members: Vec<MemberIdentity>,
     member_keys: TrieMap<BootstrapMemberKeyMessage>,
+    group_schema: GroupSchema,
     group_cipher_suite: GroupCipherSuite,
     group_key: BootstrapGroupKey,
 }
@@ -422,6 +446,7 @@ impl BootstrapGroupMessage {
         group_id: GroupId,
         members: Vec<MemberIdentity>,
         member_keys: TrieMap<BootstrapMemberKeyMessage>,
+        group_schema: GroupSchema,
         group_cipher_suite: GroupCipherSuite,
         group_key: BootstrapGroupKey,
     ) -> Result<Self, RuntimeMessageError> {
@@ -430,6 +455,7 @@ impl BootstrapGroupMessage {
             group_id,
             members,
             member_keys,
+            group_schema,
             group_cipher_suite,
             group_key,
         })
@@ -441,6 +467,11 @@ impl BootstrapGroupMessage {
 
     pub(crate) fn members(&self) -> &[MemberIdentity] {
         &self.members
+    }
+
+    /// Return dataset schemas fixed for the lifetime of this bootstrapped group.
+    pub(crate) fn group_schema(&self) -> &GroupSchema {
+        &self.group_schema
     }
 
     pub(crate) fn member_keys(&self) -> &TrieMap<BootstrapMemberKeyMessage> {
@@ -492,6 +523,12 @@ impl proto::ProtoCodec for BootstrapGroupMessage {
         replication_proto::BootstrapGroup {
             group_id: self.group_id.0.as_bytes().to_vec(),
             member_keys,
+            dataset_schemas: self
+                .group_schema
+                .datasets()
+                .iter()
+                .map(EncodeProto::encode_proto)
+                .collect(),
             group_cipher_suite: u32::from(self.group_cipher_suite.as_u16()),
             group_key: self.group_key.to_bytes().to_vec(),
             ..replication_proto::BootstrapGroup::default()
@@ -514,6 +551,8 @@ impl proto::ProtoCodec for BootstrapGroupMessage {
             members.push(entry.member_id.clone());
             member_keys.insert(entry.member_id, entry.member_key);
         }
+        let group_schema = decode_bootstrap_group_schema(message.dataset_schemas)
+            .context(InvalidBootstrapGroupSchemaSnafu)?;
         let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
         ensure!(
             message.group_cipher_suite == u32::from(expected),
@@ -528,6 +567,7 @@ impl proto::ProtoCodec for BootstrapGroupMessage {
             group_id,
             members,
             member_keys,
+            group_schema,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_bytes(group_key),
         )
@@ -554,6 +594,14 @@ impl DecodeProtoView for BootstrapGroupMessage {
             members.push(entry.member_id.clone());
             member_keys.insert(entry.member_id, entry.member_key);
         }
+        let dataset_schemas = message
+            .dataset_schemas
+            .iter()
+            .map(flotsync_messages::buffa::MessageView::to_owned_message)
+            .collect::<Result<Vec<_>, _>>()
+            .context(DecodeSnafu)?;
+        let group_schema = decode_bootstrap_group_schema(dataset_schemas)
+            .context(InvalidBootstrapGroupSchemaSnafu)?;
         let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
         ensure!(
             message.group_cipher_suite == u32::from(expected),
@@ -568,6 +616,7 @@ impl DecodeProtoView for BootstrapGroupMessage {
             group_id,
             members,
             member_keys,
+            group_schema,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_bytes(group_key),
         )
@@ -2022,6 +2071,19 @@ fn validate_bootstrap_member_key_coverage(
     Ok(())
 }
 
+fn decode_bootstrap_group_schema(
+    dataset_schemas: Vec<replication_proto::DatasetSchema>,
+) -> Result<GroupSchema, PendingGroupPayloadError> {
+    let mut group_schema = GroupSchema::default();
+    for dataset_schema in dataset_schemas {
+        let dataset_schema = DatasetSchema::decode_proto(dataset_schema)?;
+        group_schema
+            .insert_checked(dataset_schema)
+            .map_err(PendingGroupPayloadError::from)?;
+    }
+    Ok(group_schema)
+}
+
 fn ensure_version_vector_bound(
     field: &'static str,
     version: u64,
@@ -2066,8 +2128,8 @@ mod tests {
         member_identity_to_wire_format,
     };
     use crate::{
-        api::{DatasetId, DatasetUpdateRecord, ReplicationUpdateRecord},
-        test_support::test_public_member_keys,
+        api::{DatasetId, DatasetUpdateRecord, GroupSchema, ReplicationUpdateRecord},
+        test_support::{docs_group_schema, test_public_member_keys},
     };
     use flotsync_core::{
         GroupId,
@@ -2406,6 +2468,7 @@ mod tests {
             group_id,
             vec![alice.clone(), bob.clone()],
             member_keys,
+            docs_group_schema(),
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_bytes([5; GROUP_KEY_LENGTH]),
         )
@@ -2419,6 +2482,7 @@ mod tests {
             panic!("runtime message should encode as bootstrap group");
         };
         assert_eq!(proto_bootstrap.member_keys.len(), 2);
+        assert_eq!(proto_bootstrap.dataset_schemas.len(), 1);
         let mut first_entry = proto_bootstrap.member_keys[0].clone();
         let first_member_id = member_identity_from_wire(
             first_entry
@@ -2463,6 +2527,7 @@ mod tests {
             group_id,
             vec![alice, bob],
             member_keys,
+            GroupSchema::default(),
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_bytes([6; GROUP_KEY_LENGTH]),
         )
@@ -2583,6 +2648,7 @@ mod tests {
             group_id,
             vec![alice.clone()],
             member_keys,
+            GroupSchema::default(),
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_bytes([11; GROUP_KEY_LENGTH]),
         )

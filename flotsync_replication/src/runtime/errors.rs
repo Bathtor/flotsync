@@ -1,7 +1,9 @@
-use super::messages::RuntimeMessageError;
-use crate::api::{DatasetId, ListenerError, RowId, StoreError};
 #[cfg(any(test, feature = "test-support"))]
 use crate::delivery::security::DeliverySecurityError;
+use crate::{
+    api::{DatasetId, ListenerError, RowId, StoreError},
+    codecs::messages::RuntimeMessageError,
+};
 use flotsync_core::{
     GroupId,
     MemberIdentity,
@@ -15,13 +17,11 @@ use kompact::prelude::PromiseErr;
 use snafu::{Location, prelude::*};
 
 /// Boxed source for errors that would otherwise make high-level runtime errors large.
-type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum CreateGroupError {
-    #[snafu(display("Initial group state is not supported in the first replication slice."))]
-    InitialStateUnsupported,
     #[snafu(display("Group members must include the local member {local_member}."))]
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group member list is invalid: {source}"))]
@@ -131,6 +131,12 @@ pub(super) enum RuntimeStartupError {
         group_id: GroupId,
         source: GroupInstallError,
     },
+    #[snafu(display("Listener rejected one pending group decision replay event: {source}"))]
+    ReplayPendingDecision { source: ListenerError },
+    #[snafu(display(
+        "Pending group activation resume is not implemented; found {activation_count} activation record(s)."
+    ))]
+    PendingGroupActivationResumeUnsupported { activation_count: usize },
 }
 
 #[derive(Debug, Snafu)]

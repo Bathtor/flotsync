@@ -2,8 +2,10 @@ use crate::{
     SqliteReplicationStore,
     api::{
         DatasetId,
+        DatasetSchema,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
+        GroupSchema,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
@@ -41,7 +43,7 @@ use crate::{
     security_store::SecurityStore,
 };
 use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
-use flotsync_data_types::RowOperations;
+use flotsync_data_types::{Field, RowOperations, Schema};
 use flotsync_security::{
     GroupKey,
     PublicMemberKeys,
@@ -58,7 +60,7 @@ use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
 use snafu::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::{Arc, Mutex, mpsc},
     time::Duration,
@@ -67,6 +69,42 @@ use std::{
 const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Dataset id used by the common title-schema fixtures.
+///
+/// # Panics
+///
+/// Panics if the hard-coded fixture dataset id no longer satisfies
+/// [`DatasetId`] validation.
+#[must_use]
+pub fn docs_dataset_id() -> DatasetId {
+    DatasetId::try_new("docs").expect("test dataset id should build")
+}
+
+/// Dataset schema entry with one replicated linear `title` field.
+#[must_use]
+pub fn docs_dataset_schema() -> DatasetSchema {
+    DatasetSchema {
+        dataset_id: docs_dataset_id(),
+        schema: docs_schema_source(),
+    }
+}
+
+/// Schema source with one replicated linear `title` field.
+#[must_use]
+pub fn docs_schema_source() -> SchemaSource {
+    SchemaSource::from(Schema::from_fields([Field::linear_string("title")]))
+}
+
+/// Group schema containing only the common docs dataset schema.
+#[must_use]
+pub fn docs_group_schema() -> GroupSchema {
+    let dataset_schema = docs_dataset_schema();
+    GroupSchema::new(HashMap::from([(
+        dataset_schema.dataset_id,
+        dataset_schema.schema,
+    )]))
+}
 
 /// Load a replication runtime for tests that have not yet gained real security setup.
 ///

@@ -25,12 +25,12 @@ mod errors;
 pub mod handle;
 pub(crate) mod host;
 mod in_memory;
-pub(crate) mod messages;
 mod replay;
 mod store_security_validation;
 mod summary_request_manager;
 
 pub use component::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};
+pub(crate) use errors::BoxedError;
 pub use handle::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
 
 #[cfg(test)]

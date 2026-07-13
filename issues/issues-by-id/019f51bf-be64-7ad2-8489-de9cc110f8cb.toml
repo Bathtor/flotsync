@@ -2,23 +2,71 @@ id = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
 ref = "flotsync-git-pow.2"
 title = "Persist and replay pending invitation decisions"
 body = """
-Persist pending GroupInvitation and MigrationProposal decisions and replay unresolved listener events on startup.
+Persist and replay pending `GroupInvitation` and `MigrationProposal` decisions and replay unresolved listener events on startup. This slice includes pending decision persistence, listener-event replay, component-owned responders, accepted-but-not-active activation-state scaffolding, and the schema/payload storage support needed for that flow. It intentionally does not implement full group-migration activation or chunked snapshot transfer.
 
-Scope:
-A. Store pending decision records for direct invitations and migration proposals.
-B. Store accepted-but-not-active activation state separately from pending user decisions.
-C. Re-fire pending listener events after restart until accepted or rejected.
-D. Resume accepted activation work after restart without re-asking the listener.
-E. Make responder decisions idempotent by group invitation identity or MigrationId.
-F. Preserve enough initial_snapshot metadata for later activation work.
+Current holistic plan:
 
-Out of scope:
-G. Chunked snapshot payload persistence.
-H. Full migration runtime behaviour beyond state transitions needed by this slice."""
-status = "open"
+P01. Persist unresolved pending group decisions in SQLite and replay them during runtime startup as listener-mediated pending group events.
+
+P02. Persist accepted pending group work separately as pending activations so accepted work can survive until the group becomes externally active.
+
+P03. Keep responder ownership in the runtime component. Startup replay and live pending events should expose responders that transition records between decision and activation storage without leaking storage details to listeners.
+
+P04. Use SQL key columns for pending work instead of serialised string keys. Store `work_kind`, `old_group_id`, and `new_group_id`, using sentinel string `NONE` for absent old group ids so SQLite primary-key conflict detection works predictably. Do not add extra indices or SQLite CHECK constraints in this slice.
+
+P05. Store pending payload bytes as the actual protocol payload shapes for group invitations and migration proposals. The SQL key columns identify the row kind, so dedicated storage wrapper protos should not be needed.
+
+P06. Treat schemas as group-scoped and fixed for the lifetime of a group. Carry group schemas in bootstrap, invitation, and proposal payloads. Store group schemas with group records and use stored group schemas for group-record hydration and pending group work. Keep ordinary row read/write schema lookup on local `schema_sources` until `flotsync-git-x1t`.
+
+P07. Keep `GroupSchema` map-backed so ordinary callers cannot introduce duplicate dataset schema entries. Duplicate checking is only needed while decoding repeated protobuf dataset schema entries.
+
+P08. Keep initial snapshot debug output compact by default so inline row values are not dumped accidentally. Alternate debug may include full schema detail.
+
+P09. Support compact wire version vectors where this slice already needs them by using decode context. Leave the broader version-vector transfer-shape design to `flotsync-git-i20`.
+
+P10. Keep `ReplicationStore::load_dataset_schema` as the local schema-source lookup. Expose stored group dataset schema lookup on the transaction API only.
+
+P11. Use shared test fixtures for common docs dataset schemas and keep tests order-insensitive for pending decision/activation loads.
+
+Remaining aligned review fixes before implementation resumes:
+
+R01. In `flotsync_messages::proto`, replace duplicated missing-required traits with one generic missing-required protobuf trait used by both required oneof and required message-field helpers.
+
+R02. Keep the required-field extraction helper, but rename it so it clearly only takes/extracts a required field. Add complementary helpers that extract and decode via `DecodeProto` and `DecodeProtoWith`.
+
+R03. Use the extract-and-decode helper for normal required protobuf message fields such as `GroupInvitationSource`.
+
+R04. Keep `dataset_schema.schema` decoding explicit for now because `decode_schema_definition` does not participate in the proto helper traits. Add the requested `TODO(flotsync-git-02c)` at that site.
+
+R05. Add a `GroupSchema::insert_checked` API and update repeated-schema decoders to insert directly instead of collecting a temporary `Vec<DatasetSchema>`.
+
+R06. Use the now-public `BoxedError` alias for pending payload wire-value wrapper errors instead of spelling out the boxed trait object.
+
+R07. Add contextual `DecodeProtoWith` implementations for context-dependent snapshot metadata/reference decoding and route the pending payload snapshot path through those impls.
+
+R08. Leave the accepted `ok_or_else` missing-initial-snapshot-state expression alone unless nearby edits require touching it.
+
+R09. Update focused tests as needed and rerun formatting, `cargo check -p flotsync_replication --all-targets`, focused pending-group tests, full single-threaded `cargo test -p flotsync_replication`, and pedantic clippy for `flotsync_replication`.
+
+Explicit deferrals and follow-ups:
+
+F01. Full group-migration activation is out of this slice.
+
+F02. Chunked snapshot transfer is out of this slice.
+
+F03. `flotsync-git-gkd` tracks collection helpers for repeated protobuf fields.
+
+F04. `flotsync-git-i20` tracks the broader version-vector transfer-shape design.
+
+F05. `flotsync-git-x1t` tracks group schema access and sharing before schema migration work.
+
+F06. `flotsync-git-02c` tracks whether schema definition decoding should join the shared proto helper pattern."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
 labels = ["area:replication"]
+assignee = "Codex"
 blocked_by = ["019f51bf-9095-72a0-94f6-bcbd4ca68271"]
 blocks = [
     "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
@@ -26,4 +74,29 @@ blocks = [
 ]
 parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
 created_at = "2026-07-11T15:15:48.452392Z"
-updated_at = "2026-07-11T15:16:38.566463Z"
+updated_at = "2026-07-13T10:59:40.075661Z"
+closed_at = "2026-07-13T10:59:40.075661Z"
+
+[[comments]]
+id = "019f5acf-d6bb-7e91-abc1-7010cf899b93"
+author = "Codex"
+body = "Review pass C18-C25 captured in .agent_local_docs/tmp/flotsync-git-pow2-review-fixes-2026-07-12.md. The issue body was reconstructed as the holistic task plan instead of only the latest review-fix delta. Implementation is intentionally paused after documentation and task-state updates; remaining aligned fixes are R01-R09 in the issue body."
+created_at = "2026-07-13T09:29:58.203923Z"
+
+[[comments]]
+id = "019f5b12-5f63-7843-9021-2cd912003df9"
+author = "Codex"
+body = "Implemented aligned review fixes R01-R09. Validation passed: cargo fmt --all; cargo check -p flotsync_replication --all-targets; cargo test -p flotsync_replication pending_group -- --test-threads=1; cargo test -p flotsync_replication -- --test-threads=1; cargo clippy -p flotsync_replication --all-targets -- -W clippy::pedantic; git diff --check."
+created_at = "2026-07-13T10:42:38.563748Z"
+
+[[comments]]
+id = "019f5b20-c5cd-7083-b4f4-f7d715aee6cd"
+author = "Codex"
+body = "Final follow-up review fixes completed: GroupSchema::insert_checked and GroupSchemaError are public; removed context-free DecodeProto impls for InitialSnapshot, InitialSnapshotMetadata, and SnapshotRef so snapshot version-vector decoding requires explicit context. Validation passed: cargo fmt --all; cargo check -p flotsync_replication --all-targets; cargo test -p flotsync_replication pending_group -- --test-threads=1; cargo clippy -p flotsync_replication --all-targets -- -W clippy::pedantic; git diff --check."
+created_at = "2026-07-13T10:58:22.285027Z"
+
+[[comments]]
+id = "019f5b21-f5ab-76b3-8e9e-cac9af0f6605"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-13T10:59:40.075661Z"

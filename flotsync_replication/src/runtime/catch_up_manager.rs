@@ -1,13 +1,13 @@
-use super::messages::{
-    NeedRangeMessage,
-    RuntimeMessage,
-    UpdateBatchMessage,
-    UpdateMessage,
-    UpdateRangeMessage,
-    WireRuntimeMessage,
-};
 use crate::{
     api::{ReplicationStore, ReplicationUpdateFilter, StoreError},
+    codecs::messages::{
+        NeedRangeMessage,
+        RuntimeMessage,
+        UpdateBatchMessage,
+        UpdateMessage,
+        UpdateRangeMessage,
+        WireRuntimeMessage,
+    },
     delivery::{
         contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
         group_broadcast::GroupBroadcastDeliver,
@@ -796,6 +796,7 @@ mod tests {
             DatasetId,
             DatasetUpdateRecord,
             GroupMemberKeys,
+            GroupSchema,
             MemberKeyId,
             ReplicationGroupRecord,
             ReplicationUpdateRecord,
@@ -859,6 +860,7 @@ mod tests {
             group_id,
             member_keys,
             local_member_index: MemberIndex::new(0),
+            group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             security_material: current_slice_placeholder_group_security_material(group_id),
         }

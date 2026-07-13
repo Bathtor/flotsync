@@ -1,6 +1,6 @@
 //! Shared traits for converting between runtime types and generated protobuf messages.
 
-use crate::buffa::{self, Message as _};
+use crate::buffa::{self, Message as _, MessageField};
 use std::sync::Arc;
 
 /// Decode failure at a protobuf byte or buffer boundary.
@@ -53,6 +53,14 @@ pub trait EncodeProto {
     /// Encode this value into an owned generated protobuf message.
     fn encode_proto(&self) -> Self::Proto;
 
+    /// Encode this value into a boxed owned generated protobuf message.
+    ///
+    /// Generated `oneof` variants frequently box message payloads, so this
+    /// avoids repeating `Box::new(value.encode_proto())` at each call site.
+    fn encode_proto_boxed(&self) -> Box<Self::Proto> {
+        Box::new(self.encode_proto())
+    }
+
     /// Encode this value into owned bytes through its generated protobuf shape.
     fn encode_proto_to_bytes(&self) -> bytes::Bytes {
         self.encode_proto().encode_to_bytes()
@@ -80,6 +88,55 @@ pub trait EncodeProto {
     }
 }
 
+/// Encode a value into one selected generated protobuf `oneof` variant.
+///
+/// Generated protobuf `oneof` enums are not messages, so this is deliberately
+/// separate from [`EncodeProto`]. Implement this for runtime values that model
+/// the selected variant of a wrapper message.
+pub trait EncodeProtoOneof {
+    /// The generated protobuf `oneof` enum produced by this encoder.
+    type Proto;
+
+    /// Encode this value into one selected generated protobuf `oneof` variant.
+    fn encode_proto(&self) -> Self::Proto;
+}
+
+/// Construct a decode error for a missing required protobuf value.
+///
+/// `Context` is codec-specific. Simple codecs can use a field name; codecs with
+/// more precise error variants can use an enum.
+pub trait MissingRequiredProto {
+    /// Context needed to choose or construct the missing-required error.
+    type Context;
+
+    /// Build the missing-required error for `context`.
+    fn missing_required(context: Self::Context) -> Self;
+}
+
+/// Extract a required generated protobuf message field.
+pub trait RequiredProtoField<T> {
+    /// Take this required field from the generated message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `E` when the field is absent.
+    fn take_required_proto_field<E>(&mut self, context: E::Context) -> Result<T, E>
+    where
+        E: MissingRequiredProto;
+}
+
+impl<T: Default> RequiredProtoField<T> for MessageField<T> {
+    fn take_required_proto_field<E>(&mut self, context: E::Context) -> Result<T, E>
+    where
+        E: MissingRequiredProto,
+    {
+        match self.take() {
+            Some(field) => Ok(field),
+            None => Err(E::missing_required(context)),
+        }
+    }
+}
+
 /// Decode a context-free runtime value from an owned generated protobuf message.
 pub trait DecodeProto: Sized {
     /// The generated protobuf message type consumed by this decoder.
@@ -97,6 +154,24 @@ pub trait DecodeProto: Sized {
     /// Returns [`Self::Error`] when the protobuf message is malformed or cannot
     /// satisfy this runtime type's invariants.
     fn decode_proto(proto: Self::Proto) -> Result<Self, Self::Error>;
+
+    /// Decode this value from a required generated protobuf message field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the field is absent or the field payload
+    /// cannot satisfy this runtime type's invariants.
+    fn decode_required_proto_field(
+        field: &mut MessageField<Self::Proto>,
+        context: <Self::Error as MissingRequiredProto>::Context,
+    ) -> Result<Self, Self::Error>
+    where
+        Self::Error: MissingRequiredProto,
+        Self::Proto: Default,
+    {
+        let proto = field.take_required_proto_field::<Self::Error>(context)?;
+        Self::decode_proto(proto)
+    }
 
     /// Decode this value from a generated protobuf message in a byte slice.
     ///
@@ -173,6 +248,43 @@ pub trait DecodeProto: Sized {
     }
 }
 
+/// Decode a runtime value from one selected generated protobuf `oneof` variant.
+///
+/// Generated protobuf `oneof` enums are not messages, so this is deliberately
+/// separate from [`DecodeProto`]. Implement this for runtime values that model
+/// the selected variant of a wrapper message.
+pub trait DecodeProtoOneof: Sized {
+    /// The generated protobuf `oneof` enum consumed by this decoder.
+    type Proto;
+
+    /// Error returned when the `oneof` variant cannot become this value.
+    type Error: MissingRequiredProto;
+
+    /// Decode this value from one selected generated protobuf `oneof` variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the selected variant cannot satisfy this
+    /// runtime type's invariants.
+    fn decode_proto(proto: Self::Proto) -> Result<Self, Self::Error>;
+
+    /// Decode this value from a required generated protobuf `oneof` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the oneof is unset or the selected variant
+    /// cannot satisfy this runtime type's invariants.
+    fn decode_required_proto(
+        proto: Option<Self::Proto>,
+        context: <Self::Error as MissingRequiredProto>::Context,
+    ) -> Result<Self, Self::Error> {
+        match proto {
+            Some(proto) => Self::decode_proto(proto),
+            None => Err(Self::Error::missing_required(context)),
+        }
+    }
+}
+
 /// Decode a runtime value from an owned generated protobuf message with context.
 ///
 /// This stays separate from [`DecodeProto`] so call sites must make required
@@ -192,6 +304,26 @@ pub trait DecodeProtoWith<Context>: Sized {
     /// context is incompatible with the message, or when the decoded value
     /// cannot satisfy this runtime type's invariants.
     fn decode_proto_with(proto: Self::Proto, context: Context) -> Result<Self, Self::Error>;
+
+    /// Decode this value from a required generated protobuf message field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the field is absent, when the context is
+    /// incompatible with the message, or when the decoded value cannot satisfy
+    /// this runtime type's invariants.
+    fn decode_required_proto_field_with(
+        field: &mut MessageField<Self::Proto>,
+        missing_context: <Self::Error as MissingRequiredProto>::Context,
+        decode_context: Context,
+    ) -> Result<Self, Self::Error>
+    where
+        Self::Error: MissingRequiredProto,
+        Self::Proto: Default,
+    {
+        let proto = field.take_required_proto_field::<Self::Error>(missing_context)?;
+        Self::decode_proto_with(proto, decode_context)
+    }
 
     /// Decode this value from a generated protobuf message in a byte slice with
     /// explicit runtime context.

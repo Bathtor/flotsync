@@ -1,0 +1,13 @@
+id = "019f5761-b690-7ee0-9d3a-416aa365e213"
+ref = "flotsync-git-gkd"
+title = "Add collection helpers for protobuf codecs"
+body = "Add default helpers to the EncodeProto/DecodeProto scheme for repeated fields and common collection conversions, so codecs do not need to hand-write trivial iter().map(...).collect() and into_iter().map(...).collect() logic. This was discovered while addressing the pending group-decision storage review batch."
+status = "open"
+type = "task"
+priority = 0
+created_at = "2026-07-12T17:30:49.360312Z"
+updated_at = "2026-07-12T17:58:59.273296Z"
+
+[[links]]
+target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
+label = "discovered from"

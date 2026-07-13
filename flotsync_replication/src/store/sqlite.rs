@@ -5,17 +5,22 @@ use crate::{
         DatasetRowSlice,
         DatasetRowWrite,
         DatasetRowsBatch,
+        DatasetSchema,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
         GroupMemberKeys,
+        GroupSchema,
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberKeyTrustEvidenceSet,
         MemberPublicKeysRecord,
+        PendingGroupActivationRecord,
+        PendingGroupDecisionRecord,
+        PendingGroupWorkKey,
         ReplicationGroupRecord,
         ReplicationRowRecord,
         ReplicationRowSnapshot,
@@ -31,12 +36,22 @@ use crate::{
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
     },
-    runtime::messages::{
-        MemberCountContext,
-        RuntimeVersionVectorProtoSource,
-        UpdateMessage,
-        UpdateMessageProtoSource,
-        WireVersionVector,
+    codecs::{
+        messages::{
+            MemberCountContext,
+            RuntimeVersionVectorProtoSource,
+            UpdateMessage,
+            UpdateMessageProtoSource,
+            WireVersionVector,
+        },
+        pending_group::{
+            PendingGroupPayloadDecodeContext,
+            PendingGroupPayloadKind,
+            decode_pending_group_activation_payload,
+            decode_pending_group_decision_payload,
+            encode_pending_group_activation_payload,
+            encode_pending_group_decision_payload,
+        },
     },
 };
 use flotsync_core::{
@@ -331,6 +346,17 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
+    fn load_group_dataset_schema<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<SchemaSource>, StoreError>> {
+        async move {
+            load_group_dataset_schema(self.assert_open_connection(), group_id, dataset_id).await
+        }
+        .boxed()
+    }
+
     fn load_local_member_private_keys<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
@@ -459,6 +485,18 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn load_pending_group_decisions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
+        async move { load_pending_group_decisions(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_pending_group_activations(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
+        async move { load_pending_group_activations(self.assert_open_connection()).await }.boxed()
+    }
+
     fn release(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
             let connection = self
@@ -564,6 +602,38 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn upsert_pending_group_decision(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { upsert_pending_group_decision(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn remove_pending_group_decision(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move { remove_pending_group_decision(self.assert_open_connection(), key).await }
+            .boxed()
+    }
+
+    fn upsert_pending_group_activation(
+        &mut self,
+        record: PendingGroupActivationRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { upsert_pending_group_activation(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn remove_pending_group_activation(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move { remove_pending_group_activation(self.assert_open_connection(), key).await }
+            .boxed()
+    }
+
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
             let connection = self
@@ -598,10 +668,9 @@ type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 /// `i64::MAX`.
 const UPDATE_VERSION_SORT_KEY_BYTES: usize = 8;
 
-async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(), StoreError> {
-    let schema_statements = [
-        "PRAGMA foreign_keys = ON;",
-        "
+const SCHEMA_STATEMENTS: &[&str] = &[
+    "PRAGMA foreign_keys = ON;",
+    "
 CREATE TABLE IF NOT EXISTS replication_groups (
     group_id TEXT PRIMARY KEY NOT NULL,
     member_count INTEGER NOT NULL,
@@ -613,7 +682,7 @@ CREATE TABLE IF NOT EXISTS replication_groups (
     group_secret_ciphertext BLOB NOT NULL
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS group_members (
     group_id TEXT NOT NULL,
     member_index INTEGER NOT NULL,
@@ -624,7 +693,16 @@ CREATE TABLE IF NOT EXISTS group_members (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
+CREATE TABLE IF NOT EXISTS group_dataset_schemas (
+    group_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (group_id, dataset_id),
+    FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
+);
+",
+    "
 CREATE TABLE IF NOT EXISTS datasets (
     group_id TEXT NOT NULL,
     dataset_id TEXT NOT NULL,
@@ -632,7 +710,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS dataset_rows (
     group_id TEXT NOT NULL,
     dataset_id TEXT NOT NULL,
@@ -644,7 +722,7 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS dataset_updates (
     group_id TEXT NOT NULL,
     update_node_index INTEGER NOT NULL,
@@ -656,7 +734,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS local_members (
     member_identity TEXT PRIMARY KEY NOT NULL,
     private_keys_crypto_version INTEGER NOT NULL,
@@ -665,7 +743,7 @@ CREATE TABLE IF NOT EXISTS local_members (
     private_keys_ciphertext BLOB NOT NULL
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS member_public_keys (
     member_identity TEXT NOT NULL,
     key_fingerprint BLOB NOT NULL,
@@ -674,7 +752,7 @@ CREATE TABLE IF NOT EXISTS member_public_keys (
     PRIMARY KEY (member_identity, key_fingerprint)
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
     member_identity TEXT NOT NULL,
     key_fingerprint BLOB NOT NULL,
@@ -684,14 +762,34 @@ CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
         REFERENCES member_public_keys(member_identity, key_fingerprint) ON DELETE RESTRICT
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
     key_fingerprint BLOB PRIMARY KEY NOT NULL
 );
 ",
-    ];
-    for statement in schema_statements {
-        sqlx::query(statement)
+    "
+CREATE TABLE IF NOT EXISTS pending_group_decisions (
+    work_kind TEXT NOT NULL,
+    old_group_id TEXT NOT NULL,
+    new_group_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (work_kind, old_group_id, new_group_id)
+);
+",
+    "
+CREATE TABLE IF NOT EXISTS pending_group_activations (
+    work_kind TEXT NOT NULL,
+    old_group_id TEXT NOT NULL,
+    new_group_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (work_kind, old_group_id, new_group_id)
+);
+",
+];
+
+async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(), StoreError> {
+    for statement in SCHEMA_STATEMENTS {
+        sqlx::query(*statement)
             .execute(&mut *connection)
             .await
             .context(SqlxSnafu)?;
@@ -740,11 +838,13 @@ WHERE group_id = ?1
         encrypted_group_secret,
     };
     let member_keys = load_group_member_keys(connection, group_id, member_count).await?;
+    let group_schema = load_group_schema(connection, group_id).await?;
 
     Ok(Some(ReplicationGroupRecord {
         group_id: *group_id,
         member_keys,
         local_member_index,
+        group_schema,
         version_vector,
         security_material,
     }))
@@ -808,6 +908,76 @@ WHERE group_id IN (",
         }
     }
     Ok(groups)
+}
+
+async fn load_group_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<GroupSchema, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT dataset_id, payload
+FROM group_dataset_schemas
+WHERE group_id = ?1
+ORDER BY dataset_id
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut datasets = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let dataset_id = decode_dataset_id(&row.get::<String, _>("dataset_id"))?;
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let dataset_schema = decode_group_dataset_schema_payload(&payload)?;
+        ensure!(
+            dataset_schema.dataset_id == dataset_id,
+            StoredDatasetSchemaKeyMismatchSnafu {
+                group: *group_id,
+                key_dataset: dataset_id,
+                payload_dataset: dataset_schema.dataset_id.clone(),
+            }
+        );
+        datasets.insert(dataset_id, dataset_schema.schema);
+    }
+    Ok(GroupSchema::new(datasets))
+}
+
+async fn load_group_dataset_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+) -> Result<Option<SchemaSource>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT payload
+FROM group_dataset_schemas
+WHERE group_id = ?1 AND dataset_id = ?2
+",
+    )
+    .bind(group_id.to_string())
+    .bind(dataset_id.as_str())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    if let Some(row) = row {
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let dataset_schema = decode_group_dataset_schema_payload(&payload)?;
+        ensure!(
+            dataset_schema.dataset_id == *dataset_id,
+            StoredDatasetSchemaKeyMismatchSnafu {
+                group: *group_id,
+                key_dataset: dataset_id.clone(),
+                payload_dataset: dataset_schema.dataset_id.clone(),
+            }
+        );
+        return Ok(Some(dataset_schema.schema));
+    }
+
+    Ok(None)
 }
 
 async fn insert_replication_group(
@@ -883,6 +1053,29 @@ VALUES (?1, ?2, ?3, ?4)
         .bind(member_index)
         .bind(member_key.member_id.to_string())
         .bind(member_key.fingerprint.as_ref())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    }
+    insert_group_schema(connection, group.group_id, &group.group_schema).await?;
+    Ok(())
+}
+
+async fn insert_group_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    group_schema: &GroupSchema,
+) -> Result<(), StoreError> {
+    for dataset_schema in group_schema.datasets() {
+        sqlx::query(
+            "
+INSERT INTO group_dataset_schemas (group_id, dataset_id, payload)
+VALUES (?1, ?2, ?3)
+",
+        )
+        .bind(group_id.to_string())
+        .bind(dataset_schema.dataset_id.as_str())
+        .bind(encode_group_dataset_schema_payload(&dataset_schema))
         .execute(&mut *connection)
         .await
         .context(SqlxSnafu)?;
@@ -1244,6 +1437,7 @@ async fn load_dataset_rows(
         .get(dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: *group_id,
             dataset_id: dataset_id.clone(),
         })?;
     let member_count = load_group_member_count(connection, group_id).await?;
@@ -1324,6 +1518,7 @@ async fn scan_dataset_row_batch(
         .get(dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: *group_id,
             dataset_id: dataset_id.clone(),
         })?;
     let member_count = load_group_member_count(connection, group_id).await?;
@@ -1341,7 +1536,8 @@ WHERE group_id = ",
         query_builder.push_bind(after.to_string());
     }
     query_builder.push(" ORDER BY row_key LIMIT ");
-    query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+    let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
+    query_builder.push_bind(stored_limit);
 
     let stored_rows = query_builder
         .build()
@@ -1389,6 +1585,7 @@ async fn apply_dataset_row_patch(
         .get(&patch.dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: patch.group_id,
             dataset_id: patch.dataset_id.clone(),
         })?;
     ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
@@ -1505,12 +1702,8 @@ WHERE group_id = ?1
     let Some(row) = row else {
         return Ok(None);
     };
-    Ok(Some(decode_stored_update_row(
-        group_id,
-        member_count,
-        update_id,
-        &row,
-    )?))
+    let update = decode_stored_update_row(group_id, member_count, update_id, &row)?;
+    Ok(Some(update))
 }
 
 async fn load_replication_updates(
@@ -1532,7 +1725,8 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+        let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
+        query_builder.push_bind(stored_limit);
     }
     let rows = query_builder
         .build()
@@ -1546,12 +1740,8 @@ WHERE group_id = ",
             node_index: decode_member_index_value(row.get::<i64, _>("update_node_index"))?,
             version: decode_update_version_sort_key(&row.get::<Vec<u8>, _>("update_version"))?,
         };
-        updates.push(decode_stored_update_row(
-            group_id,
-            member_count,
-            update_id,
-            &row,
-        )?);
+        let update = decode_stored_update_row(group_id, member_count, update_id, &row)?;
+        updates.push(update);
     }
     Ok(updates)
 }
@@ -1574,7 +1764,8 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+        let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
+        query_builder.push_bind(stored_limit);
     }
     let rows = query_builder
         .build()
@@ -1682,6 +1873,341 @@ WHERE group_id = ?1
     Ok(())
 }
 
+async fn load_pending_group_decisions(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<PendingGroupDecisionRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT work_kind, old_group_id, new_group_id, payload
+FROM pending_group_decisions
+",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = decode_pending_group_sql_key(&row)?;
+        let context = pending_group_payload_decode_context(connection, &key).await?;
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let record = decode_stored_proto(
+            "pending group decision",
+            decode_pending_group_decision_payload(key.kind, &payload, context),
+        )?;
+        validate_pending_group_payload_key(record.key(), key)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+async fn load_pending_group_activations(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<PendingGroupActivationRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT work_kind, old_group_id, new_group_id, payload
+FROM pending_group_activations
+",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let key = decode_pending_group_sql_key(&row)?;
+        let context = pending_group_payload_decode_context(connection, &key).await?;
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let record = decode_stored_proto(
+            "pending group activation",
+            decode_pending_group_activation_payload(key.kind, &payload, context),
+        )?;
+        validate_pending_group_payload_key(record.key(), key)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+async fn upsert_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    record: &PendingGroupDecisionRecord,
+) -> Result<(), StoreError> {
+    let (kind, payload) = encode_pending_group_decision_payload(record);
+    let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
+    let old_group_id = key.old_group_id_sql();
+    sqlx::query(
+        "
+INSERT INTO pending_group_decisions (work_kind, old_group_id, new_group_id, payload)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(work_kind, old_group_id, new_group_id) DO UPDATE SET payload = excluded.payload
+",
+    )
+    .bind(key.kind.as_sql())
+    .bind(old_group_id)
+    .bind(key.new_group_id.to_string())
+    .bind(payload)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn remove_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    key: PendingGroupWorkKey,
+) -> Result<bool, StoreError> {
+    let key = PendingGroupSqlKey::from_work_key_only(key);
+    let rows_affected = delete_pending_group_decision_row(connection, &key).await?;
+    Ok(rows_affected > 0)
+}
+
+async fn upsert_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    record: &PendingGroupActivationRecord,
+) -> Result<(), StoreError> {
+    let (kind, payload) = encode_pending_group_activation_payload(record);
+    let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
+    let old_group_id = key.old_group_id_sql();
+    sqlx::query(
+        "
+INSERT INTO pending_group_activations (work_kind, old_group_id, new_group_id, payload)
+VALUES (?1, ?2, ?3, ?4)
+ON CONFLICT(work_kind, old_group_id, new_group_id) DO UPDATE SET payload = excluded.payload
+",
+    )
+    .bind(key.kind.as_sql())
+    .bind(old_group_id)
+    .bind(key.new_group_id.to_string())
+    .bind(payload)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn remove_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    key: PendingGroupWorkKey,
+) -> Result<bool, StoreError> {
+    let key = PendingGroupSqlKey::from_work_key_only(key);
+    let rows_affected = delete_pending_group_activation_row(connection, &key).await?;
+    Ok(rows_affected > 0)
+}
+
+async fn delete_pending_group_decision_row(
+    connection: &mut SqliteStoreConnection,
+    key: &PendingGroupSqlKey,
+) -> Result<u64, StoreError> {
+    let rows_affected = match key.old_group_id {
+        Some(old_group_id) => sqlx::query(
+            "
+DELETE FROM pending_group_decisions
+WHERE work_kind = ?1 AND old_group_id = ?2 AND new_group_id = ?3
+",
+        )
+        .bind(key.kind.as_sql())
+        .bind(old_group_id.to_string())
+        .bind(key.new_group_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?
+        .rows_affected(),
+        None => sqlx::query(
+            "
+DELETE FROM pending_group_decisions
+WHERE work_kind = ?1 AND old_group_id = 'NONE' AND new_group_id = ?2
+",
+        )
+        .bind(key.kind.as_sql())
+        .bind(key.new_group_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?
+        .rows_affected(),
+    };
+    Ok(rows_affected)
+}
+
+async fn delete_pending_group_activation_row(
+    connection: &mut SqliteStoreConnection,
+    key: &PendingGroupSqlKey,
+) -> Result<u64, StoreError> {
+    let rows_affected = match key.old_group_id {
+        Some(old_group_id) => sqlx::query(
+            "
+DELETE FROM pending_group_activations
+WHERE work_kind = ?1 AND old_group_id = ?2 AND new_group_id = ?3
+",
+        )
+        .bind(key.kind.as_sql())
+        .bind(old_group_id.to_string())
+        .bind(key.new_group_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?
+        .rows_affected(),
+        None => sqlx::query(
+            "
+DELETE FROM pending_group_activations
+WHERE work_kind = ?1 AND old_group_id = 'NONE' AND new_group_id = ?2
+",
+        )
+        .bind(key.kind.as_sql())
+        .bind(key.new_group_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?
+        .rows_affected(),
+    };
+    Ok(rows_affected)
+}
+
+const PENDING_GROUP_ABSENT_OLD_GROUP_ID: &str = "NONE";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingGroupSqlKey {
+    /// Stored payload discriminator matching the concrete encoded payload type.
+    kind: PendingGroupPayloadKind,
+    /// Existing group that authorises migration work, absent for ordinary invitations.
+    old_group_id: Option<GroupId>,
+    /// Target group for invitations and proposals.
+    new_group_id: GroupId,
+}
+
+impl PendingGroupSqlKey {
+    /// Convert a runtime work key into the SQL key and assert the encoded payload kind.
+    fn from_work_key(key: PendingGroupWorkKey, kind: PendingGroupPayloadKind) -> Self {
+        let sql_key = Self::from_work_key_only(key);
+        debug_assert_eq!(sql_key.kind, kind);
+        sql_key
+    }
+
+    /// Convert a runtime work key into the multi-column SQL key shape.
+    fn from_work_key_only(key: PendingGroupWorkKey) -> Self {
+        match key {
+            PendingGroupWorkKey::GroupInvitation { group_id, source } => match source {
+                crate::api::GroupInvitationSource::Creation => Self {
+                    kind: PendingGroupPayloadKind::GroupInvitation,
+                    old_group_id: None,
+                    new_group_id: group_id,
+                },
+                crate::api::GroupInvitationSource::Migration { migration_id } => Self {
+                    kind: PendingGroupPayloadKind::GroupInvitation,
+                    old_group_id: Some(migration_id.old_group_id),
+                    new_group_id: migration_id.new_group_id,
+                },
+            },
+            PendingGroupWorkKey::MigrationProposal { migration_id } => Self {
+                kind: PendingGroupPayloadKind::MigrationProposal,
+                old_group_id: Some(migration_id.old_group_id),
+                new_group_id: migration_id.new_group_id,
+            },
+        }
+    }
+
+    /// Return the stable SQL value for the nullable semantic old-group id.
+    fn old_group_id_sql(self) -> String {
+        match self.old_group_id {
+            Some(group_id) => group_id.to_string(),
+            None => PENDING_GROUP_ABSENT_OLD_GROUP_ID.to_owned(),
+        }
+    }
+}
+
+impl PendingGroupPayloadKind {
+    /// Return the stable SQL discriminator stored beside pending group payloads.
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::GroupInvitation => "group_invitation",
+            Self::MigrationProposal => "migration_proposal",
+        }
+    }
+}
+
+#[derive(Debug, Snafu)]
+enum PendingGroupSqlKeyError {
+    /// Stored `work_kind` did not name any supported pending group payload.
+    #[snafu(display("Unknown pending group work kind '{raw}'."))]
+    UnknownWorkKind { raw: String },
+    /// Migration proposals must reference the existing group that authorised them.
+    #[snafu(display("Pending migration proposal key did not contain old_group_id."))]
+    MissingMigrationProposalOldGroupId,
+    /// The decoded payload described different pending work from the SQL key.
+    #[snafu(display("Pending payload key {payload_key:?} did not match SQL key {sql_key:?}."))]
+    PayloadKeyMismatch {
+        payload_key: PendingGroupSqlKey,
+        sql_key: PendingGroupSqlKey,
+    },
+}
+
+/// Decode one pending group SQL row key from its discriminator and group columns.
+fn decode_pending_group_sql_key(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PendingGroupSqlKey, StoreError> {
+    let raw_work_kind = row.get::<String, _>("work_kind");
+    let kind = match raw_work_kind.as_str() {
+        "group_invitation" => PendingGroupPayloadKind::GroupInvitation,
+        "migration_proposal" => PendingGroupPayloadKind::MigrationProposal,
+        _ => {
+            return Err(invalid_stored_object(
+                "pending group sql key",
+                PendingGroupSqlKeyError::UnknownWorkKind { raw: raw_work_kind },
+            ));
+        }
+    };
+    let raw_old_group_id = row.get::<String, _>("old_group_id");
+    let old_group_id = if raw_old_group_id == PENDING_GROUP_ABSENT_OLD_GROUP_ID {
+        None
+    } else {
+        Some(decode_group_id(&raw_old_group_id)?)
+    };
+    let new_group_id = decode_group_id(&row.get::<String, _>("new_group_id"))?;
+    if kind == PendingGroupPayloadKind::MigrationProposal && old_group_id.is_none() {
+        return Err(invalid_stored_object(
+            "pending group sql key",
+            PendingGroupSqlKeyError::MissingMigrationProposalOldGroupId,
+        ));
+    }
+    Ok(PendingGroupSqlKey {
+        kind,
+        old_group_id,
+        new_group_id,
+    })
+}
+
+/// Build the payload decode context available from the pending group SQL key.
+async fn pending_group_payload_decode_context(
+    connection: &mut SqliteStoreConnection,
+    key: &PendingGroupSqlKey,
+) -> Result<PendingGroupPayloadDecodeContext, StoreError> {
+    let old_group_member_count = match key.old_group_id {
+        Some(group_id) => load_optional_group_member_count(connection, &group_id).await?,
+        None => None,
+    };
+    Ok(PendingGroupPayloadDecodeContext {
+        old_group_member_count,
+    })
+}
+
+/// Validate that decoded pending work still matches the row key it was stored under.
+fn validate_pending_group_payload_key(
+    payload_key: PendingGroupWorkKey,
+    sql_key: PendingGroupSqlKey,
+) -> Result<(), StoreError> {
+    let payload_key = PendingGroupSqlKey::from_work_key_only(payload_key);
+    if payload_key == sql_key {
+        return Ok(());
+    }
+    Err(invalid_stored_object(
+        "pending group sql key",
+        PendingGroupSqlKeyError::PayloadKeyMismatch {
+            payload_key,
+            sql_key,
+        },
+    ))
+}
+
 async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -1746,6 +2272,24 @@ WHERE group_id = ?1
         .map_err(StoreError::from);
     };
     decode_non_zero_member_count(member_count)
+}
+
+async fn load_optional_group_member_count(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<NonZeroUsize>, StoreError> {
+    let member_count = sqlx::query_scalar::<_, i64>(
+        "
+SELECT member_count
+FROM replication_groups
+WHERE group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    member_count.map(decode_non_zero_member_count).transpose()
 }
 
 async fn dataset_exists_in_group(
@@ -1825,6 +2369,17 @@ fn decode_dataset_row_last_changed_versions(
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
     RuntimeVersionVectorProtoSource::from(version_vector).encode_proto_to_vec()
+}
+
+fn encode_group_dataset_schema_payload(dataset_schema: &DatasetSchema) -> Vec<u8> {
+    dataset_schema.encode_proto_to_vec()
+}
+
+fn decode_group_dataset_schema_payload(bytes: &[u8]) -> Result<DatasetSchema, StoreError> {
+    decode_stored_proto(
+        "group dataset schema",
+        DatasetSchema::try_decode_proto_from_slice(bytes),
+    )
 }
 
 fn decode_stored_version_vector(
@@ -1971,15 +2526,20 @@ fn decode_group_id(raw: &str) -> Result<GroupId, StoreError> {
     Ok(GroupId(group_id))
 }
 
+fn decode_dataset_id(raw: &str) -> Result<DatasetId, StoreError> {
+    DatasetId::try_new(raw.to_owned()).map_err(|source| invalid_stored_object("dataset id", source))
+}
+
 fn decode_row_key(raw: &str) -> Result<RowKey, StoreError> {
     let row_key = Uuid::parse_str(raw).context(InvalidRowKeySnafu)?;
     Ok(RowKey(row_key))
 }
 
 fn decode_member_identity(raw: &str) -> Result<MemberIdentity, StoreError> {
-    Ok(raw.parse().context(InvalidMemberIdentitySnafu {
+    let member_identity = raw.parse().context(InvalidMemberIdentitySnafu {
         raw: raw.to_owned(),
-    })?)
+    })?;
+    Ok(member_identity)
 }
 
 fn decode_key_fingerprint(raw: &[u8]) -> Result<KeyFingerprint, StoreError> {
@@ -2093,8 +2653,13 @@ enum SqliteStoreError {
         expected_member_count: usize,
         actual_member_count: usize,
     },
-    #[snafu(display("Stored schema source for dataset '{dataset_id}' was missing."))]
-    MissingSchema { dataset_id: DatasetId },
+    #[snafu(display(
+        "Stored schema source for dataset '{dataset_id}' in group '{group_id}' was missing."
+    ))]
+    MissingSchema {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
     #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
     DecodeStoredProto {
         object: &'static str,
@@ -2127,6 +2692,14 @@ enum SqliteStoreError {
     StoredUpdateIdMismatch {
         expected_update_id: UpdateId,
         actual_update_id: UpdateId,
+    },
+    #[snafu(display(
+        "Stored schema payload for group '{group}' was keyed as dataset '{key_dataset}' but contained dataset '{payload_dataset}'."
+    ))]
+    StoredDatasetSchemaKeyMismatch {
+        group: GroupId,
+        key_dataset: DatasetId,
+        payload_dataset: DatasetId,
     },
     #[snafu(display("Stored group '{group_id}' was missing."))]
     MissingStoredGroup { group_id: GroupId },
@@ -2162,11 +2735,22 @@ mod tests {
         api::{
             DatasetRowPatch,
             DatasetRowWrite,
+            GroupInvitation,
+            GroupSchema,
+            InitialDatasetState,
+            InitialGroupState,
+            InitialRowState,
+            InitialSnapshot,
+            InitialSnapshotMetadata,
             MemberKeyTrustEvidenceKind,
             MemberKeyTrustEvidenceRecord,
             MemberPublicKeysRecord,
+            MigrationId,
+            MigrationProposal,
+            PendingGroupDecisionRecord,
             ReplicationRowRecord,
             ReplicationUpdateFilter,
+            SnapshotRef,
             current_slice_placeholder_group_security_material,
         },
         test_support::test_public_member_keys,
@@ -2175,7 +2759,11 @@ mod tests {
     use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
     use itertools::Itertools;
-    use std::{assert_matches, collections::HashSet, time::Duration};
+    use std::{
+        assert_matches,
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2222,6 +2810,210 @@ mod tests {
         Identifier::from_array(["app", "bob"])
     }
 
+    fn third_member() -> MemberIdentity {
+        Identifier::from_array(["app", "carol"])
+    }
+
+    fn initial_versions(member_count: usize) -> VersionVector {
+        VersionVector::initial(NonZeroUsize::new(member_count).expect("member count is non-zero"))
+    }
+
+    fn metadata_snapshot(
+        primary_group_id: GroupId,
+        equivalent_group_id: GroupId,
+    ) -> InitialSnapshot {
+        InitialSnapshot::Metadata(InitialSnapshotMetadata {
+            primary_ref: SnapshotRef {
+                group_id: primary_group_id,
+                versions: initial_versions(2),
+            },
+            equivalent_refs: smallvec::smallvec![SnapshotRef {
+                group_id: equivalent_group_id,
+                versions: initial_versions(3),
+            }],
+            record_count: Some(7),
+        })
+    }
+
+    fn inline_snapshot() -> InitialSnapshot {
+        InitialSnapshot::Inline(InitialGroupState {
+            datasets: vec![InitialDatasetState {
+                dataset_id: docs_dataset_id(),
+                rows: vec![InitialRowState {
+                    row_key: RowKey(Uuid::from_u128(30_001)),
+                    row: crate::row_values! {
+                        "title" => "stored",
+                    },
+                }],
+            }],
+        })
+    }
+
+    fn creation_invitation_decision(group_id: GroupId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+            group_id,
+            vec![local_member(), remote_member()],
+            GroupSchema::default(),
+            InitialSnapshot::Empty,
+            Some("shared docs".to_owned()),
+            Some("join".to_owned()),
+        ))
+    }
+
+    fn migration_invitation_decision(migration_id: MigrationId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_migration(
+            migration_id,
+            vec![local_member(), remote_member(), third_member()],
+            GroupSchema::default(),
+            inline_snapshot(),
+            None,
+            Some("migration invite".to_owned()),
+        ))
+    }
+
+    fn migration_proposal_decision(migration_id: MigrationId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions: initial_versions(2).with_version_at(0, 3),
+            proposed_members: vec![local_member(), remote_member(), third_member()],
+            group_schema: GroupSchema::default(),
+            initial_snapshot: metadata_snapshot(
+                migration_id.old_group_id,
+                migration_id.new_group_id,
+            ),
+            group_name: Some("new docs".to_owned()),
+            message: None,
+        })
+    }
+
+    #[test]
+    fn pending_group_decisions_round_trip_through_sqlite_payloads() {
+        let store = in_memory_store(local_member());
+        let migration_id = MigrationId {
+            old_group_id: GroupId(Uuid::from_u128(10_001)),
+            new_group_id: GroupId(Uuid::from_u128(10_002)),
+        };
+        let records = vec![
+            creation_invitation_decision(GroupId(Uuid::from_u128(10_000))),
+            migration_invitation_decision(migration_id),
+            migration_proposal_decision(migration_id),
+        ];
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .insert_replication_group(sample_group(migration_id.old_group_id))
+                .await
+                .expect("old group should store");
+            for record in records.iter().cloned() {
+                transaction
+                    .upsert_pending_group_decision(record)
+                    .await
+                    .expect("pending decision should store");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_decisions()
+                .await
+                .expect("pending decisions should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+
+        assert_eq!(loaded.len(), records.len());
+        for record in records {
+            assert!(
+                loaded.contains(&record),
+                "loaded decisions should contain {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_group_activation_remove_is_idempotent() {
+        let store = in_memory_store(local_member());
+        let migration_id = MigrationId {
+            old_group_id: GroupId(Uuid::from_u128(11_001)),
+            new_group_id: GroupId(Uuid::from_u128(11_002)),
+        };
+        let record = migration_proposal_decision(migration_id).into_activation();
+        let key = record.key();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .insert_replication_group(sample_group(migration_id.old_group_id))
+                .await
+                .expect("old group should store");
+            transaction
+                .upsert_pending_group_activation(record.clone())
+                .await
+                .expect("pending activation should store");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_activations()
+                .await
+                .expect("pending activations should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+        assert_eq!(loaded, vec![record]);
+
+        let (first_removed, second_removed) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let first_removed = transaction
+                .remove_pending_group_activation(key)
+                .await
+                .expect("first remove should succeed");
+            let second_removed = transaction
+                .remove_pending_group_activation(key)
+                .await
+                .expect("second remove should succeed");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+            (first_removed, second_removed)
+        });
+        assert!(first_removed);
+        assert!(!second_removed);
+    }
+
     #[test]
     fn stored_member_identity_rejects_overlong_identifier() {
         let raw = std::iter::repeat_n("s", MAX_IDENTIFIER_SEGMENTS + 1).join(".");
@@ -2250,6 +3042,13 @@ mod tests {
         Arc::new(Schema::from_fields([Field::linear_string("title")]))
     }
 
+    fn docs_group_schema() -> GroupSchema {
+        GroupSchema::new(HashMap::from([(
+            docs_dataset_id(),
+            SchemaSource::from(title_schema()),
+        )]))
+    }
+
     fn sample_encrypted_secret(seed: u8) -> EncryptedStoreSecret {
         EncryptedStoreSecret {
             crypto_version: StoreSecretCryptoVersion::new(1),
@@ -2275,6 +3074,7 @@ mod tests {
             group_id,
             member_keys,
             local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
             version_vector,
             security_material: current_slice_placeholder_group_security_material(group_id),
         }
@@ -2484,6 +3284,7 @@ mod tests {
             .expect("group should exist");
         assert_eq!(loaded_group.group_id, group.group_id);
         assert_eq!(loaded_group.member_keys, group.member_keys);
+        assert_eq!(loaded_group.group_schema, group.group_schema);
         assert_eq!(loaded_group.security_material, group.security_material);
         assert_eq!(
             loaded_group.version_vector.iter().collect::<Vec<_>>(),

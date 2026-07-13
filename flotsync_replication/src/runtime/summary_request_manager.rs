@@ -1,9 +1,12 @@
-use super::{
-    errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary},
-    messages::{RuntimeMessage, SummaryRequestMessage, WireRuntimeMessage, WireSummaryMessage},
-};
+use super::errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary};
 use crate::{
     api::{ApiError, ApiExternalSnafu, Summary, SummaryRequest},
+    codecs::messages::{
+        RuntimeMessage,
+        SummaryRequestMessage,
+        WireRuntimeMessage,
+        WireSummaryMessage,
+    },
     delivery::{
         contracts::{
             ReliableDeliveryPort,

@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::messages::UpdateBatchMessage;
 use super::{
     DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
     catch_up_manager::{
@@ -16,11 +14,12 @@ use super::{
         GroupInstallError,
         InboundDeliveryError,
         InboundFailureAction,
-        InitialStateUnsupportedSnafu,
         InvalidGroupSnafu,
         InvalidMembersSnafu,
         LocalMemberMissingSnafu,
+        PendingGroupActivationResumeUnsupportedSnafu,
         PublishChangesError,
+        ReplayPendingDecisionSnafu,
         RuntimeStartupError,
         SecuritySnafu,
         SnapshotRowsError,
@@ -43,25 +42,13 @@ use super::{
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
-    messages::{
-        BootstrapGroupKey,
-        BootstrapGroupMessage,
-        BootstrapMemberKeyMessage,
-        RuntimeMessage,
-        SummaryMessage,
-        SummaryRequestMessage,
-        UpdateMessage,
-        UpdateRangeMessage,
-        WireRuntimeMessage,
-        WireSummaryMessage,
-        WireUpdateBatchMessage,
-        WireUpdateMessage,
-    },
     replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::api::MemberKeyId;
+#[cfg(test)]
+use crate::codecs::messages::UpdateBatchMessage;
 #[cfg(any(test, feature = "test-support"))]
 use crate::test_support::{test_group_key, test_public_member_keys};
 use crate::{
@@ -77,12 +64,17 @@ use crate::{
         DatasetRowWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupInvitationResponder,
         GroupMemberKeys,
+        GroupSchema,
         MigrationId,
+        MigrationProposalResponder,
+        PendingGroupWorkKey,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
         ReadToken,
+        RejectionReason,
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
@@ -111,6 +103,20 @@ use crate::{
             PublicKeyBundleReport,
             RecordPublicKeyBundleFeedbackRequest,
         },
+    },
+    codecs::messages::{
+        BootstrapGroupKey,
+        BootstrapGroupMessage,
+        BootstrapMemberKeyMessage,
+        RuntimeMessage,
+        SummaryMessage,
+        SummaryRequestMessage,
+        UpdateMessage,
+        UpdateRangeMessage,
+        WireRuntimeMessage,
+        WireSummaryMessage,
+        WireUpdateBatchMessage,
+        WireUpdateMessage,
     },
     delivery::{
         contracts::{
@@ -145,6 +151,7 @@ use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
     BoxFuture,
     KClaimablePromise,
+    OptionExt as _,
     ResultExt as _,
     kompact_config::ConfigReadExt as _,
 };
@@ -437,6 +444,27 @@ impl BatchProvider for StoreSnapshotRowProvider {
     }
 }
 
+/// Application response to one pending group decision replayed through the listener.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingGroupDecisionResponse {
+    /// Stable idempotence key of the pending decision being resolved.
+    key: PendingGroupWorkKey,
+    /// Requested resolution for the pending decision.
+    response: PendingGroupDecisionResponseKind,
+}
+
+/// Resolution requested by a listener-facing pending group responder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PendingGroupDecisionResponseKind {
+    /// Accept the pending decision and move it into activation work.
+    Accept,
+    /// Reject the pending decision and discard it.
+    Reject {
+        /// Application-supplied reason for the rejection.
+        reason: RejectionReason,
+    },
+}
+
 /// Local-actor messages understood by [`ReplicationRuntimeComponent`].
 ///
 /// This is the imperative bridge surface between the public async runtime
@@ -461,6 +489,8 @@ pub enum ReplicationRuntimeMessage {
     CreateGroup(Ask<CreateGroupRequest, Result<GroupId, ApiError>>),
     /// Request one group-membership change through the component interface.
     ChangeGroupMembership(Ask<ChangeGroupMembershipRequest, Result<MigrationId, ApiError>>),
+    /// Resolve one listener-mediated pending group decision through the component.
+    PendingGroupDecisionResponse(Ask<PendingGroupDecisionResponse, Result<(), ApiError>>),
     /// Test-support command channel for runtime fixture setup and assertions.
     #[cfg(any(test, feature = "test-support"))]
     Test(ReplicationRuntimeTestMessage),
@@ -562,6 +592,66 @@ pub struct ReplicationRuntimeComponent {
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
     max_inline_bootstrap_public_key_bundles: usize,
+}
+
+struct ComponentBackedPendingGroupResponder {
+    /// Runtime component mailbox used to apply listener decisions on the component thread.
+    runtime_ref: ActorRefStrong<ReplicationRuntimeMessage>,
+    /// Stable store key for the decision event that produced this responder.
+    decision_key: PendingGroupWorkKey,
+}
+
+impl ComponentBackedPendingGroupResponder {
+    /// Send the listener's decision back through the runtime component mailbox.
+    fn respond(
+        self,
+        response: PendingGroupDecisionResponseKind,
+    ) -> BoxFuture<'static, Result<(), ApiError>> {
+        let Self {
+            runtime_ref,
+            decision_key,
+        } = self;
+        let request = PendingGroupDecisionResponse {
+            key: decision_key,
+            response,
+        };
+        let future = runtime_ref.ask_with(move |promise| {
+            ReplicationRuntimeMessage::PendingGroupDecisionResponse(Ask::new(promise, request))
+        });
+        async move {
+            match future.await {
+                Ok(reply) => reply,
+                Err(_) => Err(ApiError::RuntimeUnavailable),
+            }
+        }
+        .boxed()
+    }
+}
+
+impl GroupInvitationResponder for ComponentBackedPendingGroupResponder {
+    fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>> {
+        (*self).respond(PendingGroupDecisionResponseKind::Accept)
+    }
+
+    fn reject(
+        self: Box<Self>,
+        reason: RejectionReason,
+    ) -> BoxFuture<'static, Result<(), ApiError>> {
+        (*self).respond(PendingGroupDecisionResponseKind::Reject { reason })
+    }
+}
+
+impl MigrationProposalResponder for ComponentBackedPendingGroupResponder {
+    fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>> {
+        (*self).respond(PendingGroupDecisionResponseKind::Accept)
+    }
+
+    fn reject(
+        self: Box<Self>,
+        reason: RejectionReason,
+    ) -> BoxFuture<'static, Result<(), ApiError>> {
+        (*self).respond(PendingGroupDecisionResponseKind::Reject { reason })
+    }
 }
 
 impl ReplicationRuntimeComponent {
@@ -717,6 +807,7 @@ impl ReplicationRuntimeComponent {
         &self,
         group_id: GroupId,
         member_keys: GroupMemberKeys,
+        group_schema: GroupSchema,
         security_material: crate::api::EncryptedGroupSecurityMaterial,
     ) -> ReplicationGroupRecord {
         let member_count = NonZeroUsize::new(member_keys.len())
@@ -728,6 +819,7 @@ impl ReplicationRuntimeComponent {
             group_id,
             member_keys,
             local_member_index,
+            group_schema,
             version_vector: VersionVector::initial(member_count),
             security_material,
         }
@@ -958,7 +1050,8 @@ impl ReplicationRuntimeComponent {
                 .context(StoreGroupSnafu { group_id })?;
             ensure!(
                 existing.member_keys == record.member_keys
-                    && existing.local_member_index == record.local_member_index,
+                    && existing.local_member_index == record.local_member_index
+                    && existing.group_schema == record.group_schema,
                 ConflictingExistingGroupSnafu { group_id }
             );
             return Ok(existing);
@@ -1029,6 +1122,109 @@ impl ReplicationRuntimeComponent {
         Ok(memberships)
     }
 
+    /// Re-fire unresolved listener-mediated group decisions after startup.
+    async fn replay_pending_group_decisions(
+        &mut self,
+        runtime_ref: ActorRefStrong<ReplicationRuntimeMessage>,
+    ) -> Result<(), RuntimeStartupError> {
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(StoreStartupSnafu)?;
+        let pending_decisions = transaction
+            .load_pending_group_decisions()
+            .await
+            .context(StoreStartupSnafu)?;
+        transaction.release().await.context(StoreStartupSnafu)?;
+
+        for decision in pending_decisions {
+            let responder = ComponentBackedPendingGroupResponder {
+                runtime_ref: runtime_ref.clone(),
+                decision_key: decision.key(),
+            };
+            let event = decision.to_event(responder);
+            self.listener
+                .on_event(event)
+                .await
+                .context(ReplayPendingDecisionSnafu)?;
+        }
+        Ok(())
+    }
+
+    /// Resume accepted group activations without re-asking the listener.
+    async fn resume_pending_group_activations(&mut self) -> Result<(), RuntimeStartupError> {
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(StoreStartupSnafu)?;
+        let pending_activations = transaction
+            .load_pending_group_activations()
+            .await
+            .context(StoreStartupSnafu)?;
+        transaction.release().await.context(StoreStartupSnafu)?;
+
+        ensure!(
+            pending_activations.is_empty(),
+            PendingGroupActivationResumeUnsupportedSnafu {
+                activation_count: pending_activations.len(),
+            }
+        );
+        Ok(())
+    }
+
+    /// Apply one listener response to a replayed pending group decision.
+    async fn apply_pending_group_decision_response(
+        &mut self,
+        response: PendingGroupDecisionResponse,
+    ) -> Result<(), ApiError> {
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        match response.response {
+            PendingGroupDecisionResponseKind::Accept => {
+                let pending_decision = transaction
+                    .load_pending_group_decisions()
+                    .await
+                    .boxed()
+                    .context(ApiExternalSnafu)?
+                    .into_iter()
+                    .find(|decision| decision.key() == response.key);
+                if let Some(decision) = pending_decision {
+                    let removed = transaction
+                        .remove_pending_group_decision(response.key)
+                        .await
+                        .boxed()
+                        .context(ApiExternalSnafu)?;
+                    if removed {
+                        transaction
+                            .upsert_pending_group_activation(decision.into_activation())
+                            .await
+                            .boxed()
+                            .context(ApiExternalSnafu)?;
+                    }
+                }
+            }
+            PendingGroupDecisionResponseKind::Reject { .. } => {
+                transaction
+                    .remove_pending_group_decision(response.key)
+                    .await
+                    .boxed()
+                    .context(ApiExternalSnafu)?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        Ok(())
+    }
+
     /// Submit one encoded live update to the group-broadcast layer.
     fn submit_group_update(&mut self, prepared_publish: &PreparedLocalPublish) {
         self.group_broadcast.trigger(
@@ -1081,11 +1277,7 @@ impl ReplicationRuntimeComponent {
     fn prepare_created_group(
         &self,
         req: CreateGroupRequest,
-    ) -> Result<(GroupId, GroupMembers), CreateGroupError> {
-        if req.initial_state.is_some() {
-            return InitialStateUnsupportedSnafu.fail();
-        }
-
+    ) -> Result<(GroupId, GroupMembers, GroupSchema), CreateGroupError> {
         let members =
             GroupMembers::from_ordered_members(req.members).context(InvalidMembersSnafu)?;
         ensure!(
@@ -1096,7 +1288,7 @@ impl ReplicationRuntimeComponent {
         );
 
         let group_id = GroupId(Uuid::new_v4());
-        Ok((group_id, members))
+        Ok((group_id, members, req.group_schema))
     }
 
     /// Read the maximum group size for inlining bootstrap public key bundles.
@@ -1112,6 +1304,7 @@ impl ReplicationRuntimeComponent {
         max_inline_public_key_bundles: usize,
         group_id: GroupId,
         members: &GroupMembers,
+        group_schema: GroupSchema,
     ) -> Result<PreparedGroupBootstrap, CreateGroupError> {
         let group_key = DeliverySecurity::generate_group_key()
             .boxed()
@@ -1137,6 +1330,7 @@ impl ReplicationRuntimeComponent {
             group_id,
             members.ordered_members(),
             bootstrap_member_keys,
+            group_schema,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
             BootstrapGroupKey::from_group_key(group_key),
         )
@@ -1476,7 +1670,12 @@ impl ReplicationRuntimeComponent {
         let member_keys =
             GroupMemberKeys::from_ordered_member_keys(message.ordered_member_key_ids())
                 .context(inbound::InvalidBootstrapMembersSnafu)?;
-        let record = self.build_replication_group_record(group_id, member_keys, security_material);
+        let record = self.build_replication_group_record(
+            group_id,
+            member_keys,
+            message.group_schema().clone(),
+            security_material,
+        );
         let persisted_group = self
             .store_new_replication_group(record)
             .await
@@ -2127,7 +2326,7 @@ impl ReplicationRuntimeComponent {
     ) -> HandlerResult {
         let (promise, req) = ask.take();
         let created_group = self.prepare_created_group(req);
-        let (group_id, members) = match created_group {
+        let (group_id, members, group_schema) = match created_group {
             Ok(created_group) => created_group,
             Err(error) => {
                 let reply = Err(error).boxed().context(ApiExternalSnafu);
@@ -2141,6 +2340,7 @@ impl ReplicationRuntimeComponent {
                 async_self.max_inline_bootstrap_public_key_bundles,
                 group_id,
                 &members,
+                group_schema,
             )
             .await;
             let prepared_bootstrap = match prepared_bootstrap {
@@ -2168,6 +2368,7 @@ impl ReplicationRuntimeComponent {
             let record = async_self.build_replication_group_record(
                 group_id,
                 member_keys,
+                prepared_bootstrap.bootstrap_message.group_schema().clone(),
                 prepared_bootstrap.security_material,
             );
             let persisted_group = async_self.store_new_replication_group(record).await;
@@ -2203,6 +2404,20 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
+    fn handle_pending_group_decision_response(
+        &mut self,
+        ask: Ask<PendingGroupDecisionResponse, Result<(), ApiError>>,
+    ) -> HandlerResult {
+        let (promise, response) = ask.take();
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = async_self
+                .apply_pending_group_decision_response(response)
+                .await;
+            async_self.reply_api(promise, "pending_group_decision_response", reply);
+            Handled::OK
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn handle_test_install_group(
         &mut self,
@@ -2232,7 +2447,12 @@ impl ReplicationRuntimeComponent {
             .collect::<Vec<_>>();
         let member_keys = GroupMemberKeys::from_ordered_member_keys(member_keys)
             .expect("test install group members were already validated");
-        let record = self.build_replication_group_record(group_id, member_keys, security_material);
+        let record = self.build_replication_group_record(
+            group_id,
+            member_keys,
+            GroupSchema::default(),
+            security_material,
+        );
         Handled::block_on(self, async move |mut async_self| {
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {
@@ -2304,19 +2524,24 @@ impl ComponentLifecycle for ReplicationRuntimeComponent {
         self.max_inline_bootstrap_public_key_bundles =
             self.read_max_inline_bootstrap_public_key_bundles();
         Handled::block_on(self, async move |mut async_self| {
-            let hydrated_memberships = async_self.load_hydrated_runtime_memberships().await;
-            match hydrated_memberships {
-                Ok(hydrated_memberships) => {
-                    async_self.group_memberships.replace(hydrated_memberships);
-                }
-                Err(error) => {
-                    error!(
-                        async_self.log(),
-                        "replication runtime startup failed: {error}"
-                    );
-                    panic!("replication runtime startup failed: {error}");
-                }
-            }
+            let hydrated_memberships = async_self
+                .load_hydrated_runtime_memberships()
+                .await
+                .whatever_unrecoverable("replication runtime startup failed")?;
+            async_self.group_memberships.replace(hydrated_memberships);
+            let runtime_ref = async_self
+                .ctx
+                .actor_ref()
+                .hold()
+                .whatever_unrecoverable("replication runtime actor ref was unavailable")?;
+            async_self
+                .replay_pending_group_decisions(runtime_ref)
+                .await
+                .whatever_unrecoverable("replication runtime startup failed")?;
+            async_self
+                .resume_pending_group_activations()
+                .await
+                .whatever_unrecoverable("replication runtime startup failed")?;
             Handled::OK
         })
     }
@@ -2376,6 +2601,9 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::CreateGroup(ask) => self.handle_create_group(ask),
             ReplicationRuntimeMessage::ChangeGroupMembership(ask) => {
                 self.handle_change_group_membership(ask)
+            }
+            ReplicationRuntimeMessage::PendingGroupDecisionResponse(ask) => {
+                self.handle_pending_group_decision_response(ask)
             }
             #[cfg(test)]
             ReplicationRuntimeMessage::Test(ReplicationRuntimeTestMessage::Ping(ask)) => {

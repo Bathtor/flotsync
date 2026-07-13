@@ -524,6 +524,7 @@ mod tests {
         SqliteReplicationStore,
         api::{
             GroupMemberKeys,
+            GroupSchema,
             MemberKeyId,
             MemberKeyTrustEvidenceKind,
             MemberKeyTrustEvidenceRecord,
@@ -1512,6 +1513,7 @@ mod tests {
                     group_id: *group_id,
                     member_keys,
                     local_member_index,
+                    group_schema: GroupSchema::default(),
                     version_vector: VersionVector::initial(
                         NonZeroUsize::new(members.len()).expect("test group must have members"),
                     ),

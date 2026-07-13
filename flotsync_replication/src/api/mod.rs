@@ -21,7 +21,7 @@ use flotsync_utils::BoxFuture;
 use smallvec::{Array, SmallVec};
 use snafu::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fmt,
     num::NonZeroUsize,
     str::FromStr,
@@ -380,28 +380,162 @@ pub struct Summary {
 }
 
 /// One row entry in an initial dataset state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InitialRowState {
     pub row_key: RowKey,
     pub row: MutableRow,
 }
 
-/// Batch type used by [`InitialRowProvider`].
-pub type InitialRowBatch = Vec<InitialRowState>;
-
-/// Source for one dataset's initial rows in `InitialGroupState`.
-pub type InitialRowProvider = dyn BatchProvider<Batch = InitialRowBatch>;
+impl fmt::Debug for InitialRowState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialRowState")
+            .field("row_key", &self.row_key)
+            .field("field_count", &self.row.fields.len())
+            .finish()
+    }
+}
 
 /// Initial state rows for one dataset.
+#[derive(Clone, PartialEq, Eq)]
 pub struct InitialDatasetState {
     pub dataset_id: DatasetId,
-    pub rows: Box<InitialRowProvider>,
+    pub rows: Vec<InitialRowState>,
+}
+
+impl fmt::Debug for InitialDatasetState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialDatasetState")
+            .field("dataset_id", &self.dataset_id)
+            .field("row_count", &self.rows.len())
+            .finish()
+    }
 }
 
 /// Initial group state grouped by dataset.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct InitialGroupState {
     pub datasets: Vec<InitialDatasetState>,
+}
+
+impl InitialGroupState {
+    fn row_count(&self) -> usize {
+        self.datasets.iter().map(|dataset| dataset.rows.len()).sum()
+    }
+}
+
+impl fmt::Debug for InitialGroupState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InitialGroupState")
+            .field("dataset_count", &self.datasets.len())
+            .field("row_count", &self.row_count())
+            .finish()
+    }
+}
+
+/// Fixed schema for one dataset in a replication group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatasetSchema {
+    /// Dataset governed by this schema.
+    pub dataset_id: DatasetId,
+    /// Schema fixed for `dataset_id` for the lifetime of its group.
+    pub schema: SchemaSource,
+}
+
+/// Dataset schemas fixed for the lifetime of a replication group.
+///
+/// Schema changes require migrating to a new group.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct GroupSchema {
+    /// Schemas keyed by dataset.
+    datasets: HashMap<DatasetId, SchemaSource>,
+}
+
+impl GroupSchema {
+    /// Build a group schema from per-dataset schemas keyed by dataset id.
+    #[must_use]
+    pub fn new(datasets: HashMap<DatasetId, SchemaSource>) -> Self {
+        Self { datasets }
+    }
+
+    /// Insert a repeated schema entry while rejecting duplicate dataset ids.
+    ///
+    /// This is intended for codecs that decode repeated protobuf schema entries.
+    /// Ordinary callers should construct [`GroupSchema`] from a map instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupSchemaError::DuplicateDataset`] when this schema already
+    /// contains an entry for `dataset_schema.dataset_id`.
+    pub fn insert_checked(
+        &mut self,
+        dataset_schema: DatasetSchema,
+    ) -> Result<(), GroupSchemaError> {
+        match self.datasets.entry(dataset_schema.dataset_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(dataset_schema.schema);
+                Ok(())
+            }
+            Entry::Occupied(entry) => {
+                let dataset_id = entry.key().clone();
+                group_schema::DuplicateDatasetSnafu { dataset_id }.fail()
+            }
+        }
+    }
+
+    /// Return the per-dataset schema entries in deterministic dataset-id order.
+    #[must_use]
+    pub fn datasets(&self) -> Vec<DatasetSchema> {
+        let mut datasets = self
+            .datasets
+            .iter()
+            .map(|(dataset_id, schema)| DatasetSchema {
+                dataset_id: dataset_id.clone(),
+                schema: schema.clone(),
+            })
+            .collect::<Vec<_>>();
+        datasets.sort_by(|left, right| left.dataset_id.cmp(&right.dataset_id));
+        datasets
+    }
+
+    /// Return the schema for `dataset_id`, if this group declares it.
+    #[must_use]
+    pub fn schema(&self, dataset_id: &DatasetId) -> Option<&SchemaSource> {
+        self.datasets.get(dataset_id)
+    }
+
+    /// Return the number of dataset schemas in this group schema.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.datasets.len()
+    }
+
+    /// Return whether this group schema has no dataset schemas.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.datasets.is_empty()
+    }
+}
+
+impl fmt::Debug for GroupSchema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alternate = f.alternate();
+        let mut debug = f.debug_struct("GroupSchema");
+        if alternate {
+            debug.field("datasets", &self.datasets());
+        } else {
+            debug.field("dataset_count", &self.datasets.len());
+        }
+        debug.finish()
+    }
+}
+
+/// Failed construction of a group schema from repeated entries.
+#[derive(Debug, Snafu)]
+#[snafu(module(group_schema))]
+pub enum GroupSchemaError {
+    /// The repeated schema entries listed the same dataset more than once.
+    #[snafu(display("Group schema contained duplicate dataset id '{dataset_id}'."))]
+    DuplicateDataset { dataset_id: DatasetId },
 }
 
 /// Group/version reference for one materialised snapshot.
@@ -419,7 +553,7 @@ pub struct SnapshotRef {
 
 /// Initial dataset state required before a joined or migrated group becomes
 /// externally active.
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum InitialSnapshot {
     /// The initial dataset state is empty.
     ///
@@ -439,6 +573,7 @@ impl fmt::Debug for InitialSnapshot {
             Self::Inline(state) => f
                 .debug_struct("InitialSnapshot::Inline")
                 .field("dataset_count", &state.datasets.len())
+                .field("row_count", &state.row_count())
                 .finish(),
             Self::Metadata(metadata) => f
                 .debug_tuple("InitialSnapshot::Metadata")
@@ -656,16 +791,18 @@ impl ReplicationSecuritySecrets {
 }
 
 /// Request to create a new replication group.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CreateGroupRequest {
     pub members: Vec<MemberIdentity>,
-    pub initial_state: Option<InitialGroupState>,
+    /// Dataset schemas fixed for the lifetime of the new group.
+    pub group_schema: GroupSchema,
 }
 
-impl std::fmt::Debug for CreateGroupRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CreateGroupRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreateGroupRequest")
             .field("members", &self.members)
-            .field("has_initial_state", &self.initial_state.is_some())
+            .field("group_schema", &self.group_schema)
             .finish()
     }
 }
@@ -697,6 +834,7 @@ pub enum GroupInvitationSource {
 }
 
 /// Invitation details surfaced when group-invitation policy requires listener mediation.
+#[derive(Clone, PartialEq, Eq)]
 pub struct GroupInvitation {
     /// Group the recipient is being invited to activate.
     pub group_id: GroupId,
@@ -704,6 +842,8 @@ pub struct GroupInvitation {
     pub source: GroupInvitationSource,
     /// Proposed canonical member order for the invited group.
     pub proposed_members: Vec<MemberIdentity>,
+    /// Dataset schemas fixed for the lifetime of the invited group.
+    pub group_schema: GroupSchema,
     /// Initial dataset state required before the invited group becomes active.
     pub initial_snapshot: InitialSnapshot,
     /// Optional display name supplied by the proposer.
@@ -717,15 +857,125 @@ impl fmt::Debug for GroupInvitation {
         f.debug_struct("GroupInvitation")
             .field("group_id", &self.group_id)
             .field("source", &self.source)
-            .field("proposed_members", &self.proposed_members)
+            .field("proposed_member_count", &self.proposed_members.len())
+            .field("group_schema", &self.group_schema)
             .field("initial_snapshot", &self.initial_snapshot)
-            .field("group_name", &self.group_name)
-            .field("message", &self.message)
+            .field("has_group_name", &self.group_name.is_some())
+            .field("has_message", &self.message.is_some())
             .finish()
     }
 }
 
+/// Failed construction of a group invitation.
+#[derive(Debug, Snafu)]
+#[snafu(module(group_invitation))]
+pub enum GroupInvitationError {
+    /// A migration invitation named a target group different from its migration id.
+    #[snafu(display(
+        "Migration invitation group id {group_id} did not match migration target group {new_group_id}."
+    ))]
+    GroupMismatch {
+        group_id: GroupId,
+        new_group_id: GroupId,
+    },
+}
+
+impl GroupInvitation {
+    /// Build an ordinary group invitation.
+    #[must_use]
+    pub fn new_creation(
+        group_id: GroupId,
+        proposed_members: Vec<MemberIdentity>,
+        group_schema: GroupSchema,
+        initial_snapshot: InitialSnapshot,
+        group_name: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            group_id,
+            source: GroupInvitationSource::Creation,
+            proposed_members,
+            group_schema,
+            initial_snapshot,
+            group_name,
+            message,
+        }
+    }
+
+    /// Build a migration-sourced group invitation.
+    ///
+    /// The invitation's `group_id` is derived from `migration_id.new_group_id` so
+    /// the duplicated target-group identity cannot diverge.
+    #[must_use]
+    pub fn new_migration(
+        migration_id: MigrationId,
+        proposed_members: Vec<MemberIdentity>,
+        group_schema: GroupSchema,
+        initial_snapshot: InitialSnapshot,
+        group_name: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            group_id: migration_id.new_group_id,
+            source: GroupInvitationSource::Migration { migration_id },
+            proposed_members,
+            group_schema,
+            initial_snapshot,
+            group_name,
+            message,
+        }
+    }
+
+    /// Build a group invitation from explicit API parts.
+    ///
+    /// This validates that migration-sourced invitations name the migration's
+    /// target group as `group_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupInvitationError::GroupMismatch`] when `source` is
+    /// migration-sourced and `group_id` differs from `source.migration_id.new_group_id`.
+    pub fn try_new(
+        group_id: GroupId,
+        source: GroupInvitationSource,
+        proposed_members: Vec<MemberIdentity>,
+        group_schema: GroupSchema,
+        initial_snapshot: InitialSnapshot,
+        group_name: Option<String>,
+        message: Option<String>,
+    ) -> Result<Self, GroupInvitationError> {
+        match source {
+            GroupInvitationSource::Creation => Ok(Self::new_creation(
+                group_id,
+                proposed_members,
+                group_schema,
+                initial_snapshot,
+                group_name,
+                message,
+            )),
+            GroupInvitationSource::Migration { migration_id } => {
+                ensure!(
+                    group_id == migration_id.new_group_id,
+                    group_invitation::GroupMismatchSnafu {
+                        group_id,
+                        new_group_id: migration_id.new_group_id,
+                    }
+                );
+                Ok(Self::new_migration(
+                    migration_id,
+                    proposed_members,
+                    group_schema,
+                    initial_snapshot,
+                    group_name,
+                    message,
+                ))
+            }
+        }
+    }
+}
+
 /// Old-group member proposal surfaced when migration policy requires listener mediation.
+#[derive(Clone, PartialEq, Eq)]
 pub struct MigrationProposal {
     /// Old-to-new group migration being proposed.
     pub migration_id: MigrationId,
@@ -733,6 +983,8 @@ pub struct MigrationProposal {
     pub final_versions: VersionVector,
     /// Proposed canonical member order for the new group.
     pub proposed_members: Vec<MemberIdentity>,
+    /// Dataset schemas fixed for the lifetime of the new group.
+    pub group_schema: GroupSchema,
     /// Initial dataset state required before the new group becomes active.
     pub initial_snapshot: InitialSnapshot,
     /// Optional display name supplied by the proposer.
@@ -746,11 +998,110 @@ impl fmt::Debug for MigrationProposal {
         f.debug_struct("MigrationProposal")
             .field("migration_id", &self.migration_id)
             .field("final_versions", &self.final_versions)
-            .field("proposed_members", &self.proposed_members)
+            .field("proposed_member_count", &self.proposed_members.len())
+            .field("group_schema", &self.group_schema)
             .field("initial_snapshot", &self.initial_snapshot)
-            .field("group_name", &self.group_name)
-            .field("message", &self.message)
+            .field("has_group_name", &self.group_name.is_some())
+            .field("has_message", &self.message.is_some())
             .finish()
+    }
+}
+
+/// Stable identity for pending group decision or activation work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PendingGroupWorkKey {
+    /// Decision for a group invitation.
+    GroupInvitation {
+        /// Group being invited or activated.
+        group_id: GroupId,
+        /// Local source perspective for the invitation.
+        source: GroupInvitationSource,
+    },
+    /// Decision for an old-group migration proposal.
+    MigrationProposal {
+        /// Old-to-new group migration being proposed.
+        migration_id: MigrationId,
+    },
+}
+
+/// Store-owned unresolved listener-mediated group decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingGroupDecisionRecord {
+    /// Pending group invitation decision.
+    GroupInvitation(GroupInvitation),
+    /// Pending migration proposal decision.
+    MigrationProposal(MigrationProposal),
+}
+
+impl PendingGroupDecisionRecord {
+    /// Return the stable idempotence key for this pending decision.
+    #[must_use]
+    pub const fn key(&self) -> PendingGroupWorkKey {
+        match self {
+            Self::GroupInvitation(invitation) => PendingGroupWorkKey::GroupInvitation {
+                group_id: invitation.group_id,
+                source: invitation.source,
+            },
+            Self::MigrationProposal(proposal) => PendingGroupWorkKey::MigrationProposal {
+                migration_id: proposal.migration_id,
+            },
+        }
+    }
+
+    /// Convert this pending decision into the listener event that asks for the decision.
+    #[must_use]
+    pub fn to_event<R>(self, responder: R) -> ReplicationEvent
+    where
+        R: GroupInvitationResponder + MigrationProposalResponder + 'static,
+    {
+        match self {
+            Self::GroupInvitation(invitation) => ReplicationEvent::GroupInvitation {
+                invitation,
+                respond: Box::new(responder),
+            },
+            Self::MigrationProposal(proposal) => ReplicationEvent::MigrationProposal {
+                proposal,
+                respond: Box::new(responder),
+            },
+        }
+    }
+
+    /// Convert an accepted pending decision into accepted activation work.
+    #[must_use]
+    pub fn into_activation(self) -> PendingGroupActivationRecord {
+        match self {
+            Self::GroupInvitation(invitation) => {
+                PendingGroupActivationRecord::GroupInvitation(invitation)
+            }
+            Self::MigrationProposal(proposal) => {
+                PendingGroupActivationRecord::MigrationProposal(proposal)
+            }
+        }
+    }
+}
+
+/// Store-owned accepted group work that is not externally active yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PendingGroupActivationRecord {
+    /// Accepted group invitation activation work.
+    GroupInvitation(GroupInvitation),
+    /// Accepted migration proposal activation work.
+    MigrationProposal(MigrationProposal),
+}
+
+impl PendingGroupActivationRecord {
+    /// Return the stable idempotence key for this pending activation.
+    #[must_use]
+    pub const fn key(&self) -> PendingGroupWorkKey {
+        match self {
+            Self::GroupInvitation(invitation) => PendingGroupWorkKey::GroupInvitation {
+                group_id: invitation.group_id,
+                source: invitation.source,
+            },
+            Self::MigrationProposal(proposal) => PendingGroupWorkKey::MigrationProposal {
+                migration_id: proposal.migration_id,
+            },
+        }
     }
 }
 
@@ -928,15 +1279,11 @@ pub trait ReplicationApi: Send + Sync {
     /// must include the local member. On success, the runtime stores the
     /// group record, installs it in the live runtime view, broadcasts bootstrap
     /// messages to the configured remote members, and returns the newly allocated
-    /// [`GroupId`].
-    ///
-    /// Initial dataset state in [`CreateGroupRequest::initial_state`] is part of
-    /// the public request shape but is not implemented in the current manual
-    /// replication slice; requests that include it fail with [`ApiError`].
+    /// [`GroupId`]. New groups are created empty; callers publish initial
+    /// dataset contents through ordinary [`Self::publish_changes`] updates.
     ///
     /// The method returns [`ApiError`] when membership validation fails, the
-    /// runtime is unavailable, group storage fails, or unsupported
-    /// request features are used.
+    /// runtime is unavailable, or group storage fails.
     fn create_group(&self, req: CreateGroupRequest) -> BoxFuture<'_, Result<GroupId, ApiError>>;
 
     /// Request a membership migration for an existing replication group.
@@ -1110,6 +1457,8 @@ pub struct ReplicationGroupRecord {
     pub member_keys: GroupMemberKeys,
     /// Position of the local member within `member_keys`.
     pub local_member_index: MemberIndex,
+    /// Dataset schemas fixed for the lifetime of this group.
+    pub group_schema: GroupSchema,
     /// Last applied version vector stored for this group.
     pub version_vector: VersionVector,
     /// Already-encrypted group-security material needed by runtime operation.
@@ -1159,6 +1508,7 @@ impl std::fmt::Debug for ReplicationGroupRecord {
             .field("group_id", &self.group_id)
             .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
+            .field("group_schema", &self.group_schema)
             .field("version_vector", &self.version_vector)
             .field("security_material", &self.security_material)
             .finish()
@@ -1665,6 +2015,13 @@ pub trait ReplicationStoreReadTransaction: Send {
         group_ids: &'a HashSet<GroupId>,
     ) -> BoxFuture<'a, Result<Vec<ReplicationGroupRecord>, StoreError>>;
 
+    /// Load one dataset schema stored for a specific replication group.
+    fn load_group_dataset_schema<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<SchemaSource>, StoreError>>;
+
     /// Load encrypted local-private key material for one member identity.
     fn load_local_member_private_keys<'a>(
         &'a mut self,
@@ -1753,6 +2110,16 @@ pub trait ReplicationStoreReadTransaction: Send {
         after: Option<RowKey>,
         limit: NonZeroUsize,
     ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>>;
+
+    /// Load all unresolved listener-mediated group decisions.
+    fn load_pending_group_decisions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>>;
+
+    /// Load all accepted group activations that are not externally active yet.
+    fn load_pending_group_activations(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>>;
 
     /// Explicitly release the read transaction.
     ///
@@ -1886,6 +2253,38 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
         update_id: UpdateId,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
+    /// Insert or replace one unresolved listener-mediated group decision.
+    fn upsert_pending_group_decision(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Remove one unresolved group decision.
+    ///
+    /// The returned boolean is `true` when a pending decision with `key`
+    /// existed and was removed. It is `false` when the decision had already
+    /// been resolved or never existed.
+    fn remove_pending_group_decision(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>>;
+
+    /// Insert or replace one accepted group activation that is not externally active yet.
+    fn upsert_pending_group_activation(
+        &mut self,
+        record: PendingGroupActivationRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Remove one accepted group activation.
+    ///
+    /// The returned boolean is `true` when a pending activation with `key`
+    /// existed and was removed. It is `false` when the activation had already
+    /// completed or never existed.
+    fn remove_pending_group_activation(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>>;
+
     /// Commit all writes performed in this transaction.
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
 
@@ -1902,7 +2301,7 @@ pub trait ReplicationStore: Send + Sync {
     /// Return the member identity hosted by this replication runtime instance.
     fn local_member_identity(&self) -> BoxFuture<'_, Result<MemberIdentity, StoreError>>;
 
-    /// Load one application-defined dataset schema when available locally.
+    /// Load one locally available dataset schema.
     fn load_dataset_schema(
         &self,
         dataset_id: &DatasetId,
@@ -1922,6 +2321,7 @@ pub trait ReplicationStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::docs_group_schema;
 
     fn member_key_id<const N: usize>(segments: [&str; N], fingerprint_seed: u8) -> MemberKeyId {
         MemberKeyId {
@@ -1988,6 +2388,50 @@ mod tests {
             .expect_err("duplicate member identity should be rejected");
 
         assert!(matches!(error, GroupMembersError::DuplicateMember { .. }));
+    }
+
+    #[test]
+    fn group_invitation_rejects_mismatched_migration_group_id() {
+        let old_group_id = GroupId(uuid::Uuid::from_u128(91_001));
+        let new_group_id = GroupId(uuid::Uuid::from_u128(91_002));
+        let wrong_group_id = GroupId(uuid::Uuid::from_u128(91_003));
+
+        let error = GroupInvitation::try_new(
+            wrong_group_id,
+            GroupInvitationSource::Migration {
+                migration_id: MigrationId {
+                    old_group_id,
+                    new_group_id,
+                },
+            },
+            Vec::new(),
+            GroupSchema::default(),
+            InitialSnapshot::Empty,
+            None,
+            None,
+        )
+        .expect_err("mismatched migration invitation group id should be rejected");
+
+        assert!(matches!(
+            error,
+            GroupInvitationError::GroupMismatch {
+                group_id,
+                new_group_id: actual_new_group_id,
+            } if group_id == wrong_group_id && actual_new_group_id == new_group_id
+        ));
+    }
+
+    #[test]
+    fn group_schema_alternate_debug_lists_datasets() {
+        let group_schema = docs_group_schema();
+
+        let default_output = format!("{group_schema:?}");
+        let alternate_output = format!("{group_schema:#?}");
+
+        assert!(default_output.contains("dataset_count"));
+        assert!(!default_output.contains("DatasetSchema"));
+        assert!(alternate_output.contains("DatasetSchema"));
+        assert!(alternate_output.contains("docs"));
     }
 
     #[test]

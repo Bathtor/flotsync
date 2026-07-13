@@ -55,10 +55,9 @@ use std::sync::{Arc, RwLock};
 #[cfg(any(test, feature = "test-support"))]
 use super::errors::GroupInstallError;
 #[cfg(test)]
-use super::{
-    errors::InboundDeliveryError,
-    messages::{UpdateBatchMessage, UpdateMessage},
-};
+use super::errors::InboundDeliveryError;
+#[cfg(test)]
+use crate::codecs::messages::{UpdateBatchMessage, UpdateMessage};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
