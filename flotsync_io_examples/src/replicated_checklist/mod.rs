@@ -18,18 +18,18 @@ use flotsync_data_types::{
     Field,
     PrimitiveType,
     RowOperations,
-    RowRead,
+    RowStateRead,
     Schema,
     schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
 use flotsync_replication::{
     DatasetId,
-    MutableRow,
     ReadToken,
     RowChange,
     RowId,
     RowKey,
     RowMutation,
+    RowValuesPatch,
     SnapshotRow,
 };
 use itertools::Itertools;
@@ -365,7 +365,7 @@ impl ChecklistItem {
 
     fn from_row<OperationId>(
         row_key: RowKey,
-        row: &(dyn RowRead<OperationId> + Send + Sync),
+        row: &(dyn RowStateRead<OperationId> + Send + Sync),
     ) -> Result<Self, ChecklistWorkingSetError>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -396,7 +396,7 @@ impl ChecklistItem {
         })
     }
 
-    fn to_mutable_row(&self) -> MutableRow {
+    fn to_row_values_patch(&self) -> RowValuesPatch {
         let mut fields = HashMap::new();
         insert_field(&mut fields, FIELD_TEXT, self.text.clone());
         insert_field(&mut fields, FIELD_NOTE, self.note.clone());
@@ -408,10 +408,10 @@ impl ChecklistItem {
         insert_field(&mut fields, FIELD_STATUS, self.status.as_str().to_owned());
         insert_field(&mut fields, FIELD_PRIORITY, self.priority);
         insert_field(&mut fields, FIELD_EDIT_COUNT, self.edit_count);
-        MutableRow::new(fields)
+        RowValuesPatch::new(fields)
     }
 
-    fn changed_fields_since(&self, original: &Self) -> MutableRow {
+    fn changed_fields_since(&self, original: &Self) -> RowValuesPatch {
         let mut fields = HashMap::new();
         if self.text != original.text {
             insert_field(&mut fields, FIELD_TEXT, self.text.clone());
@@ -435,7 +435,7 @@ impl ChecklistItem {
         if self.edit_count != original.edit_count {
             insert_field(&mut fields, FIELD_EDIT_COUNT, self.edit_count);
         }
-        MutableRow::new(fields)
+        RowValuesPatch::new(fields)
     }
 
     fn increment_edit_count(&mut self) {
@@ -834,7 +834,7 @@ impl ChecklistWorkingSet {
                         .ok_or(ChecklistWorkingSetError::MissingDirtyRow { row_key })?;
                     mutations.push(RowMutation::Upsert {
                         row_id: self.row_id(row_key),
-                        row: item.to_mutable_row(),
+                        row: item.to_row_values_patch(),
                     });
                 }
                 DirtyRowKind::Update { original } => {
@@ -979,7 +979,7 @@ impl ChecklistWorkingSet {
     fn checklist_upsert_change_from_row<OperationId>(
         &self,
         row_id: &RowId,
-        row: &(dyn RowRead<OperationId> + Send + Sync),
+        row: &(dyn RowStateRead<OperationId> + Send + Sync),
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -1044,7 +1044,7 @@ fn push_display_row(display_order: &mut Vec<RowKey>, row_key: RowKey) {
 
 fn decode_row_field<'a, OperationId, Value>(
     row_key: RowKey,
-    row: &'a (dyn RowRead<OperationId> + Send + Sync),
+    row: &'a (dyn RowStateRead<OperationId> + Send + Sync),
     field: &'static str,
 ) -> Result<Cow<'a, Value>, ChecklistWorkingSetError>
 where
@@ -1074,12 +1074,12 @@ fn split_repl_args(line: &str) -> Vec<&str> {
 mod tests {
     use super::*;
     use flotsync_core::versions::UpdateId;
-    use flotsync_data_types::{InMemoryFieldValue, ReplicatedDataType};
+    use flotsync_data_types::{InMemoryFieldState, ReplicatedDataType};
 
     struct EmptySnapshotRow;
 
-    impl RowRead<UpdateId> for EmptySnapshotRow {
-        fn get_field(&self, _field_name: &str) -> Option<&InMemoryFieldValue<UpdateId>> {
+    impl RowStateRead<UpdateId> for EmptySnapshotRow {
+        fn get_field(&self, _field_name: &str) -> Option<&InMemoryFieldState<UpdateId>> {
             None
         }
     }

@@ -29,8 +29,8 @@ use flotsync_data_types::{
             SchemaSnapshotDecoder,
             SchemaSnapshotEncoder,
             SnapshotNodeSource,
-            SnapshotStateValue,
-            SnapshotStateValueRef,
+            StateSnapshotFieldValue,
+            StateSnapshotFieldValueRef,
         },
         values::PrimitiveValueArray,
     },
@@ -248,7 +248,7 @@ impl<'schema> SchemaSnapshotEncoder<UpdateId> for ProtoSchemaSnapshotEncoder<'sc
     fn state_field(
         &mut self,
         field_name: &str,
-        value: SnapshotStateValueRef<'_>,
+        value: StateSnapshotFieldValueRef<'_>,
     ) -> Result<(), Self::Error> {
         let (field_name, data_type) = self.register_field(field_name)?;
         ensure!(
@@ -665,7 +665,7 @@ impl SchemaSnapshotDecoder<UpdateId> for ProtoSchemaSnapshotDecoder {
         &mut self,
         field_name: &str,
         data_type: &ReplicatedDataType,
-    ) -> Result<SnapshotStateValue, Self::Error> {
+    ) -> Result<StateSnapshotFieldValue, Self::Error> {
         let value = self.take_field_value(field_name)?;
         let wire = match value {
             proto::snapshot_field::Value::MonotonicCounter(value) => {
@@ -884,7 +884,7 @@ impl<'schema> SchemaSnapshotEncoder<UpdateId> for ProtoDataSnapshotRowEncoder<'s
     fn state_field(
         &mut self,
         field_name: &str,
-        value: SnapshotStateValueRef<'_>,
+        value: StateSnapshotFieldValueRef<'_>,
     ) -> Result<(), Self::Error> {
         self.inner.state_field(field_name, value)
     }
@@ -1163,10 +1163,10 @@ mod tests {
             NullableBasicDataType,
             datamodel::{
                 DataSnapshotDecoder,
-                InMemoryData,
-                InMemoryFieldValue,
-                LinearLatestValueWinsValue,
-                LinearListValue,
+                InMemoryFieldState,
+                InMemoryStateData,
+                LinearLatestValueWinsState,
+                LinearListState,
             },
             values::{NullablePrimitiveValue, PrimitiveValue},
         },
@@ -1235,27 +1235,28 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data: InMemoryData<(), UpdateId> = InMemoryData::with_static_schema(schema);
+        let mut data: InMemoryStateData<(), UpdateId> =
+            InMemoryStateData::with_static_schema(schema);
         data.push_row_from_named_fields([
             (
                 "latest",
-                InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(
+                InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(
                     latest.clone(),
                 )),
             ),
-            ("title", InMemoryFieldValue::LinearString(title.clone())),
+            ("title", InMemoryFieldState::LinearString(title.clone())),
             (
                 "numbers",
-                InMemoryFieldValue::LinearList(LinearListValue::Int(numbers.clone())),
+                InMemoryFieldState::LinearList(LinearListState::Int(numbers.clone())),
             ),
-            ("counter", InMemoryFieldValue::MonotonicCounter(counter)),
+            ("counter", InMemoryFieldState::MonotonicCounter(counter)),
             (
                 "priority",
-                InMemoryFieldValue::TotalOrderRegister(priority.clone()),
+                InMemoryFieldState::TotalOrderRegister(priority.clone()),
             ),
             (
                 "status",
-                InMemoryFieldValue::TotalOrderFiniteStateRegister(status.clone()),
+                InMemoryFieldState::TotalOrderFiniteStateRegister(status.clone()),
             ),
         ])
         .unwrap();
@@ -1267,7 +1268,7 @@ mod tests {
         let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
         let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
-        let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
+        let roundtrip = InMemoryStateData::decode_data_snapshots(schema, &mut decoder).unwrap();
         assert_eq!(roundtrip, data);
     }
 

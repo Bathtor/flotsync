@@ -6,7 +6,7 @@ use crate::{
     DataOperation,
     IdWithIndex,
     OperationOutcome,
-    RowRead,
+    RowStateRead,
     TableOperations,
     any_data::{
         LinearLatestValueWins,
@@ -33,7 +33,7 @@ pub use decode::*;
 /// The schema is immutable while this value exists.
 /// Field names are mapped once to positional indices and rows only store per-field values.
 #[derive(Clone, Debug, PartialEq)]
-pub struct InMemoryData<RowId, OperationId>
+pub struct InMemoryStateData<RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -41,9 +41,9 @@ where
     field_names: Vec<String>,
     field_index_by_name: HashMap<String, usize>,
     row_id_map: HashMap<RowId, usize>,
-    rows: Vec<InMemoryRow<OperationId>>,
+    rows: Vec<InMemoryStateRow<OperationId>>,
 }
-impl<RowId, OperationId> InMemoryData<RowId, OperationId>
+impl<RowId, OperationId> InMemoryStateData<RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -86,13 +86,13 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn with_static_schema_and_row_snapshots<'snapshot, I>(
         schema: &'static Schema,
         rows: I,
-    ) -> Result<Self, InMemoryDataError>
+    ) -> Result<Self, InMemoryStateDataError>
     where
-        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        I: IntoIterator<Item = (RowId, RowStateSnapshot<'snapshot, OperationId>)>,
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
@@ -103,13 +103,13 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn with_owned_schema_and_row_snapshots<'snapshot, I>(
         schema: Schema,
         rows: I,
-    ) -> Result<Self, InMemoryDataError>
+    ) -> Result<Self, InMemoryStateDataError>
     where
-        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        I: IntoIterator<Item = (RowId, RowStateSnapshot<'snapshot, OperationId>)>,
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
@@ -122,13 +122,13 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn from_row_snapshots<'snapshot, I>(
         schema: impl Into<SchemaSource>,
         rows: I,
-    ) -> Result<Self, InMemoryDataError>
+    ) -> Result<Self, InMemoryStateDataError>
     where
-        I: IntoIterator<Item = (RowId, RowSnapshot<'snapshot, OperationId>)>,
+        I: IntoIterator<Item = (RowId, RowStateSnapshot<'snapshot, OperationId>)>,
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
     {
@@ -144,11 +144,11 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn from_row_snapshots_with_tombstones<'snapshot, I>(
         schema: impl Into<SchemaSource>,
         rows: I,
-    ) -> Result<Self, InMemoryDataError>
+    ) -> Result<Self, InMemoryStateDataError>
     where
         I: IntoIterator<Item = RowRecord<'snapshot, RowId, OperationId>>,
         RowId: fmt::Display,
@@ -233,8 +233,8 @@ where
     #[allow(dead_code, reason = "Maybe remove this if it remains unused")]
     pub(crate) fn push_row_from_field_values(
         &mut self,
-        fields: Vec<InMemoryFieldValue<OperationId>>,
-    ) -> Result<usize, InMemoryDataError> {
+        fields: Vec<InMemoryFieldState<OperationId>>,
+    ) -> Result<usize, InMemoryStateDataError> {
         let row = self.row_from_field_values(fields)?;
         self.rows.push(row);
         Ok(self.rows.len() - 1)
@@ -247,13 +247,13 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn push_row_from_named_fields<I, Name>(
         &mut self,
         fields: I,
-    ) -> Result<usize, InMemoryDataError>
+    ) -> Result<usize, InMemoryStateDataError>
     where
-        I: IntoIterator<Item = (Name, InMemoryFieldValue<OperationId>)>,
+        I: IntoIterator<Item = (Name, InMemoryFieldState<OperationId>)>,
         Name: AsRef<str>,
     {
         let row = self.row_from_named_fields(fields)?;
@@ -265,12 +265,12 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn push_row_snapshot<'snapshot>(
         &mut self,
         row_id: RowId,
-        snapshot: RowSnapshot<'snapshot, OperationId>,
-    ) -> Result<usize, InMemoryDataError>
+        snapshot: RowStateSnapshot<'snapshot, OperationId>,
+    ) -> Result<usize, InMemoryStateDataError>
     where
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
@@ -286,11 +286,11 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn push_row_record<'snapshot>(
         &mut self,
         record: RowRecord<'snapshot, RowId, OperationId>,
-    ) -> Result<usize, InMemoryDataError>
+    ) -> Result<usize, InMemoryStateDataError>
     where
         RowId: fmt::Display,
         OperationId: Clone + 'snapshot,
@@ -301,7 +301,7 @@ where
             tombstoned,
         } = record;
         if self.row_id_map.contains_key(&row_id) {
-            return Err(InMemoryDataError::DuplicateRowId {
+            return Err(InMemoryStateDataError::DuplicateRowId {
                 row_id: row_id.to_string(),
             });
         }
@@ -318,8 +318,8 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
-    pub fn validate_row(&self, row_index: usize) -> Result<(), InMemoryDataError> {
+    /// See `InMemoryStateDataError` for failure conditions.
+    pub fn validate_row(&self, row_index: usize) -> Result<(), InMemoryStateDataError> {
         let row = self.row(row_index)?;
         self.validate_row_value(row)
     }
@@ -328,15 +328,15 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn field(
         &self,
         row_index: usize,
         field_name: &str,
-    ) -> Result<&InMemoryFieldValue<OperationId>, InMemoryDataError> {
+    ) -> Result<&InMemoryFieldState<OperationId>, InMemoryStateDataError> {
         let field_index =
             self.field_index(field_name)
-                .ok_or_else(|| InMemoryDataError::UnknownField {
+                .ok_or_else(|| InMemoryStateDataError::UnknownField {
                     field_name: field_name.to_owned(),
                 })?;
         let row = self.row(row_index)?;
@@ -347,15 +347,15 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn field_mut(
         &mut self,
         row_index: usize,
         field_name: &str,
-    ) -> Result<&mut InMemoryFieldValue<OperationId>, InMemoryDataError> {
+    ) -> Result<&mut InMemoryFieldState<OperationId>, InMemoryStateDataError> {
         let field_index =
             self.field_index(field_name)
-                .ok_or_else(|| InMemoryDataError::UnknownField {
+                .ok_or_else(|| InMemoryStateDataError::UnknownField {
                     field_name: field_name.to_owned(),
                 })?;
         let row = self.row_mut(row_index)?;
@@ -366,12 +366,14 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataError` for failure conditions.
+    /// See `InMemoryStateDataError` for failure conditions.
     pub fn iter_row_fields(
         &self,
         row_index: usize,
-    ) -> Result<impl Iterator<Item = (&str, &InMemoryFieldValue<OperationId>)>, InMemoryDataError>
-    {
+    ) -> Result<
+        impl Iterator<Item = (&str, &InMemoryFieldState<OperationId>)>,
+        InMemoryStateDataError,
+    > {
         let row = self.row(row_index)?;
         debug_assert_eq!(self.num_fields(), row.field_count());
         Ok(self
@@ -390,11 +392,11 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataSnapshotEncodeError<E::Error>` for failure conditions.
+    /// See `InMemoryStateDataSnapshotEncodeError<E::Error>` for failure conditions.
     pub fn encode_data_snapshots<E>(
         &self,
         encoder: &mut E,
-    ) -> Result<(), InMemoryDataSnapshotEncodeError<E::Error>>
+    ) -> Result<(), InMemoryStateDataSnapshotEncodeError<E::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         E: DataSnapshotEncoder<OperationId>,
@@ -419,11 +421,11 @@ where
     ///
     /// # Errors
     ///
-    /// See `InMemoryDataSnapshotDecodeError<D::Error>` for failure conditions.
+    /// See `InMemoryStateDataSnapshotDecodeError<D::Error>` for failure conditions.
     pub fn decode_data_snapshots<D>(
         schema: impl Into<SchemaSource>,
         decoder: &mut D,
-    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    ) -> Result<Self, InMemoryStateDataSnapshotDecodeError<D::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: DataSnapshotDecoder<OperationId>,
@@ -434,12 +436,16 @@ where
 
         for row_index in 0..row_count {
             let mut row_decoder = decoder.begin_row(row_index).context(DecoderSnafu)?;
-            let row =
-                InMemoryRow::decode_snapshot(data.schema(), &data.field_names, &mut row_decoder)?;
+            let row = InMemoryStateRow::decode_snapshot(
+                data.schema(),
+                &data.field_names,
+                &mut row_decoder,
+            )?;
             drop(row_decoder);
             decoder.end_row(row_index).context(DecoderSnafu)?;
 
-            data.validate_row_value(&row).context(InMemoryDataSnafu)?;
+            data.validate_row_value(&row)
+                .context(InMemoryStateDataSnafu)?;
             data.rows.push(row);
         }
 
@@ -449,16 +455,19 @@ where
 
     fn row_from_field_values(
         &self,
-        fields: Vec<InMemoryFieldValue<OperationId>>,
-    ) -> Result<InMemoryRow<OperationId>, InMemoryDataError> {
-        let row = InMemoryRow::new(fields);
+        fields: Vec<InMemoryFieldState<OperationId>>,
+    ) -> Result<InMemoryStateRow<OperationId>, InMemoryStateDataError> {
+        let row = InMemoryStateRow::new(fields);
         self.validate_row_value(&row)?;
         Ok(row)
     }
 
-    fn validate_row_value(&self, row: &InMemoryRow<OperationId>) -> Result<(), InMemoryDataError> {
+    fn validate_row_value(
+        &self,
+        row: &InMemoryStateRow<OperationId>,
+    ) -> Result<(), InMemoryStateDataError> {
         if row.field_count() != self.num_fields() {
-            return Err(InMemoryDataError::FieldCountMismatch {
+            return Err(InMemoryStateDataError::FieldCountMismatch {
                 expected: self.num_fields(),
                 actual: row.field_count(),
             });
@@ -484,12 +493,12 @@ where
     fn row_from_named_fields<I, Name>(
         &self,
         fields: I,
-    ) -> Result<InMemoryRow<OperationId>, InMemoryDataError>
+    ) -> Result<InMemoryStateRow<OperationId>, InMemoryStateDataError>
     where
-        I: IntoIterator<Item = (Name, InMemoryFieldValue<OperationId>)>,
+        I: IntoIterator<Item = (Name, InMemoryFieldState<OperationId>)>,
         Name: AsRef<str>,
     {
-        let mut row_slots: Vec<Option<InMemoryFieldValue<OperationId>>> =
+        let mut row_slots: Vec<Option<InMemoryFieldState<OperationId>>> =
             std::iter::repeat_with(|| None)
                 .take(self.field_names.len())
                 .collect();
@@ -497,12 +506,12 @@ where
         for (field_name, value) in fields {
             let field_name = field_name.as_ref();
             let Some(field_index) = self.field_index(field_name) else {
-                return Err(InMemoryDataError::UnknownField {
+                return Err(InMemoryStateDataError::UnknownField {
                     field_name: field_name.to_owned(),
                 });
             };
             if row_slots[field_index].is_some() {
-                return Err(InMemoryDataError::DuplicateField {
+                return Err(InMemoryStateDataError::DuplicateField {
                     field_name: field_name.to_owned(),
                 });
             }
@@ -526,7 +535,7 @@ where
             .enumerate()
             .find(|(_, slot)| slot.is_none())
         {
-            return Err(InMemoryDataError::MissingField {
+            return Err(InMemoryStateDataError::MissingField {
                 field_name: self.field_names[missing_index].clone(),
             });
         }
@@ -535,19 +544,19 @@ where
             .into_iter()
             .map(|slot| slot.expect("all slots were checked for missing values"))
             .collect();
-        Ok(InMemoryRow::new(fields))
+        Ok(InMemoryStateRow::new(fields))
     }
 
     fn row_from_snapshot_with_defaults(
         &self,
-        fields: Vec<(String, InMemoryFieldValue<OperationId>)>,
+        fields: Vec<(String, InMemoryFieldState<OperationId>)>,
         change_id: &OperationId,
-    ) -> crate::OperationResult<InMemoryRow<OperationId>>
+    ) -> crate::OperationResult<InMemoryStateRow<OperationId>>
     where
         OperationId:
             Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     {
-        let mut row_slots: Vec<Option<InMemoryFieldValue<OperationId>>> =
+        let mut row_slots: Vec<Option<InMemoryFieldState<OperationId>>> =
             std::iter::repeat_with(|| None)
                 .take(self.field_names.len())
                 .collect();
@@ -613,22 +622,25 @@ where
             .into_iter()
             .map(|slot| slot.expect("all row slots are resolved after default materialization"))
             .collect();
-        Ok(InMemoryRow::new(fields))
+        Ok(InMemoryStateRow::new(fields))
     }
 
-    fn row(&self, row_index: usize) -> Result<&InMemoryRow<OperationId>, InMemoryDataError> {
+    fn row(
+        &self,
+        row_index: usize,
+    ) -> Result<&InMemoryStateRow<OperationId>, InMemoryStateDataError> {
         self.rows
             .get(row_index)
-            .ok_or(InMemoryDataError::UnknownRow { row_index })
+            .ok_or(InMemoryStateDataError::UnknownRow { row_index })
     }
 
     fn row_mut(
         &mut self,
         row_index: usize,
-    ) -> Result<&mut InMemoryRow<OperationId>, InMemoryDataError> {
+    ) -> Result<&mut InMemoryStateRow<OperationId>, InMemoryStateDataError> {
         self.rows
             .get_mut(row_index)
-            .ok_or(InMemoryDataError::UnknownRow { row_index })
+            .ok_or(InMemoryStateDataError::UnknownRow { row_index })
     }
 
     /// Apply a replicated schema operation to this dataset.
@@ -691,7 +703,9 @@ where
                     indexed_fields.push((field_index, field.value));
                 }
 
-                let row = self.row_mut(row_index).context(crate::InMemoryDataSnafu)?;
+                let row = self
+                    .row_mut(row_index)
+                    .context(crate::InMemoryStateDataSnafu)?;
                 for (field_index, operation_value) in indexed_fields {
                     apply_operation_value(&mut row.fields[field_index], operation_value)?;
                 }
@@ -711,14 +725,15 @@ where
         Ok(self)
     }
 }
-impl<RowId, OperationId> TableOperations<RowId, OperationId> for InMemoryData<RowId, OperationId>
+impl<RowId, OperationId> TableOperations<RowId, OperationId>
+    for InMemoryStateData<RowId, OperationId>
 where
     OperationId:
         Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
     RowId: Clone + PartialEq + Eq + Hash + fmt::Debug + fmt::Display,
 {
     type Row<'a>
-        = InMemoryDataRow<'a, RowId, OperationId>
+        = InMemoryStateDataRow<'a, RowId, OperationId>
     where
         Self: 'a;
 
@@ -730,9 +745,9 @@ where
         let index = self.row_id_map.get(row_id)?;
         assert!(
             self.rows.len() > *index,
-            "Illegal InMemoryData state: Row with id {row_id} has index={index}, which does not exist"
+            "Illegal InMemoryStateData state: Row with id {row_id} has index={index}, which does not exist"
         );
-        Some(InMemoryDataRow {
+        Some(InMemoryStateDataRow {
             data: self,
             row_index: *index,
         })
@@ -778,9 +793,9 @@ where
             fields.push(field_value);
         }
 
-        let row = InMemoryRow::new(fields);
+        let row = InMemoryStateRow::new(fields);
         self.validate_row_value(&row)
-            .context(crate::InMemoryDataSnafu)?;
+            .context(crate::InMemoryStateDataSnafu)?;
 
         self.rows.push(row);
         let index = self.rows.len() - 1;
@@ -789,7 +804,10 @@ where
             change_id: operation_id.clone(),
             operation: RowOperation::Insert {
                 row_id,
-                snapshot: RowSnapshot::borrowed_in_memory(&self.field_names, &self.rows[index]),
+                snapshot: RowStateSnapshot::borrowed_in_memory(
+                    &self.field_names,
+                    &self.rows[index],
+                ),
             },
         })
     }
@@ -967,7 +985,7 @@ fn build_initial_field_value<OperationId>(
     data_type: &ReplicatedDataType,
     target_value: &super::super::public_api::FieldTargetValue,
     operation_id: &OperationId,
-) -> crate::OperationResult<InMemoryFieldValue<OperationId>>
+) -> crate::OperationResult<InMemoryFieldState<OperationId>>
 where
     OperationId:
         Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -980,7 +998,7 @@ where
         (
             ReplicatedDataType::LinearString,
             super::super::public_api::FieldTargetValue::String(value),
-        ) => Ok(InMemoryFieldValue::LinearString(LinearString::with_value(
+        ) => Ok(InMemoryFieldState::LinearString(LinearString::with_value(
             value.clone(),
             operation_id.clone(),
         ))),
@@ -989,7 +1007,7 @@ where
                 value_type: PrimitiveType::String,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::String(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::String(
             LinearList::with_values(
                 decode_list_string(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1000,7 +1018,7 @@ where
                 value_type: PrimitiveType::UInt,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::UInt(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::UInt(
             LinearList::with_values(
                 decode_list_uint(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1011,7 +1029,7 @@ where
                 value_type: PrimitiveType::Int,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Int(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Int(
             LinearList::with_values(
                 decode_list_int(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1022,7 +1040,7 @@ where
                 value_type: PrimitiveType::Byte,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Byte(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Byte(
             LinearList::with_values(
                 decode_list_byte(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1033,7 +1051,7 @@ where
                 value_type: PrimitiveType::Float,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Float(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Float(
             LinearList::with_values(
                 decode_list_float(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1044,7 +1062,7 @@ where
                 value_type: PrimitiveType::Boolean,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Boolean(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Boolean(
             LinearList::with_values(
                 decode_list_boolean(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1055,7 +1073,7 @@ where
                 value_type: PrimitiveType::Binary,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Binary(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Binary(
             LinearList::with_values(
                 decode_list_binary(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1066,7 +1084,7 @@ where
                 value_type: PrimitiveType::Date,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Date(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Date(
             LinearList::with_values(
                 decode_list_date(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1077,7 +1095,7 @@ where
                 value_type: PrimitiveType::Timestamp,
             },
             super::super::public_api::FieldTargetValue::PrimitiveArray(value),
-        ) => Ok(InMemoryFieldValue::LinearList(LinearListValue::Timestamp(
+        ) => Ok(InMemoryFieldState::LinearList(LinearListState::Timestamp(
             LinearList::with_values(
                 decode_list_timestamp(value.clone()).map_err(operation_invalid_value)?,
                 operation_id.clone(),
@@ -1086,15 +1104,15 @@ where
         (
             ReplicatedDataType::MonotonicCounter { .. },
             super::super::public_api::FieldTargetValue::Counter(value),
-        ) => Ok(InMemoryFieldValue::MonotonicCounter(*value)),
+        ) => Ok(InMemoryFieldState::MonotonicCounter(*value)),
         (
             ReplicatedDataType::TotalOrderRegister { .. },
             super::super::public_api::FieldTargetValue::Primitive(value),
-        ) => Ok(InMemoryFieldValue::TotalOrderRegister(value.clone())),
+        ) => Ok(InMemoryFieldState::TotalOrderRegister(value.clone())),
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { .. },
             super::super::public_api::FieldTargetValue::NullablePrimitive(value),
-        ) => Ok(InMemoryFieldValue::TotalOrderFiniteStateRegister(
+        ) => Ok(InMemoryFieldState::TotalOrderFiniteStateRegister(
             value.clone(),
         )),
         _ => crate::InternalOperationSnafu {
@@ -1115,7 +1133,7 @@ fn build_initial_lww_value<OperationId>(
     value_type: &NullableBasicDataType,
     value: &NullableBasicValue,
     operation_id: &OperationId,
-) -> crate::OperationResult<InMemoryFieldValue<OperationId>>
+) -> crate::OperationResult<InMemoryFieldState<OperationId>>
 where
     OperationId:
         Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -1128,8 +1146,8 @@ where
     macro_rules! build_lww_variant {
         ($variant:ident, $value:expr) => {{
             let register = LinearLatestValueWins::new($value, ids);
-            Ok(InMemoryFieldValue::LatestValueWins(
-                LinearLatestValueWinsValue::$variant(register),
+            Ok(InMemoryFieldState::LatestValueWins(
+                LinearLatestValueWinsState::$variant(register),
             ))
         }};
     }
@@ -1470,7 +1488,7 @@ where
 )]
 fn build_field_operation<OperationId>(
     field_name: &str,
-    current_value: &InMemoryFieldValue<OperationId>,
+    current_value: &InMemoryFieldState<OperationId>,
     target_value: super::super::public_api::FieldTargetValue,
     operation_id: OperationId,
 ) -> crate::OperationResult<Option<OperationValue<OperationId>>>
@@ -1480,7 +1498,7 @@ where
 {
     match (current_value, target_value) {
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::String(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::String(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1489,7 +1507,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UInt(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1498,7 +1516,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Int(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Int(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1507,7 +1525,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Byte(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Byte(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1516,7 +1534,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Float(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Float(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1525,7 +1543,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Boolean(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Boolean(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1534,7 +1552,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Binary(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Binary(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1543,7 +1561,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Date(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Date(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1552,7 +1570,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Timestamp(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Timestamp(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1561,7 +1579,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::StringArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::StringArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1570,7 +1588,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UIntArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UIntArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1579,7 +1597,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::IntArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::IntArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1588,7 +1606,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::ByteArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::ByteArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1597,7 +1615,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::FloatArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::FloatArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1606,7 +1624,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::BooleanArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::BooleanArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1615,7 +1633,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::BinaryArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::BinaryArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1624,7 +1642,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::DateArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::DateArray(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1633,7 +1651,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::TimestampArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::TimestampArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1644,7 +1662,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableString(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableString(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1655,7 +1673,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1664,7 +1682,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableInt(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1673,7 +1691,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByte(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByte(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1682,7 +1700,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableFloat(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableFloat(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1691,7 +1709,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBoolean(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBoolean(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1702,7 +1720,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBinary(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBinary(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1713,7 +1731,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableDate(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableDate(current)),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
             current,
@@ -1722,7 +1740,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableTimestamp(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableTimestamp(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1733,7 +1751,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableStringArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableStringArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1744,7 +1762,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUIntArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUIntArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1755,7 +1773,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableIntArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableIntArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1766,7 +1784,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByteArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByteArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1777,7 +1795,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableFloatArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableFloatArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1788,7 +1806,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBooleanArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBooleanArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1799,7 +1817,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBinaryArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBinaryArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1810,7 +1828,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableDateArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableDateArray(
                 current,
             )),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
@@ -1821,8 +1839,8 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LatestValueWins(
-                LinearLatestValueWinsValue::NullableTimestampArray(current),
+            InMemoryFieldState::LatestValueWins(
+                LinearLatestValueWinsState::NullableTimestampArray(current),
             ),
             super::super::public_api::FieldTargetValue::NullableBasic(target),
         ) => build_lww_operation(
@@ -1832,7 +1850,7 @@ where
         )
         .map(|value| value.map(OperationValue::LatestValueWins)),
         (
-            InMemoryFieldValue::LinearString(current),
+            InMemoryFieldState::LinearString(current),
             super::super::public_api::FieldTargetValue::String(target),
         ) => {
             if current.to_string() == target {
@@ -1849,17 +1867,17 @@ where
             }
         }
         (
-            InMemoryFieldValue::LinearList(current),
+            InMemoryFieldState::LinearList(current),
             super::super::public_api::FieldTargetValue::PrimitiveArray(target),
         ) => build_linear_list_operation(current, target, &operation_id)
             .map(|value| value.map(OperationValue::LinearList)),
         (
-            InMemoryFieldValue::MonotonicCounter(current),
+            InMemoryFieldState::MonotonicCounter(current),
             super::super::public_api::FieldTargetValue::Counter(target),
         ) => build_counter_operation(field_name, *current, target)
             .map(|value| value.map(OperationValue::MonotonicCounterIncrement)),
         (
-            InMemoryFieldValue::TotalOrderRegister(current),
+            InMemoryFieldState::TotalOrderRegister(current),
             super::super::public_api::FieldTargetValue::Primitive(target),
         ) => {
             if *current == target {
@@ -1869,7 +1887,7 @@ where
             }
         }
         (
-            InMemoryFieldValue::TotalOrderFiniteStateRegister(current),
+            InMemoryFieldState::TotalOrderFiniteStateRegister(current),
             super::super::public_api::FieldTargetValue::NullablePrimitive(target),
         ) => {
             if *current == target {
@@ -1965,7 +1983,7 @@ type LinearListOperations<OperationId> =
     Vec<DataOperation<IdWithIndex<OperationId>, PrimitiveValueArray>>;
 
 fn build_linear_list_operation<OperationId>(
-    current: &LinearListValue<OperationId>,
+    current: &LinearListState<OperationId>,
     target: PrimitiveValueArray,
     operation_id: &OperationId,
 ) -> crate::OperationResult<Option<LinearListOperations<OperationId>>>
@@ -1993,23 +2011,23 @@ where
     }
 
     match current {
-        LinearListValue::String(current) => {
+        LinearListState::String(current) => {
             build_linear_list_op!(current, target, decode_list_string)
         }
-        LinearListValue::UInt(current) => build_linear_list_op!(current, target, decode_list_uint),
-        LinearListValue::Int(current) => build_linear_list_op!(current, target, decode_list_int),
-        LinearListValue::Byte(current) => build_linear_list_op!(current, target, decode_list_byte),
-        LinearListValue::Float(current) => {
+        LinearListState::UInt(current) => build_linear_list_op!(current, target, decode_list_uint),
+        LinearListState::Int(current) => build_linear_list_op!(current, target, decode_list_int),
+        LinearListState::Byte(current) => build_linear_list_op!(current, target, decode_list_byte),
+        LinearListState::Float(current) => {
             build_linear_list_op!(current, target, decode_list_float)
         }
-        LinearListValue::Boolean(current) => {
+        LinearListState::Boolean(current) => {
             build_linear_list_op!(current, target, decode_list_boolean)
         }
-        LinearListValue::Binary(current) => {
+        LinearListState::Binary(current) => {
             build_linear_list_op!(current, target, decode_list_binary)
         }
-        LinearListValue::Date(current) => build_linear_list_op!(current, target, decode_list_date),
-        LinearListValue::Timestamp(current) => {
+        LinearListState::Date(current) => build_linear_list_op!(current, target, decode_list_date),
+        LinearListState::Timestamp(current) => {
             build_linear_list_op!(current, target, decode_list_timestamp)
         }
     }
@@ -2040,7 +2058,7 @@ fn map_data_operation_value<Id, InputValue, OutputValue, E>(
     reason = "Applying operation values is an exhaustive CRDT variant dispatch table."
 )]
 fn apply_operation_value<OperationId>(
-    field_value: &mut InMemoryFieldValue<OperationId>,
+    field_value: &mut InMemoryFieldState<OperationId>,
     operation_value: OperationValue<OperationId>,
 ) -> crate::OperationResult<()>
 where
@@ -2083,178 +2101,178 @@ where
 
     match (field_value, operation_value) {
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::String(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::String(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_string),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UInt(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_uint),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Int(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Int(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_int),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Byte(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Byte(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_byte),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Float(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Float(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_float),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Boolean(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Boolean(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_boolean),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Binary(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Binary(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_binary),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Date(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Date(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_date),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Timestamp(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Timestamp(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_timestamp),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::StringArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::StringArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_string_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UIntArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UIntArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_uint_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::IntArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::IntArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_int_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::ByteArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::ByteArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_byte_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::FloatArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::FloatArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_float_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::BooleanArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::BooleanArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_boolean_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::BinaryArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::BinaryArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_binary_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::DateArray(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::DateArray(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_date_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::TimestampArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::TimestampArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_required_timestamp_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableString(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableString(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_string),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_uint),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableInt(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableInt(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_int),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByte(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByte(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_byte),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableFloat(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableFloat(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_float),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBoolean(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBoolean(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_boolean),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBinary(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBinary(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_binary),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableDate(current)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableDate(current)),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_date),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableTimestamp(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableTimestamp(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_timestamp),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableStringArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableStringArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_string_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUIntArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUIntArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_uint_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableIntArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableIntArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_int_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByteArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByteArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_byte_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableFloatArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableFloatArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_float_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBooleanArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBooleanArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_boolean_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableBinaryArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableBinaryArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_binary_array),
         (
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableDateArray(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableDateArray(
                 current,
             )),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_date_array),
         (
-            InMemoryFieldValue::LatestValueWins(
-                LinearLatestValueWinsValue::NullableTimestampArray(current),
+            InMemoryFieldState::LatestValueWins(
+                LinearLatestValueWinsState::NullableTimestampArray(current),
             ),
             OperationValue::LatestValueWins(operation),
         ) => apply_lww_operation!(current, operation, decode_optional_timestamp_array),
-        (InMemoryFieldValue::LinearString(current), OperationValue::LinearString(operations)) => {
+        (InMemoryFieldState::LinearString(current), OperationValue::LinearString(operations)) => {
             for operation in operations {
                 if current.apply_operation(operation).is_err() {
                     return crate::InternalOperationSnafu {
@@ -2266,43 +2284,43 @@ where
             Ok(())
         }
         (
-            InMemoryFieldValue::LinearList(LinearListValue::String(current)),
+            InMemoryFieldState::LinearList(LinearListState::String(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_string),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::UInt(current)),
+            InMemoryFieldState::LinearList(LinearListState::UInt(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_uint),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Int(current)),
+            InMemoryFieldState::LinearList(LinearListState::Int(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_int),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Byte(current)),
+            InMemoryFieldState::LinearList(LinearListState::Byte(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_byte),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Float(current)),
+            InMemoryFieldState::LinearList(LinearListState::Float(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_float),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Boolean(current)),
+            InMemoryFieldState::LinearList(LinearListState::Boolean(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_boolean),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Binary(current)),
+            InMemoryFieldState::LinearList(LinearListState::Binary(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_binary),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Date(current)),
+            InMemoryFieldState::LinearList(LinearListState::Date(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_date),
         (
-            InMemoryFieldValue::LinearList(LinearListValue::Timestamp(current)),
+            InMemoryFieldState::LinearList(LinearListState::Timestamp(current)),
             OperationValue::LinearList(operations),
         ) => apply_list_operations!(current, operations, decode_list_timestamp),
         (
-            InMemoryFieldValue::MonotonicCounter(current),
+            InMemoryFieldState::MonotonicCounter(current),
             OperationValue::MonotonicCounterIncrement(delta),
         ) => {
             match (current, delta) {
@@ -2322,14 +2340,14 @@ where
             Ok(())
         }
         (
-            InMemoryFieldValue::TotalOrderRegister(current),
+            InMemoryFieldState::TotalOrderRegister(current),
             OperationValue::TotalOrderRegisterSet(value),
         ) => {
             *current = value;
             Ok(())
         }
         (
-            InMemoryFieldValue::TotalOrderFiniteStateRegister(current),
+            InMemoryFieldState::TotalOrderFiniteStateRegister(current),
             OperationValue::TotalOrderFiniteStateRegisterSet(value),
         ) => {
             *current = value;
@@ -2353,14 +2371,14 @@ fn operation_invalid_value(source: DataModelValueError) -> crate::OperationError
 }
 
 #[derive(Copy)]
-pub struct InMemoryDataRow<'a, RowId, OperationId>
+pub struct InMemoryStateDataRow<'a, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
-    data: &'a InMemoryData<RowId, OperationId>,
+    data: &'a InMemoryStateData<RowId, OperationId>,
     row_index: usize,
 }
-impl<RowId, OperationId> Clone for InMemoryDataRow<'_, RowId, OperationId>
+impl<RowId, OperationId> Clone for InMemoryStateDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
@@ -2371,18 +2389,21 @@ where
         }
     }
 }
-impl<RowId, OperationId> InMemoryDataRow<'_, RowId, OperationId>
+impl<RowId, OperationId> InMemoryStateDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
     /// Materialise this row into a complete owned snapshot.
     #[must_use]
-    pub fn snapshot(&self) -> RowSnapshot<'static, OperationId>
+    pub fn snapshot(&self) -> RowStateSnapshot<'static, OperationId>
     where
         OperationId: Clone,
     {
-        RowSnapshot::borrowed_in_memory(&self.data.field_names, &self.data.rows[self.row_index])
-            .into_owned()
+        RowStateSnapshot::borrowed_in_memory(
+            &self.data.field_names,
+            &self.data.rows[self.row_index],
+        )
+        .into_owned()
     }
 
     /// Return whether this retained row is currently tombstoned.
@@ -2391,11 +2412,11 @@ where
         self.data.rows[self.row_index].deleted
     }
 }
-impl<RowId, OperationId> RowRead<OperationId> for InMemoryDataRow<'_, RowId, OperationId>
+impl<RowId, OperationId> RowStateRead<OperationId> for InMemoryStateDataRow<'_, RowId, OperationId>
 where
     RowId: PartialEq + Eq + Hash,
 {
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldState<OperationId>> {
         let field_index = self.data.field_index(field_name)?;
         let row = self.data.row(self.row_index).ok()?;
         row.fields.get(field_index)
@@ -2403,7 +2424,7 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Snafu)]
-pub enum InMemoryDataError {
+pub enum InMemoryStateDataError {
     #[snafu(display("Unknown field '{field_name}'."))]
     UnknownField { field_name: String },
     #[snafu(display("Field '{field_name}' was provided more than once."))]
@@ -2426,7 +2447,7 @@ pub enum InMemoryDataError {
 }
 
 #[derive(Debug, Snafu)]
-pub enum InMemoryDataSnapshotEncodeError<E>
+pub enum InMemoryStateDataSnapshotEncodeError<E>
 where
     E: snafu::Error + Send + Sync + 'static,
 {
@@ -2437,12 +2458,12 @@ where
 }
 
 #[derive(Debug, Snafu)]
-pub enum InMemoryDataSnapshotDecodeError<E>
+pub enum InMemoryStateDataSnapshotDecodeError<E>
 where
     E: snafu::Error + Send + Sync + 'static,
 {
     #[snafu(display("Decoded row is invalid for the in-memory dataset."))]
-    InMemoryData { source: InMemoryDataError },
+    InMemoryStateData { source: InMemoryStateDataError },
     #[snafu(display("Decoded value does not match the schema data type."))]
     InvalidValue { source: DataModelValueError },
     #[snafu(display("Failed to read CRDT snapshot nodes while decoding a row."))]
@@ -2466,12 +2487,12 @@ where
 
 /// Storage-level in-memory representation for one row over an associated schema.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct InMemoryRow<OperationId> {
+pub(crate) struct InMemoryStateRow<OperationId> {
     pub(crate) deleted: bool,
-    pub(crate) fields: Vec<InMemoryFieldValue<OperationId>>,
+    pub(crate) fields: Vec<InMemoryFieldState<OperationId>>,
 }
-impl<OperationId> InMemoryRow<OperationId> {
-    fn new(fields: Vec<InMemoryFieldValue<OperationId>>) -> Self {
+impl<OperationId> InMemoryStateRow<OperationId> {
+    fn new(fields: Vec<InMemoryFieldState<OperationId>>) -> Self {
         Self {
             deleted: false,
             fields,
@@ -2521,7 +2542,7 @@ impl<OperationId> InMemoryRow<OperationId> {
         schema: &Schema,
         field_names: &[String],
         decoder: &mut D,
-    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    ) -> Result<Self, InMemoryStateDataSnapshotDecodeError<D::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: SchemaSnapshotDecoder<OperationId>,
@@ -2534,7 +2555,7 @@ impl<OperationId> InMemoryRow<OperationId> {
                 .columns
                 .get(field_name.as_str())
                 .expect("field names and schema are in sync");
-            let field_value = InMemoryFieldValue::decode_snapshot_field(
+            let field_value = InMemoryFieldState::decode_snapshot_field(
                 field_name.as_str(),
                 schema_field,
                 decoder,
@@ -2552,10 +2573,10 @@ impl<OperationId> InMemoryRow<OperationId> {
 
 /// In-memory CRDT state for one schema field.
 #[derive(Clone, Debug, PartialEq)]
-pub enum InMemoryFieldValue<OperationId> {
-    LatestValueWins(LinearLatestValueWinsValue<OperationId>),
+pub enum InMemoryFieldState<OperationId> {
+    LatestValueWins(LinearLatestValueWinsState<OperationId>),
     LinearString(LinearString<OperationId>),
-    LinearList(LinearListValue<OperationId>),
+    LinearList(LinearListState<OperationId>),
     MonotonicCounter(CounterValue),
     TotalOrderRegister(PrimitiveValue),
     TotalOrderFiniteStateRegister(NullablePrimitiveValue),
@@ -2563,7 +2584,7 @@ pub enum InMemoryFieldValue<OperationId> {
 
 /// Specialized `LinearLatestValueWins` state variants by concrete value type.
 #[derive(Clone, Debug, PartialEq)]
-pub enum LinearLatestValueWinsValue<OperationId> {
+pub enum LinearLatestValueWinsState<OperationId> {
     String(LinearLatestValueWins<IdWithIndex<OperationId>, String>),
     UInt(LinearLatestValueWins<IdWithIndex<OperationId>, u64>),
     Int(LinearLatestValueWins<IdWithIndex<OperationId>, i64>),
@@ -2605,7 +2626,7 @@ pub enum LinearLatestValueWinsValue<OperationId> {
         LinearLatestValueWins<IdWithIndex<OperationId>, Option<Vec<UnixTimestamp>>>,
     ),
 }
-impl<OperationId> LinearLatestValueWinsValue<OperationId> {
+impl<OperationId> LinearLatestValueWinsState<OperationId> {
     #[must_use]
     #[allow(
         clippy::too_many_lines,
@@ -3177,7 +3198,7 @@ impl<OperationId> LinearLatestValueWinsValue<OperationId> {
 
 /// Specialized `LinearList` state variants by concrete primitive element type.
 #[derive(Clone, Debug, PartialEq)]
-pub enum LinearListValue<OperationId> {
+pub enum LinearListState<OperationId> {
     String(LinearList<OperationId, String>),
     UInt(LinearList<OperationId, u64>),
     Int(LinearList<OperationId, i64>),
@@ -3188,7 +3209,7 @@ pub enum LinearListValue<OperationId> {
     Date(LinearList<OperationId, NaiveDate>),
     Timestamp(LinearList<OperationId, UnixTimestamp>),
 }
-impl<OperationId> LinearListValue<OperationId> {
+impl<OperationId> LinearListState<OperationId> {
     #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {
@@ -3276,7 +3297,7 @@ impl<OperationId> LinearListValue<OperationId> {
     }
 }
 
-impl<OperationId> InMemoryFieldValue<OperationId> {
+impl<OperationId> InMemoryFieldState<OperationId> {
     pub(crate) fn encode_snapshot_field<V>(
         &self,
         field_name: &str,
@@ -3301,15 +3322,15 @@ impl<OperationId> InMemoryFieldValue<OperationId> {
             }
             Self::MonotonicCounter(value) => writer.state_field(
                 field_name,
-                SnapshotStateValueRef::MonotonicCounter(value.as_ref()),
+                StateSnapshotFieldValueRef::MonotonicCounter(value.as_ref()),
             ),
             Self::TotalOrderRegister(value) => writer.state_field(
                 field_name,
-                SnapshotStateValueRef::TotalOrderRegister(value.as_ref()),
+                StateSnapshotFieldValueRef::TotalOrderRegister(value.as_ref()),
             ),
             Self::TotalOrderFiniteStateRegister(value) => writer.state_field(
                 field_name,
-                SnapshotStateValueRef::TotalOrderFiniteStateRegister(value.as_ref()),
+                StateSnapshotFieldValueRef::TotalOrderFiniteStateRegister(value.as_ref()),
             ),
         }
     }
@@ -3318,7 +3339,7 @@ impl<OperationId> InMemoryFieldValue<OperationId> {
         field_name: &str,
         schema_field: &super::super::Field,
         decoder: &mut D,
-    ) -> Result<Self, InMemoryDataSnapshotDecodeError<D::Error>>
+    ) -> Result<Self, InMemoryStateDataSnapshotDecodeError<D::Error>>
     where
         OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: SchemaSnapshotDecoder<OperationId>,
@@ -3486,29 +3507,29 @@ where
 
 fn decode_state_snapshot_field<OperationId>(
     data_type: &ReplicatedDataType,
-    value: SnapshotStateValue,
-) -> Result<InMemoryFieldValue<OperationId>, DataModelValueError> {
+    value: StateSnapshotFieldValue,
+) -> Result<InMemoryFieldState<OperationId>, DataModelValueError> {
     match (data_type, value) {
         (
             ReplicatedDataType::MonotonicCounter { small_range },
-            SnapshotStateValue::MonotonicCounter(value),
+            StateSnapshotFieldValue::MonotonicCounter(value),
         ) => {
             ensure_counter_type(*small_range, value.as_ref())?;
-            Ok(InMemoryFieldValue::MonotonicCounter(value))
+            Ok(InMemoryFieldState::MonotonicCounter(value))
         }
         (
             ReplicatedDataType::TotalOrderRegister { value_type, .. },
-            SnapshotStateValue::TotalOrderRegister(value),
+            StateSnapshotFieldValue::TotalOrderRegister(value),
         ) => {
             ensure_primitive_type(*value_type, value.primitive_type())?;
-            Ok(InMemoryFieldValue::TotalOrderRegister(value))
+            Ok(InMemoryFieldState::TotalOrderRegister(value))
         }
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
-            SnapshotStateValue::TotalOrderFiniteStateRegister(value),
+            StateSnapshotFieldValue::TotalOrderFiniteStateRegister(value),
         ) => {
             ensure_finite_state_value(*value_type, states, &value.as_ref())?;
-            Ok(InMemoryFieldValue::TotalOrderFiniteStateRegister(value))
+            Ok(InMemoryFieldState::TotalOrderFiniteStateRegister(value))
         }
         _ => Err(DataModelValueError::InvalidSnapshotValueForType),
     }
@@ -3521,7 +3542,7 @@ fn decode_state_snapshot_field<OperationId>(
 fn decode_latest_value_wins_snapshot<OperationId, E, I>(
     value_type: &NullableBasicDataType,
     nodes: I,
-) -> Result<LinearLatestValueWinsValue<OperationId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
+) -> Result<LinearLatestValueWinsState<OperationId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
 where
     E: snafu::Error + Send + Sync + 'static,
     OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -3538,102 +3559,102 @@ where
                 nodes,
                 decode_required_string,
             ))
-            .map(LinearLatestValueWinsValue::String)
+            .map(LinearLatestValueWinsState::String)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::UInt)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_uint,
             ))
-            .map(LinearLatestValueWinsValue::UInt)
+            .map(LinearLatestValueWinsState::UInt)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Int)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_int,
             ))
-            .map(LinearLatestValueWinsValue::Int)
+            .map(LinearLatestValueWinsState::Int)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Byte)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_byte,
             ))
-            .map(LinearLatestValueWinsValue::Byte)
+            .map(LinearLatestValueWinsState::Byte)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Float)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_float,
             ))
-            .map(LinearLatestValueWinsValue::Float)
+            .map(LinearLatestValueWinsState::Float)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Boolean)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_boolean,
             ))
-            .map(LinearLatestValueWinsValue::Boolean)
+            .map(LinearLatestValueWinsState::Boolean)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Binary)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_binary,
             ))
-            .map(LinearLatestValueWinsValue::Binary)
+            .map(LinearLatestValueWinsState::Binary)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Date)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_date,
             ))
-            .map(LinearLatestValueWinsValue::Date)
+            .map(LinearLatestValueWinsState::Date)
         }
         NullableBasicDataType::NonNull(BasicDataType::Primitive(PrimitiveType::Timestamp)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_required_timestamp,
             ))
-            .map(LinearLatestValueWinsValue::Timestamp)
+            .map(LinearLatestValueWinsState::Timestamp)
         }
         NullableBasicDataType::NonNull(BasicDataType::Array(array_type)) => {
             match array_type.element_type {
                 PrimitiveType::String => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_string_array),
                 )
-                .map(LinearLatestValueWinsValue::StringArray),
+                .map(LinearLatestValueWinsState::StringArray),
                 PrimitiveType::UInt => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_uint_array),
                 )
-                .map(LinearLatestValueWinsValue::UIntArray),
+                .map(LinearLatestValueWinsState::UIntArray),
                 PrimitiveType::Int => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_int_array),
                 )
-                .map(LinearLatestValueWinsValue::IntArray),
+                .map(LinearLatestValueWinsState::IntArray),
                 PrimitiveType::Byte => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_byte_array),
                 )
-                .map(LinearLatestValueWinsValue::ByteArray),
+                .map(LinearLatestValueWinsState::ByteArray),
                 PrimitiveType::Float => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_float_array),
                 )
-                .map(LinearLatestValueWinsValue::FloatArray),
+                .map(LinearLatestValueWinsState::FloatArray),
                 PrimitiveType::Boolean => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_boolean_array),
                 )
-                .map(LinearLatestValueWinsValue::BooleanArray),
+                .map(LinearLatestValueWinsState::BooleanArray),
                 PrimitiveType::Binary => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_binary_array),
                 )
-                .map(LinearLatestValueWinsValue::BinaryArray),
+                .map(LinearLatestValueWinsState::BinaryArray),
                 PrimitiveType::Date => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_date_array),
                 )
-                .map(LinearLatestValueWinsValue::DateArray),
+                .map(LinearLatestValueWinsState::DateArray),
                 PrimitiveType::Timestamp => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_required_timestamp_array),
                 )
-                .map(LinearLatestValueWinsValue::TimestampArray),
+                .map(LinearLatestValueWinsState::TimestampArray),
             }
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::String)) => {
@@ -3641,102 +3662,102 @@ where
                 nodes,
                 decode_optional_string,
             ))
-            .map(LinearLatestValueWinsValue::NullableString)
+            .map(LinearLatestValueWinsState::NullableString)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::UInt)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_uint,
             ))
-            .map(LinearLatestValueWinsValue::NullableUInt)
+            .map(LinearLatestValueWinsState::NullableUInt)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Int)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_int,
             ))
-            .map(LinearLatestValueWinsValue::NullableInt)
+            .map(LinearLatestValueWinsState::NullableInt)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Byte)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_byte,
             ))
-            .map(LinearLatestValueWinsValue::NullableByte)
+            .map(LinearLatestValueWinsState::NullableByte)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Float)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_float,
             ))
-            .map(LinearLatestValueWinsValue::NullableFloat)
+            .map(LinearLatestValueWinsState::NullableFloat)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Boolean)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_boolean,
             ))
-            .map(LinearLatestValueWinsValue::NullableBoolean)
+            .map(LinearLatestValueWinsState::NullableBoolean)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Binary)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_binary,
             ))
-            .map(LinearLatestValueWinsValue::NullableBinary)
+            .map(LinearLatestValueWinsState::NullableBinary)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Date)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_date,
             ))
-            .map(LinearLatestValueWinsValue::NullableDate)
+            .map(LinearLatestValueWinsState::NullableDate)
         }
         NullableBasicDataType::Nullable(BasicDataType::Primitive(PrimitiveType::Timestamp)) => {
             LinearLatestValueWins::from_snapshot_nodes(map_snapshot_nodes_value(
                 nodes,
                 decode_optional_timestamp,
             ))
-            .map(LinearLatestValueWinsValue::NullableTimestamp)
+            .map(LinearLatestValueWinsState::NullableTimestamp)
         }
         NullableBasicDataType::Nullable(BasicDataType::Array(array_type)) => {
             match array_type.element_type {
                 PrimitiveType::String => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_string_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableStringArray),
+                .map(LinearLatestValueWinsState::NullableStringArray),
                 PrimitiveType::UInt => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_uint_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableUIntArray),
+                .map(LinearLatestValueWinsState::NullableUIntArray),
                 PrimitiveType::Int => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_int_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableIntArray),
+                .map(LinearLatestValueWinsState::NullableIntArray),
                 PrimitiveType::Byte => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_byte_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableByteArray),
+                .map(LinearLatestValueWinsState::NullableByteArray),
                 PrimitiveType::Float => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_float_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableFloatArray),
+                .map(LinearLatestValueWinsState::NullableFloatArray),
                 PrimitiveType::Boolean => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_boolean_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableBooleanArray),
+                .map(LinearLatestValueWinsState::NullableBooleanArray),
                 PrimitiveType::Binary => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_binary_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableBinaryArray),
+                .map(LinearLatestValueWinsState::NullableBinaryArray),
                 PrimitiveType::Date => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_date_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableDateArray),
+                .map(LinearLatestValueWinsState::NullableDateArray),
                 PrimitiveType::Timestamp => LinearLatestValueWins::from_snapshot_nodes(
                     map_snapshot_nodes_value(nodes, decode_optional_timestamp_array),
                 )
-                .map(LinearLatestValueWinsValue::NullableTimestampArray),
+                .map(LinearLatestValueWinsState::NullableTimestampArray),
             }
         }
     }
@@ -3745,7 +3766,7 @@ where
 fn decode_linear_list_snapshot<OperationId, E, I>(
     value_type: PrimitiveType,
     nodes: I,
-) -> Result<LinearListValue<OperationId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
+) -> Result<LinearListState<OperationId>, SnapshotReadError<InMemoryNodeDecodeError<E>>>
 where
     E: snafu::Error + Send + Sync + 'static,
     OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
@@ -3759,39 +3780,39 @@ where
     match value_type {
         PrimitiveType::String => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_string))
-                .map(LinearListValue::String)
+                .map(LinearListState::String)
         }
         PrimitiveType::UInt => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_uint))
-                .map(LinearListValue::UInt)
+                .map(LinearListState::UInt)
         }
         PrimitiveType::Int => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_int))
-                .map(LinearListValue::Int)
+                .map(LinearListState::Int)
         }
         PrimitiveType::Byte => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_byte))
-                .map(LinearListValue::Byte)
+                .map(LinearListState::Byte)
         }
         PrimitiveType::Float => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_float))
-                .map(LinearListValue::Float)
+                .map(LinearListState::Float)
         }
         PrimitiveType::Boolean => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_boolean))
-                .map(LinearListValue::Boolean)
+                .map(LinearListState::Boolean)
         }
         PrimitiveType::Binary => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_binary))
-                .map(LinearListValue::Binary)
+                .map(LinearListState::Binary)
         }
         PrimitiveType::Date => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_date))
-                .map(LinearListValue::Date)
+                .map(LinearListState::Date)
         }
         PrimitiveType::Timestamp => {
             LinearList::from_snapshot_nodes(map_snapshot_nodes_value(nodes, decode_list_timestamp))
-                .map(LinearListValue::Timestamp)
+                .map(LinearListState::Timestamp)
         }
     }
 }
@@ -4045,12 +4066,12 @@ fn decode_list_timestamp(
 
 pub(crate) fn validate_in_memory_field_value<OperationId>(
     data_type: &ReplicatedDataType,
-    value: &InMemoryFieldValue<OperationId>,
+    value: &InMemoryFieldState<OperationId>,
 ) -> Result<(), DataModelValueError> {
     match (data_type, value) {
         (
             ReplicatedDataType::LatestValueWins { value_type },
-            InMemoryFieldValue::LatestValueWins(v),
+            InMemoryFieldState::LatestValueWins(v),
         ) => {
             if v.matches_type(value_type) {
                 Ok(())
@@ -4058,21 +4079,21 @@ pub(crate) fn validate_in_memory_field_value<OperationId>(
                 Err(DataModelValueError::BasicTypeMismatch)
             }
         }
-        (ReplicatedDataType::LinearString, InMemoryFieldValue::LinearString(_)) => Ok(()),
-        (ReplicatedDataType::LinearList { value_type }, InMemoryFieldValue::LinearList(v)) => {
+        (ReplicatedDataType::LinearString, InMemoryFieldState::LinearString(_)) => Ok(()),
+        (ReplicatedDataType::LinearList { value_type }, InMemoryFieldState::LinearList(v)) => {
             ensure_primitive_type(*value_type, v.primitive_type())
         }
         (
             ReplicatedDataType::MonotonicCounter { small_range },
-            InMemoryFieldValue::MonotonicCounter(v),
+            InMemoryFieldState::MonotonicCounter(v),
         ) => ensure_counter_type(*small_range, v.as_ref()),
         (
             ReplicatedDataType::TotalOrderRegister { value_type, .. },
-            InMemoryFieldValue::TotalOrderRegister(v),
+            InMemoryFieldState::TotalOrderRegister(v),
         ) => ensure_primitive_type(*value_type, v.primitive_type()),
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
-            InMemoryFieldValue::TotalOrderFiniteStateRegister(v),
+            InMemoryFieldState::TotalOrderFiniteStateRegister(v),
         ) => ensure_finite_state_value(*value_type, states, &v.as_ref()),
         _ => Err(DataModelValueError::InvalidSnapshotValueForType),
     }

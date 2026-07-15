@@ -32,8 +32,10 @@ pub use generated::{
     },
 };
 
-pub type InMemoryData =
-    flotsync_data_types::schema::datamodel::InMemoryData<Uuid, flotsync_core::versions::UpdateId>;
+pub type InMemoryStateData = flotsync_data_types::schema::datamodel::InMemoryStateData<
+    Uuid,
+    flotsync_core::versions::UpdateId,
+>;
 pub type SchemaOperation<'a> = flotsync_data_types::schema::datamodel::SchemaOperation<
     'a,
     Uuid,

@@ -1,10 +1,10 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowPatch,
-        DatasetRowSlice,
-        DatasetRowWrite,
-        DatasetRowsBatch,
+        DatasetRowStateBatch,
+        DatasetRowStatePatch,
+        DatasetRowStateSlice,
+        DatasetRowStateWrite,
         DatasetSchema,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
@@ -22,8 +22,8 @@ use crate::{
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
         ReplicationGroupRecord,
-        ReplicationRowRecord,
-        ReplicationRowSnapshot,
+        ReplicationRowStateRecord,
+        ReplicationRowStateSnapshot,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -448,7 +448,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             load_dataset_rows(
@@ -469,7 +469,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         dataset_id: &'a DatasetId,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             scan_dataset_row_batch(
@@ -568,7 +568,7 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 
     fn apply_dataset_row_patch(
         &mut self,
-        patch: DatasetRowPatch,
+        patch: DatasetRowStatePatch,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
@@ -1410,11 +1410,11 @@ async fn load_dataset_rows(
     group_id: &GroupId,
     dataset_id: &DatasetId,
     row_keys: &mut RowKeyIterator<'_>,
-) -> Result<DatasetRowSlice, StoreError> {
+) -> Result<DatasetRowStateSlice, StoreError> {
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     let mut row_keys = row_keys.peekable();
     if row_keys.peek().is_none() {
-        return Ok(DatasetRowSlice {
+        return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1425,7 +1425,7 @@ async fn load_dataset_rows(
         .map(|row_key| (*row_key, None))
         .collect::<HashMap<_, _>>();
     if !dataset_exists {
-        return Ok(DatasetRowSlice {
+        return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1471,7 +1471,7 @@ WHERE group_id = ",
         )?;
         rows.insert(
             row_key,
-            Some(ReplicationRowRecord {
+            Some(ReplicationRowStateRecord {
                 row_id: row_key,
                 snapshot: row_snapshot,
                 tombstoned: row.get::<bool, _>("row_tombstoned"),
@@ -1482,7 +1482,7 @@ WHERE group_id = ",
             }),
         );
     }
-    Ok(DatasetRowSlice {
+    Ok(DatasetRowStateSlice {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
@@ -1502,10 +1502,10 @@ async fn scan_dataset_row_batch(
     dataset_id: &DatasetId,
     after: Option<RowKey>,
     limit: NonZeroUsize,
-) -> Result<DatasetRowsBatch, StoreError> {
+) -> Result<DatasetRowStateBatch, StoreError> {
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     if !dataset_exists {
-        return Ok(DatasetRowsBatch {
+        return Ok(DatasetRowStateBatch {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1551,7 +1551,7 @@ WHERE group_id = ",
             schema.as_schema(),
             &row.get::<Vec<u8>, _>("row_snapshot"),
         )?;
-        rows.push(ReplicationRowRecord {
+        rows.push(ReplicationRowStateRecord {
             row_id: row_key,
             snapshot: row_snapshot,
             tombstoned: row.get::<bool, _>("row_tombstoned"),
@@ -1563,7 +1563,7 @@ WHERE group_id = ",
     } else {
         None
     };
-    Ok(DatasetRowsBatch {
+    Ok(DatasetRowStateBatch {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
@@ -1575,7 +1575,7 @@ WHERE group_id = ",
 async fn apply_dataset_row_patch(
     connection: &mut SqliteStoreConnection,
     schema_sources: &HashMap<DatasetId, SchemaSource>,
-    patch: &DatasetRowPatch,
+    patch: &DatasetRowStatePatch,
 ) -> Result<(), StoreError> {
     if patch.actions.is_empty() {
         return Ok(());
@@ -1592,7 +1592,7 @@ async fn apply_dataset_row_patch(
 
     for action in &patch.actions {
         let (row_key, snapshot, tombstoned) = match action {
-            DatasetRowWrite::UpsertActive { row_key, snapshot } => {
+            DatasetRowStateWrite::UpsertActive { row_key, snapshot } => {
                 ensure_dataset_row_upsert_active_is_valid(
                     connection,
                     &patch.group_id,
@@ -1602,7 +1602,9 @@ async fn apply_dataset_row_patch(
                 .await?;
                 (row_key, snapshot, false)
             }
-            DatasetRowWrite::UpsertTombstone { row_key, snapshot } => (row_key, snapshot, true),
+            DatasetRowStateWrite::UpsertTombstone { row_key, snapshot } => {
+                (row_key, snapshot, true)
+            }
         };
         let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
         sqlx::query(
@@ -2336,7 +2338,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
 
 fn encode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
-    row: &ReplicationRowSnapshot,
+    row: &ReplicationRowStateSnapshot,
 ) -> Result<Vec<u8>, StoreError> {
     let row = encode_row_snapshot(row, schema)
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
@@ -2346,7 +2348,7 @@ fn encode_dataset_row_snapshot(
 fn decode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
     bytes: &[u8],
-) -> Result<ReplicationRowSnapshot, StoreError> {
+) -> Result<ReplicationRowStateSnapshot, StoreError> {
     let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
         SqliteStoreError::DecodeStoredProto {
             object: "dataset row snapshot",
@@ -2733,22 +2735,22 @@ mod tests {
     use super::*;
     use crate::{
         api::{
-            DatasetRowPatch,
-            DatasetRowWrite,
+            DatasetRowStatePatch,
+            DatasetRowStateWrite,
             GroupInvitation,
             GroupSchema,
-            InitialDatasetState,
-            InitialGroupState,
-            InitialRowState,
+            InitialDatasetValueRows,
+            InitialGroupValueRows,
             InitialSnapshot,
             InitialSnapshotMetadata,
+            InitialValueRow,
             MemberKeyTrustEvidenceKind,
             MemberKeyTrustEvidenceRecord,
             MemberPublicKeysRecord,
             MigrationId,
             MigrationProposal,
             PendingGroupDecisionRecord,
-            ReplicationRowRecord,
+            ReplicationRowStateRecord,
             ReplicationUpdateFilter,
             SnapshotRef,
             current_slice_placeholder_group_security_material,
@@ -2836,10 +2838,10 @@ mod tests {
     }
 
     fn inline_snapshot() -> InitialSnapshot {
-        InitialSnapshot::Inline(InitialGroupState {
-            datasets: vec![InitialDatasetState {
+        InitialSnapshot::Inline(InitialGroupValueRows {
+            datasets: vec![InitialDatasetValueRows {
                 dataset_id: docs_dataset_id(),
-                rows: vec![InitialRowState {
+                rows: vec![InitialValueRow {
                     row_key: RowKey(Uuid::from_u128(30_001)),
                     row: crate::row_values! {
                         "title" => "stored",
@@ -3107,14 +3109,14 @@ mod tests {
         dataset_id: &DatasetId,
         row_key: RowKey,
         operation: &flotsync_messages::SchemaOperation<'_>,
-    ) -> DatasetRowPatch {
+    ) -> DatasetRowStatePatch {
         let RowOperation::Insert { snapshot, .. } = &operation.operation else {
             panic!("expected insert operation");
         };
-        DatasetRowPatch {
+        DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertActive {
+            actions: vec![DatasetRowStateWrite::UpsertActive {
                 row_key,
                 snapshot: snapshot.clone().into_owned(),
             }],
@@ -3126,8 +3128,8 @@ mod tests {
         schema: &Arc<Schema>,
         row_key: RowKey,
         title: &str,
-    ) -> ReplicationRowSnapshot {
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+    ) -> ReplicationRowStateSnapshot {
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -3155,7 +3157,7 @@ mod tests {
         title: &str,
         schema: &Arc<Schema>,
     ) -> flotsync_messages::datamodel::SchemaOperation {
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -3217,7 +3219,7 @@ mod tests {
         let group = sample_group(group_id);
         let mut updated_version_vector = group.version_vector.clone();
         updated_version_vector.increment_at(1);
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -3239,13 +3241,13 @@ mod tests {
             encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
         let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
         let expected_row = match &row_patch.actions[0] {
-            DatasetRowWrite::UpsertActive { row_key, snapshot } => ReplicationRowRecord {
+            DatasetRowStateWrite::UpsertActive { row_key, snapshot } => ReplicationRowStateRecord {
                 row_id: *row_key,
                 snapshot: snapshot.clone(),
                 tombstoned: false,
                 last_changed_versions: row_patch.last_changed_versions.clone(),
             },
-            DatasetRowWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
+            DatasetRowStateWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
         };
         let update = ReplicationUpdateRecord {
             group_id,
@@ -3631,7 +3633,7 @@ mod tests {
         );
         let group_id = GroupId(Uuid::from_u128(104));
         let row_key = RowKey(Uuid::from_u128(204));
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -3652,7 +3654,7 @@ mod tests {
         let RowOperation::Insert { snapshot, .. } = &operation.operation else {
             panic!("expected insert operation");
         };
-        let stored_row = ReplicationRowRecord {
+        let stored_row = ReplicationRowStateRecord {
             row_id: row_key,
             snapshot: snapshot.clone().into_owned(),
             tombstoned: true,
@@ -3663,10 +3665,10 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertTombstone {
+            actions: vec![DatasetRowStateWrite::UpsertTombstone {
                 row_key,
                 snapshot: stored_row.snapshot.clone(),
             }],
@@ -3709,15 +3711,15 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
             actions: vec![
-                DatasetRowWrite::UpsertActive {
+                DatasetRowStateWrite::UpsertActive {
                     row_key: second_row_key,
                     snapshot: title_snapshot(&schema, second_row_key, "second"),
                 },
-                DatasetRowWrite::UpsertActive {
+                DatasetRowStateWrite::UpsertActive {
                     row_key: first_row_key,
                     snapshot: title_snapshot(&schema, first_row_key, "first"),
                 },
@@ -3768,10 +3770,10 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertTombstone {
+            actions: vec![DatasetRowStateWrite::UpsertTombstone {
                 row_key,
                 snapshot: tombstone_snapshot,
             }],
@@ -3779,16 +3781,17 @@ mod tests {
         }))
         .expect("missing-to-tombstone upsert should store");
 
-        let error = wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
-            group_id,
-            dataset_id,
-            actions: vec![DatasetRowWrite::UpsertActive {
-                row_key,
-                snapshot: active_snapshot,
-            }],
-            last_changed_versions: sample_last_changed_versions(),
-        }))
-        .expect_err("tombstone-to-active upsert should fail");
+        let error =
+            wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
+                group_id,
+                dataset_id,
+                actions: vec![DatasetRowStateWrite::UpsertActive {
+                    row_key,
+                    snapshot: active_snapshot,
+                }],
+                last_changed_versions: sample_last_changed_versions(),
+            }))
+            .expect_err("tombstone-to-active upsert should fail");
         wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
 
         assert!(matches!(
@@ -3829,7 +3832,7 @@ mod tests {
         );
         let group_id = GroupId(Uuid::from_u128(404));
         let group = sample_group(group_id);
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {

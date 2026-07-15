@@ -25,8 +25,8 @@ use flotsync_data_types::{
             NullableBasicValue as ModelNullableBasicValue,
             NullableBasicValueRef as ModelNullableBasicValueRef,
             PrimitiveValueArrayRef as ModelPrimitiveValueArrayRef,
-            SnapshotStateValue,
-            SnapshotStateValueRef,
+            StateSnapshotFieldValue,
+            StateSnapshotFieldValueRef,
             validation::ensure_snapshot_state_value_type,
         },
         values::{
@@ -430,26 +430,26 @@ pub fn decode_counter_value(
 /// See `CodecError` for failure conditions.
 pub fn encode_state_snapshot_value(
     data_type: &ReplicatedDataType,
-    value: SnapshotStateValueRef<'_>,
+    value: StateSnapshotFieldValueRef<'_>,
 ) -> Result<StateSnapshotWireValue, CodecError> {
     ensure_snapshot_state_value_type(data_type, value.clone())
         .context(InvalidSnapshotValueSnafu)?;
     match (data_type, value) {
         (
             ReplicatedDataType::MonotonicCounter { .. },
-            SnapshotStateValueRef::MonotonicCounter(value),
+            StateSnapshotFieldValueRef::MonotonicCounter(value),
         ) => Ok(StateSnapshotWireValue::MonotonicCounter(
             encode_counter_value(value),
         )),
         (
             ReplicatedDataType::TotalOrderRegister { .. },
-            SnapshotStateValueRef::TotalOrderRegister(value),
+            StateSnapshotFieldValueRef::TotalOrderRegister(value),
         ) => Ok(StateSnapshotWireValue::TotalOrderRegister(
             encode_primitive_value(value),
         )),
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { .. },
-            SnapshotStateValueRef::TotalOrderFiniteStateRegister(value),
+            StateSnapshotFieldValueRef::TotalOrderFiniteStateRegister(value),
         ) => Ok(StateSnapshotWireValue::TotalOrderFiniteStateRegister(
             encode_nullable_primitive_value(value),
         )),
@@ -465,19 +465,19 @@ pub fn encode_state_snapshot_value(
 pub fn decode_state_snapshot_value(
     data_type: &ReplicatedDataType,
     value: StateSnapshotWireValue,
-) -> Result<SnapshotStateValue, CodecError> {
+) -> Result<StateSnapshotFieldValue, CodecError> {
     let decoded = match value {
         StateSnapshotWireValue::MonotonicCounter(value) => {
             let counter_value = decode_counter_value(value)?;
-            SnapshotStateValue::MonotonicCounter(counter_value)
+            StateSnapshotFieldValue::MonotonicCounter(counter_value)
         }
         StateSnapshotWireValue::TotalOrderRegister(value) => {
             let register_value = decode_primitive_value(value)?;
-            SnapshotStateValue::TotalOrderRegister(register_value)
+            StateSnapshotFieldValue::TotalOrderRegister(register_value)
         }
         StateSnapshotWireValue::TotalOrderFiniteStateRegister(value) => {
             let register_value = decode_nullable_primitive_value(value)?;
-            SnapshotStateValue::TotalOrderFiniteStateRegister(register_value)
+            StateSnapshotFieldValue::TotalOrderFiniteStateRegister(register_value)
         }
     };
     ensure_snapshot_state_value_type(data_type, decoded.as_ref())
@@ -509,7 +509,7 @@ mod tests {
         NullablePrimitiveType,
         PrimitiveType,
         ReplicatedDataType,
-        datamodel::{SnapshotStateValue, SnapshotStateValueRef},
+        datamodel::{StateSnapshotFieldValue, StateSnapshotFieldValueRef},
         values::NullablePrimitiveValueArray,
     };
     use std::assert_matches;
@@ -569,9 +569,9 @@ mod tests {
             },
         };
 
-        let counter = SnapshotStateValue::MonotonicCounter(ModelCounterValue::UInt(11));
-        let register = SnapshotStateValue::TotalOrderRegister(ModelPrimitiveValue::UInt(9));
-        let finite = SnapshotStateValue::TotalOrderFiniteStateRegister(
+        let counter = StateSnapshotFieldValue::MonotonicCounter(ModelCounterValue::UInt(11));
+        let register = StateSnapshotFieldValue::TotalOrderRegister(ModelPrimitiveValue::UInt(9));
+        let finite = StateSnapshotFieldValue::TotalOrderFiniteStateRegister(
             ModelNullablePrimitiveValue::Value(ModelPrimitiveValue::String("published".to_owned())),
         );
 
@@ -600,7 +600,7 @@ mod tests {
     fn invalid_state_value_is_rejected() {
         let err = encode_state_snapshot_value(
             &ReplicatedDataType::MonotonicCounter { small_range: true },
-            SnapshotStateValueRef::MonotonicCounter(ModelCounterValueRef::UInt(9)),
+            StateSnapshotFieldValueRef::MonotonicCounter(ModelCounterValueRef::UInt(9)),
         )
         .unwrap_err();
 

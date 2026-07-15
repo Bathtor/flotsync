@@ -31,9 +31,9 @@ use crate::{
         AuthorityScope,
         CreateGroupRequest,
         DatasetId,
-        DatasetRowPatch,
-        DatasetRowSlice,
-        DatasetRowsBatch,
+        DatasetRowStateBatch,
+        DatasetRowStatePatch,
+        DatasetRowStateSlice,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupInvitation,
@@ -340,7 +340,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -388,7 +388,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         dataset_id: &'a DatasetId,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -485,7 +485,7 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
 
     fn apply_dataset_row_patch(
         &mut self,
-        patch: DatasetRowPatch,
+        patch: DatasetRowStatePatch,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let failure = self.fail_next_apply_dataset_row_patch.clone();
         async move {
@@ -1526,7 +1526,7 @@ fn load_persisted_row_slice<S>(
     group_id: GroupId,
     dataset_id: &DatasetId,
     row_keys: impl IntoIterator<Item = RowKey>,
-) -> DatasetRowSlice
+) -> DatasetRowStateSlice
 where
     S: ReplicationStore + ?Sized,
 {
@@ -4125,7 +4125,7 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             .expect("edited tombstone should persist");
     assert!(edited_tombstone.tombstoned);
     let materialised_tombstone =
-        flotsync_messages::InMemoryData::from_row_snapshots_with_tombstones(
+        flotsync_messages::InMemoryStateData::from_row_snapshots_with_tombstones(
             schema,
             [flotsync_data_types::schema::datamodel::RowRecord {
                 row_id: row_id.row_key.0,

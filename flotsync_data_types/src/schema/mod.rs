@@ -3,7 +3,7 @@
 //! concurrent modification.
 use std::{borrow::Cow, collections::HashMap, fmt, ops::Index};
 
-use crate::FieldOperations;
+use crate::FieldStateReadExt;
 
 pub mod datamodel;
 mod public_api;
@@ -198,8 +198,8 @@ impl Field {
         })
     }
 }
-impl<OperationId> FieldOperations<OperationId> for Field {
-    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a crate::InMemoryFieldValue<OperationId>
+impl<OperationId> FieldStateReadExt<OperationId> for Field {
+    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a crate::InMemoryFieldState<OperationId>
     where
         R: crate::RowOperations<OperationId>,
     {

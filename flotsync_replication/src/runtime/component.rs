@@ -60,8 +60,8 @@ use crate::{
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DatasetId,
-        DatasetRowPatch,
-        DatasetRowWrite,
+        DatasetRowStatePatch,
+        DatasetRowStateWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         GroupInvitationResponder,
@@ -78,7 +78,7 @@ use crate::{
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
-        ReplicationRowRecord,
+        ReplicationRowStateRecord,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -145,7 +145,7 @@ use flotsync_core::{
     membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::OwnedRow;
+use flotsync_data_types::OwnedStateRow;
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
@@ -370,7 +370,7 @@ impl StoreSnapshotRowProvider {
     fn snapshot_row_from_record(
         group_id: GroupId,
         dataset_id: DatasetId,
-        record: ReplicationRowRecord,
+        record: ReplicationRowStateRecord,
     ) -> SnapshotRow {
         let row_id = RowId {
             group_id,
@@ -384,7 +384,7 @@ impl StoreSnapshotRowProvider {
             .collect::<HashMap<_, _>>();
         SnapshotRow {
             row_id,
-            row: Arc::new(OwnedRow::new(fields)),
+            row: Arc::new(OwnedStateRow::new(fields)),
             deleted: record.tombstoned,
         }
     }
@@ -793,7 +793,7 @@ impl ReplicationRuntimeComponent {
     /// Persist one set of explicit row patches back into the replication store.
     async fn apply_dataset_row_patches(
         transaction: &mut dyn ReplicationStoreTransaction,
-        patches: Vec<DatasetRowPatch>,
+        patches: Vec<DatasetRowStatePatch>,
     ) -> Result<(), StoreError> {
         for patch in patches {
             transaction.apply_dataset_row_patch(patch).await?;
@@ -1380,7 +1380,7 @@ impl ReplicationRuntimeComponent {
             DatasetId,
             Vec<flotsync_messages::datamodel::SchemaOperation>,
         > = HashMap::new();
-        let mut row_writes: HashMap<DatasetId, Vec<DatasetRowWrite>> = HashMap::new();
+        let mut row_writes: HashMap<DatasetId, Vec<DatasetRowStateWrite>> = HashMap::new();
         let mut row_changes = Vec::new();
 
         'changes: for mutation in changes {
@@ -1423,7 +1423,7 @@ impl ReplicationRuntimeComponent {
             .collect();
         let row_patches = row_writes
             .into_iter()
-            .map(|(dataset_id, actions)| DatasetRowPatch {
+            .map(|(dataset_id, actions)| DatasetRowStatePatch {
                 group_id,
                 dataset_id,
                 actions,

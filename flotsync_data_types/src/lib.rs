@@ -28,7 +28,7 @@ pub use schema::{
     PrimitiveType,
     ReplicatedDataType,
     Schema,
-    datamodel::{InMemoryFieldValue, NullableBasicValue, SchemaOperation},
+    datamodel::{InMemoryFieldState, NullableBasicValue, SchemaOperation},
 };
 
 #[derive(Debug, Snafu)]
@@ -56,8 +56,8 @@ pub enum OperationError {
     #[snafu(display("The operation targets a row that already exists: {row_id}."))]
     DuplicateRowId { row_id: String },
     #[snafu(display("The operation could not be applied to the in-memory dataset."))]
-    InMemoryData {
-        source: schema::datamodel::InMemoryDataError,
+    InMemoryStateData {
+        source: schema::datamodel::InMemoryStateDataError,
     },
     #[snafu(display("The operation is invalid for the schema."))]
     SchemaValue {
@@ -99,12 +99,12 @@ pub enum DecodeValueError {
     },
 }
 
-/// A marker trait that a type can be extracted from an [[`InMemoryFieldValue`]].
+/// A marker trait that a type can be extracted from an [`InMemoryFieldState`].
 pub trait Decode<OperationId>: ToOwned {
     /// # Errors
     ///
     /// See `DecodeValueError` for failure conditions.
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError>;
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError>;
 }
 
 pub type OperationResult<T> = Result<T, OperationError>;
@@ -115,19 +115,21 @@ pub enum OperationOutcome<T> {
     NoChanges,
 }
 
-/// Object-safe read-only view over row field values.
-pub trait RowRead<OperationId> {
-    /// Get the current value of a field.
+/// Object-safe read-only view over row field state.
+pub trait RowStateRead<OperationId> {
+    /// Get the current state of a field.
     ///
     /// Returns `None` if the field does not exist.
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>>;
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldState<OperationId>>;
 }
 
-/// Typed decode helpers layered on top of [`RowRead`].
+/// Typed decode helpers layered on top of [`RowStateRead`].
 ///
 /// The blanket implementation means these helpers are also available on
-/// `&dyn RowRead<_>` values whenever [`RowOperations`] is in scope.
-pub trait RowOperations<OperationId>: RowRead<OperationId> {
+/// `&dyn RowStateRead<_>` values whenever [`RowOperations`] is in scope.
+// TODO(flotsync-git-d3w): Decouple this trait during the value-row interface
+// redesign so typed extraction works over both state-backed and value-backed rows.
+pub trait RowOperations<OperationId>: RowStateRead<OperationId> {
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
     /// # Errors
@@ -156,7 +158,7 @@ pub trait RowOperations<OperationId>: RowRead<OperationId> {
 
 impl<T, OperationId> RowOperations<OperationId> for T
 where
-    T: ?Sized + RowRead<OperationId>,
+    T: ?Sized + RowStateRead<OperationId>,
 {
     fn get_field_value<'a, Value>(
         &'a self,
@@ -188,39 +190,39 @@ where
 }
 
 fn missing_field_error<'a, OperationId>(
-    field_value: Option<&'a InMemoryFieldValue<OperationId>>,
+    field_value: Option<&'a InMemoryFieldState<OperationId>>,
     field_name: &str,
-) -> Result<&'a InMemoryFieldValue<OperationId>, DecodeValueError> {
+) -> Result<&'a InMemoryFieldState<OperationId>, DecodeValueError> {
     field_value.ok_or_else(|| DecodeValueError::FieldDoesNotExist {
         field_name: field_name.to_owned(),
     })
 }
 
-/// Owned immutable row snapshot that can outlive any backing in-memory store.
+/// Owned immutable row state snapshot that can outlive any backing in-memory store.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OwnedRow<OperationId> {
-    fields: HashMap<String, InMemoryFieldValue<OperationId>>,
+pub struct OwnedStateRow<OperationId> {
+    fields: HashMap<String, InMemoryFieldState<OperationId>>,
 }
 
-impl<OperationId> OwnedRow<OperationId> {
+impl<OperationId> OwnedStateRow<OperationId> {
     #[must_use]
-    pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
+    pub fn new(fields: HashMap<String, InMemoryFieldState<OperationId>>) -> Self {
         Self { fields }
     }
 }
 
-impl<OperationId> RowRead<OperationId> for OwnedRow<OperationId> {
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
+impl<OperationId> RowStateRead<OperationId> for OwnedStateRow<OperationId> {
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldState<OperationId>> {
         self.fields.get(field_name)
     }
 }
 
-/// This is equivalent to [[`RowOperations`]] but operating directly on schema fields.
-pub trait FieldOperations<OperationId> {
+/// This is equivalent to [`RowOperations`] but operating directly on schema fields.
+pub trait FieldStateReadExt<OperationId> {
     /// Get the current value of this field in `row`.
     ///
     /// Panics if `row` does not contain this field (i.e is from a different schema.)
-    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a InMemoryFieldValue<OperationId>
+    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a InMemoryFieldState<OperationId>
     where
         R: RowOperations<OperationId>;
 

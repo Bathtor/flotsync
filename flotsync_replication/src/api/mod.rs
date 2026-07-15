@@ -8,7 +8,7 @@ use flotsync_core::{
     membership::{GroupMembers, GroupMembersError},
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowSnapshot};
+use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowStateSnapshot};
 use flotsync_security::{
     KeyFingerprint,
     PublicKeyBundle,
@@ -37,9 +37,9 @@ pub use errors::*;
 pub use flotsync_data_types::{
     Decode,
     DecodeValueError,
-    InMemoryFieldValue,
+    InMemoryFieldState,
     RowOperations,
-    RowRead,
+    RowStateRead,
     schema::datamodel::SchemaSource,
 };
 pub use flotsync_security::{LocalStoreSecretProfile, StoreSecretKeyId};
@@ -51,19 +51,19 @@ pub use ids::*;
 /// schema. For an existing row this is a sparse field patch: fields omitted from
 /// `fields` are intentionally left unchanged by `publish_changes`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct MutableRow {
+pub struct RowValuesPatch {
     /// Desired nullable field values keyed by field name.
     pub fields: HashMap<String, NullableBasicValue>,
 }
 
-impl MutableRow {
+impl RowValuesPatch {
     #[must_use]
     pub fn new(fields: HashMap<String, NullableBasicValue>) -> Self {
         Self { fields }
     }
 }
 
-/// Convenience macro to build a [`MutableRow`] inline.
+/// Convenience macro to build a [`RowValuesPatch`] inline.
 #[macro_export]
 macro_rules! row_values {
     ($($field:expr => $value:expr),* $(,)?) => {{
@@ -74,7 +74,7 @@ macro_rules! row_values {
         $(
             fields.insert(($field).to_string(), ($value).into());
         )*
-        $crate::api::MutableRow::new(fields)
+        $crate::api::RowValuesPatch::new(fields)
     }};
 }
 
@@ -82,7 +82,7 @@ macro_rules! row_values {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowMutation {
     /// Insert a new row or update the provided fields of an existing row.
-    Upsert { row_id: RowId, row: MutableRow },
+    Upsert { row_id: RowId, row: RowValuesPatch },
     /// Tombstone an existing row.
     Delete { row_id: RowId },
 }
@@ -195,7 +195,7 @@ pub struct PublishChangesRequest {
 pub enum RowChange {
     Upsert {
         row_id: RowId,
-        row: Arc<dyn RowRead<UpdateId> + Send + Sync>,
+        row: Arc<dyn RowStateRead<UpdateId> + Send + Sync>,
     },
     Delete {
         row_id: RowId,
@@ -211,7 +211,7 @@ impl RowChange {
     }
 
     #[must_use]
-    pub fn row(&self) -> Option<&(dyn RowRead<UpdateId> + Send + Sync)> {
+    pub fn row(&self) -> Option<&(dyn RowStateRead<UpdateId> + Send + Sync)> {
         match self {
             RowChange::Upsert { row, .. } => Some(row.as_ref()),
             RowChange::Delete { .. } => None,
@@ -344,7 +344,7 @@ impl std::fmt::Debug for SnapshotRows {
 /// One row in a snapshot stream.
 pub struct SnapshotRow {
     pub row_id: RowId,
-    pub row: Arc<dyn RowRead<UpdateId> + Send + Sync>,
+    pub row: Arc<dyn RowStateRead<UpdateId> + Send + Sync>,
     /// Whether this row is a retained delete tombstone instead of an
     /// application-visible row.
     pub deleted: bool,
@@ -379,53 +379,58 @@ pub struct Summary {
     pub has_versions: VersionVector,
 }
 
-/// One row entry in an initial dataset state.
+/// One row entry in an initial dataset's value rows.
 #[derive(Clone, PartialEq, Eq)]
-pub struct InitialRowState {
+pub struct InitialValueRow {
     pub row_key: RowKey,
-    pub row: MutableRow,
+    pub row: RowValuesPatch,
 }
 
-impl fmt::Debug for InitialRowState {
+impl fmt::Debug for InitialValueRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InitialRowState")
+        f.debug_struct("InitialValueRow")
             .field("row_key", &self.row_key)
             .field("field_count", &self.row.fields.len())
             .finish()
     }
 }
 
-/// Initial state rows for one dataset.
+/// Initial value rows for one dataset.
 #[derive(Clone, PartialEq, Eq)]
-pub struct InitialDatasetState {
+pub struct InitialDatasetValueRows {
     pub dataset_id: DatasetId,
-    pub rows: Vec<InitialRowState>,
+    pub rows: Vec<InitialValueRow>,
 }
 
-impl fmt::Debug for InitialDatasetState {
+impl fmt::Debug for InitialDatasetValueRows {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InitialDatasetState")
+        f.debug_struct("InitialDatasetValueRows")
             .field("dataset_id", &self.dataset_id)
             .field("row_count", &self.rows.len())
             .finish()
     }
 }
 
-/// Initial group state grouped by dataset.
+/// Initial group value rows grouped by dataset.
+//
+// TODO(flotsync-git-d3w): Ensure all nodes deterministically derive equivalent
+// initial CRDT state from these values during group creation/migration. If data
+// types such as LinearString would diverge on generated ids, redesign this to
+// carry state instead of values.
 #[derive(Clone, Default, PartialEq, Eq)]
-pub struct InitialGroupState {
-    pub datasets: Vec<InitialDatasetState>,
+pub struct InitialGroupValueRows {
+    pub datasets: Vec<InitialDatasetValueRows>,
 }
 
-impl InitialGroupState {
+impl InitialGroupValueRows {
     fn row_count(&self) -> usize {
         self.datasets.iter().map(|dataset| dataset.rows.len()).sum()
     }
 }
 
-impl fmt::Debug for InitialGroupState {
+impl fmt::Debug for InitialGroupValueRows {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InitialGroupState")
+        f.debug_struct("InitialGroupValueRows")
             .field("dataset_count", &self.datasets.len())
             .field("row_count", &self.row_count())
             .finish()
@@ -551,18 +556,18 @@ pub struct SnapshotRef {
     pub versions: VersionVector,
 }
 
-/// Initial dataset state required before a joined or migrated group becomes
+/// Initial dataset contents required before a joined or migrated group becomes
 /// externally active.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum InitialSnapshot {
-    /// The initial dataset state is empty.
+    /// The initial dataset contents are empty.
     ///
     /// This does not imply that the group was newly created.
     #[default]
     Empty,
-    /// The initial state is carried directly in the invitation or proposal.
-    Inline(InitialGroupState),
-    /// The initial state must be resolved from metadata before activation.
+    /// The initial value rows are carried directly in the invitation or proposal.
+    Inline(InitialGroupValueRows),
+    /// The initial contents must be resolved from metadata before activation.
     Metadata(InitialSnapshotMetadata),
 }
 
@@ -1225,7 +1230,7 @@ pub trait ReplicationApi: Send + Sync {
     /// The request token is the read position of the application state used to
     /// decide the mutation list. Mutations are interpreted as sparse field
     /// patches for each [`RowMutation::Upsert`]:
-    /// fields omitted from the submitted [`MutableRow`] are intentionally left
+    /// fields omitted from the submitted [`RowValuesPatch`] are intentionally left
     /// unchanged in the current local state. [`RowMutation::Delete`] records a
     /// replicated row tombstone rather than physically removing the row from the
     /// store.
@@ -1907,7 +1912,7 @@ impl MemberKeyTrustEvidenceSet {
 /// dataset is absent. Callers can then decide whether to seed an empty
 /// in-memory working set from the application schema.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowSlice {
+pub struct DatasetRowStateSlice {
     /// Replication group that owns this dataset slice.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
@@ -1917,15 +1922,15 @@ pub struct DatasetRowSlice {
     /// Stored state for each requested row key.
     ///
     /// `None` means the requested row is absent. A present
-    /// [`ReplicationRowRecord`] with `tombstoned = true` means the row is
+    /// [`ReplicationRowStateRecord`] with `tombstoned = true` means the row is
     /// deleted for application visibility but retained so causally later CRDT
     /// operations can still target the row.
-    pub rows: HashMap<RowKey, Option<ReplicationRowRecord>>,
+    pub rows: HashMap<RowKey, Option<ReplicationRowStateRecord>>,
 }
 
 /// Storage-extension result for one ordered batch of rows scanned from a dataset.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowsBatch {
+pub struct DatasetRowStateBatch {
     /// Replication group that owns this batch.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
@@ -1933,7 +1938,7 @@ pub struct DatasetRowsBatch {
     /// Whether this dataset already exists for `group_id`.
     pub dataset_exists: bool,
     /// Row records ordered by row key.
-    pub rows: Vec<ReplicationRowRecord>,
+    pub rows: Vec<ReplicationRowStateRecord>,
     /// Row key to use as the exclusive lower bound for the next batch.
     ///
     /// `None` means the scan is exhausted. `Some` means callers should issue a
@@ -1942,16 +1947,16 @@ pub struct DatasetRowsBatch {
     pub next_after: Option<RowKey>,
 }
 
-/// Complete row snapshot used by replication storage.
-pub type ReplicationRowSnapshot = RowSnapshot<'static, UpdateId>;
+/// Complete row state snapshot used by replication storage.
+pub type ReplicationRowStateSnapshot = RowStateSnapshot<'static, UpdateId>;
 
 /// Row image loaded from or written to replication storage.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ReplicationRowRecord {
+pub struct ReplicationRowStateRecord {
     /// Stable row key in the dataset that owns this record.
     pub row_id: RowKey,
-    /// Complete value snapshot for the row.
-    pub snapshot: ReplicationRowSnapshot,
+    /// Complete state snapshot for the row.
+    pub snapshot: ReplicationRowStateSnapshot,
     /// Whether the row is deleted but still retained for causal updates.
     pub tombstoned: bool,
     /// Causal version of the last update that changed this row image.
@@ -1960,29 +1965,29 @@ pub struct ReplicationRowRecord {
 
 /// One explicit transactional row patch for a dataset.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DatasetRowPatch {
+pub struct DatasetRowStatePatch {
     /// Replication group that owns this dataset patch.
     pub group_id: GroupId,
     /// Dataset identifier within the replication group.
     pub dataset_id: DatasetId,
     /// Ordered row-level writes to apply transactionally.
-    pub actions: Vec<DatasetRowWrite>,
+    pub actions: Vec<DatasetRowStateWrite>,
     /// Causal version to store as the last change for every row in `actions`.
     pub last_changed_versions: VersionVector,
 }
 
 /// One explicit storage action for a persisted dataset row.
 #[derive(Clone, Debug, PartialEq)]
-pub enum DatasetRowWrite {
+pub enum DatasetRowStateWrite {
     /// Ensure that `row_key` exists as an active application-visible row.
     UpsertActive {
         row_key: RowKey,
-        snapshot: ReplicationRowSnapshot,
+        snapshot: ReplicationRowStateSnapshot,
     },
     /// Ensure that `row_key` exists as a retained delete tombstone.
     UpsertTombstone {
         row_key: RowKey,
-        snapshot: ReplicationRowSnapshot,
+        snapshot: ReplicationRowStateSnapshot,
     },
 }
 
@@ -2088,13 +2093,13 @@ pub trait ReplicationStoreReadTransaction: Send {
     /// Load the stored state for the requested dataset row keys.
     ///
     /// Implementations must include every iterated `row_key` exactly once in
-    /// `DatasetRowSlice.rows`.
+    /// `DatasetRowStateSlice.rows`.
     fn load_dataset_rows<'a>(
         &'a mut self,
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>>;
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>>;
 
     /// Scan one ordered batch of stored dataset rows.
     ///
@@ -2109,7 +2114,7 @@ pub trait ReplicationStoreReadTransaction: Send {
         dataset_id: &'a DatasetId,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>>;
+    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>>;
 
     /// Load all unresolved listener-mediated group decisions.
     fn load_pending_group_decisions(
@@ -2234,7 +2239,7 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     /// Apply one explicit set of row-level dataset storage actions.
     fn apply_dataset_row_patch(
         &mut self,
-        patch: DatasetRowPatch,
+        patch: DatasetRowStatePatch,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Append one new persisted replication update record.

@@ -11,13 +11,13 @@ use super::{
 };
 use crate::api::{
     DatasetId,
-    DatasetRowSlice,
-    MutableRow,
+    DatasetRowStateSlice,
     ReplicationStoreTransaction,
     ReplicationUpdateFilter,
     ReplicationUpdateRecord,
     RowId,
     RowKey,
+    RowValuesPatch,
     SchemaSource,
 };
 use flotsync_core::{
@@ -46,7 +46,7 @@ impl PublishDatasetState {
     pub(super) fn apply_upsert(
         &mut self,
         row_id: &RowId,
-        row: MutableRow,
+        row: RowValuesPatch,
         update_id: UpdateId,
     ) -> Result<Option<AppliedLocalOperation>, PublishChangesError> {
         let latest_dataset = self
@@ -87,7 +87,7 @@ pub(super) async fn load_touched_dataset_slices(
     transaction: &mut dyn ReplicationStoreTransaction,
     group_id: GroupId,
     dataset_rows: &HashMap<DatasetId, HashSet<RowKey>>,
-) -> Result<HashMap<DatasetId, DatasetRowSlice>, crate::api::StoreError> {
+) -> Result<HashMap<DatasetId, DatasetRowStateSlice>, crate::api::StoreError> {
     let mut slices = HashMap::with_capacity(dataset_rows.len());
     for (dataset_id, row_keys) in dataset_rows {
         let mut row_keys = row_keys.iter();
@@ -102,7 +102,7 @@ pub(super) async fn load_touched_dataset_slices(
 /// Materialise loaded row slices into in-memory datasets for CRDT application.
 pub(super) fn materialise_dataset_slices(
     schemas: &HashMap<DatasetId, SchemaSource>,
-    slices: HashMap<DatasetId, DatasetRowSlice>,
+    slices: HashMap<DatasetId, DatasetRowStateSlice>,
 ) -> HashMap<DatasetId, LocalDataset> {
     let mut datasets = HashMap::with_capacity(slices.len());
     for (dataset_id, row_slice) in slices {
@@ -210,7 +210,7 @@ pub(super) fn replay_datasets_at_versions(
     Ok(datasets)
 }
 
-fn row_slice_needs_replay(slice: &DatasetRowSlice, read_versions: &VersionVector) -> bool {
+fn row_slice_needs_replay(slice: &DatasetRowStateSlice, read_versions: &VersionVector) -> bool {
     slice.rows.values().any(|row| match row {
         Some(row) if row.last_changed_versions <= *read_versions => false,
         Some(_) => true,
@@ -312,7 +312,7 @@ fn replay_one_update(
 mod tests {
     use super::*;
     use crate::{
-        api::{DatasetRowWrite, DatasetUpdateRecord, ReplicationRowRecord},
+        api::{DatasetRowStateWrite, DatasetUpdateRecord, ReplicationRowStateRecord},
         row_values,
     };
     use flotsync_core::{MemberIdentity, member::Identifier, versions::PureVersionVector};
@@ -397,7 +397,7 @@ mod tests {
         dataset_id: &DatasetId,
         row_key: RowKey,
         last_changed_versions: VersionVector,
-    ) -> ReplicationRowRecord {
+    ) -> ReplicationRowStateRecord {
         let mut dataset = LocalDataset::new(title_schema());
         let applied = apply_local_upsert(
             &mut dataset,
@@ -407,10 +407,10 @@ mod tests {
         )
         .expect("local upsert should apply")
         .expect("local upsert should produce an operation");
-        let DatasetRowWrite::UpsertActive { snapshot, .. } = applied.row_write else {
+        let DatasetRowStateWrite::UpsertActive { snapshot, .. } = applied.row_write else {
             panic!("test upsert should produce an active row write");
         };
-        ReplicationRowRecord {
+        ReplicationRowStateRecord {
             row_id: row_key,
             snapshot,
             tombstoned: false,
@@ -553,7 +553,7 @@ mod tests {
             } else {
                 60_000
             });
-            let slice = DatasetRowSlice {
+            let slice = DatasetRowStateSlice {
                 group_id,
                 dataset_id: dataset_id.clone(),
                 dataset_exists: true,

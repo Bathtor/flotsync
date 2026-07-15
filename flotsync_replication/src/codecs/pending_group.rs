@@ -10,17 +10,17 @@ use crate::{
         GroupInvitationSource,
         GroupSchema,
         GroupSchemaError,
-        InitialDatasetState,
-        InitialGroupState,
-        InitialRowState,
+        InitialDatasetValueRows,
+        InitialGroupValueRows,
         InitialSnapshot,
         InitialSnapshotMetadata,
+        InitialValueRow,
         MigrationId,
         MigrationProposal,
-        MutableRow,
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         RowKey,
+        RowValuesPatch,
         SchemaSource,
         SnapshotRef,
     },
@@ -540,7 +540,7 @@ impl DecodeProtoWith<VersionVectorDecodeContext> for InitialSnapshot {
         match state {
             replication_proto::initial_snapshot::State::Empty(_) => Ok(Self::Empty),
             replication_proto::initial_snapshot::State::Inline(state) => {
-                InitialGroupState::decode_proto(*state).map(Self::Inline)
+                InitialGroupValueRows::decode_proto(*state).map(Self::Inline)
             }
             replication_proto::initial_snapshot::State::Metadata(metadata) => {
                 InitialSnapshotMetadata::decode_proto_with(*metadata, context).map(Self::Metadata)
@@ -561,7 +561,7 @@ impl EncodeProtoOneof for InitialSnapshot {
     }
 }
 
-impl EncodeProto for InitialGroupState {
+impl EncodeProto for InitialGroupValueRows {
     type Proto = replication_proto::InitialGroupState;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -576,7 +576,7 @@ impl EncodeProto for InitialGroupState {
     }
 }
 
-impl DecodeProto for InitialGroupState {
+impl DecodeProto for InitialGroupValueRows {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialGroupState;
 
@@ -584,13 +584,13 @@ impl DecodeProto for InitialGroupState {
         let datasets = state
             .datasets
             .into_iter()
-            .map(InitialDatasetState::decode_proto)
+            .map(InitialDatasetValueRows::decode_proto)
             .collect::<Result<_, _>>()?;
         Ok(Self { datasets })
     }
 }
 
-impl EncodeProto for InitialDatasetState {
+impl EncodeProto for InitialDatasetValueRows {
     type Proto = replication_proto::InitialDatasetState;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -602,7 +602,7 @@ impl EncodeProto for InitialDatasetState {
     }
 }
 
-impl DecodeProto for InitialDatasetState {
+impl DecodeProto for InitialDatasetValueRows {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialDatasetState;
 
@@ -614,13 +614,13 @@ impl DecodeProto for InitialDatasetState {
         let rows = dataset
             .rows
             .into_iter()
-            .map(InitialRowState::decode_proto)
+            .map(InitialValueRow::decode_proto)
             .collect::<Result<_, _>>()?;
         Ok(Self { dataset_id, rows })
     }
 }
 
-impl EncodeProto for InitialRowState {
+impl EncodeProto for InitialValueRow {
     type Proto = replication_proto::InitialRowState;
 
     fn encode_proto(&self) -> Self::Proto {
@@ -642,7 +642,7 @@ impl EncodeProto for InitialRowState {
     }
 }
 
-impl DecodeProto for InitialRowState {
+impl DecodeProto for InitialValueRow {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialRowState;
 
@@ -665,7 +665,7 @@ impl DecodeProto for InitialRowState {
             .collect::<Result<_, PendingGroupPayloadError>>()?;
         Ok(Self {
             row_key,
-            row: MutableRow { fields },
+            row: RowValuesPatch { fields },
         })
     }
 }

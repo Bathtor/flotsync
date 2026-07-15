@@ -1,0 +1,96 @@
+id = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
+ref = "flotsync-git-d3w"
+title = "Redesign application row interface to hide CRDT state"
+body = """
+Redesign the application-facing row interface so listeners and snapshot readers receive only current projected values, never cloned CRDT field state.
+
+Vocabulary pre-pass before interface redesign:
+V01. Rename CRDT state carriers from `Value`/ambiguous row names to `State` names before changing the public application interface.
+V02. Keep projected payload names using `Value`/`Values` only when the type carries current application values without CRDT state.
+V03. Keep write-intent names distinct from state/value rows. Concrete naming for the public write payload is `RowValuesPatch`; the existing `row_values!` macro can continue to exist and should produce the patch type until the full value-row API lands.
+V04. Keep `RowOperations` named as-is for this rename pass, but add a TODO/comment that it should be decoupled during the interface redesign because typed value extraction should work over both state-backed and value-backed rows.
+V05. Rename `MutableRow` to `RowValuesPatch` in this pass. This type represents sparse application value writes, not a complete row and not CRDT state.
+V06. Rename `InMemoryFieldValue<OperationId>` to `InMemoryFieldState<OperationId>`.
+V07. Rename `LinearLatestValueWinsValue<OperationId>` to `LinearLatestValueWinsState<OperationId>`.
+V08. Rename `LinearListValue<OperationId>` to `LinearListState<OperationId>`.
+V09. Rename `RowRead<OperationId>` to `RowStateRead<OperationId>`.
+V10. Rename `FieldOperations<OperationId>` to `FieldStateReadExt<OperationId>`.
+V11. Rename `OwnedRow<OperationId>` to `OwnedStateRow<OperationId>`.
+V12. Rename `InMemoryRow<OperationId>` to `InMemoryStateRow<OperationId>`.
+V13. Rename `InMemoryDataRow<OperationId>` to `InMemoryStateDataRow<OperationId>`.
+V14. Rename `InMemoryData` to `InMemoryStateData`.
+V15. Rename `LocalStoredRow` to `LocalStoredStateRow`.
+V16. Rename data-type `RowSnapshot` to `RowStateSnapshot`.
+V17. Rename data-type `RowSnapshotRepr` to `RowStateSnapshotRepr`.
+V18. Rename replication alias `ReplicationRowSnapshot` to `ReplicationRowStateSnapshot`.
+V19. Rename `ReplicationRowRecord` to `ReplicationRowStateRecord`.
+V20. Rename `DatasetRowSlice` to `DatasetRowStateSlice`.
+V21. Rename `DatasetRowsBatch` to `DatasetRowStateBatch`.
+V22. Rename `DatasetRowPatch` to `DatasetRowStatePatch`.
+V23. Rename `DatasetRowWrite` to `DatasetRowStateWrite`.
+V24. Rename initial inline snapshot row value types to make clear they carry pure values, not state: `InitialRowState` -> `InitialValueRow`, `InitialDatasetState` -> `InitialDatasetValueRows`, and `InitialGroupState` -> `InitialGroupValueRows`.
+V25. Add a TODO beside the initial value-row types that group creation/migration must deterministically produce equivalent initial CRDT state from pure values on every node, especially for data types such as `LinearString` whose internal ids could otherwise diverge.
+V26. Rename public snapshot value API types when the interface redesign happens: `SnapshotRows` -> `SnapshotValueRows`, `SnapshotRow` -> `SnapshotValueRow`, `SnapshotRowBatch` -> `SnapshotValueRowBatch`, and `SnapshotRowProvider` -> `SnapshotValueRowProvider`.
+V27. Rename snapshot internals for clarity: `SnapshotStateValue` -> `StateSnapshotFieldValue`, `SnapshotStateValueRef` -> `StateSnapshotFieldValueRef`, and test-only `SnapshotNodeValue`/`SnapshotNodeValueRef` -> `HistorySnapshotNodeValue`/`HistorySnapshotNodeValueRef`.
+V28. Keep `Field`, `FieldTargetValue`, `InitialFieldValue`, `PendingFieldUpdate`, `OperationValue`, `OperationFieldValue`, `RowOperation`, `SchemaOperation`, `BasicValue`, `NullableBasicValue`, `PrimitiveValue`, `NullablePrimitiveValue`, `CounterValue`, `DataOperation`, `UpdateOperation`, and `SchemaSource` unchanged in this pass.
+V29. Defer adding `RowValues`, `InMemoryValueData`, and batch-oriented value-row storage until after the existing state/type renames are complete.
+
+Current application-interface problem:
+D01. `RowChange::Upsert` currently exposes `Arc<dyn RowRead<UpdateId> + Send + Sync>`.
+D02. `SnapshotRow` exposes the same `RowRead<UpdateId>` shape.
+D03. The concrete value emitted by the runtime is `OwnedRow<UpdateId>`.
+D04. `OwnedRow<UpdateId>` stores `HashMap<String, InMemoryFieldValue<UpdateId>>`, so listener and snapshot payloads can hold full CRDT field state.
+D05. This leaks data-type internals through the application interface and can retain large histories even though applications only need current field values.
+
+Recommended interface redesign after the rename pass:
+D06. Introduce a public full current-value row type, tentatively `RowValues`, backed by projected current field values without CRDT state.
+D07. Split the current `MutableRow` concept. Existing sparse update usage becomes `RowValuesPatch`; complete projected rows become `RowValues`.
+D08. Keep `row_values!` for now and have it produce `RowValuesPatch`; conversion to `RowValues` should require a schema and check that all required fields are present.
+D09. Consider a batch-oriented value representation later, tentatively `InMemoryValueData`, that can share schema/canonical field order and store rows as pure value vectors without an `OperationId` generic.
+D10. Change listener row events to carry projected value rows, not `RowStateRead`/`OwnedStateRow`.
+D11. Change public snapshot rows to carry projected value rows, not `RowStateRead`/`OwnedStateRow`.
+D12. Ensure inline migration snapshots use pure value rows only if all nodes can deterministically materialise equivalent initial CRDT state from those values; otherwise revisit the snapshot payload design.
+
+Acceptance criteria for the redesign:
+A01. No public `ReplicationEvent::DataChanged` payload can contain `RowStateRead<UpdateId>`, `OwnedStateRow<UpdateId>`, or `InMemoryFieldState<UpdateId>`.
+A02. No public `SnapshotValueRows` payload can contain `RowStateRead<UpdateId>`, `OwnedStateRow<UpdateId>`, or `InMemoryFieldState<UpdateId>`.
+A03. Listener events and snapshot rows hold only current values plus row ids and tombstone flags.
+A04. Inline migration snapshots reuse the same current-value projection path as listener/snapshot rows, subject to the deterministic materialisation constraint in D12.
+A05. Application code still has ergonomic typed access to current values, either through `RowValues` methods or a replacement read trait backed only by projected values.
+A06. Tests cover representative field families: latest-value-wins nullable/non-null values, linear string, linear list, monotonic counters, total-order register, and nullable finite-state register.
+
+Implementation estimate:
+E01. Existing rename pre-pass: roughly 250-450 LOC of mechanical edits plus test updates.
+E02. Data-types projection API and tests: roughly 200-350 LOC.
+E03. Replication API type changes and adapters: roughly 80-160 LOC.
+E04. Runtime listener/snapshot/inline snapshot rewiring: roughly 150-300 LOC.
+E05. Test updates and regression coverage: roughly 150-300 LOC.
+E06. The rename pre-pass is small enough to do first. The full redesign remains roughly 580-1110 LOC after the rename pass; split if the projection table or value-row storage expands materially.
+
+Validation plan:
+T01. Run `cargo fmt`.
+T02. Run `cargo check -p flotsync_replication --tests`.
+T03. Run `cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic`.
+T04. Run focused data-types projection tests once projection is added.
+T05. Run `cargo test -p flotsync_replication --lib -- --test-threads=1` after the replication API is rewired.
+
+Context:
+C01. This blocks `flotsync-git-pow.4`. The paused `.4` implementation is stashed as commit `d905404fdffcac822c35ee55f45e1e18f9866711`, originally at `stash@{0}` on 2026-07-14 20:24:36 +0200."""
+status = "in-progress"
+status_reason = "rename pre-pass complete; projection redesign remains"
+type = "task"
+priority = 0
+labels = [
+    "area:api",
+    "area:replication",
+]
+assignee = "codex"
+blocks = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+created_at = "2026-07-14T18:25:44.890654Z"
+updated_at = "2026-07-15T07:20:51.846382Z"
+
+[[comments]]
+id = "019f64a6-4adf-7413-8230-2548d36d40a3"
+author = "lkroll"
+body = "Implemented the agreed vocabulary pre-pass. CRDT state carriers now use `State` names (`InMemoryFieldState`, `InMemoryStateData`, `OwnedStateRow`, store row state patch/write/batch names, row state snapshots, etc.), sparse application write payloads now use `RowValuesPatch`, and initial inline snapshot row payloads now use `InitialValueRow` / `InitialDatasetValueRows` / `InitialGroupValueRows`. Added the planned TODOs for decoupling `RowOperations` and for deterministic state materialisation from initial values. `SnapshotRows`/`SnapshotRow` remain unchanged until the projection redesign because they still carry state today."
+created_at = "2026-07-15T07:20:47.583337Z"

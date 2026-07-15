@@ -1,8 +1,8 @@
 use super::{
     CounterValue,
-    InMemoryFieldValue,
-    LinearLatestValueWinsValue,
-    LinearListValue,
+    InMemoryFieldState,
+    LinearLatestValueWinsState,
+    LinearListState,
     NullablePrimitiveValue,
     PrimitiveValue,
     UnixTimestamp,
@@ -42,14 +42,14 @@ impl<T> DecodeOperationIdBounds for T where
 {
 }
 
-fn field_value_kind<OperationId>(value: &InMemoryFieldValue<OperationId>) -> &'static str {
+fn field_value_kind<OperationId>(value: &InMemoryFieldState<OperationId>) -> &'static str {
     match value {
-        InMemoryFieldValue::LatestValueWins(_) => "LatestValueWins",
-        InMemoryFieldValue::LinearString(_) => "LinearString",
-        InMemoryFieldValue::LinearList(_) => "LinearList",
-        InMemoryFieldValue::MonotonicCounter(_) => "MonotonicCounter",
-        InMemoryFieldValue::TotalOrderRegister(_) => "TotalOrderRegister",
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(_) => "TotalOrderFiniteStateRegister",
+        InMemoryFieldState::LatestValueWins(_) => "LatestValueWins",
+        InMemoryFieldState::LinearString(_) => "LinearString",
+        InMemoryFieldState::LinearList(_) => "LinearList",
+        InMemoryFieldState::MonotonicCounter(_) => "MonotonicCounter",
+        InMemoryFieldState::TotalOrderRegister(_) => "TotalOrderRegister",
+        InMemoryFieldState::TotalOrderFiniteStateRegister(_) => "TotalOrderFiniteStateRegister",
     }
 }
 
@@ -59,7 +59,7 @@ fn null_decode_error<T>() -> DecodeValueError {
     }
 }
 
-fn type_mismatch<T, OperationId>(value: &InMemoryFieldValue<OperationId>) -> DecodeValueError {
+fn type_mismatch<T, OperationId>(value: &InMemoryFieldState<OperationId>) -> DecodeValueError {
     DecodeValueError::TypeMismatch {
         requested_type: type_name::<T>(),
         actual_type: Cow::Borrowed(field_value_kind(value)),
@@ -82,7 +82,7 @@ fn invalid_value<T>(explanation: impl Into<Cow<'static, str>>) -> DecodeValueErr
 }
 
 fn map_extract_error<T, OperationId>(
-    value: &InMemoryFieldValue<OperationId>,
+    value: &InMemoryFieldState<OperationId>,
     error: ExtractFieldError,
 ) -> DecodeValueError {
     match error {
@@ -142,79 +142,79 @@ fn try_decode_char_code<T>(code_point: u32) -> Result<char, DecodeValueError> {
 }
 
 fn extract_integer_value_ref<OperationId>(
-    value: &InMemoryFieldValue<OperationId>,
+    value: &InMemoryFieldState<OperationId>,
 ) -> Result<IntegerValueRef<'_>, ExtractFieldError>
 where
     OperationId: DecodeOperationIdBounds,
 {
     match value {
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Byte(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Byte(value)) => {
             Ok(IntegerValueRef::Byte(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UInt(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UInt(value)) => {
             Ok(IntegerValueRef::UInt(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Int(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Int(value)) => {
             Ok(IntegerValueRef::Int(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::Timestamp(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::Timestamp(value)) => {
             Ok(IntegerValueRef::Timestamp(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByte(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByte(value)) => {
             value
                 .content()
                 .as_ref()
                 .map(IntegerValueRef::Byte)
                 .ok_or(ExtractFieldError::Null)
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(value)) => {
             value
                 .content()
                 .as_ref()
                 .map(IntegerValueRef::UInt)
                 .ok_or(ExtractFieldError::Null)
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableInt(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableInt(value)) => {
             value
                 .content()
                 .as_ref()
                 .map(IntegerValueRef::Int)
                 .ok_or(ExtractFieldError::Null)
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableTimestamp(
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableTimestamp(
             value,
         )) => value
             .content()
             .as_ref()
             .map(IntegerValueRef::Timestamp)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::MonotonicCounter(CounterValue::Byte(value))
-        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
+        InMemoryFieldState::MonotonicCounter(CounterValue::Byte(value))
+        | InMemoryFieldState::TotalOrderRegister(PrimitiveValue::Byte(value)) => {
             Ok(IntegerValueRef::Byte(value))
         }
-        InMemoryFieldValue::MonotonicCounter(CounterValue::UInt(value))
-        | InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
+        InMemoryFieldState::MonotonicCounter(CounterValue::UInt(value))
+        | InMemoryFieldState::TotalOrderRegister(PrimitiveValue::UInt(value)) => {
             Ok(IntegerValueRef::UInt(value))
         }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Int(value)) => {
+        InMemoryFieldState::TotalOrderRegister(PrimitiveValue::Int(value)) => {
             Ok(IntegerValueRef::Int(value))
         }
-        InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::Timestamp(value)) => {
+        InMemoryFieldState::TotalOrderRegister(PrimitiveValue::Timestamp(value)) => {
             Ok(IntegerValueRef::Timestamp(value))
         }
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
+        InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
             PrimitiveValue::Byte(value),
         )) => Ok(IntegerValueRef::Byte(value)),
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
+        InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
             PrimitiveValue::UInt(value),
         )) => Ok(IntegerValueRef::UInt(value)),
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
+        InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
             PrimitiveValue::Int(value),
         )) => Ok(IntegerValueRef::Int(value)),
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
+        InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
             PrimitiveValue::Timestamp(value),
         )) => Ok(IntegerValueRef::Timestamp(value)),
-        InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null) => {
+        InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null) => {
             Err(ExtractFieldError::Null)
         }
         _ => Err(ExtractFieldError::TypeMismatch),
@@ -222,47 +222,47 @@ where
 }
 
 fn extract_integer_vec_ref<OperationId>(
-    value: &InMemoryFieldValue<OperationId>,
+    value: &InMemoryFieldState<OperationId>,
 ) -> Result<IntegerVecRef<'_>, ExtractFieldError>
 where
     OperationId: DecodeOperationIdBounds,
 {
     match value {
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::ByteArray(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::ByteArray(value)) => {
             Ok(IntegerVecRef::Byte(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::UIntArray(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::UIntArray(value)) => {
             Ok(IntegerVecRef::UInt(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::IntArray(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::IntArray(value)) => {
             Ok(IntegerVecRef::Int(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::TimestampArray(value)) => {
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::TimestampArray(value)) => {
             Ok(IntegerVecRef::Timestamp(value.content()))
         }
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableByteArray(
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableByteArray(
             value,
         )) => value
             .content()
             .as_ref()
             .map(IntegerVecRef::Byte)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUIntArray(
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUIntArray(
             value,
         )) => value
             .content()
             .as_ref()
             .map(IntegerVecRef::UInt)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableIntArray(
+        InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableIntArray(
             value,
         )) => value
             .content()
             .as_ref()
             .map(IntegerVecRef::Int)
             .ok_or(ExtractFieldError::Null),
-        InMemoryFieldValue::LatestValueWins(
-            LinearLatestValueWinsValue::NullableTimestampArray(value),
+        InMemoryFieldState::LatestValueWins(
+            LinearLatestValueWinsState::NullableTimestampArray(value),
         ) => value
             .content()
             .as_ref()
@@ -309,25 +309,25 @@ where
 macro_rules! define_exact_scalar_extractor {
     ($fn_name:ident, $ty:ty, $nonnull_variant:ident, $nullable_variant:ident, $primitive_variant:ident) => {
         fn $fn_name<OperationId>(
-            value: &InMemoryFieldValue<OperationId>,
+            value: &InMemoryFieldState<OperationId>,
         ) -> Result<&$ty, ExtractFieldError>
         where
             OperationId: DecodeOperationIdBounds,
         {
             match value {
-                InMemoryFieldValue::LatestValueWins(
-                    LinearLatestValueWinsValue::$nonnull_variant(value),
+                InMemoryFieldState::LatestValueWins(
+                    LinearLatestValueWinsState::$nonnull_variant(value),
                 ) => Ok(value.content()),
-                InMemoryFieldValue::LatestValueWins(
-                    LinearLatestValueWinsValue::$nullable_variant(value),
+                InMemoryFieldState::LatestValueWins(
+                    LinearLatestValueWinsState::$nullable_variant(value),
                 ) => value.content().as_ref().ok_or(ExtractFieldError::Null),
-                InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::$primitive_variant(
+                InMemoryFieldState::TotalOrderRegister(PrimitiveValue::$primitive_variant(
                     value,
                 )) => Ok(value),
-                InMemoryFieldValue::TotalOrderFiniteStateRegister(
+                InMemoryFieldState::TotalOrderFiniteStateRegister(
                     NullablePrimitiveValue::Value(PrimitiveValue::$primitive_variant(value)),
                 ) => Ok(value),
-                InMemoryFieldValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null) => {
+                InMemoryFieldState::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null) => {
                     Err(ExtractFieldError::Null)
                 }
                 _ => Err(ExtractFieldError::TypeMismatch),
@@ -339,17 +339,17 @@ macro_rules! define_exact_scalar_extractor {
 macro_rules! define_exact_array_extractor {
     ($fn_name:ident, $ty:ty, $nonnull_variant:ident, $nullable_variant:ident) => {
         fn $fn_name<OperationId>(
-            value: &InMemoryFieldValue<OperationId>,
+            value: &InMemoryFieldState<OperationId>,
         ) -> Result<&Vec<$ty>, ExtractFieldError>
         where
             OperationId: DecodeOperationIdBounds,
         {
             match value {
-                InMemoryFieldValue::LatestValueWins(
-                    LinearLatestValueWinsValue::$nonnull_variant(value),
+                InMemoryFieldState::LatestValueWins(
+                    LinearLatestValueWinsState::$nonnull_variant(value),
                 ) => Ok(value.content()),
-                InMemoryFieldValue::LatestValueWins(
-                    LinearLatestValueWinsValue::$nullable_variant(value),
+                InMemoryFieldState::LatestValueWins(
+                    LinearLatestValueWinsState::$nullable_variant(value),
                 ) => value.content().as_ref().ok_or(ExtractFieldError::Null),
                 _ => Err(ExtractFieldError::TypeMismatch),
             }
@@ -425,7 +425,7 @@ macro_rules! impl_decode_exact_scalar {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 $extractor(value)
                     .map(Cow::Borrowed)
@@ -442,7 +442,7 @@ macro_rules! impl_decode_integer_scalar_borrowed {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_value_ref(value)
                     .map_err(|err| map_extract_error::<Self, _>(value, err))?
@@ -462,7 +462,7 @@ macro_rules! impl_decode_integer_scalar_owned {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 let value = extract_integer_value_ref(value)
                     .map_err(|err| map_extract_error::<Self, _>(value, err))?;
@@ -479,13 +479,13 @@ macro_rules! impl_decode_exact_vec_or_list {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match $extractor(value) {
                     Ok(values) => Ok(Cow::Borrowed(values)),
                     Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
                     Err(ExtractFieldError::TypeMismatch) => match value {
-                        InMemoryFieldValue::LinearList(LinearListValue::$list_variant(values)) => {
+                        InMemoryFieldState::LinearList(LinearListState::$list_variant(values)) => {
                             Ok(Cow::Owned(values.iter().cloned().collect()))
                         }
                         _ => Err(type_mismatch::<Self, _>(value)),
@@ -503,7 +503,7 @@ macro_rules! impl_decode_integer_vec_borrowed {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_vec_ref(value) {
                     Ok(value) => match value {
@@ -512,25 +512,25 @@ macro_rules! impl_decode_integer_vec_borrowed {
                     },
                     Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
                     Err(ExtractFieldError::TypeMismatch) => match value {
-                        InMemoryFieldValue::LinearList(LinearListValue::Byte(values)) => Ok(
+                        InMemoryFieldState::LinearList(LinearListState::Byte(values)) => Ok(
                             Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "u8",
                             )?),
                         ),
-                        InMemoryFieldValue::LinearList(LinearListValue::UInt(values)) => Ok(
+                        InMemoryFieldState::LinearList(LinearListState::UInt(values)) => Ok(
                             Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "u64",
                             )?),
                         ),
-                        InMemoryFieldValue::LinearList(LinearListValue::Int(values)) => Ok(
+                        InMemoryFieldState::LinearList(LinearListState::Int(values)) => Ok(
                             Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "i64",
                             )?),
                         ),
-                        InMemoryFieldValue::LinearList(LinearListValue::Timestamp(values)) => Ok(
+                        InMemoryFieldState::LinearList(LinearListState::Timestamp(values)) => Ok(
                             Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "UnixTimestamp",
@@ -551,31 +551,31 @@ macro_rules! impl_decode_integer_vec_owned {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match extract_integer_vec_ref(value) {
                     Ok(value) => Ok(Cow::Owned(convert_integer_vec::<$element>(value)?)),
                     Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
                     Err(ExtractFieldError::TypeMismatch) => match value {
-                        InMemoryFieldValue::LinearList(LinearListValue::Byte(values)) => {
+                        InMemoryFieldState::LinearList(LinearListState::Byte(values)) => {
                             Ok(Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "u8",
                             )?))
                         }
-                        InMemoryFieldValue::LinearList(LinearListValue::UInt(values)) => {
+                        InMemoryFieldState::LinearList(LinearListState::UInt(values)) => {
                             Ok(Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "u64",
                             )?))
                         }
-                        InMemoryFieldValue::LinearList(LinearListValue::Int(values)) => {
+                        InMemoryFieldState::LinearList(LinearListState::Int(values)) => {
                             Ok(Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "i64",
                             )?))
                         }
-                        InMemoryFieldValue::LinearList(LinearListValue::Timestamp(values)) => {
+                        InMemoryFieldState::LinearList(LinearListState::Timestamp(values)) => {
                             Ok(Cow::Owned(collect_try_convert::<$element, _, _>(
                                 values.iter().copied(),
                                 "UnixTimestamp",
@@ -596,7 +596,7 @@ macro_rules! impl_decode_box_slice_via_vec {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 let values = <Vec<$element> as Decode<OperationId>>::decode(value)?;
                 Ok(Cow::Owned(values.into_owned().into_boxed_slice()))
@@ -612,7 +612,7 @@ macro_rules! impl_decode_slice_via_vec {
             OperationId: DecodeOperationIdBounds,
         {
             fn decode(
-                value: &InMemoryFieldValue<OperationId>,
+                value: &InMemoryFieldState<OperationId>,
             ) -> Result<Cow<'_, Self>, DecodeValueError> {
                 match <Vec<$element> as Decode<OperationId>>::decode(value)? {
                     Cow::Borrowed(values) => Ok(Cow::Borrowed(values.as_slice())),
@@ -644,12 +644,12 @@ impl<OperationId> Decode<OperationId> for String
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Borrowed(value)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
             Err(ExtractFieldError::TypeMismatch) => match value {
-                InMemoryFieldValue::LinearString(value) => {
+                InMemoryFieldState::LinearString(value) => {
                     Ok(Cow::Owned(value.iter_values().collect()))
                 }
                 _ => Err(type_mismatch::<Self, _>(value)),
@@ -662,7 +662,7 @@ impl<OperationId> Decode<OperationId> for str
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match <String as Decode<OperationId>>::decode(value)? {
             Cow::Borrowed(value) => Ok(Cow::Borrowed(value.as_str())),
             Cow::Owned(value) => Ok(Cow::Owned(value)),
@@ -674,7 +674,7 @@ impl<OperationId> Decode<OperationId> for f64
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         let value = extract_float_value_ref(value)
             .map_err(|err| map_extract_error::<Self, _>(value, err))?;
         Ok(Cow::Owned(value.into_inner()))
@@ -685,7 +685,7 @@ impl<OperationId> Decode<OperationId> for f32
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         let value = extract_float_value_ref(value)
             .map_err(|err| map_extract_error::<Self, _>(value, err))?;
         Ok(Cow::Owned(narrow_f64_to_f32(*value)))
@@ -696,12 +696,12 @@ impl<OperationId> Decode<OperationId> for char
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Owned(decode_single_char::<Self>(value.as_str())?)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
             Err(ExtractFieldError::TypeMismatch) => {
-                if let InMemoryFieldValue::LinearString(value) = value {
+                if let InMemoryFieldState::LinearString(value) = value {
                     let rendered: String = value.iter_values().collect();
                     Ok(Cow::Owned(decode_single_char::<Self>(&rendered)?))
                 } else {
@@ -720,7 +720,7 @@ impl<OperationId> Decode<OperationId> for Vec<u8>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_binary_value_ref(value) {
             Ok(value) => Ok(Cow::Borrowed(value)),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
@@ -729,19 +729,19 @@ where
                 Ok(values) => Ok(Cow::Owned(convert_integer_vec::<u8>(values)?)),
                 Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
                 Err(ExtractFieldError::TypeMismatch) => match value {
-                    InMemoryFieldValue::LinearList(LinearListValue::Byte(values)) => {
+                    InMemoryFieldState::LinearList(LinearListState::Byte(values)) => {
                         Ok(Cow::Owned(values.iter().copied().collect()))
                     }
-                    InMemoryFieldValue::LinearList(LinearListValue::UInt(values)) => {
+                    InMemoryFieldState::LinearList(LinearListState::UInt(values)) => {
                         Ok(Cow::Owned(collect_try_convert::<u8, _, _>(
                             values.iter().copied(),
                             "u64",
                         )?))
                     }
-                    InMemoryFieldValue::LinearList(LinearListValue::Int(values)) => Ok(Cow::Owned(
+                    InMemoryFieldState::LinearList(LinearListState::Int(values)) => Ok(Cow::Owned(
                         collect_try_convert::<u8, _, _>(values.iter().copied(), "i64")?,
                     )),
-                    InMemoryFieldValue::LinearList(LinearListValue::Timestamp(values)) => {
+                    InMemoryFieldState::LinearList(LinearListState::Timestamp(values)) => {
                         Ok(Cow::Owned(collect_try_convert::<u8, _, _>(
                             values.iter().copied(),
                             "UnixTimestamp",
@@ -776,14 +776,14 @@ impl<OperationId> Decode<OperationId> for Vec<f64>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_float_vec_ref(value) {
             Ok(values) => Ok(Cow::Owned(
                 values.iter().map(|value| value.into_inner()).collect(),
             )),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
             Err(ExtractFieldError::TypeMismatch) => match value {
-                InMemoryFieldValue::LinearList(LinearListValue::Float(values)) => Ok(Cow::Owned(
+                InMemoryFieldState::LinearList(LinearListState::Float(values)) => Ok(Cow::Owned(
                     values.iter().map(|value| value.into_inner()).collect(),
                 )),
                 _ => Err(type_mismatch::<Self, _>(value)),
@@ -796,7 +796,7 @@ impl<OperationId> Decode<OperationId> for Vec<f32>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_float_vec_ref(value) {
             Ok(values) => Ok(Cow::Owned(
                 values
@@ -806,7 +806,7 @@ where
             )),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
             Err(ExtractFieldError::TypeMismatch) => match value {
-                InMemoryFieldValue::LinearList(LinearListValue::Float(values)) => Ok(Cow::Owned(
+                InMemoryFieldState::LinearList(LinearListState::Float(values)) => Ok(Cow::Owned(
                     values
                         .iter()
                         .map(|value| narrow_f64_to_f32(*value))
@@ -822,12 +822,12 @@ impl<OperationId> Decode<OperationId> for Vec<char>
 where
     OperationId: DecodeOperationIdBounds,
 {
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
+    fn decode(value: &InMemoryFieldState<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError> {
         match extract_string_value_ref(value) {
             Ok(value) => Ok(Cow::Owned(value.chars().collect())),
             Err(ExtractFieldError::Null) => Err(null_decode_error::<Self>()),
             Err(ExtractFieldError::TypeMismatch) => match value {
-                InMemoryFieldValue::LinearString(value) => Ok(Cow::Owned(
+                InMemoryFieldState::LinearString(value) => Ok(Cow::Owned(
                     value.iter_values().collect::<String>().chars().collect(),
                 )),
                 _ => Err(type_mismatch::<Self, _>(value)),
@@ -892,7 +892,7 @@ mod tests {
             PrimitiveType,
             ReplicatedDataType,
             Schema,
-            datamodel::{InMemoryData, InMemoryDataRow},
+            datamodel::{InMemoryStateData, InMemoryStateDataRow},
         },
         text::LinearString,
     };
@@ -923,8 +923,10 @@ mod tests {
         IdWithIndex { id: 1, index }
     }
 
-    fn make_row(data: &InMemoryData<(), OperationId>) -> InMemoryDataRow<'_, (), OperationId> {
-        InMemoryDataRow { data, row_index: 0 }
+    fn make_row(
+        data: &InMemoryStateData<(), OperationId>,
+    ) -> InMemoryStateDataRow<'_, (), OperationId> {
+        InMemoryStateDataRow { data, row_index: 0 }
     }
 
     #[test]
@@ -937,10 +939,10 @@ mod tests {
                 )),
             },
         )]);
-        let mut data = InMemoryData::with_owned_schema(schema);
+        let mut data = InMemoryStateData::with_owned_schema(schema);
         data.push_row_from_named_fields([(
             "title",
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::String(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::String(
                 LinearLatestValueWins::new(
                     "hello".to_owned(),
                     [indexed_id(0), indexed_id(1), indexed_id(2)],
@@ -960,10 +962,10 @@ mod tests {
     #[test]
     fn get_field_value_projects_linear_string_to_owned_string() {
         let schema = make_schema([make_field("title", ReplicatedDataType::LinearString)]);
-        let mut data = InMemoryData::with_owned_schema(schema);
+        let mut data = InMemoryStateData::with_owned_schema(schema);
         data.push_row_from_named_fields([(
             "title",
-            InMemoryFieldValue::LinearString(LinearString::with_value("hej".to_owned(), 1)),
+            InMemoryFieldState::LinearString(LinearString::with_value("hej".to_owned(), 1)),
         )])
         .unwrap();
 
@@ -989,15 +991,15 @@ mod tests {
                 },
             ),
         ]);
-        let mut data = InMemoryData::with_owned_schema(schema);
+        let mut data = InMemoryStateData::with_owned_schema(schema);
         data.push_row_from_named_fields([
             (
                 "count",
-                InMemoryFieldValue::TotalOrderRegister(PrimitiveValue::UInt(42)),
+                InMemoryFieldState::TotalOrderRegister(PrimitiveValue::UInt(42)),
             ),
             (
                 "numbers",
-                InMemoryFieldValue::LinearList(LinearListValue::UInt(LinearList::with_values(
+                InMemoryFieldState::LinearList(LinearListState::UInt(LinearList::with_values(
                     [1_u64, 2, 3],
                     4,
                 ))),
@@ -1028,10 +1030,10 @@ mod tests {
                 )),
             },
         )]);
-        let mut data = InMemoryData::with_owned_schema(schema);
+        let mut data = InMemoryStateData::with_owned_schema(schema);
         data.push_row_from_named_fields([(
             "maybe_count",
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(
                 LinearLatestValueWins::new(None, [indexed_id(0), indexed_id(1), indexed_id(2)]),
             )),
         )])
