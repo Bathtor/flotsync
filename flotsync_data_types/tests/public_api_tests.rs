@@ -1,8 +1,8 @@
 use flotsync_data_types::{
     DataOperation,
-    FieldStateReadExt,
     OperationError,
     OperationOutcome,
+    RowValues,
     Schema,
     TableOperations,
     initial_values,
@@ -25,6 +25,7 @@ use flotsync_data_types::{
 use std::{
     assert_matches,
     borrow::Cow,
+    collections::HashMap,
     sync::{Arc, LazyLock},
 };
 
@@ -61,6 +62,37 @@ fn in_memory_data_preserves_shared_schema_reference() {
     let data: InMemoryStateData<RowId, OperationId> = InMemoryStateData::new(schema.clone());
 
     assert!(std::ptr::eq(data.schema(), schema.as_ref()));
+}
+
+#[test]
+fn initial_value_rows_embed_deterministic_state() {
+    let schema = &*TEST_SCHEMA;
+    let fields = HashMap::from([
+        ("title".to_owned(), "hello".into()),
+        ("numbers".to_owned(), vec![1i64, 2, 3].into()),
+        ("counter".to_owned(), 4u64.into()),
+        ("priority".to_owned(), 7u64.into()),
+    ]);
+    let row = RowValues::try_from_fields(schema, fields)
+        .expect("initial value row should match the schema");
+
+    let left = InMemoryStateData::from_initial_value_rows(schema, [(1, row.clone())], &0u32)
+        .expect("initial value rows should embed");
+    let right = InMemoryStateData::from_initial_value_rows(schema, [(1, row)], &0u32)
+        .expect("initial value rows should embed");
+
+    let left_row = left.get_row(&1).expect("row should be present");
+    let right_row = right.get_row(&1).expect("row should be present");
+    assert_eq!(left_row.snapshot(), right_row.snapshot());
+
+    let title: Cow<'_, str> = schema["title"].get_value(&left_row).unwrap();
+    let numbers: Cow<'_, [i64]> = schema["numbers"].get_value(&left_row).unwrap();
+    let counter: Cow<'_, u64> = schema["counter"].get_value(&left_row).unwrap();
+    let priority: Cow<'_, u64> = schema["priority"].get_value(&left_row).unwrap();
+    assert_eq!(&*title, "hello");
+    assert_eq!(&*numbers, [1, 2, 3]);
+    assert_eq!(*counter, 4);
+    assert_eq!(*priority, 7);
 }
 
 #[test]

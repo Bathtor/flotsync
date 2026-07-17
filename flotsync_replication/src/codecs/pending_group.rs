@@ -20,7 +20,7 @@ use crate::{
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         RowKey,
-        RowValuesPatch,
+        RowValues,
         SchemaSource,
         SnapshotRef,
     },
@@ -33,6 +33,7 @@ use crate::{
     runtime::BoxedError,
 };
 use flotsync_core::{GroupId, MemberIdentity, versions::VersionVector};
+use flotsync_data_types::InMemoryValueDataError;
 use flotsync_messages::{
     buffa::MessageField,
     codecs::{
@@ -129,6 +130,19 @@ pub enum PendingGroupPayloadError {
     InvalidRowFieldValue {
         field_name: String,
         source: DatamodelCodecError,
+    },
+    /// An inline initial dataset referenced a dataset without a decoded schema.
+    #[snafu(display("Pending initial dataset '{dataset_id}' has no decoded schema."))]
+    MissingInitialDatasetSchema { dataset_id: DatasetId },
+    /// An inline initial row did not match its decoded dataset schema.
+    #[snafu(display(
+        "Pending initial row '{row_key}' in dataset '{dataset_id}' did not match its schema: {source}",
+    ))]
+    InvalidInitialRowSchema {
+        dataset_id: DatasetId,
+        row_key: RowKey,
+        #[snafu(source(from(InMemoryValueDataError, Box::new)))]
+        source: Box<InMemoryValueDataError>,
     },
     /// A version-vector field could not be decoded with the available context.
     #[snafu(display("Pending version-vector field '{field}' was invalid: {reason}"))]
@@ -294,8 +308,12 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for GroupInvitation {
             proposed_members.len(),
             context,
         )?;
+        let snapshot_context = InitialSnapshotDecodeContext {
+            version_vector_context: vector_context,
+            group_schema: &group_schema,
+        };
         let initial_snapshot = match invitation.initial_snapshot.take() {
-            Some(snapshot) => InitialSnapshot::decode_proto_with(snapshot, vector_context)?,
+            Some(snapshot) => InitialSnapshot::decode_proto_with(snapshot, snapshot_context)?,
             None => InitialSnapshot::Empty,
         };
         GroupInvitation::try_new(
@@ -452,8 +470,12 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for MigrationProposal {
             vector_context,
         )?;
         let group_schema = decode_group_schema(proposal.dataset_schemas)?;
+        let snapshot_context = InitialSnapshotDecodeContext {
+            version_vector_context: vector_context,
+            group_schema: &group_schema,
+        };
         let initial_snapshot = match proposal.initial_snapshot.take() {
-            Some(snapshot) => InitialSnapshot::decode_proto_with(snapshot, vector_context)?,
+            Some(snapshot) => InitialSnapshot::decode_proto_with(snapshot, snapshot_context)?,
             None => InitialSnapshot::Empty,
         };
         Ok(Self {
@@ -526,13 +548,13 @@ impl EncodeProto for InitialSnapshot {
     }
 }
 
-impl DecodeProtoWith<VersionVectorDecodeContext> for InitialSnapshot {
+impl<'schema> DecodeProtoWith<InitialSnapshotDecodeContext<'schema>> for InitialSnapshot {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialSnapshot;
 
     fn decode_proto_with(
         snapshot: Self::Proto,
-        context: VersionVectorDecodeContext,
+        context: InitialSnapshotDecodeContext<'schema>,
     ) -> Result<Self, Self::Error> {
         let state = snapshot.state.ok_or_else(|| {
             PendingGroupPayloadError::missing_required_field("initial_snapshot.state")
@@ -540,10 +562,15 @@ impl DecodeProtoWith<VersionVectorDecodeContext> for InitialSnapshot {
         match state {
             replication_proto::initial_snapshot::State::Empty(_) => Ok(Self::Empty),
             replication_proto::initial_snapshot::State::Inline(state) => {
-                InitialGroupValueRows::decode_proto(*state).map(Self::Inline)
+                InitialGroupValueRows::decode_proto_with(*state, context.group_schema)
+                    .map(Self::Inline)
             }
             replication_proto::initial_snapshot::State::Metadata(metadata) => {
-                InitialSnapshotMetadata::decode_proto_with(*metadata, context).map(Self::Metadata)
+                InitialSnapshotMetadata::decode_proto_with(
+                    *metadata,
+                    context.version_vector_context,
+                )
+                .map(Self::Metadata)
             }
         }
     }
@@ -576,15 +603,18 @@ impl EncodeProto for InitialGroupValueRows {
     }
 }
 
-impl DecodeProto for InitialGroupValueRows {
+impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialGroupValueRows {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialGroupState;
 
-    fn decode_proto(state: Self::Proto) -> Result<Self, Self::Error> {
+    fn decode_proto_with(
+        state: Self::Proto,
+        group_schema: &'schema GroupSchema,
+    ) -> Result<Self, Self::Error> {
         let datasets = state
             .datasets
             .into_iter()
-            .map(InitialDatasetValueRows::decode_proto)
+            .map(|dataset| InitialDatasetValueRows::decode_proto_with(dataset, group_schema))
             .collect::<Result<_, _>>()?;
         Ok(Self { datasets })
     }
@@ -602,19 +632,36 @@ impl EncodeProto for InitialDatasetValueRows {
     }
 }
 
-impl DecodeProto for InitialDatasetValueRows {
+impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialDatasetValueRows {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialDatasetState;
 
-    fn decode_proto(dataset: Self::Proto) -> Result<Self, Self::Error> {
+    fn decode_proto_with(
+        dataset: Self::Proto,
+        group_schema: &'schema GroupSchema,
+    ) -> Result<Self, Self::Error> {
         let dataset_id =
             DatasetId::try_new(dataset.dataset_id.clone()).context(InvalidDatasetIdSnafu {
                 value: dataset.dataset_id,
             })?;
+        let schema =
+            group_schema
+                .schema(&dataset_id)
+                .context(MissingInitialDatasetSchemaSnafu {
+                    dataset_id: dataset_id.clone(),
+                })?;
         let rows = dataset
             .rows
             .into_iter()
-            .map(InitialValueRow::decode_proto)
+            .map(|row| {
+                InitialValueRow::decode_proto_with(
+                    row,
+                    InitialValueRowDecodeContext {
+                        dataset_id: &dataset_id,
+                        schema,
+                    },
+                )
+            })
             .collect::<Result<_, _>>()?;
         Ok(Self { dataset_id, rows })
     }
@@ -628,7 +675,7 @@ impl EncodeProto for InitialValueRow {
             row_key: message_wire::uuid_to_wire_bytes(self.row_key.0),
             fields: self
                 .row
-                .fields
+                .fields()
                 .iter()
                 .map(|(field_name, value)| {
                     (
@@ -642,11 +689,14 @@ impl EncodeProto for InitialValueRow {
     }
 }
 
-impl DecodeProto for InitialValueRow {
+impl<'schema> DecodeProtoWith<InitialValueRowDecodeContext<'schema>> for InitialValueRow {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialRowState;
 
-    fn decode_proto(row: Self::Proto) -> Result<Self, Self::Error> {
+    fn decode_proto_with(
+        row: Self::Proto,
+        context: InitialValueRowDecodeContext<'schema>,
+    ) -> Result<Self, Self::Error> {
         let row_key = Uuid::from_slice(&row.row_key)
             .map(RowKey)
             .context(InvalidRowKeySnafu {
@@ -663,10 +713,13 @@ impl DecodeProto for InitialValueRow {
                 Ok((field_name, value))
             })
             .collect::<Result<_, PendingGroupPayloadError>>()?;
-        Ok(Self {
-            row_key,
-            row: RowValuesPatch { fields },
-        })
+        let row = RowValues::try_from_fields(context.schema.as_schema(), fields).context(
+            InvalidInitialRowSchemaSnafu {
+                dataset_id: context.dataset_id.clone(),
+                row_key,
+            },
+        )?;
+        Ok(Self { row_key, row })
     }
 }
 
@@ -769,6 +822,24 @@ struct SnapshotRefDecodeContext {
     versions_field: &'static str,
     /// Group/member-count information for expanding compact vector encodings.
     version_vector_context: VersionVectorDecodeContext,
+}
+
+/// Context needed to decode inline initial snapshot rows against their schemas.
+#[derive(Clone, Copy, Debug)]
+struct InitialSnapshotDecodeContext<'schema> {
+    /// Group/member-count information for expanding compact vector encodings.
+    version_vector_context: VersionVectorDecodeContext,
+    /// Decoded dataset schemas for validating inline value rows.
+    group_schema: &'schema GroupSchema,
+}
+
+/// Context needed to decode one initial row against its dataset schema.
+#[derive(Clone, Copy, Debug)]
+struct InitialValueRowDecodeContext<'schema> {
+    /// Dataset that owns the row, used for error context.
+    dataset_id: &'schema DatasetId,
+    /// Decoded schema for `dataset_id`.
+    schema: &'schema SchemaSource,
 }
 
 /// Context that expands compact version vectors in pending group payloads.

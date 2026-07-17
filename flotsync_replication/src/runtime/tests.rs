@@ -84,8 +84,8 @@ use crate::{
         RowKeyIterator,
         RowMutation,
         SchemaSource,
-        SnapshotRow,
         SnapshotRowsRequest,
+        SnapshotValueRow,
         StoreError,
         StoreExternalSnafu,
         StoreSecretCryptoVersion,
@@ -634,20 +634,17 @@ impl CapturedRowChange {
         }
     }
 
-    fn capture_snapshot(row: SnapshotRow) -> Result<Self, ListenerError> {
-        if row.deleted {
-            return Ok(Self::Delete { row_id: row.row_id });
+    fn capture_snapshot(row: &SnapshotValueRow<'_>) -> Result<Self, ListenerError> {
+        let row_id = row.row_id().clone();
+        if row.is_tombstoned() {
+            return Ok(Self::Delete { row_id });
         }
         let title = row
-            .row
             .get_field_value::<str>("title")
             .boxed()
             .context(ListenerExternalSnafu)?
             .into_owned();
-        Ok(Self::Upsert {
-            row_id: row.row_id,
-            title,
-        })
+        Ok(Self::Upsert { row_id, title })
     }
 }
 
@@ -1554,9 +1551,9 @@ fn drain_snapshot_rows(
     while let Some(batch) =
         wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
     {
-        for row in batch {
+        for row in batch.rows() {
             rows.push(
-                CapturedRowChange::capture_snapshot(row).expect("snapshot row should decode"),
+                CapturedRowChange::capture_snapshot(&row).expect("snapshot row should decode"),
             );
         }
     }
@@ -1668,10 +1665,9 @@ fn snapshot_string_field(
     while let Some(batch) =
         wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
     {
-        for row in batch {
-            if row.row_id == *row_id {
+        for row in batch.rows() {
+            if row.row_id() == row_id {
                 return row
-                    .row
                     .get_field_value::<str>(field_name)
                     .expect("snapshot field should decode")
                     .into_owned();

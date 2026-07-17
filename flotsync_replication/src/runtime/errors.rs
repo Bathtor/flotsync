@@ -24,6 +24,8 @@ pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub(super) enum CreateGroupError {
     #[snafu(display("Group members must include the local member {local_member}."))]
     LocalMemberMissing { local_member: MemberIdentity },
+    #[snafu(display("Group creator {creator} must be included in the requested member list."))]
+    CreatorNotInMembers { creator: MemberIdentity },
     #[snafu(display("Group member list is invalid: {source}"))]
     InvalidMembers { source: GroupMembersError },
     #[snafu(display("Failed to prepare secure group bootstrap material: {source}"))]
@@ -37,6 +39,8 @@ pub(super) enum SnapshotRowsError {
     EmptyDatasets,
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Dataset {dataset_id} has no schema available for row snapshots."))]
+    MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display("Replication-store access failed at {location}: {source}"))]
     StoreAccess {
         source: StoreError,
@@ -277,6 +281,14 @@ pub(crate) enum InboundDeliveryError {
         group_id: GroupId,
         sender: MemberIdentity,
     },
+    #[snafu(display(
+        "Inbound bootstrap for group {group_id} was signed by {sender} at member index {sender_index:?}, but new group creators must occupy member index 0.",
+    ))]
+    BootstrapSenderNotFirstMember {
+        group_id: GroupId,
+        sender: MemberIdentity,
+        sender_index: Option<MemberIndex>,
+    },
     #[snafu(display("Failed to install inbound bootstrap group {group_id} locally: {source}"))]
     InstallBootstrapGroup {
         group_id: GroupId,
@@ -397,6 +409,7 @@ impl InboundDeliveryError {
             | Self::InvalidBootstrapMembers { .. }
             | Self::BootstrapMissingLocalMember { .. }
             | Self::BootstrapSenderNotInGroup { .. }
+            | Self::BootstrapSenderNotFirstMember { .. }
             | Self::UnknownHostedGroup { .. }
             | Self::MissingDatasetSchema { .. }
             | Self::UpdateSenderNotInGroup { .. }

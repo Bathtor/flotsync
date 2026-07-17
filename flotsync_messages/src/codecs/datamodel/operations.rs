@@ -719,7 +719,7 @@ mod tests {
             Field,
             PrimitiveType,
             Schema,
-            datamodel::{InMemoryFieldState, NullableBasicValue, RowSnapshot},
+            datamodel::{InMemoryFieldState, NullableBasicValue, RowStateSnapshot},
             values::{NullablePrimitiveValue, PrimitiveValue, PrimitiveValueArray},
         },
         test_support::schema_operations::{
@@ -987,7 +987,7 @@ mod tests {
             },
             operation: model::RowOperation::Insert {
                 row_id: row_id(40),
-                snapshot: RowSnapshot::from_owned_fields(vec![(
+                snapshot: RowStateSnapshot::from_owned_fields(vec![(
                     "priority".to_owned(),
                     InMemoryFieldState::<UpdateId>::TotalOrderRegister(PrimitiveValue::UInt(7)),
                 )]),

@@ -1,0 +1,37 @@
+id = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
+ref = "flotsync-git-vy1"
+title = "Rethink replication snapshot batching and storage row batch API"
+body = """
+The current storage snapshot batch API returns row records whose RowStateSnapshot payload repeats field names for every row. That makes the replication snapshot export path choose between per-row allocation/index material, repeated field-name storage, or O(rows * fields^2) projection when building application-facing value batches.
+
+Problem:
+- Store scans return Vec<ReplicationRowStateRecord>, each with an owned RowStateSnapshot.
+- RowStateSnapshot::Owned stores Vec<(field_name, field_state)> per row.
+- SnapshotValueRowBatch/InMemoryValueData already knows the schema mapping once per batch, but the current storage shape does not expose row fields in a schema-bound batch layout.
+- The result is an awkward impedance mismatch between the replication API batching system and storage API batch fetches.
+
+Design goal:
+- Fetch and project snapshot rows without repeating field names per row.
+- Preserve reusable batch allocations across provider calls.
+- Keep schema/field order information at the batch level, not duplicated inside every row.
+- Avoid per-row name-to-index map construction and avoid quadratic field-name traversals.
+
+Possible directions:
+- Make storage row-snapshot scan return a schema-bound row-major batch with field order once and per-row state vectors.
+- Add a storage/API batch adapter that carries field names/index maps once per batch and exposes rows as indexed views.
+- Reconsider whether replication SnapshotValueRowBatch should be built directly by storage implementations rather than via per-row RowStateSnapshot records.
+
+This was discovered while addressing flotsync-git-d3w review feedback R50. R50 is deferred for now; the inefficient access is tolerated temporarily until this design is redone."""
+status = "open"
+type = "task"
+priority = 1
+labels = [
+    "area:replication",
+    "area:store",
+]
+created_at = "2026-07-17T06:55:38.203915Z"
+updated_at = "2026-07-17T06:55:44.995422Z"
+
+[[links]]
+target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
+label = "discovered from"

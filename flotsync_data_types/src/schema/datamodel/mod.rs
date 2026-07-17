@@ -8,12 +8,14 @@
 //! [[`crate::snapshot`]].
 
 use super::{
+    ArrayType,
     BasicDataType,
     NullableBasicDataType,
     NullablePrimitiveType,
     PrimitiveType,
     ReplicatedDataType,
     Schema,
+    ValueType,
     values::{
         NullablePrimitiveValue,
         NullablePrimitiveValueArray,
@@ -279,6 +281,17 @@ pub enum BasicValueRef<'a> {
     Array(PrimitiveValueArrayRef<'a>),
 }
 impl BasicValueRef<'_> {
+    /// Return this borrowed value's schema-level basic type.
+    #[must_use]
+    pub fn value_type(&self) -> BasicDataType {
+        match self {
+            Self::Primitive(value) => BasicDataType::Primitive(value.value_type()),
+            Self::Array(values) => BasicDataType::Array(Box::new(ArrayType {
+                element_type: values.primitive_type(),
+            })),
+        }
+    }
+
     #[must_use]
     pub fn into_owned(self) -> BasicValue {
         match self {
@@ -308,6 +321,15 @@ pub enum NullableBasicValueRef<'a> {
     Value(BasicValueRef<'a>),
 }
 impl NullableBasicValueRef<'_> {
+    /// Return the projected type shape, mapping `NULL` to [`ValueType::Void`].
+    #[must_use]
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Self::Null => ValueType::Void,
+            Self::Value(value) => ValueType::Basic(value.value_type()),
+        }
+    }
+
     #[must_use]
     pub fn into_owned(self) -> NullableBasicValue {
         match self {
@@ -338,6 +360,15 @@ impl CounterValue {
         match self {
             Self::Byte(value) => CounterValueRef::Byte(*value),
             Self::UInt(value) => CounterValueRef::UInt(*value),
+        }
+    }
+
+    /// Project this counter to its application-visible primitive value.
+    #[must_use]
+    pub fn project_value(&self) -> PrimitiveValueRef<'_> {
+        match self {
+            Self::Byte(value) => PrimitiveValueRef::Byte(*value),
+            Self::UInt(value) => PrimitiveValueRef::UInt(*value),
         }
     }
 

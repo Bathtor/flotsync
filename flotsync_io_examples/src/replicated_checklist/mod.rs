@@ -18,7 +18,7 @@ use flotsync_data_types::{
     Field,
     PrimitiveType,
     RowOperations,
-    RowStateRead,
+    RowValueRead,
     Schema,
     schema::{BasicDataType, NullableBasicDataType, datamodel::NullableBasicValue},
 };
@@ -30,15 +30,13 @@ use flotsync_replication::{
     RowKey,
     RowMutation,
     RowValuesPatch,
-    SnapshotRow,
+    SnapshotValueRow,
 };
 use itertools::Itertools;
 use snafu::prelude::*;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
-    fmt,
-    hash::Hash,
     num::NonZeroUsize,
     str::FromStr,
     sync::LazyLock,
@@ -363,28 +361,25 @@ impl ChecklistItem {
             .to_string()
     }
 
-    fn from_row<OperationId>(
+    fn from_row(
         row_key: RowKey,
-        row: &(dyn RowStateRead<OperationId> + Send + Sync),
-    ) -> Result<Self, ChecklistWorkingSetError>
-    where
-        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
-    {
-        let text = decode_row_field::<_, String>(row_key, row, FIELD_TEXT)?.into_owned();
-        let note = decode_row_field::<_, String>(row_key, row, FIELD_NOTE)?.into_owned();
-        let tags = decode_row_field::<_, Vec<String>>(row_key, row, FIELD_TAGS)?
+        row: &(impl RowValueRead + ?Sized),
+    ) -> Result<Self, ChecklistWorkingSetError> {
+        let text = decode_row_field::<String>(row_key, row, FIELD_TEXT)?.into_owned();
+        let note = decode_row_field::<String>(row_key, row, FIELD_NOTE)?.into_owned();
+        let tags = decode_row_field::<Vec<String>>(row_key, row, FIELD_TAGS)?
             .iter()
             .cloned()
             .collect();
-        let status = decode_row_field::<_, String>(row_key, row, FIELD_STATUS)?;
+        let status = decode_row_field::<String>(row_key, row, FIELD_STATUS)?;
         let status = ChecklistStatus::from_schema_value(status.as_ref()).ok_or_else(|| {
             ChecklistWorkingSetError::InvalidStatus {
                 row_key,
                 value: status.into_owned(),
             }
         })?;
-        let priority = decode_row_field::<_, u8>(row_key, row, FIELD_PRIORITY)?.into_owned();
-        let edit_count = decode_row_field::<_, u64>(row_key, row, FIELD_EDIT_COUNT)?.into_owned();
+        let priority = decode_row_field::<u8>(row_key, row, FIELD_PRIORITY)?.into_owned();
+        let edit_count = decode_row_field::<u64>(row_key, row, FIELD_EDIT_COUNT)?.into_owned();
 
         Ok(Self {
             text,
@@ -803,9 +798,9 @@ impl ChecklistWorkingSet {
     /// # Errors
     ///
     /// See `ChecklistWorkingSetError` for failure conditions.
-    pub fn apply_snapshot_rows<I>(&mut self, rows: I) -> Result<(), ChecklistWorkingSetError>
+    pub fn apply_snapshot_rows<'a, I>(&mut self, rows: I) -> Result<(), ChecklistWorkingSetError>
     where
-        I: IntoIterator<Item = SnapshotRow>,
+        I: IntoIterator<Item = SnapshotValueRow<'a>>,
     {
         for row in rows {
             let change = self.checklist_change_from_snapshot_row(row)?;
@@ -962,28 +957,21 @@ impl ChecklistWorkingSet {
 
     fn checklist_change_from_snapshot_row(
         &self,
-        row: SnapshotRow,
+        row: SnapshotValueRow<'_>,
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
-        let SnapshotRow {
-            row_id,
-            row,
-            deleted,
-        } = row;
-        if deleted {
+        let row_id = row.row_id().clone();
+        if row.is_tombstoned() {
             self.validate_row_scope(&row_id)?;
             return Err(ChecklistWorkingSetError::UnexpectedDeletedSnapshotRow { row_id });
         }
-        self.checklist_upsert_change_from_row(&row_id, row.as_ref())
+        self.checklist_upsert_change_from_row(&row_id, &row)
     }
 
-    fn checklist_upsert_change_from_row<OperationId>(
+    fn checklist_upsert_change_from_row(
         &self,
         row_id: &RowId,
-        row: &(dyn RowStateRead<OperationId> + Send + Sync),
-    ) -> Result<ChecklistRowChange, ChecklistWorkingSetError>
-    where
-        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
-    {
+        row: &(impl RowValueRead + ?Sized),
+    ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         self.validate_row_scope(row_id)?;
         let row_key = row_id.row_key;
         let item = ChecklistItem::from_row(row_key, row)?;
@@ -1042,14 +1030,13 @@ fn push_display_row(display_order: &mut Vec<RowKey>, row_key: RowKey) {
     }
 }
 
-fn decode_row_field<'a, OperationId, Value>(
+fn decode_row_field<'a, Value>(
     row_key: RowKey,
-    row: &'a (dyn RowStateRead<OperationId> + Send + Sync),
+    row: &'a (impl RowValueRead + ?Sized),
     field: &'static str,
 ) -> Result<Cow<'a, Value>, ChecklistWorkingSetError>
 where
-    Value: ?Sized + Decode<OperationId>,
-    OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Value: ?Sized + Decode,
 {
     row.get_field_value::<Value>(field)
         .context(DecodeRowFieldSnafu { row_key, field })
@@ -1073,16 +1060,7 @@ fn split_repl_args(line: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flotsync_core::versions::UpdateId;
-    use flotsync_data_types::{InMemoryFieldState, ReplicatedDataType};
-
-    struct EmptySnapshotRow;
-
-    impl RowStateRead<UpdateId> for EmptySnapshotRow {
-        fn get_field(&self, _field_name: &str) -> Option<&InMemoryFieldState<UpdateId>> {
-            None
-        }
-    }
+    use flotsync_data_types::{InMemoryValueData, ReplicatedDataType, RowValues};
 
     #[test]
     fn checklist_schema_uses_agreed_replication_semantics() {
@@ -1335,12 +1313,27 @@ mod tests {
     fn snapshot_reload_rejects_unrequested_deleted_rows() {
         let mut checklist = test_working_set();
         let row_id = checklist.row_id(RowKey(Uuid::from_u128(61)));
+        let row_values = RowValues::try_from_fields(
+            &CHECKLIST_SCHEMA,
+            HashMap::from([
+                (FIELD_TEXT.to_owned(), String::new().into()),
+                (FIELD_NOTE.to_owned(), String::new().into()),
+                (FIELD_TAGS.to_owned(), Vec::<String>::new().into()),
+                (
+                    FIELD_STATUS.to_owned(),
+                    ChecklistStatus::Open.as_str().into(),
+                ),
+                (FIELD_PRIORITY.to_owned(), 0u8.into()),
+                (FIELD_EDIT_COUNT.to_owned(), 0u64.into()),
+            ]),
+        )
+        .expect("test snapshot row should match checklist schema");
+        let mut value_data = InMemoryValueData::new(CHECKLIST_SCHEMA.clone());
+        value_data
+            .push_row(row_id.clone(), true, &row_values)
+            .expect("test snapshot row should insert");
 
-        let result = checklist.apply_snapshot_rows([SnapshotRow {
-            row_id: row_id.clone(),
-            row: std::sync::Arc::new(EmptySnapshotRow),
-            deleted: true,
-        }]);
+        let result = checklist.apply_snapshot_rows(value_data.rows());
 
         assert!(matches!(
             result,

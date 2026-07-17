@@ -3,7 +3,7 @@
 //! concurrent modification.
 use std::{borrow::Cow, collections::HashMap, fmt, ops::Index};
 
-use crate::FieldStateReadExt;
+use crate::{FieldStateReadExt, FieldValueReadExt};
 
 pub mod datamodel;
 mod public_api;
@@ -22,6 +22,18 @@ pub struct Schema {
     pub metadata: HashMap<String, String>,
 }
 impl Schema {
+    /// Initialises an empty schema (no field, no metadata).
+    #[must_use]
+    pub fn empty() -> Self {
+        Schema {
+            columns: HashMap::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// Creates a schema from `fields`.
+    /// The created schema has no metadata.
+    ///
     /// # Panics
     ///
     /// Panics if any field has an invalid default value or if two fields share the same name.
@@ -197,24 +209,57 @@ impl Field {
             metadata: HashMap::new(),
         })
     }
+
+    /// Get the current value of this field in `row` converted to `T`.
+    ///
+    /// # Errors
+    ///
+    /// See `DecodeValueError` for failure conditions.
+    pub fn get_value<'a, R, T>(&self, row: &'a R) -> Result<Cow<'a, T>, crate::DecodeValueError>
+    where
+        R: crate::RowOperations,
+        T: ?Sized + crate::Decode,
+    {
+        <Self as FieldValueReadExt>::get_value(self, row)
+    }
+
+    /// Get the current nullable value of this field in `row` converted to `T`.
+    ///
+    /// Returns `Ok(None)` if the field is `NULL`.
+    ///
+    /// # Errors
+    ///
+    /// See `DecodeValueError` for failure conditions.
+    pub fn get_nullable_value<'a, R, T>(
+        &self,
+        row: &'a R,
+    ) -> Result<Option<Cow<'a, T>>, crate::DecodeValueError>
+    where
+        R: crate::RowOperations,
+        T: ?Sized + crate::Decode,
+    {
+        <Self as FieldValueReadExt>::get_nullable_value(self, row)
+    }
 }
+
 impl<OperationId> FieldStateReadExt<OperationId> for Field {
     fn get_from_row<'a, R>(&self, row: &'a R) -> &'a crate::InMemoryFieldState<OperationId>
     where
-        R: crate::RowOperations<OperationId>,
+        R: crate::RowStateRead<OperationId>,
     {
         row.get_field(&self.name)
             .expect("The row had a different schema than expected by this field.")
     }
+}
 
+impl FieldValueReadExt for Field {
     fn get_value<'a, R, T>(
         &self,
         row: &'a R,
     ) -> Result<std::borrow::Cow<'a, T>, crate::DecodeValueError>
     where
-        R: crate::RowOperations<OperationId>,
-        T: ?Sized + crate::Decode<OperationId>,
-        OperationId: 'a,
+        R: crate::RowOperations,
+        T: ?Sized + crate::Decode,
     {
         row.get_field_value(&self.name)
     }
@@ -224,9 +269,8 @@ impl<OperationId> FieldStateReadExt<OperationId> for Field {
         row: &'a R,
     ) -> Result<Option<std::borrow::Cow<'a, T>>, crate::DecodeValueError>
     where
-        R: crate::RowOperations<OperationId>,
-        T: ?Sized + crate::Decode<OperationId>,
-        OperationId: 'a,
+        R: crate::RowOperations,
+        T: ?Sized + crate::Decode,
     {
         row.get_nullable_field_value(&self.name)
     }
@@ -395,6 +439,24 @@ impl fmt::Display for BasicDataType {
         match self {
             Self::Primitive(value_type) => write!(f, "{value_type}"),
             Self::Array(array_type) => write!(f, "{array_type}"),
+        }
+    }
+}
+
+/// The type shape of one projected value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueType {
+    /// A `NULL` projected value, which carries no basic value type.
+    Void,
+    /// A non-null projected value with its concrete basic type.
+    Basic(BasicDataType),
+}
+
+impl fmt::Display for ValueType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Void => f.write_str("VOID"),
+            Self::Basic(value_type) => write!(f, "{value_type}"),
         }
     }
 }

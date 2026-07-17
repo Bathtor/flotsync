@@ -15,7 +15,13 @@ use super::{
     },
     *,
 };
-use crate::{DataOperation, IdWithIndex, any_data::UpdateOperation};
+use crate::{
+    DataOperation,
+    IdWithIndex,
+    ProjectedFieldValue,
+    RowValueRead,
+    any_data::UpdateOperation,
+};
 use std::{borrow::Cow, collections::HashSet, fmt, hash::Hash};
 
 /// Explicit operation payload shapes for all schema data types.
@@ -252,6 +258,25 @@ impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
                 }
                 Ok(())
             }
+        }
+    }
+}
+
+impl<ChangeId> RowValueRead for RowStateSnapshot<'_, ChangeId>
+where
+    ChangeId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
+        match &self.repr {
+            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
+                .iter()
+                .position(|name| name == field_name)
+                .and_then(|field_index| row.fields.get(field_index))
+                .map(InMemoryFieldState::project_value),
+            RowStateSnapshotRepr::Owned { fields } => fields
+                .iter()
+                .find(|(name, _)| name == field_name)
+                .map(|(_, value)| value.project_value()),
         }
     }
 }

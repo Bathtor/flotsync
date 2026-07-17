@@ -27,8 +27,8 @@ use crate::{
         ReplicationSecuritySecrets,
         ReplicationStore,
         RuntimeSnafu,
-        SnapshotRows,
         SnapshotRowsRequest,
+        SnapshotValueRows,
         Summary,
         SummaryRequest,
         security::{
@@ -355,7 +355,7 @@ impl ReplicationApi for ReplicationRuntime {
         })
     }
 
-    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotRows> {
+    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotValueRows> {
         self.ask(move |promise| ReplicationRuntimeMessage::SnapshotRows(Ask::new(promise, request)))
     }
 

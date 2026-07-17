@@ -21,6 +21,7 @@ use flotsync_replication::{
         CapturedDataChange,
         CapturedRowChange,
         RuntimeTestFixture,
+        docs_group_schema,
         provision_test_security,
         provision_test_trusted_public_keys,
         publish_changes,
@@ -55,7 +56,7 @@ fn create_group_bootstrap_installs_remote_membership() {
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     bob_fixture.wait_for_group_install(group_id);
@@ -95,7 +96,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     bob_fixture.wait_for_group_install(group_id);
@@ -293,7 +294,7 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed locally");
     bob_fixture.assert_group_never_installed(group_id);

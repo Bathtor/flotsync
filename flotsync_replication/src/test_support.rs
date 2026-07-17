@@ -29,8 +29,8 @@ use crate::{
         RowMutation,
         RuntimeSnafu,
         SchemaSource,
-        SnapshotRow,
         SnapshotRowsRequest,
+        SnapshotValueRow,
         StoreSecretKeyId,
         process_batches,
     },
@@ -234,9 +234,9 @@ pub fn drain_title_snapshot_rows(
     while let Some(batch) =
         wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
     {
-        for row in batch {
+        for row in batch.rows() {
             rows.push(
-                CapturedRowChange::capture_snapshot(row).expect("snapshot row should decode"),
+                CapturedRowChange::capture_snapshot(&row).expect("snapshot row should decode"),
             );
         }
     }
@@ -275,20 +275,17 @@ impl CapturedRowChange {
         }
     }
 
-    fn capture_snapshot(row: SnapshotRow) -> Result<Self, ListenerError> {
-        if row.deleted {
-            return Ok(Self::Delete { row_id: row.row_id });
+    fn capture_snapshot(row: &SnapshotValueRow<'_>) -> Result<Self, ListenerError> {
+        let row_id = row.row_id().clone();
+        if row.is_tombstoned() {
+            return Ok(Self::Delete { row_id });
         }
         let title = row
-            .row
             .get_field_value::<str>("title")
             .boxed()
             .context(ListenerExternalSnafu)?
             .into_owned();
-        Ok(Self::Upsert {
-            row_id: row.row_id,
-            title,
-        })
+        Ok(Self::Upsert { row_id, title })
     }
 }
 

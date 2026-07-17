@@ -5,8 +5,12 @@ use super::{
 use crate::{
     DataOperation,
     IdWithIndex,
+    InMemoryValueDataError,
     OperationOutcome,
+    ProjectedFieldValue,
     RowStateRead,
+    RowValueRead,
+    RowValues,
     TableOperations,
     any_data::{
         LinearLatestValueWins,
@@ -54,11 +58,10 @@ where
         let mut field_names = Vec::with_capacity(schema_ref.columns.len());
         let mut field_index_by_name = HashMap::with_capacity(schema_ref.columns.len());
 
-        for field_name in schema_ref.columns.keys() {
-            let index = field_names.len();
-            let field_name = field_name.to_owned();
+        field_names.extend(schema_ref.columns.keys().cloned());
+        field_names.sort();
+        for (index, field_name) in field_names.iter().enumerate() {
             field_index_by_name.insert(field_name.clone(), index);
-            field_names.push(field_name);
         }
 
         Self {
@@ -157,6 +160,45 @@ where
         let mut data = Self::new(schema);
         for record in rows {
             data.push_row_record(record)?;
+        }
+        Ok(data)
+    }
+
+    /// Embed complete projected value rows into deterministic CRDT state.
+    ///
+    /// Callers should pass a stable synthetic origin when this is used for
+    /// group initial state, such as `UpdateId::INITIAL_STATE_ORIGIN` in the
+    /// replication crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InitialValueRowsEmbeddingError` if a value row does not
+    /// match the schema or if inserting the derived initial state fails.
+    pub fn from_initial_value_rows<I>(
+        schema: impl Into<SchemaSource>,
+        rows: I,
+        initial_origin: &OperationId,
+    ) -> Result<Self, InitialValueRowsEmbeddingError<RowId>>
+    where
+        I: IntoIterator<Item = (RowId, RowValues)>,
+        RowId: Clone + fmt::Debug + fmt::Display,
+        OperationId:
+            Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        let schema = schema.into();
+        let mut data = Self::new(schema.clone());
+        let field_names = data.field_names.clone();
+        for (row_id, row) in rows {
+            let initial_values = row
+                .initial_values_in_field_order(schema.as_schema(), &field_names)
+                .with_context(|_| initial_value_rows_embedding::SchemaMismatchSnafu {
+                    row_id: row_id.clone(),
+                })?;
+            let error_row_id = row_id.clone();
+            data.insert_row((*initial_origin).clone(), row_id, initial_values)
+                .with_context(|_| initial_value_rows_embedding::StateInsertSnafu {
+                    row_id: error_row_id,
+                })?;
         }
         Ok(data)
     }
@@ -2423,6 +2465,17 @@ where
     }
 }
 
+impl<RowId, OperationId> RowValueRead for InMemoryStateDataRow<'_, RowId, OperationId>
+where
+    RowId: PartialEq + Eq + Hash,
+    OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
+        self.get_field(field_name)
+            .map(InMemoryFieldState::project_value)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Snafu)]
 pub enum InMemoryStateDataError {
     #[snafu(display("Unknown field '{field_name}'."))]
@@ -2444,6 +2497,25 @@ pub enum InMemoryStateDataError {
     FieldCountMismatch { expected: usize, actual: usize },
     #[snafu(display("Unknown row index {row_index}."))]
     UnknownRow { row_index: usize },
+}
+
+/// Errors raised while embedding checked projected value rows as CRDT state.
+#[derive(Debug, Snafu)]
+#[snafu(module(initial_value_rows_embedding))]
+pub enum InitialValueRowsEmbeddingError<RowId: fmt::Display> {
+    /// One projected value row was incomplete or incompatible with its schema.
+    #[snafu(display("Initial value row '{row_id}' does not match its schema: {source}"))]
+    SchemaMismatch {
+        row_id: RowId,
+        #[snafu(source(from(InMemoryValueDataError, Box::new)))]
+        source: Box<InMemoryValueDataError>,
+    },
+    /// The schema-compatible row could not be inserted as CRDT state.
+    #[snafu(display("Initial value row '{row_id}' could not be inserted as state: {source}"))]
+    StateInsert {
+        row_id: RowId,
+        source: crate::OperationError,
+    },
 }
 
 #[derive(Debug, Snafu)]
@@ -2582,6 +2654,55 @@ pub enum InMemoryFieldState<OperationId> {
     TotalOrderFiniteStateRegister(NullablePrimitiveValue),
 }
 
+impl<OperationId> InMemoryFieldState<OperationId>
+where
+    OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    /// Project this CRDT state to its current application-visible value.
+    #[must_use]
+    pub fn project_value(&self) -> ProjectedFieldValue<'_> {
+        match self {
+            Self::LatestValueWins(value) => ProjectedFieldValue::from(value.project_value()),
+            Self::LinearString(value) => {
+                ProjectedFieldValue::from(PrimitiveValue::String(value.to_string()))
+            }
+            Self::LinearList(value) => ProjectedFieldValue::from(value.project_value()),
+            Self::MonotonicCounter(value) => ProjectedFieldValue::from(value.project_value()),
+            Self::TotalOrderRegister(value) => ProjectedFieldValue::from(value.as_ref()),
+            Self::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null) => {
+                ProjectedFieldValue::from(NullableBasicValueRef::Null)
+            }
+            Self::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(value)) => {
+                ProjectedFieldValue::from(value.as_ref())
+            }
+        }
+    }
+}
+
+fn projected_primitive(value: PrimitiveValueRef<'_>) -> NullableBasicValueRef<'_> {
+    NullableBasicValueRef::Value(BasicValueRef::Primitive(value))
+}
+
+fn projected_array(value: PrimitiveValueArrayRef<'_>) -> NullableBasicValueRef<'_> {
+    NullableBasicValueRef::Value(BasicValueRef::Array(value))
+}
+
+fn projected_nullable_primitive(value: Option<PrimitiveValueRef<'_>>) -> NullableBasicValueRef<'_> {
+    match value {
+        Some(value) => projected_primitive(value),
+        None => NullableBasicValueRef::Null,
+    }
+}
+
+fn projected_nullable_array(
+    value: Option<PrimitiveValueArrayRef<'_>>,
+) -> NullableBasicValueRef<'_> {
+    match value {
+        Some(value) => projected_array(value),
+        None => NullableBasicValueRef::Null,
+    }
+}
+
 /// Specialized `LinearLatestValueWins` state variants by concrete value type.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinearLatestValueWinsState<OperationId> {
@@ -2627,6 +2748,172 @@ pub enum LinearLatestValueWinsState<OperationId> {
     ),
 }
 impl<OperationId> LinearLatestValueWinsState<OperationId> {
+    /// Project this CRDT register to its current application-visible value.
+    #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The method is an explicit matrix between typed register variants and projected value shapes."
+    )]
+    pub fn project_value(&self) -> NullableBasicValueRef<'_>
+    where
+        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        match self {
+            Self::String(value) => {
+                projected_primitive(PrimitiveValueRef::String(value.content().as_str()))
+            }
+            Self::UInt(value) => projected_primitive(PrimitiveValueRef::UInt(*value.content())),
+            Self::Int(value) => projected_primitive(PrimitiveValueRef::Int(*value.content())),
+            Self::Byte(value) => projected_primitive(PrimitiveValueRef::Byte(*value.content())),
+            Self::Float(value) => projected_primitive(PrimitiveValueRef::Float(*value.content())),
+            Self::Boolean(value) => {
+                projected_primitive(PrimitiveValueRef::Boolean(*value.content()))
+            }
+            Self::Binary(value) => {
+                projected_primitive(PrimitiveValueRef::Binary(value.content().as_slice()))
+            }
+            Self::Date(value) => projected_primitive(PrimitiveValueRef::Date(*value.content())),
+            Self::Timestamp(value) => {
+                projected_primitive(PrimitiveValueRef::Timestamp(*value.content()))
+            }
+            Self::StringArray(value) => {
+                projected_array(PrimitiveValueArrayRef::String(value.content().as_slice()))
+            }
+            Self::UIntArray(value) => {
+                projected_array(PrimitiveValueArrayRef::UInt(value.content().as_slice()))
+            }
+            Self::IntArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Int(value.content().as_slice()))
+            }
+            Self::ByteArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Byte(value.content().as_slice()))
+            }
+            Self::FloatArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Float(value.content().as_slice()))
+            }
+            Self::BooleanArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Boolean(value.content().as_slice()))
+            }
+            Self::BinaryArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Binary(value.content().as_slice()))
+            }
+            Self::DateArray(value) => {
+                projected_array(PrimitiveValueArrayRef::Date(value.content().as_slice()))
+            }
+            Self::TimestampArray(value) => projected_array(PrimitiveValueArrayRef::Timestamp(
+                value.content().as_slice(),
+            )),
+            Self::NullableString(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::String(value.as_str())),
+            ),
+            Self::NullableUInt(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::UInt(*value)),
+            ),
+            Self::NullableInt(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Int(*value)),
+            ),
+            Self::NullableByte(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Byte(*value)),
+            ),
+            Self::NullableFloat(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Float(*value)),
+            ),
+            Self::NullableBoolean(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Boolean(*value)),
+            ),
+            Self::NullableBinary(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Binary(value.as_slice())),
+            ),
+            Self::NullableDate(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Date(*value)),
+            ),
+            Self::NullableTimestamp(value) => projected_nullable_primitive(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueRef::Timestamp(*value)),
+            ),
+            Self::NullableStringArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::String(value.as_slice())),
+            ),
+            Self::NullableUIntArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::UInt(value.as_slice())),
+            ),
+            Self::NullableIntArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Int(value.as_slice())),
+            ),
+            Self::NullableByteArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Byte(value.as_slice())),
+            ),
+            Self::NullableFloatArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Float(value.as_slice())),
+            ),
+            Self::NullableBooleanArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Boolean(value.as_slice())),
+            ),
+            Self::NullableBinaryArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Binary(value.as_slice())),
+            ),
+            Self::NullableDateArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Date(value.as_slice())),
+            ),
+            Self::NullableTimestampArray(value) => projected_nullable_array(
+                value
+                    .content()
+                    .as_ref()
+                    .map(|value| PrimitiveValueArrayRef::Timestamp(value.as_slice())),
+            ),
+        }
+    }
+
     #[must_use]
     #[allow(
         clippy::too_many_lines,
@@ -3210,6 +3497,27 @@ pub enum LinearListState<OperationId> {
     Timestamp(LinearList<OperationId, UnixTimestamp>),
 }
 impl<OperationId> LinearListState<OperationId> {
+    /// Project this list CRDT to its current application-visible array value.
+    #[must_use]
+    pub fn project_value(&self) -> PrimitiveValueArray
+    where
+        OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    {
+        match self {
+            Self::String(value) => PrimitiveValueArray::String(value.iter().cloned().collect()),
+            Self::UInt(value) => PrimitiveValueArray::UInt(value.iter().copied().collect()),
+            Self::Int(value) => PrimitiveValueArray::Int(value.iter().copied().collect()),
+            Self::Byte(value) => PrimitiveValueArray::Byte(value.iter().copied().collect()),
+            Self::Float(value) => PrimitiveValueArray::Float(value.iter().copied().collect()),
+            Self::Boolean(value) => PrimitiveValueArray::Boolean(value.iter().copied().collect()),
+            Self::Binary(value) => PrimitiveValueArray::Binary(value.iter().cloned().collect()),
+            Self::Date(value) => PrimitiveValueArray::Date(value.iter().copied().collect()),
+            Self::Timestamp(value) => {
+                PrimitiveValueArray::Timestamp(value.iter().copied().collect())
+            }
+        }
+    }
+
     #[must_use]
     pub fn primitive_type(&self) -> PrimitiveType {
         match self {

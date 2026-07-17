@@ -22,6 +22,20 @@ pub struct UpdateId {
     /// node id and updates are bound to a fixed group instance with fixed membership.
     pub node_index: u32,
 }
+
+impl UpdateId {
+    /// Synthetic origin used to derive deterministic CRDT state from initial
+    /// group value rows.
+    ///
+    /// This is not a replicated update id and must not be written to update
+    /// logs. It is reserved for local materialisation of initial group state
+    /// before ordinary member updates begin at version 1.
+    pub const INITIAL_STATE_ORIGIN: Self = Self {
+        version: 0,
+        node_index: 0,
+    };
+}
+
 impl fmt::Display for UpdateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "v{}@{}", self.version, self.node_index)

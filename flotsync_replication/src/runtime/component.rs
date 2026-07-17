@@ -10,6 +10,7 @@ use super::{
     errors::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
+        CreatorNotInMembersSnafu,
         DuplicateGroupSnafu,
         GroupInstallError,
         InboundDeliveryError,
@@ -78,7 +79,6 @@ use crate::{
         ReplicationEvent,
         ReplicationEventListener,
         ReplicationGroupRecord,
-        ReplicationRowStateRecord,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -90,10 +90,9 @@ use crate::{
         RowMutation,
         RowProviderError,
         SchemaSource,
-        SnapshotRow,
-        SnapshotRowBatch,
-        SnapshotRows,
         SnapshotRowsRequest,
+        SnapshotValueRowBatch,
+        SnapshotValueRows,
         StoreError,
         Summary,
         SummaryRequest,
@@ -145,7 +144,6 @@ use flotsync_core::{
     membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::OwnedStateRow;
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
@@ -328,9 +326,16 @@ fn summary_from_wire(
 /// from requested datasets. Dropping the provider releases the transaction
 /// through the store implementation's release-on-drop path.
 struct StoreSnapshotRowProvider {
+    /// Store transaction that pins the snapshot view until the provider is drained or dropped.
     transaction: Option<Box<dyn ReplicationStoreReadTransaction>>,
+    /// Group whose local row state is being streamed.
     group_id: GroupId,
+    /// Dataset ids still waiting to be scanned.
     datasets: HashSet<DatasetId>,
+    /// Schemas for all requested datasets, loaded up front so snapshot batches
+    /// can project stored state into value rows without exposing CRDT state.
+    schemas: HashMap<DatasetId, SchemaSource>,
+    /// Dataset currently being scanned across batches.
     current_dataset: Option<DatasetId>,
     /// Exclusive lower bound for the current dataset scan.
     ///
@@ -338,6 +343,7 @@ struct StoreSnapshotRowProvider {
     /// scan requests rows with `row_key > after_row_key`.
     after_row_key: Option<RowKey>,
     max_rows_per_batch: NonZeroUsize,
+    /// Whether retained tombstones should be included as tombstoned value rows.
     include_tombstones: bool,
 }
 
@@ -366,35 +372,13 @@ impl StoreSnapshotRowProvider {
         }
         self.after_row_key = None;
     }
-
-    fn snapshot_row_from_record(
-        group_id: GroupId,
-        dataset_id: DatasetId,
-        record: ReplicationRowStateRecord,
-    ) -> SnapshotRow {
-        let row_id = RowId {
-            group_id,
-            dataset_id,
-            row_key: record.row_id,
-        };
-        let fields = record
-            .snapshot
-            .into_owned_fields()
-            .into_iter()
-            .collect::<HashMap<_, _>>();
-        SnapshotRow {
-            row_id,
-            row: Arc::new(OwnedStateRow::new(fields)),
-            deleted: record.tombstoned,
-        }
-    }
 }
 
 impl BatchProvider for StoreSnapshotRowProvider {
-    type Batch = SnapshotRowBatch;
+    type Batch = SnapshotValueRowBatch;
 
     fn new_batch(&self) -> Self::Batch {
-        SnapshotRowBatch::with_capacity(self.max_rows_per_batch.get())
+        SnapshotValueRowBatch::empty()
     }
 
     fn fill_batch(
@@ -420,15 +404,24 @@ impl BatchProvider for StoreSnapshotRowProvider {
                     .boxed()
                     .context(ProviderExternalSnafu)?;
 
-                'rows: for record in batch.rows {
+                let schema = self
+                    .schemas
+                    .get(&dataset_id)
+                    .expect("snapshot provider datasets must have loaded schemas")
+                    .clone();
+                let rows = reuse.prepare(schema, self.max_rows_per_batch.get());
+                for record in batch.rows {
                     if record.tombstoned && !self.include_tombstones {
-                        continue 'rows;
+                        continue;
                     }
-                    reuse.push(Self::snapshot_row_from_record(
-                        self.group_id,
-                        dataset_id.clone(),
-                        record,
-                    ));
+                    let row_id = RowId {
+                        group_id: self.group_id,
+                        dataset_id: dataset_id.clone(),
+                        row_key: record.row_id,
+                    };
+                    rows.push_row_read(row_id, record.tombstoned, &record.snapshot)
+                        .boxed()
+                        .context(ProviderExternalSnafu)?;
                 }
 
                 if let Some(next_after) = batch.next_after {
@@ -482,7 +475,7 @@ pub enum ReplicationRuntimeMessage {
     /// Submit one local publish request through the component interface.
     PublishChanges(Ask<PublishChangesRequest, Result<PublishReceipt, ApiError>>),
     /// Request a local snapshot stream through the component interface.
-    SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>),
+    SnapshotRows(Ask<SnapshotRowsRequest, Result<SnapshotValueRows, ApiError>>),
     /// Ask one group member for its current group version vector.
     RequestSummary(Ask<SummaryRequest, Result<Summary, ApiError>>),
     /// Create one new fixed-membership group through the component interface.
@@ -742,7 +735,7 @@ impl ReplicationRuntimeComponent {
     async fn snapshot_rows_from_store(
         &mut self,
         request: SnapshotRowsRequest,
-    ) -> Result<SnapshotRows, SnapshotRowsError> {
+    ) -> Result<SnapshotValueRows, SnapshotRowsError> {
         ensure!(!request.datasets.is_empty(), snapshot::EmptyDatasetsSnafu);
         let hosted_group_ids = self
             .group_memberships
@@ -774,16 +767,30 @@ impl ReplicationRuntimeComponent {
             }
         );
 
+        let mut schemas = HashMap::with_capacity(request.datasets.len());
+        for dataset_id in &request.datasets {
+            let schema = self
+                .store
+                .load_dataset_schema(dataset_id)
+                .await
+                .context(snapshot::StoreAccessSnafu)?;
+            let schema = schema.context(snapshot::MissingDatasetSchemaSnafu {
+                dataset_id: dataset_id.clone(),
+            })?;
+            schemas.insert(dataset_id.clone(), schema);
+        }
+
         let provider = StoreSnapshotRowProvider {
             transaction: Some(transaction),
             group_id: request.group_id,
             datasets: request.datasets,
+            schemas,
             current_dataset: None,
             after_row_key: None,
             max_rows_per_batch: request.max_rows_per_batch,
             include_tombstones: request.include_tombstones,
         };
-        Ok(SnapshotRows {
+        Ok(SnapshotValueRows {
             group_id: request.group_id,
             read_token,
             rows: Box::new(provider),
@@ -926,10 +933,17 @@ impl ReplicationRuntimeComponent {
         local_member: &MemberIdentity,
         sender: &MemberIdentity,
     ) -> Result<(), InboundDeliveryError> {
-        if !members.contains(sender) {
+        let Some(sender_index) = members.member_index(sender) else {
             return Err(InboundDeliveryError::BootstrapSenderNotInGroup {
                 group_id,
                 sender: sender.clone(),
+            });
+        };
+        if sender_index != MemberIndex::new(0) {
+            return Err(InboundDeliveryError::BootstrapSenderNotFirstMember {
+                group_id,
+                sender: sender.clone(),
+                sender_index: Some(sender_index),
             });
         }
         if !members.contains(local_member) {
@@ -1278,8 +1292,9 @@ impl ReplicationRuntimeComponent {
         &self,
         req: CreateGroupRequest,
     ) -> Result<(GroupId, GroupMembers, GroupSchema), CreateGroupError> {
+        let requested_members = creator_first_member_order(req.members, &self.local_member)?;
         let members =
-            GroupMembers::from_ordered_members(req.members).context(InvalidMembersSnafu)?;
+            GroupMembers::from_ordered_members(requested_members).context(InvalidMembersSnafu)?;
         ensure!(
             members.contains(&self.local_member),
             LocalMemberMissingSnafu {
@@ -2187,7 +2202,7 @@ impl ReplicationRuntimeComponent {
 
     fn handle_snapshot_rows(
         &mut self,
-        ask: Ask<SnapshotRowsRequest, Result<SnapshotRows, ApiError>>,
+        ask: Ask<SnapshotRowsRequest, Result<SnapshotValueRows, ApiError>>,
     ) -> HandlerResult {
         let (promise, request) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
@@ -2629,6 +2644,21 @@ fn unavailable_api(operation: &'static str) -> ApiError {
     ApiError::UnsupportedOperation { operation }
 }
 
+/// Normalise requested group members so the local creator occupies member index 0.
+fn creator_first_member_order(
+    mut members: Vec<MemberIdentity>,
+    creator: &MemberIdentity,
+) -> Result<Vec<MemberIdentity>, CreateGroupError> {
+    let creator_position = members
+        .iter()
+        .position(|member| member == creator)
+        .context(CreatorNotInMembersSnafu {
+            creator: creator.clone(),
+        })?;
+    members.swap(0, creator_position);
+    Ok(members)
+}
+
 fn panic_if_fatal_inbound_failure(action: InboundFailureAction, failure: &InboundDeliveryFailure) {
     if matches!(action, InboundFailureAction::Fatal) {
         panic!(
@@ -2669,6 +2699,7 @@ async fn notify_listener_batches(
 mod tests {
     use super::*;
     use crate::api::ListenerError;
+    use std::assert_matches;
 
     #[test]
     fn inbound_error_classification_matches_manual_slice_policy() {
@@ -2690,6 +2721,15 @@ mod tests {
             InboundDeliveryError::BootstrapSenderNotInGroup {
                 group_id,
                 sender: MemberIdentity::from_array(["runtime", "sender"]),
+            }
+            .failure_action(),
+            InboundFailureAction::Drop
+        );
+        assert_eq!(
+            InboundDeliveryError::BootstrapSenderNotFirstMember {
+                group_id,
+                sender: MemberIdentity::from_array(["runtime", "sender"]),
+                sender_index: Some(MemberIndex::new(1)),
             }
             .failure_action(),
             InboundFailureAction::Drop
@@ -2736,6 +2776,66 @@ mod tests {
             } => {
                 assert_eq!(rejected_group_id, group_id);
                 assert_eq!(rejected_sender, sender);
+            }
+            other => panic!("unexpected bootstrap membership error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn creator_first_member_order_places_creator_at_zero() {
+        let creator = MemberIdentity::from_array(["runtime", "creator"]);
+        let bob = MemberIdentity::from_array(["runtime", "bob"]);
+        let carol = MemberIdentity::from_array(["runtime", "carol"]);
+
+        let ordered =
+            creator_first_member_order(vec![bob.clone(), carol.clone(), creator.clone()], &creator)
+                .expect("creator in member list should be reordered");
+
+        assert_eq!(ordered, vec![creator, carol, bob]);
+    }
+
+    #[test]
+    fn creator_first_member_order_rejects_absent_creator() {
+        let creator = MemberIdentity::from_array(["runtime", "creator"]);
+        let bob = MemberIdentity::from_array(["runtime", "bob"]);
+
+        let error = creator_first_member_order(vec![bob], &creator)
+            .expect_err("creator must be part of the requested member list");
+
+        assert_matches!(
+            error,
+            CreateGroupError::CreatorNotInMembers {
+                creator: rejected_creator,
+            } if rejected_creator == creator
+        );
+    }
+
+    #[test]
+    fn bootstrap_membership_validation_rejects_sender_not_first_member() {
+        let group_id = GroupId(Uuid::from_u128(93));
+        let local_member = MemberIdentity::from_array(["runtime", "local"]);
+        let sender = MemberIdentity::from_array(["runtime", "sender"]);
+        let members =
+            GroupMembers::from_ordered_members(vec![local_member.clone(), sender.clone()])
+                .expect("member set should build");
+
+        let error = ReplicationRuntimeComponent::validate_bootstrap_membership(
+            group_id,
+            &members,
+            &local_member,
+            &sender,
+        )
+        .expect_err("sender at non-zero member index should be rejected");
+
+        match error {
+            InboundDeliveryError::BootstrapSenderNotFirstMember {
+                group_id: rejected_group_id,
+                sender: rejected_sender,
+                sender_index,
+            } => {
+                assert_eq!(rejected_group_id, group_id);
+                assert_eq!(rejected_sender, sender);
+                assert_eq!(sender_index, Some(MemberIndex::new(1)));
             }
             other => panic!("unexpected bootstrap membership error: {other:?}"),
         }

@@ -8,7 +8,10 @@ use flotsync_core::{
     membership::{GroupMembers, GroupMembersError},
     versions::{UpdateId, VersionVector},
 };
-use flotsync_data_types::schema::datamodel::{NullableBasicValue, RowStateSnapshot};
+use flotsync_data_types::schema::{
+    Schema,
+    datamodel::{NullableBasicValue, RowStateSnapshot},
+};
 use flotsync_security::{
     KeyFingerprint,
     PublicKeyBundle,
@@ -17,7 +20,7 @@ use flotsync_security::{
     load_local_store_secret,
     load_or_create_local_store_secret,
 };
-use flotsync_utils::BoxFuture;
+use flotsync_utils::{BoxFuture, option_when};
 use smallvec::{Array, SmallVec};
 use snafu::prelude::*;
 use std::{
@@ -38,8 +41,11 @@ pub use flotsync_data_types::{
     Decode,
     DecodeValueError,
     InMemoryFieldState,
+    InMemoryValueData,
+    InMemoryValueDataRowRef,
     RowOperations,
-    RowStateRead,
+    RowValueRead,
+    RowValues,
     schema::datamodel::SchemaSource,
 };
 pub use flotsync_security::{LocalStoreSecretProfile, StoreSecretKeyId};
@@ -195,7 +201,7 @@ pub struct PublishChangesRequest {
 pub enum RowChange {
     Upsert {
         row_id: RowId,
-        row: Arc<dyn RowStateRead<UpdateId> + Send + Sync>,
+        row: Arc<dyn RowValueRead + Send + Sync>,
     },
     Delete {
         row_id: RowId,
@@ -211,7 +217,7 @@ impl RowChange {
     }
 
     #[must_use]
-    pub fn row(&self) -> Option<&(dyn RowStateRead<UpdateId> + Send + Sync)> {
+    pub fn row(&self) -> Option<&(dyn RowValueRead + Send + Sync)> {
         match self {
             RowChange::Upsert { row, .. } => Some(row.as_ref()),
             RowChange::Delete { .. } => None,
@@ -317,47 +323,122 @@ pub struct SnapshotRowsRequest {
     pub datasets: HashSet<DatasetId>,
     /// Maximum number of stored rows the provider should read in one batch.
     pub max_rows_per_batch: NonZeroUsize,
-    /// Whether retained delete tombstones should be emitted with
-    /// [`SnapshotRow::deleted`] set.
+    /// Whether retained delete tombstones should be emitted with the snapshot
+    /// row tombstone flag set.
     ///
     /// Application reload paths normally leave this disabled so they only
     /// rebuild visible rows.
     pub include_tombstones: bool,
 }
 
-/// Row snapshot stream returned by [`ReplicationApi::snapshot_rows`].
-pub struct SnapshotRows {
+/// Projected row-value snapshot stream returned by [`ReplicationApi::snapshot_rows`].
+pub struct SnapshotValueRows {
     pub group_id: GroupId,
     pub read_token: ReadToken,
-    pub rows: Box<SnapshotRowProvider>,
+    pub rows: Box<SnapshotValueRowProvider>,
 }
 
-impl std::fmt::Debug for SnapshotRows {
+impl std::fmt::Debug for SnapshotValueRows {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnapshotRows")
+        f.debug_struct("SnapshotValueRows")
             .field("group_id", &self.group_id)
             .field("read_token", &self.read_token)
             .finish_non_exhaustive()
     }
 }
 
-/// One row in a snapshot stream.
-pub struct SnapshotRow {
-    pub row_id: RowId,
-    pub row: Arc<dyn RowStateRead<UpdateId> + Send + Sync>,
-    /// Whether this row is a retained delete tombstone instead of an
-    /// application-visible row.
-    pub deleted: bool,
+/// One borrowed row view in a snapshot stream.
+pub type SnapshotValueRow<'a> = InMemoryValueDataRowRef<'a, RowId>;
+
+/// Compact batch of projected snapshot rows for one dataset schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotValueRowBatch {
+    /// Compact value storage for this batch.
+    rows: InMemoryValueData<RowId>,
 }
 
-/// Batch of rows emitted by a [`SnapshotRowProvider`].
-pub type SnapshotRowBatch = SmallVec<[SnapshotRow; 16]>;
+impl SnapshotValueRowBatch {
+    /// Create an empty reusable batch allocation.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            rows: InMemoryValueData::new(Schema::empty()),
+        }
+    }
+
+    /// Create a batch from compact projected row storage.
+    #[must_use]
+    pub fn from_rows(rows: InMemoryValueData<RowId>) -> Self {
+        Self { rows }
+    }
+
+    /// Prepare this batch to receive rows for `schema`, preserving allocation
+    /// when the existing compact storage can be reused.
+    pub fn prepare(
+        &mut self,
+        schema: impl Into<SchemaSource>,
+        row_capacity: usize,
+    ) -> &mut InMemoryValueData<RowId> {
+        let schema = schema.into();
+        if self.rows.schema() == schema.as_schema() {
+            self.rows.clear_rows();
+            self.rows.reserve_rows(row_capacity);
+        } else {
+            self.rows = InMemoryValueData::with_row_capacity(schema, row_capacity);
+        }
+        &mut self.rows
+    }
+
+    /// Return the compact projected row storage, if this batch is non-empty.
+    #[must_use]
+    pub fn data(&self) -> Option<&InMemoryValueData<RowId>> {
+        option_when!(!self.rows.is_empty(), &self.rows)
+    }
+
+    /// Return the number of rows in this batch.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.rows.row_count()
+    }
+
+    /// Remove all rows from this reusable batch.
+    pub fn clear(&mut self) {
+        self.rows.clear_rows();
+    }
+
+    /// Return whether this batch contains no rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.row_count() == 0
+    }
+
+    /// Iterate the rows in this batch.
+    pub fn rows(&self) -> impl Iterator<Item = SnapshotValueRow<'_>> {
+        self.rows.rows()
+    }
+}
+
+impl Default for SnapshotValueRowBatch {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl ProviderBatch for SnapshotValueRowBatch {
+    fn clear(&mut self) {
+        SnapshotValueRowBatch::clear(self);
+    }
+
+    fn is_empty(&self) -> bool {
+        SnapshotValueRowBatch::is_empty(self)
+    }
+}
 
 /// Source for batched snapshot rows.
 ///
 /// Snapshot providers may hold a store read transaction internally, so callers
 /// should drain or drop them promptly.
-pub type SnapshotRowProvider = dyn BatchProvider<Batch = SnapshotRowBatch>;
+pub type SnapshotValueRowProvider = dyn BatchProvider<Batch = SnapshotValueRowBatch>;
 
 /// Request one peer's current version vector for a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -383,14 +464,14 @@ pub struct Summary {
 #[derive(Clone, PartialEq, Eq)]
 pub struct InitialValueRow {
     pub row_key: RowKey,
-    pub row: RowValuesPatch,
+    pub row: RowValues,
 }
 
 impl fmt::Debug for InitialValueRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InitialValueRow")
             .field("row_key", &self.row_key)
-            .field("field_count", &self.row.fields.len())
+            .field("field_count", &self.row.field_count())
             .finish()
     }
 }
@@ -1251,17 +1332,17 @@ pub trait ReplicationApi: Send + Sync {
         request: PublishChangesRequest,
     ) -> BoxFuture<'_, Result<PublishReceipt, ApiError>>;
 
-    /// Open a batched stream over the latest locally stored rows for selected datasets.
+    /// Open a batched stream over the latest locally stored projected row values for selected datasets.
     ///
     /// The request is scoped to one replication group and an explicit set of
     /// application datasets. The stream reflects the latest state known to the
     /// local store when the snapshot is opened; it does not wait for remote peers
     /// and it does not perform catch-up. When `include_tombstones` is false, the
     /// provider should emit only application-visible rows. When it is true,
-    /// retained delete tombstones are emitted as [`SnapshotRow`] values with
-    /// [`SnapshotRow::deleted`] set.
+    /// retained delete tombstones are emitted as [`SnapshotValueRow`] views with
+    /// [`SnapshotValueRow::is_tombstoned`] set.
     ///
-    /// The returned [`SnapshotRows`] provider may hold a store read transaction
+    /// The returned [`SnapshotValueRows`] provider may hold a store read transaction
     /// while it is alive, so callers should drain or drop it promptly. Batches
     /// are bounded by [`SnapshotRowsRequest::max_rows_per_batch`] and are emitted
     /// through the same [`BatchProvider`] end-of-stream contract as listener row
@@ -1273,7 +1354,7 @@ pub trait ReplicationApi: Send + Sync {
     fn snapshot_rows(
         &self,
         request: SnapshotRowsRequest,
-    ) -> BoxFuture<'_, Result<SnapshotRows, ApiError>>;
+    ) -> BoxFuture<'_, Result<SnapshotValueRows, ApiError>>;
 
     /// Ask one group member for its current group version vector.
     fn request_summary(&self, request: SummaryRequest) -> BoxFuture<'_, Result<Summary, ApiError>>;

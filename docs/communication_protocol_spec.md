@@ -25,7 +25,8 @@ group fan-out/storage, and replication semantics separate.
 - **Replication Group**: fixed membership set of devices sharing one replication key and schema epoch.
 - **Member**: one device identity within a replication group.
 - **Relay**: store-and-forward peer for encrypted messages.
-- **UpdateId**: `(version, producer_index)`.
+- **UpdateId**: `(version, producer_index)`. `UpdateId(0, 0)` is reserved as
+  the synthetic initial-state origin and is not a real replicated update.
 - **ReadVV**: VV captured by an update producer at creation time.
 - **VV**: one version per group member.
 - **Snapshot**: full materialized state at a group/version reference.
@@ -53,9 +54,13 @@ group fan-out/storage, and replication semantics separate.
 - **G2 Idempotence**: Replay of an already-applied update is a no-op.
 - **G3 Global causality gate**: Every update carries `ReadVV`. A receiver may apply the update only when `LocalVV >= ReadVV`.
 - **G4 Legal order**: A legal order is any order that never violates I3 and applies each update at most once.
-- **G5 Convergence**: If two members apply the same update set in any legal order, they converge.
-- **G6 Tombstone safety**: Deletes use tombstones so replay/reconstruction remain correct.
-- **G7 Ack promise**: When node `n` sends `Ack(A)`, it promises future updates produced by `n` will not produce versions below `max(A)`, that is an `Ack(A)` is a no-op update for all versions between `A[n]` and `max(A)`.
+- **G5 New-group creator index**: The creator/proposer of a newly created group
+  instance must occupy member index 0 in that group's canonical member order.
+  Bootstrap or migration material whose authenticated sender/proposer is not
+  member index 0 is invalid for that new group instance.
+- **G6 Convergence**: If two members apply the same update set in any legal order, they converge.
+- **G7 Tombstone safety**: Deletes use tombstones so replay/reconstruction remain correct.
+- **G8 Ack promise**: When node `n` sends `Ack(A)`, it promises future updates produced by `n` will not produce versions below `max(A)`, that is an `Ack(A)` is a no-op update for all versions between `A[n]` and `max(A)`.
 
 ## 5. Sub-Protocol A: PeerAnnouncement
 
@@ -479,6 +484,10 @@ Must convey one of:
 Notes:
 
 - `Empty` does not imply that the group is newly created
+- `Inline` carries projected row values, not CRDT state. Recipients embed
+  deterministic initial CRDT state from those values using
+  `UpdateId(0, 0)` as the synthetic origin. `UpdateId(0, 0)` must not appear in
+  ordinary update logs.
 - in a migration, existing old-group members may receive an old-group/cut ref
   while newly added members receive a new-group/zero-vector ref
 - equivalent refs let runtimes deduplicate local snapshot state even when
@@ -522,6 +531,8 @@ Notes:
   not yet share the new group key
 - recipients should verify sender signatures before accepting the bootstrap
   material
+- the proposer of the new group instance must be member index 0 in the proposed
+  new-group member order
 - `MigrationProposal` is signed/scoped to the old group because the old group is
   the authority context for superseding its state
 - newly added members that are not in the old group receive a `GroupInvitation`

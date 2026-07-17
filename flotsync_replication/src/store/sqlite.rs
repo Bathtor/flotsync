@@ -2758,7 +2758,13 @@ mod tests {
         test_support::test_public_member_keys,
     };
     use flotsync_core::member::{Identifier, MAX_IDENTIFIER_SEGMENTS};
-    use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
+    use flotsync_data_types::{
+        Field,
+        RowValues,
+        Schema,
+        TableOperations,
+        schema::datamodel::RowOperation,
+    };
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
     use itertools::Itertools;
     use std::{
@@ -2838,14 +2844,20 @@ mod tests {
     }
 
     fn inline_snapshot() -> InitialSnapshot {
+        let row = RowValues::try_from_fields(
+            title_schema().as_ref(),
+            crate::row_values! {
+                "title" => "stored",
+            }
+            .fields,
+        )
+        .expect("inline snapshot fixture row should match docs schema");
         InitialSnapshot::Inline(InitialGroupValueRows {
             datasets: vec![InitialDatasetValueRows {
                 dataset_id: docs_dataset_id(),
                 rows: vec![InitialValueRow {
                     row_key: RowKey(Uuid::from_u128(30_001)),
-                    row: crate::row_values! {
-                        "title" => "stored",
-                    },
+                    row,
                 }],
             }],
         })
@@ -2866,7 +2878,7 @@ mod tests {
         PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_migration(
             migration_id,
             vec![local_member(), remote_member(), third_member()],
-            GroupSchema::default(),
+            docs_group_schema(),
             inline_snapshot(),
             None,
             Some("migration invite".to_owned()),

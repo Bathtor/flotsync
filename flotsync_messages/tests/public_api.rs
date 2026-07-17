@@ -1,6 +1,5 @@
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
-    FieldStateReadExt,
     IdWithIndex,
     NULL,
     OperationOutcome,

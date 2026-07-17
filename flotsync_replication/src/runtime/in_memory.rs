@@ -36,7 +36,7 @@ use flotsync_data_types::{
     InitialFieldValue,
     OperationOutcome,
     PendingFieldUpdate,
-    RowStateRead,
+    RowValues,
     Schema,
     TableOperations,
     schema::datamodel::{RowOperation, RowRecord},
@@ -273,16 +273,12 @@ impl LocalDataset {
         self.data.row_is_tombstoned(&row_key.0)
     }
 
-    fn clone_row(&self, row_key: RowKey) -> Option<flotsync_data_types::OwnedStateRow<UpdateId>> {
+    fn clone_value_row(&self, row_key: RowKey) -> Option<RowValues> {
         let row = self.data.get_row(&row_key.0)?;
-        let mut fields = HashMap::with_capacity(self.data.num_fields());
-        for field_name in self.data.field_names() {
-            let value = row
-                .get_field(field_name)
-                .expect("dataset field iteration must resolve against the same row");
-            fields.insert(field_name.to_owned(), value.clone());
-        }
-        Some(flotsync_data_types::OwnedStateRow::new(fields))
+        Some(
+            RowValues::from_row(self.data.schema(), &row)
+                .expect("value projection from a schema-owned state row must validate"),
+        )
     }
 
     /// Snapshot the current row image for explicit durable row writes.
@@ -574,7 +570,7 @@ pub(super) fn apply_local_upsert(
         .snapshot_row(row_id.row_key)
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
     let row = dataset
-        .clone_row(row_id.row_key)
+        .clone_value_row(row_id.row_key)
         .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
     Ok(Some(AppliedLocalOperation {
         encoded_operation,
@@ -730,7 +726,7 @@ fn apply_decoded_publish_operation(
         }
     } else {
         let row = dataset
-            .clone_row(row_id.row_key)
+            .clone_value_row(row_id.row_key)
             .unwrap_or_else(|| panic!("applied local upsert must leave row {row_id} readable"));
         Some(RowChange::Upsert {
             row_id: row_id.clone(),
@@ -797,9 +793,11 @@ fn apply_remote_operation(
         }
     } else {
         Some({
-            let row = dataset.clone_row(api_row_id.row_key).unwrap_or_else(|| {
-                panic!("applied inbound upsert must leave row {api_row_id} readable")
-            });
+            let row = dataset
+                .clone_value_row(api_row_id.row_key)
+                .unwrap_or_else(|| {
+                    panic!("applied inbound upsert must leave row {api_row_id} readable")
+                });
             RowChange::Upsert {
                 row_id: api_row_id.clone(),
                 row: Arc::new(row),
