@@ -25,6 +25,7 @@ mod errors;
 pub mod handle;
 pub(crate) mod host;
 mod in_memory;
+mod pending_group;
 mod replay;
 mod store_security_validation;
 mod summary_request_manager;

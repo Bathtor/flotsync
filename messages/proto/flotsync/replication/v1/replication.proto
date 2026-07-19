@@ -10,41 +10,40 @@ import "flotsync/versions/v1/versions.proto";
 // Internal replication-runtime payloads carried inside delivery envelopes.
 //
 // These are not the full replication protocol; they are only the narrow
-// bootstrap plus live-update messages used by the first end-to-end slice.
+// group-setup plus live-update messages used by the first end-to-end slice.
 // Producer and group version values reserve u64::MAX as an exhaustion sentinel;
 // runtimes reject that value in Update, Summary, and NeedRange payloads.
 message RuntimeMessage {
   oneof body {
-    BootstrapGroup bootstrap_group = 1;
     Update update = 2;
     SummaryRequest summary_request = 3;
     Summary summary = 4;
     NeedRange need_range = 5;
     UpdateBatch update_batch = 6;
+    GroupInvitationPayload group_invitation = 7;
+    MigrationProposalPayload migration_proposal = 8;
   }
 }
 
-// Fixed-membership bootstrap message delivered reliably before live updates.
-message BootstrapGroup {
-  bytes group_id = 1;
-
+// Private setup material carried inside an invitation or migration proposal.
+//
+// Reliable delivery protects the raw symmetric group key for one recipient.
+// The containing invitation/proposal supplies the target group id, canonical
+// member identities, and schema. Receivers validate that member_keys has the
+// same ordered identities before storing the setup material.
+message GroupSetup {
   // Canonical group-member order and expected public identity key fingerprints.
   //
   // This repeated field is semantically ordered. The replication runtime uses
   // the preserved protobuf element order as the canonical member index order
   // for the group.
-  repeated BootstrapMemberKey member_keys = 2;
-
-  // Dataset schemas fixed for the lifetime of this group.
-  //
-  // Schema changes require migration to a new group.
-  repeated DatasetSchema dataset_schemas = 3;
+  repeated BootstrapMemberKey member_keys = 1;
 
   // Symmetric group-message cipher suite identifier.
-  uint32 group_cipher_suite = 4;
+  uint32 group_cipher_suite = 2;
 
   // Raw symmetric group key sealed by reliable delivery in transit.
-  bytes group_key = 5;
+  bytes group_key = 3;
 }
 
 message BootstrapMemberKey {
@@ -153,6 +152,9 @@ message GroupInvitationPayload {
   // Optional user-facing note supplied by the proposer. Absence means no note
   // was provided in the proposal payload.
   optional string message = 7;
+
+  // Private target-group setup protected by reliable delivery.
+  GroupSetup group_setup = 8;
 }
 
 message GroupInvitationSource {
@@ -203,6 +205,9 @@ message MigrationProposalPayload {
   // Optional user-facing note supplied by the proposer. Absence means no note
   // was provided in the proposal payload.
   optional string message = 8;
+
+  // Private target-group setup protected by reliable delivery.
+  GroupSetup group_setup = 9;
 }
 
 message InitialSnapshot {

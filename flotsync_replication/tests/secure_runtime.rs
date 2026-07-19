@@ -6,12 +6,18 @@ use flotsync_core::{
     MemberIndex,
     member::Identifier,
     membership::GroupMembers,
-    versions::{UpdateId, VersionVector},
+    versions::{PureVersionVector, UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, Schema};
 use flotsync_replication::{
+    ChangeGroupMembershipRequest,
     CreateGroupRequest,
     DatasetId,
+    GroupInvitationPolicy,
+    GroupMigrationPolicy,
+    PolicyDecision,
+    ReplicationConfig,
+    ReplicationStore,
     RowId,
     RowKey,
     RowMutation,
@@ -32,6 +38,7 @@ use flotsync_replication::{
     },
 };
 use std::{
+    collections::HashSet,
     num::NonZeroUsize,
     sync::{Arc, LazyLock},
 };
@@ -39,9 +46,11 @@ use uuid::Uuid;
 
 const ALICE_MEMBER_SEGMENTS: [&str; 2] = ["alice", "laptop"];
 const BOB_MEMBER_SEGMENTS: [&str; 2] = ["bob", "laptop"];
+const CHARLIE_MEMBER_SEGMENTS: [&str; 2] = ["charlie", "laptop"];
 const PROBE_MEMBER_SEGMENTS: [&str; 2] = ["probe", "laptop"];
 const APP_ALICE_SEGMENTS: [&str; 2] = ["app", "alice"];
 const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
+const APP_CHARLIE_SEGMENTS: [&str; 2] = ["app", "charlie"];
 
 static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
@@ -66,7 +75,7 @@ fn create_group_bootstrap_installs_remote_membership() {
         .expect("local runtime should host the created group");
     let bob_members = bob_fixture
         .group_members(group_id)
-        .expect("remote runtime should install the bootstrap group");
+        .expect("remote runtime should install the invited group");
 
     assert_eq!(
         alice_members.member_index(&alice_member),
@@ -84,6 +93,93 @@ fn create_group_bootstrap_installs_remote_membership() {
         bob_members.member_index(&bob_member),
         Some(MemberIndex::new(1))
     );
+}
+
+#[test]
+fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_added_member() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let charlie_member = charlie_member();
+    let dataset_id = docs_dataset_id();
+    let alice_fixture = RuntimeTestFixture::load(
+        app_alice_id(),
+        &alice_member,
+        [(dataset_id.clone(), title_schema_shared())],
+        [bob_member.clone(), charlie_member.clone()],
+    );
+    let bob_fixture = RuntimeTestFixture::load_with_config(
+        app_bob_id(),
+        &bob_member,
+        [(dataset_id.clone(), title_schema_shared())],
+        [alice_member.clone()],
+        ReplicationConfig {
+            group_invitation_policy: GroupInvitationPolicy {
+                creation: PolicyDecision::AutoAccept,
+                ..GroupInvitationPolicy::default()
+            },
+            group_migration_policy: GroupMigrationPolicy {
+                member_added: PolicyDecision::AutoAccept,
+                ..GroupMigrationPolicy::default()
+            },
+            ..ReplicationConfig::default()
+        },
+    );
+    let charlie_fixture = RuntimeTestFixture::load_with_config(
+        app_charlie_id(),
+        &charlie_member,
+        [(dataset_id, title_schema_shared())],
+        [alice_member.clone()],
+        ReplicationConfig {
+            group_invitation_policy: GroupInvitationPolicy {
+                migration_added_member: PolicyDecision::AutoAccept,
+                ..GroupInvitationPolicy::default()
+            },
+            ..ReplicationConfig::default()
+        },
+    );
+
+    alice_fixture.connect_direct_peer_routes(&bob_fixture);
+    alice_fixture.connect_direct_peer_routes(&charlie_fixture);
+    let old_group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
+        members: vec![alice_member.clone(), bob_member.clone()],
+        group_schema: docs_group_schema(),
+    }))
+    .expect("old group should be created");
+    bob_fixture.wait_for_group_install(old_group_id);
+
+    // TODO(flotsync-git-i20): remove this forced full vector and cover natural
+    // compact Synced and Override proposal vectors once inbound decode receives
+    // the old-group member count.
+    let mut transaction = wait_for_test_future(alice_fixture.store().begin_transaction())
+        .expect("version-vector transaction should start");
+    wait_for_test_future(transaction.update_replication_group_version_vector(
+        &old_group_id,
+        VersionVector::Full(PureVersionVector::from([0, 0])),
+    ))
+    .expect("full old-group vector should store");
+    wait_for_test_future(transaction.commit()).expect("version-vector transaction should commit");
+
+    let migration_id = wait_for_test_reply(alice_fixture.api().change_group_membership(
+        ChangeGroupMembershipRequest {
+            group_id: old_group_id,
+            add_members: HashSet::from([charlie_member.clone()]),
+            remove_members: HashSet::new(),
+            group_name: None,
+            message: None,
+        },
+    ))
+    .expect("membership change should succeed");
+    bob_fixture.wait_for_group_install(migration_id.new_group_id);
+    charlie_fixture.wait_for_group_install(migration_id.new_group_id);
+
+    for fixture in [&alice_fixture, &bob_fixture, &charlie_fixture] {
+        let members = fixture
+            .group_members(migration_id.new_group_id)
+            .expect("new group should be installed");
+        assert!(members.contains(&alice_member));
+        assert!(members.contains(&bob_member));
+        assert!(members.contains(&charlie_member));
+    }
 }
 
 #[test]
@@ -312,6 +408,10 @@ fn bob_member() -> Identifier {
     Identifier::from_array(BOB_MEMBER_SEGMENTS)
 }
 
+fn charlie_member() -> Identifier {
+    Identifier::from_array(CHARLIE_MEMBER_SEGMENTS)
+}
+
 fn probe_member() -> Identifier {
     Identifier::from_array(PROBE_MEMBER_SEGMENTS)
 }
@@ -322,6 +422,10 @@ fn app_alice_id() -> Identifier {
 
 fn app_bob_id() -> Identifier {
     Identifier::from_array(APP_BOB_SEGMENTS)
+}
+
+fn app_charlie_id() -> Identifier {
+    Identifier::from_array(APP_CHARLIE_SEGMENTS)
 }
 
 fn title_schema_shared() -> Arc<Schema> {
@@ -347,11 +451,18 @@ fn load_title_runtime_pair_with_trust(
         [(dataset_id.clone(), title_schema_shared())],
         [bob_member.clone()],
     );
-    let bob_fixture = RuntimeTestFixture::load(
+    let bob_fixture = RuntimeTestFixture::load_with_config(
         app_bob_id(),
         &bob_member,
         [(dataset_id.clone(), title_schema_shared())],
         [alice_member],
+        ReplicationConfig {
+            group_invitation_policy: GroupInvitationPolicy {
+                creation: PolicyDecision::AutoAccept,
+                ..GroupInvitationPolicy::default()
+            },
+            ..ReplicationConfig::default()
+        },
     );
     (alice_fixture, bob_fixture)
 }

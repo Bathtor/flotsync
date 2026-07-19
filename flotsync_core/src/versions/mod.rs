@@ -28,7 +28,7 @@ impl UpdateId {
     /// group value rows.
     ///
     /// This is not a replicated update id and must not be written to update
-    /// logs. It is reserved for local materialisation of initial group state
+    /// logs. It is reserved for local embedding of initial group state
     /// before ordinary member updates begin at version 1.
     pub const INITIAL_STATE_ORIGIN: Self = Self {
         version: 0,

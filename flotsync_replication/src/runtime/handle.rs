@@ -212,6 +212,7 @@ async fn load_replication_runtime_typed_with_security(
         &local_member,
         store,
         listener,
+        config.clone(),
         security,
         runtime_config_toml,
     )

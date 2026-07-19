@@ -473,6 +473,33 @@ impl RuntimeTestFixture {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
+        Self::load_with_config(
+            application_id,
+            local_member,
+            schemas,
+            trusted_members,
+            ReplicationConfig::default(),
+        )
+    }
+
+    /// Build one in-memory SQLite-backed runtime fixture with custom runtime policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store cannot be created, deterministic security cannot be
+    /// provisioned, or the runtime cannot be loaded.
+    #[must_use]
+    pub fn load_with_config<I, S>(
+        application_id: Identifier,
+        local_member: &MemberIdentity,
+        schemas: I,
+        trusted_members: impl IntoIterator<Item = MemberIdentity>,
+        config: ReplicationConfig,
+    ) -> Self
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
         let store = sqlite_store_with_schemas(local_member.clone(), schemas);
         wait_for_test_reply(provision_test_security(
             application_id.clone(),
@@ -481,7 +508,7 @@ impl RuntimeTestFixture {
             trusted_members,
         ))
         .expect("test security should provision");
-        Self::load_from_store(application_id, store)
+        Self::load_from_store_with_config(application_id, store, config)
     }
 
     /// Build one runtime fixture from an already provisioned `SQLite` store.
@@ -492,7 +519,6 @@ impl RuntimeTestFixture {
     /// security cannot be loaded, or the runtime cannot be started.
     #[must_use]
     pub fn load_from_store(application_id: Identifier, store: Arc<SqliteReplicationStore>) -> Self {
-        let listener = Arc::new(TestEventListener::default());
         let local_member = wait_for_test_reply(store.local_member_identity())
             .expect("local member identity should load");
         let security = wait_for_test_reply(load_test_delivery_security(
@@ -501,13 +527,62 @@ impl RuntimeTestFixture {
             &local_member,
         ))
         .expect("runtime security state should load");
+        Self::load_from_store_with_loaded_security(
+            application_id,
+            store,
+            local_member,
+            ReplicationConfig::default(),
+            security,
+        )
+    }
+
+    /// Build one runtime fixture from an already provisioned `SQLite` store
+    /// with custom runtime policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the local member cannot be loaded, deterministic runtime
+    /// security cannot be loaded, or the runtime cannot be started.
+    #[must_use]
+    pub fn load_from_store_with_config(
+        application_id: Identifier,
+        store: Arc<SqliteReplicationStore>,
+        config: ReplicationConfig,
+    ) -> Self {
+        let local_member = wait_for_test_reply(store.local_member_identity())
+            .expect("local member identity should load");
+        let security = wait_for_test_reply(load_test_delivery_security_with_config(
+            application_id.clone(),
+            store.clone(),
+            &local_member,
+            &config,
+        ))
+        .expect("runtime security state should load");
+        Self::load_from_store_with_loaded_security(
+            application_id,
+            store,
+            local_member,
+            config,
+            security,
+        )
+    }
+
+    /// Finish loading a fixture once local member identity and security are available.
+    fn load_from_store_with_loaded_security(
+        application_id: Identifier,
+        store: Arc<SqliteReplicationStore>,
+        local_member: MemberIdentity,
+        config: ReplicationConfig,
+        security: DeliverySecurity,
+    ) -> Self {
+        let listener = Arc::new(TestEventListener::default());
         let store_for_runtime: Arc<dyn ReplicationStore> = store.clone();
         let listener_for_runtime: Arc<dyn ReplicationEventListener> = listener.clone();
         let runtime = wait_for_test_reply(load_replication_runtime_typed_with_security_for_test(
             application_id,
             store_for_runtime,
             listener_for_runtime,
-            ReplicationConfig::default(),
+            config,
             security,
             None,
         ))
@@ -756,8 +831,25 @@ pub(crate) async fn load_test_delivery_security(
     store: Arc<dyn ReplicationStore>,
     local_member: &MemberIdentity,
 ) -> Result<DeliverySecurity, LoadError> {
+    load_test_delivery_security_with_config(
+        application_id,
+        store,
+        local_member,
+        &ReplicationConfig::default(),
+    )
+    .await
+}
+
+/// Load delivery security from deterministic test records with custom policy.
+#[cfg(any(test, feature = "test-support"))]
+async fn load_test_delivery_security_with_config(
+    application_id: Identifier,
+    store: Arc<dyn ReplicationStore>,
+    local_member: &MemberIdentity,
+    config: &ReplicationConfig,
+) -> Result<DeliverySecurity, LoadError> {
     DeliverySecurity::load(
-        SecurityStore::new(store, ReplicationConfig::default().trust_policy),
+        SecurityStore::new(store, config.trust_policy.clone()),
         local_member,
         Arc::new(test_store_secret_key()),
         TEST_STORE_SECRET_KEY_ID,

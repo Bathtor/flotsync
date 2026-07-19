@@ -510,11 +510,12 @@ impl CatchUpManagerComponent {
             WireRuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)
             }
-            WireRuntimeMessage::BootstrapGroup(_)
-            | WireRuntimeMessage::Update(_)
+            WireRuntimeMessage::Update(_)
             | WireRuntimeMessage::SummaryRequest(_)
             | WireRuntimeMessage::Summary(_)
-            | WireRuntimeMessage::UpdateBatch(_) => Handled::OK,
+            | WireRuntimeMessage::UpdateBatch(_)
+            | WireRuntimeMessage::GroupInvitation(_)
+            | WireRuntimeMessage::MigrationProposal(_) => Handled::OK,
         }
     }
 

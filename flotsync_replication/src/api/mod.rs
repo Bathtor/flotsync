@@ -669,6 +669,14 @@ impl fmt::Debug for InitialSnapshot {
     }
 }
 
+impl InitialSnapshot {
+    /// Return whether activation needs snapshot data that is not carried inline.
+    #[must_use]
+    pub fn requires_snapshot_fetch(&self) -> bool {
+        matches!(self, Self::Metadata(_))
+    }
+}
+
 /// Metadata for an initial snapshot that is not carried inline.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InitialSnapshotMetadata {
@@ -683,7 +691,10 @@ pub struct InitialSnapshotMetadata {
 }
 
 /// Policy decision for one invitation or migration classification.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// The enum order is the restrictiveness order: automatic acceptance is the
+/// least restrictive outcome, and automatic rejection is the most restrictive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PolicyDecision {
     /// Accept automatically after validation succeeds.
     AutoAccept,
@@ -691,6 +702,14 @@ pub enum PolicyDecision {
     AskListener,
     /// Reject automatically after validation succeeds.
     AutoReject,
+}
+
+impl PolicyDecision {
+    /// Return the more restrictive of two policy decisions.
+    #[must_use]
+    pub fn most_restrictive(self, other: Self) -> Self {
+        self.max(other)
+    }
 }
 
 /// Policy for handling group invitations.
@@ -897,8 +916,8 @@ impl fmt::Debug for CreateGroupRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeGroupMembershipRequest {
     pub group_id: GroupId,
-    pub add_members: Vec<MemberIdentity>,
-    pub remove_members: Vec<MemberIdentity>,
+    pub add_members: HashSet<MemberIdentity>,
+    pub remove_members: HashSet<MemberIdentity>,
     pub group_name: Option<String>,
     pub message: Option<String>,
 }
@@ -1110,6 +1129,17 @@ pub enum PendingGroupWorkKey {
     },
 }
 
+impl PendingGroupWorkKey {
+    /// Return the target group for the pending work.
+    #[must_use]
+    pub const fn group_id(self) -> GroupId {
+        match self {
+            Self::GroupInvitation { group_id, .. } => group_id,
+            Self::MigrationProposal { migration_id } => migration_id.new_group_id,
+        }
+    }
+}
+
 /// Store-owned unresolved listener-mediated group decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingGroupDecisionRecord {
@@ -1131,6 +1161,43 @@ impl PendingGroupDecisionRecord {
             Self::MigrationProposal(proposal) => PendingGroupWorkKey::MigrationProposal {
                 migration_id: proposal.migration_id,
             },
+        }
+    }
+
+    /// Return the target group for this pending decision.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        self.key().group_id()
+    }
+
+    /// Return whether accepting this decision requires fetching snapshot data first.
+    #[must_use]
+    pub fn requires_snapshot_fetch(&self) -> bool {
+        match self {
+            Self::GroupInvitation(invitation) => {
+                invitation.initial_snapshot.requires_snapshot_fetch()
+            }
+            Self::MigrationProposal(proposal) => {
+                proposal.initial_snapshot.requires_snapshot_fetch()
+            }
+        }
+    }
+
+    /// Return proposed target-group members in canonical order.
+    #[must_use]
+    pub fn proposed_members(&self) -> &[MemberIdentity] {
+        match self {
+            Self::GroupInvitation(invitation) => &invitation.proposed_members,
+            Self::MigrationProposal(proposal) => &proposal.proposed_members,
+        }
+    }
+
+    /// Return the target-group schema carried by this work.
+    #[must_use]
+    pub const fn group_schema(&self) -> &GroupSchema {
+        match self {
+            Self::GroupInvitation(invitation) => &invitation.group_schema,
+            Self::MigrationProposal(proposal) => &proposal.group_schema,
         }
     }
 
@@ -1189,6 +1256,62 @@ impl PendingGroupActivationRecord {
             },
         }
     }
+
+    /// Return the new group activated by this record.
+    #[must_use]
+    pub const fn group_id(&self) -> GroupId {
+        self.key().group_id()
+    }
+
+    /// Return whether activation requires fetching snapshot data first.
+    #[must_use]
+    pub fn requires_snapshot_fetch(&self) -> bool {
+        match self {
+            Self::GroupInvitation(invitation) => {
+                invitation.initial_snapshot.requires_snapshot_fetch()
+            }
+            Self::MigrationProposal(proposal) => {
+                proposal.initial_snapshot.requires_snapshot_fetch()
+            }
+        }
+    }
+
+    /// Split this record into the fields required by the activation pipeline.
+    #[must_use]
+    pub fn into_activation_record(self) -> AcceptedGroupActivationRecord {
+        let key = self.key();
+        match self {
+            Self::GroupInvitation(invitation) => AcceptedGroupActivationRecord {
+                key,
+                group_id: invitation.group_id,
+                proposed_members: invitation.proposed_members,
+                group_schema: invitation.group_schema,
+                initial_snapshot: invitation.initial_snapshot,
+            },
+            Self::MigrationProposal(proposal) => AcceptedGroupActivationRecord {
+                key,
+                group_id: proposal.migration_id.new_group_id,
+                proposed_members: proposal.proposed_members,
+                group_schema: proposal.group_schema,
+                initial_snapshot: proposal.initial_snapshot,
+            },
+        }
+    }
+}
+
+/// Decomposed accepted group work ready for activation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedGroupActivationRecord {
+    /// Stable store key for this accepted activation.
+    pub key: PendingGroupWorkKey,
+    /// New group that becomes externally active after activation succeeds.
+    pub group_id: GroupId,
+    /// Proposed canonical member order for the activated group.
+    pub proposed_members: Vec<MemberIdentity>,
+    /// Dataset schemas fixed for the activated group.
+    pub group_schema: GroupSchema,
+    /// Initial dataset state required before the group becomes active.
+    pub initial_snapshot: InitialSnapshot,
 }
 
 /// Listener-visible replication events.
@@ -1535,7 +1658,7 @@ impl Eq for GroupMemberKeys {}
 /// because it defines the stable `MemberIndex` values used in version vectors
 /// and `UpdateId.node_index`. Sensitive group-security material is already
 /// encrypted by the setup/runtime boundary before it enters the store.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ReplicationGroupRecord {
     /// Stable replication-group identifier.
     pub group_id: GroupId,
@@ -1552,6 +1675,19 @@ pub struct ReplicationGroupRecord {
 }
 
 impl ReplicationGroupRecord {
+    /// Split active progress from group material shared with pending setup.
+    #[must_use]
+    pub fn into_parts(self) -> (ReplicationGroupMaterialRecord, VersionVector) {
+        let material = ReplicationGroupMaterialRecord {
+            group_id: self.group_id,
+            member_keys: self.member_keys,
+            local_member_index: self.local_member_index,
+            group_schema: self.group_schema,
+            security_material: self.security_material,
+        };
+        (material, self.version_vector)
+    }
+
     /// Return the number of members encoded in this record.
     ///
     /// # Panics
@@ -1585,6 +1721,108 @@ impl ReplicationGroupRecord {
             .member_key_at_index(self.local_member_index)
             .expect("replication group local member index must be in bounds")
             .member_id
+    }
+
+    /// Return whether another active record has the same group definition.
+    ///
+    /// Active progress and encrypted security material are intentionally not
+    /// part of the definition comparison.
+    #[must_use]
+    pub fn matches_definition(&self, other: &Self) -> bool {
+        self.group_id == other.group_id
+            && self.member_keys == other.member_keys
+            && self.local_member_index == other.local_member_index
+            && self.group_schema == other.group_schema
+    }
+
+    /// Return whether this active group is compatible with stored material
+    /// for the same group id.
+    ///
+    /// This intentionally ignores `version_vector`: active groups may already
+    /// have applied local progress beyond the initial bootstrap state. All
+    /// identity, schema, and security material must still match exactly.
+    #[must_use]
+    pub fn matches_group_material(&self, material: &ReplicationGroupMaterialRecord) -> bool {
+        material.matches_definition(
+            self.group_id,
+            &self.member_keys,
+            self.local_member_index,
+            &self.group_schema,
+        ) && self.security_material == material.security_material
+    }
+}
+
+/// Stored group definition and local security material, independent of activation.
+///
+/// Material may exist before the group becomes externally active. Dataset rows,
+/// update logs, and active progress remain anchored to [`ReplicationGroupRecord`]
+/// through the store's separate active-group marker.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReplicationGroupMaterialRecord {
+    /// Stable replication-group identifier.
+    pub group_id: GroupId,
+    /// Canonical exact member-key order for the group.
+    pub member_keys: GroupMemberKeys,
+    /// Position of the local member within `member_keys`.
+    pub local_member_index: MemberIndex,
+    /// Dataset schemas fixed for the lifetime of this group.
+    pub group_schema: GroupSchema,
+    /// Already-encrypted group-security material needed by runtime operation.
+    pub security_material: EncryptedGroupSecurityMaterial,
+}
+
+impl ReplicationGroupMaterialRecord {
+    /// Return whether this material has the supplied group definition.
+    ///
+    /// Encrypted security material is intentionally excluded so callers can
+    /// reject structural conflicts before performing cryptographic checks.
+    #[must_use]
+    pub fn matches_definition(
+        &self,
+        group_id: GroupId,
+        member_keys: &GroupMemberKeys,
+        local_member_index: MemberIndex,
+        group_schema: &GroupSchema,
+    ) -> bool {
+        self.group_id == group_id
+            && self.member_keys == *member_keys
+            && self.local_member_index == local_member_index
+            && self.group_schema == *group_schema
+    }
+
+    /// Return the number of members encoded in this material.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an invalid material record was constructed with no member keys.
+    #[must_use]
+    pub fn member_count(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.member_keys.len())
+            .expect("replication group material must not contain an empty member set")
+    }
+
+    /// Combine this material with active progress.
+    #[must_use]
+    pub fn activate(self, version_vector: VersionVector) -> ReplicationGroupRecord {
+        ReplicationGroupRecord {
+            group_id: self.group_id,
+            member_keys: self.member_keys,
+            local_member_index: self.local_member_index,
+            group_schema: self.group_schema,
+            version_vector,
+            security_material: self.security_material,
+        }
+    }
+}
+
+impl fmt::Debug for ReplicationGroupMaterialRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplicationGroupMaterialRecord")
+            .field("group_id", &self.group_id)
+            .field("member_keys", &self.member_keys)
+            .field("local_member_index", &self.local_member_index)
+            .field("group_schema", &self.group_schema)
+            .finish_non_exhaustive()
     }
 }
 
@@ -2202,10 +2440,28 @@ pub trait ReplicationStoreReadTransaction: Send {
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>>;
 
+    /// Load the unresolved decision for one target group, if present.
+    fn load_pending_group_decision<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupDecisionRecord>, StoreError>>;
+
     /// Load all accepted group activations that are not externally active yet.
     fn load_pending_group_activations(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>>;
+
+    /// Load accepted activation work targeting one group, if present.
+    fn load_pending_group_activation<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupActivationRecord>, StoreError>>;
+
+    /// Load group material regardless of whether the group is active yet.
+    fn load_replication_group_material<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupMaterialRecord>, StoreError>>;
 
     /// Explicitly release the read transaction.
     ///
@@ -2284,6 +2540,19 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     fn insert_replication_group(
         &mut self,
         group: ReplicationGroupRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Store group material or confirm an identical record already exists.
+    fn ensure_replication_group_material(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>>;
+
+    /// Mark stored group material active at the supplied initial progress.
+    fn activate_replication_group(
+        &mut self,
+        group_id: GroupId,
+        version_vector: VersionVector,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Insert encrypted local-private key material or confirm it is already stored unchanged.
@@ -2369,6 +2638,15 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     fn remove_pending_group_activation(
         &mut self,
         key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>>;
+
+    /// Remove inactive material after its pending work is rejected.
+    ///
+    /// Returns `true` when inactive material existed and was removed. Active
+    /// group material is never removed by this operation.
+    fn remove_inactive_replication_group_material(
+        &mut self,
+        group_id: GroupId,
     ) -> BoxFuture<'_, Result<bool, StoreError>>;
 
     /// Commit all writes performed in this transaction.
@@ -2474,6 +2752,50 @@ mod tests {
             .expect_err("duplicate member identity should be rejected");
 
         assert!(matches!(error, GroupMembersError::DuplicateMember { .. }));
+    }
+
+    #[test]
+    fn group_material_definition_matching_excludes_security_material() {
+        let group_id = GroupId(uuid::Uuid::from_u128(91_000));
+        let member_keys = GroupMemberKeys::from_ordered_member_keys([
+            member_key_id(["debug", "alice"], 1),
+            member_key_id(["debug", "bob"], 2),
+        ])
+        .expect("group member keys should build");
+        let group_schema = docs_group_schema();
+        let material = ReplicationGroupMaterialRecord {
+            group_id,
+            member_keys: member_keys.clone(),
+            local_member_index: MemberIndex::new(0),
+            group_schema: group_schema.clone(),
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        };
+        let member_count = NonZeroUsize::new(2).expect("test group has members");
+        let active = material
+            .clone()
+            .activate(VersionVector::initial(member_count));
+        let mut different_security = material.clone();
+        different_security.security_material = current_slice_placeholder_group_security_material(
+            GroupId(uuid::Uuid::from_u128(91_098)),
+        );
+        let different_security_active = different_security
+            .clone()
+            .activate(VersionVector::initial(member_count));
+
+        assert!(material.matches_definition(
+            group_id,
+            &member_keys,
+            MemberIndex::new(0),
+            &group_schema,
+        ));
+        assert!(active.matches_definition(&different_security_active));
+        assert!(!active.matches_group_material(&different_security));
+        assert!(!material.matches_definition(
+            GroupId(uuid::Uuid::from_u128(91_099)),
+            &member_keys,
+            MemberIndex::new(0),
+            &group_schema,
+        ));
     }
 
     #[test]

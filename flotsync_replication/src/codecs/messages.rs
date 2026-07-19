@@ -3,14 +3,14 @@ use crate::{
     api::{
         DatasetId,
         DatasetIdError,
-        DatasetSchema,
         DatasetUpdateRecord,
-        GroupSchema,
+        GroupInvitation,
         MemberKeyId,
+        MigrationProposal,
         ReplicationUpdateRecord,
         Summary,
     },
-    codecs::pending_group::PendingGroupPayloadError,
+    codecs::pending_group::{PendingGroupPayloadDecodeContext, PendingGroupPayloadError},
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -68,16 +68,22 @@ pub(crate) enum RuntimeMessageError {
     },
     #[snafu(display("Runtime message did not contain a body."))]
     MissingBody,
-    #[snafu(display("Bootstrap group message must include at least one member."))]
-    EmptyBootstrapGroup,
-    #[snafu(display("Bootstrap group message must include key references for every member."))]
+    #[snafu(display("Group setup must include at least one member."))]
+    EmptyGroupSetup,
+    #[snafu(display("Pending-group runtime message did not include private group setup."))]
+    MissingGroupSetup,
+    #[snafu(display(
+        "Pending-group members did not match the ordered identities in private group setup."
+    ))]
+    GroupSetupMemberMismatch,
+    #[snafu(display("Group setup must include key references for every member."))]
     EmptyBootstrapMemberKeys,
     #[snafu(display("Bootstrap member-key entry did not include a member id."))]
     MissingBootstrapMemberId,
-    #[snafu(display("Bootstrap group message is missing a key reference for member {member_id}."))]
+    #[snafu(display("Group setup is missing a key reference for member {member_id}."))]
     MissingBootstrapMemberKey { member_id: MemberIdentity },
     #[snafu(display(
-        "Bootstrap group message carried {member_key_count} member-key entries for {member_count} members."
+        "Group setup carried {member_key_count} member-key entries for {member_count} members."
     ))]
     BootstrapMemberKeyCountMismatch {
         member_count: usize,
@@ -103,10 +109,8 @@ pub(crate) enum RuntimeMessageError {
         member_id: MemberIdentity,
         public_key_member_id: MemberIdentity,
     },
-    #[snafu(display("Bootstrap group schema was invalid: {source}"))]
-    InvalidBootstrapGroupSchema { source: PendingGroupPayloadError },
-    #[snafu(display("Bootstrap group cipher suite {actual} is unsupported; expected {expected}."))]
-    UnsupportedBootstrapGroupCipherSuite { actual: u32, expected: u16 },
+    #[snafu(display("Group setup cipher suite {actual} is unsupported; expected {expected}."))]
+    UnsupportedGroupSetupCipherSuite { actual: u32, expected: u16 },
     #[snafu(display(
         "Runtime message field '{field}' had invalid byte length {actual}; expected {expected}."
     ))]
@@ -160,6 +164,8 @@ pub(crate) enum RuntimeMessageError {
         field: &'static str,
         source: WireValueDecodeError,
     },
+    #[snafu(display("Runtime message pending-group payload was invalid: {source}"))]
+    InvalidPendingGroupPayload { source: PendingGroupPayloadError },
     #[snafu(display("Runtime message field '{field}' was not a valid UUID: {source}"))]
     InvalidCorrelationId {
         field: &'static str,
@@ -264,24 +270,26 @@ impl MemberCountContext {
 /// messages should add an explicit scope API rather than reusing [`Self::group_id`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuntimeMessage {
-    BootstrapGroup(Arc<BootstrapGroupMessage>),
     Update(Box<UpdateMessage>),
     SummaryRequest(SummaryRequestMessage),
     Summary(SummaryMessage),
     NeedRange(NeedRangeMessage),
     UpdateBatch(UpdateBatchMessage),
+    GroupInvitation(GroupInvitationMessage),
+    MigrationProposal(MigrationProposalMessage),
 }
 
 impl RuntimeMessage {
     /// Return the replication group that scopes every current runtime message variant.
     pub(crate) fn group_id(&self) -> GroupId {
         match self {
-            Self::BootstrapGroup(message) => message.group_id(),
             Self::Update(message) => message.group_id,
             Self::SummaryRequest(message) => message.group_id,
             Self::Summary(message) => message.group_id,
             Self::NeedRange(message) => message.group_id,
             Self::UpdateBatch(message) => message.group_id,
+            Self::GroupInvitation(message) => message.invitation.group_id,
+            Self::MigrationProposal(message) => message.proposal.migration_id.old_group_id,
         }
     }
 }
@@ -302,9 +310,6 @@ impl EncodeProtoOneof for RuntimeMessage {
 
     fn encode_proto(&self) -> Self::Proto {
         match self {
-            RuntimeMessage::BootstrapGroup(message) => {
-                Self::Proto::BootstrapGroup(message.as_ref().encode_proto_boxed())
-            }
             RuntimeMessage::Update(message) => Self::Proto::Update(message.encode_proto_boxed()),
             RuntimeMessage::SummaryRequest(message) => {
                 Self::Proto::SummaryRequest(message.encode_proto_boxed())
@@ -315,6 +320,12 @@ impl EncodeProtoOneof for RuntimeMessage {
             }
             RuntimeMessage::UpdateBatch(message) => {
                 Self::Proto::UpdateBatch(message.encode_proto_boxed())
+            }
+            RuntimeMessage::GroupInvitation(message) => {
+                Self::Proto::GroupInvitation(message.encode_proto_boxed())
+            }
+            RuntimeMessage::MigrationProposal(message) => {
+                Self::Proto::MigrationProposal(message.encode_proto_boxed())
             }
         }
     }
@@ -327,13 +338,28 @@ impl EncodeProtoOneof for RuntimeMessage {
 /// the hosted group member count before they can become a full `VersionVector`.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum WireRuntimeMessage {
-    /// Bootstrap messages already have their full runtime shape once decoded.
-    BootstrapGroup(Arc<BootstrapGroupMessage>),
     Update(WireUpdateMessage),
     SummaryRequest(SummaryRequestMessage),
     Summary(WireSummaryMessage),
     NeedRange(NeedRangeMessage),
     UpdateBatch(WireUpdateBatchMessage),
+    GroupInvitation(GroupInvitationMessage),
+    MigrationProposal(MigrationProposalMessage),
+}
+
+impl WireRuntimeMessage {
+    /// Return the replication group that scopes this message on delivery.
+    pub(crate) fn group_id(&self) -> GroupId {
+        match self {
+            Self::Update(message) => message.group_id,
+            Self::SummaryRequest(message) => message.group_id,
+            Self::Summary(message) => message.group_id,
+            Self::NeedRange(message) => message.group_id,
+            Self::UpdateBatch(message) => message.group_id,
+            Self::GroupInvitation(message) => message.invitation.group_id,
+            Self::MigrationProposal(message) => message.proposal.migration_id.old_group_id,
+        }
+    }
 }
 
 impl DecodeProto for WireRuntimeMessage {
@@ -354,12 +380,6 @@ impl DecodeProtoOneof for WireRuntimeMessage {
 
     fn decode_proto(body: Self::Proto) -> Result<Self, Self::Error> {
         match body {
-            replication_proto::runtime_message::Body::BootstrapGroup(message) => {
-                let bootstrap_message = BootstrapGroupMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::BootstrapGroup(Arc::new(
-                    bootstrap_message,
-                )))
-            }
             replication_proto::runtime_message::Body::Update(message) => {
                 let message = WireUpdateMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::Update(message))
@@ -380,6 +400,14 @@ impl DecodeProtoOneof for WireRuntimeMessage {
                 let message = WireUpdateBatchMessage::decode_proto(*message)?;
                 Ok(WireRuntimeMessage::UpdateBatch(message))
             }
+            replication_proto::runtime_message::Body::GroupInvitation(message) => {
+                let message = GroupInvitationMessage::decode_proto(*message)?;
+                Ok(WireRuntimeMessage::GroupInvitation(message))
+            }
+            replication_proto::runtime_message::Body::MigrationProposal(message) => {
+                let message = MigrationProposalMessage::decode_proto(*message)?;
+                Ok(WireRuntimeMessage::MigrationProposal(message))
+            }
         }
     }
 }
@@ -393,12 +421,6 @@ impl DecodeProtoView for WireRuntimeMessage {
             return MissingBodySnafu.fail();
         };
         match body {
-            replication_proto::runtime_message::BodyView::BootstrapGroup(message) => {
-                let bootstrap_message = BootstrapGroupMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::BootstrapGroup(Arc::new(
-                    bootstrap_message,
-                )))
-            }
             replication_proto::runtime_message::BodyView::Update(message) => {
                 let message = WireUpdateMessage::decode_proto_view(message)?;
                 Ok(WireRuntimeMessage::Update(message))
@@ -419,22 +441,160 @@ impl DecodeProtoView for WireRuntimeMessage {
                 let message = WireUpdateBatchMessage::decode_proto_view(message)?;
                 Ok(WireRuntimeMessage::UpdateBatch(message))
             }
+            replication_proto::runtime_message::BodyView::GroupInvitation(message) => {
+                // TODO(flotsync-git-i20): add borrowed contextual decoders for
+                // pending-group payloads so view decoding does not first own
+                // the generated payload.
+                let message =
+                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
+                        .context(DecodeSnafu)?;
+                let message = GroupInvitationMessage::decode_proto(message)?;
+                Ok(WireRuntimeMessage::GroupInvitation(message))
+            }
+            replication_proto::runtime_message::BodyView::MigrationProposal(message) => {
+                // TODO(flotsync-git-i20): add borrowed contextual decoders for
+                // pending-group payloads so view decoding does not first own
+                // the generated payload.
+                let message =
+                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
+                        .context(DecodeSnafu)?;
+                let message = MigrationProposalMessage::decode_proto(message)?;
+                Ok(WireRuntimeMessage::MigrationProposal(message))
+            }
         }
     }
 }
 
+/// Reliable group invitation plus recipient-protected target-group setup.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BootstrapGroupMessage {
-    group_id: GroupId,
-    members: Vec<MemberIdentity>,
-    member_keys: TrieMap<BootstrapMemberKeyMessage>,
-    group_schema: GroupSchema,
-    group_cipher_suite: GroupCipherSuite,
-    group_key: BootstrapGroupKey,
+pub(crate) struct GroupInvitationMessage {
+    invitation: GroupInvitation,
+    group_setup: Arc<GroupSetupMessage>,
 }
 
-impl BootstrapGroupMessage {
-    /// Build a bootstrap message whose member list and member-key map cover
+impl GroupInvitationMessage {
+    /// Combine listener-safe invitation data with matching private group setup.
+    pub(crate) fn try_new(
+        invitation: GroupInvitation,
+        group_setup: Arc<GroupSetupMessage>,
+    ) -> Result<Self, RuntimeMessageError> {
+        ensure!(
+            invitation.proposed_members == group_setup.members(),
+            GroupSetupMemberMismatchSnafu
+        );
+        Ok(Self {
+            invitation,
+            group_setup,
+        })
+    }
+
+    /// Split the wire message into listener-safe and private setup parts.
+    pub(crate) fn into_parts(self) -> (GroupInvitation, Arc<GroupSetupMessage>) {
+        (self.invitation, self.group_setup)
+    }
+}
+
+impl EncodeProto for GroupInvitationMessage {
+    type Proto = replication_proto::GroupInvitationPayload;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let mut message = self.invitation.encode_proto();
+        message.group_setup = MessageField::some(self.group_setup.encode_proto());
+        message
+    }
+}
+
+impl DecodeProto for GroupInvitationMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::GroupInvitationPayload;
+
+    fn decode_proto(mut message: Self::Proto) -> Result<Self, Self::Error> {
+        let Some(group_setup) = message.group_setup.take() else {
+            return MissingGroupSetupSnafu.fail();
+        };
+        let group_setup = GroupSetupMessage::decode_proto(group_setup)?;
+        let invitation = GroupInvitation::decode_proto_with(
+            message,
+            PendingGroupPayloadDecodeContext::default(),
+        )
+        .context(InvalidPendingGroupPayloadSnafu)?;
+        Self::try_new(invitation, Arc::new(group_setup))
+    }
+}
+
+/// Reliable migration proposal plus recipient-protected target-group setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MigrationProposalMessage {
+    proposal: MigrationProposal,
+    group_setup: Arc<GroupSetupMessage>,
+}
+
+impl MigrationProposalMessage {
+    /// Combine listener-safe proposal data with matching private group setup.
+    pub(crate) fn try_new(
+        proposal: MigrationProposal,
+        group_setup: Arc<GroupSetupMessage>,
+    ) -> Result<Self, RuntimeMessageError> {
+        ensure!(
+            proposal.proposed_members == group_setup.members(),
+            GroupSetupMemberMismatchSnafu
+        );
+        Ok(Self {
+            proposal,
+            group_setup,
+        })
+    }
+
+    /// Split the wire message into listener-safe and private setup parts.
+    pub(crate) fn into_parts(self) -> (MigrationProposal, Arc<GroupSetupMessage>) {
+        (self.proposal, self.group_setup)
+    }
+}
+
+impl EncodeProto for MigrationProposalMessage {
+    type Proto = replication_proto::MigrationProposalPayload;
+
+    fn encode_proto(&self) -> Self::Proto {
+        let mut message = self.proposal.encode_proto();
+        message.group_setup = MessageField::some(self.group_setup.encode_proto());
+        message
+    }
+}
+
+impl DecodeProto for MigrationProposalMessage {
+    type Error = RuntimeMessageError;
+    type Proto = replication_proto::MigrationProposalPayload;
+
+    fn decode_proto(mut message: Self::Proto) -> Result<Self, Self::Error> {
+        let Some(group_setup) = message.group_setup.take() else {
+            return MissingGroupSetupSnafu.fail();
+        };
+        let group_setup = GroupSetupMessage::decode_proto(group_setup)?;
+        // TODO(flotsync-git-i20): this empty context cannot expand compact
+        // `Synced` or `Override` final-version vectors because their old-group
+        // member count is only available from runtime state. Keep the compact
+        // wire shape, defer resolution until that context can be supplied, and
+        // add proposal decode tests for both compact variants with that work.
+        let proposal = MigrationProposal::decode_proto_with(
+            message,
+            PendingGroupPayloadDecodeContext::default(),
+        )
+        .context(InvalidPendingGroupPayloadSnafu)?;
+        Self::try_new(proposal, Arc::new(group_setup))
+    }
+}
+
+/// Private target-group key material carried by an invitation or proposal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GroupSetupMessage {
+    members: Vec<MemberIdentity>,
+    member_keys: TrieMap<BootstrapMemberKeyMessage>,
+    group_cipher_suite: GroupCipherSuite,
+    group_key: GroupSetupKey,
+}
+
+impl GroupSetupMessage {
+    /// Build setup material whose member list and member-key map cover
     /// exactly the same identities.
     ///
     /// # Errors
@@ -443,35 +603,22 @@ impl BootstrapGroupMessage {
     /// references are present, the member-key map does not match the member
     /// list, or an inline public bundle is bound to a different member.
     pub(crate) fn new(
-        group_id: GroupId,
         members: Vec<MemberIdentity>,
         member_keys: TrieMap<BootstrapMemberKeyMessage>,
-        group_schema: GroupSchema,
         group_cipher_suite: GroupCipherSuite,
-        group_key: BootstrapGroupKey,
+        group_key: GroupSetupKey,
     ) -> Result<Self, RuntimeMessageError> {
         validate_bootstrap_member_key_coverage(&members, &member_keys)?;
         Ok(Self {
-            group_id,
             members,
             member_keys,
-            group_schema,
             group_cipher_suite,
             group_key,
         })
     }
 
-    pub(crate) fn group_id(&self) -> GroupId {
-        self.group_id
-    }
-
     pub(crate) fn members(&self) -> &[MemberIdentity] {
         &self.members
-    }
-
-    /// Return dataset schemas fixed for the lifetime of this bootstrapped group.
-    pub(crate) fn group_schema(&self) -> &GroupSchema {
-        &self.group_schema
     }
 
     pub(crate) fn member_keys(&self) -> &TrieMap<BootstrapMemberKeyMessage> {
@@ -495,14 +642,14 @@ impl BootstrapGroupMessage {
             .collect()
     }
 
-    pub(crate) fn group_key(&self) -> &BootstrapGroupKey {
+    pub(crate) fn group_key(&self) -> &GroupSetupKey {
         &self.group_key
     }
 }
 
-impl proto::ProtoCodec for BootstrapGroupMessage {
+impl proto::ProtoCodec for GroupSetupMessage {
     type DecodeError = RuntimeMessageError;
-    type Proto = replication_proto::BootstrapGroup;
+    type Proto = replication_proto::GroupSetup;
 
     fn to_proto(&self) -> Self::Proto {
         let member_keys = self
@@ -520,29 +667,17 @@ impl proto::ProtoCodec for BootstrapGroupMessage {
                 .encode_proto()
             })
             .collect();
-        replication_proto::BootstrapGroup {
-            group_id: self.group_id.0.as_bytes().to_vec(),
+        replication_proto::GroupSetup {
             member_keys,
-            dataset_schemas: self
-                .group_schema
-                .datasets()
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
             group_cipher_suite: u32::from(self.group_cipher_suite.as_u16()),
             group_key: self.group_key.to_bytes().to_vec(),
-            ..replication_proto::BootstrapGroup::default()
+            ..replication_proto::GroupSetup::default()
         }
     }
 
     fn from_proto(message: Self::Proto) -> Result<Self, Self::DecodeError> {
-        let group_id = group_id_from_wire(&message.group_id, "bootstrap_group.group_id").context(
-            InvalidWireValueSnafu {
-                field: "bootstrap_group.group_id",
-            },
-        )?;
         if message.member_keys.is_empty() {
-            return EmptyBootstrapGroupSnafu.fail();
+            return EmptyGroupSetupSnafu.fail();
         }
         let mut members = Vec::with_capacity(message.member_keys.len());
         let mut member_keys = TrieMap::new();
@@ -551,41 +686,32 @@ impl proto::ProtoCodec for BootstrapGroupMessage {
             members.push(entry.member_id.clone());
             member_keys.insert(entry.member_id, entry.member_key);
         }
-        let group_schema = decode_bootstrap_group_schema(message.dataset_schemas)
-            .context(InvalidBootstrapGroupSchemaSnafu)?;
         let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
         ensure!(
             message.group_cipher_suite == u32::from(expected),
-            UnsupportedBootstrapGroupCipherSuiteSnafu {
+            UnsupportedGroupSetupCipherSuiteSnafu {
                 actual: message.group_cipher_suite,
                 expected,
             }
         );
         let group_key =
-            fixed_bytes_field::<GROUP_KEY_LENGTH>("bootstrap_group.group_key", &message.group_key)?;
+            fixed_bytes_field::<GROUP_KEY_LENGTH>("group_setup.group_key", &message.group_key)?;
         Self::new(
-            group_id,
             members,
             member_keys,
-            group_schema,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes(group_key),
+            GroupSetupKey::from_bytes(group_key),
         )
     }
 }
 
-impl DecodeProtoView for BootstrapGroupMessage {
+impl DecodeProtoView for GroupSetupMessage {
     type Error = RuntimeMessageError;
-    type ProtoView<'a> = replication_proto::BootstrapGroupView<'a>;
+    type ProtoView<'a> = replication_proto::GroupSetupView<'a>;
 
     fn decode_proto_view(message: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
-        let group_id = group_id_from_wire(message.group_id, "bootstrap_group.group_id").context(
-            InvalidWireValueSnafu {
-                field: "bootstrap_group.group_id",
-            },
-        )?;
         if message.member_keys.is_empty() {
-            return EmptyBootstrapGroupSnafu.fail();
+            return EmptyGroupSetupSnafu.fail();
         }
         let mut members = Vec::with_capacity(message.member_keys.len());
         let mut member_keys = TrieMap::new();
@@ -594,31 +720,21 @@ impl DecodeProtoView for BootstrapGroupMessage {
             members.push(entry.member_id.clone());
             member_keys.insert(entry.member_id, entry.member_key);
         }
-        let dataset_schemas = message
-            .dataset_schemas
-            .iter()
-            .map(flotsync_messages::buffa::MessageView::to_owned_message)
-            .collect::<Result<Vec<_>, _>>()
-            .context(DecodeSnafu)?;
-        let group_schema = decode_bootstrap_group_schema(dataset_schemas)
-            .context(InvalidBootstrapGroupSchemaSnafu)?;
         let expected = GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16();
         ensure!(
             message.group_cipher_suite == u32::from(expected),
-            UnsupportedBootstrapGroupCipherSuiteSnafu {
+            UnsupportedGroupSetupCipherSuiteSnafu {
                 actual: message.group_cipher_suite,
                 expected,
             }
         );
         let group_key =
-            fixed_bytes_field::<GROUP_KEY_LENGTH>("bootstrap_group.group_key", message.group_key)?;
+            fixed_bytes_field::<GROUP_KEY_LENGTH>("group_setup.group_key", message.group_key)?;
         Self::new(
-            group_id,
             members,
             member_keys,
-            group_schema,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes(group_key),
+            GroupSetupKey::from_bytes(group_key),
         )
     }
 }
@@ -698,12 +814,12 @@ impl DecodeProto for BootstrapMemberKeyEntry {
             return MissingBootstrapMemberIdSnafu.fail();
         };
         let member_id =
-            member_identity_from_wire(member_id_wire, "bootstrap_group.member_keys.member_id")
+            member_identity_from_wire(member_id_wire, "group_setup.member_keys.member_id")
                 .context(InvalidWireValueSnafu {
-                    field: "bootstrap_group.member_keys.member_id",
+                    field: "group_setup.member_keys.member_id",
                 })?;
         let fingerprint = fixed_bytes_field::<KEY_FINGERPRINT_LENGTH>(
-            "bootstrap_group.member_keys.key_fingerprint",
+            "group_setup.member_keys.key_fingerprint",
             &message.key_fingerprint,
         )
         .map(KeyFingerprint::from_bytes)?;
@@ -732,14 +848,14 @@ impl DecodeProtoView for BootstrapMemberKeyEntry {
         };
         let member_id = message_wire::member_identity_from_wire_view(
             member_id_wire,
-            "bootstrap_group.member_keys.member_id",
+            "group_setup.member_keys.member_id",
         )
         .map_err(WireValueDecodeError::from)
         .context(InvalidWireValueSnafu {
-            field: "bootstrap_group.member_keys.member_id",
+            field: "group_setup.member_keys.member_id",
         })?;
         let fingerprint = fixed_bytes_field::<KEY_FINGERPRINT_LENGTH>(
-            "bootstrap_group.member_keys.key_fingerprint",
+            "group_setup.member_keys.key_fingerprint",
             message.key_fingerprint,
         )
         .map(KeyFingerprint::from_bytes)?;
@@ -819,9 +935,9 @@ pub(crate) fn validate_bootstrap_public_key_bundle_matches_fingerprint(
 /// Runtime messages are cloned in tests and route handoff, so the key is shared
 /// through an `Arc`. The underlying [`GroupKey`] owns zeroisation on final drop.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct BootstrapGroupKey(Arc<GroupKey>);
+pub(crate) struct GroupSetupKey(Arc<GroupKey>);
 
-impl BootstrapGroupKey {
+impl GroupSetupKey {
     pub(crate) fn from_group_key(group_key: GroupKey) -> Self {
         Self(Arc::new(group_key))
     }
@@ -839,11 +955,9 @@ impl BootstrapGroupKey {
     }
 }
 
-impl fmt::Debug for BootstrapGroupKey {
+impl fmt::Debug for GroupSetupKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("BootstrapGroupKey")
-            .field(&"<redacted>")
-            .finish()
+        f.debug_tuple("GroupSetupKey").field(&"<redacted>").finish()
     }
 }
 
@@ -2039,7 +2153,7 @@ fn validate_bootstrap_member_key_coverage(
     member_keys: &TrieMap<BootstrapMemberKeyMessage>,
 ) -> Result<(), RuntimeMessageError> {
     if members.is_empty() {
-        return EmptyBootstrapGroupSnafu.fail();
+        return EmptyGroupSetupSnafu.fail();
     }
     if member_keys.is_empty() {
         return EmptyBootstrapMemberKeysSnafu.fail();
@@ -2071,19 +2185,6 @@ fn validate_bootstrap_member_key_coverage(
     Ok(())
 }
 
-fn decode_bootstrap_group_schema(
-    dataset_schemas: Vec<replication_proto::DatasetSchema>,
-) -> Result<GroupSchema, PendingGroupPayloadError> {
-    let mut group_schema = GroupSchema::default();
-    for dataset_schema in dataset_schemas {
-        let dataset_schema = DatasetSchema::decode_proto(dataset_schema)?;
-        group_schema
-            .insert_checked(dataset_schema)
-            .map_err(PendingGroupPayloadError::from)?;
-    }
-    Ok(group_schema)
-}
-
 fn ensure_version_vector_bound(
     field: &'static str,
     version: u64,
@@ -2105,12 +2206,14 @@ fn correlation_id_from_wire(
 #[cfg(test)]
 mod tests {
     use super::{
-        BootstrapGroupKey,
-        BootstrapGroupMessage,
         BootstrapMemberKeyMessage,
         DatasetUpdateMessage,
         DatasetUpdateMessageView,
+        GroupInvitationMessage,
+        GroupSetupKey,
+        GroupSetupMessage,
         MemberCountContext,
+        MigrationProposalMessage,
         NeedRangeMessage,
         RuntimeMessage,
         RuntimeMessageError,
@@ -2124,11 +2227,17 @@ mod tests {
         WireRuntimeMessage,
         WireVersionVector,
         WireVersionVectorError,
-        member_identity_from_wire,
-        member_identity_to_wire_format,
     };
     use crate::{
-        api::{DatasetId, DatasetUpdateRecord, GroupSchema, ReplicationUpdateRecord},
+        api::{
+            DatasetId,
+            DatasetUpdateRecord,
+            GroupInvitation,
+            InitialSnapshot,
+            MigrationId,
+            MigrationProposal,
+            ReplicationUpdateRecord,
+        },
         test_support::{docs_group_schema, test_public_member_keys},
     };
     use flotsync_core::{
@@ -2138,7 +2247,7 @@ mod tests {
         versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector},
     };
     use flotsync_messages::{
-        buffa::{Message as _, MessageField, MessageView as _},
+        buffa::{Message as _, MessageView as _},
         datamodel as datamodel_proto,
         proto::{DecodeProto, DecodeProtoView, DecodeProtoViewWith, DecodeProtoWith, EncodeProto},
         replication as replication_proto,
@@ -2162,6 +2271,25 @@ mod tests {
                 operations: vec![datamodel_proto::SchemaOperation::default()],
             }],
         }
+    }
+
+    fn test_group_setup(members: &[MemberIdentity]) -> Arc<GroupSetupMessage> {
+        let mut member_keys = TrieMap::new();
+        for member in members {
+            member_keys.insert(
+                member.clone(),
+                BootstrapMemberKeyMessage::from_public_keys(&test_public_member_keys(member)),
+            );
+        }
+        Arc::new(
+            GroupSetupMessage::new(
+                members.to_vec(),
+                member_keys,
+                GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+                GroupSetupKey::from_bytes([5; GROUP_KEY_LENGTH]),
+            )
+            .expect("test group setup should build"),
+        )
     }
 
     #[test]
@@ -2449,218 +2577,67 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_group_round_trips_single_canonical_member_key_list() {
-        let group_id = GroupId(Uuid::from_u128(202));
-        let alice = MemberIdentity::from_array(["runtime-message", "alice"]);
-        let bob = MemberIdentity::from_array(["runtime-message", "bob"]);
-        let alice_keys = test_public_member_keys(&alice);
-        let bob_keys = test_public_member_keys(&bob);
-        let mut member_keys = TrieMap::new();
-        member_keys.insert(
-            alice.clone(),
-            BootstrapMemberKeyMessage::from_public_keys(&alice_keys),
-        );
-        member_keys.insert(
-            bob.clone(),
-            BootstrapMemberKeyMessage::from_public_keys(&bob_keys),
-        );
-        let bootstrap = BootstrapGroupMessage::new(
-            group_id,
-            vec![alice.clone(), bob.clone()],
-            member_keys,
-            docs_group_schema(),
-            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes([5; GROUP_KEY_LENGTH]),
-        )
-        .expect("bootstrap message should build");
-        let bootstrap = Arc::new(bootstrap);
-        let runtime_message = RuntimeMessage::BootstrapGroup(Arc::clone(&bootstrap));
-        let proto = runtime_message.encode_proto();
-        let Some(replication_proto::runtime_message::Body::BootstrapGroup(proto_bootstrap)) =
-            proto.body.clone()
-        else {
-            panic!("runtime message should encode as bootstrap group");
+    fn pending_group_messages_round_trip_through_runtime_envelope() {
+        let migration_id = MigrationId {
+            old_group_id: GroupId(Uuid::from_u128(91_001)),
+            new_group_id: GroupId(Uuid::from_u128(91_002)),
         };
-        assert_eq!(proto_bootstrap.member_keys.len(), 2);
-        assert_eq!(proto_bootstrap.dataset_schemas.len(), 1);
-        let mut first_entry = proto_bootstrap.member_keys[0].clone();
-        let first_member_id = member_identity_from_wire(
-            first_entry
-                .member_id
-                .take()
-                .expect("first entry should include member id"),
-            "bootstrap_group.member_keys.member_id",
-        )
-        .expect("member id should decode");
-        assert_eq!(first_member_id, alice);
+        let members = vec![
+            MemberIdentity::from_array(["runtime-message", "alice"]),
+            MemberIdentity::from_array(["runtime-message", "bob"]),
+        ];
+        let group_schema = docs_group_schema();
+        let group_setup = test_group_setup(&members);
+        let invitation = GroupInvitation::new_migration(
+            migration_id,
+            members.clone(),
+            group_schema.clone(),
+            InitialSnapshot::Empty,
+            Some("docs".to_owned()),
+            Some("join migration".to_owned()),
+        );
+        let invitation_message =
+            GroupInvitationMessage::try_new(invitation, Arc::clone(&group_setup))
+                .expect("invitation members should match setup");
         assert_eq!(
-            first_entry.key_fingerprint,
-            alice_keys.fingerprint().as_ref()
+            RuntimeMessage::GroupInvitation(invitation_message.clone()).group_id(),
+            migration_id.new_group_id
         );
-        assert!(first_entry.public_key_bundle.is_set());
-
-        let payload = proto.encode_to_bytes();
+        let invitation_payload = RuntimeMessage::GroupInvitation(invitation_message.clone())
+            .encode_proto()
+            .encode_to_bytes();
+        let decoded_invitation =
+            WireRuntimeMessage::decode_proto_view_from_slice(&invitation_payload)
+                .expect("invitation should decode");
         assert_eq!(
-            WireRuntimeMessage::decode_proto_view_from_slice(&payload)
-                .expect("bootstrap should decode"),
-            WireRuntimeMessage::BootstrapGroup(bootstrap)
+            decoded_invitation,
+            WireRuntimeMessage::GroupInvitation(invitation_message)
         );
-    }
 
-    #[test]
-    fn bootstrap_group_round_trips_fingerprint_only_member_key_list() {
-        let group_id = GroupId(Uuid::from_u128(204));
-        let alice = MemberIdentity::from_array(["runtime-message", "alice"]);
-        let bob = MemberIdentity::from_array(["runtime-message", "bob"]);
-        let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
-        let bob_fingerprint = test_public_member_keys(&bob).fingerprint();
-        let mut member_keys = TrieMap::new();
-        member_keys.insert(
-            alice.clone(),
-            BootstrapMemberKeyMessage::from_fingerprint(alice_fingerprint),
-        );
-        member_keys.insert(
-            bob.clone(),
-            BootstrapMemberKeyMessage::from_fingerprint(bob_fingerprint),
-        );
-        let bootstrap = BootstrapGroupMessage::new(
-            group_id,
-            vec![alice, bob],
-            member_keys,
-            GroupSchema::default(),
-            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes([6; GROUP_KEY_LENGTH]),
-        )
-        .expect("bootstrap message should build");
-        let bootstrap = Arc::new(bootstrap);
-        let runtime_message = RuntimeMessage::BootstrapGroup(Arc::clone(&bootstrap));
-        let proto = runtime_message.encode_proto();
-        let Some(replication_proto::runtime_message::Body::BootstrapGroup(proto_bootstrap)) =
-            proto.body.clone()
-        else {
-            panic!("runtime message should encode as bootstrap group");
+        let proposal = MigrationProposal {
+            migration_id,
+            final_versions: VersionVector::Full(PureVersionVector::from([3, 4])),
+            proposed_members: members,
+            group_schema,
+            initial_snapshot: InitialSnapshot::Empty,
+            group_name: Some("docs".to_owned()),
+            message: Some("migrate".to_owned()),
         };
-
-        assert_eq!(proto_bootstrap.member_keys.len(), 2);
-        assert!(
-            proto_bootstrap
-                .member_keys
-                .iter()
-                .all(|member_key| !member_key.public_key_bundle.is_set())
-        );
-        let payload = proto.encode_to_bytes();
+        let proposal_message = MigrationProposalMessage::try_new(proposal, group_setup)
+            .expect("proposal members should match setup");
         assert_eq!(
-            WireRuntimeMessage::decode_proto_view_from_slice(&payload)
-                .expect("bootstrap should decode"),
-            WireRuntimeMessage::BootstrapGroup(bootstrap)
+            RuntimeMessage::MigrationProposal(proposal_message.clone()).group_id(),
+            migration_id.old_group_id
         );
-    }
-
-    #[test]
-    fn bootstrap_group_rejects_duplicate_member_key_entries() {
-        let group_id = GroupId(Uuid::from_u128(203));
-        let member_id = MemberIdentity::from_array(["runtime-message", "alice"]);
-        let member_wire = member_identity_to_wire_format(&member_id);
-        let member_key = replication_proto::BootstrapMemberKey {
-            member_id: MessageField::some(member_wire),
-            key_fingerprint: test_public_member_keys(&member_id)
-                .fingerprint()
-                .as_ref()
-                .to_vec(),
-            ..replication_proto::BootstrapMemberKey::default()
-        };
-        let payload = replication_proto::RuntimeMessage {
-            body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
-                Box::new(replication_proto::BootstrapGroup {
-                    group_id: group_id.0.as_bytes().to_vec(),
-                    member_keys: vec![member_key.clone(), member_key],
-                    group_cipher_suite: u32::from(GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16()),
-                    group_key: vec![9; GROUP_KEY_LENGTH],
-                    ..replication_proto::BootstrapGroup::default()
-                }),
-            )),
-            ..replication_proto::RuntimeMessage::default()
-        }
-        .encode_to_bytes();
-
-        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
-            .expect_err("duplicate bootstrap key member entries should be rejected");
-        assert!(matches!(
-            error,
-            RuntimeMessageError::BootstrapMemberKeyCountMismatch {
-                member_count: 2,
-                member_key_count: 1,
-            }
-        ));
-    }
-
-    #[test]
-    fn bootstrap_group_rejects_inline_bundle_fingerprint_mismatch() {
-        let group_id = GroupId(Uuid::from_u128(205));
-        let alice = MemberIdentity::from_array(["runtime-message", "alice"]);
-        let bob = MemberIdentity::from_array(["runtime-message", "bob"]);
-        let alice_keys = test_public_member_keys(&alice);
-        let bob_keys = test_public_member_keys(&bob);
-        let member_key = replication_proto::BootstrapMemberKey {
-            member_id: MessageField::some(member_identity_to_wire_format(&alice)),
-            key_fingerprint: alice_keys.fingerprint().as_ref().to_vec(),
-            public_key_bundle: MessageField::some(bob_keys.encode_proto()),
-            ..replication_proto::BootstrapMemberKey::default()
-        };
-        let payload = replication_proto::RuntimeMessage {
-            body: Some(replication_proto::runtime_message::Body::BootstrapGroup(
-                Box::new(replication_proto::BootstrapGroup {
-                    group_id: group_id.0.as_bytes().to_vec(),
-                    member_keys: vec![member_key],
-                    group_cipher_suite: u32::from(GROUP_CIPHER_SUITE_CHACHA20_POLY1305.as_u16()),
-                    group_key: vec![10; GROUP_KEY_LENGTH],
-                    ..replication_proto::BootstrapGroup::default()
-                }),
-            )),
-            ..replication_proto::RuntimeMessage::default()
-        }
-        .encode_to_bytes();
-
-        let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
-            .expect_err("inline bundle fingerprint mismatch should be rejected");
-        assert!(matches!(
-            error,
-            RuntimeMessageError::BootstrapPublicKeyBundleFingerprintMismatch {
-                member_id,
-                ..
-            } if member_id == alice
-        ));
-    }
-
-    #[test]
-    fn bootstrap_group_rejects_inline_bundle_member_binding_mismatch() {
-        let group_id = GroupId(Uuid::from_u128(206));
-        let alice = MemberIdentity::from_array(["runtime-message", "alice"]);
-        let bob = MemberIdentity::from_array(["runtime-message", "bob"]);
-        let bob_keys = test_public_member_keys(&bob);
-        let mut member_keys = TrieMap::new();
-        member_keys.insert(
-            alice.clone(),
-            BootstrapMemberKeyMessage::from_public_keys(&bob_keys),
+        let proposal_payload = RuntimeMessage::MigrationProposal(proposal_message.clone())
+            .encode_proto()
+            .encode_to_bytes();
+        let decoded_proposal = WireRuntimeMessage::decode_proto_view_from_slice(&proposal_payload)
+            .expect("proposal should decode");
+        assert_eq!(
+            decoded_proposal,
+            WireRuntimeMessage::MigrationProposal(proposal_message)
         );
-
-        let error = BootstrapGroupMessage::new(
-            group_id,
-            vec![alice.clone()],
-            member_keys,
-            GroupSchema::default(),
-            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_bytes([11; GROUP_KEY_LENGTH]),
-        )
-        .expect_err("inline bundle member binding mismatch should reject bootstrap");
-
-        assert!(matches!(
-            error,
-            RuntimeMessageError::BootstrapMemberKeyBindingMismatch {
-                member_id,
-                public_key_member_id,
-            } if member_id == alice && public_key_member_id == bob
-        ));
     }
 
     #[test]

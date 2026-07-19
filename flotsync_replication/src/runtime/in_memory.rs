@@ -184,6 +184,27 @@ impl PendingUpdateSet {
         Self { updates }
     }
 
+    /// Remove updates already represented by `group` and return one causally ready id.
+    fn remove_applied_and_find_ready(
+        &mut self,
+        group: &LoadedGroupMeta,
+        already_applied: &mut Vec<UpdateId>,
+    ) -> Option<UpdateId> {
+        let stale_ids = self
+            .updates
+            .keys()
+            .copied()
+            .filter(|update_id| group.has_applied(*update_id))
+            .collect::<Vec<_>>();
+        for update_id in stale_ids {
+            self.updates.remove(&update_id);
+            already_applied.push(update_id);
+        }
+        self.updates
+            .iter()
+            .find_map(|(update_id, update)| option_when!(group.can_apply(update), *update_id))
+    }
+
     /// Determine which pending updates are already reflected in durable state
     /// and which additional updates can now apply in causal order.
     pub(super) fn plan_apply_chain(&mut self, group: &LoadedGroupMeta) -> PendingApplyPlan {
@@ -191,24 +212,9 @@ impl PendingUpdateSet {
         let mut ready_chain = Vec::new();
         let mut simulated_group = group.clone();
 
-        'drain: loop {
-            let stale_ids: Vec<_> = self
-                .updates
-                .keys()
-                .copied()
-                .filter(|update_id| simulated_group.has_applied(*update_id))
-                .collect();
-            for update_id in stale_ids {
-                self.updates.remove(&update_id);
-                already_applied.push(update_id);
-            }
-
-            let ready_update_id = self.updates.iter().find_map(|(update_id, update)| {
-                option_when!(simulated_group.can_apply(update), *update_id)
-            });
-            let Some(ready_update_id) = ready_update_id else {
-                break 'drain;
-            };
+        while let Some(ready_update_id) =
+            self.remove_applied_and_find_ready(&simulated_group, &mut already_applied)
+        {
             let ready_update = self
                 .updates
                 .remove(&ready_update_id)
@@ -273,7 +279,7 @@ impl LocalDataset {
         self.data.row_is_tombstoned(&row_key.0)
     }
 
-    fn clone_value_row(&self, row_key: RowKey) -> Option<RowValues> {
+    pub(super) fn clone_value_row(&self, row_key: RowKey) -> Option<RowValues> {
         let row = self.data.get_row(&row_key.0)?;
         Some(
             RowValues::from_row(self.data.schema(), &row)
@@ -282,7 +288,7 @@ impl LocalDataset {
     }
 
     /// Snapshot the current row image for explicit durable row writes.
-    fn snapshot_row(&self, row_key: RowKey) -> Option<ReplicationRowStateSnapshot> {
+    pub(super) fn snapshot_row(&self, row_key: RowKey) -> Option<ReplicationRowStateSnapshot> {
         self.data.get_row(&row_key.0).map(|row| row.snapshot())
     }
 }

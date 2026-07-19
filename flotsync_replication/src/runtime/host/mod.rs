@@ -3,12 +3,18 @@
 use super::{
     ReplicationRuntimeComponent,
     catch_up_manager::CatchUpManagerComponent,
+    component::{
+        RuntimeApplicationServices,
+        RuntimeComponentActors,
+        RuntimeIdentityContext,
+        RuntimeSecurityContext,
+    },
     summary_request_manager::SummaryRequestManagerComponent,
 };
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
-    api::{BoxError, ReplicationEventListener, ReplicationStore},
+    api::{BoxError, ReplicationConfig, ReplicationEventListener, ReplicationStore},
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
@@ -975,20 +981,25 @@ struct RuntimeLogicTopology {
     runtime_component: Arc<Component<ReplicationRuntimeComponent>>,
 }
 
+/// Runtime-logic knobs that are not application or identity dependencies.
+struct RuntimeLogicSettings {
+    summary_request_timeout: Duration,
+}
+
+/// Grouped inputs for the runtime logic topology.
+struct RuntimeLogicTopologyInput {
+    identity: RuntimeIdentityContext,
+    services: RuntimeApplicationServices,
+    security: RuntimeSecurityContext,
+    settings: RuntimeLogicSettings,
+}
+
 impl RuntimeLogicTopology {
-    fn build(
-        system: &KompactSystem,
-        group_memberships: SharedGroupMemberships,
-        local_member: MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-        security: DeliverySecurity,
-        host_config: DeliveryRuntimeHostConfig,
-    ) -> Self {
+    fn build(system: &KompactSystem, input: RuntimeLogicTopologyInput) -> Self {
         let catch_up_manager = CatchUpManagerComponent::new(
-            local_member.clone(),
-            group_memberships.clone(),
-            store.clone(),
+            input.identity.local_member.clone(),
+            input.identity.group_memberships.clone(),
+            input.services.store.clone(),
         );
         let catch_up_manager = system.create(move || catch_up_manager);
         let catch_up_manager_ref = catch_up_manager
@@ -996,9 +1007,9 @@ impl RuntimeLogicTopology {
             .hold()
             .expect("catch-up manager must expose a strong actor ref");
         let summary_request_manager = SummaryRequestManagerComponent::new(
-            local_member.clone(),
-            group_memberships.clone(),
-            host_config.summary_request_timeout,
+            input.identity.local_member.clone(),
+            input.identity.group_memberships.clone(),
+            input.settings.summary_request_timeout,
         );
         let summary_request_manager = system.create(move || summary_request_manager);
         let summary_request_manager_ref = summary_request_manager
@@ -1006,13 +1017,13 @@ impl RuntimeLogicTopology {
             .hold()
             .expect("summary request manager must expose a strong actor ref");
         let runtime_component = ReplicationRuntimeComponent::new(
-            local_member,
-            store,
-            listener,
-            security,
-            group_memberships,
-            summary_request_manager_ref,
-            catch_up_manager_ref,
+            input.identity,
+            input.services,
+            input.security,
+            RuntimeComponentActors {
+                summary_request_manager: summary_request_manager_ref,
+                catch_up_manager: catch_up_manager_ref,
+            },
         );
         let runtime_component = system.create(move || runtime_component);
         Self {
@@ -1082,6 +1093,7 @@ struct RuntimeTopologyBuildInput {
     local_member: MemberIdentity,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
     security: DeliverySecurity,
     host_config: DeliveryRuntimeHostConfig,
     static_route_hints: PreconfiguredPeerRoutesConfig,
@@ -1098,6 +1110,18 @@ impl RuntimeTopology {
         let discovery_transport_handles = DiscoveryTransportHandles {
             route_transport: manager_ref.clone(),
             egress_pool,
+        };
+        let identity = RuntimeIdentityContext {
+            local_member: input.local_member.clone(),
+            group_memberships: input.group_memberships.clone(),
+        };
+        let services = RuntimeApplicationServices {
+            store: input.store,
+            listener: input.listener,
+            config: input.config,
+        };
+        let security = RuntimeSecurityContext {
+            security: input.security.clone(),
         };
         let delivery = DeliveryTopology::build(
             system,
@@ -1117,12 +1141,14 @@ impl RuntimeTopology {
         );
         let runtime = RuntimeLogicTopology::build(
             system,
-            input.group_memberships,
-            input.local_member,
-            input.store,
-            input.listener,
-            input.security,
-            input.host_config,
+            RuntimeLogicTopologyInput {
+                identity,
+                services,
+                security,
+                settings: RuntimeLogicSettings {
+                    summary_request_timeout: input.host_config.summary_request_timeout,
+                },
+            },
         );
 
         Self {
@@ -1227,6 +1253,7 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        config: ReplicationConfig,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
     ) -> Result<Self, RuntimeHostError> {
@@ -1234,6 +1261,7 @@ impl DeliveryRuntimeHost {
             local_member,
             store,
             listener,
+            config,
             security,
             runtime_config_toml,
             #[cfg(test)]
@@ -1246,6 +1274,7 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        config: ReplicationConfig,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
         #[cfg(test)] route_publish_mode: PreconfiguredPeerRoutesPublishMode,
@@ -1262,6 +1291,7 @@ impl DeliveryRuntimeHost {
                 local_member: local_member.clone(),
                 store,
                 listener,
+                config,
                 security,
                 host_config,
                 static_route_hints: routes_config,
@@ -1314,6 +1344,7 @@ impl DeliveryRuntimeHost {
         local_member: &MemberIdentity,
         store: Arc<dyn ReplicationStore>,
         listener: Arc<dyn ReplicationEventListener>,
+        config: ReplicationConfig,
         security: DeliverySecurity,
         runtime_config_toml: Option<&str>,
         route_publish_mode: PreconfiguredPeerRoutesPublishMode,
@@ -1322,6 +1353,7 @@ impl DeliveryRuntimeHost {
             local_member,
             store,
             listener,
+            config,
             security,
             runtime_config_toml,
             route_publish_mode,

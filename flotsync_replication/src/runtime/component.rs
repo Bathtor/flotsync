@@ -8,17 +8,19 @@ use super::{
     },
     config_keys,
     errors::{
+        ChangeGroupMembershipError,
         ConflictingExistingGroupSnafu,
         CreateGroupError,
         CreatorNotInMembersSnafu,
         DuplicateGroupSnafu,
+        GroupActivationError,
         GroupInstallError,
         InboundDeliveryError,
         InboundFailureAction,
         InvalidGroupSnafu,
         InvalidMembersSnafu,
         LocalMemberMissingSnafu,
-        PendingGroupActivationResumeUnsupportedSnafu,
+        PendingGroupActivationResumeSnafu,
         PublishChangesError,
         ReplayPendingDecisionSnafu,
         RuntimeStartupError,
@@ -27,6 +29,8 @@ use super::{
         StoreGroupSnafu,
         StoreStartupSnafu,
         SummaryError,
+        activation,
+        change_membership,
         inbound,
         publish,
         snapshot,
@@ -43,6 +47,7 @@ use super::{
         validate_inbound_update_read_versions,
         validate_update_mapping,
     },
+    pending_group,
     replay,
     summary_request_manager::SummaryRequestManagerMessage,
 };
@@ -65,19 +70,28 @@ use crate::{
         DatasetRowStateWrite,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupInvitation,
         GroupInvitationResponder,
         GroupMemberKeys,
         GroupSchema,
+        InitialSnapshot,
+        ListenerError,
         MigrationId,
+        MigrationProposal,
         MigrationProposalResponder,
+        PendingGroupActivationRecord,
+        PendingGroupDecisionRecord,
         PendingGroupWorkKey,
+        PolicyDecision,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
         ReadToken,
         RejectionReason,
+        ReplicationConfig,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationStore,
         ReplicationStoreReadTransaction,
@@ -104,9 +118,11 @@ use crate::{
         },
     },
     codecs::messages::{
-        BootstrapGroupKey,
-        BootstrapGroupMessage,
         BootstrapMemberKeyMessage,
+        GroupInvitationMessage,
+        GroupSetupKey,
+        GroupSetupMessage,
+        MigrationProposalMessage,
         RuntimeMessage,
         SummaryMessage,
         SummaryRequestMessage,
@@ -156,6 +172,8 @@ use flotsync_utils::{
 use futures_util::FutureExt;
 use itertools::Itertools;
 use kompact::prelude::*;
+use roaring::RoaringBitmap;
+use smallvec::{SmallVec, smallvec};
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -164,19 +182,22 @@ use std::{
 };
 use uuid::Uuid;
 
-/// Security records and plaintext bootstrap message prepared for group creation.
-pub(super) struct PreparedGroupBootstrap {
+/// Security records and private wire setup prepared for one new group.
+pub(super) struct PreparedGroupSetup {
     security_material: EncryptedGroupSecurityMaterial,
-    bootstrap_message: Arc<BootstrapGroupMessage>,
+    group_setup: Arc<GroupSetupMessage>,
 }
 
-impl PreparedGroupBootstrap {
-    /// Return the plaintext bootstrap message prepared for group creation.
+impl PreparedGroupSetup {
+    /// Return the plaintext group setup prepared for group creation.
     #[cfg(test)]
-    pub(super) fn bootstrap_message(&self) -> &BootstrapGroupMessage {
-        self.bootstrap_message.as_ref()
+    pub(super) fn group_setup(&self) -> &GroupSetupMessage {
+        self.group_setup.as_ref()
     }
 }
+
+/// Listener notification batches with inline storage for the common single batch.
+type ListenerDataChangeBatches = SmallVec<[ListenerDataChanges; 1]>;
 
 /// One local publish batch after local apply, encoding, and delivery-envelope preparation.
 struct PreparedLocalPublish {
@@ -198,7 +219,7 @@ enum InboundUpdateOrigin {
 /// Result of processing one inbound update.
 struct InboundUpdateOutcome {
     /// Listener batches produced by updates that became newly applicable.
-    event_batches: Vec<ListenerDataChanges>,
+    event_batches: ListenerDataChangeBatches,
     /// Producer-version ranges still needed before blocked updates can apply.
     needed_ranges: Vec<UpdateRangeMessage>,
     /// Producer versions now known to be present in the local update log.
@@ -219,6 +240,46 @@ struct SummaryCatchUpObservation {
 struct ListenerDataChanges {
     read_token: ReadToken,
     row_changes: Vec<RowChange>,
+}
+
+/// Locally prepared membership migration before outbound reliable messages are sent.
+struct PreparedMembershipMigration {
+    migration_id: MigrationId,
+    final_versions: VersionVector,
+    group_schema: GroupSchema,
+    initial_snapshot: InitialSnapshot,
+    prepared_setup: PreparedGroupSetup,
+    /// Sparse proposed-member indices for newly added recipients.
+    added_member_indices: RoaringBitmap,
+    group_name: Option<String>,
+    message: Option<String>,
+}
+
+/// Proposed member set plus recipient classifications for a membership change.
+struct ProposedMembershipChange {
+    proposed_members: GroupMembers,
+    added_member_indices: RoaringBitmap,
+}
+
+/// Encoded migration payloads and sparse recipient classes ready for fan-out.
+struct PreparedMembershipDispatch {
+    migration_id: MigrationId,
+    group_setup: Arc<GroupSetupMessage>,
+    migration_payload: bytes::Bytes,
+    invitation_payload: bytes::Bytes,
+    added_member_indices: RoaringBitmap,
+}
+
+/// Result of activating accepted group work into externally readable row state.
+struct PendingGroupActivationOutcome {
+    read_token: ReadToken,
+    row_changes: Vec<RowChange>,
+}
+
+/// Verified target-group material together with its current activation state.
+struct ValidatedInboundGroupSetup {
+    material: ReplicationGroupMaterialRecord,
+    already_active: bool,
 }
 
 enum DatasetSchemaLoadError {
@@ -579,6 +640,7 @@ pub struct ReplicationRuntimeComponent {
     local_member: MemberIdentity,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
+    config: ReplicationConfig,
     security: DeliverySecurity,
     group_memberships: SharedGroupMemberships,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
@@ -587,11 +649,38 @@ pub struct ReplicationRuntimeComponent {
     max_inline_bootstrap_public_key_bundles: usize,
 }
 
+/// Identity and membership views shared by runtime logic components.
+#[derive(Clone)]
+pub(super) struct RuntimeIdentityContext {
+    pub(super) local_member: MemberIdentity,
+    pub(super) group_memberships: SharedGroupMemberships,
+}
+
+/// Application-facing services consumed by the replication runtime component.
+#[derive(Clone)]
+pub(super) struct RuntimeApplicationServices {
+    pub(super) store: Arc<dyn ReplicationStore>,
+    pub(super) listener: Arc<dyn ReplicationEventListener>,
+    pub(super) config: ReplicationConfig,
+}
+
+/// Security services used for delivery and bootstrap material handling.
+#[derive(Clone)]
+pub(super) struct RuntimeSecurityContext {
+    pub(super) security: DeliverySecurity,
+}
+
+/// Actor dependencies created by the runtime logic topology.
+pub(super) struct RuntimeComponentActors {
+    pub(super) summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
+    pub(super) catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
+}
+
 struct ComponentBackedPendingGroupResponder {
     /// Runtime component mailbox used to apply listener decisions on the component thread.
     runtime_ref: ActorRefStrong<ReplicationRuntimeMessage>,
-    /// Stable store key for the decision event that produced this responder.
-    decision_key: PendingGroupWorkKey,
+    /// Stable store key for the pending work that produced this responder.
+    work_key: PendingGroupWorkKey,
 }
 
 impl ComponentBackedPendingGroupResponder {
@@ -602,10 +691,10 @@ impl ComponentBackedPendingGroupResponder {
     ) -> BoxFuture<'static, Result<(), ApiError>> {
         let Self {
             runtime_ref,
-            decision_key,
+            work_key,
         } = self;
         let request = PendingGroupDecisionResponse {
-            key: decision_key,
+            key: work_key,
             response,
         };
         let future = runtime_ref.ask_with(move |promise| {
@@ -650,25 +739,23 @@ impl MigrationProposalResponder for ComponentBackedPendingGroupResponder {
 impl ReplicationRuntimeComponent {
     /// Construct one replication runtime component for one local member.
     pub(super) fn new(
-        local_member: MemberIdentity,
-        store: Arc<dyn ReplicationStore>,
-        listener: Arc<dyn ReplicationEventListener>,
-        security: DeliverySecurity,
-        group_memberships: SharedGroupMemberships,
-        summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
-        catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
+        identity: RuntimeIdentityContext,
+        services: RuntimeApplicationServices,
+        security: RuntimeSecurityContext,
+        actors: RuntimeComponentActors,
     ) -> Self {
         Self {
             ctx: ComponentContext::uninitialised(),
             group_broadcast: RequiredPort::uninitialised(),
             reliable_delivery: RequiredPort::uninitialised(),
-            local_member,
-            store,
-            listener,
-            security,
-            group_memberships,
-            summary_request_manager,
-            catch_up_manager,
+            local_member: identity.local_member,
+            store: services.store,
+            listener: services.listener,
+            config: services.config,
+            security: security.security,
+            group_memberships: identity.group_memberships,
+            summary_request_manager: actors.summary_request_manager,
+            catch_up_manager: actors.catch_up_manager,
             max_inline_bootstrap_public_key_bundles:
                 DEFAULT_MAX_INLINE_BOOTSTRAP_PUBLIC_KEY_BUNDLES,
         }
@@ -730,6 +817,37 @@ impl ReplicationRuntimeComponent {
             loaded_schemas.insert(dataset_id, schema);
         }
         Ok(loaded_schemas)
+    }
+
+    /// Validate stored material against the members and schema from accepted work.
+    fn validate_activation_group_material(
+        &self,
+        group_id: GroupId,
+        proposed_members: Vec<MemberIdentity>,
+        group_schema: &GroupSchema,
+        material: &ReplicationGroupMaterialRecord,
+    ) -> Result<ReplicationGroupRecord, GroupActivationError> {
+        let expected_members = GroupMembers::from_ordered_members(proposed_members)
+            .context(activation::InvalidMembersSnafu)?;
+        ensure!(
+            expected_members.contains(&self.local_member),
+            activation::LocalMemberMissingSnafu {
+                local_member: self.local_member.clone(),
+            }
+        );
+        let initial_versions = VersionVector::initial(material.member_count());
+        let group_record = material.clone().activate(initial_versions);
+        let local_group = LoadedGroupMeta::from_replication_group_record(
+            &self.local_member,
+            group_record.clone(),
+        )
+        .context(activation::InvalidPersistedGroupSnafu { group_id })?;
+        ensure!(
+            local_group.members.ordered_members() == expected_members.ordered_members()
+                && group_record.group_schema == *group_schema,
+            activation::ConflictingGroupMaterialSnafu { group_id }
+        );
+        Ok(group_record)
     }
 
     async fn snapshot_rows_from_store(
@@ -817,17 +935,34 @@ impl ReplicationRuntimeComponent {
         group_schema: GroupSchema,
         security_material: crate::api::EncryptedGroupSecurityMaterial,
     ) -> ReplicationGroupRecord {
-        let member_count = NonZeroUsize::new(member_keys.len())
+        let material = self.build_replication_group_material_record(
+            group_id,
+            member_keys,
+            group_schema,
+            security_material,
+        );
+        let version_vector = VersionVector::initial(material.member_count());
+        material.activate(version_vector)
+    }
+
+    /// Build stored group material without making the group active.
+    fn build_replication_group_material_record(
+        &self,
+        group_id: GroupId,
+        member_keys: GroupMemberKeys,
+        group_schema: GroupSchema,
+        security_material: crate::api::EncryptedGroupSecurityMaterial,
+    ) -> ReplicationGroupMaterialRecord {
+        NonZeroUsize::new(member_keys.len())
             .expect("group installation must keep members non-empty");
         let local_member_index = member_keys
             .member_index(&self.local_member)
             .expect("group installation validates the local member before persistence");
-        ReplicationGroupRecord {
+        ReplicationGroupMaterialRecord {
             group_id,
             member_keys,
             local_member_index,
             group_schema,
-            version_vector: VersionVector::initial(member_count),
             security_material,
         }
     }
@@ -926,33 +1061,152 @@ impl ReplicationRuntimeComponent {
         }
     }
 
-    /// Validate that a bootstrap message authorises both the sender and local member.
-    fn validate_bootstrap_membership(
+    /// Validate that group setup authorises both its sender and the local member.
+    fn validate_group_setup_membership(
         group_id: GroupId,
         members: &GroupMembers,
         local_member: &MemberIdentity,
         sender: &MemberIdentity,
     ) -> Result<(), InboundDeliveryError> {
         let Some(sender_index) = members.member_index(sender) else {
-            return Err(InboundDeliveryError::BootstrapSenderNotInGroup {
+            return Err(InboundDeliveryError::GroupSetupSenderNotInGroup {
                 group_id,
                 sender: sender.clone(),
             });
         };
         if sender_index != MemberIndex::new(0) {
-            return Err(InboundDeliveryError::BootstrapSenderNotFirstMember {
+            return Err(InboundDeliveryError::GroupSetupSenderNotFirstMember {
                 group_id,
                 sender: sender.clone(),
                 sender_index: Some(sender_index),
             });
         }
         if !members.contains(local_member) {
-            return Err(InboundDeliveryError::BootstrapMissingLocalMember {
+            return Err(InboundDeliveryError::GroupSetupMissingLocalMember {
                 group_id,
                 local_member: local_member.clone(),
             });
         }
         Ok(())
+    }
+
+    /// Validate that pending work names a coherent member set including this runtime.
+    fn validate_pending_group_members(
+        &self,
+        group_id: GroupId,
+        proposed_members: &[MemberIdentity],
+    ) -> Result<GroupMembers, InboundDeliveryError> {
+        let members = GroupMembers::from_ordered_members(proposed_members.iter().cloned())
+            .context(inbound::InvalidPendingGroupMembersSnafu)?;
+        ensure!(
+            members.contains(&self.local_member),
+            inbound::PendingGroupMissingLocalMemberSnafu {
+                group_id,
+                local_member: self.local_member.clone(),
+            }
+        );
+        Ok(members)
+    }
+
+    /// Resolve local policy for one validated group invitation.
+    fn invitation_policy_decision(
+        &self,
+        invitation: &GroupInvitation,
+    ) -> Result<PolicyDecision, InboundDeliveryError> {
+        self.validate_pending_group_members(invitation.group_id, &invitation.proposed_members)?;
+        Ok(match invitation.source {
+            crate::api::GroupInvitationSource::Creation => {
+                self.config.group_invitation_policy.creation
+            }
+            crate::api::GroupInvitationSource::Migration { .. } => {
+                self.config.group_invitation_policy.migration_added_member
+            }
+        })
+    }
+
+    /// Resolve local policy for one migration proposal by comparing old and proposed members.
+    async fn migration_policy_decision(
+        &mut self,
+        proposal: &MigrationProposal,
+    ) -> Result<PolicyDecision, InboundDeliveryError> {
+        let group_id = proposal.migration_id.new_group_id;
+        let proposed_members =
+            self.validate_pending_group_members(group_id, &proposal.proposed_members)?;
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let old_group_id = proposal.migration_id.old_group_id;
+        let persisted_group = transaction
+            .load_replication_group(&old_group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?
+            .context(inbound::UnknownHostedGroupSnafu {
+                group_id: old_group_id,
+            })?;
+        transaction
+            .release()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let local_group =
+            LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
+                .context(inbound::InvalidPersistedGroupSnafu {
+                    group_id: old_group_id,
+                })?;
+        let policy = &self.config.group_migration_policy;
+        let mut decision = policy.epoch_change;
+
+        for old_member in local_group.members.iter() {
+            if !proposed_members.contains(&old_member) {
+                decision = decision.most_restrictive(policy.member_removed);
+            }
+        }
+        for proposed_member in proposed_members.iter() {
+            if !local_group.members.contains(&proposed_member) {
+                decision = decision.most_restrictive(policy.member_added);
+            }
+        }
+        Ok(decision)
+    }
+
+    /// Resolve local policy for pending group work before accepting activation.
+    async fn pending_group_policy_decision(
+        &mut self,
+        record: &PendingGroupDecisionRecord,
+    ) -> Result<PolicyDecision, InboundDeliveryError> {
+        if record.requires_snapshot_fetch() {
+            return Ok(PolicyDecision::AutoReject);
+        }
+        match record {
+            PendingGroupDecisionRecord::GroupInvitation(invitation) => {
+                self.invitation_policy_decision(invitation)
+            }
+            PendingGroupDecisionRecord::MigrationProposal(proposal) => {
+                self.migration_policy_decision(proposal).await
+            }
+        }
+    }
+
+    /// Notify the listener about already stored pending work.
+    async fn notify_pending_group_decision_listener(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+    ) -> Result<(), InboundDeliveryError> {
+        let key = record.key();
+        let runtime_ref = self
+            .ctx
+            .actor_ref()
+            .hold()
+            .expect("replication runtime actor ref must be available while running");
+        let responder = ComponentBackedPendingGroupResponder {
+            runtime_ref,
+            work_key: key,
+        };
+        self.listener
+            .on_event(record.to_event(responder))
+            .await
+            .context(inbound::NotifyPendingGroupDecisionSnafu)
     }
 
     fn notify_catch_up_needed(&self, group_id: GroupId, ranges: Vec<UpdateRangeMessage>) {
@@ -1063,9 +1317,7 @@ impl ReplicationRuntimeComponent {
                 .await
                 .context(StoreGroupSnafu { group_id })?;
             ensure!(
-                existing.member_keys == record.member_keys
-                    && existing.local_member_index == record.local_member_index
-                    && existing.group_schema == record.group_schema,
+                existing.matches_definition(&record),
                 ConflictingExistingGroupSnafu { group_id }
             );
             return Ok(existing);
@@ -1146,18 +1398,18 @@ impl ReplicationRuntimeComponent {
             .begin_read_transaction()
             .await
             .context(StoreStartupSnafu)?;
-        let pending_decisions = transaction
+        let pending_work_items = transaction
             .load_pending_group_decisions()
             .await
             .context(StoreStartupSnafu)?;
         transaction.release().await.context(StoreStartupSnafu)?;
 
-        for decision in pending_decisions {
+        for work in pending_work_items {
             let responder = ComponentBackedPendingGroupResponder {
                 runtime_ref: runtime_ref.clone(),
-                decision_key: decision.key(),
+                work_key: work.key(),
             };
-            let event = decision.to_event(responder);
+            let event = work.to_event(responder);
             self.listener
                 .on_event(event)
                 .await
@@ -1179,12 +1431,16 @@ impl ReplicationRuntimeComponent {
             .context(StoreStartupSnafu)?;
         transaction.release().await.context(StoreStartupSnafu)?;
 
-        ensure!(
-            pending_activations.is_empty(),
-            PendingGroupActivationResumeUnsupportedSnafu {
-                activation_count: pending_activations.len(),
-            }
-        );
+        for activation in pending_activations {
+            let outcome = self
+                .activate_pending_group_record(activation)
+                .await
+                .context(PendingGroupActivationResumeSnafu)?;
+            notify_pending_activation_data_changes(self.listener.clone(), outcome)
+                .await
+                .context(activation::NotifyListenerSnafu)
+                .context(PendingGroupActivationResumeSnafu)?;
+        }
         Ok(())
     }
 
@@ -1193,6 +1449,8 @@ impl ReplicationRuntimeComponent {
         &mut self,
         response: PendingGroupDecisionResponse,
     ) -> Result<(), ApiError> {
+        let mut accepted_activation = None;
+        let mut unsupported_activation = None;
         let mut transaction = self
             .store
             .begin_transaction()
@@ -1201,31 +1459,50 @@ impl ReplicationRuntimeComponent {
             .context(ApiExternalSnafu)?;
         match response.response {
             PendingGroupDecisionResponseKind::Accept => {
-                let pending_decision = transaction
-                    .load_pending_group_decisions()
+                let group_id = response.key.group_id();
+                let pending_work = transaction
+                    .load_pending_group_decision(&group_id)
                     .await
                     .boxed()
-                    .context(ApiExternalSnafu)?
-                    .into_iter()
-                    .find(|decision| decision.key() == response.key);
-                if let Some(decision) = pending_decision {
-                    let removed = transaction
-                        .remove_pending_group_decision(response.key)
-                        .await
-                        .boxed()
-                        .context(ApiExternalSnafu)?;
-                    if removed {
+                    .context(ApiExternalSnafu)?;
+                if let Some(work) = pending_work.filter(|value| value.key() == response.key) {
+                    if work.requires_snapshot_fetch() {
                         transaction
-                            .upsert_pending_group_activation(decision.into_activation())
+                            .remove_pending_group_decision(response.key)
                             .await
                             .boxed()
                             .context(ApiExternalSnafu)?;
+                        transaction
+                            .remove_inactive_replication_group_material(group_id)
+                            .await
+                            .boxed()
+                            .context(ApiExternalSnafu)?;
+                        unsupported_activation = Some(group_id);
+                    } else {
+                        let activation = work.into_activation();
+                        transaction
+                            .upsert_pending_group_activation(activation.clone())
+                            .await
+                            .boxed()
+                            .context(ApiExternalSnafu)?;
+                        accepted_activation = Some(activation);
                     }
                 }
             }
             PendingGroupDecisionResponseKind::Reject { .. } => {
+                let rejected_group_id = match response.key {
+                    PendingGroupWorkKey::GroupInvitation { group_id, .. } => group_id,
+                    PendingGroupWorkKey::MigrationProposal { migration_id } => {
+                        migration_id.new_group_id
+                    }
+                };
                 transaction
                     .remove_pending_group_decision(response.key)
+                    .await
+                    .boxed()
+                    .context(ApiExternalSnafu)?;
+                transaction
+                    .remove_inactive_replication_group_material(rejected_group_id)
                     .await
                     .boxed()
                     .context(ApiExternalSnafu)?;
@@ -1236,6 +1513,23 @@ impl ReplicationRuntimeComponent {
             .await
             .boxed()
             .context(ApiExternalSnafu)?;
+        if let Some(group_id) = unsupported_activation {
+            return activation::UnsupportedInitialSnapshotSnafu { group_id }
+                .fail::<()>()
+                .boxed()
+                .context(ApiExternalSnafu);
+        }
+        if let Some(activation) = accepted_activation {
+            let outcome = self
+                .activate_pending_group_record(activation)
+                .await
+                .boxed()
+                .context(ApiExternalSnafu)?;
+            notify_pending_activation_data_changes(self.listener.clone(), outcome)
+                .await
+                .boxed()
+                .context(ApiExternalSnafu)?;
+        }
         Ok(())
     }
 
@@ -1248,12 +1542,23 @@ impl ReplicationRuntimeComponent {
         );
     }
 
+    /// Submit one runtime envelope through reliable delivery using its authority scope.
     fn submit_reliable_runtime_message(
         &mut self,
         recipient: MemberIdentity,
         message: &RuntimeMessage,
     ) {
         let payload = message.encode_proto_to_bytes();
+        self.submit_reliable_runtime_payload(recipient, message.group_id(), payload);
+    }
+
+    /// Submit one already encoded runtime payload through reliable delivery.
+    fn submit_reliable_runtime_payload(
+        &mut self,
+        recipient: MemberIdentity,
+        scope_group_id: GroupId,
+        payload: bytes::Bytes,
+    ) {
         self.reliable_delivery
             .trigger(ReliableDeliveryPortRequest::Submit(
                 ReliableDeliverySubmit {
@@ -1263,7 +1568,7 @@ impl ReplicationRuntimeComponent {
                             recipient,
                             message_id: MessageId(Uuid::new_v4()),
                             scope: ReliableMessageScope::Group {
-                                group_id: message.group_id(),
+                                group_id: scope_group_id,
                             },
                         },
                         payload: PlaintextPayload { bytes: payload },
@@ -1272,17 +1577,92 @@ impl ReplicationRuntimeComponent {
             ));
     }
 
-    /// Submit reliable bootstrap messages after the group is locally installed.
-    fn submit_group_bootstrap_messages(&mut self, bootstrap_message: &Arc<BootstrapGroupMessage>) {
+    /// Fan one encoded creation invitation out to every remote target-group member.
+    fn submit_group_creation_invitation_messages(
+        &mut self,
+        group_id: GroupId,
+        group_setup: &GroupSetupMessage,
+        payload: &bytes::Bytes,
+    ) {
         let local_member = self.local_member.clone();
-        for recipient in bootstrap_message
+        for recipient in group_setup
             .members()
             .iter()
             .filter(|member| *member != &local_member)
             .cloned()
         {
-            let message = RuntimeMessage::BootstrapGroup(Arc::clone(bootstrap_message));
-            self.submit_reliable_runtime_message(recipient, &message);
+            self.submit_reliable_runtime_payload(recipient, group_id, payload.clone());
+        }
+    }
+
+    /// Send old-group migration proposals and new-group invitations for one change.
+    fn submit_membership_migration_messages(&mut self, dispatch: &PreparedMembershipDispatch) {
+        let proposed_members = dispatch.group_setup.members();
+        // Index zero is the local member. Dispatch classifies only remote
+        // recipients; every remote index absent from `added_member_indices`
+        // necessarily names a continuing old-group member.
+        for (member_index, recipient) in proposed_members.iter().enumerate().skip(1) {
+            let member_index = u32::try_from(member_index).expect("group member indices fit u32");
+            if dispatch.added_member_indices.contains(member_index) {
+                self.submit_reliable_runtime_payload(
+                    recipient.clone(),
+                    dispatch.migration_id.new_group_id,
+                    dispatch.invitation_payload.clone(),
+                );
+            } else {
+                self.submit_reliable_runtime_payload(
+                    recipient.clone(),
+                    dispatch.migration_id.old_group_id,
+                    dispatch.migration_payload.clone(),
+                );
+            }
+        }
+    }
+
+    /// Encode one proposal and one invitation before local activation consumes the snapshot.
+    fn prepare_membership_dispatch(
+        prepared: &PreparedMembershipMigration,
+    ) -> PreparedMembershipDispatch {
+        let proposed_members = prepared.prepared_setup.group_setup.members().to_vec();
+        let proposal = MigrationProposal {
+            migration_id: prepared.migration_id,
+            final_versions: prepared.final_versions.clone(),
+            proposed_members: proposed_members.clone(),
+            group_schema: prepared.group_schema.clone(),
+            initial_snapshot: prepared.initial_snapshot.clone(),
+            group_name: prepared.group_name.clone(),
+            message: prepared.message.clone(),
+        };
+        let proposal_message = MigrationProposalMessage::try_new(
+            proposal,
+            Arc::clone(&prepared.prepared_setup.group_setup),
+        )
+        .expect("prepared proposal members match prepared group setup");
+        let migration_payload =
+            RuntimeMessage::MigrationProposal(proposal_message).encode_proto_to_bytes();
+
+        let invitation = GroupInvitation::new_migration(
+            prepared.migration_id,
+            proposed_members,
+            prepared.group_schema.clone(),
+            prepared.initial_snapshot.clone(),
+            prepared.group_name.clone(),
+            prepared.message.clone(),
+        );
+        let invitation_message = GroupInvitationMessage::try_new(
+            invitation,
+            Arc::clone(&prepared.prepared_setup.group_setup),
+        )
+        .expect("prepared invitation members match prepared group setup");
+        let invitation_payload =
+            RuntimeMessage::GroupInvitation(invitation_message).encode_proto_to_bytes();
+
+        PreparedMembershipDispatch {
+            migration_id: prepared.migration_id,
+            group_setup: Arc::clone(&prepared.prepared_setup.group_setup),
+            migration_payload,
+            invitation_payload,
+            added_member_indices: prepared.added_member_indices.clone(),
         }
     }
 
@@ -1314,13 +1694,12 @@ impl ReplicationRuntimeComponent {
         )
     }
 
-    pub(super) async fn prepare_group_bootstrap(
+    pub(super) async fn prepare_group_setup(
         security: &DeliverySecurity,
         max_inline_public_key_bundles: usize,
         group_id: GroupId,
         members: &GroupMembers,
-        group_schema: GroupSchema,
-    ) -> Result<PreparedGroupBootstrap, CreateGroupError> {
+    ) -> Result<PreparedGroupSetup, CreateGroupError> {
         let group_key = DeliverySecurity::generate_group_key()
             .boxed()
             .context(SecuritySnafu)?;
@@ -1330,7 +1709,7 @@ impl ReplicationRuntimeComponent {
             .boxed()
             .context(SecuritySnafu)?;
         let inline_public_bundles = members.len() <= max_inline_public_key_bundles;
-        let bootstrap_member_keys = public_keys.map_values(|public_keys| {
+        let setup_member_keys = public_keys.map_values(|public_keys| {
             if inline_public_bundles {
                 BootstrapMemberKeyMessage::from_public_keys(public_keys)
             } else {
@@ -1341,19 +1720,284 @@ impl ReplicationRuntimeComponent {
             .seal_group_secret(group_id.0, &group_key)
             .boxed()
             .context(SecuritySnafu)?;
-        let bootstrap_message = BootstrapGroupMessage::new(
-            group_id,
+        let group_setup = GroupSetupMessage::new(
             members.ordered_members(),
-            bootstrap_member_keys,
-            group_schema,
+            setup_member_keys,
             GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-            BootstrapGroupKey::from_group_key(group_key),
+            GroupSetupKey::from_group_key(group_key),
         )
         .boxed()
         .context(SecuritySnafu)?;
-        Ok(PreparedGroupBootstrap {
+        Ok(PreparedGroupSetup {
             security_material,
-            bootstrap_message: Arc::new(bootstrap_message),
+            group_setup: Arc::new(group_setup),
+        })
+    }
+
+    /// Translate group-bootstrap preparation errors into membership-change failures.
+    fn map_create_group_error(error: CreateGroupError) -> ChangeGroupMembershipError {
+        match error {
+            CreateGroupError::LocalMemberMissing { local_member } => {
+                ChangeGroupMembershipError::LocalMemberMissing { local_member }
+            }
+            CreateGroupError::CreatorNotInMembers { creator } => {
+                ChangeGroupMembershipError::LocalMemberMissing {
+                    local_member: creator,
+                }
+            }
+            CreateGroupError::InvalidMembers { source } => {
+                ChangeGroupMembershipError::InvalidMembers { source }
+            }
+            CreateGroupError::Security { source } => {
+                ChangeGroupMembershipError::Security { source }
+            }
+        }
+    }
+
+    /// Compute canonical proposed membership and outbound recipient classifications.
+    fn proposed_members_for_change(
+        &self,
+        current_members: &GroupMembers,
+        req: &ChangeGroupMembershipRequest,
+    ) -> Result<ProposedMembershipChange, ChangeGroupMembershipError> {
+        let current_member_set = current_members.iter().collect::<HashSet<_>>();
+        ensure!(
+            current_member_set.contains(&self.local_member),
+            change_membership::LocalMemberMissingSnafu {
+                local_member: self.local_member.clone(),
+            }
+        );
+        let mut final_members = current_member_set.clone();
+        for member in &req.remove_members {
+            final_members.remove(member);
+        }
+        final_members.extend(req.add_members.iter().cloned());
+        ensure!(
+            final_members.remove(&self.local_member),
+            change_membership::LocalMemberMissingSnafu {
+                local_member: self.local_member.clone(),
+            }
+        );
+
+        let mut proposed_member_list = Vec::with_capacity(final_members.len() + 1);
+        proposed_member_list.push(self.local_member.clone());
+        let mut added_member_indices = RoaringBitmap::new();
+        for member in final_members {
+            let member_index = u32::try_from(proposed_member_list.len())
+                .expect("group member indices fit into u32");
+            if !current_member_set.contains(&member) {
+                added_member_indices.insert(member_index);
+            }
+            proposed_member_list.push(member);
+        }
+        let proposed_members = GroupMembers::from_ordered_members(proposed_member_list)
+            .context(change_membership::InvalidMembersSnafu)?;
+        Ok(ProposedMembershipChange {
+            proposed_members,
+            added_member_indices,
+        })
+    }
+
+    /// Prepare local state and outbound payloads for a membership change request.
+    async fn prepare_membership_migration(
+        &mut self,
+        req: ChangeGroupMembershipRequest,
+    ) -> Result<PreparedMembershipMigration, ChangeGroupMembershipError> {
+        let old_group_id = req.group_id;
+        let mut transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(change_membership::StoreAccessSnafu)?;
+        let persisted_group = transaction
+            .load_replication_group(&old_group_id)
+            .await
+            .context(change_membership::StoreAccessSnafu)?
+            .context(change_membership::UnknownGroupSnafu {
+                group_id: old_group_id,
+            })?;
+        let group_schema = persisted_group.group_schema.clone();
+        let local_group =
+            LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
+                .context(change_membership::InvalidPersistedGroupSnafu {
+                    group_id: old_group_id,
+                })?;
+        let proposed_change = self.proposed_members_for_change(&local_group.members, &req)?;
+        let final_versions = local_group.version_vector.clone();
+        let initial_snapshot = pending_group::build_inline_initial_snapshot(
+            transaction.as_mut(),
+            old_group_id,
+            &group_schema,
+        )
+        .await?;
+        transaction
+            .release()
+            .await
+            .context(change_membership::StoreAccessSnafu)?;
+
+        let new_group_id = GroupId(Uuid::new_v4());
+        let prepared_setup = Self::prepare_group_setup(
+            &self.security,
+            self.max_inline_bootstrap_public_key_bundles,
+            new_group_id,
+            &proposed_change.proposed_members,
+        )
+        .await
+        .map_err(Self::map_create_group_error)?;
+        let migration_id = MigrationId {
+            old_group_id,
+            new_group_id,
+        };
+        Ok(PreparedMembershipMigration {
+            migration_id,
+            final_versions,
+            group_schema,
+            initial_snapshot,
+            prepared_setup,
+            added_member_indices: proposed_change.added_member_indices,
+            group_name: req.group_name,
+            message: req.message,
+        })
+    }
+
+    /// Build the stored group record represented by prepared bootstrap material.
+    fn prepared_migration_group_record(
+        &self,
+        prepared: &PreparedMembershipMigration,
+    ) -> Result<ReplicationGroupRecord, GroupActivationError> {
+        let member_keys = GroupMemberKeys::from_ordered_member_keys(
+            prepared.prepared_setup.group_setup.ordered_member_key_ids(),
+        )
+        .context(activation::InvalidMembersSnafu)?;
+        Ok(self.build_replication_group_record(
+            prepared.migration_id.new_group_id,
+            member_keys,
+            prepared.group_schema.clone(),
+            prepared.prepared_setup.security_material.clone(),
+        ))
+    }
+
+    /// Install locally prepared membership-change state before notifying remote members.
+    async fn activate_prepared_membership_migration(
+        &mut self,
+        prepared: PreparedMembershipMigration,
+    ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
+        let group_id = prepared.migration_id.new_group_id;
+        let record = self.prepared_migration_group_record(&prepared)?;
+        let member_count = record.member_keys.len();
+        let member_count =
+            NonZeroUsize::new(member_count).expect("prepared migration members are non-empty");
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let existing = transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        if existing.is_none() {
+            transaction
+                .insert_replication_group(record.clone())
+                .await
+                .context(activation::StoreAccessSnafu)?;
+        }
+        let row_changes = match prepared.initial_snapshot {
+            InitialSnapshot::Empty => Vec::new(),
+            InitialSnapshot::Inline(initial_state) => {
+                pending_group::embed_inline_initial_snapshot(
+                    transaction.as_mut(),
+                    group_id,
+                    member_count,
+                    &prepared.group_schema,
+                    initial_state,
+                )
+                .await?
+            }
+            InitialSnapshot::Metadata(_) => {
+                return activation::UnsupportedInitialSnapshotSnafu { group_id }.fail();
+            }
+        };
+        let active_groups = transaction
+            .load_replication_groups()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let read_token = Self::read_token_from_groups(active_groups);
+        transaction
+            .commit()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        self.install_group_membership_view(record)
+            .context(activation::InstallGroupSnafu { group_id })?;
+        Ok(PendingGroupActivationOutcome {
+            read_token,
+            row_changes,
+        })
+    }
+
+    /// Activate accepted pending work using its atomically stored group material.
+    async fn activate_pending_group_record(
+        &mut self,
+        record: PendingGroupActivationRecord,
+    ) -> Result<PendingGroupActivationOutcome, GroupActivationError> {
+        let activation_record = record.into_activation_record();
+        let key = activation_record.key;
+        let group_id = activation_record.group_id;
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let material = transaction
+            .load_replication_group_material(&group_id)
+            .await
+            .context(activation::StoreAccessSnafu)?
+            .context(activation::MissingGroupMaterialSnafu { group_id })?;
+        let group_record = self.validate_activation_group_material(
+            group_id,
+            activation_record.proposed_members,
+            &activation_record.group_schema,
+            &material,
+        )?;
+        let member_count = group_record.member_count();
+        transaction
+            .activate_replication_group(group_id, group_record.version_vector.clone())
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let row_changes = match activation_record.initial_snapshot {
+            InitialSnapshot::Empty => Vec::new(),
+            InitialSnapshot::Inline(initial_state) => {
+                pending_group::embed_inline_initial_snapshot(
+                    transaction.as_mut(),
+                    group_id,
+                    member_count,
+                    &activation_record.group_schema,
+                    initial_state,
+                )
+                .await?
+            }
+            InitialSnapshot::Metadata(_) => {
+                return activation::UnsupportedInitialSnapshotSnafu { group_id }.fail();
+            }
+        };
+        transaction
+            .remove_pending_group_activation(key)
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let active_groups = transaction
+            .load_replication_groups()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        let read_token = Self::read_token_from_groups(active_groups);
+        transaction
+            .commit()
+            .await
+            .context(activation::StoreAccessSnafu)?;
+        self.install_group_membership_view(group_record)
+            .context(activation::InstallGroupSnafu { group_id })?;
+        Ok(PendingGroupActivationOutcome {
+            read_token,
+            row_changes,
         })
     }
 
@@ -1645,18 +2289,26 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    /// Validate, persist, and install one reliable-delivery bootstrap message.
-    fn handle_bootstrap_group_delivery(
+    fn handle_inbound_pending_group_decision(
         &mut self,
         context: InboundDeliveryContext,
         deliver: ReliableDeliveryDeliver,
-        message: Arc<BootstrapGroupMessage>,
+        record: PendingGroupDecisionRecord,
+        group_setup: Arc<GroupSetupMessage>,
     ) -> HandlerResult {
+        let group_id = record.group_id();
         let sender = deliver.envelope.header.sender.clone();
+        let processed = deliver.processed;
         Handled::block_on(self, async move |mut async_self| {
-            let reply = async_self
-                .install_bootstrap_group_delivery(deliver, message, sender)
-                .await;
+            let reply = async {
+                async_self
+                    .install_pending_group_delivery(record, group_setup, sender)
+                    .await?;
+                processed
+                    .complete()
+                    .context(inbound::CompleteProcessedPromiseSnafu { group_id })
+            }
+            .await;
             if let Err(error) = reply {
                 let failure = InboundDeliveryFailure::new(context, error);
                 let action = async_self.record_inbound_failure(&failure);
@@ -1666,45 +2318,211 @@ impl ReplicationRuntimeComponent {
         })
     }
 
-    async fn install_bootstrap_group_delivery(
+    /// Validate inbound setup and reuse matching encrypted material on replay.
+    ///
+    /// Validation intentionally finishes its read transaction before security
+    /// checks because those checks may perform independent security-store
+    /// operations. Kompact serialises work through this component, so its group
+    /// state cannot change through the runtime between this phase and pending
+    /// persistence. The later write transaction remains authoritative: it
+    /// ensures exact group material and rejects conflicting target-keyed work.
+    async fn validate_inbound_group_setup(
         &mut self,
-        deliver: ReliableDeliveryDeliver,
-        message: Arc<BootstrapGroupMessage>,
+        record: &PendingGroupDecisionRecord,
+        group_setup: &GroupSetupMessage,
+        sender: &MemberIdentity,
+    ) -> Result<ValidatedInboundGroupSetup, InboundDeliveryError> {
+        let group_id = record.group_id();
+        let members = GroupMembers::from_ordered_members(group_setup.members().to_vec())
+            .context(inbound::InvalidGroupSetupMembersSnafu)?;
+        Self::validate_group_setup_membership(group_id, &members, &self.local_member, sender)?;
+        let member_keys =
+            GroupMemberKeys::from_ordered_member_keys(group_setup.ordered_member_key_ids())
+                .context(inbound::InvalidGroupSetupMembersSnafu)?;
+        let local_member_index = member_keys
+            .member_index(&self.local_member)
+            .expect("group setup membership validation requires the local member");
+        let group_schema = record.group_schema().clone();
+        let mut read_transaction = self
+            .store
+            .begin_read_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let existing_material = read_transaction
+            .load_replication_group_material(&group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        let already_active = read_transaction
+            .load_replication_group(&group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?
+            .is_some();
+        read_transaction
+            .release()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+
+        let material = if let Some(existing_material) = existing_material {
+            let definition_matches = existing_material.matches_definition(
+                group_id,
+                &member_keys,
+                local_member_index,
+                &group_schema,
+            );
+            if !definition_matches {
+                let result: Result<(), GroupInstallError> =
+                    ConflictingExistingGroupSnafu { group_id }.fail();
+                result.context(inbound::InstallGroupSetupSnafu { group_id })?;
+            }
+            self.security
+                .validate_existing_group_setup_security(
+                    group_id,
+                    group_setup,
+                    sender,
+                    &existing_material.security_material,
+                )
+                .await
+                .boxed()
+                .context(inbound::GroupSetupSecuritySnafu)?;
+            existing_material
+        } else {
+            let security_material = self
+                .security
+                .prepare_security_material_from_group_setup(group_id, group_setup, sender)
+                .await
+                .boxed()
+                .context(inbound::GroupSetupSecuritySnafu)?;
+            ReplicationGroupMaterialRecord {
+                group_id,
+                member_keys,
+                local_member_index,
+                group_schema,
+                security_material,
+            }
+        };
+        Ok(ValidatedInboundGroupSetup {
+            material,
+            already_active,
+        })
+    }
+
+    /// Remove any inactive state for work rejected by current policy.
+    async fn reject_pending_group_delivery(
+        &mut self,
+        key: PendingGroupWorkKey,
+        group_id: GroupId,
+    ) -> Result<(), InboundDeliveryError> {
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .remove_pending_group_decision(key)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .remove_pending_group_activation(key)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .remove_inactive_replication_group_material(group_id)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .commit()
+            .await
+            .context(inbound::StoreAccessSnafu)
+    }
+
+    /// Atomically persist verified material and unresolved listener work.
+    async fn persist_pending_group_listener_decision(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+        record: PendingGroupDecisionRecord,
+    ) -> Result<(), InboundDeliveryError> {
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .upsert_pending_group_decision(record)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .commit()
+            .await
+            .context(inbound::StoreAccessSnafu)
+    }
+
+    /// Atomically persist verified material and accepted activation work.
+    async fn persist_pending_group_auto_activation(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+        activation: PendingGroupActivationRecord,
+    ) -> Result<(), InboundDeliveryError> {
+        let mut transaction = self
+            .store
+            .begin_transaction()
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .upsert_pending_group_activation(activation)
+            .await
+            .context(inbound::StoreAccessSnafu)?;
+        transaction
+            .commit()
+            .await
+            .context(inbound::StoreAccessSnafu)
+    }
+
+    /// Verify group setup and atomically persist the policy-selected pending state.
+    async fn install_pending_group_delivery(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+        group_setup: Arc<GroupSetupMessage>,
         sender: MemberIdentity,
     ) -> Result<(), InboundDeliveryError> {
-        let group_id = message.group_id();
-        let members = GroupMembers::from_ordered_members(message.members().to_vec())
-            .context(inbound::InvalidBootstrapMembersSnafu)?;
-        Self::validate_bootstrap_membership(group_id, &members, &self.local_member, &sender)?;
-        let security_material = self
-            .security
-            .prepare_security_material_from_bootstrap_msg(message.as_ref(), &sender)
-            .await
-            .boxed()
-            .context(inbound::BootstrapSecuritySnafu)?;
-        let member_keys =
-            GroupMemberKeys::from_ordered_member_keys(message.ordered_member_key_ids())
-                .context(inbound::InvalidBootstrapMembersSnafu)?;
-        let record = self.build_replication_group_record(
-            group_id,
-            member_keys,
-            message.group_schema().clone(),
-            security_material,
-        );
-        let persisted_group = self
-            .store_new_replication_group(record)
-            .await
-            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-        self.install_group_membership_view(persisted_group)
-            .context(inbound::InstallBootstrapGroupSnafu { group_id })?;
-        // Complete `processed` only after the bootstrap group is stored and the
-        // local membership view is installed. Failure paths intentionally withhold
-        // this completion, so the sender-side recipient-ack timeout can redeliver
-        // the same reliable message later.
-        deliver
-            .processed
-            .complete()
-            .context(inbound::CompleteProcessedPromiseSnafu { group_id })
+        let group_id = record.group_id();
+        let validated = self
+            .validate_inbound_group_setup(&record, group_setup.as_ref(), &sender)
+            .await?;
+        if validated.already_active {
+            return Ok(());
+        }
+
+        match self.pending_group_policy_decision(&record).await? {
+            PolicyDecision::AutoReject => {
+                self.reject_pending_group_delivery(record.key(), group_id)
+                    .await
+            }
+            PolicyDecision::AskListener => {
+                self.persist_pending_group_listener_decision(validated.material, record.clone())
+                    .await?;
+                self.notify_pending_group_decision_listener(record).await
+            }
+            PolicyDecision::AutoAccept => {
+                let activation = record.into_activation();
+                self.persist_pending_group_auto_activation(validated.material, activation.clone())
+                    .await?;
+                let outcome = self
+                    .activate_pending_group_record(activation)
+                    .await
+                    .context(inbound::PendingGroupActivationSnafu)?;
+                notify_pending_activation_data_changes(self.listener.clone(), outcome)
+                    .await
+                    .context(inbound::NotifyListenerSnafu)
+            }
+        }
     }
 
     fn handle_reliable_delivery(
@@ -1719,9 +2537,39 @@ impl ReplicationRuntimeComponent {
                 Ok(message) => message,
                 Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
             };
+        let message_group_id = message.group_id();
+        let ReliableMessageScope::Group {
+            group_id: envelope_group_id,
+        } = deliver.envelope.header.scope
+        else {
+            let error = InboundDeliveryError::ReliableMessageMissingGroupScope { message_group_id };
+            return Err(InboundDeliveryFailure::new(context, error));
+        };
+        if envelope_group_id != message_group_id {
+            let error = InboundDeliveryError::ReliableMessageGroupMismatch {
+                envelope_group_id,
+                message_group_id,
+            };
+            return Err(InboundDeliveryFailure::new(context, error));
+        }
         match message {
-            WireRuntimeMessage::BootstrapGroup(message) => {
-                Ok(self.handle_bootstrap_group_delivery(context, deliver, message))
+            WireRuntimeMessage::GroupInvitation(message) => {
+                let (invitation, group_setup) = message.into_parts();
+                Ok(self.handle_inbound_pending_group_decision(
+                    context,
+                    deliver,
+                    PendingGroupDecisionRecord::GroupInvitation(invitation),
+                    group_setup,
+                ))
+            }
+            WireRuntimeMessage::MigrationProposal(message) => {
+                let (proposal, group_setup) = message.into_parts();
+                Ok(self.handle_inbound_pending_group_decision(
+                    context,
+                    deliver,
+                    PendingGroupDecisionRecord::MigrationProposal(proposal),
+                    group_setup,
+                ))
             }
             WireRuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
                 context,
@@ -1768,10 +2616,12 @@ impl ReplicationRuntimeComponent {
                 Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
             };
         match message {
-            WireRuntimeMessage::BootstrapGroup(_) => Err(InboundDeliveryFailure::new(
-                context,
-                InboundDeliveryError::UnexpectedGroupMessage,
-            )),
+            WireRuntimeMessage::GroupInvitation(_) | WireRuntimeMessage::MigrationProposal(_) => {
+                Err(InboundDeliveryFailure::new(
+                    context,
+                    InboundDeliveryError::UnexpectedGroupMessage,
+                ))
+            }
             WireRuntimeMessage::Update(message) => Ok(self.handle_update(context, sender, message)),
             WireRuntimeMessage::UpdateBatch(message) => {
                 Ok(self.handle_update_batch(context, sender, message))
@@ -1844,7 +2694,7 @@ impl ReplicationRuntimeComponent {
                 .await
                 .context(inbound::StoreAccessSnafu)?;
             return Ok(InboundUpdateOutcome {
-                event_batches: Vec::new(),
+                event_batches: ListenerDataChangeBatches::new(),
                 needed_ranges,
                 observed_available: vec![incoming_available_range],
             });
@@ -1920,7 +2770,7 @@ impl ReplicationRuntimeComponent {
                 .await
                 .context(inbound::StoreAccessSnafu)?;
             return Ok(InboundUpdateOutcome {
-                event_batches: Vec::new(),
+                event_batches: ListenerDataChangeBatches::new(),
                 needed_ranges,
                 observed_available,
             });
@@ -1968,7 +2818,7 @@ impl ReplicationRuntimeComponent {
             listener_read_token = listener_read_token
                 .with_group_version(group_id, local_group.version_vector.clone());
         }
-        let mut event_batches = Vec::new();
+        let mut event_batches = ListenerDataChangeBatches::new();
         for ready_update in &apply_plan.ready_chain {
             let applied_batch =
                 apply_one_update(&mut local_group, &mut working_datasets, ready_update)?;
@@ -2133,7 +2983,7 @@ impl ReplicationRuntimeComponent {
                     );
                     match notify_listener_batches(
                         async_self.listener.clone(),
-                        vec![ListenerDataChanges {
+                        smallvec![ListenerDataChanges {
                             read_token: read_token.clone(),
                             row_changes: prepared_publish.row_changes,
                         }],
@@ -2350,16 +3200,15 @@ impl ReplicationRuntimeComponent {
             }
         };
         Handled::block_on(self, async move |mut async_self| {
-            let prepared_bootstrap = Self::prepare_group_bootstrap(
+            let prepared_setup = Self::prepare_group_setup(
                 &async_self.security,
                 async_self.max_inline_bootstrap_public_key_bundles,
                 group_id,
                 &members,
-                group_schema,
             )
             .await;
-            let prepared_bootstrap = match prepared_bootstrap {
-                Ok(prepared_bootstrap) => prepared_bootstrap,
+            let prepared_setup = match prepared_setup {
+                Ok(prepared_setup) => prepared_setup,
                 Err(error) => {
                     let reply = Err(error).boxed().context(ApiExternalSnafu);
                     async_self.reply_api(promise, "create_group", reply);
@@ -2367,9 +3216,7 @@ impl ReplicationRuntimeComponent {
                 }
             };
             let member_keys = match GroupMemberKeys::from_ordered_member_keys(
-                prepared_bootstrap
-                    .bootstrap_message
-                    .ordered_member_key_ids(),
+                prepared_setup.group_setup.ordered_member_key_ids(),
             ) {
                 Ok(member_keys) => member_keys,
                 Err(source) => {
@@ -2380,19 +3227,36 @@ impl ReplicationRuntimeComponent {
                     return Handled::OK;
                 }
             };
+            let invitation = GroupInvitation::new_creation(
+                group_id,
+                prepared_setup.group_setup.members().to_vec(),
+                group_schema.clone(),
+                InitialSnapshot::Empty,
+                None,
+                None,
+            );
+            let invitation_message = GroupInvitationMessage::try_new(
+                invitation,
+                Arc::clone(&prepared_setup.group_setup),
+            )
+            .expect("created-group invitation members match prepared group setup");
+            let invitation_payload =
+                RuntimeMessage::GroupInvitation(invitation_message).encode_proto_to_bytes();
             let record = async_self.build_replication_group_record(
                 group_id,
                 member_keys,
-                prepared_bootstrap.bootstrap_message.group_schema().clone(),
-                prepared_bootstrap.security_material,
+                group_schema,
+                prepared_setup.security_material,
             );
             let persisted_group = async_self.store_new_replication_group(record).await;
             let reply = match persisted_group {
                 Ok(persisted_group) => {
                     match async_self.install_group_membership_view(persisted_group) {
                         Ok(()) => {
-                            async_self.submit_group_bootstrap_messages(
-                                &prepared_bootstrap.bootstrap_message,
+                            async_self.submit_group_creation_invitation_messages(
+                                group_id,
+                                &prepared_setup.group_setup,
+                                &invitation_payload,
                             );
                             Ok::<GroupId, GroupInstallError>(group_id)
                                 .boxed()
@@ -2413,10 +3277,45 @@ impl ReplicationRuntimeComponent {
         ask: Ask<ChangeGroupMembershipRequest, Result<MigrationId, ApiError>>,
     ) -> HandlerResult {
         let (promise, req) = ask.take();
-        let _ = req;
-        let reply = Err(unavailable_api("change_group_membership"));
-        self.reply_api(promise, "change_group_membership", reply);
-        Handled::OK
+        Handled::block_on(self, async move |mut async_self| {
+            let reply = match async_self.prepare_membership_migration(req).await {
+                Ok(prepared) => {
+                    let migration_id = prepared.migration_id;
+                    let dispatch = Self::prepare_membership_dispatch(&prepared);
+                    match async_self
+                        .activate_prepared_membership_migration(prepared)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            async_self.submit_membership_migration_messages(&dispatch);
+                            match notify_listener_data_changes(
+                                async_self.listener.clone(),
+                                smallvec![ListenerDataChanges {
+                                    read_token: outcome.read_token,
+                                    row_changes: outcome.row_changes,
+                                }],
+                            )
+                            .await
+                            {
+                                Ok(()) => Ok(migration_id),
+                                Err(error) => Err(ChangeGroupMembershipError::NotifyListener {
+                                    source: error,
+                                })
+                                .boxed()
+                                .context(ApiExternalSnafu),
+                            }
+                        }
+                        Err(error) => Err(error)
+                            .context(change_membership::ActivateGroupSnafu)
+                            .boxed()
+                            .context(ApiExternalSnafu),
+                    }
+                }
+                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
+            };
+            async_self.reply_api(promise, "change_group_membership", reply);
+            Handled::OK
+        })
     }
 
     fn handle_pending_group_decision_response(
@@ -2640,10 +3539,6 @@ impl Actor for ReplicationRuntimeComponent {
     }
 }
 
-fn unavailable_api(operation: &'static str) -> ApiError {
-    ApiError::UnsupportedOperation { operation }
-}
-
 /// Normalise requested group members so the local creator occupies member index 0.
 fn creator_first_member_order(
     mut members: Vec<MemberIdentity>,
@@ -2678,8 +3573,18 @@ fn handled_after_inbound_failure(
 
 async fn notify_listener_batches(
     listener: Arc<dyn ReplicationEventListener>,
-    event_batches: Vec<ListenerDataChanges>,
+    event_batches: ListenerDataChangeBatches,
 ) -> Result<(), InboundDeliveryError> {
+    notify_listener_data_changes(listener, event_batches)
+        .await
+        .context(inbound::NotifyListenerSnafu)
+}
+
+/// Emit non-empty listener data-change batches in their prepared order.
+async fn notify_listener_data_changes(
+    listener: Arc<dyn ReplicationEventListener>,
+    event_batches: ListenerDataChangeBatches,
+) -> Result<(), ListenerError> {
     for event_batch in event_batches {
         if event_batch.row_changes.is_empty() {
             continue;
@@ -2689,10 +3594,24 @@ async fn notify_listener_batches(
                 read_token: event_batch.read_token,
                 rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
             })
-            .await
-            .context(inbound::NotifyListenerSnafu)?;
+            .await?;
     }
     Ok(())
+}
+
+/// Notify listeners when accepted pending activation produced externally visible rows.
+async fn notify_pending_activation_data_changes(
+    listener: Arc<dyn ReplicationEventListener>,
+    outcome: PendingGroupActivationOutcome,
+) -> Result<(), ListenerError> {
+    notify_listener_data_changes(
+        listener,
+        smallvec![ListenerDataChanges {
+            read_token: outcome.read_token,
+            row_changes: outcome.row_changes,
+        }],
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -2718,7 +3637,7 @@ mod tests {
             InboundFailureAction::Drop
         );
         assert_eq!(
-            InboundDeliveryError::BootstrapSenderNotInGroup {
+            InboundDeliveryError::GroupSetupSenderNotInGroup {
                 group_id,
                 sender: MemberIdentity::from_array(["runtime", "sender"]),
             }
@@ -2726,7 +3645,7 @@ mod tests {
             InboundFailureAction::Drop
         );
         assert_eq!(
-            InboundDeliveryError::BootstrapSenderNotFirstMember {
+            InboundDeliveryError::GroupSetupSenderNotFirstMember {
                 group_id,
                 sender: MemberIdentity::from_array(["runtime", "sender"]),
                 sender_index: Some(MemberIndex::new(1)),
@@ -2754,14 +3673,14 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_membership_validation_rejects_sender_outside_group() {
+    fn group_setup_membership_validation_rejects_sender_outside_group() {
         let group_id = GroupId(Uuid::from_u128(92));
         let local_member = MemberIdentity::from_array(["runtime", "local"]);
         let sender = MemberIdentity::from_array(["runtime", "sender"]);
         let members = GroupMembers::from_ordered_members(vec![local_member.clone()])
             .expect("member set should build");
 
-        let error = ReplicationRuntimeComponent::validate_bootstrap_membership(
+        let error = ReplicationRuntimeComponent::validate_group_setup_membership(
             group_id,
             &members,
             &local_member,
@@ -2770,7 +3689,7 @@ mod tests {
         .expect_err("sender outside the group should be rejected");
 
         match error {
-            InboundDeliveryError::BootstrapSenderNotInGroup {
+            InboundDeliveryError::GroupSetupSenderNotInGroup {
                 group_id: rejected_group_id,
                 sender: rejected_sender,
             } => {
@@ -2811,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_membership_validation_rejects_sender_not_first_member() {
+    fn group_setup_membership_validation_rejects_sender_not_first_member() {
         let group_id = GroupId(Uuid::from_u128(93));
         let local_member = MemberIdentity::from_array(["runtime", "local"]);
         let sender = MemberIdentity::from_array(["runtime", "sender"]);
@@ -2819,7 +3738,7 @@ mod tests {
             GroupMembers::from_ordered_members(vec![local_member.clone(), sender.clone()])
                 .expect("member set should build");
 
-        let error = ReplicationRuntimeComponent::validate_bootstrap_membership(
+        let error = ReplicationRuntimeComponent::validate_group_setup_membership(
             group_id,
             &members,
             &local_member,
@@ -2828,7 +3747,7 @@ mod tests {
         .expect_err("sender at non-zero member index should be rejected");
 
         match error {
-            InboundDeliveryError::BootstrapSenderNotFirstMember {
+            InboundDeliveryError::GroupSetupSenderNotFirstMember {
                 group_id: rejected_group_id,
                 sender: rejected_sender,
                 sender_index,

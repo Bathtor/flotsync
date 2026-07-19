@@ -317,11 +317,12 @@ impl SummaryRequestManagerComponent {
                 let sender = deliver.envelope.header.sender.clone();
                 self.handle_summary(context, sender, deliver.processed, message)
             }
-            WireRuntimeMessage::BootstrapGroup(_)
-            | WireRuntimeMessage::Update(_)
+            WireRuntimeMessage::Update(_)
             | WireRuntimeMessage::SummaryRequest(_)
             | WireRuntimeMessage::NeedRange(_)
-            | WireRuntimeMessage::UpdateBatch(_) => Handled::OK,
+            | WireRuntimeMessage::UpdateBatch(_)
+            | WireRuntimeMessage::GroupInvitation(_)
+            | WireRuntimeMessage::MigrationProposal(_) => Handled::OK,
         }
     }
 

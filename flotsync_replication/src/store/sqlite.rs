@@ -21,6 +21,7 @@ use crate::{
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
+        ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationRowStateRecord,
         ReplicationRowStateSnapshot,
@@ -491,10 +492,36 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_pending_group_decisions(self.assert_open_connection()).await }.boxed()
     }
 
+    fn load_pending_group_decision<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupDecisionRecord>, StoreError>> {
+        async move { load_pending_group_decision(self.assert_open_connection(), group_id).await }
+            .boxed()
+    }
+
     fn load_pending_group_activations(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
         async move { load_pending_group_activations(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_pending_group_activation<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupActivationRecord>, StoreError>> {
+        async move { load_pending_group_activation(self.assert_open_connection(), group_id).await }
+            .boxed()
+    }
+
+    fn load_replication_group_material<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupMaterialRecord>, StoreError>> {
+        async move {
+            load_replication_group_material(self.assert_open_connection(), group_id).await
+        }
+        .boxed()
     }
 
     fn release(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
@@ -516,6 +543,28 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
+    }
+
+    fn ensure_replication_group_material(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move {
+            ensure_replication_group_material(self.assert_open_connection(), &material).await
+        }
+        .boxed()
+    }
+
+    fn activate_replication_group(
+        &mut self,
+        group_id: GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move {
+            activate_replication_group(self.assert_open_connection(), group_id, &version_vector)
+                .await
+        }
+        .boxed()
     }
 
     fn ensure_local_member_private_keys(
@@ -634,6 +683,17 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
+    fn remove_inactive_replication_group_material(
+        &mut self,
+        group_id: GroupId,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move {
+            remove_inactive_replication_group_material(self.assert_open_connection(), group_id)
+                .await
+        }
+        .boxed()
+    }
+
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
             let connection = self
@@ -668,14 +728,28 @@ type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 /// `i64::MAX`.
 const UPDATE_VERSION_SORT_KEY_BYTES: usize = 8;
 
+// Group persistence is normalised around one material record per group:
+//
+// replication_group_material -> group_members
+//                            -> group_dataset_schemas
+//                                      |
+// replication_groups (active marker + version vector)
+//                                      |
+//                         datasets / rows / updates
+//
+// Invitations and proposals store verified material before policy acceptance.
+// Only inserting the replication_groups marker makes that material active and
+// permits data-state writes through SQLite foreign keys. pending_group_work has
+// exactly one decision or activation row per target group and changes state in
+// place when accepted.
+
 const SCHEMA_STATEMENTS: &[&str] = &[
     "PRAGMA foreign_keys = ON;",
     "
-CREATE TABLE IF NOT EXISTS replication_groups (
+CREATE TABLE IF NOT EXISTS replication_group_material (
     group_id TEXT PRIMARY KEY NOT NULL,
     member_count INTEGER NOT NULL,
     local_member_index INTEGER NOT NULL,
-    version_vector BLOB NOT NULL,
     group_secret_crypto_version INTEGER NOT NULL,
     group_secret_key_id TEXT NOT NULL,
     group_secret_nonce BLOB NOT NULL,
@@ -690,7 +764,7 @@ CREATE TABLE IF NOT EXISTS group_members (
     key_fingerprint BLOB NOT NULL,
     PRIMARY KEY (group_id, member_index),
     UNIQUE (group_id, member_identity),
-    FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
+    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
 );
 ",
     "
@@ -699,7 +773,14 @@ CREATE TABLE IF NOT EXISTS group_dataset_schemas (
     dataset_id TEXT NOT NULL,
     payload BLOB NOT NULL,
     PRIMARY KEY (group_id, dataset_id),
-    FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
+    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
+);
+",
+    "
+CREATE TABLE IF NOT EXISTS replication_groups (
+    group_id TEXT PRIMARY KEY NOT NULL,
+    version_vector BLOB NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
 );
 ",
     "
@@ -768,21 +849,13 @@ CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
 );
 ",
     "
-CREATE TABLE IF NOT EXISTS pending_group_decisions (
+CREATE TABLE IF NOT EXISTS pending_group_work (
+    new_group_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('decision', 'activation')),
     work_kind TEXT NOT NULL,
-    old_group_id TEXT NOT NULL,
-    new_group_id TEXT NOT NULL,
+    old_group_id TEXT,
     payload BLOB NOT NULL,
-    PRIMARY KEY (work_kind, old_group_id, new_group_id)
-);
-",
-    "
-CREATE TABLE IF NOT EXISTS pending_group_activations (
-    work_kind TEXT NOT NULL,
-    old_group_id TEXT NOT NULL,
-    new_group_id TEXT NOT NULL,
-    payload BLOB NOT NULL,
-    PRIMARY KEY (work_kind, old_group_id, new_group_id)
+    FOREIGN KEY (new_group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
 );
 ",
 ];
@@ -797,21 +870,20 @@ async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(),
     Ok(())
 }
 
-async fn load_replication_group(
+async fn load_replication_group_material(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
-) -> Result<Option<ReplicationGroupRecord>, StoreError> {
+) -> Result<Option<ReplicationGroupMaterialRecord>, StoreError> {
     let row = sqlx::query(
         "
 SELECT
     member_count,
     local_member_index,
-    version_vector,
     group_secret_crypto_version,
     group_secret_key_id,
     group_secret_nonce,
     group_secret_ciphertext
-FROM replication_groups
+FROM replication_group_material
 WHERE group_id = ?1
 ",
     )
@@ -826,8 +898,6 @@ WHERE group_id = ?1
     let member_count = decode_non_zero_member_count(row.get::<i64, _>("member_count"))?;
     let local_member_index =
         decode_member_index(row.get::<i64, _>("local_member_index"), member_count)?;
-    let version_vector =
-        decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
     let encrypted_group_secret = decode_encrypted_store_secret(
         row.get("group_secret_crypto_version"),
         row.get("group_secret_key_id"),
@@ -840,14 +910,41 @@ WHERE group_id = ?1
     let member_keys = load_group_member_keys(connection, group_id, member_count).await?;
     let group_schema = load_group_schema(connection, group_id).await?;
 
-    Ok(Some(ReplicationGroupRecord {
+    Ok(Some(ReplicationGroupMaterialRecord {
         group_id: *group_id,
         member_keys,
         local_member_index,
         group_schema,
-        version_vector,
         security_material,
     }))
+}
+
+async fn load_replication_group(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<ReplicationGroupRecord>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT version_vector
+FROM replication_groups
+WHERE group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let material = load_replication_group_material(connection, group_id)
+        .await?
+        .expect("active group foreign key guarantees matching group material");
+    let version_vector = decode_stored_version_vector(
+        &row.get::<Vec<u8>, _>("version_vector"),
+        material.member_count(),
+    )?;
+    Ok(Some(material.activate(version_vector)))
 }
 
 async fn load_replication_groups(
@@ -984,54 +1081,76 @@ async fn insert_replication_group(
     connection: &mut SqliteStoreConnection,
     group: &ReplicationGroupRecord,
 ) -> Result<(), StoreError> {
-    let member_count = group.member_count();
-    ensure_member_index_in_bounds(group.local_member_index, member_count)?;
+    let material = ReplicationGroupMaterialRecord {
+        group_id: group.group_id,
+        member_keys: group.member_keys.clone(),
+        local_member_index: group.local_member_index,
+        group_schema: group.group_schema.clone(),
+        security_material: group.security_material.clone(),
+    };
+    ensure_replication_group_material(connection, &material).await?;
+    activate_replication_group(connection, group.group_id, &group.version_vector).await
+}
 
-    let version_vector = encode_stored_version_vector(&group.version_vector);
+/// Store group material, accepting only exact idempotent replays.
+async fn ensure_replication_group_material(
+    connection: &mut SqliteStoreConnection,
+    material: &ReplicationGroupMaterialRecord,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_replication_group_material(connection, &material.group_id).await? {
+        ensure!(
+            existing == *material,
+            ConflictingGroupMaterialSnafu {
+                group_id: material.group_id
+            }
+        );
+        return Ok(());
+    }
+    let member_count = material.member_count();
+    ensure_member_index_in_bounds(material.local_member_index, member_count)?;
+
     let stored_member_count =
         i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?;
     sqlx::query(
         "
-INSERT INTO replication_groups (
+INSERT INTO replication_group_material (
     group_id,
     member_count,
     local_member_index,
-    version_vector,
     group_secret_crypto_version,
     group_secret_key_id,
     group_secret_nonce,
     group_secret_ciphertext
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ",
     )
-    .bind(group.group_id.to_string())
+    .bind(material.group_id.to_string())
     .bind(stored_member_count)
-    .bind(i64::from(group.local_member_index.as_u32()))
-    .bind(version_vector)
+    .bind(i64::from(material.local_member_index.as_u32()))
     .bind(i64::from(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .crypto_version
             .as_u16(),
     ))
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .key_id
             .to_string(),
     )
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .nonce
             .as_ref(),
     )
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .ciphertext
@@ -1041,7 +1160,12 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     .await
     .context(SqlxSnafu)?;
 
-    for (member_index, member_key) in group.member_keys.ordered_member_keys().iter().enumerate() {
+    for (member_index, member_key) in material
+        .member_keys
+        .ordered_member_keys()
+        .iter()
+        .enumerate()
+    {
         let member_index = i64::try_from(member_index).context(MemberCountOverflowSnafu)?;
         sqlx::query(
             "
@@ -1049,7 +1173,7 @@ INSERT INTO group_members (group_id, member_index, member_identity, key_fingerpr
 VALUES (?1, ?2, ?3, ?4)
 ",
         )
-        .bind(group.group_id.to_string())
+        .bind(material.group_id.to_string())
         .bind(member_index)
         .bind(member_key.member_id.to_string())
         .bind(member_key.fingerprint.as_ref())
@@ -1057,7 +1181,7 @@ VALUES (?1, ?2, ?3, ?4)
         .await
         .context(SqlxSnafu)?;
     }
-    insert_group_schema(connection, group.group_id, &group.group_schema).await?;
+    insert_group_schema(connection, material.group_id, &material.group_schema).await?;
     Ok(())
 }
 
@@ -1081,6 +1205,47 @@ VALUES (?1, ?2, ?3)
         .context(SqlxSnafu)?;
     }
     Ok(())
+}
+
+/// Insert the active marker for existing material.
+async fn activate_replication_group(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    version_vector: &VersionVector,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+INSERT INTO replication_groups (group_id, version_vector)
+VALUES (?1, ?2)
+",
+    )
+    .bind(group_id.to_string())
+    .bind(encode_stored_version_vector(version_vector))
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+/// Remove material only while no active marker exists.
+async fn remove_inactive_replication_group_material(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "
+DELETE FROM replication_group_material
+WHERE group_id = ?1
+  AND NOT EXISTS (
+      SELECT 1 FROM replication_groups WHERE replication_groups.group_id = ?1
+  )
+",
+    )
+    .bind(group_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(result.rows_affected() > 0)
 }
 
 async fn load_local_member_private_keys(
@@ -1536,8 +1701,7 @@ WHERE group_id = ",
         query_builder.push_bind(after.to_string());
     }
     query_builder.push(" ORDER BY row_key LIMIT ");
-    let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
-    query_builder.push_bind(stored_limit);
+    query_builder.push_bind(sqlite_limit_value(limit));
 
     let stored_rows = query_builder
         .build()
@@ -1727,8 +1891,7 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
-        query_builder.push_bind(stored_limit);
+        query_builder.push_bind(sqlite_limit_value(limit));
     }
     let rows = query_builder
         .build()
@@ -1766,8 +1929,7 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        let stored_limit = i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?;
-        query_builder.push_bind(stored_limit);
+        query_builder.push_bind(sqlite_limit_value(limit));
     }
     let rows = query_builder
         .build()
@@ -1875,60 +2037,255 @@ WHERE group_id = ?1
     Ok(())
 }
 
-async fn load_pending_group_decisions(
+/// Decoded SQL metadata and bytes for one pending target-group row.
+struct StoredPendingGroupPayload {
+    state: PendingGroupWorkState,
+    key: PendingGroupSqlKey,
+    context: PendingGroupPayloadDecodeContext,
+    payload: Vec<u8>,
+}
+
+/// Lifecycle state stored in the single target-group keyed work table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingGroupWorkState {
+    /// Listener-mediated work that has not yet been accepted or rejected.
+    AwaitingDecision,
+    /// Accepted work that must activate without consulting the listener again.
+    AcceptedActivation,
+}
+
+impl PendingGroupWorkState {
+    /// Return the stable SQL representation for this lifecycle state.
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::AwaitingDecision => "decision",
+            Self::AcceptedActivation => "activation",
+        }
+    }
+}
+
+impl TryFrom<String> for PendingGroupWorkState {
+    type Error = PendingGroupSqlKeyError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "decision" => Ok(Self::AwaitingDecision),
+            "activation" => Ok(Self::AcceptedActivation),
+            _ => Err(PendingGroupSqlKeyError::UnknownWorkState { raw }),
+        }
+    }
+}
+
+async fn stored_pending_group_payload_from_row(
     connection: &mut SqliteStoreConnection,
-) -> Result<Vec<PendingGroupDecisionRecord>, StoreError> {
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredPendingGroupPayload, StoreError> {
+    let raw_state = row.get::<String, _>("state");
+    let state = PendingGroupWorkState::try_from(raw_state)
+        .map_err(|source| invalid_stored_object("pending group work state", source))?;
+    let key = decode_pending_group_sql_key(&row)?;
+    let context = pending_group_payload_decode_context(connection, &key).await?;
+    Ok(StoredPendingGroupPayload {
+        state,
+        key,
+        context,
+        payload: row.get::<Vec<u8>, _>("payload"),
+    })
+}
+
+async fn load_pending_group_payloads(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+) -> Result<Vec<StoredPendingGroupPayload>, StoreError> {
     let rows = sqlx::query(
         "
-SELECT work_kind, old_group_id, new_group_id, payload
-FROM pending_group_decisions
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE state = ?1
 ",
     )
+    .bind(state.as_sql())
     .fetch_all(&mut *connection)
     .await
     .context(SqlxSnafu)?;
-
-    let mut records = Vec::with_capacity(rows.len());
+    let mut payloads = Vec::with_capacity(rows.len());
     for row in rows {
-        let key = decode_pending_group_sql_key(&row)?;
-        let context = pending_group_payload_decode_context(connection, &key).await?;
-        let payload = row.get::<Vec<u8>, _>("payload");
+        payloads.push(stored_pending_group_payload_from_row(connection, row).await?);
+    }
+    Ok(payloads)
+}
+
+async fn load_pending_group_payload(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    state: Option<PendingGroupWorkState>,
+) -> Result<Option<StoredPendingGroupPayload>, StoreError> {
+    let row = if let Some(state) = state {
+        let query = sqlx::query(
+            "
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE new_group_id = ?1 AND state = ?2
+",
+        )
+        .bind(group_id.to_string())
+        .bind(state.as_sql())
+        .fetch_optional(&mut *connection);
+        query.await.context(SqlxSnafu)?
+    } else {
+        let query = sqlx::query(
+            "
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE new_group_id = ?1
+",
+        )
+        .bind(group_id.to_string())
+        .fetch_optional(&mut *connection);
+        query.await.context(SqlxSnafu)?
+    };
+    match row {
+        Some(row) => stored_pending_group_payload_from_row(connection, row)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn load_pending_group_decisions(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<PendingGroupDecisionRecord>, StoreError> {
+    let payloads =
+        load_pending_group_payloads(connection, PendingGroupWorkState::AwaitingDecision).await?;
+    let mut records = Vec::with_capacity(payloads.len());
+    for stored in payloads {
         let record = decode_stored_proto(
             "pending group decision",
-            decode_pending_group_decision_payload(key.kind, &payload, context),
+            decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
         )?;
-        validate_pending_group_payload_key(record.key(), key)?;
+        validate_pending_group_payload_key(record.key(), stored.key)?;
         records.push(record);
     }
     Ok(records)
 }
 
+async fn load_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<PendingGroupDecisionRecord>, StoreError> {
+    let stored = load_pending_group_payload(
+        connection,
+        group_id,
+        Some(PendingGroupWorkState::AwaitingDecision),
+    )
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let record = decode_stored_proto(
+        "pending group decision",
+        decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
+    )?;
+    validate_pending_group_payload_key(record.key(), stored.key)?;
+    Ok(Some(record))
+}
+
 async fn load_pending_group_activations(
     connection: &mut SqliteStoreConnection,
 ) -> Result<Vec<PendingGroupActivationRecord>, StoreError> {
-    let rows = sqlx::query(
-        "
-SELECT work_kind, old_group_id, new_group_id, payload
-FROM pending_group_activations
-",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-
-    let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
-        let key = decode_pending_group_sql_key(&row)?;
-        let context = pending_group_payload_decode_context(connection, &key).await?;
-        let payload = row.get::<Vec<u8>, _>("payload");
+    let payloads =
+        load_pending_group_payloads(connection, PendingGroupWorkState::AcceptedActivation).await?;
+    let mut records = Vec::with_capacity(payloads.len());
+    for stored in payloads {
         let record = decode_stored_proto(
             "pending group activation",
-            decode_pending_group_activation_payload(key.kind, &payload, context),
+            decode_pending_group_activation_payload(
+                stored.key.kind,
+                &stored.payload,
+                stored.context,
+            ),
         )?;
-        validate_pending_group_payload_key(record.key(), key)?;
+        validate_pending_group_payload_key(record.key(), stored.key)?;
         records.push(record);
     }
     Ok(records)
+}
+
+async fn load_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<PendingGroupActivationRecord>, StoreError> {
+    let stored = load_pending_group_payload(
+        connection,
+        group_id,
+        Some(PendingGroupWorkState::AcceptedActivation),
+    )
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let record = decode_stored_proto(
+        "pending group activation",
+        decode_pending_group_activation_payload(stored.key.kind, &stored.payload, stored.context),
+    )?;
+    validate_pending_group_payload_key(record.key(), stored.key)?;
+    Ok(Some(record))
+}
+
+async fn upsert_pending_group_payload_row(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+    key: PendingGroupSqlKey,
+    payload: Vec<u8>,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_pending_group_payload(connection, &key.new_group_id, None).await? {
+        ensure!(
+            existing.key == key && existing.payload == payload,
+            ConflictingPendingGroupWorkSnafu {
+                group_id: key.new_group_id
+            }
+        );
+        match (existing.state, state) {
+            (
+                PendingGroupWorkState::AwaitingDecision,
+                PendingGroupWorkState::AcceptedActivation,
+            ) => {
+                sqlx::query(
+                    "
+UPDATE pending_group_work
+SET state = 'activation'
+WHERE new_group_id = ?1
+",
+                )
+                .bind(key.new_group_id.to_string())
+                .execute(&mut *connection)
+                .await
+                .context(SqlxSnafu)?;
+            }
+            (existing_state, requested_state) => ensure!(
+                existing_state == requested_state,
+                ConflictingPendingGroupWorkSnafu {
+                    group_id: key.new_group_id
+                }
+            ),
+        }
+        return Ok(());
+    }
+    sqlx::query(
+        "
+INSERT INTO pending_group_work (new_group_id, state, work_kind, old_group_id, payload)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+    )
+    .bind(key.new_group_id.to_string())
+    .bind(state.as_sql())
+    .bind(key.kind.as_sql())
+    .bind(key.old_group_id.map(|group_id| group_id.to_string()))
+    .bind(payload)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
 }
 
 async fn upsert_pending_group_decision(
@@ -1937,22 +2294,13 @@ async fn upsert_pending_group_decision(
 ) -> Result<(), StoreError> {
     let (kind, payload) = encode_pending_group_decision_payload(record);
     let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
-    let old_group_id = key.old_group_id_sql();
-    sqlx::query(
-        "
-INSERT INTO pending_group_decisions (work_kind, old_group_id, new_group_id, payload)
-VALUES (?1, ?2, ?3, ?4)
-ON CONFLICT(work_kind, old_group_id, new_group_id) DO UPDATE SET payload = excluded.payload
-",
+    upsert_pending_group_payload_row(
+        connection,
+        PendingGroupWorkState::AwaitingDecision,
+        key,
+        payload,
     )
-    .bind(key.kind.as_sql())
-    .bind(old_group_id)
-    .bind(key.new_group_id.to_string())
-    .bind(payload)
-    .execute(&mut *connection)
     .await
-    .context(SqlxSnafu)?;
-    Ok(())
 }
 
 async fn remove_pending_group_decision(
@@ -1960,8 +2308,8 @@ async fn remove_pending_group_decision(
     key: PendingGroupWorkKey,
 ) -> Result<bool, StoreError> {
     let key = PendingGroupSqlKey::from_work_key_only(key);
-    let rows_affected = delete_pending_group_decision_row(connection, &key).await?;
-    Ok(rows_affected > 0)
+    remove_pending_group_payload_row(connection, PendingGroupWorkState::AwaitingDecision, &key)
+        .await
 }
 
 async fn upsert_pending_group_activation(
@@ -1970,22 +2318,13 @@ async fn upsert_pending_group_activation(
 ) -> Result<(), StoreError> {
     let (kind, payload) = encode_pending_group_activation_payload(record);
     let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
-    let old_group_id = key.old_group_id_sql();
-    sqlx::query(
-        "
-INSERT INTO pending_group_activations (work_kind, old_group_id, new_group_id, payload)
-VALUES (?1, ?2, ?3, ?4)
-ON CONFLICT(work_kind, old_group_id, new_group_id) DO UPDATE SET payload = excluded.payload
-",
+    upsert_pending_group_payload_row(
+        connection,
+        PendingGroupWorkState::AcceptedActivation,
+        key,
+        payload,
     )
-    .bind(key.kind.as_sql())
-    .bind(old_group_id)
-    .bind(key.new_group_id.to_string())
-    .bind(payload)
-    .execute(&mut *connection)
     .await
-    .context(SqlxSnafu)?;
-    Ok(())
 }
 
 async fn remove_pending_group_activation(
@@ -1993,79 +2332,34 @@ async fn remove_pending_group_activation(
     key: PendingGroupWorkKey,
 ) -> Result<bool, StoreError> {
     let key = PendingGroupSqlKey::from_work_key_only(key);
-    let rows_affected = delete_pending_group_activation_row(connection, &key).await?;
+    remove_pending_group_payload_row(connection, PendingGroupWorkState::AcceptedActivation, &key)
+        .await
+}
+
+async fn remove_pending_group_payload_row(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+    key: &PendingGroupSqlKey,
+) -> Result<bool, StoreError> {
+    let rows_affected = sqlx::query(
+        "
+DELETE FROM pending_group_work
+WHERE new_group_id = ?1
+  AND state = ?2
+  AND work_kind = ?3
+  AND old_group_id IS ?4
+",
+    )
+    .bind(key.new_group_id.to_string())
+    .bind(state.as_sql())
+    .bind(key.kind.as_sql())
+    .bind(key.old_group_id.map(|group_id| group_id.to_string()))
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?
+    .rows_affected();
     Ok(rows_affected > 0)
 }
-
-async fn delete_pending_group_decision_row(
-    connection: &mut SqliteStoreConnection,
-    key: &PendingGroupSqlKey,
-) -> Result<u64, StoreError> {
-    let rows_affected = match key.old_group_id {
-        Some(old_group_id) => sqlx::query(
-            "
-DELETE FROM pending_group_decisions
-WHERE work_kind = ?1 AND old_group_id = ?2 AND new_group_id = ?3
-",
-        )
-        .bind(key.kind.as_sql())
-        .bind(old_group_id.to_string())
-        .bind(key.new_group_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .context(SqlxSnafu)?
-        .rows_affected(),
-        None => sqlx::query(
-            "
-DELETE FROM pending_group_decisions
-WHERE work_kind = ?1 AND old_group_id = 'NONE' AND new_group_id = ?2
-",
-        )
-        .bind(key.kind.as_sql())
-        .bind(key.new_group_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .context(SqlxSnafu)?
-        .rows_affected(),
-    };
-    Ok(rows_affected)
-}
-
-async fn delete_pending_group_activation_row(
-    connection: &mut SqliteStoreConnection,
-    key: &PendingGroupSqlKey,
-) -> Result<u64, StoreError> {
-    let rows_affected = match key.old_group_id {
-        Some(old_group_id) => sqlx::query(
-            "
-DELETE FROM pending_group_activations
-WHERE work_kind = ?1 AND old_group_id = ?2 AND new_group_id = ?3
-",
-        )
-        .bind(key.kind.as_sql())
-        .bind(old_group_id.to_string())
-        .bind(key.new_group_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .context(SqlxSnafu)?
-        .rows_affected(),
-        None => sqlx::query(
-            "
-DELETE FROM pending_group_activations
-WHERE work_kind = ?1 AND old_group_id = 'NONE' AND new_group_id = ?2
-",
-        )
-        .bind(key.kind.as_sql())
-        .bind(key.new_group_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .context(SqlxSnafu)?
-        .rows_affected(),
-    };
-    Ok(rows_affected)
-}
-
-const PENDING_GROUP_ABSENT_OLD_GROUP_ID: &str = "NONE";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingGroupSqlKey {
@@ -2107,14 +2401,6 @@ impl PendingGroupSqlKey {
             },
         }
     }
-
-    /// Return the stable SQL value for the nullable semantic old-group id.
-    fn old_group_id_sql(self) -> String {
-        match self.old_group_id {
-            Some(group_id) => group_id.to_string(),
-            None => PENDING_GROUP_ABSENT_OLD_GROUP_ID.to_owned(),
-        }
-    }
 }
 
 impl PendingGroupPayloadKind {
@@ -2132,6 +2418,9 @@ enum PendingGroupSqlKeyError {
     /// Stored `work_kind` did not name any supported pending group payload.
     #[snafu(display("Unknown pending group work kind '{raw}'."))]
     UnknownWorkKind { raw: String },
+    /// Stored lifecycle state did not name a supported pending-work state.
+    #[snafu(display("Unknown pending group work state '{raw}'."))]
+    UnknownWorkState { raw: String },
     /// Migration proposals must reference the existing group that authorised them.
     #[snafu(display("Pending migration proposal key did not contain old_group_id."))]
     MissingMigrationProposalOldGroupId,
@@ -2158,12 +2447,11 @@ fn decode_pending_group_sql_key(
             ));
         }
     };
-    let raw_old_group_id = row.get::<String, _>("old_group_id");
-    let old_group_id = if raw_old_group_id == PENDING_GROUP_ABSENT_OLD_GROUP_ID {
-        None
-    } else {
-        Some(decode_group_id(&raw_old_group_id)?)
-    };
+    let raw_old_group_id = row.get::<Option<String>, _>("old_group_id");
+    let old_group_id = raw_old_group_id
+        .as_deref()
+        .map(decode_group_id)
+        .transpose()?;
     let new_group_id = decode_group_id(&row.get::<String, _>("new_group_id"))?;
     if kind == PendingGroupPayloadKind::MigrationProposal && old_group_id.is_none() {
         return Err(invalid_stored_object(
@@ -2257,9 +2545,10 @@ async fn load_group_member_count(
 ) -> Result<NonZeroUsize, StoreError> {
     let member_count = sqlx::query_scalar::<_, i64>(
         "
-SELECT member_count
-FROM replication_groups
-WHERE group_id = ?1
+SELECT material.member_count
+FROM replication_groups AS active
+JOIN replication_group_material AS material ON material.group_id = active.group_id
+WHERE active.group_id = ?1
 ",
     )
     .bind(group_id.to_string())
@@ -2282,9 +2571,10 @@ async fn load_optional_group_member_count(
 ) -> Result<Option<NonZeroUsize>, StoreError> {
     let member_count = sqlx::query_scalar::<_, i64>(
         "
-SELECT member_count
-FROM replication_groups
-WHERE group_id = ?1
+SELECT material.member_count
+FROM replication_groups AS active
+JOIN replication_group_material AS material ON material.group_id = active.group_id
+WHERE active.group_id = ?1
 ",
     )
     .bind(group_id.to_string())
@@ -2496,6 +2786,15 @@ fn decode_non_zero_member_count(member_count: i64) -> Result<NonZeroUsize, Store
         .map_err(StoreError::from)
 }
 
+/// Convert caller-visible limits into `SQLite`'s signed `LIMIT` range.
+///
+/// Callers may pass `usize::MAX` as a practical "no limit" sentinel for a
+/// single storage call. `SQLite` accepts signed 64-bit limits, so saturating keeps
+/// that sentinel useful without changing smaller, exact limits.
+fn sqlite_limit_value(limit: NonZeroUsize) -> i64 {
+    i64::try_from(limit.get()).unwrap_or(i64::MAX)
+}
+
 fn ensure_member_index_in_bounds(
     member_index: MemberIndex,
     member_count: NonZeroUsize,
@@ -2638,8 +2937,6 @@ enum SqliteStoreError {
     MemberIndexOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Stored secret crypto version overflowed the supported range: {source}"))]
     SecretCryptoVersionOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Dataset row scan limit overflowed the supported range: {source}"))]
-    RowLimitOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
         "Stored local member index {local_member_index} is out of bounds for {member_count} members."
     ))]
@@ -2681,6 +2978,14 @@ enum SqliteStoreError {
         object: &'static str,
         member_id: MemberIdentity,
     },
+    #[snafu(display(
+        "Stored group material for group '{group_id}' conflicts with requested material."
+    ))]
+    ConflictingGroupMaterial { group_id: GroupId },
+    #[snafu(display(
+        "Stored pending work for target group '{group_id}' conflicts with requested work."
+    ))]
+    ConflictingPendingGroupWork { group_id: GroupId },
     #[snafu(display(
         "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
     ))]
@@ -2901,16 +3206,36 @@ mod tests {
     }
 
     #[test]
+    fn pending_group_work_state_decodes_stable_sql_values() {
+        assert_matches!(
+            PendingGroupWorkState::try_from("decision".to_owned()),
+            Ok(PendingGroupWorkState::AwaitingDecision)
+        );
+        assert_matches!(
+            PendingGroupWorkState::try_from("activation".to_owned()),
+            Ok(PendingGroupWorkState::AcceptedActivation)
+        );
+        assert_matches!(
+            PendingGroupWorkState::try_from("unknown".to_owned()),
+            Err(PendingGroupSqlKeyError::UnknownWorkState { raw }) if raw == "unknown"
+        );
+    }
+
+    #[test]
     fn pending_group_decisions_round_trip_through_sqlite_payloads() {
         let store = in_memory_store(local_member());
         let migration_id = MigrationId {
             old_group_id: GroupId(Uuid::from_u128(10_001)),
             new_group_id: GroupId(Uuid::from_u128(10_002)),
         };
+        let proposal_migration_id = MigrationId {
+            old_group_id: migration_id.old_group_id,
+            new_group_id: GroupId(Uuid::from_u128(10_003)),
+        };
         let records = vec![
             creation_invitation_decision(GroupId(Uuid::from_u128(10_000))),
             migration_invitation_decision(migration_id),
-            migration_proposal_decision(migration_id),
+            migration_proposal_decision(proposal_migration_id),
         ];
 
         wait_for_store_future(async {
@@ -2923,6 +3248,11 @@ mod tests {
                 .await
                 .expect("old group should store");
             for record in records.iter().cloned() {
+                let (material, _) = sample_group(record.group_id()).into_parts();
+                transaction
+                    .ensure_replication_group_material(material)
+                    .await
+                    .expect("target group material should store");
                 transaction
                     .upsert_pending_group_decision(record)
                     .await
@@ -2978,6 +3308,11 @@ mod tests {
                 .insert_replication_group(sample_group(migration_id.old_group_id))
                 .await
                 .expect("old group should store");
+            let (material, _) = sample_group(migration_id.new_group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
             transaction
                 .upsert_pending_group_activation(record.clone())
                 .await
@@ -3026,6 +3361,215 @@ mod tests {
         });
         assert!(first_removed);
         assert!(!second_removed);
+    }
+
+    #[test]
+    fn pending_group_work_accepts_replay_and_rejects_conflicting_target_work() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(11_100));
+        let original = creation_invitation_decision(group_id);
+        let mut conflicting = original.clone();
+        let PendingGroupDecisionRecord::GroupInvitation(invitation) = &mut conflicting else {
+            panic!("creation invitation fixture must contain an invitation");
+        };
+        invitation.message = Some("different invitation".to_owned());
+
+        let conflict = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let (material, _) = sample_group(group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
+            transaction
+                .upsert_pending_group_decision(original.clone())
+                .await
+                .expect("pending decision should store");
+            transaction
+                .upsert_pending_group_decision(original.clone())
+                .await
+                .expect("exact pending decision replay should be idempotent");
+            let conflict = transaction
+                .upsert_pending_group_decision(conflicting)
+                .await
+                .expect_err("conflicting target work should be rejected");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+            conflict
+        });
+
+        assert!(is_conflicting_pending_group_work(&conflict, group_id));
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_decision(&group_id)
+                .await
+                .expect("pending decision should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+        assert_eq!(loaded, Some(original));
+    }
+
+    #[test]
+    fn pending_group_decision_transitions_to_one_activation_for_target_group() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(11_101));
+        let decision = creation_invitation_decision(group_id);
+        let activation = decision.clone().into_activation();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let (material, _) = sample_group(group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
+            transaction
+                .upsert_pending_group_decision(decision)
+                .await
+                .expect("pending decision should store");
+            transaction
+                .upsert_pending_group_activation(activation.clone())
+                .await
+                .expect("pending decision should transition to activation");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let (loaded_decision, loaded_activation) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded_decision = transaction
+                .load_pending_group_decision(&group_id)
+                .await
+                .expect("pending decision lookup should succeed");
+            let loaded_activation = transaction
+                .load_pending_group_activation(&group_id)
+                .await
+                .expect("pending activation lookup should succeed");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            (loaded_decision, loaded_activation)
+        });
+        assert_eq!(loaded_decision, None);
+        assert_eq!(loaded_activation, Some(activation));
+    }
+
+    #[test]
+    fn inactive_group_material_is_not_active_and_cannot_own_data_state() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = in_memory_store_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        );
+        let group_id = GroupId(Uuid::from_u128(11_102));
+        let row_key = RowKey(Uuid::from_u128(11_103));
+        let group = sample_group(group_id);
+        let (material, _) = group.clone().into_parts();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("inactive group material should store");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let (active_group, active_groups, stored_material) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let active_group = transaction
+                .load_replication_group(&group_id)
+                .await
+                .expect("active group lookup should succeed");
+            let active_groups = transaction
+                .load_replication_groups()
+                .await
+                .expect("active groups should load");
+            let stored_material = transaction
+                .load_replication_group_material(&group_id)
+                .await
+                .expect("group material lookup should succeed");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            (active_group, active_groups, stored_material)
+        });
+        assert_eq!(active_group, None);
+        assert!(active_groups.is_empty());
+        assert!(stored_material.is_some());
+
+        let (row_error, update_error) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let row_error = transaction
+                .apply_dataset_row_patch(DatasetRowStatePatch {
+                    group_id,
+                    dataset_id: dataset_id.clone(),
+                    actions: vec![DatasetRowStateWrite::UpsertActive {
+                        row_key,
+                        snapshot: title_snapshot(&schema, row_key, "inactive"),
+                    }],
+                    last_changed_versions: sample_last_changed_versions(),
+                })
+                .await
+                .expect_err("inactive material must not own row state");
+            let update_error = transaction
+                .append_replication_update(ReplicationUpdateRecord {
+                    group_id,
+                    update_id: UpdateId {
+                        node_index: 0,
+                        version: 1,
+                    },
+                    sender: local_member(),
+                    read_versions: VersionVector::initial(group.member_count()),
+                    dataset_updates: Vec::new(),
+                    applied_locally: false,
+                })
+                .await
+                .expect_err("inactive material must not own update state");
+            transaction
+                .rollback()
+                .await
+                .expect("transaction should roll back");
+            (row_error, update_error)
+        });
+        assert!(matches!(row_error, StoreError::StoreExternal { .. }));
+        assert!(matches!(update_error, StoreError::StoreExternal { .. }));
     }
 
     #[test]
@@ -3106,6 +3650,17 @@ mod tests {
                     object: stored_object,
                     member_id: stored_member_id,
                 }) if *stored_object == object && stored_member_id == member_id
+            ),
+        }
+    }
+
+    fn is_conflicting_pending_group_work(error: &StoreError, group_id: GroupId) -> bool {
+        match error {
+            StoreError::StoreExternal { source } => matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::ConflictingPendingGroupWork {
+                    group_id: stored_group_id,
+                }) if *stored_group_id == group_id
             ),
         }
     }

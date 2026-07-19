@@ -1,0 +1,29 @@
+id = "019f5b28-a26f-7b11-a979-595b4ccdb149"
+ref = "flotsync-git-lg9"
+title = "Add GroupClose protocol message shape"
+body = """
+Add the protocol/runtime message shape and local access-state handling for optional old-group close signalling after the inline migration activation slice is complete.
+
+Scope:
+G01. Add a GroupClose wire payload carrying the migration id and a close mode/policy marker.
+G02. Keep GroupClose old-group scoped/signed because the old group is the authority context for the lifecycle signal.
+G03. Add minimal runtime/API shape and encode/decode coverage at dispatch boundaries.
+G04. Preserve compatibility behaviour for unknown or unsupported close signals by ignoring/dropping them.
+G05. Add persistent/local runtime state for old-group access policy after migration close: observe-only, read-only, or closed for reads and writes.
+G06. Enforce old-group local access policy in public APIs such as publish_changes and snapshot_rows, without blocking internal catch-up or diagnostic reads needed by the runtime.
+G07. Define and implement listener event semantics for old-group close transitions, including whether CloseReadsAndWrites emits delete/tombstone-style DataChanged events for old-group rows or a separate group-lifecycle event.
+G08. Cover the interaction between locally accepted migration activation and later/duplicate GroupClose signals so old-group state changes are idempotent.
+
+Out of scope:
+G09. Full inline migration activation from pending proposals/invitations; that belongs to flotsync-git-pow.4.
+G10. Chunked snapshot transfer.
+G11. Dynamic checklist UI/REPL integration."""
+status = "open"
+type = "task"
+priority = 3
+blocked_by = [
+    "019f51bf-e9f0-7eb3-96ff-fc754675ca7d",
+    "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
+]
+created_at = "2026-07-13T11:06:57.519537Z"
+updated_at = "2026-07-13T11:20:01.784175Z"

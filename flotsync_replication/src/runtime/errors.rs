@@ -11,10 +11,15 @@ use flotsync_core::{
     membership::GroupMembersError,
     versions::UpdateId,
 };
-use flotsync_data_types::{OperationError, schema::FieldValueBuildError};
+use flotsync_data_types::{
+    InMemoryValueDataError,
+    OperationError,
+    schema::{FieldValueBuildError, datamodel::InitialValueRowsEmbeddingError},
+};
 use flotsync_messages::codecs::datamodel::OperationCodecError;
 use kompact::prelude::PromiseErr;
 use snafu::{Location, prelude::*};
+use uuid::Uuid;
 
 /// Boxed source for errors that would otherwise make high-level runtime errors large.
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -70,7 +75,7 @@ pub(super) enum SummaryError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub(crate) enum GroupInstallError {
-    #[snafu(display("Group {group_id} already exists with a different canonical member order."))]
+    #[snafu(display("Group {group_id} already exists with a different group definition."))]
     ConflictingExistingGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
     InstallMissingLocalMember { local_member: MemberIdentity },
@@ -141,6 +146,114 @@ pub(super) enum RuntimeStartupError {
         "Pending group activation resume is not implemented; found {activation_count} activation record(s)."
     ))]
     PendingGroupActivationResumeUnsupported { activation_count: usize },
+    #[snafu(display("Pending group activation resume failed: {source}"))]
+    PendingGroupActivationResume {
+        #[snafu(source(from(GroupActivationError, Box::new)))]
+        source: Box<GroupActivationError>,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(change_membership))]
+pub(crate) enum ChangeGroupMembershipError {
+    #[snafu(display("Group {group_id} is not hosted by this runtime."))]
+    UnknownGroup { group_id: GroupId },
+    #[snafu(display("New group members were invalid: {source}"))]
+    InvalidMembers { source: GroupMembersError },
+    #[snafu(display("New group members must include the local member {local_member}."))]
+    LocalMemberMissing { local_member: MemberIdentity },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
+    InvalidPersistedGroup {
+        group_id: GroupId,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Migration inline snapshot could not project row {row_id}: {source}"))]
+    SnapshotRowValue {
+        row_id: RowId,
+        #[snafu(source(from(InMemoryValueDataError, Box::new)))]
+        source: Box<InMemoryValueDataError>,
+    },
+    #[snafu(display(
+        "Migration inline snapshot scan for dataset '{dataset_id}' in group {group_id} did not exhaust in one storage call."
+    ))]
+    IncompleteInitialSnapshotScan {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
+    #[snafu(display("Failed to prepare secure migration bootstrap material: {source}"))]
+    Security { source: BoxedError },
+    #[snafu(display("Failed to activate locally prepared membership state: {source}"))]
+    ActivateGroup {
+        #[snafu(source(from(GroupActivationError, Box::new)))]
+        source: Box<GroupActivationError>,
+    },
+    #[snafu(display("Listener rejected one local migration data-change event: {source}"))]
+    NotifyListener { source: ListenerError },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(activation))]
+pub(crate) enum GroupActivationError {
+    #[snafu(display("Accepted group activation {group_id} has no stored group material."))]
+    MissingGroupMaterial { group_id: GroupId },
+    #[snafu(display(
+        "Accepted group activation {group_id} carries metadata-only snapshot state, which this slice cannot fetch."
+    ))]
+    UnsupportedInitialSnapshot { group_id: GroupId },
+    #[snafu(display("Activation group members were invalid: {source}"))]
+    InvalidMembers { source: GroupMembersError },
+    #[snafu(display("Activation group members must include the local member {local_member}."))]
+    LocalMemberMissing { local_member: MemberIdentity },
+    #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
+    InvalidPersistedGroup {
+        group_id: GroupId,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display(
+        "Stored group material {group_id} does not match the membership or schema accepted for activation."
+    ))]
+    ConflictingGroupMaterial { group_id: GroupId },
+    #[snafu(display(
+        "Accepted activation snapshot for group {group_id} referenced unknown dataset '{dataset_id}'."
+    ))]
+    MissingInitialDatasetSchema {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
+    #[snafu(display(
+        "Accepted activation snapshot for dataset '{dataset_id}' in group {group_id} could not be embedded: {source}"
+    ))]
+    EmbedInitialRows {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+        source: InitialValueRowsEmbeddingError<Uuid>,
+    },
+    #[snafu(display("Replication-store access failed at {location}: {source}"))]
+    StoreAccess {
+        source: StoreError,
+        #[snafu(implicit)]
+        location: Location,
+    },
+    #[snafu(display("Failed to install activated group {group_id}: {source}"))]
+    InstallGroup {
+        group_id: GroupId,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
+    },
+    #[snafu(display("Listener rejected one activation data-change event: {source}"))]
+    NotifyListener { source: ListenerError },
 }
 
 #[derive(Debug, Snafu)]
@@ -252,45 +365,49 @@ pub(crate) enum ReplayError {
 pub(crate) enum InboundDeliveryError {
     #[snafu(display("Failed to decode inbound runtime message: {source}"))]
     DecodeMessage { source: RuntimeMessageError },
-    #[snafu(display("Inbound bootstrap failed security checks: {source}"))]
-    BootstrapSecurity { source: BoxedError },
-    #[snafu(display(
-        "Inbound bootstrap wire group id {wire_group_id} did not match payload group id {payload_group_id}."
-    ))]
-    BootstrapGroupIdMismatch {
-        wire_group_id: GroupId,
-        payload_group_id: uuid::Uuid,
-    },
+    #[snafu(display("Inbound group setup failed security checks: {source}"))]
+    GroupSetupSecurity { source: BoxedError },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
     UnexpectedReliableMessage,
-    #[snafu(display("Group broadcast unexpectedly carried a reliable bootstrap message."))]
-    UnexpectedGroupMessage,
-    #[snafu(display("Inbound bootstrap message carried an invalid group member set: {source}"))]
-    InvalidBootstrapMembers { source: GroupMembersError },
     #[snafu(display(
-        "Inbound bootstrap for group {group_id} did not include the local member {local_member}.",
+        "Reliable envelope group {envelope_group_id} did not match runtime message scope {message_group_id}."
     ))]
-    BootstrapMissingLocalMember {
+    ReliableMessageGroupMismatch {
+        envelope_group_id: GroupId,
+        message_group_id: GroupId,
+    },
+    #[snafu(display(
+        "Reliable runtime message for group {message_group_id} arrived without group scope."
+    ))]
+    ReliableMessageMissingGroupScope { message_group_id: GroupId },
+    #[snafu(display("Group broadcast unexpectedly carried a reliable pending-group message."))]
+    UnexpectedGroupMessage,
+    #[snafu(display("Inbound group setup carried an invalid group member set: {source}"))]
+    InvalidGroupSetupMembers { source: GroupMembersError },
+    #[snafu(display(
+        "Inbound group setup for group {group_id} did not include the local member {local_member}.",
+    ))]
+    GroupSetupMissingLocalMember {
         group_id: GroupId,
         local_member: MemberIdentity,
     },
     #[snafu(display(
-        "Inbound bootstrap for group {group_id} was signed by {sender}, which is not a group member.",
+        "Inbound group setup for group {group_id} was signed by {sender}, which is not a group member.",
     ))]
-    BootstrapSenderNotInGroup {
+    GroupSetupSenderNotInGroup {
         group_id: GroupId,
         sender: MemberIdentity,
     },
     #[snafu(display(
-        "Inbound bootstrap for group {group_id} was signed by {sender} at member index {sender_index:?}, but new group creators must occupy member index 0.",
+        "Inbound group setup for group {group_id} was signed by {sender} at member index {sender_index:?}, but new group creators must occupy member index 0.",
     ))]
-    BootstrapSenderNotFirstMember {
+    GroupSetupSenderNotFirstMember {
         group_id: GroupId,
         sender: MemberIdentity,
         sender_index: Option<MemberIndex>,
     },
-    #[snafu(display("Failed to install inbound bootstrap group {group_id} locally: {source}"))]
-    InstallBootstrapGroup {
+    #[snafu(display("Failed to reconcile inbound group setup {group_id} locally: {source}"))]
+    InstallGroupSetup {
         group_id: GroupId,
         #[snafu(source(from(GroupInstallError, Box::new)))]
         source: Box<GroupInstallError>,
@@ -302,6 +419,15 @@ pub(crate) enum InboundDeliveryError {
     },
     #[snafu(display("Inbound update targeted unknown hosted group {group_id}."))]
     UnknownHostedGroup { group_id: GroupId },
+    #[snafu(display("Inbound pending group work carried an invalid group member set: {source}"))]
+    InvalidPendingGroupMembers { source: GroupMembersError },
+    #[snafu(display(
+        "Inbound pending group work for group {group_id} did not include the local member {local_member}."
+    ))]
+    PendingGroupMissingLocalMember {
+        group_id: GroupId,
+        local_member: MemberIdentity,
+    },
     #[snafu(display("Persisted group {group_id} was invalid at {location}: {source}"))]
     InvalidPersistedGroup {
         group_id: GroupId,
@@ -388,6 +514,13 @@ pub(crate) enum InboundDeliveryError {
         row_id: RowId,
         source: OperationError,
     },
+    #[snafu(display("Inbound pending group activation failed: {source}"))]
+    PendingGroupActivation {
+        #[snafu(source(from(GroupActivationError, Box::new)))]
+        source: Box<GroupActivationError>,
+    },
+    #[snafu(display("Listener rejected one inbound pending group decision event: {source}"))]
+    NotifyPendingGroupDecision { source: ListenerError },
     #[snafu(display("Listener rejected one inbound data-change event: {source}"))]
     NotifyListener { source: ListenerError },
 }
@@ -398,19 +531,24 @@ impl InboundDeliveryError {
             Self::StoreAccess { .. }
             | Self::LoadDatasetSchema { .. }
             | Self::InvalidPersistedGroup { .. }
-            | Self::InstallBootstrapGroup { .. }
+            | Self::InstallGroupSetup { .. }
+            | Self::PendingGroupActivation { .. }
             | Self::CompleteProcessedPromise { .. }
+            | Self::NotifyPendingGroupDecision { .. }
             | Self::NotifyListener { .. } => InboundFailureAction::Fatal,
             Self::DecodeMessage { .. }
-            | Self::BootstrapSecurity { .. }
-            | Self::BootstrapGroupIdMismatch { .. }
+            | Self::GroupSetupSecurity { .. }
             | Self::UnexpectedReliableMessage
+            | Self::ReliableMessageGroupMismatch { .. }
+            | Self::ReliableMessageMissingGroupScope { .. }
             | Self::UnexpectedGroupMessage
-            | Self::InvalidBootstrapMembers { .. }
-            | Self::BootstrapMissingLocalMember { .. }
-            | Self::BootstrapSenderNotInGroup { .. }
-            | Self::BootstrapSenderNotFirstMember { .. }
+            | Self::InvalidGroupSetupMembers { .. }
+            | Self::GroupSetupMissingLocalMember { .. }
+            | Self::GroupSetupSenderNotInGroup { .. }
+            | Self::GroupSetupSenderNotFirstMember { .. }
             | Self::UnknownHostedGroup { .. }
+            | Self::InvalidPendingGroupMembers { .. }
+            | Self::PendingGroupMissingLocalMember { .. }
             | Self::MissingDatasetSchema { .. }
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
