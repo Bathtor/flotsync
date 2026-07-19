@@ -1,0 +1,11 @@
+id = "019f7b56-0bdc-7602-ba86-3b9f690ee997"
+ref = "flotsync-git-f32"
+title = "Reorganise oversized Rust modules"
+body = "Refactor agreed oversized Rust modules along semantic boundaries, preserving production behaviour. No production change is permitted beyond moving code, module declarations/re-exports, imports, documentation required by the new modules, and visibility corrections. Agreed scope: R01 runtime tests by fixtures/scenario families; R02 SQLite store by transaction/groups/keys/datasets/updates/pending groups/decode; R03 in-memory data by state/operation building/operation application/field state/snapshots/values; R04 a runtime/component/ subtree with all ReplicationRuntimeComponent implementations retained in component/mod.rs and only component-local helper modules; R05 API by changes/snapshots/combined group/security/store; R06 codec messages by message family; R07 schema snapshot contracts/writer/reader/tests; R08 route manager; R09 TCP driver; R10 IO test support; R11 reliable delivery; R12 Kompact testing; R17 UDPour runtime tests; R18 runtime host; R20 security store; R22 delivery security; R23 data-model snapshots with shared primitives retained in module root; R25 route-establishment tests; R26 schema-operation test support; R28 UDPour runtime; R32 Kompact driver component; R33 security tests; R36 Kompact tests. Explicitly unchanged: R13-R15, R19, R21, R24, R27, R29-R31, R34-R35, R37-R38. Implement as small buildable batches; preserve public paths with re-exports where required. Final validation must include formatting, clippy where practical, and targeted tests."
+status = "in-progress"
+status_reason = "in review"
+type = "task"
+priority = 3
+assignee = "Codex"
+created_at = "2026-07-19T17:04:24.540612Z"
+updated_at = "2026-07-19T18:45:15.473207Z"
