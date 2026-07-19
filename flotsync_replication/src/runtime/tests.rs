@@ -2705,7 +2705,8 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
         "the injected post-commit failure must prevent immediate activation"
     );
 
-    let _shutdown_result = wait_for_test_reply(bob_runtime.shutdown());
+    wait_for_test_reply(bob_runtime.shutdown())
+        .expect("runtime host should shut down after the induced component fault");
     let restarted_listener = Arc::new(ListenerStub::default());
     let restarted_runtime = load_runtime_with_parts_and_config(
         app_bob_id(),

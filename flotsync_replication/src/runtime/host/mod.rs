@@ -481,6 +481,11 @@ where
         control_timeout: Duration,
     ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
         async move {
+            // Faulty and destroyed components cannot process lifecycle messages.
+            // The enclosing system shutdown remains responsible for final cleanup.
+            if self.is_faulty() || self.is_destroyed() {
+                return Ok(());
+            }
             system
                 .stop_notify(self)
                 .map(|result| result.boxed().context(ControlFutureSnafu))
