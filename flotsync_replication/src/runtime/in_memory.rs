@@ -3,6 +3,7 @@ use super::errors::{
     InboundDeliveryError,
     InstallMissingLocalMemberSnafu,
     InvalidPersistedMembersSnafu,
+    PersistedFinalVersionVectorMemberCountMismatchSnafu,
     PersistedLocalMemberIndexMismatchSnafu,
     PersistedVersionVectorMemberCountMismatchSnafu,
     PublishChangesError,
@@ -105,6 +106,16 @@ impl LoadedGroupMeta {
                 actual_member_count: member_count.get(),
             }
         );
+        if let Some(final_versions) = group.lifecycle.final_versions() {
+            ensure!(
+                final_versions.num_members() == member_count,
+                PersistedFinalVersionVectorMemberCountMismatchSnafu {
+                    group_id,
+                    final_member_count: final_versions.num_members().get(),
+                    actual_member_count: member_count.get(),
+                }
+            );
+        }
 
         Ok(Self {
             members,

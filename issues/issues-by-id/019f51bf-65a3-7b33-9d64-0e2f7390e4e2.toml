@@ -26,8 +26,8 @@ N. InitialSnapshot is Empty, Inline, or Metadata. Empty means empty state, not n
 O. Snapshot refs are { group_id, versions }, and equivalent refs may alias the same logical snapshot.
 P. New-group activation snapshots are encrypted with the new group key.
 Q. Inline transfer is sufficient for this parent; chunked snapshot transfer is tracked separately."""
-status = "in-progress"
-status_reason = "plan agreed"
+status = "closed"
+status_reason = "completed"
 type = "feature"
 priority = 2
 labels = ["area:replication"]
@@ -45,4 +45,11 @@ children = [
     "019f7a4f-c2c8-7bf0-b3a9-5ccb333e941e",
 ]
 created_at = "2026-07-11T15:15:25.731747Z"
-updated_at = "2026-07-19T12:17:59.125297Z"
+updated_at = "2026-07-19T15:39:48.485476Z"
+closed_at = "2026-07-19T15:39:48.485476Z"
+
+[[comments]]
+id = "019f7b08-9785-7172-a0f0-82038b705169"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-19T15:39:48.485476Z"

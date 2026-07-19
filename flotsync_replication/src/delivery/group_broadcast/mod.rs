@@ -529,6 +529,7 @@ mod tests {
             MemberKeyTrustEvidenceKind,
             MemberKeyTrustEvidenceRecord,
             MemberPublicKeysRecord,
+            ReplicationGroupLifecycle,
             ReplicationGroupRecord,
             ReplicationStore,
         },
@@ -1517,6 +1518,7 @@ mod tests {
                     version_vector: VersionVector::initial(
                         NonZeroUsize::new(members.len()).expect("test group must have members"),
                     ),
+                    lifecycle: ReplicationGroupLifecycle::Open,
                     security_material,
                 };
                 transaction

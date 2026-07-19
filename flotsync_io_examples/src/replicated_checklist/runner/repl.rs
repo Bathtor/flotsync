@@ -83,11 +83,14 @@ impl ReplicationEventListener for ChecklistListener {
                         .boxed()?;
                     Ok(())
                 }
-                ReplicationEvent::MigrationProposal { respond, .. } => {
-                    respond
-                        .reject(RejectionReason::PolicyDenied)
-                        .await
-                        .boxed()?;
+                ReplicationEvent::MigrationProposals { proposals } => {
+                    for candidate in proposals {
+                        candidate
+                            .respond
+                            .reject(RejectionReason::PolicyDenied)
+                            .await
+                            .boxed()?;
+                    }
                     Ok(())
                 }
             }

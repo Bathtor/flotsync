@@ -1,7 +1,7 @@
 #[cfg(any(test, feature = "test-support"))]
 use crate::delivery::security::DeliverySecurityError;
 use crate::{
-    api::{DatasetId, ListenerError, RowId, StoreError},
+    api::{DatasetId, ListenerError, ReplicationGroupLifecycle, RowId, StoreError},
     codecs::messages::RuntimeMessageError,
 };
 use flotsync_core::{
@@ -25,6 +25,48 @@ use uuid::Uuid;
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(group_lifecycle))]
+pub(crate) enum GroupLifecycleTransitionError {
+    #[snafu(display("Old migration group {group_id} is not hosted by this runtime."))]
+    UnknownGroup { group_id: GroupId },
+    #[snafu(display(
+        "Old migration group {group_id} cannot accept a new direction from lifecycle {lifecycle:?}."
+    ))]
+    NotOpen {
+        group_id: GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    },
+    #[snafu(display(
+        "Old migration group {group_id} lifecycle does not match the accepted migration cut."
+    ))]
+    AcceptedCutMismatch { group_id: GroupId },
+    #[snafu(display(
+        "Migration cut for group {group_id} has {final_member_count} members, but the old group has {group_member_count}."
+    ))]
+    MemberCountMismatch {
+        group_id: GroupId,
+        final_member_count: usize,
+        group_member_count: usize,
+    },
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)), module(accept_migration))]
+pub(crate) enum AcceptMigrationError {
+    #[snafu(display("Target group material could not be prepared: {source}"))]
+    PrepareTarget {
+        #[snafu(source(from(GroupActivationError, Box::new)))]
+        source: Box<GroupActivationError>,
+    },
+    #[snafu(display("Replication-store access failed while accepting migration: {source}"))]
+    StoreAccess { source: StoreError },
+    #[snafu(display("Old-group lifecycle rejected migration acceptance: {source}"))]
+    Lifecycle {
+        source: GroupLifecycleTransitionError,
+    },
+}
+
+#[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum CreateGroupError {
     #[snafu(display("Group members must include the local member {local_member}."))]
@@ -44,6 +86,8 @@ pub(super) enum SnapshotRowsError {
     EmptyDatasets,
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Group {group_id} is closed to application reads."))]
+    GroupClosed { group_id: GroupId },
     #[snafu(display("Dataset {dataset_id} has no schema available for row snapshots."))]
     MissingDatasetSchema { dataset_id: DatasetId },
     #[snafu(display("Replication-store access failed at {location}: {source}"))]
@@ -59,6 +103,8 @@ pub(super) enum SnapshotRowsError {
 pub(super) enum SummaryError {
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Group {group_id} is closed to application summary requests."))]
+    GroupClosed { group_id: GroupId },
     #[snafu(display("Summary target {target} is not a member of group {group_id}."))]
     TargetNotInGroup {
         group_id: GroupId,
@@ -101,6 +147,14 @@ pub(crate) enum GroupInstallError {
     PersistedVersionVectorMemberCountMismatch {
         group_id: GroupId,
         persisted_member_count: usize,
+        actual_member_count: usize,
+    },
+    #[snafu(display(
+        "Persisted group {group_id} stored a final vector with {final_member_count} members, but the canonical member set has {actual_member_count}."
+    ))]
+    PersistedFinalVersionVectorMemberCountMismatch {
+        group_id: GroupId,
+        final_member_count: usize,
         actual_member_count: usize,
     },
     #[snafu(display(
@@ -158,6 +212,8 @@ pub(super) enum RuntimeStartupError {
 pub(crate) enum ChangeGroupMembershipError {
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Group {group_id} no longer accepts membership changes."))]
+    GroupNotWritable { group_id: GroupId },
     #[snafu(display("New group members were invalid: {source}"))]
     InvalidMembers { source: GroupMembersError },
     #[snafu(display("New group members must include the local member {local_member}."))]
@@ -252,6 +308,10 @@ pub(crate) enum GroupActivationError {
         #[snafu(source(from(GroupInstallError, Box::new)))]
         source: Box<GroupInstallError>,
     },
+    #[snafu(display("Failed to close the old migration group: {source}"))]
+    CloseOldGroup {
+        source: GroupLifecycleTransitionError,
+    },
     #[snafu(display("Listener rejected one activation data-change event: {source}"))]
     NotifyListener { source: ListenerError },
 }
@@ -270,6 +330,8 @@ pub(crate) enum PublishChangesError {
     },
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
+    #[snafu(display("Group {group_id} no longer accepts local updates."))]
+    GroupNotWritable { group_id: GroupId },
     #[snafu(display("Read token does not contain group {group_id}."))]
     ReadTokenMissingGroup { group_id: GroupId },
     #[snafu(display(
@@ -367,6 +429,11 @@ pub(crate) enum InboundDeliveryError {
     DecodeMessage { source: RuntimeMessageError },
     #[snafu(display("Inbound group setup failed security checks: {source}"))]
     GroupSetupSecurity { source: BoxedError },
+    #[snafu(display("Inbound migration acceptance failed: {source}"))]
+    AcceptMigration {
+        #[snafu(source(from(AcceptMigrationError, Box::new)))]
+        source: Box<AcceptMigrationError>,
+    },
     #[snafu(display("Reliable delivery unexpectedly carried a group-broadcast update message."))]
     UnexpectedReliableMessage,
     #[snafu(display(
@@ -532,6 +599,7 @@ impl InboundDeliveryError {
             | Self::LoadDatasetSchema { .. }
             | Self::InvalidPersistedGroup { .. }
             | Self::InstallGroupSetup { .. }
+            | Self::AcceptMigration { .. }
             | Self::PendingGroupActivation { .. }
             | Self::CompleteProcessedPromise { .. }
             | Self::NotifyPendingGroupDecision { .. }

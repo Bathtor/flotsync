@@ -21,6 +21,7 @@ use crate::{
         PendingGroupActivationRecord,
         PendingGroupDecisionRecord,
         PendingGroupWorkKey,
+        ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationRowStateRecord,
@@ -615,6 +616,18 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn update_replication_group_lifecycle<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        async move {
+            update_replication_group_lifecycle(self.assert_open_connection(), group_id, &lifecycle)
+                .await
+        }
+        .boxed()
+    }
+
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowStatePatch,
@@ -722,6 +735,23 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 type SqliteStoreConnection = SqliteConnection;
 type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 
+const GROUP_LIFECYCLE_OPEN_SQL: &str = "open";
+const GROUP_LIFECYCLE_READ_ONLY_SQL: &str = "read_only";
+const GROUP_LIFECYCLE_CLOSED_SQL: &str = "closed";
+
+// SQLite schema strings cannot interpolate the constants above. Keep this
+// adjacent CHECK constraint aligned when lifecycle labels change.
+const REPLICATION_GROUPS_SCHEMA_STATEMENT: &str = concat!(
+    "\nCREATE TABLE IF NOT EXISTS replication_groups (\n",
+    "    group_id TEXT PRIMARY KEY NOT NULL,\n",
+    "    version_vector BLOB NOT NULL,\n",
+    "    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('open', 'read_only', 'closed')),\n",
+    "    successor_group_id TEXT,\n",
+    "    final_versions BLOB,\n",
+    "    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE\n",
+    ");\n",
+);
+
 /// `SQLite` compares BLOBs lexicographically. Fixed-width big-endian encodings
 /// therefore preserve the natural ordering of `u64` values across the full
 /// range, so `ORDER BY update_version` remains numerically correct even above
@@ -776,13 +806,7 @@ CREATE TABLE IF NOT EXISTS group_dataset_schemas (
     FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
 );
 ",
-    "
-CREATE TABLE IF NOT EXISTS replication_groups (
-    group_id TEXT PRIMARY KEY NOT NULL,
-    version_vector BLOB NOT NULL,
-    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
-);
-",
+    REPLICATION_GROUPS_SCHEMA_STATEMENT,
     "
 CREATE TABLE IF NOT EXISTS datasets (
     group_id TEXT NOT NULL,
@@ -925,7 +949,7 @@ async fn load_replication_group(
 ) -> Result<Option<ReplicationGroupRecord>, StoreError> {
     let row = sqlx::query(
         "
-SELECT version_vector
+SELECT version_vector, lifecycle, successor_group_id, final_versions
 FROM replication_groups
 WHERE group_id = ?1
 ",
@@ -944,7 +968,10 @@ WHERE group_id = ?1
         &row.get::<Vec<u8>, _>("version_vector"),
         material.member_count(),
     )?;
-    Ok(Some(material.activate(version_vector)))
+    let lifecycle = decode_replication_group_lifecycle(&row, material.member_count())?;
+    let mut group = material.activate(version_vector);
+    group.lifecycle = lifecycle;
+    Ok(Some(group))
 }
 
 async fn load_replication_groups(
@@ -1089,7 +1116,13 @@ async fn insert_replication_group(
         security_material: group.security_material.clone(),
     };
     ensure_replication_group_material(connection, &material).await?;
-    activate_replication_group(connection, group.group_id, &group.version_vector).await
+    activate_replication_group_with_lifecycle(
+        connection,
+        group.group_id,
+        &group.version_vector,
+        &group.lifecycle,
+    )
+    .await
 }
 
 /// Store group material, accepting only exact idempotent replays.
@@ -1213,14 +1246,40 @@ async fn activate_replication_group(
     group_id: GroupId,
     version_vector: &VersionVector,
 ) -> Result<(), StoreError> {
+    activate_replication_group_with_lifecycle(
+        connection,
+        group_id,
+        version_vector,
+        &ReplicationGroupLifecycle::Open,
+    )
+    .await
+}
+
+/// Insert the active marker and its application-access lifecycle.
+async fn activate_replication_group_with_lifecycle(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    version_vector: &VersionVector,
+    lifecycle: &ReplicationGroupLifecycle,
+) -> Result<(), StoreError> {
+    let lifecycle_sql = replication_group_lifecycle_sql_label(lifecycle);
+    let successor_group_id = lifecycle
+        .successor_group_id()
+        .map(|group_id| group_id.to_string());
+    let final_versions = lifecycle.final_versions().map(encode_stored_version_vector);
     sqlx::query(
         "
-INSERT INTO replication_groups (group_id, version_vector)
-VALUES (?1, ?2)
+INSERT INTO replication_groups (
+    group_id, version_vector, lifecycle, successor_group_id, final_versions
+)
+VALUES (?1, ?2, ?3, ?4, ?5)
 ",
     )
     .bind(group_id.to_string())
     .bind(encode_stored_version_vector(version_vector))
+    .bind(lifecycle_sql)
+    .bind(successor_group_id)
+    .bind(final_versions)
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;
@@ -1556,6 +1615,40 @@ WHERE group_id = ?1
     )
     .bind(group_id.to_string())
     .bind(encode_stored_version_vector(version_vector))
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?
+    .rows_affected();
+    ensure!(
+        rows_affected == 1,
+        MissingStoredGroupSnafu {
+            group_id: *group_id
+        }
+    );
+    Ok(())
+}
+
+async fn update_replication_group_lifecycle(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    lifecycle: &ReplicationGroupLifecycle,
+) -> Result<(), StoreError> {
+    let lifecycle_sql = replication_group_lifecycle_sql_label(lifecycle);
+    let successor_group_id = lifecycle
+        .successor_group_id()
+        .map(|group_id| group_id.to_string());
+    let final_versions = lifecycle.final_versions().map(encode_stored_version_vector);
+    let rows_affected = sqlx::query(
+        "
+UPDATE replication_groups
+SET lifecycle = ?2, successor_group_id = ?3, final_versions = ?4
+WHERE group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .bind(lifecycle_sql)
+    .bind(successor_group_id)
+    .bind(final_versions)
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?
@@ -2414,6 +2507,21 @@ impl PendingGroupPayloadKind {
 }
 
 #[derive(Debug, Snafu)]
+enum StoredGroupLifecycleError {
+    /// Open groups must not carry accepted migration data.
+    #[snafu(display("Open replication group unexpectedly stored migration data."))]
+    OpenWithMigrationData,
+    /// Non-open groups require both the accepted successor and immutable cut.
+    #[snafu(display(
+        "Replication group lifecycle '{raw}' did not store required field '{field}'."
+    ))]
+    MissingMigrationData { raw: String, field: &'static str },
+    /// Stored lifecycle discriminator is not supported.
+    #[snafu(display("Unknown replication group lifecycle '{raw}'."))]
+    Unknown { raw: String },
+}
+
+#[derive(Debug, Snafu)]
 enum PendingGroupSqlKeyError {
     /// Stored `work_kind` did not name any supported pending group payload.
     #[snafu(display("Unknown pending group work kind '{raw}'."))]
@@ -2661,6 +2769,95 @@ fn decode_dataset_row_last_changed_versions(
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
     RuntimeVersionVectorProtoSource::from(version_vector).encode_proto_to_vec()
+}
+
+/// Return the stable `SQLite` label for one group lifecycle variant.
+fn replication_group_lifecycle_sql_label(lifecycle: &ReplicationGroupLifecycle) -> &'static str {
+    match lifecycle {
+        ReplicationGroupLifecycle::Open => GROUP_LIFECYCLE_OPEN_SQL,
+        ReplicationGroupLifecycle::ReadOnly { .. } => GROUP_LIFECYCLE_READ_ONLY_SQL,
+        ReplicationGroupLifecycle::Closed { .. } => GROUP_LIFECYCLE_CLOSED_SQL,
+    }
+}
+
+/// Require one migration-specific column for a non-open lifecycle row.
+fn required_stored_group_lifecycle_field<T>(
+    value: Option<T>,
+    raw: &str,
+    field: &'static str,
+) -> Result<T, StoreError> {
+    value
+        .context(MissingMigrationDataSnafu {
+            raw: raw.to_owned(),
+            field,
+        })
+        .map_err(|source| invalid_stored_object("replication group lifecycle", source))
+}
+
+/// Ensure an open lifecycle row does not carry migration-only columns.
+fn validate_open_group_lifecycle_fields(
+    successor_group_id: Option<&str>,
+    final_versions: Option<&[u8]>,
+) -> Result<(), StoredGroupLifecycleError> {
+    ensure!(
+        successor_group_id.is_none() && final_versions.is_none(),
+        OpenWithMigrationDataSnafu
+    );
+    Ok(())
+}
+
+/// Decode lifecycle state and enforce the discriminator/cut relationship.
+fn decode_replication_group_lifecycle(
+    row: &sqlx::sqlite::SqliteRow,
+    member_count: NonZeroUsize,
+) -> Result<ReplicationGroupLifecycle, StoreError> {
+    let raw = row.get::<String, _>("lifecycle");
+    let successor_group_id = row.get::<Option<String>, _>("successor_group_id");
+    let final_versions = row.get::<Option<Vec<u8>>, _>("final_versions");
+    match raw.as_str() {
+        GROUP_LIFECYCLE_OPEN_SQL => {
+            validate_open_group_lifecycle_fields(
+                successor_group_id.as_deref(),
+                final_versions.as_deref(),
+            )
+            .map_err(|source| invalid_stored_object("replication group lifecycle", source))?;
+            Ok(ReplicationGroupLifecycle::Open)
+        }
+        GROUP_LIFECYCLE_READ_ONLY_SQL => {
+            let successor_group_id = required_stored_group_lifecycle_field(
+                successor_group_id,
+                &raw,
+                "successor_group_id",
+            )?;
+            let successor_group_id = decode_group_id(&successor_group_id)?;
+            let final_versions =
+                required_stored_group_lifecycle_field(final_versions, &raw, "final_versions")?;
+            let final_versions = decode_stored_version_vector(&final_versions, member_count)?;
+            Ok(ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions,
+            })
+        }
+        GROUP_LIFECYCLE_CLOSED_SQL => {
+            let successor_group_id = required_stored_group_lifecycle_field(
+                successor_group_id,
+                &raw,
+                "successor_group_id",
+            )?;
+            let successor_group_id = decode_group_id(&successor_group_id)?;
+            let final_versions =
+                required_stored_group_lifecycle_field(final_versions, &raw, "final_versions")?;
+            let final_versions = decode_stored_version_vector(&final_versions, member_count)?;
+            Ok(ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions,
+            })
+        }
+        _ => Err(invalid_stored_object(
+            "replication group lifecycle",
+            StoredGroupLifecycleError::Unknown { raw },
+        )),
+    }
 }
 
 fn encode_group_dataset_schema_payload(dataset_schema: &DatasetSchema) -> Vec<u8> {
@@ -3634,6 +3831,7 @@ mod tests {
             local_member_index: MemberIndex::new(0),
             group_schema: docs_group_schema(),
             version_vector,
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
@@ -3767,6 +3965,68 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("dropping an open transaction should release the SQLite store promptly");
         probe_result.expect("dropped transaction should leave the SQLite store usable");
+    }
+
+    #[test]
+    fn sqlite_store_roundtrips_replication_group_lifecycle() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(99));
+        let successor_group_id = GroupId(Uuid::from_u128(100));
+        let group = sample_group(group_id);
+        let final_versions = group.version_vector.clone();
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(group))
+            .expect("group should insert");
+        wait_for_store_future(transaction.update_replication_group_lifecycle(
+            &group_id,
+            ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            },
+        ))
+        .expect("read-only lifecycle should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let stored = wait_for_store_future(transaction.load_replication_group(&group_id))
+            .expect("group should load")
+            .expect("group should exist");
+        assert_eq!(
+            stored.lifecycle,
+            ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            }
+        );
+        wait_for_store_future(transaction.release()).expect("read should release");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.update_replication_group_lifecycle(
+            &group_id,
+            ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            },
+        ))
+        .expect("closed lifecycle should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let stored = wait_for_store_future(transaction.load_replication_group(&group_id))
+            .expect("group should load")
+            .expect("group should exist");
+        assert_eq!(
+            stored.lifecycle,
+            ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions,
+            }
+        );
+        wait_for_store_future(transaction.release()).expect("read should release");
     }
 
     #[test]

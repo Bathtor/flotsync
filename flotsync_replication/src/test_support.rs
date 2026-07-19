@@ -434,7 +434,7 @@ impl ReplicationEventListener for TestEventListener {
                         .expect("listener event channel must remain open while tests are running");
                 }
                 ReplicationEvent::GroupInvitation { .. }
-                | ReplicationEvent::MigrationProposal { .. } => {}
+                | ReplicationEvent::MigrationProposals { .. } => {}
             }
             Ok(())
         }

@@ -19,7 +19,7 @@ use flotsync_core::{
     MemberIdentity,
     MemberIndex,
     membership::SharedGroupMemberships,
-    versions::UpdateId,
+    versions::{UpdateId, VersionVector},
 };
 use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
 use flotsync_utils::{OptionExt as _, ResultExt as _, kompact_config::ConfigReadExt as _};
@@ -76,6 +76,13 @@ pub(super) enum CatchUpManagerMessage {
     NeedVersions(NeedVersions),
     /// Record producer versions already stored by the local runtime.
     ObservedAvailable(ObservedAvailable),
+    /// Bound current and future repair traffic for one accepted old group.
+    FinaliseGroup {
+        /// Old group whose migration direction was accepted.
+        group_id: GroupId,
+        /// Immutable replay cut carried by the accepted proposal.
+        final_versions: VersionVector,
+    },
 }
 
 /// Concrete missing producer ranges for one replication group.
@@ -199,6 +206,12 @@ impl ProducerVersionSets {
         self.ranges.retain(|_, versions| !versions.is_empty());
     }
 
+    /// Remove producer versions beyond one fixed group replay cut.
+    fn bound_to(&mut self, final_versions: &VersionVector) {
+        let bounded = bound_ranges_to_versions(self.to_message_ranges(), final_versions);
+        *self = Self::from_ranges(&bounded);
+    }
+
     /// Convert normalised intervals back into wire/runtime range messages.
     fn to_message_ranges(&self) -> Vec<UpdateRangeMessage> {
         self.ranges
@@ -266,6 +279,28 @@ pub(super) fn subtract_available_ranges(
     needed_versions.to_message_ranges()
 }
 
+/// Clamp inclusive producer ranges to one compatible final-version vector.
+fn bound_ranges_to_versions(
+    ranges: Vec<UpdateRangeMessage>,
+    final_versions: &VersionVector,
+) -> Vec<UpdateRangeMessage> {
+    ranges
+        .into_iter()
+        .filter_map(|mut range| {
+            let producer_index = range.producer_index as usize;
+            if producer_index >= final_versions.num_members().get() {
+                return None;
+            }
+            let final_version = final_versions.version_at(producer_index);
+            if range.start_version > final_version {
+                return None;
+            }
+            range.end_version = range.end_version.min(final_version);
+            Some(range)
+        })
+        .collect()
+}
+
 /// Convert one protocol range into the interval type used for set arithmetic.
 fn version_set_from_range(range: UpdateRangeMessage) -> IntervalSet<u64> {
     debug_assert!(
@@ -291,6 +326,8 @@ pub(super) struct CatchUpManagerComponent {
     pending_needs: HashMap<GroupId, PendingNeed>,
     /// Group-scoped update-log availability known from storage and runtime observations.
     known_available: HashMap<GroupId, ProducerVersionSets>,
+    /// Accepted migration cuts used to bound old-group repair traffic.
+    final_versions: HashMap<GroupId, VersionVector>,
 }
 
 impl CatchUpManagerComponent {
@@ -309,6 +346,7 @@ impl CatchUpManagerComponent {
             max_updates_per_batch: NonZeroUsize::new(DEFAULT_MAX_UPDATES_PER_BATCH),
             pending_needs: HashMap::new(),
             known_available: HashMap::new(),
+            final_versions: HashMap::new(),
         }
     }
 
@@ -351,6 +389,9 @@ impl CatchUpManagerComponent {
         group_id: GroupId,
         mut needed_versions: ProducerVersionSets,
     ) {
+        if let Some(final_versions) = self.final_versions.get(&group_id) {
+            needed_versions.bound_to(final_versions);
+        }
         if let Some(available) = self.known_available.get(&group_id) {
             needed_versions.subtract_sets(available);
         }
@@ -497,6 +538,29 @@ impl CatchUpManagerComponent {
         Handled::OK
     }
 
+    /// Install a final cut and trim any outstanding request beyond it.
+    fn handle_finalise_group(
+        &mut self,
+        group_id: GroupId,
+        final_versions: &VersionVector,
+    ) -> HandlerResult {
+        self.final_versions.insert(group_id, final_versions.clone());
+        let mut timer_to_cancel = None;
+        if let Some(pending) = self.pending_needs.get_mut(&group_id) {
+            pending.needed_versions.bound_to(final_versions);
+            if pending.is_empty() {
+                timer_to_cancel = pending.retry_timer.take();
+            }
+        }
+        if timer_to_cancel.is_some() {
+            self.pending_needs.remove(&group_id);
+        }
+        if let Some(timer) = timer_to_cancel {
+            self.cancel_timer(timer);
+        }
+        Handled::OK
+    }
+
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
         let message =
             WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
@@ -560,6 +624,12 @@ impl CatchUpManagerComponent {
                 group_id,
                 sender
             );
+        }
+        if ranges.is_empty() {
+            return Handled::OK;
+        }
+        if let Some(final_versions) = self.final_versions.get(&group_id) {
+            ranges = bound_ranges_to_versions(ranges, final_versions);
         }
         if ranges.is_empty() {
             return Handled::OK;
@@ -653,7 +723,11 @@ impl CatchUpManagerComponent {
             .await
             .context(catch_up::StoreAccessSnafu)?;
         let mut available_by_group = HashMap::new();
+        let mut final_versions_by_group = HashMap::new();
         for group in groups {
+            if let Some(final_versions) = group.lifecycle.final_versions() {
+                final_versions_by_group.insert(group.group_id, final_versions.clone());
+            }
             let update_ids = transaction
                 .load_replication_update_ids(&group.group_id, ReplicationUpdateFilter::All, None)
                 .await
@@ -664,6 +738,7 @@ impl CatchUpManagerComponent {
             }
         }
         self.known_available = available_by_group;
+        self.final_versions = final_versions_by_group;
         Ok(())
     }
 
@@ -784,6 +859,10 @@ impl Actor for CatchUpManagerComponent {
             CatchUpManagerMessage::ObservedAvailable(observed) => {
                 self.handle_observed_available(observed)
             }
+            CatchUpManagerMessage::FinaliseGroup {
+                group_id,
+                final_versions,
+            } => self.handle_finalise_group(*group_id, final_versions),
         }
     }
 }
@@ -799,13 +878,18 @@ mod tests {
             GroupMemberKeys,
             GroupSchema,
             MemberKeyId,
+            ReplicationGroupLifecycle,
             ReplicationGroupRecord,
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
         test_support::test_public_member_keys,
     };
-    use flotsync_core::{member::Identifier, versions::VersionVector};
+    use flotsync_core::{
+        member::Identifier,
+        membership::{GroupMembers, GroupMemberships},
+        versions::VersionVector,
+    };
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
     use flotsync_messages::datamodel as datamodel_proto;
     use uuid::Uuid;
@@ -863,6 +947,7 @@ mod tests {
             local_member_index: MemberIndex::new(0),
             group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
@@ -902,6 +987,22 @@ mod tests {
         wait_for_store_future(transaction.commit()).expect("transaction should commit");
     }
 
+    fn catch_up_manager_for_group(
+        system: &KompactSystem,
+        group_id: GroupId,
+    ) -> Arc<Component<CatchUpManagerComponent>> {
+        let local_member = local_member();
+        let members = GroupMembers::from_ordered_members([local_member.clone(), remote_member()])
+            .expect("test group members should build");
+        let memberships =
+            SharedGroupMemberships::new(GroupMemberships::from_groups([(group_id, members)]));
+        let store: Arc<dyn ReplicationStore> = Arc::new(
+            wait_for_store_future(SqliteReplicationStore::in_memory(local_member.clone()))
+                .expect("store should build"),
+        );
+        system.create(move || CatchUpManagerComponent::new(local_member, memberships, store))
+    }
+
     #[test]
     fn producer_version_sets_preserve_holes() {
         let mut versions = ProducerVersionSets::new();
@@ -939,6 +1040,90 @@ mod tests {
         assert!(!pending.insert_sets(&duplicate_request));
         assert!(pending.insert_sets(&overlapping_request));
         assert_eq!(pending.to_message_ranges(), vec![update_range(0, 1, 4)]);
+    }
+
+    #[test]
+    fn final_versions_trim_ranges_and_drop_post_cut_producers() {
+        let final_versions =
+            VersionVector::Full(flotsync_core::versions::PureVersionVector::from([3, 0]));
+        let bounded = bound_ranges_to_versions(
+            vec![
+                update_range(0, 2, 6),
+                update_range(1, 1, 2),
+                update_range(2, 1, 1),
+            ],
+            &final_versions,
+        );
+
+        assert_eq!(bounded, vec![update_range(0, 2, 3)]);
+    }
+
+    #[test]
+    fn finalise_group_trims_existing_pending_need() {
+        let group_id = GroupId(Uuid::from_u128(80_101));
+        let system = build_test_kompact_system();
+        let manager = catch_up_manager_for_group(&system, group_id);
+        let final_versions =
+            VersionVector::Full(flotsync_core::versions::PureVersionVector::from([3, 0]));
+
+        manager.on_definition(|component| {
+            let mut pending = PendingNeed::new();
+            pending
+                .needed_versions
+                .insert_ranges(&[update_range(0, 1, 6), update_range(1, 1, 2)]);
+            component.pending_needs.insert(group_id, pending);
+
+            let _handled = component.receive_local(CatchUpManagerMessage::FinaliseGroup {
+                group_id,
+                final_versions: final_versions.clone(),
+            });
+
+            assert_eq!(
+                component.final_versions.get(&group_id),
+                Some(&final_versions)
+            );
+            assert_eq!(
+                component
+                    .pending_needs
+                    .get(&group_id)
+                    .expect("bounded pending need should remain")
+                    .to_message_ranges(),
+                vec![update_range(0, 1, 3)],
+            );
+        });
+        system.shutdown().wait().expect("Kompact shutdown");
+    }
+
+    #[test]
+    fn inbound_need_range_is_truncated_to_final_versions() {
+        let group_id = GroupId(Uuid::from_u128(80_102));
+        let system = build_test_kompact_system();
+        let manager = catch_up_manager_for_group(&system, group_id);
+        let final_versions =
+            VersionVector::Full(flotsync_core::versions::PureVersionVector::from([3, 0]));
+
+        manager.on_definition(|component| {
+            component
+                .final_versions
+                .insert(group_id, final_versions.clone());
+            let _handled = component.handle_inbound_need_range(
+                &remote_member(),
+                NeedRangeMessage {
+                    group_id,
+                    ranges: vec![update_range(0, 2, 6), update_range(1, 1, 2)],
+                },
+            );
+
+            assert_eq!(
+                component
+                    .pending_needs
+                    .get(&group_id)
+                    .expect("bounded inbound request should become pending")
+                    .to_message_ranges(),
+                vec![update_range(0, 2, 3)],
+            );
+        });
+        system.shutdown().wait().expect("Kompact shutdown");
     }
 
     #[test]

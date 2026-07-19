@@ -384,11 +384,22 @@ and group-scoped delivery is handled by sub-protocol D.
 
 ### 9.2 State Model (per local node, per replication group)
 
-- `Active`: normal update production/application.
-- `CatchUp`: local node is behind known frontier and is requesting data.
-- `CausalityBlocked`: buffered updates exist with unsatisfied `ReadVV`.
-- `Migrating`: migration has been proposed/accepted and new-group transition is in progress.
-- `Closed`: old group locally closed for writes by policy.
+Application access follows a persisted lifecycle:
+
+- `Open`: application reads, writes, summaries, membership changes, and
+  listener row events are enabled.
+- `ReadOnly`: an accepted migration target and immutable `final_versions` cut
+  are recorded while target activation completes. Application reads,
+  summaries, and listener row events remain enabled; writes and further
+  membership changes are rejected.
+- `Closed`: application access and listener row events are disabled. The group
+  still applies and serves replication updates needed to reproduce the accepted
+  cut.
+
+Catch-up and causality-blocked work are operational states within this
+lifecycle. For `ReadOnly` and `Closed` groups, summaries, range requests, and
+accepted updates are bounded by `final_versions`. Read tokens omit both states
+because neither can produce further application writes.
 
 ### 9.3 Message Classes
 
@@ -646,8 +657,10 @@ Same wire behavior as initial sync: VV is the cursor.
 2. `SingleRecipientDurableDelivery`: deliver per-recipient invitation packages
    directly or through relay mailboxes until `RecipientAck`.
 3. receivers validate the self-contained setup and classify the work according
-   to local policy. Metadata snapshots are automatically rejected in the
-   current implementation because snapshot fetching is unavailable.
+   to local policy. Concurrent undecided proposals for the same old group are
+   exposed to the listener together so one candidate can be selected. Metadata
+   snapshots are automatically rejected in the current implementation because
+   snapshot fetching is unavailable.
 4. automatic rejection removes inactive material and pending work. Listener
    mediation atomically stores inactive material plus pending decision state.
    Automatic acceptance atomically stores inactive material plus accepted
@@ -655,16 +668,22 @@ Same wire behavior as initial sync: VV is the cursor.
 5. once the message has been processed and does not require retry, the receiver
    completes the reliable-delivery acknowledgement. Listener mediation does not
    wait for the eventual listener response before acknowledging delivery.
-6. pending listener decisions are re-surfaced after restart. Accepted activation
+6. accepting one proposal atomically records the selected target and cut, moves
+   the old group to `ReadOnly`, removes competing proposals for that old group,
+   and stores accepted activation work. Exact replays of the selected proposal
+   are idempotent; proposals for a different target or cut are terminally
+   rejected and acknowledged without setup validation or listener notification.
+7. pending listener decisions are re-surfaced after restart. Accepted activation
    work resumes after restart without asking the listener again.
-7. Empty snapshots activate without rows. Inline projected rows are embedded as
+8. Empty snapshots activate without rows. Inline projected rows are embedded as
    deterministic initial state, committed with target-group activation, and
    emitted to the listener after commit.
-8. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
+9. target activation and the old group's transition from `ReadOnly` to `Closed`
+   commit together. A closed old group continues bounded catch-up without
+   exposing further rows to the application.
+10. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
    within that group as normal.
-9. the current implementation does not yet perform the required old-group
-   read-only and inactive transitions; `flotsync-git-03f` tracks this gap.
-10. rejecting or ignoring migration can intentionally split old/new group
+11. rejecting or ignoring migration can intentionally split old/new group
    activity.
 
 ## 11. Error Handling and Compatibility

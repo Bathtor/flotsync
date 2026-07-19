@@ -77,6 +77,7 @@ use crate::{
         ReplicationConfig,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationSecuritySecrets,
@@ -558,6 +559,17 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .update_replication_group_version_vector(group_id, version_vector)
     }
 
+    fn update_replication_group_lifecycle<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .update_replication_group_lifecycle(group_id, lifecycle)
+    }
+
     fn apply_dataset_row_patch(
         &mut self,
         patch: DatasetRowStatePatch,
@@ -763,6 +775,7 @@ struct ListenerStub {
     data_changes: Mutex<Vec<CapturedDataChange>>,
     data_change_read_tokens: Mutex<Vec<ReadToken>>,
     pending_group_events: Mutex<Vec<CapturedPendingGroupEvent>>,
+    migration_proposal_event_sizes: Mutex<Vec<usize>>,
     reject_pending_group_events: Mutex<bool>,
     rejected_pending_group_event_count: Mutex<usize>,
     buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
@@ -776,6 +789,7 @@ impl Default for ListenerStub {
             data_changes: Mutex::new(Vec::new()),
             data_change_read_tokens: Mutex::new(Vec::new()),
             pending_group_events: Mutex::new(Vec::new()),
+            migration_proposal_event_sizes: Mutex::new(Vec::new()),
             reject_pending_group_events: Mutex::new(false),
             rejected_pending_group_event_count: Mutex::new(0),
             buffered_events: Mutex::new(buffered_events),
@@ -837,6 +851,13 @@ impl ListenerStub {
                 .lock()
                 .expect("pending-group listener capture mutex must not be poisoned"),
         )
+    }
+
+    fn migration_proposal_event_sizes(&self) -> Vec<usize> {
+        self.migration_proposal_event_sizes
+            .lock()
+            .expect("migration proposal event-size mutex must not be poisoned")
+            .clone()
     }
 
     fn wait_for_pending_group_event_count(&self, count: usize) {
@@ -925,7 +946,7 @@ impl ReplicationEventListener for ListenerStub {
                             respond,
                         });
                 }
-                ReplicationEvent::MigrationProposal { proposal, respond } => {
+                ReplicationEvent::MigrationProposals { proposals } => {
                     if *self
                         .reject_pending_group_events
                         .lock()
@@ -940,10 +961,20 @@ impl ReplicationEventListener for ListenerStub {
                             message: "pending group event rejected by test listener".to_owned(),
                         });
                     }
-                    self.pending_group_events
+                    self.migration_proposal_event_sizes
                         .lock()
-                        .expect("pending-group listener capture mutex must not be poisoned")
-                        .push(CapturedPendingGroupEvent::MigrationProposal { proposal, respond });
+                        .expect("migration proposal event-size mutex must not be poisoned")
+                        .push(proposals.len());
+                    let mut captured = self
+                        .pending_group_events
+                        .lock()
+                        .expect("pending-group listener capture mutex must not be poisoned");
+                    for proposal in proposals {
+                        captured.push(CapturedPendingGroupEvent::MigrationProposal {
+                            proposal: proposal.proposal,
+                            respond: proposal.respond,
+                        });
+                    }
                 }
             }
             Ok(())
@@ -995,6 +1026,26 @@ fn runtime_test_migration_proposal_decision() -> PendingGroupDecisionRecord {
         group_schema: GroupSchema::default(),
         initial_snapshot: InitialSnapshot::Empty,
         group_name: Some("runtime migration".to_owned()),
+        message: None,
+    })
+}
+
+fn migration_proposal_decision(
+    old_group_id: GroupId,
+    new_group_id: GroupId,
+) -> PendingGroupDecisionRecord {
+    PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+        migration_id: MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        final_versions: VersionVector::initial(
+            NonZeroUsize::new(2).expect("two old-group members"),
+        ),
+        proposed_members: vec![alice_member(), bob_member()],
+        group_schema: GroupSchema::default(),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: None,
         message: None,
     })
 }
@@ -1616,6 +1667,18 @@ where
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
 }
 
+fn persist_group_lifecycle(
+    store: &dyn ReplicationStore,
+    group_id: &GroupId,
+    lifecycle: ReplicationGroupLifecycle,
+) {
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.update_replication_group_lifecycle(group_id, lifecycle))
+        .expect("group lifecycle should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+}
+
 fn inactive_group_record(
     group_id: GroupId,
     members: Vec<MemberIdentity>,
@@ -1630,6 +1693,7 @@ fn inactive_group_record(
         version_vector: VersionVector::initial(
             NonZeroUsize::new(member_count).expect("group should not be empty"),
         ),
+        lifecycle: ReplicationGroupLifecycle::Open,
         security_material: current_slice_placeholder_group_security_material(group_id),
     }
 }
@@ -1664,6 +1728,7 @@ fn persist_group_membership_for_member<S>(
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(member_count).expect("group should not be empty"),
             ),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -1682,6 +1747,7 @@ fn persist_alice_group_with_security_material(
             local_member_index: MemberIndex::new(0),
             group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
         },
     );
@@ -1841,29 +1907,43 @@ fn title_update_message(
     update_id: UpdateId,
     read_versions: VersionVector,
 ) -> (RowId, UpdateMessage) {
-    let row_id = test_row_id(group_id, dataset_id.clone(), row_raw);
+    let row_id = test_row_id(group_id, dataset_id, row_raw);
     let mut source_dataset = LocalDataset::new(title_schema_static());
-    let operation = apply_local_upsert(
+    let message = title_update_message_for_row(
         &mut source_dataset,
         &row_id,
+        title,
+        update_id,
+        read_versions,
+    );
+    (row_id, message)
+}
+
+fn title_update_message_for_row(
+    source_dataset: &mut LocalDataset,
+    row_id: &RowId,
+    title: &str,
+    update_id: UpdateId,
+    read_versions: VersionVector,
+) -> UpdateMessage {
+    let operation = apply_local_upsert(
+        source_dataset,
+        row_id,
         crate::row_values! { "title" => title },
         update_id,
     )
     .expect("operation should build")
     .expect("operation should apply")
     .encoded_operation;
-    (
-        row_id,
-        UpdateMessage {
-            group_id,
-            update_id,
-            read_versions,
-            dataset_updates: vec![DatasetUpdateMessage {
-                dataset_id,
-                operations: vec![operation],
-            }],
-        },
-    )
+    UpdateMessage {
+        group_id: row_id.group_id,
+        update_id,
+        read_versions,
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: row_id.dataset_id.clone(),
+            operations: vec![operation],
+        }],
+    }
 }
 
 fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
@@ -2180,6 +2260,7 @@ fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
             local_member_index: MemberIndex::new(0),
             group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material_with_key_id(
                 group_id,
                 store_secret_key_id,
@@ -2232,6 +2313,7 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
             local_member_index: MemberIndex::new(0),
             group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material_with_key_id(
                 group_id,
                 store_secret_key_id,
@@ -2388,6 +2470,7 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(2).expect("group should have two members"),
             ),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -2510,6 +2593,66 @@ fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
 }
 
 #[test]
+fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_target() {
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let old_group_id = GroupId(Uuid::from_u128(60_120));
+    let selected_group_id = GroupId(Uuid::from_u128(60_121));
+    let competing_group_id = GroupId(Uuid::from_u128(60_122));
+    persist_group_in_store(
+        store.as_ref(),
+        inactive_group_record(
+            old_group_id,
+            vec![alice_member(), bob_member()],
+            GroupSchema::default(),
+        ),
+    );
+    store_pending_group_decision(
+        store.as_ref(),
+        migration_proposal_decision(old_group_id, selected_group_id),
+    );
+    store_pending_group_decision(
+        store.as_ref(),
+        migration_proposal_decision(old_group_id, competing_group_id),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_pending_group_event_count(2);
+    assert_eq!(listener.migration_proposal_event_sizes(), vec![2]);
+    let events = listener.take_pending_group_events();
+    let selected = events
+        .into_iter()
+        .find_map(|event| match event {
+            CapturedPendingGroupEvent::MigrationProposal { proposal, respond }
+                if proposal.migration_id.new_group_id == selected_group_id =>
+            {
+                Some(respond)
+            }
+            _ => None,
+        })
+        .expect("selected migration proposal should be exposed");
+    wait_for_test_reply(selected.accept()).expect("selected migration should activate");
+
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), competing_group_id).is_none());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), old_group_id).lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id: selected_group_id,
+            final_versions: VersionVector::initial(
+                NonZeroUsize::new(2).expect("two old-group members"),
+            ),
+        }
+    );
+    assert_eq!(
+        load_persisted_group(store.as_ref(), selected_group_id).lifecycle,
+        ReplicationGroupLifecycle::Open
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
 fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decision() {
     let alice_member = alice_member();
     let bob_member = bob_member();
@@ -2610,6 +2753,7 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
             local_member_index: MemberIndex::new(0),
             group_schema: docs_group_schema(),
             version_vector: unrelated_versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(
                 unrelated_group_id,
             ),
@@ -2623,6 +2767,7 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
             local_member_index: MemberIndex::new(0),
             group_schema: docs_group_schema(),
             version_vector: VersionVector::initial(member_count),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -2698,11 +2843,29 @@ fn runtime_resumes_pending_migration_proposal_activation() {
         [(dataset_id.clone(), title_schema_static())],
     );
     let members = vec![alice_member, bob_member];
+    let final_versions = VersionVector::Full(PureVersionVector::from([4, 0]));
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: migration_id.old_group_id,
+            member_keys: test_group_member_keys(members.clone()),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id: migration_id.new_group_id,
+                final_versions: final_versions.clone(),
+            },
+            security_material: current_slice_placeholder_group_security_material(
+                migration_id.old_group_id,
+            ),
+        },
+    );
     store_pending_group_activation(
         store.as_ref(),
         PendingGroupActivationRecord::MigrationProposal(MigrationProposal {
             migration_id,
-            final_versions: VersionVector::Full(PureVersionVector::from([4, 0])),
+            final_versions,
             proposed_members: members,
             group_schema: docs_group_schema(),
             initial_snapshot: InitialSnapshot::Inline(InitialGroupValueRows {
@@ -2741,6 +2904,13 @@ fn runtime_resumes_pending_migration_proposal_activation() {
         load_persisted_group(store.as_ref(), migration_id.new_group_id).group_id,
         migration_id.new_group_id
     );
+    assert!(matches!(
+        load_persisted_group(store.as_ref(), migration_id.old_group_id).lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id,
+            ..
+        } if successor_group_id == migration_id.new_group_id
+    ));
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
@@ -3285,9 +3455,9 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     let store = Arc::new(store);
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store, listener.clone());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member],
+        members: vec![alice_member.clone()],
         group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
@@ -3334,6 +3504,108 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
                 title: "membership snapshot".to_owned(),
             }],
         }
+    );
+    let old_group = load_persisted_group(store.as_ref(), old_group_id);
+    assert_eq!(
+        old_group.lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id: migration_id.new_group_id,
+            final_versions: old_group.version_vector.clone(),
+        }
+    );
+    let migration_read_token = listener
+        .captured_data_change_read_tokens()
+        .last()
+        .cloned()
+        .expect("migration listener event should carry a read token");
+    assert!(migration_read_token.group_version(&old_group_id).is_none());
+    assert!(
+        migration_read_token
+            .group_version(&migration_id.new_group_id)
+            .is_some()
+    );
+    assert!(
+        wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+            group_id: old_group_id,
+            datasets: HashSet::from([docs_dataset_id()]),
+            max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
+            include_tombstones: false,
+        }))
+        .is_err()
+    );
+    assert!(
+        wait_for_test_reply(runtime.request_summary(SummaryRequest {
+            group_id: old_group_id,
+            target: alice_member.clone(),
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn read_only_group_allows_reads_but_rejects_application_writes() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(50_601));
+    let successor_group_id = GroupId(Uuid::from_u128(50_602));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let versions = VersionVector::initial(NonZeroUsize::new(1).unwrap());
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            member_keys: test_group_member_keys(vec![alice_member.clone()]),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: versions.clone(),
+            },
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    let snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+        group_id,
+        datasets: HashSet::from([dataset_id.clone()]),
+        max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
+        include_tombstones: false,
+    }))
+    .expect("read-only group should remain snapshot-readable");
+    assert!(snapshot.read_token.group_version(&group_id).is_none());
+    drop(snapshot);
+    wait_for_test_reply(runtime.request_summary(SummaryRequest {
+        group_id,
+        target: alice_member.clone(),
+    }))
+    .expect("read-only group should permit application summaries");
+    assert!(
+        wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
+            read_token: ReadToken::from_group_versions(HashMap::from([(group_id, versions)])),
+            changes: vec![RowMutation::Upsert {
+                row_id: test_row_id(group_id, dataset_id, 50_603),
+                row: crate::row_values! { "title" => "rejected" },
+            }],
+        }))
+        .is_err()
+    );
+    assert!(
+        wait_for_test_reply(
+            runtime.change_group_membership(ChangeGroupMembershipRequest {
+                group_id,
+                add_members: HashSet::new(),
+                remove_members: HashSet::new(),
+                group_name: None,
+                message: None,
+            })
+        )
+        .is_err()
     );
 }
 
@@ -3559,6 +3831,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
             local_member_index: MemberIndex::new(0),
             group_schema: docs_group_schema(),
             version_vector: version_vector.clone(),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -4370,6 +4643,108 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         .apply_update_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
+}
+
+#[test]
+fn migrated_group_updates_follow_read_only_and_closed_application_visibility() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let group_id = GroupId(Uuid::from_u128(50_701));
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let successor_group_id = GroupId(Uuid::from_u128(50_702));
+    let final_versions = VersionVector::Full(PureVersionVector::from([2, 0]));
+    persist_group_lifecycle(
+        fixture.store.as_ref(),
+        &group_id,
+        ReplicationGroupLifecycle::ReadOnly {
+            successor_group_id,
+            final_versions: final_versions.clone(),
+        },
+    );
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 50_703);
+    let mut source_dataset = LocalDataset::new(title_schema_static());
+    let read_only_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "read-only update",
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        VersionVector::initial(member_count),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member.clone(), read_only_update)
+        .expect("in-cut update should apply");
+    fixture.listener.wait_for_data_change_count(1);
+    assert!(
+        fixture.listener.captured_data_change_read_tokens()[0]
+            .group_version(&group_id)
+            .is_none()
+    );
+
+    persist_group_lifecycle(
+        fixture.store.as_ref(),
+        &group_id,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id,
+            final_versions,
+        },
+    );
+
+    let closed_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "silent catch-up",
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+        VersionVector::Full(PureVersionVector::from([1, 0])),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member.clone(), closed_update)
+        .expect("closed in-cut update should apply without a listener event");
+
+    let discarded_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "discarded",
+        UpdateId {
+            version: 3,
+            node_index: 0,
+        },
+        VersionVector::Full(PureVersionVector::from([2, 0])),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member, discarded_update)
+        .expect("post-cut update should be ignored without failing delivery");
+
+    assert_eq!(fixture.listener.captured_data_changes().len(), 1);
+    assert_eq!(
+        load_persisted_group(fixture.store.as_ref(), group_id)
+            .version_vector
+            .version_at(0),
+        2
+    );
 }
 
 #[test]

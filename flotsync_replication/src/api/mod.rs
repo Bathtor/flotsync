@@ -21,7 +21,7 @@ use flotsync_security::{
     load_or_create_local_store_secret,
 };
 use flotsync_utils::{BoxFuture, option_when};
-use smallvec::{Array, SmallVec};
+use smallvec::{Array, SmallVec, smallvec};
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -1220,9 +1220,11 @@ impl PendingGroupDecisionRecord {
                 invitation,
                 respond: Box::new(responder),
             },
-            Self::MigrationProposal(proposal) => ReplicationEvent::MigrationProposal {
-                proposal,
-                respond: Box::new(responder),
+            Self::MigrationProposal(proposal) => ReplicationEvent::MigrationProposals {
+                proposals: smallvec![MigrationCandidateProposal {
+                    proposal,
+                    respond: Box::new(responder),
+                }],
             },
         }
     }
@@ -1292,6 +1294,7 @@ impl PendingGroupActivationRecord {
             Self::GroupInvitation(invitation) => AcceptedGroupActivationRecord {
                 key,
                 group_id: invitation.group_id,
+                migration_cutover: None,
                 proposed_members: invitation.proposed_members,
                 group_schema: invitation.group_schema,
                 initial_snapshot: invitation.initial_snapshot,
@@ -1299,6 +1302,10 @@ impl PendingGroupActivationRecord {
             Self::MigrationProposal(proposal) => AcceptedGroupActivationRecord {
                 key,
                 group_id: proposal.migration_id.new_group_id,
+                migration_cutover: Some(AcceptedMigrationCutover {
+                    old_group_id: proposal.migration_id.old_group_id,
+                    final_versions: proposal.final_versions,
+                }),
                 proposed_members: proposal.proposed_members,
                 group_schema: proposal.group_schema,
                 initial_snapshot: proposal.initial_snapshot,
@@ -1314,6 +1321,8 @@ pub struct AcceptedGroupActivationRecord {
     pub key: PendingGroupWorkKey,
     /// New group that becomes externally active after activation succeeds.
     pub group_id: GroupId,
+    /// Old-group cutover performed after target activation, when applicable.
+    pub migration_cutover: Option<AcceptedMigrationCutover>,
     /// Proposed canonical member order for the activated group.
     pub proposed_members: Vec<MemberIdentity>,
     /// Dataset schemas fixed for the activated group.
@@ -1322,7 +1331,20 @@ pub struct AcceptedGroupActivationRecord {
     pub initial_snapshot: InitialSnapshot,
 }
 
+/// Immutable old-group closure context retained by accepted migration work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptedMigrationCutover {
+    /// Existing group that becomes closed after target activation.
+    pub old_group_id: GroupId,
+    /// Replay cut fixed by the accepted migration proposal.
+    pub final_versions: VersionVector,
+}
+
 /// Listener-visible replication events.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Listener events are infrequent, and keeping invitation values direct avoids public API indirection."
+)]
 pub enum ReplicationEvent {
     DataChanged {
         /// Read position reached by the row changes in this event.
@@ -1339,10 +1361,19 @@ pub enum ReplicationEvent {
         invitation: GroupInvitation,
         respond: Box<dyn GroupInvitationResponder>,
     },
-    MigrationProposal {
-        proposal: MigrationProposal,
-        respond: Box<dyn MigrationProposalResponder>,
+    /// Current undecided migration candidates for one old group.
+    MigrationProposals {
+        /// Complete candidate set known when this event was emitted.
+        proposals: SmallVec<[MigrationCandidateProposal; 1]>,
     },
+}
+
+/// One listener-mediated candidate within a grouped migration proposal event.
+pub struct MigrationCandidateProposal {
+    /// Proposed target group and immutable old-group replay cut.
+    pub proposal: MigrationProposal,
+    /// One-shot response for this specific candidate.
+    pub respond: Box<dyn MigrationProposalResponder>,
 }
 
 /// Callback for applications to accept or reject one group invitation.
@@ -1514,6 +1545,11 @@ pub trait ReplicationApi: Send + Sync {
     /// Receiver-side mediation is governed by [`GroupInvitationPolicy`] and
     /// [`GroupMigrationPolicy`].
     ///
+    /// The old group becomes read-only when the migration is accepted and
+    /// becomes closed when local target-group activation commits. Closed groups
+    /// remain available to the replication protocol for bounded catch-up, but
+    /// no longer interact with the application.
+    ///
     /// # Errors
     ///
     /// Returns [`ApiError`] when the old group is unknown or invalid, the
@@ -1658,6 +1694,81 @@ impl PartialEq for GroupMemberKeys {
 
 impl Eq for GroupMemberKeys {}
 
+/// Application-access lifecycle for one hosted replication group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicationGroupLifecycle {
+    /// The group accepts application reads, writes, and membership changes.
+    Open,
+    /// Local writes are disabled while accepted migration activation completes.
+    ReadOnly {
+        /// Accepted target group used to identify exact proposal replays.
+        successor_group_id: GroupId,
+        /// Immutable old-group replay cut carried by the accepted proposal.
+        final_versions: VersionVector,
+    },
+    /// The group remains available only for bounded replication and catch-up.
+    Closed {
+        /// Accepted target group used to identify exact proposal replays.
+        successor_group_id: GroupId,
+        /// Immutable old-group replay cut carried by the accepted proposal.
+        final_versions: VersionVector,
+    },
+}
+
+impl ReplicationGroupLifecycle {
+    /// Return whether application code may publish or change membership.
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    /// Return whether application code may read rows or request summaries.
+    #[must_use]
+    pub const fn is_readable(&self) -> bool {
+        !matches!(self, Self::Closed { .. })
+    }
+
+    /// Return whether newly applied remote rows should reach the listener.
+    #[must_use]
+    pub const fn emits_data_changes(&self) -> bool {
+        self.is_readable()
+    }
+
+    /// Return the immutable migration cut for a non-open group.
+    #[must_use]
+    pub const fn final_versions(&self) -> Option<&VersionVector> {
+        match self {
+            Self::Open => None,
+            Self::ReadOnly { final_versions, .. } | Self::Closed { final_versions, .. } => {
+                Some(final_versions)
+            }
+        }
+    }
+
+    /// Return the accepted successor for a non-open group.
+    #[must_use]
+    pub const fn successor_group_id(&self) -> Option<GroupId> {
+        match self {
+            Self::Open => None,
+            Self::ReadOnly {
+                successor_group_id, ..
+            }
+            | Self::Closed {
+                successor_group_id, ..
+            } => Some(*successor_group_id),
+        }
+    }
+
+    /// Bound one replication frontier by this lifecycle's migration cut.
+    #[must_use]
+    pub fn bound_versions(&self, versions: &VersionVector) -> VersionVector {
+        match self.final_versions() {
+            Some(final_versions) => versions.greatest_lower_bound(final_versions),
+            None => versions.clone(),
+        }
+    }
+}
+
 /// One persisted replication group together with its local progress.
 ///
 /// This is the group-level record that anchors dataset snapshots and persisted
@@ -1677,6 +1788,8 @@ pub struct ReplicationGroupRecord {
     pub group_schema: GroupSchema,
     /// Last applied version vector stored for this group.
     pub version_vector: VersionVector,
+    /// Current application-access and replication lifecycle.
+    pub lifecycle: ReplicationGroupLifecycle,
     /// Already-encrypted group-security material needed by runtime operation.
     pub security_material: EncryptedGroupSecurityMaterial,
 }
@@ -1684,7 +1797,7 @@ pub struct ReplicationGroupRecord {
 impl ReplicationGroupRecord {
     /// Split active progress from group material shared with pending setup.
     #[must_use]
-    pub fn into_parts(self) -> (ReplicationGroupMaterialRecord, VersionVector) {
+    pub fn into_parts(self) -> (ReplicationGroupMaterialRecord, ReplicationGroupActiveState) {
         let material = ReplicationGroupMaterialRecord {
             group_id: self.group_id,
             member_keys: self.member_keys,
@@ -1692,7 +1805,11 @@ impl ReplicationGroupRecord {
             group_schema: self.group_schema,
             security_material: self.security_material,
         };
-        (material, self.version_vector)
+        let active_state = ReplicationGroupActiveState {
+            version_vector: self.version_vector,
+            lifecycle: self.lifecycle,
+        };
+        (material, active_state)
     }
 
     /// Return the number of members encoded in this record.
@@ -1759,6 +1876,15 @@ impl ReplicationGroupRecord {
     }
 }
 
+/// Persisted state that distinguishes active group material from inactive setup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicationGroupActiveState {
+    /// Last applied version vector stored for the active group.
+    pub version_vector: VersionVector,
+    /// Current application-access and replication lifecycle.
+    pub lifecycle: ReplicationGroupLifecycle,
+}
+
 /// Stored group definition and local security material, independent of activation.
 ///
 /// Material may exist before the group becomes externally active. Dataset rows,
@@ -1817,6 +1943,7 @@ impl ReplicationGroupMaterialRecord {
             local_member_index: self.local_member_index,
             group_schema: self.group_schema,
             version_vector,
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: self.security_material,
         }
     }
@@ -1841,6 +1968,7 @@ impl std::fmt::Debug for ReplicationGroupRecord {
             .field("local_member_index", &self.local_member_index)
             .field("group_schema", &self.group_schema)
             .field("version_vector", &self.version_vector)
+            .field("lifecycle", &self.lifecycle)
             .field("security_material", &self.security_material)
             .finish()
     }
@@ -2593,6 +2721,13 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
         version_vector: VersionVector,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
 
+    /// Replace the application-access lifecycle for one hosted group.
+    fn update_replication_group_lifecycle<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
+
     /// Apply one explicit set of row-level dataset storage actions.
     fn apply_dataset_row_patch(
         &mut self,
@@ -2841,6 +2976,37 @@ mod tests {
             MemberIndex::new(0),
             &group_schema,
         ));
+    }
+
+    #[test]
+    fn active_group_decomposition_preserves_progress_and_lifecycle() {
+        let group_id = GroupId(uuid::Uuid::from_u128(91_100));
+        let successor_group_id = GroupId(uuid::Uuid::from_u128(91_101));
+        let member_count = NonZeroUsize::new(1).expect("test group has one member");
+        let mut versions = VersionVector::initial(member_count);
+        versions.increment_at(0);
+        let lifecycle = ReplicationGroupLifecycle::ReadOnly {
+            successor_group_id,
+            final_versions: versions.clone(),
+        };
+        let group = ReplicationGroupRecord {
+            group_id,
+            member_keys: GroupMemberKeys::from_ordered_member_keys([member_key_id(
+                ["active-state", "alice"],
+                1,
+            )])
+            .expect("test group member keys should build"),
+            local_member_index: MemberIndex::new(0),
+            group_schema: GroupSchema::default(),
+            version_vector: versions.clone(),
+            lifecycle: lifecycle.clone(),
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        };
+
+        let (_, active_state) = group.into_parts();
+
+        assert_eq!(active_state.version_vector, versions);
+        assert_eq!(active_state.lifecycle, lifecycle);
     }
 
     #[test]

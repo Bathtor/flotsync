@@ -89,6 +89,7 @@ pub(super) async fn initialise_configured_group_if_ready(
             member_keys,
             local_member_index: group_shape.local_member_index,
             version_vector: VersionVector::initial(group_shape.member_count),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
             group_schema: checklist_group_schema(),
         })
