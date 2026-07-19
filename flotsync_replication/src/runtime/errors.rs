@@ -192,7 +192,8 @@ pub(super) enum RuntimeStartupError {
     ))]
     InvalidGroup {
         group_id: GroupId,
-        source: GroupInstallError,
+        #[snafu(source(from(GroupInstallError, Box::new)))]
+        source: Box<GroupInstallError>,
     },
     #[snafu(display("Listener rejected one pending group decision replay event: {source}"))]
     ReplayPendingDecision { source: ListenerError },

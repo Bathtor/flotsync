@@ -52,7 +52,7 @@ pub(super) fn run_udp(
     match biconnect_components::<UdpPort, _, _>(runtime.bridge_component(), &component) {
         Ok(_) => {}
         Err(error) => {
-            whatever!("failed to connect UDP netcat component to IoBridge: {error:?}")
+            whatever!("failed to connect UDP netcat component to IoBridge: {error:?}");
         }
     }
     start_component(runtime, &component)?;

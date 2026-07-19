@@ -803,7 +803,7 @@ impl ChecklistWorkingSet {
         I: IntoIterator<Item = SnapshotValueRow<'a>>,
     {
         for row in rows {
-            let change = self.checklist_change_from_snapshot_row(row)?;
+            let change = self.checklist_change_from_snapshot_row(&row)?;
             self.apply_checklist_change(change);
         }
         Ok(())
@@ -957,14 +957,14 @@ impl ChecklistWorkingSet {
 
     fn checklist_change_from_snapshot_row(
         &self,
-        row: SnapshotValueRow<'_>,
+        row: &SnapshotValueRow<'_>,
     ) -> Result<ChecklistRowChange, ChecklistWorkingSetError> {
         let row_id = row.row_id().clone();
         if row.is_tombstoned() {
             self.validate_row_scope(&row_id)?;
             return Err(ChecklistWorkingSetError::UnexpectedDeletedSnapshotRow { row_id });
         }
-        self.checklist_upsert_change_from_row(&row_id, &row)
+        self.checklist_upsert_change_from_row(&row_id, row)
     }
 
     fn checklist_upsert_change_from_row(
