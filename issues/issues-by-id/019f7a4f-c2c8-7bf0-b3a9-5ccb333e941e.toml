@@ -1,0 +1,45 @@
+id = "019f7a4f-c2c8-7bf0-b3a9-5ccb333e941e"
+ref = "flotsync-git-03f"
+title = "Deactivate old group during membership migration"
+body = """
+Implement the missing old-group lifecycle transition for membership migration after the new group has been prepared and accepted.
+
+Scope:
+A. Represent and persist the old group lifecycle needed by migration: writable, read-only while the cutover is being finalised, and inactive after successful new-group activation.
+B. Define the transaction and recovery ordering so the old and new groups cannot both remain writable after a successful migration, while failures and retries remain idempotent.
+C. Apply the lifecycle transition for locally initiated migrations and for accepted inbound migration proposals when the runtime hosts the old group.
+D. Preserve any internal old-group reads required for final-version validation, snapshot history, catch-up, and recovery after external writes are disabled.
+E. Resume interrupted transitions on startup without re-asking the listener or duplicating activation effects.
+F. Add focused unit, store, restart, and integration coverage for success, replay, failure boundaries, and the writable-to-read-only-to-inactive sequence.
+G. Update protocol and runtime documentation to describe the implemented migration lifecycle.
+
+Explicit boundaries:
+H. Application-facing exposure of group deactivation remains separate and is related to flotsync-git-pvp and flotsync-git-os1.
+I. The standalone GroupClose API, which closes a group without creating a replacement, remains flotsync-git-lg9.
+J. Large snapshot transfer remains outside this task.
+
+Implementation estimate:
+K. Lifecycle model and persistence: 120-220 LOC.
+L. Runtime cutover and recovery wiring: 180-320 LOC.
+M. Tests and documentation: 180-300 LOC.
+N. Total expected change: approximately 480-840 LOC, below 1000 LOC. If recovery semantics require a broader store redesign, split that work into a separate child before implementation."""
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+blocked_by = ["019f51c0-4c99-72f3-ab68-fc5fa752a914"]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-19T12:17:55.400677Z"
+updated_at = "2026-07-19T12:18:14.5529Z"
+
+[[links]]
+target = "019f5b3a-ee57-7413-b39b-55e107995695"
+label = "application deactivation exposure"
+
+[[links]]
+target = "019f7474-9d0a-7d21-ad30-d57c359543ed"
+label = "batched deactivation notification context"
+
+[[links]]
+target = "019f5b28-a26f-7b11-a979-595b4ccdb149"
+label = "distinct GroupClose API"

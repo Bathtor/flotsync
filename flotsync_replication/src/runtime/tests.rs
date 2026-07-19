@@ -2684,6 +2684,67 @@ fn runtime_resumes_pending_group_activation_with_global_read_token() {
 }
 
 #[test]
+fn runtime_resumes_pending_migration_proposal_activation() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let migration_id = MigrationId {
+        old_group_id: GroupId(Uuid::from_u128(60_111)),
+        new_group_id: GroupId(Uuid::from_u128(60_112)),
+    };
+    let row_key = RowKey(Uuid::from_u128(60_113));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let members = vec![alice_member, bob_member];
+    store_pending_group_activation(
+        store.as_ref(),
+        PendingGroupActivationRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions: VersionVector::Full(PureVersionVector::from([4, 0])),
+            proposed_members: members,
+            group_schema: docs_group_schema(),
+            initial_snapshot: InitialSnapshot::Inline(InitialGroupValueRows {
+                datasets: vec![InitialDatasetValueRows {
+                    dataset_id: dataset_id.clone(),
+                    rows: vec![InitialValueRow {
+                        row_key,
+                        row: title_row_values("migration resumed on startup"),
+                    }],
+                }],
+            }),
+            group_name: None,
+            message: None,
+        }),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_data_change_count(1);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: RowId {
+                    group_id: migration_id.new_group_id,
+                    dataset_id,
+                    row_key,
+                },
+                title: "migration resumed on startup".to_owned(),
+            }],
+        }]
+    );
+    assert!(listener.take_pending_group_events().is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), migration_id.new_group_id).group_id,
+        migration_id.new_group_id
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
 fn runtime_keeps_inactive_group_material_hidden_without_accepted_work() {
     let alice_member_id = alice_member();
     let bob_member_id = bob_member();
@@ -2780,37 +2841,21 @@ fn runtime_accepts_replayed_invitation_with_stored_group_material() {
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
-#[test]
-fn metadata_invitation_accept_rejects_without_persisting_activation() {
-    let alice_member_id = alice_member();
-    let bob_member_id = bob_member();
-    let group_id = GroupId(Uuid::from_u128(60_110));
-    let store = sqlite_store_with_schemas(
-        alice_member_id.clone(),
-        Vec::<(DatasetId, SchemaSource)>::new(),
-    );
-    store_pending_group_decision(
-        store.as_ref(),
-        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
-            group_id,
-            vec![alice_member_id, bob_member_id],
-            GroupSchema::default(),
-            metadata_initial_snapshot(group_id, NonZeroUsize::new(2).expect("two members")),
-            None,
-            None,
-        )),
-    );
+/// Assert manually restored Metadata work cannot transition into activation.
+fn assert_metadata_work_accept_rejects_without_activation(record: PendingGroupDecisionRecord) {
+    let group_id = record.group_id();
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    store_pending_group_decision(store.as_ref(), record);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
 
     listener.wait_for_pending_group_event_count(1);
     let mut events = listener.take_pending_group_events();
-    let CapturedPendingGroupEvent::GroupInvitation { respond, .. } =
-        events.pop().expect("invitation should be replayed")
-    else {
-        panic!("expected invitation event");
+    let accept = match events.pop().expect("pending work should be replayed") {
+        CapturedPendingGroupEvent::GroupInvitation { respond, .. } => respond.accept(),
+        CapturedPendingGroupEvent::MigrationProposal { respond, .. } => respond.accept(),
     };
-    let result = wait_for_test_reply(respond.accept());
+    let result = wait_for_test_reply(accept);
 
     assert!(
         matches!(result, Err(ApiError::ApiExternal { .. })),
@@ -2820,6 +2865,40 @@ fn metadata_invitation_accept_rejects_without_persisting_activation() {
     assert!(load_pending_group_activations(store.as_ref()).is_empty());
     assert!(load_group_material(store.as_ref(), group_id).is_none());
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn metadata_pending_group_work_accept_rejects_without_persisting_activation() {
+    let alice_member_id = alice_member();
+    let bob_member_id = bob_member();
+    let member_count = NonZeroUsize::new(2).expect("two members");
+    let invitation_group_id = GroupId(Uuid::from_u128(60_110));
+    assert_metadata_work_accept_rejects_without_activation(
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+            invitation_group_id,
+            vec![alice_member_id.clone(), bob_member_id.clone()],
+            GroupSchema::default(),
+            metadata_initial_snapshot(invitation_group_id, member_count),
+            None,
+            None,
+        )),
+    );
+
+    let migration_id = MigrationId {
+        old_group_id: GroupId(Uuid::from_u128(60_114)),
+        new_group_id: GroupId(Uuid::from_u128(60_115)),
+    };
+    assert_metadata_work_accept_rejects_without_activation(
+        PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions: VersionVector::Full(PureVersionVector::from([4, 0])),
+            proposed_members: vec![alice_member_id, bob_member_id],
+            group_schema: GroupSchema::default(),
+            initial_snapshot: metadata_initial_snapshot(migration_id.new_group_id, member_count),
+            group_name: None,
+            message: None,
+        }),
+    );
 }
 
 #[test]

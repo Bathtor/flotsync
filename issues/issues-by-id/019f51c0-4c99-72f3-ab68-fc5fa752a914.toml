@@ -2,23 +2,96 @@ id = "019f51c0-4c99-72f3-ab68-fc5fa752a914"
 ref = "flotsync-git-pow.5"
 title = "Validate and document inline migration policy flow"
 body = """
-Add focused validation and documentation coverage for the inline-snapshot migration policy implementation.
+Validate and document the implemented inline-snapshot membership-migration policy flow without duplicating the broad runtime coverage completed in flotsync-git-pow.4.
 
 Scope:
-A. Unit tests for policy classification and safe defaults.
-B. Store/restart tests for pending decision replay and accepted activation resume.
-C. Runtime tests for GroupInvitation, MigrationProposal, GroupClose, and inline initial_snapshot activation.
-D. Tests that Metadata-only snapshots are represented but not activated until non-inline snapshot transfer exists.
-E. Update protocol/API/scenario docs to match implemented inline behaviour.
+P01. Extract the top-level membership-delta policy derivation into a pure runtime helper after existing persisted-group loading and membership validation.
+P02. Cover epoch-only, member-added, member-removed, replacement, and most-restrictive decision behaviour.
+P03. Add concise API contract tests for PolicyDecision ordering and the exact defaults of GroupInvitationPolicy and GroupMigrationPolicy.
+P04. Rely on runtime behaviour tests for snapshot-fetch classification; do not retain a tautological API test that merely reconstructs both pending-work record forms.
+P05. Extend runtime metadata rejection coverage to MigrationProposal: acceptance fails before activation, pending work and inactive material are removed, and the target group remains hidden.
+P06. Add accepted MigrationProposal startup-resume coverage, including target-group activation, no repeated listener mediation, and pending-work cleanup.
+P07. Retain and reference existing coverage for decision replay, listener failure, automatic-acceptance crash recovery, global read tokens, inline row events, SQLite lifecycle transitions, and three-runtime proposal/invitation delivery.
+P08. Keep ReplicationApi and responder Rustdoc focused on the caller-visible membership-change contract; remove Empty-versus-Inline implementation detail and add a conventional Errors section.
+P09. Document that device-level migration classifications, local-member removal, and GroupClosePolicy are reserved for later flows and are not consumed by the current inline proposal path.
+P10. Update communication and single-recipient delivery protocol documents for the positive self-contained invitation/proposal setup shape and concrete recipient acknowledgement semantics: a message was processed and does not require retry after rejection, stored listener mediation, or committed activation.
+P11. Add an OKF state-machine document for validation, policy selection, pending decision, accepted activation, activation, restart, snapshot forms, and explicit deferrals or known gaps.
+P12. Regenerate docs/index.md and validate the OKF corpus.
 
-Out of scope:
-F. Dynamic checklist product workflow changes beyond documentation hooks.
-G. Chunked snapshot transfer tests."""
-status = "open"
+Explicit boundaries and discovered work:
+P13. The standalone GroupClose API, which closes a group without creating a replacement, remains flotsync-git-lg9.
+P14. Device-level member classification remains outside this slice.
+P15. Chunked or fetched Metadata snapshot activation remains outside this slice.
+P16. No membership-change steps are added to the replicated-checklist manual because that application does not expose the required commands.
+P17. Old-group read-only and inactive transitions are required migration behaviour but are missing from the current implementation. Implement them next in flotsync-git-03f, a child of flotsync-git-pow. Application-facing deactivation exposure remains related to flotsync-git-pvp and flotsync-git-os1.
+
+Review refinements:
+P18. Describe only protocol shapes that exist; do not document an absent standalone bootstrap message.
+P19. Replace vague local-processing-boundary terminology with processed-and-no-retry wording.
+P20. Generate policy-order combinations from the expected restrictiveness instead of spelling out the full matrix.
+P21. Describe the policy helper as deriving a decision from membership differences.
+P22. Do not claim the missing old-group lifecycle behaviour in public Rustdoc; track it explicitly through flotsync-git-03f.
+
+Validation:
+P23. Run focused policy, metadata, and restart tests.
+P24. Run cargo fmt, pedantic Clippy, the Rust instruction audit, and the complete serial flotsync_replication test suite.
+P25. Run amm scripts/okf-docs.sc generate-index and amm scripts/okf-docs.sc check.
+
+Estimate:
+P26. Policy helpers and unit tests: roughly 60-110 LOC after removing redundant coverage.
+P27. Metadata and restart tests: roughly 120-220 LOC.
+P28. API Rustdoc corrections: roughly 20-45 LOC.
+P29. Protocol and state-machine documentation: roughly 180-300 LOC.
+P30. Total expected churn: roughly 380-675 LOC, below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
 labels = ["area:replication"]
+assignee = "codex"
 blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+blocks = ["019f7a4f-c2c8-7bf0-b3a9-5ccb333e941e"]
 parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
 created_at = "2026-07-11T15:16:24.85732Z"
-updated_at = "2026-07-11T15:16:29.021394Z"
+updated_at = "2026-07-19T12:36:04.766439Z"
+closed_at = "2026-07-19T12:36:04.766439Z"
+
+[[links]]
+target = "019f5b28-a26f-7b11-a979-595b4ccdb149"
+label = "GroupClose follow-up"
+
+[[comments]]
+id = "019f79ea-abff-79c3-b84f-8e2d4b08c700"
+author = "codex"
+body = "Plan aligned: add only the missing policy, Metadata, and proposal-resume coverage; correct stale API and recipient-ack documentation; add an OKF state-machine document. GroupClose remains explicitly deferred to flotsync-git-lg9 and no unavailable checklist UI workflow will be documented."
+created_at = "2026-07-19T10:27:30.431467Z"
+
+[[comments]]
+id = "019f79f3-e5e0-7812-b965-425202e1df6c"
+author = "codex"
+body = "Implementation ready for review. Added pure top-level migration policy reduction plus ordering/default contract tests; covered snapshot classification for both work kinds, Metadata rejection for invitations and proposals, and accepted proposal activation resume. Corrected stale API and reliable-delivery semantics, added the Inline Migration Policy Flow OKF state machine, regenerated the docs index, and linked GroupClose to flotsync-git-lg9. Validation passed: formatting, pedantic Clippy with test-support, Rust instruction audit, OKF docs check, git diff check, 196 unit tests, and 6 secure runtime integration tests."
+created_at = "2026-07-19T10:37:35.07264Z"
+
+[[comments]]
+id = "019f7a44-d832-7ae3-8df8-86b8c4e1b8a4"
+author = "codex"
+body = "Review pass received. Planned corrections: document positive message shape only; replace vague processing-boundary terminology; simplify public change_group_membership Rustdoc and add an Errors section; compress policy-order coverage; remove the tautological snapshot-classification test; rename the policy helper description. Current code does not transition the old group to read-only or inactive; that lifecycle remains in flotsync-git-lg9 unless scope is changed."
+created_at = "2026-07-19T12:05:59.986777Z"
+
+[[comments]]
+id = "019f7a50-ba31-7c03-bd3c-038b60320a07"
+author = "codex"
+body = "Review plan corrected and agreed: normal membership migration must deactivate the old group; only the standalone close-without-replacement API remains flotsync-git-lg9. The missing writable-to-read-only-to-inactive transition is tracked next in child flotsync-git-03f, with application exposure linked to flotsync-git-pvp and flotsync-git-os1. This review pass will keep public docs factual, clarify no-retry acknowledgements, simplify the API Rustdoc and policy-order test, remove tautological snapshot classification coverage, and correct policy-helper terminology."
+created_at = "2026-07-19T12:18:58.737323Z"
+
+[[comments]]
+id = "019f7a58-e296-7bf1-818b-37dfd0370bd8"
+author = "codex"
+body = "Review fixes are ready. Protocol docs now describe the positive self-contained setup shape and concrete processed/no-retry acknowledgements; GroupClose is documented as standalone closure rather than migration deactivation. Public membership-change Rustdoc is concise with an Errors section, policy-order coverage generates combinations, the tautological snapshot classification test is removed, and policy wording uses derivation. The missing migration old-group transition is recorded in child flotsync-git-03f. Validation passed: formatting, pedantic Clippy, OKF generation/check, focused policy/Metadata/resume tests, 195 unit tests, and 6 secure runtime integration tests."
+created_at = "2026-07-19T12:27:53.366483Z"
+
+[[comments]]
+id = "019f7a60-621e-7281-b0ed-12d6c88300cc"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-19T12:36:04.766439Z"

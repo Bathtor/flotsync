@@ -220,8 +220,8 @@ Notes:
 #### `RecipientAck`
 
 Purpose:
-Tell the original sender that the recipient durably accepted one
-recipient-addressed message.
+Tell the original sender that one recipient-addressed message was processed and
+does not require retry.
 
 Must convey:
 
@@ -231,6 +231,13 @@ Must convey:
 - recipient signature over the ack fields
 
 Notes:
+
+- invitation and proposal payloads do not require retry after terminal
+  rejection, stored listener mediation, or committed activation work
+- it does not imply that a listener accepted the work or that the target group
+  is already active
+- failures before processing reaches one of those outcomes intentionally
+  withhold the acknowledgement so reliable delivery may retry
 
 - this is the completion signal for sender-side delivery
 - it may itself be delivered directly or through relay mailboxes
@@ -330,7 +337,7 @@ Must convey:
     - `message_ref` (for relay indexing/retrieval), e.g.:
         - `GroupInit(migration_or_group_id)`
         - `Update(version, producer_index)`
-        - `GroupClose(migration_id)`
+        - `GroupClose(group_id)`
     - envelope `message_id` (dedupe/retry bookkeeping)
 - encrypted payload bytes
 
@@ -510,6 +517,29 @@ Notes:
 - steady state: usually ack each `Update`
 - catch-up: coarse ack (for example once synced) is acceptable
 
+#### `GroupInvitation`
+
+Purpose:
+Invite a recipient to activate a new group when the recipient cannot rely on an
+old-group authority context.
+
+Must convey:
+
+- target group id
+- creation or migration source context
+- proposed canonical membership
+- group schema
+- empty, inline, or metadata initial snapshot
+- recipient-protected target-group member keys, cipher suite, and group key
+- optional application-facing group name and message
+
+Notes:
+
+- the reliable invitation payload carries its matching private group setup
+- migration-derived invitations are scoped to the target group and are sent to
+  newly added members
+- private setup remains outside listener-visible invitation values
+
 #### `MigrationProposal`
 
 Purpose:
@@ -522,7 +552,8 @@ Must convey:
 - new group id
 - migration cut VV in old group
 - new group membership
-- new shared key material (encrypted per recipient)
+- new group schema
+- recipient-protected target-group member keys, cipher suite, and group key
 - initial snapshot
 
 Notes:
@@ -538,23 +569,25 @@ Notes:
 - newly added members that are not in the old group receive a `GroupInvitation`
   with migration source context rather than a listener-visible
   `MigrationProposal`
-- inline initial snapshot payloads for the new group are encrypted with the new
-  group key
+- the proposal and its private group setup are one self-contained reliable
+  payload; private setup remains outside listener-visible proposal values
+- the recipient-addressed envelope protects both inline snapshot values and
+  target-group setup while they are in transit
 
 #### `GroupClose`
 
 Purpose:
-Signal old-group lifecycle policy after migration.
+Request closure of an existing group without creating a replacement group.
 
 Must convey:
 
-- migration id
-- old group id
+- group id
 - close mode/policy marker
 
 Notes:
 
-- `GroupClose` is signed/scoped to the old group
+- this standalone group-close message is specified for a later runtime slice
+- `GroupClose` is signed/scoped to the group being closed
 - it is a lifecycle signal, not remote command authority
 - local policy decides whether to close writes, keep read-only access, or only
   observe the signal
@@ -564,18 +597,19 @@ Notes:
 
 ### 10.1 Bootstrap / Invitation
 
-1. higher-layer logic prepares recipient-addressed bootstrap material (for
-   example a migration proposal, group invitation, or key package).
+1. higher-layer logic prepares a self-contained recipient-addressed migration
+   proposal or group invitation with matching private target-group setup.
 2. `SingleRecipientDurableDelivery`: attempt direct delivery and relay mailbox
    storage.
 3. recipient checks in with configured relay mailboxes using `MailboxFetch`.
 4. relay returns pending envelopes in `MailboxBatch`.
-5. recipient verifies the sender signature, durably accepts relevant messages,
-   and sends `MailboxAck` for relay cleanup.
+5. recipient verifies the sender signature and payload, processes the message
+   to an outcome that does not require retry, and sends `MailboxAck` for relay
+   cleanup.
 6. recipient sends `RecipientAck` back to the original sender, directly when
    possible and through relay mailboxes when necessary.
-7. once the invitation or bootstrap material is accepted, the recipient can
-   join the new group.
+7. automatic or listener acceptance activates Empty and Inline snapshots;
+   Metadata snapshots remain unsupported by the current runtime.
 
 ### 10.2 Initial Sync
 
@@ -611,20 +645,26 @@ Same wire behavior as initial sync: VV is the cursor.
    added members.
 2. `SingleRecipientDurableDelivery`: deliver per-recipient invitation packages
    directly or through relay mailboxes until `RecipientAck`.
-3. receivers accept, reject, or leave the proposal pending according to policy
-   or user mediation. Pending decisions are persisted and re-surfaced after
-   restart until decided.
-4. after acceptance, the receiver sends the semantic recipient acknowledgement
-   and moves into accepted-but-not-active activation state.
-5. the receiver resolves `initial_snapshot`: empty state can activate
-   immediately, inline state can be applied locally, and metadata state requires
-   local reconstruction, delta catch-up, or a future snapshot fetch protocol.
-6. once the initial snapshot is resolved, accepting receivers activate the new
-   group and start sync there.
-7. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
+3. receivers validate the self-contained setup and classify the work according
+   to local policy. Metadata snapshots are automatically rejected in the
+   current implementation because snapshot fetching is unavailable.
+4. automatic rejection removes inactive material and pending work. Listener
+   mediation atomically stores inactive material plus pending decision state.
+   Automatic acceptance atomically stores inactive material plus accepted
+   activation state.
+5. once the message has been processed and does not require retry, the receiver
+   completes the reliable-delivery acknowledgement. Listener mediation does not
+   wait for the eventual listener response before acknowledging delivery.
+6. pending listener decisions are re-surfaced after restart. Accepted activation
+   work resumes after restart without asking the listener again.
+7. Empty snapshots activate without rows. Inline projected rows are embedded as
+   deterministic initial state, committed with target-group activation, and
+   emitted to the listener after commit.
+8. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
    within that group as normal.
-8. optional `GroupClose` informs old-group write/read lifecycle policy.
-9. rejecting or ignoring migration can intentionally split old/new group
+9. the current implementation does not yet perform the required old-group
+   read-only and inactive transitions; `flotsync-git-03f` tracks this gap.
+10. rejecting or ignoring migration can intentionally split old/new group
    activity.
 
 ## 11. Error Handling and Compatibility

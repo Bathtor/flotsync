@@ -73,6 +73,7 @@ use crate::{
         GroupInvitation,
         GroupInvitationResponder,
         GroupMemberKeys,
+        GroupMigrationPolicy,
         GroupSchema,
         InitialSnapshot,
         ListenerError,
@@ -1154,20 +1155,33 @@ impl ReplicationRuntimeComponent {
                 .context(inbound::InvalidPersistedGroupSnafu {
                     group_id: old_group_id,
                 })?;
-        let policy = &self.config.group_migration_policy;
-        let mut decision = policy.epoch_change;
+        Ok(Self::migration_policy_decision_for_members(
+            &self.config.group_migration_policy,
+            &local_group.members,
+            &proposed_members,
+        ))
+    }
 
-        for old_member in local_group.members.iter() {
-            if !proposed_members.contains(&old_member) {
-                decision = decision.most_restrictive(policy.member_removed);
-            }
+    /// Derive the configured migration policy from top-level membership differences.
+    fn migration_policy_decision_for_members(
+        policy: &GroupMigrationPolicy,
+        old_members: &GroupMembers,
+        proposed_members: &GroupMembers,
+    ) -> PolicyDecision {
+        let mut decision = policy.epoch_change;
+        if old_members
+            .iter()
+            .any(|member| !proposed_members.contains(&member))
+        {
+            decision = decision.most_restrictive(policy.member_removed);
         }
-        for proposed_member in proposed_members.iter() {
-            if !local_group.members.contains(&proposed_member) {
-                decision = decision.most_restrictive(policy.member_added);
-            }
+        if proposed_members
+            .iter()
+            .any(|member| !old_members.contains(&member))
+        {
+            decision = decision.most_restrictive(policy.member_added);
         }
-        Ok(decision)
+        decision
     }
 
     /// Resolve local policy for pending group work before accepting activation.
@@ -3619,6 +3633,60 @@ mod tests {
     use super::*;
     use crate::api::ListenerError;
     use std::assert_matches;
+
+    /// Build one valid member set for pure policy-derivation tests.
+    fn policy_test_members(names: &[&str]) -> GroupMembers {
+        GroupMembers::from_ordered_members(
+            names
+                .iter()
+                .map(|name| MemberIdentity::from_array(["policy", *name])),
+        )
+        .expect("policy test members should be valid")
+    }
+
+    #[test]
+    fn migration_policy_classifies_top_level_membership_differences() {
+        let policy = GroupMigrationPolicy {
+            epoch_change: PolicyDecision::AutoAccept,
+            member_added: PolicyDecision::AskListener,
+            member_removed: PolicyDecision::AutoReject,
+            ..GroupMigrationPolicy::default()
+        };
+        let alice_bob = policy_test_members(&["alice", "bob"]);
+        let alice_bob_carol = policy_test_members(&["alice", "bob", "carol"]);
+        let alice_carol = policy_test_members(&["alice", "carol"]);
+
+        assert_eq!(
+            ReplicationRuntimeComponent::migration_policy_decision_for_members(
+                &policy, &alice_bob, &alice_bob,
+            ),
+            PolicyDecision::AutoAccept
+        );
+        assert_eq!(
+            ReplicationRuntimeComponent::migration_policy_decision_for_members(
+                &policy,
+                &alice_bob,
+                &alice_bob_carol,
+            ),
+            PolicyDecision::AskListener
+        );
+        assert_eq!(
+            ReplicationRuntimeComponent::migration_policy_decision_for_members(
+                &policy,
+                &alice_bob_carol,
+                &alice_bob,
+            ),
+            PolicyDecision::AutoReject
+        );
+        assert_eq!(
+            ReplicationRuntimeComponent::migration_policy_decision_for_members(
+                &policy,
+                &alice_bob,
+                &alice_carol,
+            ),
+            PolicyDecision::AutoReject
+        );
+    }
 
     #[test]
     fn inbound_error_classification_matches_manual_slice_policy() {
