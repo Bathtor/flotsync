@@ -10,36 +10,40 @@ import "flotsync/versions/v1/versions.proto";
 // Internal replication-runtime payloads carried inside delivery envelopes.
 //
 // These are not the full replication protocol; they are only the narrow
-// bootstrap plus live-update messages used by the first end-to-end slice.
+// group-setup plus live-update messages used by the first end-to-end slice.
 // Producer and group version values reserve u64::MAX as an exhaustion sentinel;
 // runtimes reject that value in Update, Summary, and NeedRange payloads.
 message RuntimeMessage {
   oneof body {
-    BootstrapGroup bootstrap_group = 1;
     Update update = 2;
     SummaryRequest summary_request = 3;
     Summary summary = 4;
     NeedRange need_range = 5;
     UpdateBatch update_batch = 6;
+    GroupInvitationPayload group_invitation = 7;
+    MigrationProposalPayload migration_proposal = 8;
   }
 }
 
-// Fixed-membership bootstrap message delivered reliably before live updates.
-message BootstrapGroup {
-  bytes group_id = 1;
-
+// Private setup material carried inside an invitation or migration proposal.
+//
+// Reliable delivery protects the raw symmetric group key for one recipient.
+// The containing invitation/proposal supplies the target group id, canonical
+// member identities, and schema. Receivers validate that member_keys has the
+// same ordered identities before storing the setup material.
+message GroupSetup {
   // Canonical group-member order and expected public identity key fingerprints.
   //
   // This repeated field is semantically ordered. The replication runtime uses
   // the preserved protobuf element order as the canonical member index order
   // for the group.
-  repeated BootstrapMemberKey member_keys = 2;
+  repeated BootstrapMemberKey member_keys = 1;
 
   // Symmetric group-message cipher suite identifier.
-  uint32 group_cipher_suite = 4;
+  uint32 group_cipher_suite = 2;
 
   // Raw symmetric group key sealed by reliable delivery in transit.
-  bytes group_key = 5;
+  bytes group_key = 3;
 }
 
 message BootstrapMemberKey {
@@ -103,4 +107,158 @@ message UpdateBatch {
 message DatasetUpdate {
   string dataset_id = 1;
   repeated flotsync.datamodel.v1.SchemaOperation operations = 2;
+}
+
+message DatasetSchema {
+  // Dataset whose schema is fixed for the lifetime of this group.
+  string dataset_id = 1;
+
+  // Full schema definition for dataset_id.
+  flotsync.datamodel.v1.SchemaDefinition schema = 2;
+}
+
+message GroupInvitationPayload {
+  // Target group the recipient is being invited to activate.
+  //
+  // For migration-sourced invitations this must match GroupInvitationMigration.new_group_id.
+  bytes group_id = 1;
+
+  // Local reason this invitation exists: ordinary creation/invitation or a
+  // migration where the recipient sees the new group as an invitation.
+  GroupInvitationSource source = 2;
+
+  // Proposed canonical member order for the target group.
+  //
+  // Element order is semantically significant and becomes the member-index
+  // order if the invitation is accepted and later activated.
+  repeated flotsync.discovery.v1.Identifier proposed_members = 3;
+
+  // Dataset schemas fixed for the lifetime of the target group.
+  //
+  // Schema changes require migration to a new group.
+  repeated DatasetSchema dataset_schemas = 4;
+
+  // Initial target-group dataset state required before external activation.
+  //
+  // Empty means no rows are present at the activation cut. Inline carries all
+  // rows in this payload. Metadata describes a snapshot that must be fetched by
+  // another protocol before the group becomes externally active.
+  InitialSnapshot initial_snapshot = 5;
+
+  // Optional display name supplied by the proposer. Absence means no display
+  // name was provided in the proposal payload.
+  optional string group_name = 6;
+
+  // Optional user-facing note supplied by the proposer. Absence means no note
+  // was provided in the proposal payload.
+  optional string message = 7;
+
+  // Private target-group setup protected by reliable delivery.
+  GroupSetup group_setup = 8;
+}
+
+message GroupInvitationSource {
+  oneof source {
+    GroupInvitationCreation creation = 1;
+    GroupInvitationMigration migration = 2;
+  }
+}
+
+message GroupInvitationCreation {}
+
+message GroupInvitationMigration {
+  // Existing group that authorises the migration.
+  bytes old_group_id = 1;
+
+  // Target group being joined through the migration.
+  bytes new_group_id = 2;
+}
+
+message MigrationProposalPayload {
+  // Existing group whose members are evaluating the migration.
+  bytes old_group_id = 1;
+
+  // Target group that will become active after acceptance and snapshot load.
+  bytes new_group_id = 2;
+
+  // Final externally writable old-group versions at the migration cut.
+  flotsync.versions.v1.VersionVector final_versions = 3;
+
+  // Proposed canonical member order for the target group.
+  //
+  // Element order is semantically significant and becomes the member-index
+  // order after activation.
+  repeated flotsync.discovery.v1.Identifier proposed_members = 4;
+
+  // Dataset schemas fixed for the lifetime of the target group.
+  //
+  // Schema changes require migration to a new group.
+  repeated DatasetSchema dataset_schemas = 5;
+
+  // Initial target-group dataset state at the migration cut.
+  InitialSnapshot initial_snapshot = 6;
+
+  // Optional display name supplied by the proposer. Absence means no display
+  // name was provided in the proposal payload.
+  optional string group_name = 7;
+
+  // Optional user-facing note supplied by the proposer. Absence means no note
+  // was provided in the proposal payload.
+  optional string message = 8;
+
+  // Private target-group setup protected by reliable delivery.
+  GroupSetup group_setup = 9;
+}
+
+message InitialSnapshot {
+  oneof state {
+    InitialSnapshotEmpty empty = 1;
+    InitialGroupState inline = 2;
+    InitialSnapshotMetadata metadata = 3;
+  }
+}
+
+message InitialSnapshotEmpty {}
+
+message InitialGroupState {
+  // Initial rows grouped by dataset. Dataset element order is not semantic.
+  repeated InitialDatasetState datasets = 1;
+}
+
+message InitialDatasetState {
+  // Dataset whose initial rows are included.
+  string dataset_id = 1;
+
+  // Initial rows for dataset_id. Row element order is not semantic.
+  repeated InitialRowState rows = 2;
+}
+
+message InitialRowState {
+  // Application row key inside the dataset.
+  bytes row_key = 1;
+
+  // Initial nullable field values keyed by field name.
+  map<string, flotsync.datamodel.v1.NullableBasicValue> fields = 2;
+}
+
+message InitialSnapshotMetadata {
+  // Primary group/version reference the recipient should use when reasoning
+  // about this snapshot.
+  SnapshotRef primary_ref = 1;
+
+  // Other known group/version references that identify the same logical
+  // snapshot. This list is not required to be exhaustive.
+  repeated SnapshotRef equivalent_refs = 2;
+
+  // Optional expected row-record count. Absence means the proposer did not
+  // provide a count.
+  optional uint64 record_count = 3;
+}
+
+message SnapshotRef {
+  // Group whose version vector names the snapshot state.
+  bytes group_id = 1;
+
+  // Version vector identifying the materialised snapshot state in group_id.
+  flotsync.versions.v1.VersionVector versions = 2;
 }

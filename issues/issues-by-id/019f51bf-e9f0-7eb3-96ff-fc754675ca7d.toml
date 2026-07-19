@@ -1,0 +1,39 @@
+id = "019f51bf-e9f0-7eb3-96ff-fc754675ca7d"
+ref = "flotsync-git-pow.3"
+title = "Add migration proposal and snapshot metadata wire messages"
+body = """
+Add the wire/runtime message shapes needed for migration proposals, group close, and inline or metadata initial snapshots.
+
+Scope:
+A. Add MigrationProposal with old-group signing/scope and both old/new group ids.
+B. Add GroupClose with migration id and close mode marker.
+C. Add InitialSnapshot wire shape with Empty, Inline, and Metadata.
+D. Add SnapshotRef wire shape and equivalent_refs metadata.
+E. Preserve compatibility behaviour for unknown message kinds.
+F. Keep Metadata sufficient for future non-inline snapshot fetching without implementing chunk transfer here.
+
+Out of scope:
+G. Chunked snapshot request/chunk/complete protocol.
+H. Runtime activation logic beyond decoding/encoding and dispatch boundaries."""
+status = "closed"
+status_reason = "done by flotsync-git-pow.2"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+assignee = "codex"
+blocked_by = ["019f51bf-9095-72a0-94f6-bcbd4ca68271"]
+blocks = [
+    "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
+    "019f51c0-8226-71a0-b86a-49553af4160e",
+    "019f5b28-a26f-7b11-a979-595b4ccdb149",
+]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-11T15:15:59.600691Z"
+updated_at = "2026-07-13T11:07:08.604635Z"
+closed_at = "2026-07-13T11:07:08.604635Z"
+
+[[comments]]
+id = "019f5b28-cdbc-7323-b4c6-bfa10bed8ea6"
+author = "lkroll"
+body = "done by flotsync-git-pow.2"
+created_at = "2026-07-13T11:07:08.604635Z"

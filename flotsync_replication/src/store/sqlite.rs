@@ -1,24 +1,31 @@
 use crate::{
     api::{
         DatasetId,
-        DatasetRowPatch,
-        DatasetRowSlice,
-        DatasetRowWrite,
-        DatasetRowsBatch,
+        DatasetRowStateBatch,
+        DatasetRowStatePatch,
+        DatasetRowStateSlice,
+        DatasetRowStateWrite,
+        DatasetSchema,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
         EncryptedLocalMemberPrivateKeys,
         EncryptedStoreSecret,
         GroupMemberKeys,
+        GroupSchema,
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
         MemberKeyTrustEvidenceSet,
         MemberPublicKeysRecord,
+        PendingGroupActivationRecord,
+        PendingGroupDecisionRecord,
+        PendingGroupWorkKey,
+        ReplicationGroupLifecycle,
+        ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
-        ReplicationRowRecord,
-        ReplicationRowSnapshot,
+        ReplicationRowStateRecord,
+        ReplicationRowStateSnapshot,
         ReplicationStore,
         ReplicationStoreReadTransaction,
         ReplicationStoreTransaction,
@@ -31,12 +38,22 @@ use crate::{
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
     },
-    runtime::messages::{
-        MemberCountContext,
-        RuntimeVersionVectorProtoSource,
-        UpdateMessage,
-        UpdateMessageProtoSource,
-        WireVersionVector,
+    codecs::{
+        messages::{
+            MemberCountContext,
+            RuntimeVersionVectorProtoSource,
+            UpdateMessage,
+            UpdateMessageProtoSource,
+            WireVersionVector,
+        },
+        pending_group::{
+            PendingGroupPayloadDecodeContext,
+            PendingGroupPayloadKind,
+            decode_pending_group_activation_payload,
+            decode_pending_group_decision_payload,
+            encode_pending_group_activation_payload,
+            encode_pending_group_decision_payload,
+        },
     },
 };
 use flotsync_core::{
@@ -331,6 +348,17 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             .boxed()
     }
 
+    fn load_group_dataset_schema<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<SchemaSource>, StoreError>> {
+        async move {
+            load_group_dataset_schema(self.assert_open_connection(), group_id, dataset_id).await
+        }
+        .boxed()
+    }
+
     fn load_local_member_private_keys<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
@@ -422,7 +450,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             load_dataset_rows(
@@ -443,7 +471,7 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         dataset_id: &'a DatasetId,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
             scan_dataset_row_batch(
@@ -455,6 +483,44 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
                 limit,
             )
             .await
+        }
+        .boxed()
+    }
+
+    fn load_pending_group_decisions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
+        async move { load_pending_group_decisions(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_pending_group_decision<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupDecisionRecord>, StoreError>> {
+        async move { load_pending_group_decision(self.assert_open_connection(), group_id).await }
+            .boxed()
+    }
+
+    fn load_pending_group_activations(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
+        async move { load_pending_group_activations(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_pending_group_activation<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupActivationRecord>, StoreError>> {
+        async move { load_pending_group_activation(self.assert_open_connection(), group_id).await }
+            .boxed()
+    }
+
+    fn load_replication_group_material<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupMaterialRecord>, StoreError>> {
+        async move {
+            load_replication_group_material(self.assert_open_connection(), group_id).await
         }
         .boxed()
     }
@@ -478,6 +544,28 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         async move { insert_replication_group(self.assert_open_connection(), &group).await }.boxed()
+    }
+
+    fn ensure_replication_group_material(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move {
+            ensure_replication_group_material(self.assert_open_connection(), &material).await
+        }
+        .boxed()
+    }
+
+    fn activate_replication_group(
+        &mut self,
+        group_id: GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move {
+            activate_replication_group(self.assert_open_connection(), group_id, &version_vector)
+                .await
+        }
+        .boxed()
     }
 
     fn ensure_local_member_private_keys(
@@ -528,9 +616,21 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn update_replication_group_lifecycle<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        async move {
+            update_replication_group_lifecycle(self.assert_open_connection(), group_id, &lifecycle)
+                .await
+        }
+        .boxed()
+    }
+
     fn apply_dataset_row_patch(
         &mut self,
-        patch: DatasetRowPatch,
+        patch: DatasetRowStatePatch,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let schema_sources = self.schema_sources.clone();
         async move {
@@ -564,6 +664,49 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
         .boxed()
     }
 
+    fn upsert_pending_group_decision(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { upsert_pending_group_decision(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn remove_pending_group_decision(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move { remove_pending_group_decision(self.assert_open_connection(), key).await }
+            .boxed()
+    }
+
+    fn upsert_pending_group_activation(
+        &mut self,
+        record: PendingGroupActivationRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        async move { upsert_pending_group_activation(self.assert_open_connection(), &record).await }
+            .boxed()
+    }
+
+    fn remove_pending_group_activation(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move { remove_pending_group_activation(self.assert_open_connection(), key).await }
+            .boxed()
+    }
+
+    fn remove_inactive_replication_group_material(
+        &mut self,
+        group_id: GroupId,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        async move {
+            remove_inactive_replication_group_material(self.assert_open_connection(), group_id)
+                .await
+        }
+        .boxed()
+    }
+
     fn commit(mut self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
         async move {
             let connection = self
@@ -592,28 +735,58 @@ impl ReplicationStoreTransaction for SqliteReplicationStoreTransaction {
 type SqliteStoreConnection = SqliteConnection;
 type SqliteStoreTransaction = sqlx::Transaction<'static, Sqlite>;
 
+const GROUP_LIFECYCLE_OPEN_SQL: &str = "open";
+const GROUP_LIFECYCLE_READ_ONLY_SQL: &str = "read_only";
+const GROUP_LIFECYCLE_CLOSED_SQL: &str = "closed";
+
+// SQLite schema strings cannot interpolate the constants above. Keep this
+// adjacent CHECK constraint aligned when lifecycle labels change.
+const REPLICATION_GROUPS_SCHEMA_STATEMENT: &str = concat!(
+    "\nCREATE TABLE IF NOT EXISTS replication_groups (\n",
+    "    group_id TEXT PRIMARY KEY NOT NULL,\n",
+    "    version_vector BLOB NOT NULL,\n",
+    "    lifecycle TEXT NOT NULL CHECK (lifecycle IN ('open', 'read_only', 'closed')),\n",
+    "    successor_group_id TEXT,\n",
+    "    final_versions BLOB,\n",
+    "    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE\n",
+    ");\n",
+);
+
 /// `SQLite` compares BLOBs lexicographically. Fixed-width big-endian encodings
 /// therefore preserve the natural ordering of `u64` values across the full
 /// range, so `ORDER BY update_version` remains numerically correct even above
 /// `i64::MAX`.
 const UPDATE_VERSION_SORT_KEY_BYTES: usize = 8;
 
-async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(), StoreError> {
-    let schema_statements = [
-        "PRAGMA foreign_keys = ON;",
-        "
-CREATE TABLE IF NOT EXISTS replication_groups (
+// Group persistence is normalised around one material record per group:
+//
+// replication_group_material -> group_members
+//                            -> group_dataset_schemas
+//                                      |
+// replication_groups (active marker + version vector)
+//                                      |
+//                         datasets / rows / updates
+//
+// Invitations and proposals store verified material before policy acceptance.
+// Only inserting the replication_groups marker makes that material active and
+// permits data-state writes through SQLite foreign keys. pending_group_work has
+// exactly one decision or activation row per target group and changes state in
+// place when accepted.
+
+const SCHEMA_STATEMENTS: &[&str] = &[
+    "PRAGMA foreign_keys = ON;",
+    "
+CREATE TABLE IF NOT EXISTS replication_group_material (
     group_id TEXT PRIMARY KEY NOT NULL,
     member_count INTEGER NOT NULL,
     local_member_index INTEGER NOT NULL,
-    version_vector BLOB NOT NULL,
     group_secret_crypto_version INTEGER NOT NULL,
     group_secret_key_id TEXT NOT NULL,
     group_secret_nonce BLOB NOT NULL,
     group_secret_ciphertext BLOB NOT NULL
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS group_members (
     group_id TEXT NOT NULL,
     member_index INTEGER NOT NULL,
@@ -621,10 +794,20 @@ CREATE TABLE IF NOT EXISTS group_members (
     key_fingerprint BLOB NOT NULL,
     PRIMARY KEY (group_id, member_index),
     UNIQUE (group_id, member_identity),
-    FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
+    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
+CREATE TABLE IF NOT EXISTS group_dataset_schemas (
+    group_id TEXT NOT NULL,
+    dataset_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    PRIMARY KEY (group_id, dataset_id),
+    FOREIGN KEY (group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
+);
+",
+    REPLICATION_GROUPS_SCHEMA_STATEMENT,
+    "
 CREATE TABLE IF NOT EXISTS datasets (
     group_id TEXT NOT NULL,
     dataset_id TEXT NOT NULL,
@@ -632,7 +815,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS dataset_rows (
     group_id TEXT NOT NULL,
     dataset_id TEXT NOT NULL,
@@ -644,7 +827,7 @@ CREATE TABLE IF NOT EXISTS dataset_rows (
     FOREIGN KEY (group_id, dataset_id) REFERENCES datasets(group_id, dataset_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS dataset_updates (
     group_id TEXT NOT NULL,
     update_node_index INTEGER NOT NULL,
@@ -656,7 +839,7 @@ CREATE TABLE IF NOT EXISTS dataset_updates (
     FOREIGN KEY (group_id) REFERENCES replication_groups(group_id) ON DELETE CASCADE
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS local_members (
     member_identity TEXT PRIMARY KEY NOT NULL,
     private_keys_crypto_version INTEGER NOT NULL,
@@ -665,7 +848,7 @@ CREATE TABLE IF NOT EXISTS local_members (
     private_keys_ciphertext BLOB NOT NULL
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS member_public_keys (
     member_identity TEXT NOT NULL,
     key_fingerprint BLOB NOT NULL,
@@ -674,7 +857,7 @@ CREATE TABLE IF NOT EXISTS member_public_keys (
     PRIMARY KEY (member_identity, key_fingerprint)
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
     member_identity TEXT NOT NULL,
     key_fingerprint BLOB NOT NULL,
@@ -684,14 +867,26 @@ CREATE TABLE IF NOT EXISTS member_key_trust_evidence (
         REFERENCES member_public_keys(member_identity, key_fingerprint) ON DELETE RESTRICT
 );
 ",
-        "
+    "
 CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
     key_fingerprint BLOB PRIMARY KEY NOT NULL
 );
 ",
-    ];
-    for statement in schema_statements {
-        sqlx::query(statement)
+    "
+CREATE TABLE IF NOT EXISTS pending_group_work (
+    new_group_id TEXT PRIMARY KEY NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('decision', 'activation')),
+    work_kind TEXT NOT NULL,
+    old_group_id TEXT,
+    payload BLOB NOT NULL,
+    FOREIGN KEY (new_group_id) REFERENCES replication_group_material(group_id) ON DELETE CASCADE
+);
+",
+];
+
+async fn initialise_schema(connection: &mut SqliteStoreConnection) -> Result<(), StoreError> {
+    for statement in SCHEMA_STATEMENTS {
+        sqlx::query(*statement)
             .execute(&mut *connection)
             .await
             .context(SqlxSnafu)?;
@@ -699,21 +894,20 @@ CREATE TABLE IF NOT EXISTS blocked_key_fingerprints (
     Ok(())
 }
 
-async fn load_replication_group(
+async fn load_replication_group_material(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
-) -> Result<Option<ReplicationGroupRecord>, StoreError> {
+) -> Result<Option<ReplicationGroupMaterialRecord>, StoreError> {
     let row = sqlx::query(
         "
 SELECT
     member_count,
     local_member_index,
-    version_vector,
     group_secret_crypto_version,
     group_secret_key_id,
     group_secret_nonce,
     group_secret_ciphertext
-FROM replication_groups
+FROM replication_group_material
 WHERE group_id = ?1
 ",
     )
@@ -728,8 +922,6 @@ WHERE group_id = ?1
     let member_count = decode_non_zero_member_count(row.get::<i64, _>("member_count"))?;
     let local_member_index =
         decode_member_index(row.get::<i64, _>("local_member_index"), member_count)?;
-    let version_vector =
-        decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
     let encrypted_group_secret = decode_encrypted_store_secret(
         row.get("group_secret_crypto_version"),
         row.get("group_secret_key_id"),
@@ -740,14 +932,46 @@ WHERE group_id = ?1
         encrypted_group_secret,
     };
     let member_keys = load_group_member_keys(connection, group_id, member_count).await?;
+    let group_schema = load_group_schema(connection, group_id).await?;
 
-    Ok(Some(ReplicationGroupRecord {
+    Ok(Some(ReplicationGroupMaterialRecord {
         group_id: *group_id,
         member_keys,
         local_member_index,
-        version_vector,
+        group_schema,
         security_material,
     }))
+}
+
+async fn load_replication_group(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<ReplicationGroupRecord>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT version_vector, lifecycle, successor_group_id, final_versions
+FROM replication_groups
+WHERE group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let material = load_replication_group_material(connection, group_id)
+        .await?
+        .expect("active group foreign key guarantees matching group material");
+    let version_vector = decode_stored_version_vector(
+        &row.get::<Vec<u8>, _>("version_vector"),
+        material.member_count(),
+    )?;
+    let lifecycle = decode_replication_group_lifecycle(&row, material.member_count())?;
+    let mut group = material.activate(version_vector);
+    group.lifecycle = lifecycle;
+    Ok(Some(group))
 }
 
 async fn load_replication_groups(
@@ -810,58 +1034,156 @@ WHERE group_id IN (",
     Ok(groups)
 }
 
+async fn load_group_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<GroupSchema, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT dataset_id, payload
+FROM group_dataset_schemas
+WHERE group_id = ?1
+ORDER BY dataset_id
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut datasets = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let dataset_id = decode_dataset_id(&row.get::<String, _>("dataset_id"))?;
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let dataset_schema = decode_group_dataset_schema_payload(&payload)?;
+        ensure!(
+            dataset_schema.dataset_id == dataset_id,
+            StoredDatasetSchemaKeyMismatchSnafu {
+                group: *group_id,
+                key_dataset: dataset_id,
+                payload_dataset: dataset_schema.dataset_id.clone(),
+            }
+        );
+        datasets.insert(dataset_id, dataset_schema.schema);
+    }
+    Ok(GroupSchema::new(datasets))
+}
+
+async fn load_group_dataset_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    dataset_id: &DatasetId,
+) -> Result<Option<SchemaSource>, StoreError> {
+    let row = sqlx::query(
+        "
+SELECT payload
+FROM group_dataset_schemas
+WHERE group_id = ?1 AND dataset_id = ?2
+",
+    )
+    .bind(group_id.to_string())
+    .bind(dataset_id.as_str())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    if let Some(row) = row {
+        let payload = row.get::<Vec<u8>, _>("payload");
+        let dataset_schema = decode_group_dataset_schema_payload(&payload)?;
+        ensure!(
+            dataset_schema.dataset_id == *dataset_id,
+            StoredDatasetSchemaKeyMismatchSnafu {
+                group: *group_id,
+                key_dataset: dataset_id.clone(),
+                payload_dataset: dataset_schema.dataset_id.clone(),
+            }
+        );
+        return Ok(Some(dataset_schema.schema));
+    }
+
+    Ok(None)
+}
+
 async fn insert_replication_group(
     connection: &mut SqliteStoreConnection,
     group: &ReplicationGroupRecord,
 ) -> Result<(), StoreError> {
-    let member_count = group.member_count();
-    ensure_member_index_in_bounds(group.local_member_index, member_count)?;
+    let material = ReplicationGroupMaterialRecord {
+        group_id: group.group_id,
+        member_keys: group.member_keys.clone(),
+        local_member_index: group.local_member_index,
+        group_schema: group.group_schema.clone(),
+        security_material: group.security_material.clone(),
+    };
+    ensure_replication_group_material(connection, &material).await?;
+    activate_replication_group_with_lifecycle(
+        connection,
+        group.group_id,
+        &group.version_vector,
+        &group.lifecycle,
+    )
+    .await
+}
 
-    let version_vector = encode_stored_version_vector(&group.version_vector);
+/// Store group material, accepting only exact idempotent replays.
+async fn ensure_replication_group_material(
+    connection: &mut SqliteStoreConnection,
+    material: &ReplicationGroupMaterialRecord,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_replication_group_material(connection, &material.group_id).await? {
+        ensure!(
+            existing == *material,
+            ConflictingGroupMaterialSnafu {
+                group_id: material.group_id
+            }
+        );
+        return Ok(());
+    }
+    let member_count = material.member_count();
+    ensure_member_index_in_bounds(material.local_member_index, member_count)?;
+
     let stored_member_count =
         i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?;
     sqlx::query(
         "
-INSERT INTO replication_groups (
+INSERT INTO replication_group_material (
     group_id,
     member_count,
     local_member_index,
-    version_vector,
     group_secret_crypto_version,
     group_secret_key_id,
     group_secret_nonce,
     group_secret_ciphertext
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
 ",
     )
-    .bind(group.group_id.to_string())
+    .bind(material.group_id.to_string())
     .bind(stored_member_count)
-    .bind(i64::from(group.local_member_index.as_u32()))
-    .bind(version_vector)
+    .bind(i64::from(material.local_member_index.as_u32()))
     .bind(i64::from(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .crypto_version
             .as_u16(),
     ))
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .key_id
             .to_string(),
     )
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .nonce
             .as_ref(),
     )
     .bind(
-        group
+        material
             .security_material
             .encrypted_group_secret
             .ciphertext
@@ -871,7 +1193,12 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
     .await
     .context(SqlxSnafu)?;
 
-    for (member_index, member_key) in group.member_keys.ordered_member_keys().iter().enumerate() {
+    for (member_index, member_key) in material
+        .member_keys
+        .ordered_member_keys()
+        .iter()
+        .enumerate()
+    {
         let member_index = i64::try_from(member_index).context(MemberCountOverflowSnafu)?;
         sqlx::query(
             "
@@ -879,7 +1206,7 @@ INSERT INTO group_members (group_id, member_index, member_identity, key_fingerpr
 VALUES (?1, ?2, ?3, ?4)
 ",
         )
-        .bind(group.group_id.to_string())
+        .bind(material.group_id.to_string())
         .bind(member_index)
         .bind(member_key.member_id.to_string())
         .bind(member_key.fingerprint.as_ref())
@@ -887,7 +1214,97 @@ VALUES (?1, ?2, ?3, ?4)
         .await
         .context(SqlxSnafu)?;
     }
+    insert_group_schema(connection, material.group_id, &material.group_schema).await?;
     Ok(())
+}
+
+async fn insert_group_schema(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    group_schema: &GroupSchema,
+) -> Result<(), StoreError> {
+    for dataset_schema in group_schema.datasets() {
+        sqlx::query(
+            "
+INSERT INTO group_dataset_schemas (group_id, dataset_id, payload)
+VALUES (?1, ?2, ?3)
+",
+        )
+        .bind(group_id.to_string())
+        .bind(dataset_schema.dataset_id.as_str())
+        .bind(encode_group_dataset_schema_payload(&dataset_schema))
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+    }
+    Ok(())
+}
+
+/// Insert the active marker for existing material.
+async fn activate_replication_group(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    version_vector: &VersionVector,
+) -> Result<(), StoreError> {
+    activate_replication_group_with_lifecycle(
+        connection,
+        group_id,
+        version_vector,
+        &ReplicationGroupLifecycle::Open,
+    )
+    .await
+}
+
+/// Insert the active marker and its application-access lifecycle.
+async fn activate_replication_group_with_lifecycle(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+    version_vector: &VersionVector,
+    lifecycle: &ReplicationGroupLifecycle,
+) -> Result<(), StoreError> {
+    let lifecycle_sql = replication_group_lifecycle_sql_label(lifecycle);
+    let successor_group_id = lifecycle
+        .successor_group_id()
+        .map(|group_id| group_id.to_string());
+    let final_versions = lifecycle.final_versions().map(encode_stored_version_vector);
+    sqlx::query(
+        "
+INSERT INTO replication_groups (
+    group_id, version_vector, lifecycle, successor_group_id, final_versions
+)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+    )
+    .bind(group_id.to_string())
+    .bind(encode_stored_version_vector(version_vector))
+    .bind(lifecycle_sql)
+    .bind(successor_group_id)
+    .bind(final_versions)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+/// Remove material only while no active marker exists.
+async fn remove_inactive_replication_group_material(
+    connection: &mut SqliteStoreConnection,
+    group_id: GroupId,
+) -> Result<bool, StoreError> {
+    let result = sqlx::query(
+        "
+DELETE FROM replication_group_material
+WHERE group_id = ?1
+  AND NOT EXISTS (
+      SELECT 1 FROM replication_groups WHERE replication_groups.group_id = ?1
+  )
+",
+    )
+    .bind(group_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(result.rows_affected() > 0)
 }
 
 async fn load_local_member_private_keys(
@@ -1211,17 +1628,51 @@ WHERE group_id = ?1
     Ok(())
 }
 
+async fn update_replication_group_lifecycle(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    lifecycle: &ReplicationGroupLifecycle,
+) -> Result<(), StoreError> {
+    let lifecycle_sql = replication_group_lifecycle_sql_label(lifecycle);
+    let successor_group_id = lifecycle
+        .successor_group_id()
+        .map(|group_id| group_id.to_string());
+    let final_versions = lifecycle.final_versions().map(encode_stored_version_vector);
+    let rows_affected = sqlx::query(
+        "
+UPDATE replication_groups
+SET lifecycle = ?2, successor_group_id = ?3, final_versions = ?4
+WHERE group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .bind(lifecycle_sql)
+    .bind(successor_group_id)
+    .bind(final_versions)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?
+    .rows_affected();
+    ensure!(
+        rows_affected == 1,
+        MissingStoredGroupSnafu {
+            group_id: *group_id
+        }
+    );
+    Ok(())
+}
+
 async fn load_dataset_rows(
     connection: &mut SqliteStoreConnection,
     schema_sources: &HashMap<DatasetId, SchemaSource>,
     group_id: &GroupId,
     dataset_id: &DatasetId,
     row_keys: &mut RowKeyIterator<'_>,
-) -> Result<DatasetRowSlice, StoreError> {
+) -> Result<DatasetRowStateSlice, StoreError> {
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     let mut row_keys = row_keys.peekable();
     if row_keys.peek().is_none() {
-        return Ok(DatasetRowSlice {
+        return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1232,7 +1683,7 @@ async fn load_dataset_rows(
         .map(|row_key| (*row_key, None))
         .collect::<HashMap<_, _>>();
     if !dataset_exists {
-        return Ok(DatasetRowSlice {
+        return Ok(DatasetRowStateSlice {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1244,6 +1695,7 @@ async fn load_dataset_rows(
         .get(dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: *group_id,
             dataset_id: dataset_id.clone(),
         })?;
     let member_count = load_group_member_count(connection, group_id).await?;
@@ -1277,7 +1729,7 @@ WHERE group_id = ",
         )?;
         rows.insert(
             row_key,
-            Some(ReplicationRowRecord {
+            Some(ReplicationRowStateRecord {
                 row_id: row_key,
                 snapshot: row_snapshot,
                 tombstoned: row.get::<bool, _>("row_tombstoned"),
@@ -1288,7 +1740,7 @@ WHERE group_id = ",
             }),
         );
     }
-    Ok(DatasetRowSlice {
+    Ok(DatasetRowStateSlice {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
@@ -1308,10 +1760,10 @@ async fn scan_dataset_row_batch(
     dataset_id: &DatasetId,
     after: Option<RowKey>,
     limit: NonZeroUsize,
-) -> Result<DatasetRowsBatch, StoreError> {
+) -> Result<DatasetRowStateBatch, StoreError> {
     let dataset_exists = dataset_exists_in_group(connection, group_id, dataset_id).await?;
     if !dataset_exists {
-        return Ok(DatasetRowsBatch {
+        return Ok(DatasetRowStateBatch {
             group_id: *group_id,
             dataset_id: dataset_id.clone(),
             dataset_exists,
@@ -1324,6 +1776,7 @@ async fn scan_dataset_row_batch(
         .get(dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: *group_id,
             dataset_id: dataset_id.clone(),
         })?;
     let member_count = load_group_member_count(connection, group_id).await?;
@@ -1341,7 +1794,7 @@ WHERE group_id = ",
         query_builder.push_bind(after.to_string());
     }
     query_builder.push(" ORDER BY row_key LIMIT ");
-    query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+    query_builder.push_bind(sqlite_limit_value(limit));
 
     let stored_rows = query_builder
         .build()
@@ -1355,7 +1808,7 @@ WHERE group_id = ",
             schema.as_schema(),
             &row.get::<Vec<u8>, _>("row_snapshot"),
         )?;
-        rows.push(ReplicationRowRecord {
+        rows.push(ReplicationRowStateRecord {
             row_id: row_key,
             snapshot: row_snapshot,
             tombstoned: row.get::<bool, _>("row_tombstoned"),
@@ -1367,7 +1820,7 @@ WHERE group_id = ",
     } else {
         None
     };
-    Ok(DatasetRowsBatch {
+    Ok(DatasetRowStateBatch {
         group_id: *group_id,
         dataset_id: dataset_id.clone(),
         dataset_exists,
@@ -1379,7 +1832,7 @@ WHERE group_id = ",
 async fn apply_dataset_row_patch(
     connection: &mut SqliteStoreConnection,
     schema_sources: &HashMap<DatasetId, SchemaSource>,
-    patch: &DatasetRowPatch,
+    patch: &DatasetRowStatePatch,
 ) -> Result<(), StoreError> {
     if patch.actions.is_empty() {
         return Ok(());
@@ -1389,13 +1842,14 @@ async fn apply_dataset_row_patch(
         .get(&patch.dataset_id)
         .cloned()
         .context(MissingSchemaSnafu {
+            group_id: patch.group_id,
             dataset_id: patch.dataset_id.clone(),
         })?;
     ensure_dataset_exists(connection, &patch.group_id, &patch.dataset_id).await?;
 
     for action in &patch.actions {
         let (row_key, snapshot, tombstoned) = match action {
-            DatasetRowWrite::UpsertActive { row_key, snapshot } => {
+            DatasetRowStateWrite::UpsertActive { row_key, snapshot } => {
                 ensure_dataset_row_upsert_active_is_valid(
                     connection,
                     &patch.group_id,
@@ -1405,7 +1859,9 @@ async fn apply_dataset_row_patch(
                 .await?;
                 (row_key, snapshot, false)
             }
-            DatasetRowWrite::UpsertTombstone { row_key, snapshot } => (row_key, snapshot, true),
+            DatasetRowStateWrite::UpsertTombstone { row_key, snapshot } => {
+                (row_key, snapshot, true)
+            }
         };
         let row_snapshot = encode_dataset_row_snapshot(schema.as_schema(), snapshot)?;
         sqlx::query(
@@ -1505,12 +1961,8 @@ WHERE group_id = ?1
     let Some(row) = row else {
         return Ok(None);
     };
-    Ok(Some(decode_stored_update_row(
-        group_id,
-        member_count,
-        update_id,
-        &row,
-    )?))
+    let update = decode_stored_update_row(group_id, member_count, update_id, &row)?;
+    Ok(Some(update))
 }
 
 async fn load_replication_updates(
@@ -1532,7 +1984,7 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+        query_builder.push_bind(sqlite_limit_value(limit));
     }
     let rows = query_builder
         .build()
@@ -1546,12 +1998,8 @@ WHERE group_id = ",
             node_index: decode_member_index_value(row.get::<i64, _>("update_node_index"))?,
             version: decode_update_version_sort_key(&row.get::<Vec<u8>, _>("update_version"))?,
         };
-        updates.push(decode_stored_update_row(
-            group_id,
-            member_count,
-            update_id,
-            &row,
-        )?);
+        let update = decode_stored_update_row(group_id, member_count, update_id, &row)?;
+        updates.push(update);
     }
     Ok(updates)
 }
@@ -1574,7 +2022,7 @@ WHERE group_id = ",
     query_builder.push(" ORDER BY update_version, update_node_index");
     if let Some(limit) = limit {
         query_builder.push(" LIMIT ");
-        query_builder.push_bind(i64::try_from(limit.get()).context(RowLimitOverflowSnafu)?);
+        query_builder.push_bind(sqlite_limit_value(limit));
     }
     let rows = query_builder
         .build()
@@ -1682,6 +2130,482 @@ WHERE group_id = ?1
     Ok(())
 }
 
+/// Decoded SQL metadata and bytes for one pending target-group row.
+struct StoredPendingGroupPayload {
+    state: PendingGroupWorkState,
+    key: PendingGroupSqlKey,
+    context: PendingGroupPayloadDecodeContext,
+    payload: Vec<u8>,
+}
+
+/// Lifecycle state stored in the single target-group keyed work table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingGroupWorkState {
+    /// Listener-mediated work that has not yet been accepted or rejected.
+    AwaitingDecision,
+    /// Accepted work that must activate without consulting the listener again.
+    AcceptedActivation,
+}
+
+impl PendingGroupWorkState {
+    /// Return the stable SQL representation for this lifecycle state.
+    const fn as_sql(self) -> &'static str {
+        match self {
+            Self::AwaitingDecision => "decision",
+            Self::AcceptedActivation => "activation",
+        }
+    }
+}
+
+impl TryFrom<String> for PendingGroupWorkState {
+    type Error = PendingGroupSqlKeyError;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        match raw.as_str() {
+            "decision" => Ok(Self::AwaitingDecision),
+            "activation" => Ok(Self::AcceptedActivation),
+            _ => Err(PendingGroupSqlKeyError::UnknownWorkState { raw }),
+        }
+    }
+}
+
+async fn stored_pending_group_payload_from_row(
+    connection: &mut SqliteStoreConnection,
+    row: sqlx::sqlite::SqliteRow,
+) -> Result<StoredPendingGroupPayload, StoreError> {
+    let raw_state = row.get::<String, _>("state");
+    let state = PendingGroupWorkState::try_from(raw_state)
+        .map_err(|source| invalid_stored_object("pending group work state", source))?;
+    let key = decode_pending_group_sql_key(&row)?;
+    let context = pending_group_payload_decode_context(connection, &key).await?;
+    Ok(StoredPendingGroupPayload {
+        state,
+        key,
+        context,
+        payload: row.get::<Vec<u8>, _>("payload"),
+    })
+}
+
+async fn load_pending_group_payloads(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+) -> Result<Vec<StoredPendingGroupPayload>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE state = ?1
+",
+    )
+    .bind(state.as_sql())
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let mut payloads = Vec::with_capacity(rows.len());
+    for row in rows {
+        payloads.push(stored_pending_group_payload_from_row(connection, row).await?);
+    }
+    Ok(payloads)
+}
+
+async fn load_pending_group_payload(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+    state: Option<PendingGroupWorkState>,
+) -> Result<Option<StoredPendingGroupPayload>, StoreError> {
+    let row = if let Some(state) = state {
+        let query = sqlx::query(
+            "
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE new_group_id = ?1 AND state = ?2
+",
+        )
+        .bind(group_id.to_string())
+        .bind(state.as_sql())
+        .fetch_optional(&mut *connection);
+        query.await.context(SqlxSnafu)?
+    } else {
+        let query = sqlx::query(
+            "
+SELECT state, work_kind, old_group_id, new_group_id, payload
+FROM pending_group_work
+WHERE new_group_id = ?1
+",
+        )
+        .bind(group_id.to_string())
+        .fetch_optional(&mut *connection);
+        query.await.context(SqlxSnafu)?
+    };
+    match row {
+        Some(row) => stored_pending_group_payload_from_row(connection, row)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn load_pending_group_decisions(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<PendingGroupDecisionRecord>, StoreError> {
+    let payloads =
+        load_pending_group_payloads(connection, PendingGroupWorkState::AwaitingDecision).await?;
+    let mut records = Vec::with_capacity(payloads.len());
+    for stored in payloads {
+        let record = decode_stored_proto(
+            "pending group decision",
+            decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
+        )?;
+        validate_pending_group_payload_key(record.key(), stored.key)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+async fn load_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<PendingGroupDecisionRecord>, StoreError> {
+    let stored = load_pending_group_payload(
+        connection,
+        group_id,
+        Some(PendingGroupWorkState::AwaitingDecision),
+    )
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let record = decode_stored_proto(
+        "pending group decision",
+        decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
+    )?;
+    validate_pending_group_payload_key(record.key(), stored.key)?;
+    Ok(Some(record))
+}
+
+async fn load_pending_group_activations(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<PendingGroupActivationRecord>, StoreError> {
+    let payloads =
+        load_pending_group_payloads(connection, PendingGroupWorkState::AcceptedActivation).await?;
+    let mut records = Vec::with_capacity(payloads.len());
+    for stored in payloads {
+        let record = decode_stored_proto(
+            "pending group activation",
+            decode_pending_group_activation_payload(
+                stored.key.kind,
+                &stored.payload,
+                stored.context,
+            ),
+        )?;
+        validate_pending_group_payload_key(record.key(), stored.key)?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+async fn load_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<PendingGroupActivationRecord>, StoreError> {
+    let stored = load_pending_group_payload(
+        connection,
+        group_id,
+        Some(PendingGroupWorkState::AcceptedActivation),
+    )
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let record = decode_stored_proto(
+        "pending group activation",
+        decode_pending_group_activation_payload(stored.key.kind, &stored.payload, stored.context),
+    )?;
+    validate_pending_group_payload_key(record.key(), stored.key)?;
+    Ok(Some(record))
+}
+
+async fn upsert_pending_group_payload_row(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+    key: PendingGroupSqlKey,
+    payload: Vec<u8>,
+) -> Result<(), StoreError> {
+    if let Some(existing) = load_pending_group_payload(connection, &key.new_group_id, None).await? {
+        ensure!(
+            existing.key == key && existing.payload == payload,
+            ConflictingPendingGroupWorkSnafu {
+                group_id: key.new_group_id
+            }
+        );
+        match (existing.state, state) {
+            (
+                PendingGroupWorkState::AwaitingDecision,
+                PendingGroupWorkState::AcceptedActivation,
+            ) => {
+                sqlx::query(
+                    "
+UPDATE pending_group_work
+SET state = 'activation'
+WHERE new_group_id = ?1
+",
+                )
+                .bind(key.new_group_id.to_string())
+                .execute(&mut *connection)
+                .await
+                .context(SqlxSnafu)?;
+            }
+            (existing_state, requested_state) => ensure!(
+                existing_state == requested_state,
+                ConflictingPendingGroupWorkSnafu {
+                    group_id: key.new_group_id
+                }
+            ),
+        }
+        return Ok(());
+    }
+    sqlx::query(
+        "
+INSERT INTO pending_group_work (new_group_id, state, work_kind, old_group_id, payload)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+    )
+    .bind(key.new_group_id.to_string())
+    .bind(state.as_sql())
+    .bind(key.kind.as_sql())
+    .bind(key.old_group_id.map(|group_id| group_id.to_string()))
+    .bind(payload)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    Ok(())
+}
+
+async fn upsert_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    record: &PendingGroupDecisionRecord,
+) -> Result<(), StoreError> {
+    let (kind, payload) = encode_pending_group_decision_payload(record);
+    let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
+    upsert_pending_group_payload_row(
+        connection,
+        PendingGroupWorkState::AwaitingDecision,
+        key,
+        payload,
+    )
+    .await
+}
+
+async fn remove_pending_group_decision(
+    connection: &mut SqliteStoreConnection,
+    key: PendingGroupWorkKey,
+) -> Result<bool, StoreError> {
+    let key = PendingGroupSqlKey::from_work_key_only(key);
+    remove_pending_group_payload_row(connection, PendingGroupWorkState::AwaitingDecision, &key)
+        .await
+}
+
+async fn upsert_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    record: &PendingGroupActivationRecord,
+) -> Result<(), StoreError> {
+    let (kind, payload) = encode_pending_group_activation_payload(record);
+    let key = PendingGroupSqlKey::from_work_key(record.key(), kind);
+    upsert_pending_group_payload_row(
+        connection,
+        PendingGroupWorkState::AcceptedActivation,
+        key,
+        payload,
+    )
+    .await
+}
+
+async fn remove_pending_group_activation(
+    connection: &mut SqliteStoreConnection,
+    key: PendingGroupWorkKey,
+) -> Result<bool, StoreError> {
+    let key = PendingGroupSqlKey::from_work_key_only(key);
+    remove_pending_group_payload_row(connection, PendingGroupWorkState::AcceptedActivation, &key)
+        .await
+}
+
+async fn remove_pending_group_payload_row(
+    connection: &mut SqliteStoreConnection,
+    state: PendingGroupWorkState,
+    key: &PendingGroupSqlKey,
+) -> Result<bool, StoreError> {
+    let rows_affected = sqlx::query(
+        "
+DELETE FROM pending_group_work
+WHERE new_group_id = ?1
+  AND state = ?2
+  AND work_kind = ?3
+  AND old_group_id IS ?4
+",
+    )
+    .bind(key.new_group_id.to_string())
+    .bind(state.as_sql())
+    .bind(key.kind.as_sql())
+    .bind(key.old_group_id.map(|group_id| group_id.to_string()))
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?
+    .rows_affected();
+    Ok(rows_affected > 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingGroupSqlKey {
+    /// Stored payload discriminator matching the concrete encoded payload type.
+    kind: PendingGroupPayloadKind,
+    /// Existing group that authorises migration work, absent for ordinary invitations.
+    old_group_id: Option<GroupId>,
+    /// Target group for invitations and proposals.
+    new_group_id: GroupId,
+}
+
+impl PendingGroupSqlKey {
+    /// Convert a runtime work key into the SQL key and assert the encoded payload kind.
+    fn from_work_key(key: PendingGroupWorkKey, kind: PendingGroupPayloadKind) -> Self {
+        let sql_key = Self::from_work_key_only(key);
+        debug_assert_eq!(sql_key.kind, kind);
+        sql_key
+    }
+
+    /// Convert a runtime work key into the multi-column SQL key shape.
+    fn from_work_key_only(key: PendingGroupWorkKey) -> Self {
+        match key {
+            PendingGroupWorkKey::GroupInvitation { group_id, source } => match source {
+                crate::api::GroupInvitationSource::Creation => Self {
+                    kind: PendingGroupPayloadKind::GroupInvitation,
+                    old_group_id: None,
+                    new_group_id: group_id,
+                },
+                crate::api::GroupInvitationSource::Migration { migration_id } => Self {
+                    kind: PendingGroupPayloadKind::GroupInvitation,
+                    old_group_id: Some(migration_id.old_group_id),
+                    new_group_id: migration_id.new_group_id,
+                },
+            },
+            PendingGroupWorkKey::MigrationProposal { migration_id } => Self {
+                kind: PendingGroupPayloadKind::MigrationProposal,
+                old_group_id: Some(migration_id.old_group_id),
+                new_group_id: migration_id.new_group_id,
+            },
+        }
+    }
+}
+
+impl PendingGroupPayloadKind {
+    /// Return the stable SQL discriminator stored beside pending group payloads.
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::GroupInvitation => "group_invitation",
+            Self::MigrationProposal => "migration_proposal",
+        }
+    }
+}
+
+#[derive(Debug, Snafu)]
+enum StoredGroupLifecycleError {
+    /// Open groups must not carry accepted migration data.
+    #[snafu(display("Open replication group unexpectedly stored migration data."))]
+    OpenWithMigrationData,
+    /// Non-open groups require both the accepted successor and immutable cut.
+    #[snafu(display(
+        "Replication group lifecycle '{raw}' did not store required field '{field}'."
+    ))]
+    MissingMigrationData { raw: String, field: &'static str },
+    /// Stored lifecycle discriminator is not supported.
+    #[snafu(display("Unknown replication group lifecycle '{raw}'."))]
+    Unknown { raw: String },
+}
+
+#[derive(Debug, Snafu)]
+enum PendingGroupSqlKeyError {
+    /// Stored `work_kind` did not name any supported pending group payload.
+    #[snafu(display("Unknown pending group work kind '{raw}'."))]
+    UnknownWorkKind { raw: String },
+    /// Stored lifecycle state did not name a supported pending-work state.
+    #[snafu(display("Unknown pending group work state '{raw}'."))]
+    UnknownWorkState { raw: String },
+    /// Migration proposals must reference the existing group that authorised them.
+    #[snafu(display("Pending migration proposal key did not contain old_group_id."))]
+    MissingMigrationProposalOldGroupId,
+    /// The decoded payload described different pending work from the SQL key.
+    #[snafu(display("Pending payload key {payload_key:?} did not match SQL key {sql_key:?}."))]
+    PayloadKeyMismatch {
+        payload_key: PendingGroupSqlKey,
+        sql_key: PendingGroupSqlKey,
+    },
+}
+
+/// Decode one pending group SQL row key from its discriminator and group columns.
+fn decode_pending_group_sql_key(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<PendingGroupSqlKey, StoreError> {
+    let raw_work_kind = row.get::<String, _>("work_kind");
+    let kind = match raw_work_kind.as_str() {
+        "group_invitation" => PendingGroupPayloadKind::GroupInvitation,
+        "migration_proposal" => PendingGroupPayloadKind::MigrationProposal,
+        _ => {
+            return Err(invalid_stored_object(
+                "pending group sql key",
+                PendingGroupSqlKeyError::UnknownWorkKind { raw: raw_work_kind },
+            ));
+        }
+    };
+    let raw_old_group_id = row.get::<Option<String>, _>("old_group_id");
+    let old_group_id = raw_old_group_id
+        .as_deref()
+        .map(decode_group_id)
+        .transpose()?;
+    let new_group_id = decode_group_id(&row.get::<String, _>("new_group_id"))?;
+    if kind == PendingGroupPayloadKind::MigrationProposal && old_group_id.is_none() {
+        return Err(invalid_stored_object(
+            "pending group sql key",
+            PendingGroupSqlKeyError::MissingMigrationProposalOldGroupId,
+        ));
+    }
+    Ok(PendingGroupSqlKey {
+        kind,
+        old_group_id,
+        new_group_id,
+    })
+}
+
+/// Build the payload decode context available from the pending group SQL key.
+async fn pending_group_payload_decode_context(
+    connection: &mut SqliteStoreConnection,
+    key: &PendingGroupSqlKey,
+) -> Result<PendingGroupPayloadDecodeContext, StoreError> {
+    let old_group_member_count = match key.old_group_id {
+        Some(group_id) => load_optional_group_member_count(connection, &group_id).await?,
+        None => None,
+    };
+    Ok(PendingGroupPayloadDecodeContext {
+        old_group_member_count,
+    })
+}
+
+/// Validate that decoded pending work still matches the row key it was stored under.
+fn validate_pending_group_payload_key(
+    payload_key: PendingGroupWorkKey,
+    sql_key: PendingGroupSqlKey,
+) -> Result<(), StoreError> {
+    let payload_key = PendingGroupSqlKey::from_work_key_only(payload_key);
+    if payload_key == sql_key {
+        return Ok(());
+    }
+    Err(invalid_stored_object(
+        "pending group sql key",
+        PendingGroupSqlKeyError::PayloadKeyMismatch {
+            payload_key,
+            sql_key,
+        },
+    ))
+}
+
 async fn load_group_member_keys(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -1729,9 +2653,10 @@ async fn load_group_member_count(
 ) -> Result<NonZeroUsize, StoreError> {
     let member_count = sqlx::query_scalar::<_, i64>(
         "
-SELECT member_count
-FROM replication_groups
-WHERE group_id = ?1
+SELECT material.member_count
+FROM replication_groups AS active
+JOIN replication_group_material AS material ON material.group_id = active.group_id
+WHERE active.group_id = ?1
 ",
     )
     .bind(group_id.to_string())
@@ -1746,6 +2671,25 @@ WHERE group_id = ?1
         .map_err(StoreError::from);
     };
     decode_non_zero_member_count(member_count)
+}
+
+async fn load_optional_group_member_count(
+    connection: &mut SqliteStoreConnection,
+    group_id: &GroupId,
+) -> Result<Option<NonZeroUsize>, StoreError> {
+    let member_count = sqlx::query_scalar::<_, i64>(
+        "
+SELECT material.member_count
+FROM replication_groups AS active
+JOIN replication_group_material AS material ON material.group_id = active.group_id
+WHERE active.group_id = ?1
+",
+    )
+    .bind(group_id.to_string())
+    .fetch_optional(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    member_count.map(decode_non_zero_member_count).transpose()
 }
 
 async fn dataset_exists_in_group(
@@ -1792,7 +2736,7 @@ ON CONFLICT(group_id, dataset_id) DO NOTHING
 
 fn encode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
-    row: &ReplicationRowSnapshot,
+    row: &ReplicationRowStateSnapshot,
 ) -> Result<Vec<u8>, StoreError> {
     let row = encode_row_snapshot(row, schema)
         .map_err(|source| invalid_stored_object("dataset row snapshot", source))?;
@@ -1802,7 +2746,7 @@ fn encode_dataset_row_snapshot(
 fn decode_dataset_row_snapshot(
     schema: &flotsync_data_types::schema::Schema,
     bytes: &[u8],
-) -> Result<ReplicationRowSnapshot, StoreError> {
+) -> Result<ReplicationRowStateSnapshot, StoreError> {
     let row = datamodel_proto::RowSnapshot::decode_from_slice(bytes).map_err(|source| {
         SqliteStoreError::DecodeStoredProto {
             object: "dataset row snapshot",
@@ -1825,6 +2769,106 @@ fn decode_dataset_row_last_changed_versions(
 
 fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
     RuntimeVersionVectorProtoSource::from(version_vector).encode_proto_to_vec()
+}
+
+/// Return the stable `SQLite` label for one group lifecycle variant.
+fn replication_group_lifecycle_sql_label(lifecycle: &ReplicationGroupLifecycle) -> &'static str {
+    match lifecycle {
+        ReplicationGroupLifecycle::Open => GROUP_LIFECYCLE_OPEN_SQL,
+        ReplicationGroupLifecycle::ReadOnly { .. } => GROUP_LIFECYCLE_READ_ONLY_SQL,
+        ReplicationGroupLifecycle::Closed { .. } => GROUP_LIFECYCLE_CLOSED_SQL,
+    }
+}
+
+/// Require one migration-specific column for a non-open lifecycle row.
+fn required_stored_group_lifecycle_field<T>(
+    value: Option<T>,
+    raw: &str,
+    field: &'static str,
+) -> Result<T, StoreError> {
+    value
+        .context(MissingMigrationDataSnafu {
+            raw: raw.to_owned(),
+            field,
+        })
+        .map_err(|source| invalid_stored_object("replication group lifecycle", source))
+}
+
+/// Ensure an open lifecycle row does not carry migration-only columns.
+fn validate_open_group_lifecycle_fields(
+    successor_group_id: Option<&str>,
+    final_versions: Option<&[u8]>,
+) -> Result<(), StoredGroupLifecycleError> {
+    ensure!(
+        successor_group_id.is_none() && final_versions.is_none(),
+        OpenWithMigrationDataSnafu
+    );
+    Ok(())
+}
+
+/// Decode lifecycle state and enforce the discriminator/cut relationship.
+fn decode_replication_group_lifecycle(
+    row: &sqlx::sqlite::SqliteRow,
+    member_count: NonZeroUsize,
+) -> Result<ReplicationGroupLifecycle, StoreError> {
+    let raw = row.get::<String, _>("lifecycle");
+    let successor_group_id = row.get::<Option<String>, _>("successor_group_id");
+    let final_versions = row.get::<Option<Vec<u8>>, _>("final_versions");
+    match raw.as_str() {
+        GROUP_LIFECYCLE_OPEN_SQL => {
+            validate_open_group_lifecycle_fields(
+                successor_group_id.as_deref(),
+                final_versions.as_deref(),
+            )
+            .map_err(|source| invalid_stored_object("replication group lifecycle", source))?;
+            Ok(ReplicationGroupLifecycle::Open)
+        }
+        GROUP_LIFECYCLE_READ_ONLY_SQL => {
+            let successor_group_id = required_stored_group_lifecycle_field(
+                successor_group_id,
+                &raw,
+                "successor_group_id",
+            )?;
+            let successor_group_id = decode_group_id(&successor_group_id)?;
+            let final_versions =
+                required_stored_group_lifecycle_field(final_versions, &raw, "final_versions")?;
+            let final_versions = decode_stored_version_vector(&final_versions, member_count)?;
+            Ok(ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions,
+            })
+        }
+        GROUP_LIFECYCLE_CLOSED_SQL => {
+            let successor_group_id = required_stored_group_lifecycle_field(
+                successor_group_id,
+                &raw,
+                "successor_group_id",
+            )?;
+            let successor_group_id = decode_group_id(&successor_group_id)?;
+            let final_versions =
+                required_stored_group_lifecycle_field(final_versions, &raw, "final_versions")?;
+            let final_versions = decode_stored_version_vector(&final_versions, member_count)?;
+            Ok(ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions,
+            })
+        }
+        _ => Err(invalid_stored_object(
+            "replication group lifecycle",
+            StoredGroupLifecycleError::Unknown { raw },
+        )),
+    }
+}
+
+fn encode_group_dataset_schema_payload(dataset_schema: &DatasetSchema) -> Vec<u8> {
+    dataset_schema.encode_proto_to_vec()
+}
+
+fn decode_group_dataset_schema_payload(bytes: &[u8]) -> Result<DatasetSchema, StoreError> {
+    decode_stored_proto(
+        "group dataset schema",
+        DatasetSchema::try_decode_proto_from_slice(bytes),
+    )
 }
 
 fn decode_stored_version_vector(
@@ -1939,6 +2983,15 @@ fn decode_non_zero_member_count(member_count: i64) -> Result<NonZeroUsize, Store
         .map_err(StoreError::from)
 }
 
+/// Convert caller-visible limits into `SQLite`'s signed `LIMIT` range.
+///
+/// Callers may pass `usize::MAX` as a practical "no limit" sentinel for a
+/// single storage call. `SQLite` accepts signed 64-bit limits, so saturating keeps
+/// that sentinel useful without changing smaller, exact limits.
+fn sqlite_limit_value(limit: NonZeroUsize) -> i64 {
+    i64::try_from(limit.get()).unwrap_or(i64::MAX)
+}
+
 fn ensure_member_index_in_bounds(
     member_index: MemberIndex,
     member_count: NonZeroUsize,
@@ -1971,15 +3024,20 @@ fn decode_group_id(raw: &str) -> Result<GroupId, StoreError> {
     Ok(GroupId(group_id))
 }
 
+fn decode_dataset_id(raw: &str) -> Result<DatasetId, StoreError> {
+    DatasetId::try_new(raw.to_owned()).map_err(|source| invalid_stored_object("dataset id", source))
+}
+
 fn decode_row_key(raw: &str) -> Result<RowKey, StoreError> {
     let row_key = Uuid::parse_str(raw).context(InvalidRowKeySnafu)?;
     Ok(RowKey(row_key))
 }
 
 fn decode_member_identity(raw: &str) -> Result<MemberIdentity, StoreError> {
-    Ok(raw.parse().context(InvalidMemberIdentitySnafu {
+    let member_identity = raw.parse().context(InvalidMemberIdentitySnafu {
         raw: raw.to_owned(),
-    })?)
+    })?;
+    Ok(member_identity)
 }
 
 fn decode_key_fingerprint(raw: &[u8]) -> Result<KeyFingerprint, StoreError> {
@@ -2076,8 +3134,6 @@ enum SqliteStoreError {
     MemberIndexOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Stored secret crypto version overflowed the supported range: {source}"))]
     SecretCryptoVersionOverflow { source: std::num::TryFromIntError },
-    #[snafu(display("Dataset row scan limit overflowed the supported range: {source}"))]
-    RowLimitOverflow { source: std::num::TryFromIntError },
     #[snafu(display(
         "Stored local member index {local_member_index} is out of bounds for {member_count} members."
     ))]
@@ -2093,8 +3149,13 @@ enum SqliteStoreError {
         expected_member_count: usize,
         actual_member_count: usize,
     },
-    #[snafu(display("Stored schema source for dataset '{dataset_id}' was missing."))]
-    MissingSchema { dataset_id: DatasetId },
+    #[snafu(display(
+        "Stored schema source for dataset '{dataset_id}' in group '{group_id}' was missing."
+    ))]
+    MissingSchema {
+        group_id: GroupId,
+        dataset_id: DatasetId,
+    },
     #[snafu(display("Stored {object} blob could not be decoded: {source}"))]
     DecodeStoredProto {
         object: &'static str,
@@ -2115,6 +3176,14 @@ enum SqliteStoreError {
         member_id: MemberIdentity,
     },
     #[snafu(display(
+        "Stored group material for group '{group_id}' conflicts with requested material."
+    ))]
+    ConflictingGroupMaterial { group_id: GroupId },
+    #[snafu(display(
+        "Stored pending work for target group '{group_id}' conflicts with requested work."
+    ))]
+    ConflictingPendingGroupWork { group_id: GroupId },
+    #[snafu(display(
         "Stored update belonged to group '{actual_group_id}', expected '{expected_group_id}'."
     ))]
     StoredUpdateGroupMismatch {
@@ -2127,6 +3196,14 @@ enum SqliteStoreError {
     StoredUpdateIdMismatch {
         expected_update_id: UpdateId,
         actual_update_id: UpdateId,
+    },
+    #[snafu(display(
+        "Stored schema payload for group '{group}' was keyed as dataset '{key_dataset}' but contained dataset '{payload_dataset}'."
+    ))]
+    StoredDatasetSchemaKeyMismatch {
+        group: GroupId,
+        key_dataset: DatasetId,
+        payload_dataset: DatasetId,
     },
     #[snafu(display("Stored group '{group_id}' was missing."))]
     MissingStoredGroup { group_id: GroupId },
@@ -2160,22 +3237,43 @@ mod tests {
     use super::*;
     use crate::{
         api::{
-            DatasetRowPatch,
-            DatasetRowWrite,
+            DatasetRowStatePatch,
+            DatasetRowStateWrite,
+            GroupInvitation,
+            GroupSchema,
+            InitialDatasetValueRows,
+            InitialGroupValueRows,
+            InitialSnapshot,
+            InitialSnapshotMetadata,
+            InitialValueRow,
             MemberKeyTrustEvidenceKind,
             MemberKeyTrustEvidenceRecord,
             MemberPublicKeysRecord,
-            ReplicationRowRecord,
+            MigrationId,
+            MigrationProposal,
+            PendingGroupDecisionRecord,
+            ReplicationRowStateRecord,
             ReplicationUpdateFilter,
+            SnapshotRef,
             current_slice_placeholder_group_security_material,
         },
         test_support::test_public_member_keys,
     };
     use flotsync_core::member::{Identifier, MAX_IDENTIFIER_SEGMENTS};
-    use flotsync_data_types::{Field, Schema, TableOperations, schema::datamodel::RowOperation};
+    use flotsync_data_types::{
+        Field,
+        RowValues,
+        Schema,
+        TableOperations,
+        schema::datamodel::RowOperation,
+    };
     use flotsync_messages::codecs::datamodel::encode_schema_operation;
     use itertools::Itertools;
-    use std::{assert_matches, collections::HashSet, time::Duration};
+    use std::{
+        assert_matches,
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     const STORE_FUTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -2222,6 +3320,455 @@ mod tests {
         Identifier::from_array(["app", "bob"])
     }
 
+    fn third_member() -> MemberIdentity {
+        Identifier::from_array(["app", "carol"])
+    }
+
+    fn initial_versions(member_count: usize) -> VersionVector {
+        VersionVector::initial(NonZeroUsize::new(member_count).expect("member count is non-zero"))
+    }
+
+    fn metadata_snapshot(
+        primary_group_id: GroupId,
+        equivalent_group_id: GroupId,
+    ) -> InitialSnapshot {
+        InitialSnapshot::Metadata(InitialSnapshotMetadata {
+            primary_ref: SnapshotRef {
+                group_id: primary_group_id,
+                versions: initial_versions(2),
+            },
+            equivalent_refs: smallvec::smallvec![SnapshotRef {
+                group_id: equivalent_group_id,
+                versions: initial_versions(3),
+            }],
+            record_count: Some(7),
+        })
+    }
+
+    fn inline_snapshot() -> InitialSnapshot {
+        let row = RowValues::try_from_fields(
+            title_schema().as_ref(),
+            crate::row_values! {
+                "title" => "stored",
+            }
+            .fields,
+        )
+        .expect("inline snapshot fixture row should match docs schema");
+        InitialSnapshot::Inline(InitialGroupValueRows {
+            datasets: vec![InitialDatasetValueRows {
+                dataset_id: docs_dataset_id(),
+                rows: vec![InitialValueRow {
+                    row_key: RowKey(Uuid::from_u128(30_001)),
+                    row,
+                }],
+            }],
+        })
+    }
+
+    fn creation_invitation_decision(group_id: GroupId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+            group_id,
+            vec![local_member(), remote_member()],
+            GroupSchema::default(),
+            InitialSnapshot::Empty,
+            Some("shared docs".to_owned()),
+            Some("join".to_owned()),
+        ))
+    }
+
+    fn migration_invitation_decision(migration_id: MigrationId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_migration(
+            migration_id,
+            vec![local_member(), remote_member(), third_member()],
+            docs_group_schema(),
+            inline_snapshot(),
+            None,
+            Some("migration invite".to_owned()),
+        ))
+    }
+
+    fn migration_proposal_decision(migration_id: MigrationId) -> PendingGroupDecisionRecord {
+        PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions: initial_versions(2).with_version_at(0, 3),
+            proposed_members: vec![local_member(), remote_member(), third_member()],
+            group_schema: GroupSchema::default(),
+            initial_snapshot: metadata_snapshot(
+                migration_id.old_group_id,
+                migration_id.new_group_id,
+            ),
+            group_name: Some("new docs".to_owned()),
+            message: None,
+        })
+    }
+
+    #[test]
+    fn pending_group_work_state_decodes_stable_sql_values() {
+        assert_matches!(
+            PendingGroupWorkState::try_from("decision".to_owned()),
+            Ok(PendingGroupWorkState::AwaitingDecision)
+        );
+        assert_matches!(
+            PendingGroupWorkState::try_from("activation".to_owned()),
+            Ok(PendingGroupWorkState::AcceptedActivation)
+        );
+        assert_matches!(
+            PendingGroupWorkState::try_from("unknown".to_owned()),
+            Err(PendingGroupSqlKeyError::UnknownWorkState { raw }) if raw == "unknown"
+        );
+    }
+
+    #[test]
+    fn pending_group_decisions_round_trip_through_sqlite_payloads() {
+        let store = in_memory_store(local_member());
+        let migration_id = MigrationId {
+            old_group_id: GroupId(Uuid::from_u128(10_001)),
+            new_group_id: GroupId(Uuid::from_u128(10_002)),
+        };
+        let proposal_migration_id = MigrationId {
+            old_group_id: migration_id.old_group_id,
+            new_group_id: GroupId(Uuid::from_u128(10_003)),
+        };
+        let records = vec![
+            creation_invitation_decision(GroupId(Uuid::from_u128(10_000))),
+            migration_invitation_decision(migration_id),
+            migration_proposal_decision(proposal_migration_id),
+        ];
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .insert_replication_group(sample_group(migration_id.old_group_id))
+                .await
+                .expect("old group should store");
+            for record in records.iter().cloned() {
+                let (material, _) = sample_group(record.group_id()).into_parts();
+                transaction
+                    .ensure_replication_group_material(material)
+                    .await
+                    .expect("target group material should store");
+                transaction
+                    .upsert_pending_group_decision(record)
+                    .await
+                    .expect("pending decision should store");
+            }
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_decisions()
+                .await
+                .expect("pending decisions should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+
+        assert_eq!(loaded.len(), records.len());
+        for record in records {
+            assert!(
+                loaded.contains(&record),
+                "loaded decisions should contain {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_group_activation_remove_is_idempotent() {
+        let store = in_memory_store(local_member());
+        let migration_id = MigrationId {
+            old_group_id: GroupId(Uuid::from_u128(11_001)),
+            new_group_id: GroupId(Uuid::from_u128(11_002)),
+        };
+        let record = migration_proposal_decision(migration_id).into_activation();
+        let key = record.key();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .insert_replication_group(sample_group(migration_id.old_group_id))
+                .await
+                .expect("old group should store");
+            let (material, _) = sample_group(migration_id.new_group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
+            transaction
+                .upsert_pending_group_activation(record.clone())
+                .await
+                .expect("pending activation should store");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_activations()
+                .await
+                .expect("pending activations should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+        assert_eq!(loaded, vec![record]);
+
+        let (first_removed, second_removed) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let first_removed = transaction
+                .remove_pending_group_activation(key)
+                .await
+                .expect("first remove should succeed");
+            let second_removed = transaction
+                .remove_pending_group_activation(key)
+                .await
+                .expect("second remove should succeed");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+            (first_removed, second_removed)
+        });
+        assert!(first_removed);
+        assert!(!second_removed);
+    }
+
+    #[test]
+    fn pending_group_work_accepts_replay_and_rejects_conflicting_target_work() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(11_100));
+        let original = creation_invitation_decision(group_id);
+        let mut conflicting = original.clone();
+        let PendingGroupDecisionRecord::GroupInvitation(invitation) = &mut conflicting else {
+            panic!("creation invitation fixture must contain an invitation");
+        };
+        invitation.message = Some("different invitation".to_owned());
+
+        let conflict = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let (material, _) = sample_group(group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
+            transaction
+                .upsert_pending_group_decision(original.clone())
+                .await
+                .expect("pending decision should store");
+            transaction
+                .upsert_pending_group_decision(original.clone())
+                .await
+                .expect("exact pending decision replay should be idempotent");
+            let conflict = transaction
+                .upsert_pending_group_decision(conflicting)
+                .await
+                .expect_err("conflicting target work should be rejected");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+            conflict
+        });
+
+        assert!(is_conflicting_pending_group_work(&conflict, group_id));
+        let loaded = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded = transaction
+                .load_pending_group_decision(&group_id)
+                .await
+                .expect("pending decision should load");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            loaded
+        });
+        assert_eq!(loaded, Some(original));
+    }
+
+    #[test]
+    fn pending_group_decision_transitions_to_one_activation_for_target_group() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(11_101));
+        let decision = creation_invitation_decision(group_id);
+        let activation = decision.clone().into_activation();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let (material, _) = sample_group(group_id).into_parts();
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("target group material should store");
+            transaction
+                .upsert_pending_group_decision(decision)
+                .await
+                .expect("pending decision should store");
+            transaction
+                .upsert_pending_group_activation(activation.clone())
+                .await
+                .expect("pending decision should transition to activation");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let (loaded_decision, loaded_activation) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let loaded_decision = transaction
+                .load_pending_group_decision(&group_id)
+                .await
+                .expect("pending decision lookup should succeed");
+            let loaded_activation = transaction
+                .load_pending_group_activation(&group_id)
+                .await
+                .expect("pending activation lookup should succeed");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            (loaded_decision, loaded_activation)
+        });
+        assert_eq!(loaded_decision, None);
+        assert_eq!(loaded_activation, Some(activation));
+    }
+
+    #[test]
+    fn inactive_group_material_is_not_active_and_cannot_own_data_state() {
+        let dataset_id = docs_dataset_id();
+        let schema = title_schema();
+        let store = in_memory_store_with_schema_sources(
+            local_member(),
+            [(dataset_id.clone(), schema.clone())],
+        );
+        let group_id = GroupId(Uuid::from_u128(11_102));
+        let row_key = RowKey(Uuid::from_u128(11_103));
+        let group = sample_group(group_id);
+        let (material, _) = group.clone().into_parts();
+
+        wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            transaction
+                .ensure_replication_group_material(material)
+                .await
+                .expect("inactive group material should store");
+            transaction
+                .commit()
+                .await
+                .expect("transaction should commit");
+        });
+
+        let (active_group, active_groups, stored_material) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_read_transaction()
+                .await
+                .expect("read transaction should open");
+            let active_group = transaction
+                .load_replication_group(&group_id)
+                .await
+                .expect("active group lookup should succeed");
+            let active_groups = transaction
+                .load_replication_groups()
+                .await
+                .expect("active groups should load");
+            let stored_material = transaction
+                .load_replication_group_material(&group_id)
+                .await
+                .expect("group material lookup should succeed");
+            transaction
+                .release()
+                .await
+                .expect("read transaction should release");
+            (active_group, active_groups, stored_material)
+        });
+        assert_eq!(active_group, None);
+        assert!(active_groups.is_empty());
+        assert!(stored_material.is_some());
+
+        let (row_error, update_error) = wait_for_store_future(async {
+            let mut transaction = store
+                .begin_transaction()
+                .await
+                .expect("transaction should open");
+            let row_error = transaction
+                .apply_dataset_row_patch(DatasetRowStatePatch {
+                    group_id,
+                    dataset_id: dataset_id.clone(),
+                    actions: vec![DatasetRowStateWrite::UpsertActive {
+                        row_key,
+                        snapshot: title_snapshot(&schema, row_key, "inactive"),
+                    }],
+                    last_changed_versions: sample_last_changed_versions(),
+                })
+                .await
+                .expect_err("inactive material must not own row state");
+            let update_error = transaction
+                .append_replication_update(ReplicationUpdateRecord {
+                    group_id,
+                    update_id: UpdateId {
+                        node_index: 0,
+                        version: 1,
+                    },
+                    sender: local_member(),
+                    read_versions: VersionVector::initial(group.member_count()),
+                    dataset_updates: Vec::new(),
+                    applied_locally: false,
+                })
+                .await
+                .expect_err("inactive material must not own update state");
+            transaction
+                .rollback()
+                .await
+                .expect("transaction should roll back");
+            (row_error, update_error)
+        });
+        assert!(matches!(row_error, StoreError::StoreExternal { .. }));
+        assert!(matches!(update_error, StoreError::StoreExternal { .. }));
+    }
+
     #[test]
     fn stored_member_identity_rejects_overlong_identifier() {
         let raw = std::iter::repeat_n("s", MAX_IDENTIFIER_SEGMENTS + 1).join(".");
@@ -2250,6 +3797,13 @@ mod tests {
         Arc::new(Schema::from_fields([Field::linear_string("title")]))
     }
 
+    fn docs_group_schema() -> GroupSchema {
+        GroupSchema::new(HashMap::from([(
+            docs_dataset_id(),
+            SchemaSource::from(title_schema()),
+        )]))
+    }
+
     fn sample_encrypted_secret(seed: u8) -> EncryptedStoreSecret {
         EncryptedStoreSecret {
             crypto_version: StoreSecretCryptoVersion::new(1),
@@ -2275,7 +3829,9 @@ mod tests {
             group_id,
             member_keys,
             local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
             version_vector,
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         }
     }
@@ -2296,6 +3852,17 @@ mod tests {
         }
     }
 
+    fn is_conflicting_pending_group_work(error: &StoreError, group_id: GroupId) -> bool {
+        match error {
+            StoreError::StoreExternal { source } => matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::ConflictingPendingGroupWork {
+                    group_id: stored_group_id,
+                }) if *stored_group_id == group_id
+            ),
+        }
+    }
+
     fn sample_last_changed_versions() -> VersionVector {
         let mut version_vector = VersionVector::initial(NonZeroUsize::new(2).unwrap());
         version_vector.increment_at(0);
@@ -2307,14 +3874,14 @@ mod tests {
         dataset_id: &DatasetId,
         row_key: RowKey,
         operation: &flotsync_messages::SchemaOperation<'_>,
-    ) -> DatasetRowPatch {
+    ) -> DatasetRowStatePatch {
         let RowOperation::Insert { snapshot, .. } = &operation.operation else {
             panic!("expected insert operation");
         };
-        DatasetRowPatch {
+        DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertActive {
+            actions: vec![DatasetRowStateWrite::UpsertActive {
                 row_key,
                 snapshot: snapshot.clone().into_owned(),
             }],
@@ -2326,8 +3893,8 @@ mod tests {
         schema: &Arc<Schema>,
         row_key: RowKey,
         title: &str,
-    ) -> ReplicationRowSnapshot {
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+    ) -> ReplicationRowStateSnapshot {
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -2355,7 +3922,7 @@ mod tests {
         title: &str,
         schema: &Arc<Schema>,
     ) -> flotsync_messages::datamodel::SchemaOperation {
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -2401,6 +3968,68 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_store_roundtrips_replication_group_lifecycle() {
+        let store = in_memory_store(local_member());
+        let group_id = GroupId(Uuid::from_u128(99));
+        let successor_group_id = GroupId(Uuid::from_u128(100));
+        let group = sample_group(group_id);
+        let final_versions = group.version_vector.clone();
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.insert_replication_group(group))
+            .expect("group should insert");
+        wait_for_store_future(transaction.update_replication_group_lifecycle(
+            &group_id,
+            ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            },
+        ))
+        .expect("read-only lifecycle should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let stored = wait_for_store_future(transaction.load_replication_group(&group_id))
+            .expect("group should load")
+            .expect("group should exist");
+        assert_eq!(
+            stored.lifecycle,
+            ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            }
+        );
+        wait_for_store_future(transaction.release()).expect("read should release");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(transaction.update_replication_group_lifecycle(
+            &group_id,
+            ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions: final_versions.clone(),
+            },
+        ))
+        .expect("closed lifecycle should store");
+        wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+        let mut transaction =
+            wait_for_store_future(store.begin_read_transaction()).expect("read should start");
+        let stored = wait_for_store_future(transaction.load_replication_group(&group_id))
+            .expect("group should load")
+            .expect("group should exist");
+        assert_eq!(
+            stored.lifecycle,
+            ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                final_versions,
+            }
+        );
+        wait_for_store_future(transaction.release()).expect("read should release");
+    }
+
+    #[test]
     #[allow(
         clippy::too_many_lines,
         reason = "This store roundtrip test keeps related group, dataset, and update assertions in one fixture."
@@ -2417,7 +4046,7 @@ mod tests {
         let group = sample_group(group_id);
         let mut updated_version_vector = group.version_vector.clone();
         updated_version_vector.increment_at(1);
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -2439,13 +4068,13 @@ mod tests {
             encode_schema_operation(&operation, schema.as_ref()).expect("operation should encode");
         let row_patch = insert_row_patch(group_id, &dataset_id, row_key, &operation);
         let expected_row = match &row_patch.actions[0] {
-            DatasetRowWrite::UpsertActive { row_key, snapshot } => ReplicationRowRecord {
+            DatasetRowStateWrite::UpsertActive { row_key, snapshot } => ReplicationRowStateRecord {
                 row_id: *row_key,
                 snapshot: snapshot.clone(),
                 tombstoned: false,
                 last_changed_versions: row_patch.last_changed_versions.clone(),
             },
-            DatasetRowWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
+            DatasetRowStateWrite::UpsertTombstone { .. } => panic!("expected active row patch"),
         };
         let update = ReplicationUpdateRecord {
             group_id,
@@ -2484,6 +4113,7 @@ mod tests {
             .expect("group should exist");
         assert_eq!(loaded_group.group_id, group.group_id);
         assert_eq!(loaded_group.member_keys, group.member_keys);
+        assert_eq!(loaded_group.group_schema, group.group_schema);
         assert_eq!(loaded_group.security_material, group.security_material);
         assert_eq!(
             loaded_group.version_vector.iter().collect::<Vec<_>>(),
@@ -2830,7 +4460,7 @@ mod tests {
         );
         let group_id = GroupId(Uuid::from_u128(104));
         let row_key = RowKey(Uuid::from_u128(204));
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {
@@ -2851,7 +4481,7 @@ mod tests {
         let RowOperation::Insert { snapshot, .. } = &operation.operation else {
             panic!("expected insert operation");
         };
-        let stored_row = ReplicationRowRecord {
+        let stored_row = ReplicationRowStateRecord {
             row_id: row_key,
             snapshot: snapshot.clone().into_owned(),
             tombstoned: true,
@@ -2862,10 +4492,10 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertTombstone {
+            actions: vec![DatasetRowStateWrite::UpsertTombstone {
                 row_key,
                 snapshot: stored_row.snapshot.clone(),
             }],
@@ -2908,15 +4538,15 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
             actions: vec![
-                DatasetRowWrite::UpsertActive {
+                DatasetRowStateWrite::UpsertActive {
                     row_key: second_row_key,
                     snapshot: title_snapshot(&schema, second_row_key, "second"),
                 },
-                DatasetRowWrite::UpsertActive {
+                DatasetRowStateWrite::UpsertActive {
                     row_key: first_row_key,
                     snapshot: title_snapshot(&schema, first_row_key, "first"),
                 },
@@ -2967,10 +4597,10 @@ mod tests {
             wait_for_store_future(store.begin_transaction()).expect("transaction should start");
         wait_for_store_future(transaction.insert_replication_group(sample_group(group_id)))
             .expect("group should store");
-        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
+        wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
             group_id,
             dataset_id: dataset_id.clone(),
-            actions: vec![DatasetRowWrite::UpsertTombstone {
+            actions: vec![DatasetRowStateWrite::UpsertTombstone {
                 row_key,
                 snapshot: tombstone_snapshot,
             }],
@@ -2978,16 +4608,17 @@ mod tests {
         }))
         .expect("missing-to-tombstone upsert should store");
 
-        let error = wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowPatch {
-            group_id,
-            dataset_id,
-            actions: vec![DatasetRowWrite::UpsertActive {
-                row_key,
-                snapshot: active_snapshot,
-            }],
-            last_changed_versions: sample_last_changed_versions(),
-        }))
-        .expect_err("tombstone-to-active upsert should fail");
+        let error =
+            wait_for_store_future(transaction.apply_dataset_row_patch(DatasetRowStatePatch {
+                group_id,
+                dataset_id,
+                actions: vec![DatasetRowStateWrite::UpsertActive {
+                    row_key,
+                    snapshot: active_snapshot,
+                }],
+                last_changed_versions: sample_last_changed_versions(),
+            }))
+            .expect_err("tombstone-to-active upsert should fail");
         wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
 
         assert!(matches!(
@@ -3028,7 +4659,7 @@ mod tests {
         );
         let group_id = GroupId(Uuid::from_u128(404));
         let group = sample_group(group_id);
-        let mut source_data = flotsync_messages::InMemoryData::new(schema.clone());
+        let mut source_data = flotsync_messages::InMemoryStateData::new(schema.clone());
         let operation = source_data
             .insert_row(
                 UpdateId {

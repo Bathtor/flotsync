@@ -25,6 +25,7 @@ use flotsync_replication::{
     ApiError,
     AuthorityScope,
     GroupMemberKeys,
+    GroupSchema,
     ListenerError,
     LoadError,
     LoadSecurityError,
@@ -43,6 +44,7 @@ use flotsync_replication::{
     ReplicationConfig,
     ReplicationEvent,
     ReplicationEventListener,
+    ReplicationGroupLifecycle,
     ReplicationGroupRecord,
     ReplicationSecuritySecrets,
     ReplicationStore,
@@ -74,7 +76,7 @@ use kompact::prelude::block_on;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     future::Future,
     io::{self, Write},
@@ -415,7 +417,12 @@ mod tests {
                     member_keys: test_group_member_keys(&config.ordered_members),
                     local_member_index,
                     version_vector: VersionVector::initial(member_count),
+                    lifecycle: ReplicationGroupLifecycle::Open,
                     security_material,
+                    group_schema: GroupSchema::new(HashMap::from([(
+                        checklist_dataset_id(),
+                        CHECKLIST_SCHEMA.clone().into(),
+                    )])),
                 })
                 .await
                 .expect("test group should insert");

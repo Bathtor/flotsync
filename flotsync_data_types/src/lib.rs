@@ -3,11 +3,12 @@
 #![deny(clippy::dbg_macro)]
 pub use chrono;
 use snafu::{Location, prelude::*};
-use std::{borrow::Cow, collections::HashMap};
+use std::{borrow::Cow, collections::HashMap, fmt, hash::Hash};
 
 pub mod any_data;
 #[allow(unused, reason = "Might re-use some already implemented things later.")]
 mod linear_data;
+pub mod row_values;
 pub mod schema;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
@@ -17,6 +18,17 @@ pub mod snapshot {
 }
 
 pub use linear_data::{DataOperation, IdWithIndex, IdWithIndexRange, IntegrityError};
+pub use row_values::{
+    Decode,
+    InMemoryValueData,
+    InMemoryValueDataError,
+    InMemoryValueDataRowRef,
+    InMemoryValueRowMeta,
+    ProjectedFieldValue,
+    RowOperations,
+    RowValueRead,
+    RowValues,
+};
 pub use schema::{
     Direction,
     Field,
@@ -28,7 +40,7 @@ pub use schema::{
     PrimitiveType,
     ReplicatedDataType,
     Schema,
-    datamodel::{InMemoryFieldValue, NullableBasicValue, SchemaOperation},
+    datamodel::{InMemoryFieldState, NullableBasicValue, SchemaOperation},
 };
 
 #[derive(Debug, Snafu)]
@@ -56,8 +68,8 @@ pub enum OperationError {
     #[snafu(display("The operation targets a row that already exists: {row_id}."))]
     DuplicateRowId { row_id: String },
     #[snafu(display("The operation could not be applied to the in-memory dataset."))]
-    InMemoryData {
-        source: schema::datamodel::InMemoryDataError,
+    InMemoryStateData {
+        source: schema::datamodel::InMemoryStateDataError,
     },
     #[snafu(display("The operation is invalid for the schema."))]
     SchemaValue {
@@ -99,14 +111,6 @@ pub enum DecodeValueError {
     },
 }
 
-/// A marker trait that a type can be extracted from an [[`InMemoryFieldValue`]].
-pub trait Decode<OperationId>: ToOwned {
-    /// # Errors
-    ///
-    /// See `DecodeValueError` for failure conditions.
-    fn decode(value: &InMemoryFieldValue<OperationId>) -> Result<Cow<'_, Self>, DecodeValueError>;
-}
-
 pub type OperationResult<T> = Result<T, OperationError>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,115 +119,56 @@ pub enum OperationOutcome<T> {
     NoChanges,
 }
 
-/// Object-safe read-only view over row field values.
-pub trait RowRead<OperationId> {
-    /// Get the current value of a field.
+/// Object-safe read-only view over row field state.
+pub trait RowStateRead<OperationId> {
+    /// Get the current state of a field.
     ///
     /// Returns `None` if the field does not exist.
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>>;
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldState<OperationId>>;
 }
 
-/// Typed decode helpers layered on top of [`RowRead`].
-///
-/// The blanket implementation means these helpers are also available on
-/// `&dyn RowRead<_>` values whenever [`RowOperations`] is in scope.
-pub trait RowOperations<OperationId>: RowRead<OperationId> {
-    /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
-    fn get_field_value<'a, T>(&'a self, field_name: &str) -> Result<Cow<'a, T>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-        OperationId: 'a;
-
-    /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
-    ///
-    /// Returns `Ok(None)` if the field is `NULL`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(DecodeValueError::FieldDoesNotExist)` if the field does not exist.
-    fn get_nullable_field_value<'a, T>(
-        &'a self,
-        field_name: &str,
-    ) -> Result<Option<Cow<'a, T>>, DecodeValueError>
-    where
-        T: ?Sized + Decode<OperationId>,
-        OperationId: 'a;
-}
-
-impl<T, OperationId> RowOperations<OperationId> for T
-where
-    T: ?Sized + RowRead<OperationId>,
-{
-    fn get_field_value<'a, Value>(
-        &'a self,
-        field_name: &str,
-    ) -> Result<Cow<'a, Value>, DecodeValueError>
-    where
-        Value: ?Sized + Decode<OperationId>,
-        OperationId: 'a,
-    {
-        let field_value = missing_field_error(self.get_field(field_name), field_name)?;
-        Value::decode(field_value)
-    }
-
-    fn get_nullable_field_value<'a, Value>(
-        &'a self,
-        field_name: &str,
-    ) -> Result<Option<Cow<'a, Value>>, DecodeValueError>
-    where
-        Value: ?Sized + Decode<OperationId>,
-        OperationId: 'a,
-    {
-        let field_value = missing_field_error(self.get_field(field_name), field_name)?;
-        match Value::decode(field_value) {
-            Ok(value) => Ok(Some(value)),
-            Err(DecodeValueError::NullValue { .. }) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-fn missing_field_error<'a, OperationId>(
-    field_value: Option<&'a InMemoryFieldValue<OperationId>>,
-    field_name: &str,
-) -> Result<&'a InMemoryFieldValue<OperationId>, DecodeValueError> {
-    field_value.ok_or_else(|| DecodeValueError::FieldDoesNotExist {
-        field_name: field_name.to_owned(),
-    })
-}
-
-/// Owned immutable row snapshot that can outlive any backing in-memory store.
+/// Owned immutable row state snapshot that can outlive any backing in-memory store.
 #[derive(Clone, Debug, PartialEq)]
-pub struct OwnedRow<OperationId> {
-    fields: HashMap<String, InMemoryFieldValue<OperationId>>,
+pub struct OwnedStateRow<OperationId> {
+    fields: HashMap<String, InMemoryFieldState<OperationId>>,
 }
 
-impl<OperationId> OwnedRow<OperationId> {
+impl<OperationId> OwnedStateRow<OperationId> {
     #[must_use]
-    pub fn new(fields: HashMap<String, InMemoryFieldValue<OperationId>>) -> Self {
+    pub fn new(fields: HashMap<String, InMemoryFieldState<OperationId>>) -> Self {
         Self { fields }
     }
 }
 
-impl<OperationId> RowRead<OperationId> for OwnedRow<OperationId> {
-    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldValue<OperationId>> {
+impl<OperationId> RowStateRead<OperationId> for OwnedStateRow<OperationId> {
+    fn get_field(&self, field_name: &str) -> Option<&InMemoryFieldState<OperationId>> {
         self.fields.get(field_name)
     }
 }
 
-/// This is equivalent to [[`RowOperations`]] but operating directly on schema fields.
-pub trait FieldOperations<OperationId> {
-    /// Get the current value of this field in `row`.
+impl<OperationId> RowValueRead for OwnedStateRow<OperationId>
+where
+    OperationId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
+        self.fields
+            .get(field_name)
+            .map(InMemoryFieldState::project_value)
+    }
+}
+
+/// State access helper for schema fields.
+pub trait FieldStateReadExt<OperationId> {
+    /// Get the current state of this field in `row`.
     ///
     /// Panics if `row` does not contain this field (i.e is from a different schema.)
-    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a InMemoryFieldValue<OperationId>
+    fn get_from_row<'a, R>(&self, row: &'a R) -> &'a InMemoryFieldState<OperationId>
     where
-        R: RowOperations<OperationId>;
+        R: RowStateRead<OperationId>;
+}
 
+/// Typed value access helper for schema fields.
+pub trait FieldValueReadExt {
     /// Get the current value of this field in `row` converted to `T` (owned or reference, as feasible).
     ///
     /// # Errors
@@ -231,9 +176,8 @@ pub trait FieldOperations<OperationId> {
     /// See `DecodeValueError` for failure conditions.
     fn get_value<'a, R, T>(&self, row: &'a R) -> Result<Cow<'a, T>, DecodeValueError>
     where
-        R: RowOperations<OperationId>,
-        T: ?Sized + Decode<OperationId>,
-        OperationId: 'a;
+        R: RowOperations,
+        T: ?Sized + Decode;
 
     /// Get the current value of the field with `field_name` converted to `T` (owned or reference, as feasible).
     ///
@@ -247,9 +191,8 @@ pub trait FieldOperations<OperationId> {
         row: &'a R,
     ) -> Result<Option<Cow<'a, T>>, DecodeValueError>
     where
-        R: RowOperations<OperationId>,
-        T: ?Sized + Decode<OperationId>,
-        OperationId: 'a;
+        R: RowOperations,
+        T: ?Sized + Decode;
 }
 
 /// Operations that can be performed on table with a given [[Schema]].
@@ -258,7 +201,7 @@ pub trait FieldOperations<OperationId> {
 /// over the network to be applied at other nodes.
 pub trait TableOperations<RowId, OperationId> {
     /// A representation of a single row in this table.
-    type Row<'a>: RowOperations<OperationId>
+    type Row<'a>: RowOperations
     where
         Self: 'a;
 

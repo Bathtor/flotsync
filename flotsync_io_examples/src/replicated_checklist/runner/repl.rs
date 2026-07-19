@@ -83,6 +83,16 @@ impl ReplicationEventListener for ChecklistListener {
                         .boxed()?;
                     Ok(())
                 }
+                ReplicationEvent::MigrationProposals { proposals } => {
+                    for candidate in proposals {
+                        candidate
+                            .respond
+                            .reject(RejectionReason::PolicyDenied)
+                            .await
+                            .boxed()?;
+                    }
+                    Ok(())
+                }
             }
         }
         .boxed()
@@ -457,7 +467,7 @@ async fn load_checklist_working_set(
         .context(repl_error::SnapshotRowsSnafu)?
     {
         working_set
-            .apply_snapshot_rows(batch)
+            .apply_snapshot_rows(batch.rows())
             .context(repl_error::WorkingSetSnafu)?;
     }
     working_set.set_read_token(read_token);

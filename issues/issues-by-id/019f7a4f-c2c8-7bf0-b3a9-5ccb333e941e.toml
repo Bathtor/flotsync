@@ -1,0 +1,147 @@
+id = "019f7a4f-c2c8-7bf0-b3a9-5ccb333e941e"
+ref = "flotsync-git-03f"
+title = "Deactivate old group during membership migration"
+body = """
+Implement the old-group lifecycle transition that accompanies an accepted membership migration.
+
+Agreed lifecycle:
+A. Persist one lifecycle on each hosted group: Open, ReadOnly { successor_group_id, final_versions }, or Closed { successor_group_id, final_versions }. Keep both the accepted target and final-version cut immutable from the accepted MigrationProposal.
+B. Acceptance atomically records activation and moves the old group from Open to ReadOnly. Successful target activation moves the old group to Closed and removes accepted activation work. Restart resumes accepted activation without asking the listener again.
+C. Locally initiated migration follows the same lifecycle semantics. Invitations received by members that do not host the old group activate only the target group.
+D. Existing local state may be behind or ahead of final_versions; do not constrain progress or delete existing updates merely because it differs from the cut.
+
+Application access:
+E. Open groups retain all application operations.
+F. ReadOnly groups reject publish_changes and change_group_membership, but allow snapshot_rows and application request_summary. Inbound updates continue to produce listener row-change events.
+G. Closed groups additionally reject snapshot_rows and application request_summary. Inbound updates are applied without listener notification.
+H. Omit ReadOnly and Closed groups from application ReadTokens. Centralise lifecycle permission checks.
+
+Pending proposal arbitration:
+I. Multiple decision-state proposals may coexist for one old group. Keep storage target-group keyed and group by old_group_id in memory.
+J. Expose the complete current candidate set for one old group together, including at startup. A singleton MigrationProposals event remains valid and is expected to be the common case.
+K. Rejecting one candidate removes only that candidate and inactive target material. Accepting one atomically moves it to activation, removes competitors and their inactive material, and marks the old group ReadOnly.
+L. For ReadOnly or Closed groups, a proposal with the accepted successor and cut is an idempotent replay. A different target or cut is a permanent terminal rejection before setup validation and listener notification; acknowledge reliable processing so it is not retried.
+M. Do not add backend-specific grouped queries or uniqueness constraints preventing multiple undecided candidates.
+
+Replication and catch-up:
+N. Keep ReadOnly and Closed groups installed in membership and security state for old-group traffic.
+O. Continue accepting Update, UpdateBatch, SummaryRequest, and NeedRange traffic. Newly received producer versions beyond the cut may be dropped as best-effort resource protection; existing state beyond it remains valid.
+P. For non-open groups, advertise the pointwise intersection of current versions and the cut, intersect peer summaries before deriving missing ranges, request only through the cut, and truncate served NeedRange intervals at the cut.
+Q. Trim outstanding catch-up requests when a group becomes ReadOnly. These bounds are traffic controls, not stored-state correctness invariants.
+
+Persistence and recovery:
+R. Extend the existing replication-group representation rather than introducing a separate lifecycle table. No deployed database migration is required.
+S. Preserve atomic boundaries so old and target groups cannot both remain writable after successful activation. Failure after acceptance leaves the old group ReadOnly and recoverable.
+T. Preserve idempotence for proposal replay, activation replay, and startup recovery.
+U. Active-record decomposition must preserve both version_vector and lifecycle in a named active-state value; inactive material activation remains explicitly Open.
+
+Tests and documentation:
+V. Cover Open, ReadOnly, and Closed lifecycle persistence and target-keyed pending-work transitions.
+W. Cover application permissions, ReadToken filtering, grouped proposals, competition, replay classification, startup recovery, local and inbound cutover, and listener suppression.
+X. Add stateful catch-up tests proving FinaliseGroup trims existing demand and inbound NeedRange work is truncated at the accepted cut.
+Y. Keep protocol/runtime documentation limited to implemented semantics.
+
+Explicit boundaries:
+Z. Application-facing deactivation events remain in flotsync-git-pvp and flotsync-git-os1.
+AA. The standalone GroupClose API remains flotsync-git-lg9.
+AB. Large snapshot transfer remains outside this task.
+
+Agreed review refinements:
+AI. Store MigrationProposals candidates in SmallVec with inline capacity one while retaining singleton event construction.
+AJ. Put repeated pending responder construction behind ComponentBackedPendingGroupResponder::new.
+AK. Treat a response whose pending work has disappeared as an idempotent no-op, document why, and log the stale work key at debug level.
+AL. Separate migration-arrival classification from candidate setup, policy, persistence, and activation so terminal replay/conflict paths do not obscure the candidate path.
+AM. Name dense post-cut and asynchronous activation results before branching or matching.
+AN. Reuse lifecycle and update-message test helpers so the read-only/closed listener test remains linear without a too-many-lines allowance.
+AO. Replace tuple-valued SQLite lifecycle encoding with a backend label accessor and the lifecycle's existing named successor and final-version accessors.
+AP. Decode SQLite lifecycle state by its label first, require variant fields with contextual Option errors, and reject migration fields on Open rows.
+AQ. Single-source SQLite lifecycle labels across Rust encoding/decoding and the replication_groups CHECK declaration.
+AR. Update all downstream workspace consumers for explicit Open lifecycle construction and grouped migration-proposal events, then verify the complete workspace.
+AS. Name the awaited listener-notification result before matching it.
+AT. Keep SQLite lifecycle labels as adjacent ordinary constants and a readable plain schema statement, with explicit duplication where required.
+AU. Validate Open lifecycle columns with ensure! before returning the decoded Open lifecycle.
+
+Implementation estimate:
+AC. Lifecycle model and persistence: 140-220 LOC.
+AD. Runtime cutover, permissions, and recovery: 220-340 LOC.
+AE. Candidate grouping and arbitration: 120-200 LOC.
+AF. Catch-up bounds: 120-190 LOC.
+AG. Tests and documentation: 240-360 LOC.
+AH. The final review refinements touch approximately 215-375 LOC, with likely net deletion in tests and control flow. The complete slice remains over 1,000 LOC because lifecycle, arbitration, catch-up, and regression coverage are correctness-critical and local to this task."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+assignee = "codex"
+blocked_by = ["019f51c0-4c99-72f3-ab68-fc5fa752a914"]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-19T12:17:55.400677Z"
+updated_at = "2026-07-19T15:39:41.461338Z"
+closed_at = "2026-07-19T15:39:41.461338Z"
+
+[[links]]
+target = "019f5b3a-ee57-7413-b39b-55e107995695"
+label = "application deactivation exposure"
+
+[[links]]
+target = "019f7474-9d0a-7d21-ad30-d57c359543ed"
+label = "batched deactivation notification context"
+
+[[links]]
+target = "019f5b28-a26f-7b11-a979-595b4ccdb149"
+label = "distinct GroupClose API"
+
+[[comments]]
+id = "019f7a7f-406c-7660-9020-787f4ffe3be2"
+author = "codex"
+body = "Plan alignment completed: retain target-keyed pending rows, group competing migration proposals by old_group_id in memory in the runtime, allow multiple undecided candidates, and reject conflicting arrivals only after one candidate has entered activation or the old group has closed."
+created_at = "2026-07-19T13:09:47.756963Z"
+
+[[comments]]
+id = "019f7a8c-e41a-7301-883b-f500a681d7d9"
+author = "codex"
+body = "Implementation detail discovered while enforcing exact replay: ReadOnly and Closed lifecycle records must retain the accepted successor group id beside final_versions; otherwise a closed old group cannot distinguish an exact replay from a conflicting target with the same cut. This remains in the existing replication-group row and does not alter the store API boundary."
+created_at = "2026-07-19T13:24:41.626583Z"
+
+[[comments]]
+id = "019f7abb-142f-78a0-b3af-9efecb038297"
+author = "codex"
+body = "Final review delta agreed: conflicting post-acceptance proposals are terminally processed and acknowledged without setup/persistence/listener work; active-record decomposition retains lifecycle beside versions; stateful catch-up finalisation and inbound range truncation gain focused tests. The singleton MigrationProposals helper remains unchanged by explicit user direction."
+created_at = "2026-07-19T14:15:08.591268Z"
+
+[[comments]]
+id = "019f7ac2-15e6-7582-a447-88358a1e1e8a"
+author = "codex"
+body = "Review fixes implemented and verified: terminal proposal conflicts now return successful semantic processing so reliable delivery acknowledges them; ReplicationGroupActiveState preserves version and lifecycle through decomposition; catch-up tests exercise existing-demand trimming and inbound NeedRange truncation. Replication tests, pedantic clippy, formatting, diff checks, and OKF documentation checks pass."
+created_at = "2026-07-19T14:22:47.782168Z"
+
+[[comments]]
+id = "019f7ae9-e6e8-71f3-ba93-b45d31577b35"
+author = "lkroll"
+body = "Follow-up review plan agreed: use SmallVec for proposal candidates; add a responder constructor; log stale missing acceptances at debug level; separate candidate installation from proposal-arrival classification; name dense predicates/results; reduce lifecycle test boilerplate; and restructure SQLite lifecycle encoding/decoding around named accessors and single-sourced labels."
+created_at = "2026-07-19T15:06:17.192345Z"
+
+[[comments]]
+id = "019f7af4-c2fb-7190-bca3-0f45d82e80de"
+author = "lkroll"
+body = "Follow-up review fixes implemented and verified: proposal candidate events use SmallVec; responder construction belongs to its type; stale acceptance is documented and debug-logged; proposal classification dispatches to a separate candidate installer; dense predicates and activation results are named; lifecycle tests use focused helpers; and SQLite lifecycle storage uses named accessors with single-sourced labels. The full 204-test replication library suite and pedantic Clippy pass."
+created_at = "2026-07-19T15:18:08.891542Z"
+
+[[comments]]
+id = "019f7af9-d92d-7e21-9823-55ef45088592"
+author = "lkroll"
+body = "Downstream workspace compile failures fixed: checklist static-group records now set lifecycle to Open, and the checklist listener rejects each candidate in MigrationProposals. A workspace-wide audit found no other stale consumers. Full cargo test passes across the workspace; example-crate pedantic Clippy reports only the pre-existing SnapshotValueRow needless-pass-by-value warning."
+created_at = "2026-07-19T15:23:42.253854Z"
+
+[[comments]]
+id = "019f7b06-6f1b-76f2-9e21-c3005cee6771"
+author = "lkroll"
+body = "Latest review cleanup implemented: listener notification is assigned before matching; lifecycle SQL labels are ordinary adjacent constants with a plain CHECK statement and an explicit synchronisation comment; Open lifecycle columns are validated through ensure! before returning Open. Workspace all-targets check, all 204 replication tests, pedantic replication Clippy, formatting, and diff checks pass."
+created_at = "2026-07-19T15:37:27.067273Z"
+
+[[comments]]
+id = "019f7b08-7c15-7b60-8bc1-2852b393e454"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-19T15:39:41.461338Z"

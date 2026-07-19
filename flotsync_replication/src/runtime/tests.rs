@@ -6,7 +6,12 @@ use super::{
         load_replication_runtime_typed_with_security_for_test,
         wait_for_test_reply,
     },
-    host::{DeliveryRuntimeHost, DeliveryRuntimeHostTestExt, PreconfiguredPeerRoutesPublishMode},
+    host::{
+        DeliveryRuntimeHost,
+        DeliveryRuntimeHostTestExt,
+        PreconfiguredPeerRoutesPublishMode,
+        RuntimeHostError,
+    },
     in_memory::{
         LocalDataset,
         apply_local_delete,
@@ -17,14 +22,6 @@ use super::{
     },
     load_replication_runtime,
     load_replication_runtime_with_runtime_config_toml,
-    messages::{
-        BootstrapGroupKey,
-        BootstrapGroupMessage,
-        BootstrapMemberKeyMessage,
-        DatasetUpdateMessage,
-        UpdateBatchMessage,
-        UpdateMessage,
-    },
 };
 use crate::{
     MAX_VERSION_VALUE,
@@ -32,14 +29,25 @@ use crate::{
     api::{
         ApiError,
         AuthorityScope,
+        ChangeGroupMembershipRequest,
         CreateGroupRequest,
         DatasetId,
-        DatasetRowPatch,
-        DatasetRowSlice,
-        DatasetRowsBatch,
+        DatasetRowStateBatch,
+        DatasetRowStatePatch,
+        DatasetRowStateSlice,
         DatasetUpdateRecord,
         EncryptedGroupSecurityMaterial,
+        GroupInvitation,
+        GroupInvitationPolicy,
+        GroupInvitationResponder,
+        GroupInvitationSource,
         GroupMemberKeys,
+        GroupSchema,
+        InitialDatasetValueRows,
+        InitialGroupValueRows,
+        InitialSnapshot,
+        InitialSnapshotMetadata,
+        InitialValueRow,
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
@@ -52,15 +60,25 @@ use crate::{
         MemberKeyTrustEvidenceSet,
         MemberKeyTrustRequirement,
         MemberPublicKeysRecord,
+        MigrationId,
+        MigrationProposal,
+        MigrationProposalResponder,
+        PendingGroupActivationRecord,
+        PendingGroupDecisionRecord,
+        PendingGroupWorkKey,
         PermissionDenialReason,
+        PolicyDecision,
         ProviderExternalSnafu,
         PublishChangesRequest,
         PublishReceipt,
         ReadToken,
+        RejectionReason,
         ReplicationApi,
         ReplicationConfig,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupLifecycle,
+        ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
         ReplicationSecuritySecrets,
         ReplicationStore,
@@ -75,8 +93,9 @@ use crate::{
         RowKeyIterator,
         RowMutation,
         SchemaSource,
-        SnapshotRow,
+        SnapshotRef,
         SnapshotRowsRequest,
+        SnapshotValueRow,
         StoreError,
         StoreExternalSnafu,
         StoreSecretCryptoVersion,
@@ -92,6 +111,14 @@ use crate::{
             PublicKeyBundleFeedback,
             RecordPublicKeyBundleFeedbackRequest,
         },
+    },
+    codecs::messages::{
+        BootstrapMemberKeyMessage,
+        DatasetUpdateMessage,
+        GroupSetupKey,
+        GroupSetupMessage,
+        UpdateBatchMessage,
+        UpdateMessage,
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
     provision_replication_security,
@@ -110,9 +137,9 @@ use flotsync_core::{
     MemberIndex,
     member::{Identifier, TrieMap},
     membership::{GroupMembers, GroupMemberships},
-    versions::{UpdateId, VersionVector},
+    versions::{PureVersionVector, UpdateId, VersionVector},
 };
-use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
+use flotsync_data_types::{Field, RowOperations, RowValues, Schema, TableOperations};
 use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
@@ -157,6 +184,7 @@ struct RuntimeFixture<S> {
 struct FailingStore<S> {
     inner: Arc<S>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
+    fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
 }
 
 impl<S> FailingStore<S> {
@@ -164,6 +192,7 @@ impl<S> FailingStore<S> {
         Self {
             inner,
             fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
+            fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -172,6 +201,13 @@ impl<S> FailingStore<S> {
             .fail_next_apply_dataset_row_patch
             .lock()
             .expect("failing store mutex must not be poisoned") = Some(dataset_id);
+    }
+
+    fn fail_after_next_pending_group_commit(&self) {
+        *self
+            .fail_after_next_pending_group_commit
+            .lock()
+            .expect("failing store mutex must not be poisoned") = true;
     }
 }
 
@@ -195,11 +231,15 @@ where
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let inner = self.inner.clone();
         let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
+        let fail_after_next_pending_group_commit =
+            self.fail_after_next_pending_group_commit.clone();
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
                 inner: Some(inner),
                 fail_next_apply_dataset_row_patch,
+                fail_after_next_pending_group_commit,
+                wrote_pending_group_work: false,
             }) as Box<dyn ReplicationStoreTransaction>)
         }
         .boxed()
@@ -215,6 +255,8 @@ where
 struct FailingStoreTransaction {
     inner: Option<Box<dyn ReplicationStoreTransaction>>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
+    fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
+    wrote_pending_group_work: bool,
 }
 
 impl ReplicationStoreReadTransaction for FailingStoreTransaction {
@@ -245,6 +287,17 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_groups_for_ids(group_ids)
+    }
+
+    fn load_group_dataset_schema<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        dataset_id: &'a DatasetId,
+    ) -> BoxFuture<'a, Result<Option<SchemaSource>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_group_dataset_schema(group_id, dataset_id)
     }
 
     fn load_local_member_private_keys<'a>(
@@ -312,7 +365,7 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         group_id: &'a GroupId,
         dataset_id: &'a DatasetId,
         row_keys: &'a mut RowKeyIterator<'a>,
-    ) -> BoxFuture<'a, Result<DatasetRowSlice, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateSlice, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
@@ -360,11 +413,59 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
         dataset_id: &'a DatasetId,
         after: Option<RowKey>,
         limit: NonZeroUsize,
-    ) -> BoxFuture<'a, Result<DatasetRowsBatch, StoreError>> {
+    ) -> BoxFuture<'a, Result<DatasetRowStateBatch, StoreError>> {
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .scan_dataset_row_batch(group_id, dataset_id, after, limit)
+    }
+
+    fn load_pending_group_decisions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupDecisionRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_decisions()
+    }
+
+    fn load_pending_group_decision<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupDecisionRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_decision(group_id)
+    }
+
+    fn load_pending_group_activations(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<PendingGroupActivationRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_activations()
+    }
+
+    fn load_pending_group_activation<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<PendingGroupActivationRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_pending_group_activation(group_id)
+    }
+
+    fn load_replication_group_material<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+    ) -> BoxFuture<'a, Result<Option<ReplicationGroupMaterialRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_replication_group_material(group_id)
     }
 
     fn release(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
@@ -384,6 +485,27 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")
             .insert_replication_group(group)
+    }
+
+    fn ensure_replication_group_material(
+        &mut self,
+        material: ReplicationGroupMaterialRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .ensure_replication_group_material(material)
+    }
+
+    fn activate_replication_group(
+        &mut self,
+        group_id: GroupId,
+        version_vector: VersionVector,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .activate_replication_group(group_id, version_vector)
     }
 
     fn ensure_local_member_private_keys(
@@ -437,9 +559,20 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .update_replication_group_version_vector(group_id, version_vector)
     }
 
+    fn update_replication_group_lifecycle<'a>(
+        &'a mut self,
+        group_id: &'a GroupId,
+        lifecycle: ReplicationGroupLifecycle,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .update_replication_group_lifecycle(group_id, lifecycle)
+    }
+
     fn apply_dataset_row_patch(
         &mut self,
-        patch: DatasetRowPatch,
+        patch: DatasetRowStatePatch,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
         let failure = self.fail_next_apply_dataset_row_patch.clone();
         async move {
@@ -496,11 +629,87 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
             .mark_replication_update_applied(group_id, update_id)
     }
 
+    fn upsert_pending_group_decision(
+        &mut self,
+        record: PendingGroupDecisionRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.wrote_pending_group_work = true;
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .upsert_pending_group_decision(record)
+    }
+
+    fn remove_pending_group_decision(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .remove_pending_group_decision(key)
+    }
+
+    fn upsert_pending_group_activation(
+        &mut self,
+        record: PendingGroupActivationRecord,
+    ) -> BoxFuture<'_, Result<(), StoreError>> {
+        self.wrote_pending_group_work = true;
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .upsert_pending_group_activation(record)
+    }
+
+    fn remove_pending_group_activation(
+        &mut self,
+        key: PendingGroupWorkKey,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .remove_pending_group_activation(key)
+    }
+
+    fn remove_inactive_replication_group_material(
+        &mut self,
+        group_id: GroupId,
+    ) -> BoxFuture<'_, Result<bool, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated writes")
+            .remove_inactive_replication_group_material(group_id)
+    }
+
     fn commit(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
-        let Self { inner, .. } = *self;
-        inner
-            .expect("failing store transaction must remain open until commit")
-            .commit()
+        let Self {
+            inner,
+            fail_after_next_pending_group_commit,
+            wrote_pending_group_work,
+            ..
+        } = *self;
+        async move {
+            inner
+                .expect("failing store transaction must remain open until commit")
+                .commit()
+                .await?;
+            let should_fail = if wrote_pending_group_work {
+                let mut failure = fail_after_next_pending_group_commit
+                    .lock()
+                    .expect("failing store mutex must not be poisoned");
+                std::mem::take(&mut *failure)
+            } else {
+                false
+            };
+            if should_fail {
+                let source = std::io::Error::other(
+                    "failing store intentionally failed after committing pending group work",
+                );
+                return Err::<(), _>(source).boxed().context(StoreExternalSnafu);
+            }
+            Ok(())
+        }
+        .boxed()
     }
 
     fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>> {
@@ -522,6 +731,17 @@ enum CapturedRowChange {
     Delete { row_id: RowId },
 }
 
+enum CapturedPendingGroupEvent {
+    GroupInvitation {
+        invitation: GroupInvitation,
+        respond: Box<dyn GroupInvitationResponder>,
+    },
+    MigrationProposal {
+        proposal: MigrationProposal,
+        respond: Box<dyn MigrationProposalResponder>,
+    },
+}
+
 impl CapturedRowChange {
     fn capture(change: RowChange) -> Result<Self, ListenerError> {
         match change {
@@ -537,26 +757,27 @@ impl CapturedRowChange {
         }
     }
 
-    fn capture_snapshot(row: SnapshotRow) -> Result<Self, ListenerError> {
-        if row.deleted {
-            return Ok(Self::Delete { row_id: row.row_id });
+    fn capture_snapshot(row: &SnapshotValueRow<'_>) -> Result<Self, ListenerError> {
+        let row_id = row.row_id().clone();
+        if row.is_tombstoned() {
+            return Ok(Self::Delete { row_id });
         }
         let title = row
-            .row
             .get_field_value::<str>("title")
             .boxed()
             .context(ListenerExternalSnafu)?
             .into_owned();
-        Ok(Self::Upsert {
-            row_id: row.row_id,
-            title,
-        })
+        Ok(Self::Upsert { row_id, title })
     }
 }
 
 struct ListenerStub {
     data_changes: Mutex<Vec<CapturedDataChange>>,
     data_change_read_tokens: Mutex<Vec<ReadToken>>,
+    pending_group_events: Mutex<Vec<CapturedPendingGroupEvent>>,
+    migration_proposal_event_sizes: Mutex<Vec<usize>>,
+    reject_pending_group_events: Mutex<bool>,
+    rejected_pending_group_event_count: Mutex<usize>,
     buffered_events: Mutex<mpsc::Receiver<CapturedDataChange>>,
     buffered_event_tx: mpsc::Sender<CapturedDataChange>,
 }
@@ -567,6 +788,10 @@ impl Default for ListenerStub {
         Self {
             data_changes: Mutex::new(Vec::new()),
             data_change_read_tokens: Mutex::new(Vec::new()),
+            pending_group_events: Mutex::new(Vec::new()),
+            migration_proposal_event_sizes: Mutex::new(Vec::new()),
+            reject_pending_group_events: Mutex::new(false),
+            rejected_pending_group_event_count: Mutex::new(0),
             buffered_events: Mutex::new(buffered_events),
             buffered_event_tx,
         }
@@ -618,6 +843,50 @@ impl ListenerStub {
             .expect("listener read-token capture mutex must not be poisoned")
             .clone()
     }
+
+    fn take_pending_group_events(&self) -> Vec<CapturedPendingGroupEvent> {
+        std::mem::take(
+            &mut *self
+                .pending_group_events
+                .lock()
+                .expect("pending-group listener capture mutex must not be poisoned"),
+        )
+    }
+
+    fn migration_proposal_event_sizes(&self) -> Vec<usize> {
+        self.migration_proposal_event_sizes
+            .lock()
+            .expect("migration proposal event-size mutex must not be poisoned")
+            .clone()
+    }
+
+    fn wait_for_pending_group_event_count(&self, count: usize) {
+        eventually(
+            TEST_WAIT_TIMEOUT,
+            || {
+                self.pending_group_events
+                    .lock()
+                    .expect("pending-group listener capture mutex must not be poisoned")
+                    .len()
+                    >= count
+            },
+            format!("timed out waiting for {count} pending-group listener events"),
+        );
+    }
+
+    fn reject_pending_group_events(&self) {
+        *self
+            .reject_pending_group_events
+            .lock()
+            .expect("pending-group rejection flag mutex must not be poisoned") = true;
+    }
+
+    fn rejected_pending_group_event_count(&self) -> usize {
+        *self
+            .rejected_pending_group_event_count
+            .lock()
+            .expect("pending-group rejection count mutex must not be poisoned")
+    }
 }
 
 impl ReplicationEventListener for ListenerStub {
@@ -651,7 +920,62 @@ impl ReplicationEventListener for ListenerStub {
                         })
                         .expect("listener event channel must remain open while tests are running");
                 }
-                ReplicationEvent::GroupInvitation { .. } => {}
+                ReplicationEvent::GroupInvitation {
+                    invitation,
+                    respond,
+                } => {
+                    if *self
+                        .reject_pending_group_events
+                        .lock()
+                        .expect("pending-group rejection flag mutex must not be poisoned")
+                    {
+                        *self
+                            .rejected_pending_group_event_count
+                            .lock()
+                            .expect("pending-group rejection count mutex must not be poisoned") +=
+                            1;
+                        return Err(ListenerError::Rejected {
+                            message: "pending group event rejected by test listener".to_owned(),
+                        });
+                    }
+                    self.pending_group_events
+                        .lock()
+                        .expect("pending-group listener capture mutex must not be poisoned")
+                        .push(CapturedPendingGroupEvent::GroupInvitation {
+                            invitation,
+                            respond,
+                        });
+                }
+                ReplicationEvent::MigrationProposals { proposals } => {
+                    if *self
+                        .reject_pending_group_events
+                        .lock()
+                        .expect("pending-group rejection flag mutex must not be poisoned")
+                    {
+                        *self
+                            .rejected_pending_group_event_count
+                            .lock()
+                            .expect("pending-group rejection count mutex must not be poisoned") +=
+                            1;
+                        return Err(ListenerError::Rejected {
+                            message: "pending group event rejected by test listener".to_owned(),
+                        });
+                    }
+                    self.migration_proposal_event_sizes
+                        .lock()
+                        .expect("migration proposal event-size mutex must not be poisoned")
+                        .push(proposals.len());
+                    let mut captured = self
+                        .pending_group_events
+                        .lock()
+                        .expect("pending-group listener capture mutex must not be poisoned");
+                    for proposal in proposals {
+                        captured.push(CapturedPendingGroupEvent::MigrationProposal {
+                            proposal: proposal.proposal,
+                            respond: proposal.respond,
+                        });
+                    }
+                }
             }
             Ok(())
         }
@@ -669,6 +993,61 @@ fn alice_member() -> Identifier {
 
 fn bob_member() -> Identifier {
     Identifier::from_array(BOB_MEMBER_SEGMENTS)
+}
+
+fn carol_member() -> Identifier {
+    Identifier::from_array(["app", "carol"])
+}
+
+fn runtime_test_migration_id() -> MigrationId {
+    MigrationId {
+        old_group_id: GroupId(Uuid::from_u128(70_001)),
+        new_group_id: GroupId(Uuid::from_u128(70_002)),
+    }
+}
+
+fn runtime_test_invitation_decision(group_id: GroupId) -> PendingGroupDecisionRecord {
+    PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+        group_id,
+        vec![alice_member(), bob_member()],
+        GroupSchema::default(),
+        InitialSnapshot::Empty,
+        Some("runtime docs".to_owned()),
+        Some("runtime replay".to_owned()),
+    ))
+}
+
+fn runtime_test_migration_proposal_decision() -> PendingGroupDecisionRecord {
+    let migration_id = runtime_test_migration_id();
+    PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+        migration_id,
+        final_versions: VersionVector::Full(PureVersionVector::from([4, 0])),
+        proposed_members: vec![alice_member(), bob_member(), carol_member()],
+        group_schema: GroupSchema::default(),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: Some("runtime migration".to_owned()),
+        message: None,
+    })
+}
+
+fn migration_proposal_decision(
+    old_group_id: GroupId,
+    new_group_id: GroupId,
+) -> PendingGroupDecisionRecord {
+    PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+        migration_id: MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        final_versions: VersionVector::initial(
+            NonZeroUsize::new(2).expect("two old-group members"),
+        ),
+        proposed_members: vec![alice_member(), bob_member()],
+        group_schema: GroupSchema::default(),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: None,
+        message: None,
+    })
 }
 
 fn test_public_keys(member: &MemberIdentity) -> PublicMemberKeys {
@@ -786,8 +1165,27 @@ fn title_schema_shared() -> Arc<Schema> {
     Arc::new(STATIC_TITLE_SCHEMA.clone())
 }
 
+fn docs_group_schema_from_schema<S>(schema: S) -> GroupSchema
+where
+    S: Into<SchemaSource>,
+{
+    GroupSchema::new(HashMap::from([(docs_dataset_id(), schema.into())]))
+}
+
+fn docs_group_schema() -> GroupSchema {
+    docs_group_schema_from_schema(title_schema_shared())
+}
+
 fn title_schema_static() -> &'static Schema {
     &STATIC_TITLE_SCHEMA
+}
+
+fn title_row_values(title: &str) -> RowValues {
+    RowValues::try_from_fields(
+        title_schema_static(),
+        HashMap::from([("title".to_owned(), title.into())]),
+    )
+    .expect("test title row must match the title schema")
 }
 
 fn title_note_schema_shared() -> Arc<Schema> {
@@ -829,6 +1227,184 @@ fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
     let store = wait_for_test_future(SqliteReplicationStore::in_memory(local_member))
         .expect("store should build");
     Arc::new(store)
+}
+
+fn store_pending_group_decision(store: &dyn ReplicationStore, record: PendingGroupDecisionRecord) {
+    let group_record = inactive_group_record(
+        record.group_id(),
+        record.proposed_members().to_vec(),
+        record.group_schema().clone(),
+    );
+    let (material, _) = group_record.into_parts();
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .expect("pending decision material should store");
+        transaction
+            .upsert_pending_group_decision(record)
+            .await
+            .expect("pending decision should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+    });
+}
+
+fn store_pending_group_activation(
+    store: &dyn ReplicationStore,
+    record: PendingGroupActivationRecord,
+) {
+    let activation = record.clone().into_activation_record();
+    let group_record = inactive_group_record(
+        activation.group_id,
+        activation.proposed_members,
+        activation.group_schema,
+    );
+    let (material, _) = group_record.into_parts();
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .expect("pending activation material should store");
+        transaction
+            .upsert_pending_group_activation(record)
+            .await
+            .expect("pending activation should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+    });
+}
+
+fn store_inactive_group_material(store: &dyn ReplicationStore, record: ReplicationGroupRecord) {
+    let (material, _) = record.into_parts();
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .expect("inactive group material should store");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+    });
+}
+
+fn load_group_material(
+    store: &dyn ReplicationStore,
+    group_id: GroupId,
+) -> Option<ReplicationGroupMaterialRecord> {
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .load_replication_group_material(&group_id)
+            .await
+            .expect("group material should load")
+    })
+}
+
+fn load_pending_group_decisions(store: &dyn ReplicationStore) -> Vec<PendingGroupDecisionRecord> {
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let records = transaction
+            .load_pending_group_decisions()
+            .await
+            .expect("pending decisions should load");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        records
+    })
+}
+
+fn load_pending_group_activations(
+    store: &dyn ReplicationStore,
+) -> Vec<PendingGroupActivationRecord> {
+    wait_for_test_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should open");
+        let records = transaction
+            .load_pending_group_activations()
+            .await
+            .expect("pending activations should load");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        records
+    })
+}
+
+fn replay_one_pending_invitation(
+    store: Arc<SqliteReplicationStore>,
+    group_id: GroupId,
+) -> (Arc<ReplicationRuntime>, Box<dyn GroupInvitationResponder>) {
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener.clone());
+    listener.wait_for_pending_group_event_count(1);
+    let mut events = listener.take_pending_group_events();
+    assert_eq!(events.len(), 1);
+    match events.pop().expect("one pending event should replay") {
+        CapturedPendingGroupEvent::GroupInvitation {
+            invitation,
+            respond,
+        } => {
+            assert_eq!(invitation.group_id, group_id);
+            (runtime, respond)
+        }
+        CapturedPendingGroupEvent::MigrationProposal { .. } => {
+            panic!("expected replayed group invitation")
+        }
+    }
+}
+
+fn accept_one_creation_invitation(
+    listener: &ListenerStub,
+    group_id: GroupId,
+    expected_members: &[MemberIdentity],
+) {
+    listener.wait_for_pending_group_event_count(1);
+    let mut events = listener.take_pending_group_events();
+    assert_eq!(events.len(), 1);
+    match events.pop().expect("one pending event should arrive") {
+        CapturedPendingGroupEvent::GroupInvitation {
+            invitation,
+            respond,
+        } => {
+            assert_eq!(invitation.group_id, group_id);
+            assert_eq!(invitation.source, GroupInvitationSource::Creation);
+            assert_eq!(invitation.proposed_members.as_slice(), expected_members);
+            wait_for_test_reply(respond.accept())
+                .expect("creation invitation accept should persist");
+        }
+        CapturedPendingGroupEvent::MigrationProposal { .. } => {
+            panic!("expected creation group invitation")
+        }
+    }
 }
 
 fn load_runtime_fixture<I, S>(
@@ -984,6 +1560,7 @@ fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
         local_member,
         store,
         listener,
+        ReplicationConfig::default(),
         security,
         None,
     ))
@@ -1000,6 +1577,23 @@ fn load_runtime_with_parts<S>(
 where
     S: ReplicationStore + 'static,
 {
+    load_runtime_with_parts_and_config(
+        application_id,
+        store,
+        listener,
+        ReplicationConfig::default(),
+    )
+}
+
+fn load_runtime_with_parts_and_config<S>(
+    application_id: Identifier,
+    store: Arc<S>,
+    listener: Arc<ListenerStub>,
+    config: ReplicationConfig,
+) -> Arc<ReplicationRuntime>
+where
+    S: ReplicationStore + 'static,
+{
     let local_member = wait_for_test_reply(store.local_member_identity())
         .expect("local member identity should load");
     let security = load_test_runtime_security(store.clone(), &local_member);
@@ -1007,7 +1601,7 @@ where
         application_id,
         store,
         listener,
-        ReplicationConfig::default(),
+        config,
         security,
         None,
     ))
@@ -1073,6 +1667,48 @@ where
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
 }
 
+fn persist_group_lifecycle(
+    store: &dyn ReplicationStore,
+    group_id: &GroupId,
+    lifecycle: ReplicationGroupLifecycle,
+) {
+    let mut transaction =
+        wait_for_test_reply(store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.update_replication_group_lifecycle(group_id, lifecycle))
+        .expect("group lifecycle should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+}
+
+fn inactive_group_record(
+    group_id: GroupId,
+    members: Vec<MemberIdentity>,
+    group_schema: GroupSchema,
+) -> ReplicationGroupRecord {
+    let member_count = members.len();
+    ReplicationGroupRecord {
+        group_id,
+        member_keys: test_group_member_keys(members),
+        local_member_index: MemberIndex::new(0),
+        group_schema,
+        version_vector: VersionVector::initial(
+            NonZeroUsize::new(member_count).expect("group should not be empty"),
+        ),
+        lifecycle: ReplicationGroupLifecycle::Open,
+        security_material: current_slice_placeholder_group_security_material(group_id),
+    }
+}
+
+fn metadata_initial_snapshot(group_id: GroupId, member_count: NonZeroUsize) -> InitialSnapshot {
+    InitialSnapshot::Metadata(InitialSnapshotMetadata {
+        primary_ref: SnapshotRef {
+            group_id,
+            versions: VersionVector::initial(member_count),
+        },
+        equivalent_refs: smallvec::SmallVec::default(),
+        record_count: Some(1),
+    })
+}
+
 fn persist_group_membership_for_member<S>(
     store: &S,
     group_id: GroupId,
@@ -1088,9 +1724,11 @@ fn persist_group_membership_for_member<S>(
             group_id,
             member_keys: test_group_member_keys(members),
             local_member_index: MemberIndex::new(local_member_index),
+            group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(member_count).expect("group should not be empty"),
             ),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -1107,7 +1745,9 @@ fn persist_alice_group_with_security_material(
             group_id,
             member_keys: test_group_member_keys(vec![alice_member()]),
             local_member_index: MemberIndex::new(0),
+            group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
         },
     );
@@ -1175,7 +1815,7 @@ fn load_persisted_row_slice<S>(
     group_id: GroupId,
     dataset_id: &DatasetId,
     row_keys: impl IntoIterator<Item = RowKey>,
-) -> DatasetRowSlice
+) -> DatasetRowStateSlice
 where
     S: ReplicationStore + ?Sized,
 {
@@ -1203,9 +1843,9 @@ fn drain_snapshot_rows(
     while let Some(batch) =
         wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
     {
-        for row in batch {
+        for row in batch.rows() {
             rows.push(
-                CapturedRowChange::capture_snapshot(row).expect("snapshot row should decode"),
+                CapturedRowChange::capture_snapshot(&row).expect("snapshot row should decode"),
             );
         }
     }
@@ -1267,29 +1907,43 @@ fn title_update_message(
     update_id: UpdateId,
     read_versions: VersionVector,
 ) -> (RowId, UpdateMessage) {
-    let row_id = test_row_id(group_id, dataset_id.clone(), row_raw);
+    let row_id = test_row_id(group_id, dataset_id, row_raw);
     let mut source_dataset = LocalDataset::new(title_schema_static());
-    let operation = apply_local_upsert(
+    let message = title_update_message_for_row(
         &mut source_dataset,
         &row_id,
+        title,
+        update_id,
+        read_versions,
+    );
+    (row_id, message)
+}
+
+fn title_update_message_for_row(
+    source_dataset: &mut LocalDataset,
+    row_id: &RowId,
+    title: &str,
+    update_id: UpdateId,
+    read_versions: VersionVector,
+) -> UpdateMessage {
+    let operation = apply_local_upsert(
+        source_dataset,
+        row_id,
         crate::row_values! { "title" => title },
         update_id,
     )
     .expect("operation should build")
     .expect("operation should apply")
     .encoded_operation;
-    (
-        row_id,
-        UpdateMessage {
-            group_id,
-            update_id,
-            read_versions,
-            dataset_updates: vec![DatasetUpdateMessage {
-                dataset_id,
-                operations: vec![operation],
-            }],
-        },
-    )
+    UpdateMessage {
+        group_id: row_id.group_id,
+        update_id,
+        read_versions,
+        dataset_updates: vec![DatasetUpdateMessage {
+            dataset_id: row_id.dataset_id.clone(),
+            operations: vec![operation],
+        }],
+    }
 }
 
 fn sort_captured_rows(rows: &mut [CapturedRowChange]) {
@@ -1317,10 +1971,9 @@ fn snapshot_string_field(
     while let Some(batch) =
         wait_for_test_reply(snapshot.rows.next_batch()).expect("snapshot batch should load")
     {
-        for row in batch {
-            if row.row_id == *row_id {
+        for row in batch.rows() {
+            if row.row_id() == row_id {
                 return row
-                    .row
                     .get_field_value::<str>(field_name)
                     .expect("snapshot field should decode")
                     .into_owned();
@@ -1605,7 +2258,9 @@ fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
             group_id,
             member_keys: member_keys.clone(),
             local_member_index: MemberIndex::new(0),
+            group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material_with_key_id(
                 group_id,
                 store_secret_key_id,
@@ -1656,7 +2311,9 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
             group_id,
             member_keys: member_keys.clone(),
             local_member_index: MemberIndex::new(0),
+            group_schema: GroupSchema::default(),
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material_with_key_id(
                 group_id,
                 store_secret_key_id,
@@ -1752,6 +2409,7 @@ fn runtime_host_can_publish_static_peer_routes_manually_in_tests() {
             &alice_member,
             store,
             listener,
+            ReplicationConfig::default(),
             security,
             Some(runtime_config_toml.as_str()),
             PreconfiguredPeerRoutesPublishMode::ManualForTest,
@@ -1776,6 +2434,7 @@ fn runtime_host_treats_zero_catch_up_batch_size_as_unlimited() {
             &alice_member,
             store,
             listener,
+            ReplicationConfig::default(),
             security,
             Some(
                 r"
@@ -1807,9 +2466,11 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
             group_id,
             member_keys: test_group_member_keys(members.ordered_members()),
             local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
             version_vector: VersionVector::initial(
                 NonZeroUsize::new(2).expect("group should have two members"),
             ),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -1843,7 +2504,7 @@ fn create_group_persists_membership_across_runtime_restart() {
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener);
     let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     drop(runtime);
@@ -1867,6 +2528,649 @@ fn create_group_persists_membership_across_runtime_restart() {
 }
 
 #[test]
+fn runtime_replays_pending_group_decisions_and_persists_responses_on_startup() {
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let invited_group_id = GroupId(Uuid::from_u128(60_101));
+    store_pending_group_decision(
+        store.as_ref(),
+        runtime_test_invitation_decision(invited_group_id),
+    );
+    store_pending_group_decision(store.as_ref(), runtime_test_migration_proposal_decision());
+    let listener = Arc::new(ListenerStub::default());
+
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_pending_group_event_count(2);
+    let events = listener.take_pending_group_events();
+    assert_eq!(events.len(), 2);
+    let mut accepted_invitation = false;
+    let mut rejected_migration = false;
+    for event in events {
+        match event {
+            CapturedPendingGroupEvent::GroupInvitation {
+                invitation,
+                respond,
+            } => {
+                assert_eq!(invitation.group_id, invited_group_id);
+                assert_eq!(invitation.source, GroupInvitationSource::Creation);
+                assert_eq!(
+                    invitation.proposed_members,
+                    vec![alice_member(), bob_member()]
+                );
+                wait_for_test_reply(respond.accept()).expect("invitation accept should persist");
+                accepted_invitation = true;
+            }
+            CapturedPendingGroupEvent::MigrationProposal { proposal, respond } => {
+                assert_eq!(proposal.migration_id, runtime_test_migration_id());
+                assert_eq!(
+                    proposal.proposed_members,
+                    vec![alice_member(), bob_member(), carol_member()]
+                );
+                wait_for_test_reply(respond.reject(RejectionReason::UserDenied))
+                    .expect("migration rejection should persist");
+                rejected_migration = true;
+            }
+        }
+    }
+    assert!(accepted_invitation);
+    assert!(rejected_migration);
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), invited_group_id).group_id,
+        invited_group_id
+    );
+    drop(runtime);
+
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime =
+        load_runtime_with_parts(app_alice_id(), store.clone(), restarted_listener.clone());
+
+    assert!(restarted_listener.take_pending_group_events().is_empty());
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
+}
+
+#[test]
+fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_target() {
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let old_group_id = GroupId(Uuid::from_u128(60_120));
+    let selected_group_id = GroupId(Uuid::from_u128(60_121));
+    let competing_group_id = GroupId(Uuid::from_u128(60_122));
+    persist_group_in_store(
+        store.as_ref(),
+        inactive_group_record(
+            old_group_id,
+            vec![alice_member(), bob_member()],
+            GroupSchema::default(),
+        ),
+    );
+    store_pending_group_decision(
+        store.as_ref(),
+        migration_proposal_decision(old_group_id, selected_group_id),
+    );
+    store_pending_group_decision(
+        store.as_ref(),
+        migration_proposal_decision(old_group_id, competing_group_id),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_pending_group_event_count(2);
+    assert_eq!(listener.migration_proposal_event_sizes(), vec![2]);
+    let events = listener.take_pending_group_events();
+    let selected = events
+        .into_iter()
+        .find_map(|event| match event {
+            CapturedPendingGroupEvent::MigrationProposal { proposal, respond }
+                if proposal.migration_id.new_group_id == selected_group_id =>
+            {
+                Some(respond)
+            }
+            _ => None,
+        })
+        .expect("selected migration proposal should be exposed");
+    wait_for_test_reply(selected.accept()).expect("selected migration should activate");
+
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), competing_group_id).is_none());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), old_group_id).lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id: selected_group_id,
+            final_versions: VersionVector::initial(
+                NonZeroUsize::new(2).expect("two old-group members"),
+            ),
+        }
+    );
+    assert_eq!(
+        load_persisted_group(store.as_ref(), selected_group_id).lifecycle,
+        ReplicationGroupLifecycle::Open
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decision() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let alice_store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let bob_sqlite_store =
+        sqlite_store_with_schemas(bob_member.clone(), Vec::<(DatasetId, SchemaSource)>::new());
+    provision_test_security(alice_store.as_ref(), &alice_member, [bob_member.clone()]);
+    provision_test_security(
+        bob_sqlite_store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
+    );
+    let bob_store = Arc::new(FailingStore::new(bob_sqlite_store.clone()));
+    let alice_listener = Arc::new(ListenerStub::default());
+    let bob_listener = Arc::new(ListenerStub::default());
+    let alice_runtime =
+        load_runtime_with_parts(app_alice_id(), alice_store, alice_listener.clone());
+    let auto_accept_config = ReplicationConfig {
+        group_invitation_policy: GroupInvitationPolicy {
+            creation: PolicyDecision::AutoAccept,
+            ..GroupInvitationPolicy::default()
+        },
+        ..ReplicationConfig::default()
+    };
+    let bob_runtime = load_runtime_with_parts_and_config(
+        app_bob_id(),
+        bob_store.clone(),
+        bob_listener,
+        auto_accept_config.clone(),
+    );
+    publish_direct_peer_routes(&alice_runtime, &alice_member, &bob_runtime, &bob_member);
+    bob_store.fail_after_next_pending_group_commit();
+
+    let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member, bob_member],
+        group_schema: GroupSchema::default(),
+    }))
+    .expect("group creation should succeed locally");
+    eventually(
+        TEST_WAIT_TIMEOUT,
+        || !load_pending_group_activations(bob_sqlite_store.as_ref()).is_empty(),
+        "auto-accepted work should commit as activation before the injected failure",
+    );
+    assert!(load_pending_group_decisions(bob_sqlite_store.as_ref()).is_empty());
+    assert!(
+        load_persisted_groups(bob_sqlite_store.as_ref()).is_empty(),
+        "the injected post-commit failure must prevent immediate activation"
+    );
+
+    wait_for_test_reply(bob_runtime.shutdown())
+        .expect("runtime host should shut down after the induced component fault");
+    let restarted_listener = Arc::new(ListenerStub::default());
+    let restarted_runtime = load_runtime_with_parts_and_config(
+        app_bob_id(),
+        bob_sqlite_store.clone(),
+        restarted_listener.clone(),
+        auto_accept_config,
+    );
+
+    eventually(
+        TEST_WAIT_TIMEOUT,
+        || {
+            restarted_runtime
+                .membership_snapshot_for_test()
+                .contains_group(&group_id)
+        },
+        "startup should resume the committed auto-accept activation",
+    );
+    assert!(restarted_listener.take_pending_group_events().is_empty());
+    assert!(load_pending_group_activations(bob_sqlite_store.as_ref()).is_empty());
+    wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
+    wait_for_test_reply(alice_runtime.shutdown()).expect("alice runtime should shut down");
+}
+
+#[test]
+fn runtime_resumes_pending_group_activation_with_global_read_token() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(60_105));
+    let unrelated_group_id = GroupId(Uuid::from_u128(60_104));
+    let row_key = RowKey(Uuid::from_u128(60_106));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let members = vec![alice_member.clone(), bob_member.clone()];
+    let member_count = NonZeroUsize::new(members.len()).expect("group should have members");
+    let mut unrelated_versions = VersionVector::initial(member_count);
+    unrelated_versions.increment_at(0);
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: unrelated_group_id,
+            member_keys: test_group_member_keys(members.clone()),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: unrelated_versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material: current_slice_placeholder_group_security_material(
+                unrelated_group_id,
+            ),
+        },
+    );
+    store_inactive_group_material(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            member_keys: test_group_member_keys(members.clone()),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: VersionVector::initial(member_count),
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        },
+    );
+    store_pending_group_activation(
+        store.as_ref(),
+        PendingGroupActivationRecord::GroupInvitation(GroupInvitation::new_creation(
+            group_id,
+            members,
+            docs_group_schema(),
+            InitialSnapshot::Inline(InitialGroupValueRows {
+                datasets: vec![InitialDatasetValueRows {
+                    dataset_id: dataset_id.clone(),
+                    rows: vec![InitialValueRow {
+                        row_key,
+                        row: title_row_values("activated on startup"),
+                    }],
+                }],
+            }),
+            None,
+            None,
+        )),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_data_change_count(1);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: RowId {
+                    group_id,
+                    dataset_id,
+                    row_key,
+                },
+                title: "activated on startup".to_owned(),
+            }],
+        }]
+    );
+    let read_tokens = listener.captured_data_change_read_tokens();
+    let activation_read_token = read_tokens
+        .last()
+        .expect("activation event should carry a read token");
+    assert_eq!(
+        activation_read_token.group_version(&group_id),
+        Some(&VersionVector::initial(member_count))
+    );
+    assert_eq!(
+        activation_read_token.group_version(&unrelated_group_id),
+        Some(&unrelated_versions)
+    );
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), group_id).is_some());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).group_id,
+        group_id
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn runtime_resumes_pending_migration_proposal_activation() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let migration_id = MigrationId {
+        old_group_id: GroupId(Uuid::from_u128(60_111)),
+        new_group_id: GroupId(Uuid::from_u128(60_112)),
+    };
+    let row_key = RowKey(Uuid::from_u128(60_113));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let members = vec![alice_member, bob_member];
+    let final_versions = VersionVector::Full(PureVersionVector::from([4, 0]));
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id: migration_id.old_group_id,
+            member_keys: test_group_member_keys(members.clone()),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
+            lifecycle: ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id: migration_id.new_group_id,
+                final_versions: final_versions.clone(),
+            },
+            security_material: current_slice_placeholder_group_security_material(
+                migration_id.old_group_id,
+            ),
+        },
+    );
+    store_pending_group_activation(
+        store.as_ref(),
+        PendingGroupActivationRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions,
+            proposed_members: members,
+            group_schema: docs_group_schema(),
+            initial_snapshot: InitialSnapshot::Inline(InitialGroupValueRows {
+                datasets: vec![InitialDatasetValueRows {
+                    dataset_id: dataset_id.clone(),
+                    rows: vec![InitialValueRow {
+                        row_key,
+                        row: title_row_values("migration resumed on startup"),
+                    }],
+                }],
+            }),
+            group_name: None,
+            message: None,
+        }),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_data_change_count(1);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: RowId {
+                    group_id: migration_id.new_group_id,
+                    dataset_id,
+                    row_key,
+                },
+                title: "migration resumed on startup".to_owned(),
+            }],
+        }]
+    );
+    assert!(listener.take_pending_group_events().is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), migration_id.new_group_id).group_id,
+        migration_id.new_group_id
+    );
+    assert!(matches!(
+        load_persisted_group(store.as_ref(), migration_id.old_group_id).lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id,
+            ..
+        } if successor_group_id == migration_id.new_group_id
+    ));
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn runtime_keeps_inactive_group_material_hidden_without_accepted_work() {
+    let alice_member_id = alice_member();
+    let bob_member_id = bob_member();
+    let group_id = GroupId(Uuid::from_u128(60_107));
+    let store = sqlite_store_with_schemas(
+        alice_member_id.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    store_inactive_group_material(
+        store.as_ref(),
+        inactive_group_record(
+            group_id,
+            vec![alice_member_id, bob_member_id],
+            GroupSchema::default(),
+        ),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    assert!(load_persisted_groups(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), group_id).is_some());
+    assert!(listener.captured_data_changes().is_empty());
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn runtime_accepts_replayed_invitation_with_stored_group_material() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(60_108));
+    let row_key = RowKey(Uuid::from_u128(60_109));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let members = vec![alice_member.clone(), bob_member.clone()];
+    store_inactive_group_material(
+        store.as_ref(),
+        inactive_group_record(group_id, members.clone(), docs_group_schema()),
+    );
+    store_pending_group_decision(
+        store.as_ref(),
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+            group_id,
+            members,
+            docs_group_schema(),
+            InitialSnapshot::Inline(InitialGroupValueRows {
+                datasets: vec![InitialDatasetValueRows {
+                    dataset_id: dataset_id.clone(),
+                    rows: vec![InitialValueRow {
+                        row_key,
+                        row: title_row_values("accepted from stored material"),
+                    }],
+                }],
+            }),
+            None,
+            None,
+        )),
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_pending_group_event_count(1);
+    let mut events = listener.take_pending_group_events();
+    let CapturedPendingGroupEvent::GroupInvitation { respond, .. } =
+        events.pop().expect("invitation should be replayed")
+    else {
+        panic!("expected invitation event");
+    };
+    wait_for_test_reply(respond.accept()).expect("accept should activate pending group work");
+
+    listener.wait_for_data_change_count(1);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: RowId {
+                    group_id,
+                    dataset_id,
+                    row_key,
+                },
+                title: "accepted from stored material".to_owned(),
+            }],
+        }]
+    );
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), group_id).is_some());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).group_id,
+        group_id
+    );
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+/// Assert manually restored Metadata work cannot transition into activation.
+fn assert_metadata_work_accept_rejects_without_activation(record: PendingGroupDecisionRecord) {
+    let group_id = record.group_id();
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    store_pending_group_decision(store.as_ref(), record);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+
+    listener.wait_for_pending_group_event_count(1);
+    let mut events = listener.take_pending_group_events();
+    let accept = match events.pop().expect("pending work should be replayed") {
+        CapturedPendingGroupEvent::GroupInvitation { respond, .. } => respond.accept(),
+        CapturedPendingGroupEvent::MigrationProposal { respond, .. } => respond.accept(),
+    };
+    let result = wait_for_test_reply(accept);
+
+    assert!(
+        matches!(result, Err(ApiError::ApiExternal { .. })),
+        "metadata accept should fail before activation is persisted: {result:?}"
+    );
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert!(load_group_material(store.as_ref(), group_id).is_none());
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
+fn metadata_pending_group_work_accept_rejects_without_persisting_activation() {
+    let alice_member_id = alice_member();
+    let bob_member_id = bob_member();
+    let member_count = NonZeroUsize::new(2).expect("two members");
+    let invitation_group_id = GroupId(Uuid::from_u128(60_110));
+    assert_metadata_work_accept_rejects_without_activation(
+        PendingGroupDecisionRecord::GroupInvitation(GroupInvitation::new_creation(
+            invitation_group_id,
+            vec![alice_member_id.clone(), bob_member_id.clone()],
+            GroupSchema::default(),
+            metadata_initial_snapshot(invitation_group_id, member_count),
+            None,
+            None,
+        )),
+    );
+
+    let migration_id = MigrationId {
+        old_group_id: GroupId(Uuid::from_u128(60_114)),
+        new_group_id: GroupId(Uuid::from_u128(60_115)),
+    };
+    assert_metadata_work_accept_rejects_without_activation(
+        PendingGroupDecisionRecord::MigrationProposal(MigrationProposal {
+            migration_id,
+            final_versions: VersionVector::Full(PureVersionVector::from([4, 0])),
+            proposed_members: vec![alice_member_id, bob_member_id],
+            group_schema: GroupSchema::default(),
+            initial_snapshot: metadata_initial_snapshot(migration_id.new_group_id, member_count),
+            group_name: None,
+            message: None,
+        }),
+    );
+}
+
+#[test]
+fn stopped_runtime_stale_invitation_accept_reports_unavailable_after_reject() {
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let group_id = GroupId(Uuid::from_u128(60_103));
+    store_pending_group_decision(store.as_ref(), runtime_test_invitation_decision(group_id));
+    let (first_runtime, stale_accept) = replay_one_pending_invitation(store.clone(), group_id);
+    wait_for_test_reply(first_runtime.shutdown()).expect("first runtime should shut down");
+    let (second_runtime, reject) = replay_one_pending_invitation(store.clone(), group_id);
+
+    wait_for_test_reply(reject.reject(RejectionReason::UserDenied))
+        .expect("reject should resolve the decision");
+    let stale_result = wait_for_test_reply(stale_accept.accept());
+    assert!(
+        matches!(stale_result, Err(ApiError::RuntimeUnavailable)),
+        "unexpected stale accept result: {stale_result:?}"
+    );
+
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    wait_for_test_reply(second_runtime.shutdown()).expect("second runtime should shut down");
+}
+
+#[test]
+fn stopped_runtime_stale_invitation_reject_reports_unavailable_after_accept() {
+    let store = sqlite_store_with_schemas(alice_member(), Vec::<(DatasetId, SchemaSource)>::new());
+    let group_id = GroupId(Uuid::from_u128(60_104));
+    store_pending_group_decision(store.as_ref(), runtime_test_invitation_decision(group_id));
+    let (first_runtime, stale_reject) = replay_one_pending_invitation(store.clone(), group_id);
+    wait_for_test_reply(first_runtime.shutdown()).expect("first runtime should shut down");
+    let (second_runtime, accept) = replay_one_pending_invitation(store.clone(), group_id);
+
+    wait_for_test_reply(accept.accept()).expect("accept should resolve the decision");
+    let stale_result = wait_for_test_reply(stale_reject.reject(RejectionReason::UserDenied));
+    assert!(
+        matches!(stale_result, Err(ApiError::RuntimeUnavailable)),
+        "unexpected stale reject result: {stale_result:?}"
+    );
+
+    assert!(load_pending_group_decisions(store.as_ref()).is_empty());
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+    assert_eq!(
+        load_persisted_group(store.as_ref(), group_id).group_id,
+        group_id
+    );
+    wait_for_test_reply(second_runtime.shutdown()).expect("second runtime should shut down");
+}
+
+#[test]
+fn runtime_replay_listener_failure_keeps_pending_group_decision() {
+    let alice_member = alice_member();
+    let store = sqlite_store(alice_member.clone());
+    provision_test_security(store.as_ref(), &alice_member, []);
+    let group_id = GroupId(Uuid::from_u128(60_102));
+    let decision = runtime_test_invitation_decision(group_id);
+    let decision_key = decision.key();
+    store_pending_group_decision(store.as_ref(), decision);
+    let security = load_test_runtime_security(store.clone(), &alice_member);
+    let listener = Arc::new(ListenerStub::default());
+    listener.reject_pending_group_events();
+    let start_result =
+        kompact::prelude::block_on(DeliveryRuntimeHost::start_with_runtime_config_toml(
+            &alice_member,
+            store.clone(),
+            listener.clone(),
+            ReplicationConfig::default(),
+            security,
+            None,
+        ));
+
+    match start_result {
+        Ok(mut host) => {
+            let startup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                host.wait_for_runtime_startup();
+            }));
+            assert!(startup_result.is_err());
+            let _ = wait_for_test_future(host.shutdown());
+        }
+        Err(error) => {
+            assert!(
+                matches!(
+                    error,
+                    RuntimeHostError::StartComponent {
+                        component: "ReplicationRuntimeComponent",
+                        ..
+                    }
+                ),
+                "unexpected startup error while replay listener rejects: {error:?}"
+            );
+        }
+    }
+
+    assert_eq!(listener.rejected_pending_group_event_count(), 1);
+    let decisions = load_pending_group_decisions(store.as_ref());
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].key(), decision_key);
+    assert!(load_pending_group_activations(store.as_ref()).is_empty());
+}
+
+#[test]
 fn publish_changes_persists_applied_update_and_snapshot_state() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -1877,7 +3181,7 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 34);
@@ -1928,7 +3232,7 @@ fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_i
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 121_000);
@@ -1980,7 +3284,7 @@ fn request_summary_reports_local_versions() {
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
@@ -2020,7 +3324,7 @@ fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let active_row_id = test_row_id(group_id, dataset_id.clone(), 35);
@@ -2108,7 +3412,7 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 39);
@@ -2133,6 +3437,176 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
                 title: "local event".to_owned(),
             }],
         }]
+    );
+}
+
+#[test]
+fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+        alice_member.clone(),
+        [(
+            dataset_id.clone(),
+            SchemaSource::from(title_schema_shared()),
+        )],
+    ))
+    .expect("store should build");
+    let store = Arc::new(store);
+    provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
+    let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone()],
+        group_schema: docs_group_schema(),
+    }))
+    .expect("create_group should succeed");
+    let old_row_id = test_row_id(old_group_id, dataset_id.clone(), 40);
+
+    let read_token = snapshot_read_token(runtime.as_ref(), old_group_id, dataset_id.clone());
+    publish_changes(
+        runtime.as_ref(),
+        read_token,
+        vec![RowMutation::Upsert {
+            row_id: old_row_id.clone(),
+            row: crate::row_values! {
+                "title" => "membership snapshot",
+            },
+        }],
+    );
+    listener.wait_for_data_change_count(1);
+    let previous_event_count = listener.captured_data_changes().len();
+
+    let migration_id = wait_for_test_reply(runtime.change_group_membership(
+        ChangeGroupMembershipRequest {
+            group_id: old_group_id,
+            add_members: HashSet::from([bob_member]),
+            remove_members: HashSet::new(),
+            group_name: None,
+            message: None,
+        },
+    ))
+    .expect("membership change should succeed");
+
+    listener.wait_for_data_change_count(previous_event_count + 1);
+    let data_changes = listener.captured_data_changes();
+    let migration_change = &data_changes[previous_event_count];
+    let new_row_id = RowId {
+        group_id: migration_id.new_group_id,
+        dataset_id,
+        row_key: old_row_id.row_key,
+    };
+    assert_eq!(
+        migration_change,
+        &CapturedDataChange {
+            rows: vec![CapturedRowChange::Upsert {
+                row_id: new_row_id,
+                title: "membership snapshot".to_owned(),
+            }],
+        }
+    );
+    let old_group = load_persisted_group(store.as_ref(), old_group_id);
+    assert_eq!(
+        old_group.lifecycle,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id: migration_id.new_group_id,
+            final_versions: old_group.version_vector.clone(),
+        }
+    );
+    let migration_read_token = listener
+        .captured_data_change_read_tokens()
+        .last()
+        .cloned()
+        .expect("migration listener event should carry a read token");
+    assert!(migration_read_token.group_version(&old_group_id).is_none());
+    assert!(
+        migration_read_token
+            .group_version(&migration_id.new_group_id)
+            .is_some()
+    );
+    assert!(
+        wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+            group_id: old_group_id,
+            datasets: HashSet::from([docs_dataset_id()]),
+            max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
+            include_tombstones: false,
+        }))
+        .is_err()
+    );
+    assert!(
+        wait_for_test_reply(runtime.request_summary(SummaryRequest {
+            group_id: old_group_id,
+            target: alice_member.clone(),
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn read_only_group_allows_reads_but_rejects_application_writes() {
+    let alice_member = alice_member();
+    let dataset_id = docs_dataset_id();
+    let group_id = GroupId(Uuid::from_u128(50_601));
+    let successor_group_id = GroupId(Uuid::from_u128(50_602));
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let versions = VersionVector::initial(NonZeroUsize::new(1).unwrap());
+    persist_group_in_store(
+        store.as_ref(),
+        ReplicationGroupRecord {
+            group_id,
+            member_keys: test_group_member_keys(vec![alice_member.clone()]),
+            local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
+            version_vector: versions.clone(),
+            lifecycle: ReplicationGroupLifecycle::ReadOnly {
+                successor_group_id,
+                final_versions: versions.clone(),
+            },
+            security_material: current_slice_placeholder_group_security_material(group_id),
+        },
+    );
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+
+    let snapshot = wait_for_test_reply(runtime.snapshot_rows(SnapshotRowsRequest {
+        group_id,
+        datasets: HashSet::from([dataset_id.clone()]),
+        max_rows_per_batch: NonZeroUsize::new(1).unwrap(),
+        include_tombstones: false,
+    }))
+    .expect("read-only group should remain snapshot-readable");
+    assert!(snapshot.read_token.group_version(&group_id).is_none());
+    drop(snapshot);
+    wait_for_test_reply(runtime.request_summary(SummaryRequest {
+        group_id,
+        target: alice_member.clone(),
+    }))
+    .expect("read-only group should permit application summaries");
+    assert!(
+        wait_for_test_reply(runtime.publish_changes(PublishChangesRequest {
+            read_token: ReadToken::from_group_versions(HashMap::from([(group_id, versions)])),
+            changes: vec![RowMutation::Upsert {
+                row_id: test_row_id(group_id, dataset_id, 50_603),
+                row: crate::row_values! { "title" => "rejected" },
+            }],
+        }))
+        .is_err()
+    );
+    assert!(
+        wait_for_test_reply(
+            runtime.change_group_membership(ChangeGroupMembershipRequest {
+                group_id,
+                add_members: HashSet::new(),
+                remove_members: HashSet::new(),
+                group_name: None,
+                message: None,
+            })
+        )
+        .is_err()
     );
 }
 
@@ -2219,7 +3693,7 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema_from_schema(title_note_schema_shared()),
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 41);
@@ -2288,20 +3762,18 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
 fn publish_changes_error_display_includes_local_operation_source() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
+    let schema = Arc::new(Schema::from_fields([
+        Field::linear_string("title"),
+        Field::monotonic_counter("edit_count"),
+    ]));
     let fixture = load_runtime_fixture(
         app_alice_id(),
         alice_member.clone(),
-        [(
-            dataset_id.clone(),
-            Arc::new(Schema::from_fields([
-                Field::linear_string("title"),
-                Field::monotonic_counter("edit_count"),
-            ])),
-        )],
+        [(dataset_id.clone(), schema.clone())],
     );
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
-        initial_state: None,
+        group_schema: docs_group_schema_from_schema(schema),
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 40);
@@ -2358,7 +3830,9 @@ fn publish_changes_rejects_reserved_local_update_version() {
             group_id,
             member_keys: test_group_member_keys(vec![alice_member.clone(), bob_member]),
             local_member_index: MemberIndex::new(0),
+            group_schema: docs_group_schema(),
             version_vector: version_vector.clone(),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
         },
     );
@@ -2422,7 +3896,7 @@ fn create_group_rejects_missing_permitted_keys_without_storing_group() {
 
     let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member.clone()],
-        initial_state: None,
+        group_schema: GroupSchema::default(),
     }))
     .expect_err("missing permitted keys should reject group creation");
 
@@ -2462,22 +3936,20 @@ fn bootstrap_payload_validation_rejects_unpermitted_sender_fingerprint() {
     let probe_keys = test_public_keys(&Identifier::from_array(["probe", "laptop"]));
     let mismatched_alice_key =
         BootstrapMemberKeyMessage::from_fingerprint(probe_keys.fingerprint());
-    let payload = BootstrapGroupMessage::new(
-        GroupId(Uuid::from_u128(70_001)),
+    let payload = GroupSetupMessage::new(
         vec![alice_member.clone(), bob_member.clone()],
         bootstrap_member_keys([
             (alice_member.clone(), mismatched_alice_key),
             bootstrap_member_key(&bob_keys),
         ]),
         GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-        BootstrapGroupKey::from_bytes([70; 32]),
+        GroupSetupKey::from_bytes([70; 32]),
     )
     .expect("bootstrap payload should build");
 
-    let err = wait_for_test_reply(
-        security.validate_bootstrap_payload_member_keys(&payload, &alice_member),
-    )
-    .expect_err("mismatched bootstrap keys should reject payload");
+    let err =
+        wait_for_test_reply(security.validate_group_setup_member_keys(&payload, &alice_member))
+            .expect_err("mismatched bootstrap keys should reject payload");
 
     match err {
         DeliverySecurityError::MemberKeyPermissionDenied {
@@ -2524,19 +3996,18 @@ fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multi
     wait_for_test_reply(transaction.commit()).expect("transaction should commit");
     let security = load_test_runtime_security(store, &bob_member);
     let bob_keys = test_public_keys(&bob_member);
-    let payload = BootstrapGroupMessage::new(
-        GroupId(Uuid::from_u128(70_006)),
+    let payload = GroupSetupMessage::new(
         vec![alice_member.clone(), bob_member.clone()],
         bootstrap_member_keys([
             bootstrap_member_key(&alternate_alice_keys),
             bootstrap_member_key(&bob_keys),
         ]),
         GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-        BootstrapGroupKey::from_bytes([73; 32]),
+        GroupSetupKey::from_bytes([73; 32]),
     )
     .expect("bootstrap payload should build");
 
-    wait_for_test_reply(security.validate_bootstrap_payload_member_keys(&payload, &alice_member))
+    wait_for_test_reply(security.validate_group_setup_member_keys(&payload, &alice_member))
         .expect("advertised permitted sender key should validate");
 }
 
@@ -2563,22 +4034,20 @@ fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_perm
     .expect("runtime security state should load");
     let alice_keys = test_public_keys(&alice_member);
     let bob_keys = test_public_keys(&bob_member);
-    let payload = BootstrapGroupMessage::new(
-        GroupId(Uuid::from_u128(70_002)),
+    let payload = GroupSetupMessage::new(
         vec![alice_member.clone(), bob_member.clone()],
         bootstrap_member_keys([
             bootstrap_member_key(&alice_keys),
             bootstrap_member_key(&bob_keys),
         ]),
         GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-        BootstrapGroupKey::from_bytes([71; 32]),
+        GroupSetupKey::from_bytes([71; 32]),
     )
     .expect("bootstrap payload should build");
 
-    let err = wait_for_test_reply(
-        security.validate_bootstrap_payload_member_keys(&payload, &alice_member),
-    )
-    .expect_err("bootstrap activation permission should reject payload");
+    let err =
+        wait_for_test_reply(security.validate_group_setup_member_keys(&payload, &alice_member))
+            .expect_err("bootstrap activation permission should reject payload");
 
     match err {
         DeliverySecurityError::MemberKeyPermissionDenied {
@@ -2607,8 +4076,8 @@ fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
     let bob_keys = test_public_keys(&bob_member);
     let charlie_keys = test_public_keys(&charlie_member);
     let charlie_record = MemberPublicKeysRecord::from_public_keys(&charlie_keys);
-    let payload = BootstrapGroupMessage::new(
-        GroupId(Uuid::from_u128(70_003)),
+    let group_id = GroupId(Uuid::from_u128(70_003));
+    let payload = GroupSetupMessage::new(
         vec![
             alice_member.clone(),
             bob_member.clone(),
@@ -2620,13 +4089,15 @@ fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
             bootstrap_member_key(&charlie_keys),
         ]),
         GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
-        BootstrapGroupKey::from_bytes([72; 32]),
+        GroupSetupKey::from_bytes([72; 32]),
     )
     .expect("bootstrap payload should build");
 
-    wait_for_test_reply(
-        security.prepare_security_material_from_bootstrap_msg(&payload, &alice_member),
-    )
+    wait_for_test_reply(security.prepare_security_material_from_group_setup(
+        group_id,
+        &payload,
+        &alice_member,
+    ))
     .expect("bootstrap security material should prepare");
 
     let mut transaction =
@@ -2660,7 +4131,7 @@ fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
     ])
     .expect("group members should build");
 
-    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_bootstrap(
+    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_setup(
         &security,
         2,
         GroupId(Uuid::from_u128(70_004)),
@@ -2670,7 +4141,7 @@ fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
 
     assert!(
         prepared
-            .bootstrap_message()
+            .group_setup()
             .member_keys()
             .owned_entries()
             .all(|(_, member_key)| member_key.public_keys().is_none())
@@ -2687,7 +4158,7 @@ fn bootstrap_preparation_inlines_bundles_at_configured_limit() {
     let members = GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
         .expect("group members should build");
 
-    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_bootstrap(
+    let prepared = wait_for_test_reply(ReplicationRuntimeComponent::prepare_group_setup(
         &security,
         2,
         GroupId(Uuid::from_u128(70_005)),
@@ -2697,7 +4168,7 @@ fn bootstrap_preparation_inlines_bundles_at_configured_limit() {
 
     assert!(
         prepared
-            .bootstrap_message()
+            .group_setup()
             .member_keys()
             .owned_entries()
             .all(|(_, member_key)| member_key.public_keys().is_some())
@@ -2990,10 +4461,15 @@ fn request_summary_returns_remote_current_version_vector() {
     );
 
     let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
-        members: vec![alice_member, bob_member.clone()],
-        initial_state: None,
+        members: vec![alice_member.clone(), bob_member.clone()],
+        group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
+    accept_one_creation_invitation(
+        &bob_fixture.listener,
+        group_id,
+        &[alice_member, bob_member.clone()],
+    );
     wait_for_group_install(bob_runtime, group_id);
 
     let summary = wait_for_test_reply(alice_runtime.request_summary(SummaryRequest {
@@ -3008,6 +4484,52 @@ fn request_summary_returns_remote_current_version_vector() {
         summary.has_versions,
         VersionVector::initial(NonZeroUsize::new(2).expect("two members"))
     );
+}
+
+#[test]
+fn group_invitation_persists_group_schema() {
+    let _runtime_endpoint_leases =
+        reserve_sockets(&[ReservedSocketKind::UdpSocket, ReservedSocketKind::UdpSocket]);
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let alice_fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice_member.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let bob_fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    provision_test_security(
+        alice_fixture.store.as_ref(),
+        &alice_member,
+        [bob_member.clone()],
+    );
+    provision_test_security(
+        bob_fixture.store.as_ref(),
+        &bob_member,
+        [alice_member.clone()],
+    );
+    publish_direct_peer_routes(
+        &alice_fixture.runtime,
+        &alice_member,
+        &bob_fixture.runtime,
+        &bob_member,
+    );
+
+    let group_schema = docs_group_schema();
+    let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
+        members: vec![alice_member.clone(), bob_member.clone()],
+        group_schema: group_schema.clone(),
+    }))
+    .expect("create_group should succeed");
+    accept_one_creation_invitation(&bob_fixture.listener, group_id, &[alice_member, bob_member]);
+    wait_for_group_install(&bob_fixture.runtime, group_id);
+
+    let bob_group = load_persisted_group(bob_fixture.store.as_ref(), group_id);
+    assert_eq!(bob_group.group_schema, group_schema);
 }
 
 #[test]
@@ -3122,6 +4644,108 @@ fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicate
         .apply_update_for_test(alice_member, first_message)
         .expect("duplicate update should be ignored");
     assert_eq!(bob_fixture.listener.captured_data_changes().len(), 2);
+}
+
+#[test]
+fn migrated_group_updates_follow_read_only_and_closed_application_visibility() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let dataset_id = docs_dataset_id();
+    let fixture = load_runtime_fixture(
+        app_bob_id(),
+        bob_member.clone(),
+        [(dataset_id.clone(), title_schema_static())],
+    );
+    let group_id = GroupId(Uuid::from_u128(50_701));
+    fixture
+        .runtime
+        .install_group_for_test(
+            group_id,
+            GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member])
+                .expect("group should build"),
+        )
+        .expect("group should install");
+    let member_count = NonZeroUsize::new(2).expect("group has two members");
+    let successor_group_id = GroupId(Uuid::from_u128(50_702));
+    let final_versions = VersionVector::Full(PureVersionVector::from([2, 0]));
+    persist_group_lifecycle(
+        fixture.store.as_ref(),
+        &group_id,
+        ReplicationGroupLifecycle::ReadOnly {
+            successor_group_id,
+            final_versions: final_versions.clone(),
+        },
+    );
+
+    let row_id = test_row_id(group_id, dataset_id.clone(), 50_703);
+    let mut source_dataset = LocalDataset::new(title_schema_static());
+    let read_only_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "read-only update",
+        UpdateId {
+            version: 1,
+            node_index: 0,
+        },
+        VersionVector::initial(member_count),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member.clone(), read_only_update)
+        .expect("in-cut update should apply");
+    fixture.listener.wait_for_data_change_count(1);
+    assert!(
+        fixture.listener.captured_data_change_read_tokens()[0]
+            .group_version(&group_id)
+            .is_none()
+    );
+
+    persist_group_lifecycle(
+        fixture.store.as_ref(),
+        &group_id,
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id,
+            final_versions,
+        },
+    );
+
+    let closed_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "silent catch-up",
+        UpdateId {
+            version: 2,
+            node_index: 0,
+        },
+        VersionVector::Full(PureVersionVector::from([1, 0])),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member.clone(), closed_update)
+        .expect("closed in-cut update should apply without a listener event");
+
+    let discarded_update = title_update_message_for_row(
+        &mut source_dataset,
+        &row_id,
+        "discarded",
+        UpdateId {
+            version: 3,
+            node_index: 0,
+        },
+        VersionVector::Full(PureVersionVector::from([2, 0])),
+    );
+    fixture
+        .runtime
+        .apply_update_for_test(alice_member, discarded_update)
+        .expect("post-cut update should be ignored without failing delivery");
+
+    assert_eq!(fixture.listener.captured_data_changes().len(), 1);
+    assert_eq!(
+        load_persisted_group(fixture.store.as_ref(), group_id)
+            .version_vector
+            .version_at(0),
+        2
+    );
 }
 
 #[test]
@@ -3553,7 +5177,7 @@ fn inbound_update_after_local_delete_updates_tombstone_without_resurrection() {
             .expect("edited tombstone should persist");
     assert!(edited_tombstone.tombstoned);
     let materialised_tombstone =
-        flotsync_messages::InMemoryData::from_row_snapshots_with_tombstones(
+        flotsync_messages::InMemoryStateData::from_row_snapshots_with_tombstones(
             schema,
             [flotsync_data_types::schema::datamodel::RowRecord {
                 row_id: row_id.row_key.0,

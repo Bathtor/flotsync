@@ -125,7 +125,9 @@ impl ExampleRuntime {
 
         match system.shutdown().wait() {
             Ok(()) => Ok(()),
-            Err(message) => whatever!("failed to shut down Kompact system: {message}"),
+            Err(message) => {
+                whatever!("failed to shut down Kompact system: {message}");
+            }
         }
     }
 }

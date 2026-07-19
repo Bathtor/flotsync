@@ -32,6 +32,7 @@ Do not edit it directly.
 ## State Machine
 
 - [GroupBroadcast Queue Model](group_broadcast_queue_model.md) - Specifies GroupBroadcast queue ownership, route states, transitions, and completion rules.
+- [Inline Migration Policy Flow](inline_migration_policy_flow.md) - Defines validation, policy, persistence, activation, and restart behaviour for inline membership migration work.
 
 ## Testing Guide
 

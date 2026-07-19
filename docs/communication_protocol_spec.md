@@ -25,11 +25,19 @@ group fan-out/storage, and replication semantics separate.
 - **Replication Group**: fixed membership set of devices sharing one replication key and schema epoch.
 - **Member**: one device identity within a replication group.
 - **Relay**: store-and-forward peer for encrypted messages.
-- **UpdateId**: `(version, producer_index)`.
+- **UpdateId**: `(version, producer_index)`. `UpdateId(0, 0)` is reserved as
+  the synthetic initial-state origin and is not a real replicated update.
 - **ReadVV**: VV captured by an update producer at creation time.
 - **VV**: one version per group member.
-- **Snapshot**: full materialized state at a VV cut.
+- **Snapshot**: full materialized state at a group/version reference.
+- **SnapshotRef**: `(group_id, VV)` reference to one group state. Multiple
+  refs may describe the same logical snapshot, for example an old group at a
+  migration cut and a new group at its zero vector.
+- **InitialSnapshot**: initial dataset state required before activating a
+  joined or migrated group. It may be empty, inline, or described by metadata
+  for later retrieval.
 - **Migration**: creation of a new replication group from a state cut of an old group.
+- **MigrationId**: `(old_group_id, new_group_id)`.
 
 ## 3. System Model and Assumptions
 
@@ -46,9 +54,13 @@ group fan-out/storage, and replication semantics separate.
 - **G2 Idempotence**: Replay of an already-applied update is a no-op.
 - **G3 Global causality gate**: Every update carries `ReadVV`. A receiver may apply the update only when `LocalVV >= ReadVV`.
 - **G4 Legal order**: A legal order is any order that never violates I3 and applies each update at most once.
-- **G5 Convergence**: If two members apply the same update set in any legal order, they converge.
-- **G6 Tombstone safety**: Deletes use tombstones so replay/reconstruction remain correct.
-- **G7 Ack promise**: When node `n` sends `Ack(A)`, it promises future updates produced by `n` will not produce versions below `max(A)`, that is an `Ack(A)` is a no-op update for all versions between `A[n]` and `max(A)`.
+- **G5 New-group creator index**: The creator/proposer of a newly created group
+  instance must occupy member index 0 in that group's canonical member order.
+  Bootstrap or migration material whose authenticated sender/proposer is not
+  member index 0 is invalid for that new group instance.
+- **G6 Convergence**: If two members apply the same update set in any legal order, they converge.
+- **G7 Tombstone safety**: Deletes use tombstones so replay/reconstruction remain correct.
+- **G8 Ack promise**: When node `n` sends `Ack(A)`, it promises future updates produced by `n` will not produce versions below `max(A)`, that is an `Ack(A)` is a no-op update for all versions between `A[n]` and `max(A)`.
 
 ## 5. Sub-Protocol A: PeerAnnouncement
 
@@ -208,8 +220,8 @@ Notes:
 #### `RecipientAck`
 
 Purpose:
-Tell the original sender that the recipient durably accepted one
-recipient-addressed message.
+Tell the original sender that one recipient-addressed message was processed and
+does not require retry.
 
 Must convey:
 
@@ -219,6 +231,13 @@ Must convey:
 - recipient signature over the ack fields
 
 Notes:
+
+- invitation and proposal payloads do not require retry after terminal
+  rejection, stored listener mediation, or committed activation work
+- it does not imply that a listener accepted the work or that the target group
+  is already active
+- failures before processing reaches one of those outcomes intentionally
+  withhold the acknowledgement so reliable delivery may retry
 
 - this is the completion signal for sender-side delivery
 - it may itself be delivered directly or through relay mailboxes
@@ -318,7 +337,7 @@ Must convey:
     - `message_ref` (for relay indexing/retrieval), e.g.:
         - `GroupInit(migration_or_group_id)`
         - `Update(version, producer_index)`
-        - `GroupClose(migration_id)`
+        - `GroupClose(group_id)`
     - envelope `message_id` (dedupe/retry bookkeeping)
 - encrypted payload bytes
 
@@ -365,11 +384,22 @@ and group-scoped delivery is handled by sub-protocol D.
 
 ### 9.2 State Model (per local node, per replication group)
 
-- `Active`: normal update production/application.
-- `CatchUp`: local node is behind known frontier and is requesting data.
-- `CausalityBlocked`: buffered updates exist with unsatisfied `ReadVV`.
-- `Migrating`: migration has been proposed/accepted and new-group transition is in progress.
-- `Closed`: old group locally closed for writes by policy.
+Application access follows a persisted lifecycle:
+
+- `Open`: application reads, writes, summaries, membership changes, and
+  listener row events are enabled.
+- `ReadOnly`: an accepted migration target and immutable `final_versions` cut
+  are recorded while target activation completes. Application reads,
+  summaries, and listener row events remain enabled; writes and further
+  membership changes are rejected.
+- `Closed`: application access and listener row events are disabled. The group
+  still applies and serves replication updates needed to reproduce the accepted
+  cut.
+
+Catch-up and causality-blocked work are operational states within this
+lifecycle. For `ReadOnly` and `Closed` groups, summaries, range requests, and
+accepted updates are bounded by `final_versions`. Read tokens omit both states
+because neither can produce further application writes.
 
 ### 9.3 Message Classes
 
@@ -432,18 +462,56 @@ Must convey:
 #### `Snapshot`
 
 Purpose:
-Send full state at a VV cut as catch-up optimization or migration seed.
+Send full state at a group/version reference as a catch-up optimization or
+activation input.
 
 Must convey:
 
-- group id (or new group id in migration context)
-- `snapshotVV`
+- snapshot ref:
+    - group id
+    - VV
 - snapshot payload
 
 Notes:
 
 - relays may forward stored snapshots
 - relays cannot synthesize snapshots from update history
+- far-behind members may fetch a snapshot instead of replaying many deltas
+- large snapshot transfer must be chunked by the replication layer so transport
+  reassembly does not need to hold a complete snapshot in memory
+
+#### `InitialSnapshot`
+
+Purpose:
+Describe the initial state required before a group invitation or migration can
+become active locally.
+
+Must convey one of:
+
+- `Empty`: the initial dataset state is empty
+- `Inline`: the initial snapshot payload is carried directly
+- `Metadata`: the initial snapshot exists elsewhere and must be resolved before
+  activation
+
+`Metadata` must convey:
+
+- primary snapshot ref
+- zero or more equivalent snapshot refs
+- optional record count
+
+Notes:
+
+- `Empty` does not imply that the group is newly created
+- `Inline` carries projected row values, not CRDT state. Recipients embed
+  deterministic initial CRDT state from those values using
+  `UpdateId(0, 0)` as the synthetic origin. `UpdateId(0, 0)` must not appear in
+  ordinary update logs.
+- in a migration, existing old-group members may receive an old-group/cut ref
+  while newly added members receive a new-group/zero-vector ref
+- equivalent refs let runtimes deduplicate local snapshot state even when
+  transfer encryption or recipient perspective differs
+- digest, encoded size, and table count are intentionally deferred until their
+  canonical semantics are designed
 
 #### `Ack`
 
@@ -460,20 +528,44 @@ Notes:
 - steady state: usually ack each `Update`
 - catch-up: coarse ack (for example once synced) is acceptable
 
-#### `MigrationInit`
+#### `GroupInvitation`
+
+Purpose:
+Invite a recipient to activate a new group when the recipient cannot rely on an
+old-group authority context.
+
+Must convey:
+
+- target group id
+- creation or migration source context
+- proposed canonical membership
+- group schema
+- empty, inline, or metadata initial snapshot
+- recipient-protected target-group member keys, cipher suite, and group key
+- optional application-facing group name and message
+
+Notes:
+
+- the reliable invitation payload carries its matching private group setup
+- migration-derived invitations are scoped to the target group and are sent to
+  newly added members
+- private setup remains outside listener-visible invitation values
+
+#### `MigrationProposal`
 
 Purpose:
 Propose/initiate migration to new group.
 
 Must convey:
 
-- migration id
+- migration id `(old_group_id, new_group_id)`
 - old group id
 - new group id
 - migration cut VV in old group
 - new group membership
-- new shared key material (encrypted per recipient)
-- initial snapshot for new group
+- new group schema
+- recipient-protected target-group member keys, cipher suite, and group key
+- initial snapshot
 
 Notes:
 
@@ -481,34 +573,54 @@ Notes:
   not yet share the new group key
 - recipients should verify sender signatures before accepting the bootstrap
   material
+- the proposer of the new group instance must be member index 0 in the proposed
+  new-group member order
+- `MigrationProposal` is signed/scoped to the old group because the old group is
+  the authority context for superseding its state
+- newly added members that are not in the old group receive a `GroupInvitation`
+  with migration source context rather than a listener-visible
+  `MigrationProposal`
+- the proposal and its private group setup are one self-contained reliable
+  payload; private setup remains outside listener-visible proposal values
+- the recipient-addressed envelope protects both inline snapshot values and
+  target-group setup while they are in transit
 
 #### `GroupClose`
 
 Purpose:
-Signal old-group lifecycle policy after migration.
+Request closure of an existing group without creating a replacement group.
 
 Must convey:
 
-- migration id
-- old group id
+- group id
 - close mode/policy marker
+
+Notes:
+
+- this standalone group-close message is specified for a later runtime slice
+- `GroupClose` is signed/scoped to the group being closed
+- it is a lifecycle signal, not remote command authority
+- local policy decides whether to close writes, keep read-only access, or only
+  observe the signal
+- unauthorised or unsupported close signals are ignored
 
 ## 10. Cross-Protocol Flows
 
 ### 10.1 Bootstrap / Invitation
 
-1. higher-layer logic prepares recipient-addressed bootstrap material (for
-   example a migration invitation or key package).
+1. higher-layer logic prepares a self-contained recipient-addressed migration
+   proposal or group invitation with matching private target-group setup.
 2. `SingleRecipientDurableDelivery`: attempt direct delivery and relay mailbox
    storage.
 3. recipient checks in with configured relay mailboxes using `MailboxFetch`.
 4. relay returns pending envelopes in `MailboxBatch`.
-5. recipient verifies the sender signature, durably accepts relevant messages,
-   and sends `MailboxAck` for relay cleanup.
+5. recipient verifies the sender signature and payload, processes the message
+   to an outcome that does not require retry, and sends `MailboxAck` for relay
+   cleanup.
 6. recipient sends `RecipientAck` back to the original sender, directly when
    possible and through relay mailboxes when necessary.
-7. once the invitation or bootstrap material is accepted, the recipient can
-   join the new group.
+7. automatic or listener acceptance activates Empty and Inline snapshots;
+   Metadata snapshots remain unsupported by the current runtime.
 
 ### 10.2 Initial Sync
 
@@ -539,16 +651,40 @@ Same wire behavior as initial sync: VV is the cursor.
 
 ### 10.6 Migration
 
-1. `Replication`: emit `MigrationInit` or equivalent recipient-addressed
-   invitation material.
+1. `Replication`: emit old-group-scoped `MigrationProposal` messages for
+   existing members and migration-sourced `GroupInvitation` messages for newly
+   added members.
 2. `SingleRecipientDurableDelivery`: deliver per-recipient invitation packages
    directly or through relay mailboxes until `RecipientAck`.
-3. receivers accept or ignore migration (policy/user mediated).
-4. accepting receivers join new group and start sync there.
-5. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
+3. receivers validate the self-contained setup and classify the work according
+   to local policy. Concurrent undecided proposals for the same old group are
+   exposed to the listener together so one candidate can be selected. Metadata
+   snapshots are automatically rejected in the current implementation because
+   snapshot fetching is unavailable.
+4. automatic rejection removes inactive material and pending work. Listener
+   mediation atomically stores inactive material plus pending decision state.
+   Automatic acceptance atomically stores inactive material plus accepted
+   activation state.
+5. once the message has been processed and does not require retry, the receiver
+   completes the reliable-delivery acknowledgement. Listener mediation does not
+   wait for the eventual listener response before acknowledging delivery.
+6. accepting one proposal atomically records the selected target and cut, moves
+   the old group to `ReadOnly`, removes competing proposals for that old group,
+   and stores accepted activation work. Exact replays of the selected proposal
+   are idempotent; proposals for a different target or cut are terminally
+   rejected and acknowledged without setup validation or listener notification.
+7. pending listener decisions are re-surfaced after restart. Accepted activation
+   work resumes after restart without asking the listener again.
+8. Empty snapshots activate without rows. Inline projected rows are embedded as
+   deterministic initial state, committed with target-group activation, and
+   emitted to the listener after commit.
+9. target activation and the old group's transition from `ReadOnly` to `Closed`
+   commit together. A closed old group continues bounded catch-up without
+   exposing further rows to the application.
+10. `GroupBroadcast`: once the new group exists, fan-out group-scoped traffic
    within that group as normal.
-6. optional `GroupClose` updates old-group write/read policy.
-7. ignoring migration can intentionally split old/new group activity.
+11. rejecting or ignoring migration can intentionally split old/new group
+   activity.
 
 ## 11. Error Handling and Compatibility
 

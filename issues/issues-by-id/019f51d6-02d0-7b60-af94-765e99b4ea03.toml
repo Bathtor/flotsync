@@ -1,0 +1,32 @@
+id = "019f51d6-02d0-7b60-af94-765e99b4ea03"
+ref = "flotsync-git-5la"
+title = "Design read-token remapping across group migrations"
+body = """
+Design whether and how an application read position from an old replication group can safely be used as the basis for a write to the migrated new group.
+
+Context:
+A. During migration, the old group becomes read-only while the new group is accepted and activated.
+B. The first migration-policy implementation should not support basing a new-group write on a ReadToken captured from the old group.
+C. Supporting this later may be possible by remapping old-group version vectors to the new group initial snapshot reference, but the semantics are tricky and need explicit design.
+
+Scope:
+D. Define the correctness model for mapping old-group read positions into a new-group write context.
+E. Specify how old-group final_versions, new-group zero vectors, equivalent SnapshotRef values, and trailing deltas interact.
+F. Decide whether the public ReadToken remains fully opaque or gains an internal migration lineage representation.
+G. Define validation failures for stale, partially migrated, or unsupported cross-group publish attempts.
+H. Produce follow-up implementation tasks if the design is accepted.
+
+Out of scope:
+I. The current migration policy API slice.
+J. Inline snapshot activation without cross-group writes."""
+status = "open"
+type = "task"
+priority = 4
+labels = ["area:replication"]
+blocked_by = ["019f51bf-65a3-7b33-9d64-0e2f7390e4e2"]
+created_at = "2026-07-11T15:40:07.760812Z"
+updated_at = "2026-07-11T15:40:13.637533Z"
+
+[[links]]
+target = "019f51bf-9095-72a0-94f6-bcbd4ca68271"
+label = "discovered from"

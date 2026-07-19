@@ -1,9 +1,12 @@
-use super::{
-    errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary},
-    messages::{RuntimeMessage, SummaryRequestMessage, WireRuntimeMessage, WireSummaryMessage},
-};
+use super::errors::{InboundDeliveryError, InboundFailureAction, SummaryError, inbound, summary};
 use crate::{
     api::{ApiError, ApiExternalSnafu, Summary, SummaryRequest},
+    codecs::messages::{
+        RuntimeMessage,
+        SummaryRequestMessage,
+        WireRuntimeMessage,
+        WireSummaryMessage,
+    },
     delivery::{
         contracts::{
             ReliableDeliveryPort,
@@ -314,11 +317,12 @@ impl SummaryRequestManagerComponent {
                 let sender = deliver.envelope.header.sender.clone();
                 self.handle_summary(context, sender, deliver.processed, message)
             }
-            WireRuntimeMessage::BootstrapGroup(_)
-            | WireRuntimeMessage::Update(_)
+            WireRuntimeMessage::Update(_)
             | WireRuntimeMessage::SummaryRequest(_)
             | WireRuntimeMessage::NeedRange(_)
-            | WireRuntimeMessage::UpdateBatch(_) => Handled::OK,
+            | WireRuntimeMessage::UpdateBatch(_)
+            | WireRuntimeMessage::GroupInvitation(_)
+            | WireRuntimeMessage::MigrationProposal(_) => Handled::OK,
         }
     }
 

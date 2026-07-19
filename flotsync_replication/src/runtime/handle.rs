@@ -17,8 +17,8 @@ use crate::{
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
-        GroupMigration,
         LoadError,
+        MigrationId,
         PublishChangesRequest,
         PublishReceipt,
         ReplicationApi,
@@ -27,8 +27,8 @@ use crate::{
         ReplicationSecuritySecrets,
         ReplicationStore,
         RuntimeSnafu,
-        SnapshotRows,
         SnapshotRowsRequest,
+        SnapshotValueRows,
         Summary,
         SummaryRequest,
         security::{
@@ -55,10 +55,9 @@ use std::sync::{Arc, RwLock};
 #[cfg(any(test, feature = "test-support"))]
 use super::errors::GroupInstallError;
 #[cfg(test)]
-use super::{
-    errors::InboundDeliveryError,
-    messages::{UpdateBatchMessage, UpdateMessage},
-};
+use super::errors::InboundDeliveryError;
+#[cfg(test)]
+use crate::codecs::messages::{UpdateBatchMessage, UpdateMessage};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
@@ -213,6 +212,7 @@ async fn load_replication_runtime_typed_with_security(
         &local_member,
         store,
         listener,
+        config.clone(),
         security,
         runtime_config_toml,
     )
@@ -356,7 +356,7 @@ impl ReplicationApi for ReplicationRuntime {
         })
     }
 
-    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotRows> {
+    fn snapshot_rows(&self, request: SnapshotRowsRequest) -> ApiFuture<'_, SnapshotValueRows> {
         self.ask(move |promise| ReplicationRuntimeMessage::SnapshotRows(Ask::new(promise, request)))
     }
 
@@ -373,7 +373,7 @@ impl ReplicationApi for ReplicationRuntime {
     fn change_group_membership(
         &self,
         req: ChangeGroupMembershipRequest,
-    ) -> ApiFuture<'_, GroupMigration> {
+    ) -> ApiFuture<'_, MigrationId> {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::ChangeGroupMembership(Ask::new(promise, req))
         })

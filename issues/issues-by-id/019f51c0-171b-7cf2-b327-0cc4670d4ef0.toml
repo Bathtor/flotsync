@@ -1,0 +1,191 @@
+id = "019f51c0-171b-7cf2-b327-0cc4670d4ef0"
+ref = "flotsync-git-pow.4"
+title = "Implement migration proposal runtime with inline snapshots"
+body = """
+Implement the runtime flow for migration proposals and migration-derived group invitations using Empty or Inline initial snapshots.
+
+Agreed scope:
+P01. Add runtime and wire delivery support for MigrationProposal and migration-sourced GroupInvitation at the existing dispatch boundaries.
+P02. Implement change_group_membership for the inline-snapshot slice: compute the new member set, prepare new-group security material, snapshot old-group rows, activate the new local group, and build outbound proposal/invitation payloads.
+P03. Send MigrationProposal to continuing old-group members in the old-group authority context, and send GroupInvitation with Migration source to newly added members in the new-group context.
+P04. Make GroupInvitation and MigrationProposal self-contained setup messages. Each wire payload carries the private target-group security/bootstrap material needed by its recipient; the standalone BootstrapGroup runtime message is removed.
+P05. Keep raw group keys and exact setup details out of listener-visible public invitation/proposal values. Inbound handling verifies setup material, seals the group key for local storage, and persists prepared group material atomically with pending work.
+P06. Apply the configured invitation/proposal policy and reject Metadata-only snapshots until non-inline snapshot fetching exists.
+P07. Activate InitialSnapshot::Empty by creating the new active group without row embedding.
+P08. Activate InitialSnapshot::Inline by embedding projected rows into deterministic initial CRDT state in the new group namespace.
+P09. Emit listener DataChanged upserts for rows created by activation. Empty activation emits no row-change event.
+P10. Do not emit synthetic old-group deletes in this slice. Old-group lifecycle and access semantics remain deferred.
+P11. Resume accepted Empty/Inline activations on startup without asking the listener again.
+P12. Listener read tokens emitted by activation contain progress for every active group represented in application state.
+
+Storage design:
+P13. Normalise member bindings, schemas, local member index, and encrypted group security material into one group-material table family.
+P14. Represent external activation with a small active-group marker containing the version vector. Material without the marker is hidden; datasets and updates remain foreign-keyed to the active marker.
+P15. Persist verified inactive material and pending invitation/proposal work atomically. Acceptance inserts the active marker while embedding rows and removes pending work in the same transaction. Rejection removes pending work and inactive material.
+P16. Replace pending_group_decisions and pending_group_activations with one pending_group_work table keyed by new_group_id and an explicit decision/activation state.
+P17. Accept exact idempotent replay and matching decision-to-activation transitions; reject conflicting work for an occupied target group.
+P18. Provide keyed Option loads for listener decisions and group-targeted activations; retain all-record loads only for startup replay.
+P19. Use named stored pending-payload row types rather than tuple plumbing.
+P20. Put a high-level design comment near the SQLite schema/helpers describing group material, active markers, and pending work before the individual SQL statements.
+
+Runtime and allocation review fixes:
+P21. Derive proposed membership with HashSet operations. The local member is index zero; remaining order is arbitrary but fixed for the new group.
+P22. Store continuing and added proposed-member indices in RoaringBitmap values. Iterate set indices and point-lookup recipients in the canonical bootstrap member slice.
+P23. Encode one proposal and one invitation payload before local activation, consume the original prepared snapshot for embedding, and clone only shared Bytes per recipient after commit.
+P24. Apply the same encode-once fan-out principle to creation invitations.
+P25. Use RowValues::from_row for snapshot projection and InMemoryStateData::from_initial_value_rows for embedding in the dedicated runtime pending_group module.
+P26. Scan inline snapshots once per dataset with usize::MAX until the Metadata threshold path exists.
+P27. Stream store patches per dataset inside the activation transaction; retain one post-commit listener event for consistency in this slice.
+P28. Add TODO(flotsync-git-vy1) at the embedding boundary that temporarily holds multiple full-row representations.
+P29. Use shared membership-validation, snapshot-capture, and activation cause errors wrapped by operation-specific outer errors.
+P30. Preserve compact version-vector encoding shapes and retain TODO(flotsync-git-i20) at blocked borrowed-view decode boundaries.
+P31. Keep the previously agreed role-based runtime constructor inputs and API-owned pending-record/policy semantics.
+
+Tests and explicit deferrals:
+P32. Add focused tests for self-contained proposal/invitation codecs, removal of standalone bootstrap dispatch, recipient classification, encode-once fan-out, policy handling, restart, Empty/Inline activation, listener rows, complete read tokens, pending target uniqueness, state transitions, and inactive-material isolation.
+P33. GroupClose protocol and old-group lifecycle/access semantics are deferred to flotsync-git-lg9.
+P34. Application-facing de-duplication across group changes is deferred to flotsync-git-pvp.
+P35. Memory-bounded post-commit activation listener batching and change-set rederivation are deferred to flotsync-git-os1.
+P36. Chunked or fetched snapshot transfer remains out of scope.
+P37. Broader snapshot/storage batching redesign remains in flotsync-git-vy1.
+
+Implementation estimate:
+P38. Protocol/runtime ownership, sparse dispatch, read tokens, and errors: roughly 350-650 LOC of churn.
+P39. SQLite normalisation, store API changes, and storage tests: roughly 550-900 LOC of churn.
+P40. Integration and codec tests: roughly 150-300 LOC of churn.
+P41. Total likely 1050-1850 LOC. Implement in internal runtime and storage phases, but deliver as one coherent review pass.
+
+Post-full-review correctness fixes:
+P42. Keep compact MigrationProposal final-version encoding unchanged. Add a precise TODO(flotsync-git-i20) at the inbound empty-context decode boundary documenting that Synced and Override forms currently fail, and require coverage for both forms in that follow-up.
+P43. Make self-contained group-setup replay semantically idempotent. Check cheap group id, member binding, local index, and schema invariants before decrypting; compare the existing plaintext group key with the received setup key; reuse existing encrypted material on a match and seal only for first insertion.
+P44. Resolve pending-group policy before the first pending-work commit. AutoReject stores no pending work, AskListener atomically stores inactive material plus decision state, and AutoAccept atomically stores inactive material plus activation state before activation side effects.
+P45. Classify proposed recipients directly into RoaringBitmap indices while consuming the final HashSet, without temporary continuing/added identity sets.
+P46. Add regression coverage for semantic setup replay, crash-consistent policy state, and continuing-versus-added remote fan-out. Compact Synced/Override proposal delivery tests remain explicitly deferred to flotsync-git-i20.
+
+Additional review refinements:
+P47. Rename fallible invitation/proposal wire constructors to try_new.
+P48. Retain only added_member_indices and derive continuing recipients as its complement over remote proposed-member indices.
+P49. Move reusable group-definition comparison semantics onto the API record types and remove component-local field comparisons.
+P50. Rename local values holding work awaiting listener mediation to pending_work/work without broad public record-type churn.
+P51. Explicitly validate that the old hosted group already contains the local member before applying membership request sets; index zero remains outside the explicitly remote dispatch domain.
+P52. Document the two-phase inbound setup boundary: security validation may perform independent store work, component handling is serial, and the later write transaction revalidates exact material and target-keyed pending work.
+P53. Use SmallVec<[ListenerDataChanges; 1]> for listener event-batch collections.
+P54. Rename and document SQLite pending-work states as awaiting a decision versus accepted activation, retaining stable SQL strings, and parse them through TryFrom<String>.
+P55. Move roaring to workspace dependencies for replication and UDPour, and consume the existing workspace smallvec dependency from replication.
+P56. Update focused tests and rerun formatting, pedantic Clippy, the Rust instruction audit, and the complete serial replication suite.
+
+Additional review estimate:
+P57. Constructor and terminology updates: roughly 15-30 LOC of churn.
+P58. Recipient representation and invariant checks: roughly 45-90 LOC of churn.
+P59. API comparison consolidation, listener SmallVec, SQLite state parsing, manifests, and tests: roughly 80-150 LOC of churn.
+P60. Total likely 140-270 LOC, remaining well below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+assignee = "codex"
+blocked_by = [
+    "019f51bf-be64-7ad2-8489-de9cc110f8cb",
+    "019f51bf-e9f0-7eb3-96ff-fc754675ca7d",
+    "019f61e0-b7ba-70c1-995c-c02a0f45ba39",
+]
+blocks = [
+    "019f51c0-4c99-72f3-ab68-fc5fa752a914",
+    "019f5b28-a26f-7b11-a979-595b4ccdb149",
+    "019f5b3a-ee57-7413-b39b-55e107995695",
+]
+parent = "019f51bf-65a3-7b33-9d64-0e2f7390e4e2"
+created_at = "2026-07-11T15:16:11.163089Z"
+updated_at = "2026-07-19T09:29:59.564963Z"
+closed_at = "2026-07-19T09:29:59.564963Z"
+
+[[comments]]
+id = "019f5b3b-6b4b-72a3-a1fd-5b32945974e2"
+author = "codex"
+body = "Plan update after review feedback: inline activation will emit DataChanged upserts for new-group rows, will not emit synthetic old-group remove/delete events, and accepts the temporary application-level duplicate-row behaviour. GroupClose/access lifecycle semantics are tracked in flotsync-git-lg9. Long-term application-facing record de-duplication is tracked as P1 follow-up flotsync-git-pvp."
+created_at = "2026-07-13T11:27:28.587262Z"
+
+[[comments]]
+id = "019f5cb9-069e-7323-bade-15e9d99bb54b"
+author = "lkroll"
+body = "Implementation ready for review. Runtime envelopes now decode/dispatch GroupInvitation and MigrationProposal; change_group_membership prepares bootstrap material, inline snapshots, local activation, and outbound proposal/invitation messages; accepted inbound decisions are persisted as pending activation and materialise only after the real bootstrap group is installed. Inline activation emits DataChanged upserts for new-group rows and leaves old-group rows untouched. Validation: cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_replication --lib -- --test-threads=1."
+created_at = "2026-07-13T18:24:17.566939Z"
+
+[[comments]]
+id = "019f5ccd-3ac5-70c3-bdbc-5db00656015a"
+author = "codex"
+body = "Review-fix pass started. Agreed fixes: keep inbound bootstrap material from making a group externally active until the invitation/proposal policy accepts activation; reject unsupported Metadata snapshots before accepted activation work is persisted; scope migration invitations for newly added members to the new group while keeping migration proposals for existing members old-group scoped; add focused tests for these paths."
+created_at = "2026-07-13T18:46:21.637492Z"
+
+[[comments]]
+id = "019f5cf3-8d6c-7350-89c4-ed02ec6be3d5"
+author = "codex"
+body = "Review fixes implemented. Bootstrap material is now hidden until accepted pending group work activates it; metadata snapshots are rejected before activation persistence; migration invitations use the new-group reliable scope while migration proposals remain old-group scoped; creation/bootstrap integration tests now accept the pending invitation explicitly. Validation: cargo fmt; cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_replication --lib -- --test-threads=1."
+created_at = "2026-07-13T19:28:13.164572Z"
+
+[[comments]]
+id = "019f61df-fe94-7c91-844e-4a94ef1b1005"
+author = "codex"
+body = "Paused current implementation for application interface redesign. Uncommitted work was stashed as stash@{0} at creation time, message: 'flotsync-git-pow.4 WIP before application interface redesign'. Stable stash commit: d905404fdffcac822c35ee55f45e1e18f9866711. Use the commit hash rather than the reflog position if later stashes are added."
+created_at = "2026-07-14T18:24:57.492318Z"
+
+[[comments]]
+id = "019f7055-4091-7373-8ac5-5b6250ead60e"
+author = "lkroll"
+body = "Resumed after completing flotsync-git-d3w. Popped and resolved stash d905404fdffcac822c35ee55f45e1e18f9866711, then dropped the stash entry. Conflict resolution adapted the migration inline snapshot and activation paths to the new application-facing RowValues/SnapshotValueRow API while preserving the pow.4 runtime behaviour. Validation passed: cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_replication --lib -- --test-threads=1."
+created_at = "2026-07-17T13:47:43.121622Z"
+
+[[comments]]
+id = "019f7475-77d5-76f0-9a7e-bda7c10262df"
+author = "lkroll"
+body = "Review-fix plan aligned after partial review. Key changes: move pending-group and policy semantics onto owning API types; remove duplicate reliable scope helper; preserve compact version-vector encodings; replace bespoke inline snapshot value decoding with projection and embedding helpers; structure runtime constructor inputs by role; factor group-record comparison and SQLite duplication where readable. Memory-bounded post-commit activation listener batching is tracked separately as flotsync-git-os1."
+created_at = "2026-07-18T09:01:23.285656Z"
+
+[[comments]]
+id = "019f7495-a0cc-7112-8cc6-be07c0f7423e"
+author = "lkroll"
+body = "Review-feedback implementation complete and issue marked in review. Addressed API-owned pending-group helpers, PolicyDecision restrictiveness, reliable-scope removal, compact MigrationProposal version-vector encoding, pending snapshot projection/embedding via existing helpers, constructor input grouping, SQLite factoring, and group-scoped pending activation lookup. Remaining borrowed pending-payload view decode work is locally TODO-linked to flotsync-git-i20; memory-bounded activation listener batching is tracked in flotsync-git-os1. Validation: cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_replication --tests -- --test-threads=1."
+created_at = "2026-07-18T09:36:30.924955Z"
+
+[[comments]]
+id = "019f7559-85fd-7171-84e3-000ef585f875"
+author = "codex"
+body = "Full-review plan aligned. The standalone BootstrapGroup runtime flow will be replaced by self-contained GroupInvitation/MigrationProposal setup payloads; verified inactive material will use normalised group-material tables plus an active marker; pending decisions/activations will share one target-group-keyed table; recipient classes use roaring bitmaps; outbound payloads encode once and fan out through shared Bytes; activation tokens cover every active group."
+created_at = "2026-07-18T13:10:29.117973Z"
+
+[[comments]]
+id = "019f7598-f800-7fe2-b8f0-7034108c7b8f"
+author = "codex"
+body = "Full-review implementation is ready for review. Invitation/proposal messages now carry self-contained private group setup and the standalone BootstrapGroup path is removed. SQLite uses shared group material plus an active marker and one target-group-keyed pending-work table. Recipient sets use roaring bitmaps; proposal/invitation payloads encode once into shared Bytes; activation tokens cover every active group; shared activation causes remove duplicated errors. TODOs link the blocked borrowed decode and snapshot-memory follow-ups to flotsync-git-i20 and flotsync-git-vy1. Rust instruction audit passed. Validation: cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_replication --tests -- -W clippy::pedantic; full serial test suite 186 passed, 0 failed."
+created_at = "2026-07-18T14:19:47.072653Z"
+
+[[comments]]
+id = "019f75d3-8e0b-70b1-945d-7550d4a055d5"
+author = "codex"
+body = "Post-full-review fixes are ready. Compact Synced/Override migration proposal decoding remains explicitly deferred to flotsync-git-i20 with TODOs at the empty-context decoder and integration workaround. Setup replay now reuses semantically matching encrypted material after cheap structural checks and plaintext-key comparison. Pending-group policy is resolved before persistence, with atomic decision or activation state; restart coverage proves AutoAccept does not replay as a listener decision. Recipient classification is one-pass into RoaringBitmap indices, and a three-runtime test covers continuing-member proposals plus added-member invitations. Validation passed: cargo fmt --all -- --check; pedantic Clippy with test-support; git diff HEAD --check; complete serial suite, 189 unit and 6 integration tests."
+created_at = "2026-07-18T15:23:46.571066Z"
+
+[[comments]]
+id = "019f7996-e795-7250-b9ba-60be257801dc"
+author = "codex"
+body = "Additional review plan agreed: fallible wire constructors become try_new; only added-member indices remain materialised; group-definition comparisons move to API record types; local pending-work terminology is clarified; old-group local membership is checked explicitly; the split security/persistence boundary is documented; listener event batches use inline SmallVec storage; SQLite pending states gain semantic names, variant docs, and TryFrom parsing; roaring and smallvec use workspace dependency declarations."
+created_at = "2026-07-19T08:56:00.66142Z"
+
+[[comments]]
+id = "019f79a4-76fb-71f1-9037-52ea6984a9a9"
+author = "codex"
+body = "Additional review refinements implemented. Fallible setup constructors use try_new; recipient dispatch stores only added-member indices and derives continuing remotes by complement after an explicit old-group local-membership check; group-definition comparisons live on API records; listener batches use inline SmallVec storage; SQLite work states are semantically named, documented, and parsed through TryFrom; roaring is workspace-managed. The two-phase inbound setup boundary now documents serialisation and write-time conflict checks. Validation passed: formatting check, pedantic Clippy with test-support, Rust instruction audit, git diff check, 191 unit tests, and 6 secure runtime integration tests."
+created_at = "2026-07-19T09:10:49.339761Z"
+
+[[comments]]
+id = "019f79af-c41e-7f31-8afe-e90c602f0f57"
+author = "codex"
+body = "Final review naming fix: PreparedMembershipDispatch now calls the old-group proposal bytes migration_payload throughout, removing the ambiguous proposal_payload name. Formatting and cargo check with tests/test-support pass."
+created_at = "2026-07-19T09:23:09.982935Z"
+
+[[comments]]
+id = "019f79b6-040c-7b61-8230-db7be07db799"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-19T09:29:59.564963Z"

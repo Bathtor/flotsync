@@ -1,0 +1,13 @@
+id = "019f5761-cef3-7582-a48f-dc777ea8da33"
+ref = "flotsync-git-i20"
+title = "Rethink version-vector protobuf transfer shapes"
+body = "Decide how Flotsync should represent version vectors across wire, storage, and in-memory partially decoded forms. In particular, evaluate whether we need separate self-describing and context-compact protobuf variants, and define how contextual decoders recover compact vectors when group membership knowledge can be assumed."
+status = "open"
+type = "task"
+priority = 0
+created_at = "2026-07-12T17:30:55.603866Z"
+updated_at = "2026-07-12T17:59:02.188105Z"
+
+[[links]]
+target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
+label = "discovered from"

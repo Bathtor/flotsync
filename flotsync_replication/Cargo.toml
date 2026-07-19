@@ -27,7 +27,8 @@ interval = { package = "intervallum", version = "1" }
 itertools = { workspace = true }
 kompact = { workspace = true }
 log = { workspace = true }
-smallvec = "1"
+roaring = { workspace = true }
+smallvec = { workspace = true }
 snafu = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

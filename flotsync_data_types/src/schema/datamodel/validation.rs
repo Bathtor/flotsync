@@ -17,7 +17,7 @@ use super::{
     PrimitiveValueArray,
     PrimitiveValueRef,
     ReplicatedDataType,
-    SnapshotStateValueRef,
+    StateSnapshotFieldValueRef,
     ensure,
 };
 use crate::schema::values::NullablePrimitiveValueArray;
@@ -163,20 +163,20 @@ pub fn ensure_finite_state_value(
 /// See `DataModelValueError` for failure conditions.
 pub fn ensure_snapshot_state_value_type(
     data_type: &ReplicatedDataType,
-    value: SnapshotStateValueRef<'_>,
+    value: StateSnapshotFieldValueRef<'_>,
 ) -> Result<(), DataModelValueError> {
     match (data_type, value) {
         (
             ReplicatedDataType::MonotonicCounter { small_range },
-            SnapshotStateValueRef::MonotonicCounter(value),
+            StateSnapshotFieldValueRef::MonotonicCounter(value),
         ) => ensure_counter_type(*small_range, value),
         (
             ReplicatedDataType::TotalOrderRegister { value_type, .. },
-            SnapshotStateValueRef::TotalOrderRegister(value),
+            StateSnapshotFieldValueRef::TotalOrderRegister(value),
         ) => ensure_primitive_type(*value_type, value.value_type()),
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
-            SnapshotStateValueRef::TotalOrderFiniteStateRegister(value),
+            StateSnapshotFieldValueRef::TotalOrderFiniteStateRegister(value),
         ) => ensure_finite_state_value(*value_type, states, &value),
         _ => InvalidSnapshotValueForTypeSnafu.fail(),
     }

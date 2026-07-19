@@ -1,0 +1,35 @@
+id = "019f64c4-b767-78d3-9171-6ce82db0f45b"
+ref = "flotsync-git-a17"
+title = "Design explicit group leave semantics"
+body = """
+Design how a member explicitly leaves a replication group without breaking bootstrap and migration invariants that rely on the group creator occupying `node_index=0` in new groups.
+
+Context:
+L01. The value-row redesign reserves `UpdateId { version: 0, node_index: 0 }` as the deterministic initial-state origin.
+L02. For consistency, newly created groups should require the group creator to occupy member index 0.
+L03. A member leaving its own group creates a membership edge case because the leaving member may need to be removed while creator/index invariants still matter for future group instances or migrations.
+
+Design questions:
+Q01. What does an explicit "leave group" operation mean for the leaving member, remaining members, stored local state, delivery routes, and future migrations?
+Q02. Is leave represented as a new group migration excluding the leaving member, a local-only stop-hosting action, a tombstoned membership state, or a separate protocol message?
+Q03. How does the rule that the creator is at `node_index=0` apply to replacement groups created as part of leave semantics?
+Q04. How do we preserve stable causal interpretation of old updates while allowing the member list of the replacement group to exclude the leaving member?
+
+Acceptance criteria:
+A01. Document the protocol semantics and invariants.
+A02. Identify required API/store/runtime changes.
+A03. Include migration and self-leave edge cases.
+A04. Define tests needed for single-member, creator-leaves, non-creator-leaves, and stale update delivery cases."""
+status = "open"
+type = "task"
+priority = 2
+labels = [
+    "area:membership",
+    "area:protocol",
+]
+created_at = "2026-07-15T07:54:01.447181Z"
+updated_at = "2026-07-15T07:54:08.383948Z"
+
+[[links]]
+target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
+label = "discovered from"

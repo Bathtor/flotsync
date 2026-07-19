@@ -1,0 +1,24 @@
+id = "019f7474-9d0a-7d21-ad30-d57c359543ed"
+ref = "flotsync-git-os1"
+title = "Redesign activation change delivery for memory-bounded listener batches"
+body = """
+Redesign activation change delivery so large InitialSnapshot::Inline activations do not require holding every listener row change in memory.
+
+Context:
+P01. flotsync-git-pow.4 keeps one listener DataChanged event per activation to avoid pre-commit visibility and partial listener failure semantics.
+P02. Large inline or fetched snapshots may require a post-commit path that rederives the change-set and emits batches, each with suitable ReadTokens.
+
+Expected outcome:
+P03. Define consistency semantics for activation listener batches after commit.
+P04. Bound memory for store patching and listener emission.
+P05. Decide whether and where to rederive activation row changes from store after commit."""
+status = "open"
+type = "task"
+priority = 2
+labels = ["area:replication"]
+created_at = "2026-07-18T09:00:27.274771Z"
+updated_at = "2026-07-18T09:00:34.219746Z"
+
+[[links]]
+target = "019f51c0-171b-7cf2-b327-0cc4670d4ef0"
+label = "discovered from"

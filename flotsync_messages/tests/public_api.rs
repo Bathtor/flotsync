@@ -1,6 +1,5 @@
 use flotsync_core::versions::UpdateId;
 use flotsync_data_types::{
-    FieldOperations,
     IdWithIndex,
     NULL,
     OperationOutcome,
@@ -15,9 +14,9 @@ use flotsync_data_types::{
         PrimitiveType,
         Schema,
         datamodel::{
-            InMemoryFieldValue,
-            LinearLatestValueWinsValue,
-            LinearListValue,
+            InMemoryFieldState,
+            LinearLatestValueWinsState,
+            LinearListState,
             SchemaSource,
         },
         values::{NullablePrimitiveValue, PrimitiveValue},
@@ -31,7 +30,7 @@ use flotsync_data_types::{
     update_values,
 };
 use flotsync_messages::{
-    InMemoryData,
+    InMemoryStateData,
     Uuid,
     buffa::Message,
     codecs::{
@@ -110,25 +109,25 @@ fn public_snapshot_transport_roundtrips_dataset() {
     let priority = PrimitiveValue::UInt(7);
     let status = NullablePrimitiveValue::Null;
 
-    let mut data = InMemoryData::with_static_schema(schema);
+    let mut data = InMemoryStateData::with_static_schema(schema);
     data.push_row_from_named_fields([
         (
             "latest",
-            InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(latest)),
+            InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(latest)),
         ),
-        ("title", InMemoryFieldValue::LinearString(title)),
+        ("title", InMemoryFieldState::LinearString(title)),
         (
             "numbers",
-            InMemoryFieldValue::LinearList(LinearListValue::Int(numbers)),
+            InMemoryFieldState::LinearList(LinearListState::Int(numbers)),
         ),
-        ("counter", InMemoryFieldValue::MonotonicCounter(counter)),
+        ("counter", InMemoryFieldState::MonotonicCounter(counter)),
         (
             "priority",
-            InMemoryFieldValue::TotalOrderRegister(priority.clone()),
+            InMemoryFieldState::TotalOrderRegister(priority.clone()),
         ),
         (
             "status",
-            InMemoryFieldValue::TotalOrderFiniteStateRegister(status.clone()),
+            InMemoryFieldState::TotalOrderFiniteStateRegister(status.clone()),
         ),
     ])
     .unwrap();
@@ -140,7 +139,7 @@ fn public_snapshot_transport_roundtrips_dataset() {
     let snapshot = proto::DataSnapshot::decode_from_slice(&bytes).unwrap();
 
     let mut decoder = ProtoDataSnapshotDecoder::new(snapshot);
-    let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
+    let roundtrip = InMemoryStateData::decode_data_snapshots(schema, &mut decoder).unwrap();
 
     assert_eq!(roundtrip, data);
 }
@@ -202,7 +201,7 @@ fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
     ]));
     let row_id = row_id(7777);
 
-    let mut source = InMemoryData::new(old_schema.clone());
+    let mut source = InMemoryStateData::new(old_schema.clone());
     let insert = source
         .insert_row(
             update_id(700, 1),
@@ -217,7 +216,7 @@ fn public_operation_transport_decodes_legacy_insert_and_applies_defaults() {
     let encoded = proto::SchemaOperation::decode_from_slice(&bytes).unwrap();
     let decoded = decode_schema_operation(encoded, &new_schema).unwrap();
 
-    let target = InMemoryData::new(new_schema.clone())
+    let target = InMemoryStateData::new(new_schema.clone())
         .apply_schema_operation(decoded)
         .unwrap();
     let row = target
@@ -263,7 +262,7 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
     let schema = &*PUBLIC_TEST_SCHEMA;
     let row_id = row_id(4242);
 
-    let mut source = InMemoryData::with_static_schema(schema);
+    let mut source = InMemoryStateData::with_static_schema(schema);
     let decoded_insert = {
         let insert = source
             .insert_row(
@@ -310,7 +309,7 @@ fn public_operation_transport_decodes_and_applies_to_in_memory_data() {
         decode_schema_operation(encoded, schema).unwrap()
     };
 
-    let target = InMemoryData::with_static_schema(schema)
+    let target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(decoded_insert)
         .unwrap()
         .apply_schema_operation(decoded_delete)

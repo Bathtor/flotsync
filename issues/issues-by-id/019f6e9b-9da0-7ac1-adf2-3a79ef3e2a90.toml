@@ -1,0 +1,36 @@
+id = "019f6e9b-9da0-7ac1-adf2-3a79ef3e2a90"
+ref = "flotsync-git-kui"
+title = "Build flotsync fuzz tests on deterministic network simulator"
+body = """
+Build a fuzz test suite for Flotsync on top of the deterministic flotsync_io network simulator.
+
+Context:
+C01. This depends on the simulator task because fuzz cases need controlled simulation time, deterministic network behaviour, and fully single-threaded execution.
+C02. The goal is to find replication, membership, delivery, and IO interaction bugs with reproducible failing seeds and compact enough scenarios for debugging.
+C03. The first fuzzing slice should use the simulator rather than real sockets or wall-clock timers.
+
+Scope:
+S01. Define fuzz input models for network topology, latency settings, partitions, node actions, message delivery progress, and simulation-time advancement.
+S02. Exercise core Flotsync behaviours such as group creation, update propagation, temporary partitions, partition healing, retries, and eventual convergence.
+S03. Record failing seeds, simulator configuration, and enough event trace information to reproduce failures as ordinary tests.
+S04. Keep all fuzz execution fully single threaded to preserve deterministic replay.
+S05. Add shrink-friendly scenario representation where practical, avoiding opaque blobs for high-level operations.
+S06. Start with a small suite of bounded fuzz targets before expanding to larger mixed membership and migration scenarios.
+
+Acceptance criteria:
+A01. At least one fuzz target runs against the simulator with a deterministic seed and no real network sockets.
+A02. Failing cases can be replayed by seed and scenario data in a normal test harness.
+A03. The suite checks at least one convergence or safety property across partition and healing scenarios.
+A04. The harness documents runtime bounds, seed handling, and how to promote discovered failures into regression tests.
+A05. Any larger fuzzing expansions, such as migration-heavy scenarios or deterministic entropy across all crates, are captured as follow-up work rather than hidden TODOs."""
+status = "open"
+type = "task"
+priority = 4
+labels = [
+    "area:fuzzing",
+    "area:replication",
+    "area:test-infra",
+]
+blocked_by = ["019f6e9b-6f3c-75b1-98c9-df0758e68876"]
+created_at = "2026-07-17T05:45:20.032751Z"
+updated_at = "2026-07-17T05:50:39.375427Z"

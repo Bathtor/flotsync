@@ -34,11 +34,11 @@ pub enum OperationCodecError {
     SnapshotAdapter { source: SnapshotAdapterError },
     #[snafu(display("Schema operation snapshot encoding failed."))]
     SnapshotEncode {
-        source: model::RowSnapshotEncodeError<SnapshotAdapterError>,
+        source: model::RowStateSnapshotEncodeError<SnapshotAdapterError>,
     },
     #[snafu(display("Schema operation snapshot decoding failed."))]
     SnapshotDecode {
-        source: model::RowSnapshotDecodeError<SnapshotAdapterError>,
+        source: model::RowStateSnapshotDecodeError<SnapshotAdapterError>,
     },
     #[snafu(display("Schema operation payload does not satisfy datamodel invariants."))]
     InvalidOperationValue { source: model::DataModelValueError },
@@ -167,7 +167,7 @@ pub fn decode_schema_operation(
 ///
 /// See `OperationCodecError` for failure conditions.
 pub fn encode_row_snapshot(
-    snapshot: &model::RowSnapshot<'_, UpdateId>,
+    snapshot: &model::RowStateSnapshot<'_, UpdateId>,
     schema: &Schema,
 ) -> OperationResult<proto::RowSnapshot> {
     let mut encoder = ProtoSchemaSnapshotEncoder::new(schema);
@@ -185,7 +185,7 @@ pub fn encode_row_snapshot(
 pub fn decode_row_snapshot(
     snapshot: proto::RowSnapshot,
     schema: &Schema,
-) -> OperationResult<model::RowSnapshot<'static, UpdateId>> {
+) -> OperationResult<model::RowStateSnapshot<'static, UpdateId>> {
     let mut seen_fields = HashSet::<String>::new();
     let mut decoded_fields = Vec::with_capacity(snapshot.fields.len());
     for field in snapshot.fields {
@@ -204,20 +204,21 @@ pub fn decode_row_snapshot(
         decoded_fields.push((schema_field.name.clone(), field_value));
     }
 
-    Ok(model::RowSnapshot::from_owned_fields(decoded_fields))
+    Ok(model::RowStateSnapshot::from_owned_fields(decoded_fields))
 }
 
 fn decode_single_row_snapshot_field(
     field: proto::SnapshotField,
     schema_field: &flotsync_data_types::schema::Field,
-) -> OperationResult<model::InMemoryFieldValue<UpdateId>> {
+) -> OperationResult<model::InMemoryFieldState<UpdateId>> {
     let single_field_schema = Schema::from_fields([schema_field.clone()]);
     let mut snapshot = proto::RowSnapshot::default();
     snapshot.fields.push(field);
 
     let mut decoder = ProtoSchemaSnapshotDecoder::new(snapshot).context(SnapshotAdapterSnafu)?;
-    let decoded_snapshot = model::RowSnapshot::decode_snapshot(&single_field_schema, &mut decoder)
-        .context(SnapshotDecodeSnafu)?;
+    let decoded_snapshot =
+        model::RowStateSnapshot::decode_snapshot(&single_field_schema, &mut decoder)
+            .context(SnapshotDecodeSnafu)?;
     let mut fields = decoded_snapshot.into_owned_fields();
     let (_, field_value) = fields
         .pop()
@@ -718,7 +719,7 @@ mod tests {
             Field,
             PrimitiveType,
             Schema,
-            datamodel::{InMemoryFieldValue, NullableBasicValue, RowSnapshot},
+            datamodel::{InMemoryFieldState, NullableBasicValue, RowStateSnapshot},
             values::{NullablePrimitiveValue, PrimitiveValue, PrimitiveValueArray},
         },
         test_support::schema_operations::{
@@ -986,9 +987,9 @@ mod tests {
             },
             operation: model::RowOperation::Insert {
                 row_id: row_id(40),
-                snapshot: RowSnapshot::from_owned_fields(vec![(
+                snapshot: RowStateSnapshot::from_owned_fields(vec![(
                     "priority".to_owned(),
-                    InMemoryFieldValue::<UpdateId>::TotalOrderRegister(PrimitiveValue::UInt(7)),
+                    InMemoryFieldState::<UpdateId>::TotalOrderRegister(PrimitiveValue::UInt(7)),
                 )]),
             },
         };

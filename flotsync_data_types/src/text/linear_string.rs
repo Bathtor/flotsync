@@ -178,7 +178,7 @@ where
 }
 impl<Id> fmt::Display for LinearString<Id>
 where
-    Id: Clone + fmt::Debug + fmt::Display + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+    Id: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.data.iter_values().try_for_each(|s| f.write_str(s))

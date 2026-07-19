@@ -1,0 +1,14 @@
+id = "019f5789-2d54-70e2-a97c-f1f3a1521121"
+ref = "flotsync-git-x1t"
+title = "Rethink group schema access before schema migration"
+body = "Review how replication runtime and store access fixed group schemas before any further schema-migration work. Current slice makes lookup group-scoped, but still duplicates schema payloads across bootstrap, invitations, migration proposals, store rows, and runtime validation. Decide whether to introduce a shared group-schema view/accessor, schema interning, or another storage/query shape before implementing schema migration."
+status = "open"
+type = "task"
+priority = 1
+labels = ["area:replication"]
+created_at = "2026-07-12T18:13:55.668921Z"
+updated_at = "2026-07-12T18:13:59.276908Z"
+
+[[links]]
+target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
+label = "discovered from"

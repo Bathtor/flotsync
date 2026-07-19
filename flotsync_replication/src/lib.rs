@@ -7,6 +7,7 @@
 pub const MAX_VERSION_VALUE: u64 = u64::MAX - 1;
 
 pub mod api;
+pub(crate) mod codecs;
 pub mod delivery;
 pub mod runtime;
 pub mod security_provisioning;

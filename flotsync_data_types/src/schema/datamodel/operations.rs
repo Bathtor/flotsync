@@ -1,5 +1,5 @@
 use super::{
-    in_memory::{InMemoryFieldValue, InMemoryRow, validate_in_memory_field_value},
+    in_memory::{InMemoryFieldState, InMemoryStateRow, validate_in_memory_field_value},
     snapshots::{
         SchemaSnapshotDecoder,
         SchemaSnapshotEncoder,
@@ -15,7 +15,13 @@ use super::{
     },
     *,
 };
-use crate::{DataOperation, IdWithIndex, any_data::UpdateOperation};
+use crate::{
+    DataOperation,
+    IdWithIndex,
+    ProjectedFieldValue,
+    RowValueRead,
+    any_data::UpdateOperation,
+};
 use std::{borrow::Cow, collections::HashSet, fmt, hash::Hash};
 
 /// Explicit operation payload shapes for all schema data types.
@@ -87,7 +93,7 @@ pub enum RowOperation<'a, RowId, ChangeId> {
     /// Insert a new row identified with `row_id` using the given `snapshot` as initial state.
     Insert {
         row_id: RowId,
-        snapshot: RowSnapshot<'a, ChangeId>,
+        snapshot: RowStateSnapshot<'a, ChangeId>,
     },
     /// Update the `fields` in the existing row identified by `row_id`.
     Update {
@@ -121,71 +127,71 @@ impl<RowId, ChangeId> RowOperation<'_, RowId, ChangeId> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RowSnapshot<'a, ChangeId> {
-    repr: RowSnapshotRepr<'a, ChangeId>,
+pub struct RowStateSnapshot<'a, ChangeId> {
+    repr: RowStateSnapshotRepr<'a, ChangeId>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum RowSnapshotRepr<'a, ChangeId> {
+enum RowStateSnapshotRepr<'a, ChangeId> {
     BorrowedInMemory {
         field_names: &'a [String],
-        row: &'a InMemoryRow<ChangeId>,
+        row: &'a InMemoryStateRow<ChangeId>,
     },
     Owned {
-        fields: Vec<(String, InMemoryFieldValue<ChangeId>)>,
+        fields: Vec<(String, InMemoryFieldState<ChangeId>)>,
     },
 }
 
-impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
+impl<'a, ChangeId> RowStateSnapshot<'a, ChangeId> {
     pub(crate) fn borrowed_in_memory(
         field_names: &'a [String],
-        row: &'a InMemoryRow<ChangeId>,
+        row: &'a InMemoryStateRow<ChangeId>,
     ) -> Self {
         Self {
-            repr: RowSnapshotRepr::BorrowedInMemory { field_names, row },
+            repr: RowStateSnapshotRepr::BorrowedInMemory { field_names, row },
         }
     }
 
     #[must_use]
-    pub fn from_owned_fields(fields: Vec<(String, InMemoryFieldValue<ChangeId>)>) -> Self {
+    pub fn from_owned_fields(fields: Vec<(String, InMemoryFieldState<ChangeId>)>) -> Self {
         Self {
-            repr: RowSnapshotRepr::Owned { fields },
+            repr: RowStateSnapshotRepr::Owned { fields },
         }
     }
 
     /// Materialize this snapshot into an owned `'static` representation.
     #[must_use]
-    pub fn into_owned(self) -> RowSnapshot<'static, ChangeId>
+    pub fn into_owned(self) -> RowStateSnapshot<'static, ChangeId>
     where
         ChangeId: Clone,
     {
-        RowSnapshot::from_owned_fields(self.into_owned_fields())
+        RowStateSnapshot::from_owned_fields(self.into_owned_fields())
     }
 
     /// Materialize this snapshot as owned `(field_name, value)` pairs.
     #[must_use]
-    pub fn into_owned_fields(self) -> Vec<(String, InMemoryFieldValue<ChangeId>)>
+    pub fn into_owned_fields(self) -> Vec<(String, InMemoryFieldState<ChangeId>)>
     where
         ChangeId: Clone,
     {
         match self.repr {
-            RowSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
+            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
                 .iter()
                 .cloned()
                 .zip(row.fields.iter().cloned())
                 .collect(),
-            RowSnapshotRepr::Owned { fields } => fields,
+            RowStateSnapshotRepr::Owned { fields } => fields,
         }
     }
 
     /// # Errors
     ///
-    /// See `RowSnapshotEncodeError<V::Error>` for failure conditions.
+    /// See `RowStateSnapshotEncodeError<V::Error>` for failure conditions.
     pub fn encode_snapshot<V>(
         &self,
         schema: &Schema,
         encoder: &mut V,
-    ) -> Result<(), RowSnapshotEncodeError<V::Error>>
+    ) -> Result<(), RowStateSnapshotEncodeError<V::Error>>
     where
         ChangeId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         V: SchemaSnapshotEncoder<ChangeId>,
@@ -199,7 +205,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
 
     /// # Errors
     ///
-    /// See `RowSnapshotDecodeError<D::Error>` for failure conditions.
+    /// See `RowStateSnapshotDecodeError<D::Error>` for failure conditions.
     ///
     /// # Panics
     ///
@@ -208,7 +214,7 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     pub fn decode_snapshot<D>(
         schema: &Schema,
         decoder: &mut D,
-    ) -> Result<Self, RowSnapshotDecodeError<D::Error>>
+    ) -> Result<Self, RowStateSnapshotDecodeError<D::Error>>
     where
         ChangeId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
         D: SchemaSnapshotDecoder<ChangeId>,
@@ -221,12 +227,12 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
                 .columns
                 .get(field_name.as_str())
                 .expect("field names and schema are in sync");
-            let field_value = InMemoryFieldValue::decode_snapshot_field(
+            let field_value = InMemoryFieldState::decode_snapshot_field(
                 field_name.as_str(),
                 schema_field,
                 decoder,
             )
-            .context(InMemoryFieldValueSnafu)?;
+            .context(InMemoryFieldStateSnafu)?;
             fields.push((field_name.clone(), field_value));
         }
 
@@ -243,10 +249,10 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
         V: SchemaSnapshotEncoder<ChangeId>,
     {
         match &self.repr {
-            RowSnapshotRepr::BorrowedInMemory { field_names, row } => {
+            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => {
                 row.encode_snapshot_fields(field_names, writer)
             }
-            RowSnapshotRepr::Owned { fields } => {
+            RowStateSnapshotRepr::Owned { fields } => {
                 for (field_name, field_value) in fields {
                     field_value.encode_snapshot_field(field_name, writer)?;
                 }
@@ -256,24 +262,43 @@ impl<'a, ChangeId> RowSnapshot<'a, ChangeId> {
     }
 }
 
+impl<ChangeId> RowValueRead for RowStateSnapshot<'_, ChangeId>
+where
+    ChangeId: Clone + fmt::Debug + PartialEq + Eq + Hash + PartialOrd + Ord + 'static,
+{
+    fn get_value(&self, field_name: &str) -> Option<ProjectedFieldValue<'_>> {
+        match &self.repr {
+            RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => field_names
+                .iter()
+                .position(|name| name == field_name)
+                .and_then(|field_index| row.fields.get(field_index))
+                .map(InMemoryFieldState::project_value),
+            RowStateSnapshotRepr::Owned { fields } => fields
+                .iter()
+                .find(|(name, _)| name == field_name)
+                .map(|(_, value)| value.project_value()),
+        }
+    }
+}
+
 /// One retained row image together with its addressability state.
 ///
 /// A [`RowRecord`] is a storage and rehydration shape, not a replicated row
-/// operation. `snapshot` contains the complete row value image, while
+/// operation. `snapshot` contains the complete row state image, while
 /// `tombstoned` records whether that image is retained only so later CRDT
 /// operations can still address the row after a delete.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowRecord<'a, RowId, ChangeId> {
     /// Stable row identifier in the dataset that owns this record.
     pub row_id: RowId,
-    /// Complete value snapshot for the row.
-    pub snapshot: RowSnapshot<'a, ChangeId>,
+    /// Complete state snapshot for the row.
+    pub snapshot: RowStateSnapshot<'a, ChangeId>,
     /// Whether the row is deleted but still retained for causal updates.
     pub tombstoned: bool,
 }
 
 #[derive(Debug, Snafu)]
-pub enum RowSnapshotEncodeError<E>
+pub enum RowStateSnapshotEncodeError<E>
 where
     E: snafu::Error + Send + Sync + 'static,
 {
@@ -282,13 +307,13 @@ where
 }
 
 #[derive(Debug, Snafu)]
-pub enum RowSnapshotDecodeError<E>
+pub enum RowStateSnapshotDecodeError<E>
 where
     E: snafu::Error + Send + Sync + 'static,
 {
     #[snafu(display("Decoded row snapshot value does not match the schema data type."))]
-    InMemoryFieldValue {
-        source: InMemoryDataSnapshotDecodeError<E>,
+    InMemoryFieldState {
+        source: InMemoryStateDataSnapshotDecodeError<E>,
     },
     #[snafu(display("Row snapshot decoder failed."))]
     Decoder { source: E },
@@ -296,13 +321,13 @@ where
 
 fn validate_schema_snapshot<ChangeId>(
     schema: &Schema,
-    snapshot: &RowSnapshot<'_, ChangeId>,
+    snapshot: &RowStateSnapshot<'_, ChangeId>,
 ) -> Result<(), SchemaValueError> {
     let mut seen_fields = HashSet::<String>::new();
     let mut missing_fields = schema.columns.keys().cloned().collect::<HashSet<_>>();
 
     match &snapshot.repr {
-        RowSnapshotRepr::BorrowedInMemory { field_names, row } => {
+        RowStateSnapshotRepr::BorrowedInMemory { field_names, row } => {
             for (field_name, field_value) in field_names
                 .iter()
                 .map(String::as_str)
@@ -317,7 +342,7 @@ fn validate_schema_snapshot<ChangeId>(
                 )?;
             }
         }
-        RowSnapshotRepr::Owned { fields } => {
+        RowStateSnapshotRepr::Owned { fields } => {
             for (field_name, field_value) in fields {
                 validate_snapshot_field(
                     schema,
@@ -346,7 +371,7 @@ fn validate_snapshot_field<ChangeId>(
     seen_fields: &mut HashSet<String>,
     missing_fields: &mut HashSet<String>,
     field_name: &str,
-    field_value: &InMemoryFieldValue<ChangeId>,
+    field_value: &InMemoryFieldState<ChangeId>,
 ) -> Result<(), SchemaValueError> {
     ensure!(
         seen_fields.insert(field_name.to_owned()),
@@ -569,9 +594,9 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let snapshot = RowSnapshot::from_owned_fields(vec![(
+        let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "name".to_owned(),
-            InMemoryFieldValue::LinearString(crate::text::LinearString::with_value(
+            InMemoryFieldState::LinearString(crate::text::LinearString::with_value(
                 "hello".to_owned(),
                 1u32,
             )),
@@ -611,9 +636,9 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let snapshot = RowSnapshot::from_owned_fields(vec![(
+        let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "name".to_owned(),
-            InMemoryFieldValue::LinearString(crate::text::LinearString::with_value(
+            InMemoryFieldState::LinearString(crate::text::LinearString::with_value(
                 "hello".to_owned(),
                 1u32,
             )),
@@ -632,9 +657,9 @@ mod tests {
             },
         );
 
-        let snapshot = RowSnapshot::from_owned_fields(vec![(
+        let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "created_on".to_owned(),
-            InMemoryFieldValue::<u32>::TotalOrderRegister(PrimitiveValue::UInt(1)),
+            InMemoryFieldState::<u32>::TotalOrderRegister(PrimitiveValue::UInt(1)),
         )]);
 
         let err = validate_schema_snapshot(&schema, &snapshot).unwrap_err();
@@ -660,9 +685,9 @@ mod tests {
             },
         );
 
-        let snapshot = RowSnapshot::from_owned_fields(vec![(
+        let snapshot = RowStateSnapshot::from_owned_fields(vec![(
             "created_on".to_owned(),
-            InMemoryFieldValue::<u32>::TotalOrderRegister(PrimitiveValue::Date(
+            InMemoryFieldState::<u32>::TotalOrderRegister(PrimitiveValue::Date(
                 NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
             )),
         )]);

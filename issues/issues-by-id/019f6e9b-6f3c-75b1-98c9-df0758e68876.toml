@@ -1,0 +1,46 @@
+id = "019f6e9b-6f3c-75b1-98c9-df0758e68876"
+ref = "flotsync-git-ial"
+title = "Build deterministic flotsync_io network simulator"
+body = """
+Build a simple network simulator for flotsync_io tests that can run Kompact-based flows against controlled simulation time instead of wall-clock IO.
+
+Context:
+C01. The simulator should support flotsync_io integration and higher-level Flotsync tests without binding real sockets or depending on operating-system scheduling.
+C02. It should work together with the hierarchical_hash_wheel_timer simulation timer path injected into Kompact.
+C03. The test runtime must be fully single threaded so actor scheduling, timer progress, and simulated network delivery have deterministic ordering under test control.
+C04. Seeded deterministic random number generation is desirable, but replacing all relevant RNG sources may need a separate design if it crosses crate boundaries.
+
+Scope:
+S01. Define a simulator API that can stand in for the relevant flotsync_io transport behaviour used by Kompact components.
+S02. Model latency with at least a small set of distributions, such as fixed, uniform, normal-like/jittered, and explicitly scripted delays.
+S03. Support static partitions configured before a run and dynamic partitions scheduled during simulation time.
+S04. Route all delivery, drops, partition changes, and timer progress through simulation time rather than wall-clock sleeps.
+S05. Integrate the wheel timer crate simulation timer into the Kompact test system so timer callbacks and network deliveries share one deterministic time source.
+S06. Enforce or clearly encapsulate a fully single-threaded execution mode for tests using the simulator.
+S07. Provide deterministic event ordering for simultaneous deliveries and timer events, including documented tie-breaking rules.
+S08. Add a seed-controlled RNG path for network-model randomness where practical, and document what remains non-deterministic or outside this task if full RNG replacement is larger.
+
+Design questions:
+D01. Which flotsync_io abstractions should the simulator implement directly, and which should be adapted through test-only components?
+D02. How should simulation time be advanced: explicit ticks, run-until-idle, run-until-deadline, or a small combination of those operations?
+D03. What is the narrowest way to inject the wheel timer crate simulation timer into Kompact without making production runtime configuration awkward?
+D04. How much RNG replacement belongs in this task versus a follow-up deterministic entropy provider across more crates?
+
+Acceptance criteria:
+A01. Tests can instantiate a single-threaded Kompact system with the simulation timer and simulated flotsync_io transport.
+A02. Tests can configure latency distributions, static partitions, and dynamic partitions in simulation time.
+A03. Simulated message delivery, loss due to partitions, timer callbacks, and time advancement are deterministic for a given configuration and seed.
+A04. Simultaneous-event ordering is documented and covered by focused tests.
+A05. At least one existing flotsync_io or replication transport scenario is ported to the simulator as a smoke test.
+A06. Any remaining non-deterministic RNG sources are documented with follow-up work if they cannot be fixed in the first slice."""
+status = "open"
+type = "task"
+priority = 4
+labels = [
+    "area:determinism",
+    "area:io",
+    "area:test-infra",
+]
+blocks = ["019f6e9b-9da0-7ac1-adf2-3a79ef3e2a90"]
+created_at = "2026-07-17T05:45:08.15654Z"
+updated_at = "2026-07-17T05:50:35.139472Z"

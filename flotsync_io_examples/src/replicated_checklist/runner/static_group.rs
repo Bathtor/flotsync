@@ -15,6 +15,14 @@ struct ConfiguredStaticGroup {
     member_count: NonZeroUsize,
 }
 
+/// Return the fixed dataset schema for configured checklist groups.
+fn checklist_group_schema() -> GroupSchema {
+    GroupSchema::new(HashMap::from([(
+        checklist_dataset_id(),
+        CHECKLIST_SCHEMA.clone().into(),
+    )]))
+}
+
 /// Derive the configured static group shape shared by run and key setup.
 fn configured_static_group(
     config: &ChecklistAppConfig,
@@ -81,7 +89,9 @@ pub(super) async fn initialise_configured_group_if_ready(
             member_keys,
             local_member_index: group_shape.local_member_index,
             version_vector: VersionVector::initial(group_shape.member_count),
+            lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
+            group_schema: checklist_group_schema(),
         })
         .await
         .context(static_group_error::StoreSnafu)?;

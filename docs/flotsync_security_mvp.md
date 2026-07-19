@@ -124,6 +124,11 @@ without a global trust lookup.
 The group id is the group key epoch. Membership or key changes create a new
 group id through migration rather than mutating the old group's key material.
 
+Initial snapshots used to activate a migrated or invited group belong to the
+target group. Migration proposals may be authorised in the old group context,
+but inline snapshot payloads for the new group are encrypted with the new group
+key so all accepted target-group members can consume one shared representation.
+
 Rationale: group metadata, membership, version state, and group key material are
 normally needed together. Storing encrypted group-security material with the
 group record keeps that lifecycle explicit.

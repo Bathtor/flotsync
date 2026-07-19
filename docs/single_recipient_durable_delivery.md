@@ -12,7 +12,7 @@ one specific recipient outside normal `GroupBroadcast` fan-out.
 
 Its primary use is bootstrap traffic such as:
 
-- migration invitations
+- migration proposals
 - new-group establishment
 - recipient-specific key packages
 
@@ -54,9 +54,12 @@ This protocol is not a special case of `GroupBroadcast`.
 The major differences are:
 
 - it has exactly one intended recipient
-- it is not group-scoped
 - it must work before a shared group key exists
 - relay mailbox storage can satisfy the sender's durability obligation
+
+The delivery target is recipient-scoped. A replication payload may still carry
+a group authority scope used to validate routing and message identity: migration
+proposals use the old group, while invitations use the target group.
 
 It does, however, intentionally reuse the same route-state vocabulary where
 possible so later runtime and type work can share machinery.
@@ -68,6 +71,7 @@ Replication owns:
 - the logical meaning of the payload
 - whether a payload should be sent via this protocol or via `GroupBroadcast`
 - invitation acceptance and rejection policy
+- accepted-but-not-active group activation and initial snapshot resolution
 
 This protocol owns:
 
@@ -173,9 +177,8 @@ Must convey:
     - sender identity
     - recipient identity
     - `message_ref`, for example:
-        - `MigrationInit(migration_id)`
-        - `GroupInvite(group_id)`
-        - `BootstrapKeyPackage(group_id)`
+        - `MigrationProposal(migration_id)`
+        - `GroupInvitation(group_id)`
     - `message_id`
     - sender signature metadata
 - encrypted payload bytes
@@ -192,8 +195,8 @@ Notes:
 ### 4.2 `RecipientAck`
 
 Purpose:
-Let the recipient confirm durable local acceptance of one recipient-addressed
-message.
+Let the recipient confirm that one recipient-addressed message was processed
+and does not require retry.
 
 Must convey:
 
@@ -207,6 +210,11 @@ Notes:
 - this is the only completion signal that satisfies the sender-side work item
 - it may itself be delivered directly or via relay mailbox using this same
   protocol
+- invitations and proposals do not require retry after terminal rejection,
+  stored listener mediation, or committed activation work
+- acknowledgement does not imply listener acceptance or an active target group
+- failures before one of those outcomes withhold acknowledgement so redelivery
+  can retry processing
 
 ## 5. Relay Mailbox Contract
 
@@ -303,9 +311,10 @@ On mailbox retrieval, the recipient must:
 - verify the sender signature on each envelope before acting on the payload
 - treat fetched envelopes as opaque input to higher-level bootstrap or
   replication logic
-- ack envelopes only after durable local acceptance
+- ack envelopes only after the higher layer reports that processing completed
+  and does not require retry
 
-After durable local acceptance, the recipient should:
+After processing no longer requires retry, the recipient should:
 
 - send `MailboxAck` to the relay for mailbox cleanup
 - send `RecipientAck` to the original sender, directly when possible and via
@@ -340,12 +349,17 @@ bootstrap material before a shared group key exists.
 Typical examples:
 
 - first invitation into a new replication group
-- migration invitation for a recipient not yet in the new group
-- one recipient's encrypted share of new group key material
+- migration proposal for an existing old-group member
+- migration-derived group invitation for a recipient not yet in the new group
+
+Each invitation or proposal is self-contained: the recipient-protected payload
+includes its matching target-group member keys, cipher suite, group key, schema,
+and initial snapshot metadata or values. Private setup is removed before the
+listener-visible invitation or proposal is emitted.
 
 ### 9.2 Transition to Group Protocols
 
-Once the recipient accepts and joins the group:
+Once policy accepts an Empty or Inline initial snapshot and activates the group:
 
 - group-scoped traffic moves to `GroupBroadcast`
 - state synchronization uses `Replication`
@@ -353,6 +367,9 @@ Once the recipient accepts and joins the group:
 This protocol remains available for future recipient-addressed bootstrap or
 out-of-band control messages, but it is not the normal path for steady-state
 group replication.
+
+Metadata-only initial snapshots are represented by the replication payload but
+are rejected by the current runtime until snapshot fetching is implemented.
 
 ## 10. Open Questions Deferred to Later Tasks
 

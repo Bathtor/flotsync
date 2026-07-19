@@ -9,6 +9,6 @@ crc32c = "0.6"
 flotsync_io = { path = "../flotsync_io" }
 flotsync_utils = { path = "../flotsync_utils" }
 kompact = { workspace = true }
-roaring = "0.10"
+roaring = { workspace = true }
 smallvec = { workspace = true }
 snafu = { workspace = true }

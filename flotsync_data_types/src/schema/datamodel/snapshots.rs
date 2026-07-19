@@ -34,18 +34,20 @@ use std::{collections::HashSet, convert::Infallible, marker::PhantomData};
 /// Snapshot node payload shapes for history-based CRDT snapshots.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SnapshotNodeValue {
+enum HistorySnapshotNodeValue {
     LatestValueWins(NullableBasicValue),
     LinearString(String),
     LinearList(PrimitiveValueArray),
 }
 #[cfg(test)]
-impl SnapshotNodeValue {
-    pub fn as_ref(&self) -> SnapshotNodeValueRef<'_> {
+impl HistorySnapshotNodeValue {
+    pub fn as_ref(&self) -> HistorySnapshotNodeValueRef<'_> {
         match self {
-            Self::LatestValueWins(value) => SnapshotNodeValueRef::LatestValueWins(value.as_ref()),
-            Self::LinearString(value) => SnapshotNodeValueRef::LinearString(value.as_str()),
-            Self::LinearList(values) => SnapshotNodeValueRef::LinearList(values.as_ref()),
+            Self::LatestValueWins(value) => {
+                HistorySnapshotNodeValueRef::LatestValueWins(value.as_ref())
+            }
+            Self::LinearString(value) => HistorySnapshotNodeValueRef::LinearString(value.as_str()),
+            Self::LinearList(values) => HistorySnapshotNodeValueRef::LinearList(values.as_ref()),
         }
     }
 }
@@ -53,7 +55,7 @@ impl SnapshotNodeValue {
 /// Borrowed snapshot node payload shapes for history-based CRDT snapshots.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum SnapshotNodeValueRef<'a> {
+enum HistorySnapshotNodeValueRef<'a> {
     LatestValueWins(NullableBasicValueRef<'a>),
     LinearString(&'a str),
     LinearList(PrimitiveValueArrayRef<'a>),
@@ -61,23 +63,23 @@ enum SnapshotNodeValueRef<'a> {
 
 /// Snapshot value shapes for state-based CRDT snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SnapshotStateValue {
+pub enum StateSnapshotFieldValue {
     MonotonicCounter(CounterValue),
     TotalOrderRegister(PrimitiveValue),
     TotalOrderFiniteStateRegister(NullablePrimitiveValue),
 }
-impl SnapshotStateValue {
+impl StateSnapshotFieldValue {
     #[must_use]
-    pub fn as_ref(&self) -> SnapshotStateValueRef<'_> {
+    pub fn as_ref(&self) -> StateSnapshotFieldValueRef<'_> {
         match self {
             Self::MonotonicCounter(value) => {
-                SnapshotStateValueRef::MonotonicCounter(value.as_ref())
+                StateSnapshotFieldValueRef::MonotonicCounter(value.as_ref())
             }
             Self::TotalOrderRegister(value) => {
-                SnapshotStateValueRef::TotalOrderRegister(value.as_ref())
+                StateSnapshotFieldValueRef::TotalOrderRegister(value.as_ref())
             }
             Self::TotalOrderFiniteStateRegister(value) => {
-                SnapshotStateValueRef::TotalOrderFiniteStateRegister(value.as_ref())
+                StateSnapshotFieldValueRef::TotalOrderFiniteStateRegister(value.as_ref())
             }
         }
     }
@@ -85,23 +87,23 @@ impl SnapshotStateValue {
 
 /// Borrowed snapshot value shapes for state-based CRDT snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SnapshotStateValueRef<'a> {
+pub enum StateSnapshotFieldValueRef<'a> {
     MonotonicCounter(CounterValueRef),
     TotalOrderRegister(PrimitiveValueRef<'a>),
     TotalOrderFiniteStateRegister(NullablePrimitiveValueRef<'a>),
 }
-impl SnapshotStateValueRef<'_> {
+impl StateSnapshotFieldValueRef<'_> {
     #[must_use]
-    pub fn into_owned(self) -> SnapshotStateValue {
+    pub fn into_owned(self) -> StateSnapshotFieldValue {
         match self {
             Self::MonotonicCounter(value) => {
-                SnapshotStateValue::MonotonicCounter(value.into_owned())
+                StateSnapshotFieldValue::MonotonicCounter(value.into_owned())
             }
             Self::TotalOrderRegister(value) => {
-                SnapshotStateValue::TotalOrderRegister(value.to_owned())
+                StateSnapshotFieldValue::TotalOrderRegister(value.to_owned())
             }
             Self::TotalOrderFiniteStateRegister(value) => {
-                SnapshotStateValue::TotalOrderFiniteStateRegister(value.to_owned())
+                StateSnapshotFieldValue::TotalOrderFiniteStateRegister(value.to_owned())
             }
         }
     }
@@ -155,7 +157,7 @@ pub trait SchemaSnapshotEncoder<Id> {
     fn state_field(
         &mut self,
         field_name: &str,
-        value: SnapshotStateValueRef<'_>,
+        value: StateSnapshotFieldValueRef<'_>,
     ) -> Result<(), Self::Error>;
 
     /// Prepare a sink for one `LatestValueWins` field.
@@ -216,7 +218,7 @@ pub trait SchemaSnapshotEncoder<Id> {
 /// ```ignore
 /// let mut snapshot = prepare_schema_snapshot_encoder(&mut visitor, schema)?;
 ///
-/// snapshot.state_field("counter", SnapshotStateValueRef::MonotonicCounter(...))?;
+/// snapshot.state_field("counter", StateSnapshotFieldValueRef::MonotonicCounter(...))?;
 ///
 /// // LinearString can stream directly.
 /// let mut title_sink = snapshot.prepare_linear_string_field("title")?;
@@ -259,7 +261,7 @@ where
     pub(super) fn state_field(
         &mut self,
         field_name: &str,
-        value: SnapshotStateValueRef<'_>,
+        value: StateSnapshotFieldValueRef<'_>,
     ) -> Result<(), SchemaVisitError<V::Error>> {
         self.register_field(field_name)
             .map_err(|source| SchemaVisitError::InvalidSchemaValue { source })?;
@@ -502,7 +504,7 @@ pub trait SchemaSnapshotDecoder<Id> {
         &mut self,
         field_name: &str,
         data_type: &ReplicatedDataType,
-    ) -> Result<SnapshotStateValue, Self::Error>;
+    ) -> Result<StateSnapshotFieldValue, Self::Error>;
 
     /// # Errors
     ///
@@ -610,7 +612,7 @@ pub trait DataSnapshotDecoder<Id> {
 
 /// Visitor used by serializers to encode one history node payload at a time.
 #[cfg(test)]
-trait SnapshotNodeValueEncoder {
+trait HistorySnapshotNodeValueEncoder {
     type Error;
 
     fn visit_latest_value_wins_node(
@@ -630,7 +632,7 @@ trait SnapshotNodeValueEncoder {
 
 /// Decoder used to lazily decode one history node payload at a time.
 #[cfg(test)]
-trait SnapshotNodeValueDecoder {
+trait HistorySnapshotNodeValueDecoder {
     type Error;
 
     fn decode_latest_value_wins_node(
@@ -647,7 +649,7 @@ trait SnapshotNodeValueDecoder {
 }
 
 /// Visitor used by serializers to encode one state snapshot value at a time.
-trait SnapshotStateValueEncoder {
+trait StateSnapshotFieldValueEncoder {
     type Error;
 
     fn visit_monotonic_counter(
@@ -672,7 +674,7 @@ trait SnapshotStateValueEncoder {
 
 /// Decoder used to lazily decode one state snapshot value at a time.
 #[cfg(test)]
-trait SnapshotStateValueDecoder {
+trait StateSnapshotFieldValueDecoder {
     type Error;
 
     fn decode_monotonic_counter(&mut self, small_range: bool) -> Result<CounterValue, Self::Error>;
@@ -693,16 +695,16 @@ trait SnapshotStateValueDecoder {
 fn encode_snapshot_node_value<V>(
     visitor: &mut V,
     data_type: &ReplicatedDataType,
-    value: SnapshotNodeValueRef<'_>,
+    value: HistorySnapshotNodeValueRef<'_>,
 ) -> Result<(), VisitError<V::Error>>
 where
-    V: SnapshotNodeValueEncoder,
+    V: HistorySnapshotNodeValueEncoder,
     V::Error: snafu::Error + Send + Sync + 'static,
 {
     match (data_type, value) {
         (
             ReplicatedDataType::LatestValueWins { value_type },
-            SnapshotNodeValueRef::LatestValueWins(v),
+            HistorySnapshotNodeValueRef::LatestValueWins(v),
         ) => {
             ensure_nullable_basic_type(value_type, &v)
                 .map_err(|source| VisitError::InvalidVisitedValue { source })?;
@@ -710,10 +712,13 @@ where
                 .visit_latest_value_wins_node(value_type, v)
                 .map_err(|source| VisitError::VisitorSource { source })
         }
-        (ReplicatedDataType::LinearString, SnapshotNodeValueRef::LinearString(v)) => visitor
+        (ReplicatedDataType::LinearString, HistorySnapshotNodeValueRef::LinearString(v)) => visitor
             .visit_linear_string_node(v)
             .map_err(|source| VisitError::VisitorSource { source }),
-        (ReplicatedDataType::LinearList { value_type }, SnapshotNodeValueRef::LinearList(v)) => {
+        (
+            ReplicatedDataType::LinearList { value_type },
+            HistorySnapshotNodeValueRef::LinearList(v),
+        ) => {
             ensure_primitive_array_type(*value_type, v.primitive_type())
                 .map_err(|source| VisitError::InvalidVisitedValue { source })?;
             visitor
@@ -731,9 +736,9 @@ where
 fn decode_snapshot_node_value<D>(
     decoder: &mut D,
     data_type: &ReplicatedDataType,
-) -> Result<SnapshotNodeValue, DecodeError<D::Error>>
+) -> Result<HistorySnapshotNodeValue, DecodeError<D::Error>>
 where
-    D: SnapshotNodeValueDecoder,
+    D: HistorySnapshotNodeValueDecoder,
     D::Error: snafu::Error + Send + Sync + 'static,
 {
     match data_type {
@@ -743,11 +748,11 @@ where
                 .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_nullable_basic_type(value_type, &value.as_ref())
                 .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
-            Ok(SnapshotNodeValue::LatestValueWins(value))
+            Ok(HistorySnapshotNodeValue::LatestValueWins(value))
         }
         ReplicatedDataType::LinearString => decoder
             .decode_linear_string_node()
-            .map(SnapshotNodeValue::LinearString)
+            .map(HistorySnapshotNodeValue::LinearString)
             .map_err(|source| DecodeError::DecoderSource { source }),
         ReplicatedDataType::LinearList { value_type } => {
             let values = decoder
@@ -755,7 +760,7 @@ where
                 .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_primitive_array_type(*value_type, values.primitive_type())
                 .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
-            Ok(SnapshotNodeValue::LinearList(values))
+            Ok(HistorySnapshotNodeValue::LinearList(values))
         }
         ReplicatedDataType::MonotonicCounter { .. }
         | ReplicatedDataType::TotalOrderRegister { .. }
@@ -771,16 +776,16 @@ where
 fn encode_snapshot_state_value<V>(
     visitor: &mut V,
     data_type: &ReplicatedDataType,
-    value: SnapshotStateValueRef<'_>,
+    value: StateSnapshotFieldValueRef<'_>,
 ) -> Result<(), VisitError<V::Error>>
 where
-    V: SnapshotStateValueEncoder,
+    V: StateSnapshotFieldValueEncoder,
     V::Error: snafu::Error + Send + Sync + 'static,
 {
     match (data_type, value) {
         (
             ReplicatedDataType::MonotonicCounter { small_range },
-            SnapshotStateValueRef::MonotonicCounter(v),
+            StateSnapshotFieldValueRef::MonotonicCounter(v),
         ) => {
             ensure_counter_type(*small_range, v)
                 .map_err(|source| VisitError::InvalidVisitedValue { source })?;
@@ -790,7 +795,7 @@ where
         }
         (
             ReplicatedDataType::TotalOrderRegister { value_type, .. },
-            SnapshotStateValueRef::TotalOrderRegister(v),
+            StateSnapshotFieldValueRef::TotalOrderRegister(v),
         ) => {
             ensure_primitive_type(*value_type, v.value_type())
                 .map_err(|source| VisitError::InvalidVisitedValue { source })?;
@@ -800,7 +805,7 @@ where
         }
         (
             ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states },
-            SnapshotStateValueRef::TotalOrderFiniteStateRegister(v),
+            StateSnapshotFieldValueRef::TotalOrderFiniteStateRegister(v),
         ) => {
             ensure_finite_state_value(*value_type, states, &v)
                 .map_err(|source| VisitError::InvalidVisitedValue { source })?;
@@ -819,9 +824,9 @@ where
 fn decode_snapshot_state_value<D>(
     decoder: &mut D,
     data_type: &ReplicatedDataType,
-) -> Result<SnapshotStateValue, DecodeError<D::Error>>
+) -> Result<StateSnapshotFieldValue, DecodeError<D::Error>>
 where
-    D: SnapshotStateValueDecoder,
+    D: StateSnapshotFieldValueDecoder,
     D::Error: snafu::Error + Send + Sync + 'static,
 {
     match data_type {
@@ -831,7 +836,7 @@ where
                 .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_counter_type(*small_range, value.as_ref())
                 .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
-            Ok(SnapshotStateValue::MonotonicCounter(value))
+            Ok(StateSnapshotFieldValue::MonotonicCounter(value))
         }
         ReplicatedDataType::TotalOrderRegister { value_type, .. } => {
             let value = decoder
@@ -839,7 +844,7 @@ where
                 .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_primitive_type(*value_type, value.primitive_type())
                 .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
-            Ok(SnapshotStateValue::TotalOrderRegister(value))
+            Ok(StateSnapshotFieldValue::TotalOrderRegister(value))
         }
         ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, states } => {
             let value = decoder
@@ -847,7 +852,9 @@ where
                 .map_err(|source| DecodeError::DecoderSource { source })?;
             ensure_finite_state_value(*value_type, states, &value.as_ref())
                 .map_err(|source| DecodeError::InvalidDecodedValue { source })?;
-            Ok(SnapshotStateValue::TotalOrderFiniteStateRegister(value))
+            Ok(StateSnapshotFieldValue::TotalOrderFiniteStateRegister(
+                value,
+            ))
         }
         ReplicatedDataType::LatestValueWins { .. }
         | ReplicatedDataType::LinearString
@@ -858,17 +865,17 @@ where
 }
 fn validate_snapshot_state_value_for_type(
     data_type: &ReplicatedDataType,
-    value: SnapshotStateValueRef<'_>,
+    value: StateSnapshotFieldValueRef<'_>,
 ) -> Result<(), DataModelValueError> {
-    let mut visitor = NoopSnapshotStateValueEncoder;
+    let mut visitor = NoopStateSnapshotFieldValueEncoder;
     match encode_snapshot_state_value(&mut visitor, data_type, value) {
         Ok(()) => Ok(()),
         Err(VisitError::InvalidVisitedValue { source }) => Err(source),
         Err(VisitError::VisitorSource { source: never }) => match never {},
     }
 }
-struct NoopSnapshotStateValueEncoder;
-impl SnapshotStateValueEncoder for NoopSnapshotStateValueEncoder {
+struct NoopStateSnapshotFieldValueEncoder;
+impl StateSnapshotFieldValueEncoder for NoopStateSnapshotFieldValueEncoder {
     type Error = Infallible;
 
     fn visit_monotonic_counter(
@@ -917,10 +924,10 @@ mod tests {
             Direction,
             Field,
             datamodel::{
-                InMemoryData,
-                InMemoryFieldValue,
-                LinearLatestValueWinsValue,
-                LinearListValue,
+                InMemoryFieldState,
+                InMemoryStateData,
+                LinearLatestValueWinsState,
+                LinearListState,
             },
         },
         snapshot::{SnapshotHeader, SnapshotNodeRef, SnapshotSink},
@@ -1396,7 +1403,7 @@ mod tests {
             self.bytes.freeze()
         }
     }
-    impl SnapshotNodeValueEncoder for BytesNodeValueEncoder {
+    impl HistorySnapshotNodeValueEncoder for BytesNodeValueEncoder {
         type Error = TestError;
 
         fn visit_latest_value_wins_node(
@@ -1436,7 +1443,7 @@ mod tests {
             }
         }
     }
-    impl SnapshotNodeValueDecoder for BytesNodeValueDecoder {
+    impl HistorySnapshotNodeValueDecoder for BytesNodeValueDecoder {
         type Error = TestError;
 
         fn decode_latest_value_wins_node(
@@ -1470,7 +1477,7 @@ mod tests {
             self.bytes.freeze()
         }
     }
-    impl SnapshotStateValueEncoder for BytesStateValueEncoder {
+    impl StateSnapshotFieldValueEncoder for BytesStateValueEncoder {
         type Error = TestError;
 
         fn visit_monotonic_counter(
@@ -1515,7 +1522,7 @@ mod tests {
             }
         }
     }
-    impl SnapshotStateValueDecoder for BytesStateValueDecoder {
+    impl StateSnapshotFieldValueDecoder for BytesStateValueDecoder {
         type Error = TestError;
 
         fn decode_monotonic_counter(
@@ -1557,7 +1564,7 @@ mod tests {
 
     fn encode_node_payload(
         data_type: &ReplicatedDataType,
-        value: SnapshotNodeValueRef<'_>,
+        value: HistorySnapshotNodeValueRef<'_>,
     ) -> Result<Vec<u8>, String> {
         let mut encoder = BytesNodeValueEncoder::default();
         encode_snapshot_node_value(&mut encoder, data_type, value)
@@ -1568,7 +1575,7 @@ mod tests {
     fn decode_node_payload(
         data_type: &ReplicatedDataType,
         payload: &[u8],
-    ) -> Result<SnapshotNodeValue, String> {
+    ) -> Result<HistorySnapshotNodeValue, String> {
         let mut decoder = BytesNodeValueDecoder::new(Bytes::copy_from_slice(payload));
         let value =
             decode_snapshot_node_value(&mut decoder, data_type).map_err(decode_error_to_string)?;
@@ -1578,7 +1585,7 @@ mod tests {
 
     fn encode_state_payload(
         data_type: &ReplicatedDataType,
-        value: SnapshotStateValueRef<'_>,
+        value: StateSnapshotFieldValueRef<'_>,
     ) -> Result<Vec<u8>, String> {
         let mut encoder = BytesStateValueEncoder::default();
         encode_snapshot_state_value(&mut encoder, data_type, value)
@@ -1589,7 +1596,7 @@ mod tests {
     fn decode_state_payload(
         data_type: &ReplicatedDataType,
         payload: &[u8],
-    ) -> Result<SnapshotStateValue, String> {
+    ) -> Result<StateSnapshotFieldValue, String> {
         let mut decoder = BytesStateValueDecoder::new(Bytes::copy_from_slice(payload));
         let value =
             decode_snapshot_state_value(&mut decoder, data_type).map_err(decode_error_to_string)?;
@@ -1673,7 +1680,7 @@ mod tests {
             let encoded_value = if let Some(value) = node.value {
                 Some(encode_node_payload(
                     &data_type,
-                    SnapshotNodeValueRef::LatestValueWins(value.clone()),
+                    HistorySnapshotNodeValueRef::LatestValueWins(value.clone()),
                 )?)
             } else {
                 None
@@ -1737,7 +1744,7 @@ mod tests {
             let encoded_value = if let Some(value) = node.value {
                 Some(encode_node_payload(
                     &data_type,
-                    SnapshotNodeValueRef::LinearString(value),
+                    HistorySnapshotNodeValueRef::LinearString(value),
                 )?)
             } else {
                 None
@@ -1811,7 +1818,7 @@ mod tests {
             let encoded_value = if let Some(value) = node.value {
                 Some(encode_node_payload(
                     &data_type,
-                    SnapshotNodeValueRef::LinearList(value.clone()),
+                    HistorySnapshotNodeValueRef::LinearList(value.clone()),
                 )?)
             } else {
                 None
@@ -1881,7 +1888,7 @@ mod tests {
         fn state_field(
             &mut self,
             field_name: &str,
-            value: SnapshotStateValueRef<'_>,
+            value: StateSnapshotFieldValueRef<'_>,
         ) -> Result<(), Self::Error> {
             let data_type = &self
                 .schema
@@ -1965,7 +1972,7 @@ mod tests {
         fn state_field(
             &mut self,
             field_name: &str,
-            value: SnapshotStateValueRef<'_>,
+            value: StateSnapshotFieldValueRef<'_>,
         ) -> Result<(), Self::Error> {
             self.inner.state_field(field_name, value)
         }
@@ -2168,7 +2175,7 @@ mod tests {
             &mut self,
             field_name: &str,
             data_type: &ReplicatedDataType,
-        ) -> Result<SnapshotStateValue, Self::Error> {
+        ) -> Result<StateSnapshotFieldValue, Self::Error> {
             let bytes = self
                 .state_fields
                 .get(field_name)
@@ -2195,7 +2202,7 @@ mod tests {
                 bytes,
                 snapshot_bytes::decode_id_with_index_u32,
                 |payload| match decode_node_payload(&data_type, payload)? {
-                    SnapshotNodeValue::LatestValueWins(value) => Ok(value),
+                    HistorySnapshotNodeValue::LatestValueWins(value) => Ok(value),
                     _ => Err("expected latest value wins node value".to_owned()),
                 },
             )?;
@@ -2217,7 +2224,7 @@ mod tests {
                 bytes,
                 snapshot_bytes::decode_id_with_index_u32,
                 |payload| match decode_node_payload(&data_type, payload)? {
-                    SnapshotNodeValue::LinearString(value) => Ok(value),
+                    HistorySnapshotNodeValue::LinearString(value) => Ok(value),
                     _ => Err("expected linear string node value".to_owned()),
                 },
             )?;
@@ -2240,7 +2247,7 @@ mod tests {
                 bytes,
                 snapshot_bytes::decode_id_with_index_u32,
                 |payload| match decode_node_payload(&data_type, payload)? {
-                    SnapshotNodeValue::LinearList(value) => Ok(value),
+                    HistorySnapshotNodeValue::LinearList(value) => Ok(value),
                     _ => Err("expected linear list node value".to_owned()),
                 },
             )?;
@@ -2461,21 +2468,21 @@ mod tests {
         let cases = vec![
             (
                 &lvw_type,
-                SnapshotNodeValue::LatestValueWins(NullableBasicValue::Null),
+                HistorySnapshotNodeValue::LatestValueWins(NullableBasicValue::Null),
             ),
             (
                 &lvw_type,
-                SnapshotNodeValue::LatestValueWins(NullableBasicValue::Value(
+                HistorySnapshotNodeValue::LatestValueWins(NullableBasicValue::Value(
                     BasicValue::Primitive(PrimitiveValue::UInt(42)),
                 )),
             ),
             (
                 &string_type,
-                SnapshotNodeValue::LinearString("hello world".to_owned()),
+                HistorySnapshotNodeValue::LinearString("hello world".to_owned()),
             ),
             (
                 &list_type,
-                SnapshotNodeValue::LinearList(PrimitiveValueArray::Int(vec![-1, 0, 9])),
+                HistorySnapshotNodeValue::LinearList(PrimitiveValueArray::Int(vec![-1, 0, 9])),
             ),
         ];
 
@@ -2507,21 +2514,23 @@ mod tests {
         let cases = vec![
             (
                 &counter_type,
-                SnapshotStateValue::MonotonicCounter(CounterValue::UInt(9)),
+                StateSnapshotFieldValue::MonotonicCounter(CounterValue::UInt(9)),
             ),
             (
                 &register_type,
-                SnapshotStateValue::TotalOrderRegister(PrimitiveValue::UInt(33)),
+                StateSnapshotFieldValue::TotalOrderRegister(PrimitiveValue::UInt(33)),
             ),
             (
                 &finite_type,
-                SnapshotStateValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Null),
+                StateSnapshotFieldValue::TotalOrderFiniteStateRegister(
+                    NullablePrimitiveValue::Null,
+                ),
             ),
             (
                 &finite_type,
-                SnapshotStateValue::TotalOrderFiniteStateRegister(NullablePrimitiveValue::Value(
-                    PrimitiveValue::String("published".to_owned()),
-                )),
+                StateSnapshotFieldValue::TotalOrderFiniteStateRegister(
+                    NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned())),
+                ),
             ),
         ];
 
@@ -2563,27 +2572,27 @@ mod tests {
         let priority = PrimitiveValue::UInt(7);
         let status = NullablePrimitiveValue::Value(PrimitiveValue::String("published".to_owned()));
 
-        let mut data: InMemoryData<(), u32> = InMemoryData::with_static_schema(schema);
+        let mut data: InMemoryStateData<(), u32> = InMemoryStateData::with_static_schema(schema);
         data.push_row_from_named_fields([
             (
                 "latest",
-                InMemoryFieldValue::LatestValueWins(LinearLatestValueWinsValue::NullableUInt(
+                InMemoryFieldState::LatestValueWins(LinearLatestValueWinsState::NullableUInt(
                     latest.clone(),
                 )),
             ),
-            ("title", InMemoryFieldValue::LinearString(title.clone())),
+            ("title", InMemoryFieldState::LinearString(title.clone())),
             (
                 "numbers",
-                InMemoryFieldValue::LinearList(LinearListValue::Int(numbers.clone())),
+                InMemoryFieldState::LinearList(LinearListState::Int(numbers.clone())),
             ),
-            ("counter", InMemoryFieldValue::MonotonicCounter(counter)),
+            ("counter", InMemoryFieldState::MonotonicCounter(counter)),
             (
                 "priority",
-                InMemoryFieldValue::TotalOrderRegister(priority.clone()),
+                InMemoryFieldState::TotalOrderRegister(priority.clone()),
             ),
             (
                 "status",
-                InMemoryFieldValue::TotalOrderFiniteStateRegister(status.clone()),
+                InMemoryFieldState::TotalOrderFiniteStateRegister(status.clone()),
             ),
         ])
         .unwrap();
@@ -2593,7 +2602,7 @@ mod tests {
         let bytes = encoder.result();
 
         let mut decoder = BytesDataSnapshotDecoder::try_from_bytes(bytes).unwrap();
-        let roundtrip = InMemoryData::decode_data_snapshots(schema, &mut decoder).unwrap();
+        let roundtrip = InMemoryStateData::decode_data_snapshots(schema, &mut decoder).unwrap();
         assert_eq!(roundtrip, data);
     }
 }

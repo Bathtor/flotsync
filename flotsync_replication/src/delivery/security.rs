@@ -17,16 +17,16 @@ use crate::{
             RecordPublicKeyBundleFeedbackRequest,
         },
     },
+    codecs::messages::{
+        BootstrapMemberKeyMessage,
+        GroupSetupMessage,
+        RuntimeMessageError,
+        validate_bootstrap_public_key_bundle_matches_fingerprint,
+    },
     delivery::{
         group_broadcast::GroupMessageHeader,
         reliable_delivery::{RecipientAckHeader, ReliableMessageHeader},
         shared::{DetachedSignature, MessageId, ReliableMessageScope, SignatureScheme},
-    },
-    runtime::messages::{
-        BootstrapGroupMessage,
-        BootstrapMemberKeyMessage,
-        RuntimeMessageError,
-        validate_bootstrap_public_key_bundle_matches_fingerprint,
     },
     security_store::{MemberPublicKeyLoadPolicy, SecurityStore, SecurityStoreError},
 };
@@ -97,6 +97,10 @@ pub(crate) enum DeliverySecurityError {
     MissingLocalPrivateKeys { member_id: MemberIdentity },
     #[snafu(display("Security material for group {group_id} is not provisioned."))]
     MissingGroupSecurity { group_id: GroupId },
+    #[snafu(display(
+        "Inbound setup key for group {group_id} does not match the stored group key."
+    ))]
+    GroupSetupKeyMismatch { group_id: GroupId },
     #[snafu(display("Reliable delivery cannot send a message from {member_id} to itself."))]
     ReliableSelfMessage { member_id: MemberIdentity },
     #[snafu(display(
@@ -254,6 +258,8 @@ impl DeliverySecurityError {
             Self::MissingLocalPrivateKeys { .. } => false,
             // Missing group-security state requires provisioning or data repair.
             Self::MissingGroupSecurity { .. } => false,
+            // A replayed setup key mismatch is a permanent conflict for that payload.
+            Self::GroupSetupKeyMismatch { .. } => false,
             // Reliable self-send is a caller bug.
             Self::ReliableSelfMessage { .. } => false,
             // Sender/recipient mismatches are local routing or authenticity violations.
@@ -682,15 +688,39 @@ impl DeliverySecurity {
     }
 
     /// Validate bootstrap member keys and prepare encrypted group-security material.
-    pub(crate) async fn prepare_security_material_from_bootstrap_msg(
+    pub(crate) async fn prepare_security_material_from_group_setup(
         &self,
-        payload: &BootstrapGroupMessage,
-        bootstrap_sender: &MemberIdentity,
+        group_id: GroupId,
+        payload: &GroupSetupMessage,
+        setup_sender: &MemberIdentity,
     ) -> Result<EncryptedGroupSecurityMaterial, DeliverySecurityError> {
-        self.validate_bootstrap_payload_member_keys(payload, bootstrap_sender)
+        self.validate_group_setup_member_keys(payload, setup_sender)
             .await?;
-        self.store_bootstrap_inline_public_keys(payload).await?;
-        self.seal_group_secret(payload.group_id().0, payload.group_key().as_group_key())
+        self.store_group_setup_inline_public_keys(payload).await?;
+        self.seal_group_secret(group_id.0, payload.group_key().as_group_key())
+    }
+
+    /// Validate replayed setup against existing encrypted group-security material.
+    ///
+    /// Callers are expected to compare cheap group-definition fields before
+    /// invoking this method. The stored key is only decrypted after member-key
+    /// trust and inline bundle validation succeed.
+    pub(crate) async fn validate_existing_group_setup_security(
+        &self,
+        group_id: GroupId,
+        payload: &GroupSetupMessage,
+        setup_sender: &MemberIdentity,
+        security_material: &EncryptedGroupSecurityMaterial,
+    ) -> Result<(), DeliverySecurityError> {
+        self.validate_group_setup_member_keys(payload, setup_sender)
+            .await?;
+        self.store_group_setup_inline_public_keys(payload).await?;
+        let stored_group_key = self.open_group_secret(group_id, security_material)?;
+        ensure!(
+            stored_group_key == *payload.group_key().as_group_key(),
+            GroupSetupKeyMismatchSnafu { group_id }
+        );
+        Ok(())
     }
 
     fn local_public_bootstrap_key(&self) -> BootstrapMemberKeyMessage {
@@ -824,10 +854,10 @@ impl DeliverySecurity {
     }
 
     /// Compare bootstrap payload key references against locally provisioned trust records.
-    pub(crate) async fn validate_bootstrap_payload_member_keys(
+    pub(crate) async fn validate_group_setup_member_keys(
         &self,
-        payload: &BootstrapGroupMessage,
-        bootstrap_sender: &MemberIdentity,
+        payload: &GroupSetupMessage,
+        setup_sender: &MemberIdentity,
     ) -> Result<(), DeliverySecurityError> {
         for member_id in payload.members() {
             if payload.member_keys().get(member_id).is_none() {
@@ -843,24 +873,24 @@ impl DeliverySecurity {
                 }
             }
         }
-        let Some(sender_key) = payload.member_keys().get(bootstrap_sender) else {
+        let Some(sender_key) = payload.member_keys().get(setup_sender) else {
             return Err(DeliverySecurityError::MissingBootstrapMemberKey {
-                member_id: bootstrap_sender.clone(),
+                member_id: setup_sender.clone(),
             });
         };
-        if bootstrap_sender == &self.local_member {
+        if setup_sender == &self.local_member {
             let expected_fingerprint = self.local_public_bootstrap_key().fingerprint();
             ensure!(
                 sender_key.fingerprint() == expected_fingerprint,
                 BootstrapKeyFingerprintMismatchSnafu {
-                    member_id: bootstrap_sender.clone(),
+                    member_id: setup_sender.clone(),
                     expected: expected_fingerprint,
                     actual: sender_key.fingerprint(),
                 }
             );
         } else {
             self.require_member_key_permission(
-                bootstrap_sender,
+                setup_sender,
                 sender_key.fingerprint(),
                 AuthorityScope::BootstrapActivation,
             )
@@ -902,9 +932,9 @@ impl DeliverySecurity {
     }
 
     /// Store valid inline bootstrap public bundles as observed key material.
-    async fn store_bootstrap_inline_public_keys(
+    async fn store_group_setup_inline_public_keys(
         &self,
-        payload: &BootstrapGroupMessage,
+        payload: &GroupSetupMessage,
     ) -> Result<(), DeliverySecurityError> {
         let inline_public_keys = payload
             .member_keys()
@@ -1040,6 +1070,7 @@ mod tests {
     use crate::{
         SqliteReplicationStore,
         api::{MemberKeyTrustRequirement, ReplicationStore, TrustPolicy},
+        codecs::messages::GroupSetupKey,
         test_support::{
             provision_test_security,
             provision_test_trusted_public_keys,
@@ -1048,7 +1079,7 @@ mod tests {
         },
     };
     use flotsync_core::member::Identifier;
-    use flotsync_security::sign_discovery_payload;
+    use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, sign_discovery_payload};
     use std::{future::Future, sync::Arc, time::Duration};
 
     const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1129,6 +1160,80 @@ mod tests {
         let store = sqlite_store(alice.clone());
         provision_security(store.as_ref(), &alice, Vec::new());
         load_delivery_security(store, &alice)
+    }
+
+    fn test_group_setup(
+        creator: &MemberIdentity,
+        invited_member: &MemberIdentity,
+        key_byte: u8,
+    ) -> GroupSetupMessage {
+        let members = vec![creator.clone(), invited_member.clone()];
+        let mut member_keys = TrieMap::new();
+        for member in &members {
+            member_keys.insert(
+                member.clone(),
+                BootstrapMemberKeyMessage::from_public_keys(&test_public_member_keys(member)),
+            );
+        }
+        GroupSetupMessage::new(
+            members,
+            member_keys,
+            GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
+            GroupSetupKey::from_group_key(GroupKey::from_bytes([key_byte; 32])),
+        )
+        .expect("test group setup should build")
+    }
+
+    #[test]
+    fn existing_group_setup_security_accepts_same_plaintext_key_after_random_sealing() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let group_id = GroupId(Uuid::from_u128(70_001));
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let setup = test_group_setup(&alice, &bob, 41);
+
+        let stored = wait_for_delivery_security_future(
+            bob_security.prepare_security_material_from_group_setup(group_id, &setup, &alice),
+        )
+        .expect("initial setup should seal");
+        wait_for_delivery_security_future(
+            bob_security.validate_existing_group_setup_security(group_id, &setup, &alice, &stored),
+        )
+        .expect("same plaintext setup key should match stored ciphertext");
+    }
+
+    #[test]
+    fn existing_group_setup_security_rejects_different_plaintext_key() {
+        let alice = alice_member();
+        let bob = bob_member();
+        let group_id = GroupId(Uuid::from_u128(70_002));
+        let bob_store = sqlite_store(bob.clone());
+        provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
+        let bob_security = load_delivery_security(bob_store, &bob);
+        let original = test_group_setup(&alice, &bob, 42);
+        let conflicting = test_group_setup(&alice, &bob, 43);
+
+        let stored = wait_for_delivery_security_future(
+            bob_security.prepare_security_material_from_group_setup(group_id, &original, &alice),
+        )
+        .expect("initial setup should seal");
+        let error =
+            wait_for_delivery_security_future(bob_security.validate_existing_group_setup_security(
+                group_id,
+                &conflicting,
+                &alice,
+                &stored,
+            ))
+            .expect_err("different plaintext setup key should conflict");
+
+        assert!(matches!(
+            error,
+            DeliverySecurityError::GroupSetupKeyMismatch {
+                group_id: actual_group_id
+            } if actual_group_id == group_id
+        ));
     }
 
     #[test]

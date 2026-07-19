@@ -1,11 +1,19 @@
 use super::{
+    ArrayType,
     Field,
     NullableBasicDataType,
     NullablePrimitiveType,
     PrimitiveType,
     ReplicatedDataType,
-    datamodel::{BasicValue, CounterValue, NullableBasicValue},
-    values::{NullablePrimitiveValue, PrimitiveValue, PrimitiveValueArray},
+    datamodel::{
+        BasicValue,
+        BasicValueRef,
+        CounterValue,
+        NullableBasicValue,
+        NullableBasicValueRef,
+        PrimitiveValueArrayRef,
+    },
+    values::{NullablePrimitiveValue, PrimitiveValue, PrimitiveValueArray, PrimitiveValueRef},
 };
 use ordered_float::OrderedFloat;
 use snafu::prelude::*;
@@ -125,6 +133,16 @@ impl Field {
         })
     }
 
+    /// Check whether `value` can initialise this field without building the
+    /// owned initial field value.
+    ///
+    /// # Errors
+    ///
+    /// See `FieldValueBuildError` for failure conditions.
+    pub fn can_initial(&self, value: &NullableBasicValue) -> Result<(), FieldValueBuildError> {
+        self.validate_field_value(value.as_ref())
+    }
+
     /// # Errors
     ///
     /// See `FieldValueBuildError` for failure conditions.
@@ -167,6 +185,54 @@ impl Field {
             }
         }
     }
+
+    /// Validate that a projected value can initialise the field without
+    /// normalising the value or building CRDT state.
+    ///
+    /// This checks nullability, replicated data-type shape, primitive or array
+    /// element type compatibility, integer range compatibility, and
+    /// finite-state register value compatibility.
+    fn validate_field_value(
+        &self,
+        value: NullableBasicValueRef<'_>,
+    ) -> Result<(), FieldValueBuildError> {
+        match &self.data_type {
+            ReplicatedDataType::LatestValueWins { value_type } => {
+                validate_nullable_basic_value_ref(&self.name, value_type, &value)
+            }
+            ReplicatedDataType::LinearString => {
+                let primitive = validate_non_null_primitive(&self.name, value, "a string value")?;
+                match primitive {
+                    PrimitiveValueRef::String(_) => Ok(()),
+                    actual => {
+                        primitive_ref_mismatch(&self.name, Cow::Borrowed("a string value"), &actual)
+                    }
+                }
+            }
+            ReplicatedDataType::LinearList { value_type } => {
+                validate_primitive_array(&self.name, *value_type, value)
+            }
+            ReplicatedDataType::MonotonicCounter { small_range } => {
+                let primitive = validate_non_null_primitive(&self.name, value, "a counter value")?;
+                if *small_range {
+                    validate_primitive_integer::<u8>(&self.name, &primitive, "u8 counter value")
+                } else {
+                    validate_primitive_integer::<u64>(&self.name, &primitive, "u64 counter value")
+                }
+            }
+            ReplicatedDataType::TotalOrderRegister { value_type, .. } => {
+                let primitive = validate_non_null_primitive(
+                    &self.name,
+                    value,
+                    primitive_type_name(*value_type).as_str(),
+                )?;
+                validate_primitive_value(&self.name, *value_type, &primitive)
+            }
+            ReplicatedDataType::TotalOrderFiniteStateRegister { value_type, .. } => {
+                validate_nullable_primitive(&self.name, *value_type, value)
+            }
+        }
+    }
 }
 
 fn validate_nullable_basic_value(
@@ -174,11 +240,19 @@ fn validate_nullable_basic_value(
     value_type: &NullableBasicDataType,
     value: &NullableBasicValue,
 ) -> Result<(), FieldValueBuildError> {
+    validate_nullable_basic_value_ref(field_name, value_type, &value.as_ref())
+}
+
+fn validate_nullable_basic_value_ref(
+    field_name: &str,
+    value_type: &NullableBasicDataType,
+    value: &NullableBasicValueRef<'_>,
+) -> Result<(), FieldValueBuildError> {
     if value.matches_type(value_type) {
         return Ok(());
     }
 
-    if matches!(value, NullableBasicValue::Null) {
+    if matches!(value, NullableBasicValueRef::Null) {
         return NullNotAllowedSnafu {
             field_name: field_name.to_owned(),
         }
@@ -188,9 +262,161 @@ fn validate_nullable_basic_value(
     TypeMismatchSnafu {
         field_name: field_name.to_owned(),
         expected: Cow::Owned(nullable_basic_data_type_name(value_type)),
-        actual: Cow::Owned(nullable_basic_value_name(value)),
+        actual: Cow::Owned(value.value_type().to_string()),
     }
     .fail()
+}
+
+fn validate_non_null_primitive<'a>(
+    field_name: &str,
+    value: NullableBasicValueRef<'a>,
+    expected: &str,
+) -> Result<PrimitiveValueRef<'a>, FieldValueBuildError> {
+    match value {
+        NullableBasicValueRef::Null => NullNotAllowedSnafu {
+            field_name: field_name.to_owned(),
+        }
+        .fail(),
+        NullableBasicValueRef::Value(BasicValueRef::Primitive(value)) => Ok(value),
+        NullableBasicValueRef::Value(actual) => TypeMismatchSnafu {
+            field_name: field_name.to_owned(),
+            expected: Cow::Owned(expected.to_owned()),
+            actual: Cow::Owned(actual.value_type().to_string()),
+        }
+        .fail(),
+    }
+}
+
+fn validate_nullable_primitive(
+    field_name: &str,
+    value_type: NullablePrimitiveType,
+    value: NullableBasicValueRef<'_>,
+) -> Result<(), FieldValueBuildError> {
+    match value {
+        NullableBasicValueRef::Null => {
+            ensure!(
+                value_type.is_nullable(),
+                NullNotAllowedSnafu {
+                    field_name: field_name.to_owned(),
+                }
+            );
+            Ok(())
+        }
+        NullableBasicValueRef::Value(BasicValueRef::Primitive(primitive)) => {
+            validate_primitive_value(field_name, value_type.value_type(), &primitive)
+        }
+        NullableBasicValueRef::Value(actual) => TypeMismatchSnafu {
+            field_name: field_name.to_owned(),
+            expected: Cow::Owned(nullable_primitive_type_name(value_type)),
+            actual: Cow::Owned(actual.value_type().to_string()),
+        }
+        .fail(),
+    }
+}
+
+fn validate_primitive_array(
+    field_name: &str,
+    value_type: PrimitiveType,
+    value: NullableBasicValueRef<'_>,
+) -> Result<(), FieldValueBuildError> {
+    match value {
+        NullableBasicValueRef::Null => NullNotAllowedSnafu {
+            field_name: field_name.to_owned(),
+        }
+        .fail(),
+        NullableBasicValueRef::Value(BasicValueRef::Array(value)) => {
+            validate_primitive_array_value(field_name, value_type, &value)
+        }
+        NullableBasicValueRef::Value(BasicValueRef::Primitive(PrimitiveValueRef::Binary(_)))
+            if value_type == PrimitiveType::Byte =>
+        {
+            Ok(())
+        }
+        NullableBasicValueRef::Value(actual) => TypeMismatchSnafu {
+            field_name: field_name.to_owned(),
+            expected: Cow::Owned(array_type_name(value_type)),
+            actual: Cow::Owned(actual.value_type().to_string()),
+        }
+        .fail(),
+    }
+}
+
+fn validate_primitive_value(
+    field_name: &str,
+    value_type: PrimitiveType,
+    value: &PrimitiveValueRef<'_>,
+) -> Result<(), FieldValueBuildError> {
+    match value_type {
+        PrimitiveType::String => match value {
+            PrimitiveValueRef::String(_) => Ok(()),
+            actual => primitive_ref_mismatch(field_name, primitive_type_name(value_type), actual),
+        },
+        PrimitiveType::UInt => validate_primitive_integer::<u64>(
+            field_name,
+            value,
+            primitive_type_name(value_type).as_str(),
+        ),
+        PrimitiveType::Int | PrimitiveType::Timestamp => validate_primitive_integer::<i64>(
+            field_name,
+            value,
+            primitive_type_name(value_type).as_str(),
+        ),
+        PrimitiveType::Byte => validate_primitive_integer::<u8>(
+            field_name,
+            value,
+            primitive_type_name(value_type).as_str(),
+        ),
+        PrimitiveType::Float => match value {
+            PrimitiveValueRef::Float(_) => Ok(()),
+            actual => primitive_ref_mismatch(field_name, primitive_type_name(value_type), actual),
+        },
+        PrimitiveType::Boolean => match value {
+            PrimitiveValueRef::Boolean(_) => Ok(()),
+            actual => primitive_ref_mismatch(field_name, primitive_type_name(value_type), actual),
+        },
+        PrimitiveType::Binary => match value {
+            PrimitiveValueRef::Binary(_) => Ok(()),
+            actual => primitive_ref_mismatch(field_name, primitive_type_name(value_type), actual),
+        },
+        PrimitiveType::Date => match value {
+            PrimitiveValueRef::Date(_) => Ok(()),
+            actual => primitive_ref_mismatch(field_name, primitive_type_name(value_type), actual),
+        },
+    }
+}
+
+fn validate_primitive_array_value(
+    field_name: &str,
+    value_type: PrimitiveType,
+    value: &PrimitiveValueArrayRef<'_>,
+) -> Result<(), FieldValueBuildError> {
+    match value_type {
+        PrimitiveType::String => match value {
+            PrimitiveValueArrayRef::String(_) => Ok(()),
+            actual => array_ref_mismatch(field_name, value_type, actual),
+        },
+        PrimitiveType::UInt => validate_integer_array::<u64>(field_name, value_type, value),
+        PrimitiveType::Int | PrimitiveType::Timestamp => {
+            validate_integer_array::<i64>(field_name, value_type, value)
+        }
+        PrimitiveType::Byte => validate_integer_array::<u8>(field_name, value_type, value),
+        PrimitiveType::Float => match value {
+            PrimitiveValueArrayRef::Float(_) => Ok(()),
+            actual => array_ref_mismatch(field_name, value_type, actual),
+        },
+        PrimitiveType::Boolean => match value {
+            PrimitiveValueArrayRef::Boolean(_) => Ok(()),
+            actual => array_ref_mismatch(field_name, value_type, actual),
+        },
+        PrimitiveType::Binary => match value {
+            PrimitiveValueArrayRef::Binary(_) => Ok(()),
+            actual => array_ref_mismatch(field_name, value_type, actual),
+        },
+        PrimitiveType::Date => match value {
+            PrimitiveValueArrayRef::Date(_) => Ok(()),
+            actual => array_ref_mismatch(field_name, value_type, actual),
+        },
+    }
 }
 
 fn normalize_string(
@@ -203,7 +429,7 @@ fn normalize_string(
         actual => TypeMismatchSnafu {
             field_name: field_name.to_owned(),
             expected: Cow::Borrowed("a string value"),
-            actual: Cow::Owned(primitive_value_name(&actual)),
+            actual: Cow::Owned(actual.value_type().to_string()),
         }
         .fail(),
     }
@@ -254,7 +480,7 @@ fn normalize_nullable_primitive(
                 return TypeMismatchSnafu {
                     field_name: field_name.to_owned(),
                     expected: Cow::Owned(nullable_primitive_type_name(value_type)),
-                    actual: Cow::Owned(basic_value_name(&value)),
+                    actual: Cow::Owned(value.as_ref().value_type().to_string()),
                 }
                 .fail();
             };
@@ -287,8 +513,8 @@ fn normalize_primitive_array(
         }
         NullableBasicValue::Value(actual) => TypeMismatchSnafu {
             field_name: field_name.to_owned(),
-            expected: Cow::Owned(format!("a {} array", primitive_type_name(value_type))),
-            actual: Cow::Owned(basic_value_name(&actual)),
+            expected: Cow::Owned(array_type_name(value_type)),
+            actual: Cow::Owned(actual.as_ref().value_type().to_string()),
         }
         .fail(),
     }
@@ -308,7 +534,7 @@ fn normalize_non_null_primitive(
         NullableBasicValue::Value(actual) => TypeMismatchSnafu {
             field_name: field_name.to_owned(),
             expected: Cow::Owned(expected.to_owned()),
-            actual: Cow::Owned(basic_value_name(&actual)),
+            actual: Cow::Owned(actual.as_ref().value_type().to_string()),
         }
         .fail(),
     }
@@ -443,6 +669,32 @@ where
     Ok(build(converted))
 }
 
+fn validate_integer_array<T>(
+    field_name: &str,
+    value_type: PrimitiveType,
+    value: &PrimitiveValueArrayRef<'_>,
+) -> Result<(), FieldValueBuildError>
+where
+    T: TryFrom<i64> + TryFrom<u64> + TryFrom<u8>,
+    <T as TryFrom<i64>>::Error: std::fmt::Debug,
+    <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    <T as TryFrom<u8>>::Error: std::fmt::Debug,
+{
+    let expected = primitive_type_name(value_type);
+    match value {
+        PrimitiveValueArrayRef::Int(values) => values
+            .iter()
+            .try_for_each(|value| validate_integer::<T, _>(field_name, expected.clone(), *value)),
+        PrimitiveValueArrayRef::UInt(values) => values
+            .iter()
+            .try_for_each(|value| validate_integer::<T, _>(field_name, expected.clone(), *value)),
+        PrimitiveValueArrayRef::Byte(values) => values
+            .iter()
+            .try_for_each(|value| validate_integer::<T, _>(field_name, expected.clone(), *value)),
+        actual => array_ref_mismatch(field_name, value_type, actual),
+    }
+}
+
 fn convert_primitive_integer<T>(
     field_name: &str,
     value: &PrimitiveValue,
@@ -475,6 +727,38 @@ where
     }
 }
 
+fn validate_primitive_integer<T>(
+    field_name: &str,
+    value: &PrimitiveValueRef<'_>,
+    expected: &str,
+) -> Result<(), FieldValueBuildError>
+where
+    T: TryFrom<i64> + TryFrom<u64> + TryFrom<u8>,
+    <T as TryFrom<i64>>::Error: std::fmt::Debug,
+    <T as TryFrom<u64>>::Error: std::fmt::Debug,
+    <T as TryFrom<u8>>::Error: std::fmt::Debug,
+{
+    #[allow(
+        clippy::match_same_arms,
+        reason = "Accepted integer variants have different payload types and share the same validation path."
+    )]
+    match value {
+        PrimitiveValueRef::Int(value) => {
+            validate_integer::<T, _>(field_name, Cow::Owned(expected.to_owned()), *value)
+        }
+        PrimitiveValueRef::UInt(value) => {
+            validate_integer::<T, _>(field_name, Cow::Owned(expected.to_owned()), *value)
+        }
+        PrimitiveValueRef::Byte(value) => {
+            validate_integer::<T, _>(field_name, Cow::Owned(expected.to_owned()), *value)
+        }
+        PrimitiveValueRef::Timestamp(value) => {
+            validate_integer::<T, _>(field_name, Cow::Owned(expected.to_owned()), *value)
+        }
+        actual => primitive_ref_mismatch(field_name, Cow::Owned(expected.to_owned()), actual),
+    }
+}
+
 fn convert_integer<T, Input>(
     field_name: &str,
     expected: impl Into<Cow<'static, str>>,
@@ -494,15 +778,42 @@ where
         })
 }
 
+fn validate_integer<T, Input>(
+    field_name: &str,
+    expected: impl Into<Cow<'static, str>>,
+    value: Input,
+) -> Result<(), FieldValueBuildError>
+where
+    T: TryFrom<Input>,
+    Input: Copy + std::fmt::Display,
+    <T as TryFrom<Input>>::Error: std::fmt::Debug,
+{
+    T::try_from(value)
+        .map(|_| ())
+        .map_err(|_| FieldValueBuildError::ConversionFailed {
+            field_name: field_name.to_owned(),
+            expected: expected.into(),
+            value: value.to_string(),
+        })
+}
+
 fn mismatch<T>(
     field_name: &str,
     expected: impl Into<Cow<'static, str>>,
     actual: &PrimitiveValue,
 ) -> Result<T, FieldValueBuildError> {
+    primitive_ref_mismatch(field_name, expected, &actual.as_ref())
+}
+
+fn primitive_ref_mismatch<T>(
+    field_name: &str,
+    expected: impl Into<Cow<'static, str>>,
+    actual: &PrimitiveValueRef<'_>,
+) -> Result<T, FieldValueBuildError> {
     TypeMismatchSnafu {
         field_name: field_name.to_owned(),
         expected: expected.into(),
-        actual: Cow::Owned(primitive_value_name(actual)),
+        actual: Cow::Owned(actual.value_type().to_string()),
     }
     .fail()
 }
@@ -512,93 +823,39 @@ fn array_mismatch<T>(
     value_type: PrimitiveType,
     actual: &PrimitiveValueArray,
 ) -> Result<T, FieldValueBuildError> {
+    array_ref_mismatch(field_name, value_type, &actual.as_ref())
+}
+
+fn array_ref_mismatch<T>(
+    field_name: &str,
+    value_type: PrimitiveType,
+    actual: &PrimitiveValueArrayRef<'_>,
+) -> Result<T, FieldValueBuildError> {
     TypeMismatchSnafu {
         field_name: field_name.to_owned(),
-        expected: Cow::Owned(format!("a {} array", primitive_type_name(value_type))),
-        actual: Cow::Owned(primitive_array_value_name(actual)),
+        expected: Cow::Owned(array_type_name(value_type)),
+        actual: Cow::Owned(array_type_name(actual.primitive_type())),
     }
     .fail()
 }
 
 fn primitive_type_name(value_type: PrimitiveType) -> String {
-    match value_type {
-        PrimitiveType::String => "string".to_owned(),
-        PrimitiveType::UInt => "u64".to_owned(),
-        PrimitiveType::Int => "i64".to_owned(),
-        PrimitiveType::Byte => "u8".to_owned(),
-        PrimitiveType::Float => "f64".to_owned(),
-        PrimitiveType::Boolean => "bool".to_owned(),
-        PrimitiveType::Binary => "binary".to_owned(),
-        PrimitiveType::Date => "date".to_owned(),
-        PrimitiveType::Timestamp => "timestamp".to_owned(),
-    }
+    value_type.to_string()
 }
 
 fn nullable_basic_data_type_name(value_type: &NullableBasicDataType) -> String {
-    if value_type.is_nullable() {
-        format!("nullable {}", basic_data_type_name(value_type.value_type()))
-    } else {
-        basic_data_type_name(value_type.value_type())
-    }
-}
-
-fn basic_data_type_name(value_type: &super::BasicDataType) -> String {
-    match value_type {
-        super::BasicDataType::Primitive(value_type) => primitive_type_name(*value_type),
-        super::BasicDataType::Array(value_type) => {
-            format!("{} array", primitive_type_name(value_type.element_type))
-        }
-    }
+    value_type.to_string()
 }
 
 fn nullable_primitive_type_name(value_type: NullablePrimitiveType) -> String {
-    if value_type.is_nullable() {
-        format!("nullable {}", primitive_type_name(value_type.value_type()))
-    } else {
-        primitive_type_name(value_type.value_type())
-    }
+    value_type.to_string()
 }
 
-fn nullable_basic_value_name(value: &NullableBasicValue) -> String {
-    match value {
-        NullableBasicValue::Null => "null".to_owned(),
-        NullableBasicValue::Value(value) => basic_value_name(value),
+fn array_type_name(value_type: PrimitiveType) -> String {
+    ArrayType {
+        element_type: value_type,
     }
-}
-
-fn basic_value_name(value: &BasicValue) -> String {
-    match value {
-        BasicValue::Primitive(value) => primitive_value_name(value),
-        BasicValue::Array(value) => primitive_array_value_name(value),
-    }
-}
-
-fn primitive_value_name(value: &PrimitiveValue) -> String {
-    match value {
-        PrimitiveValue::String(_) => "string".to_owned(),
-        PrimitiveValue::UInt(_) => "u64".to_owned(),
-        PrimitiveValue::Int(_) => "i64".to_owned(),
-        PrimitiveValue::Byte(_) => "u8".to_owned(),
-        PrimitiveValue::Float(_) => "f64".to_owned(),
-        PrimitiveValue::Boolean(_) => "bool".to_owned(),
-        PrimitiveValue::Binary(_) => "binary".to_owned(),
-        PrimitiveValue::Date(_) => "date".to_owned(),
-        PrimitiveValue::Timestamp(_) => "timestamp".to_owned(),
-    }
-}
-
-fn primitive_array_value_name(value: &PrimitiveValueArray) -> String {
-    match value {
-        PrimitiveValueArray::String(_) => "string array".to_owned(),
-        PrimitiveValueArray::UInt(_) => "u64 array".to_owned(),
-        PrimitiveValueArray::Int(_) => "i64 array".to_owned(),
-        PrimitiveValueArray::Byte(_) => "u8 array".to_owned(),
-        PrimitiveValueArray::Float(_) => "f64 array".to_owned(),
-        PrimitiveValueArray::Boolean(_) => "bool array".to_owned(),
-        PrimitiveValueArray::Binary(_) => "binary array".to_owned(),
-        PrimitiveValueArray::Date(_) => "date array".to_owned(),
-        PrimitiveValueArray::Timestamp(_) => "timestamp array".to_owned(),
-    }
+    .to_string()
 }
 
 impl From<OrderedFloat<f64>> for PrimitiveValue {

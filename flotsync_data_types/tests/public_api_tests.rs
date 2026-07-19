@@ -1,8 +1,8 @@
 use flotsync_data_types::{
     DataOperation,
-    FieldOperations,
     OperationError,
     OperationOutcome,
+    RowValues,
     Schema,
     TableOperations,
     initial_values,
@@ -11,7 +11,7 @@ use flotsync_data_types::{
         Field,
         PrimitiveType,
         datamodel::{
-            InMemoryData,
+            InMemoryStateData,
             OperationValue,
             RowOperation,
             RowRecord,
@@ -25,6 +25,7 @@ use flotsync_data_types::{
 use std::{
     assert_matches,
     borrow::Cow,
+    collections::HashMap,
     sync::{Arc, LazyLock},
 };
 
@@ -50,7 +51,7 @@ fn expect_applied<T>(outcome: OperationOutcome<T>) -> T {
 #[test]
 fn in_memory_data_preserves_static_schema_reference() {
     let schema = &*TEST_SCHEMA;
-    let data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let data: InMemoryStateData<RowId, OperationId> = InMemoryStateData::with_static_schema(schema);
 
     assert!(std::ptr::eq(data.schema(), schema));
 }
@@ -58,16 +59,48 @@ fn in_memory_data_preserves_static_schema_reference() {
 #[test]
 fn in_memory_data_preserves_shared_schema_reference() {
     let schema = Arc::new(Schema::from_fields([Field::linear_string("title")]));
-    let data: InMemoryData<RowId, OperationId> = InMemoryData::new(schema.clone());
+    let data: InMemoryStateData<RowId, OperationId> = InMemoryStateData::new(schema.clone());
 
     assert!(std::ptr::eq(data.schema(), schema.as_ref()));
+}
+
+#[test]
+fn initial_value_rows_embed_deterministic_state() {
+    let schema = &*TEST_SCHEMA;
+    let fields = HashMap::from([
+        ("title".to_owned(), "hello".into()),
+        ("numbers".to_owned(), vec![1i64, 2, 3].into()),
+        ("counter".to_owned(), 4u64.into()),
+        ("priority".to_owned(), 7u64.into()),
+    ]);
+    let row = RowValues::try_from_fields(schema, fields)
+        .expect("initial value row should match the schema");
+
+    let left = InMemoryStateData::from_initial_value_rows(schema, [(1, row.clone())], &0u32)
+        .expect("initial value rows should embed");
+    let right = InMemoryStateData::from_initial_value_rows(schema, [(1, row)], &0u32)
+        .expect("initial value rows should embed");
+
+    let left_row = left.get_row(&1).expect("row should be present");
+    let right_row = right.get_row(&1).expect("row should be present");
+    assert_eq!(left_row.snapshot(), right_row.snapshot());
+
+    let title: Cow<'_, str> = schema["title"].get_value(&left_row).unwrap();
+    let numbers: Cow<'_, [i64]> = schema["numbers"].get_value(&left_row).unwrap();
+    let counter: Cow<'_, u64> = schema["counter"].get_value(&left_row).unwrap();
+    let priority: Cow<'_, u64> = schema["priority"].get_value(&left_row).unwrap();
+    assert_eq!(&*title, "hello");
+    assert_eq!(&*numbers, [1, 2, 3]);
+    assert_eq!(*counter, 4);
+    assert_eq!(*priority, 7);
 }
 
 #[test]
 fn table_operations_insert_modify_and_delete_rows() {
     let schema = &*TEST_SCHEMA;
 
-    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut data: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
 
     {
         let insert = data
@@ -174,7 +207,8 @@ fn table_operations_insert_modify_and_delete_rows() {
 #[test]
 fn modify_row_linear_list_emits_targeted_diff_operations() {
     let schema = &*TEST_SCHEMA;
-    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut data: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
 
     data.insert_row(
         100,
@@ -239,7 +273,8 @@ fn modify_row_linear_list_emits_targeted_diff_operations() {
 fn insert_row_requires_explicit_values_for_all_fields() {
     let schema = &*TEST_SCHEMA;
 
-    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut data: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let error = data
         .insert_row(
             20,
@@ -276,7 +311,7 @@ fn insert_row_uses_schema_defaults_for_omitted_fields() {
             .with_default(11u64)
             .unwrap(),
     ]));
-    let mut data: InMemoryData<RowId, OperationId> = InMemoryData::new(schema.clone());
+    let mut data: InMemoryStateData<RowId, OperationId> = InMemoryStateData::new(schema.clone());
 
     let operation = data
         .insert_row(
@@ -318,7 +353,8 @@ fn apply_insert_materializes_defaults_for_missing_fields() {
             .unwrap(),
     ]));
 
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::new(old_schema.clone());
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::new(old_schema.clone());
     let insert = source
         .insert_row(
             300,
@@ -330,7 +366,7 @@ fn apply_insert_materializes_defaults_for_missing_fields() {
         .unwrap()
         .into_owned();
 
-    let target = InMemoryData::new(new_schema.clone())
+    let target = InMemoryStateData::new(new_schema.clone())
         .apply_schema_operation(insert)
         .unwrap();
 
@@ -346,7 +382,8 @@ fn apply_insert_materializes_defaults_for_missing_fields() {
 #[test]
 fn apply_schema_operation_roundtrips_insert_update_delete() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
 
     let insert = source
         .insert_row(
@@ -378,7 +415,7 @@ fn apply_schema_operation_roundtrips_insert_update_delete() {
     .into_owned();
     let delete = source.delete_row(202, 9).unwrap().into_owned();
 
-    let target = InMemoryData::with_static_schema(schema)
+    let target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(insert)
         .unwrap()
         .apply_schema_operation(update)
@@ -392,7 +429,8 @@ fn apply_schema_operation_roundtrips_insert_update_delete() {
 #[test]
 fn row_snapshots_can_rebuild_a_dataset_directly() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
 
     let first_insert = source
         .insert_row(
@@ -427,7 +465,7 @@ fn row_snapshots_can_rebuild_a_dataset_directly() {
         };
         (row_id, snapshot)
     });
-    let rebuilt = InMemoryData::with_static_schema_and_row_snapshots(schema, rows).unwrap();
+    let rebuilt = InMemoryStateData::with_static_schema_and_row_snapshots(schema, rows).unwrap();
 
     assert_eq!(rebuilt, source);
 }
@@ -435,7 +473,8 @@ fn row_snapshots_can_rebuild_a_dataset_directly() {
 #[test]
 fn apply_schema_operation_rejects_duplicate_insert_and_unknown_rows() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let insert = source
         .insert_row(
             210,
@@ -463,14 +502,15 @@ fn apply_schema_operation_rejects_duplicate_insert_and_unknown_rows() {
     .into_owned();
     let delete = source.delete_row(212, 5).unwrap().into_owned();
 
-    let empty_target: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let empty_target: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let update_err = empty_target.clone().apply_schema_operation(update.clone());
     assert_matches!(update_err, Err(OperationError::UnknownRowId { .. }));
 
     let delete_err = empty_target.apply_schema_operation(delete.clone());
     assert_matches!(delete_err, Err(OperationError::UnknownRowId { .. }));
 
-    let applied_once = InMemoryData::with_static_schema(schema)
+    let applied_once = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(insert.clone())
         .unwrap();
     let duplicate_insert = applied_once.apply_schema_operation(insert);
@@ -480,7 +520,8 @@ fn apply_schema_operation_rejects_duplicate_insert_and_unknown_rows() {
 #[test]
 fn apply_schema_operation_update_on_deleted_row_applies_and_repeated_delete_is_ok() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let insert = source
         .insert_row(
             220,
@@ -508,7 +549,7 @@ fn apply_schema_operation_update_on_deleted_row_applies_and_repeated_delete_is_o
     .into_owned();
     let delete = source.delete_row(222, 8).unwrap().into_owned();
 
-    let target = InMemoryData::with_static_schema(schema)
+    let target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(insert)
         .unwrap()
         .apply_schema_operation(delete.clone())
@@ -529,7 +570,8 @@ fn apply_schema_operation_update_on_deleted_row_applies_and_repeated_delete_is_o
 #[test]
 fn in_memory_data_rehydrates_tombstoned_row_snapshots() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let insert = source
         .insert_row(
             230,
@@ -559,7 +601,7 @@ fn in_memory_data_rehydrates_tombstoned_row_snapshots() {
     )
     .into_owned();
 
-    let target = InMemoryData::from_row_snapshots_with_tombstones(
+    let target = InMemoryStateData::from_row_snapshots_with_tombstones(
         schema,
         [RowRecord {
             row_id: 10,
@@ -583,7 +625,8 @@ fn in_memory_data_rehydrates_tombstoned_row_snapshots() {
 #[test]
 fn apply_schema_operation_schema_validation_rejects_unknown_fields() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let insert = source
         .insert_row(
             230,
@@ -614,7 +657,7 @@ fn apply_schema_operation_schema_validation_rejects_unknown_fields() {
     };
     fields[0].field_name = Cow::Borrowed("unknown_field");
 
-    let target = InMemoryData::with_static_schema(schema)
+    let target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(insert)
         .unwrap();
     let err = target.apply_schema_operation(update);
@@ -629,7 +672,8 @@ fn apply_schema_operation_schema_validation_rejects_unknown_fields() {
 #[test]
 fn apply_schema_operation_enforces_causal_order_for_linear_string_updates() {
     let schema = &*TEST_SCHEMA;
-    let mut source: InMemoryData<RowId, OperationId> = InMemoryData::with_static_schema(schema);
+    let mut source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let insert = source
         .insert_row(
             240,
@@ -668,7 +712,7 @@ fn apply_schema_operation_enforces_causal_order_for_linear_string_updates() {
     )
     .into_owned();
 
-    let target = InMemoryData::with_static_schema(schema)
+    let target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(insert)
         .unwrap();
 
@@ -691,8 +735,8 @@ fn apply_schema_operation_enforces_causal_order_for_linear_string_updates() {
 fn apply_schema_operation_duplicate_updates_can_succeed_or_fail_by_field_type() {
     let schema = &*TEST_SCHEMA;
 
-    let mut register_source: InMemoryData<RowId, OperationId> =
-        InMemoryData::with_static_schema(schema);
+    let mut register_source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let register_insert = register_source
         .insert_row(
             250,
@@ -719,7 +763,7 @@ fn apply_schema_operation_duplicate_updates_can_succeed_or_fail_by_field_type() 
     )
     .into_owned();
 
-    let register_target = InMemoryData::with_static_schema(schema)
+    let register_target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(register_insert)
         .unwrap()
         .apply_schema_operation(register_update.clone())
@@ -730,8 +774,8 @@ fn apply_schema_operation_duplicate_updates_can_succeed_or_fail_by_field_type() 
     let register_value: Cow<'_, u64> = schema["priority"].get_value(&register_row).unwrap();
     assert_eq!(*register_value, 9);
 
-    let mut string_source: InMemoryData<RowId, OperationId> =
-        InMemoryData::with_static_schema(schema);
+    let mut string_source: InMemoryStateData<RowId, OperationId> =
+        InMemoryStateData::with_static_schema(schema);
     let string_insert = string_source
         .insert_row(
             260,
@@ -758,7 +802,7 @@ fn apply_schema_operation_duplicate_updates_can_succeed_or_fail_by_field_type() 
     )
     .into_owned();
 
-    let string_target = InMemoryData::with_static_schema(schema)
+    let string_target = InMemoryStateData::with_static_schema(schema)
         .apply_schema_operation(string_insert)
         .unwrap()
         .apply_schema_operation(string_update.clone())

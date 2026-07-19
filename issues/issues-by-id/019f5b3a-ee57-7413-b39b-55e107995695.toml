@@ -1,0 +1,28 @@
+id = "019f5b3a-ee57-7413-b39b-55e107995695"
+ref = "flotsync-git-pvp"
+title = "Design application-facing record identity across group changes"
+body = """
+Design and implement application-facing record identity/projection semantics so membership or schema changes do not appear as duplicated rows to applications.
+
+Context:
+D01. flotsync-git-pow.4 intentionally materialises inline snapshots into a new group namespace and emits add/upsert events for those new-group rows.
+D02. That is acceptable for the current protocol slice, but it means repeated membership or schema changes can make the same logical records appear multiple times when an application observes rows by group-scoped RowId alone.
+D03. This work is blocked by flotsync-git-pow.4 because it should build on the first working inline activation path and its listener semantics.
+
+Scope:
+D04. Decide the long-term application-facing identity model for logical records across group changes, including whether identity is a stable record id, a dataset projection, a supersession relation, or another explicit API concept.
+D05. Define listener semantics so applications can distinguish true new records from records re-exposed in a new group after membership or schema change.
+D06. Define query/snapshot semantics that prevent duplicate logical rows by default while preserving access to group-scoped diagnostic/runtime views where needed.
+D07. Update the design documentation and API contracts with the chosen semantics.
+D08. Implement the runtime/storage/listener changes needed for the chosen model.
+D09. Add tests covering repeated membership/schema changes, overlapping rows between old and new groups, and application-level views without duplicate logical rows.
+
+Out of scope:
+D10. GroupClose protocol shape and old-group access-state enforcement; that is tracked separately in flotsync-git-lg9."""
+status = "open"
+type = "task"
+priority = 1
+labels = ["area:replication"]
+blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+created_at = "2026-07-13T11:26:56.59962Z"
+updated_at = "2026-07-13T11:26:56.59962Z"

@@ -1,0 +1,107 @@
+id = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
+ref = "flotsync-git-d3w"
+title = "Redesign application row interface to hide CRDT state"
+body = """
+Redesign the application-facing row interface so listeners and snapshot readers receive only current projected values, never cloned CRDT field state.
+
+Completed so far:
+P01. Rename-only vocabulary pre-pass was committed as bd5dce8.
+P02. Application-facing row values and compact snapshot value rows were introduced, with deterministic initial-state embedding using UpdateId::INITIAL_STATE_ORIGIN.
+P03. Partial review pass R01-R26 was implemented: protocol G-rule numbering, projected type-kind helpers, decode cleanup, private checked RowValues, row-major value batches, projection helper narrowing, embedding error naming, and full CRDT-state deterministic tests.
+P04. Full review pass R27-R49 was implemented: embedding terminology, ValueType, borrowed initial-value validation, snapshot value-row API cleanup, reusable snapshot batches, schema-aware pending-group initial row decode, and creator/member-index validation.
+P05. Compile-fix pass updated stale call sites in flotsync_messages, flotsync_io_examples, and secure_runtime for RowStateSnapshot, SnapshotValueRow, RowValueRead, and group_schema.
+
+Current agreed follow-up plan from 2026-07-17:
+R50. Deferred. RowStateSnapshot by-name projected access is inefficient on snapshot export, but fixing it locally would paper over a larger storage/API batching design flaw. P1 follow-up flotsync-git-vy1 tracks redesigning the interaction between replication API batching and storage API row-snapshot batch fetches.
+R51. Document precisely what Field::validate_field_value validates: nullability, replicated data-type shape, primitive/array compatibility, integer range compatibility, and finite-state compatibility for initial values, without normalising or building CRDT state.
+R52. Refactor public_api.rs owned validation helpers to delegate to borrowed/ref validation via as_ref where possible.
+R53. Update the validate_primitive_integer clippy reason to say validation path.
+R54. Remove bloaty value-name helpers where possible and use existing type formatting through value_type().to_string(), including ArrayType/BasicDataType display for ARRAY<...>.
+R55. Remove the Option representation from SnapshotValueRowBatch so empty has one representation while still retaining reusable InMemoryValueData allocations.
+R56. Simplify creator_first_member_order absent-creator test with assert_matches.
+R57. Keep the recent compile-fix changes in scope and validate the workspace/test paths they touched.
+
+Acceptance criteria:
+A01. Public listener events and snapshot rows expose projected values only, never CRDT row state.
+A02. Initial group value rows embed into deterministic CRDT state through the reserved initial-state origin.
+A03. Snapshot batches preserve useful value-buffer allocations across provider reuse.
+A04. Review comments R51-R57 are implemented; R50 is intentionally deferred to flotsync-git-vy1.
+
+Validation plan:
+T01. Run cargo fmt.
+T02. Run cargo check --workspace --tests.
+T03. Run cargo clippy -p flotsync_data_types -p flotsync_replication --tests -- -W clippy::pedantic.
+T04. Run targeted tests for affected data-types/replication paths as needed.
+T05. Run checklist example tests if compile-fix files remain touched.
+
+Context:
+C01. This blocks flotsync-git-pow.4.
+C02. Follow-up flotsync-git-a17 tracks explicit group leave semantics.
+C03. Follow-up flotsync-git-vy1 tracks the storage/API batching redesign discovered from R50."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+labels = [
+    "area:api",
+    "area:replication",
+]
+assignee = "codex"
+blocks = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
+created_at = "2026-07-14T18:25:44.890654Z"
+updated_at = "2026-07-17T13:29:16.576387Z"
+closed_at = "2026-07-17T13:29:16.576387Z"
+
+[[comments]]
+id = "019f64a6-4adf-7413-8230-2548d36d40a3"
+author = "lkroll"
+body = "Implemented the agreed vocabulary pre-pass. CRDT state carriers now use `State` names (`InMemoryFieldState`, `InMemoryStateData`, `OwnedStateRow`, store row state patch/write/batch names, row state snapshots, etc.), sparse application write payloads now use `RowValuesPatch`, and initial inline snapshot row payloads now use `InitialValueRow` / `InitialDatasetValueRows` / `InitialGroupValueRows`. Added the planned TODOs for decoupling `RowOperations` and for deterministic state materialisation from initial values. `SnapshotRows`/`SnapshotRow` remain unchanged until the projection redesign because they still carry state today."
+created_at = "2026-07-15T07:20:47.583337Z"
+
+[[comments]]
+id = "019f64f1-afa7-78a3-bd20-3e621d65d8e5"
+author = "lkroll"
+body = "Implemented value-interface rework: data-types now has operation-id-free RowValueRead, RowOperations, Decode, RowValues, compact InMemoryValueData batches, and deterministic materialisation from complete values into state via the reserved initial origin. Replication events and snapshot batches now project to values before crossing the public API boundary. Protocol docs define UpdateId(0,0) as synthetic initial-state origin and require the new group creator or proposer to be member index 0. Current live group creation and inbound bootstrap validation enforce that rule; migration proposal construction is not live yet, so flotsync-git-pow.4 must enforce the same rule where it introduces the proposal construction path. Validation passed: cargo fmt; cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_data_types -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_data_types --tests -- --test-threads=1; cargo test -p flotsync_replication --tests -- --test-threads=1; amm scripts/okf-docs.sc generate-index; amm scripts/okf-docs.sc check."
+created_at = "2026-07-15T08:43:08.583965Z"
+
+[[comments]]
+id = "019f6542-6575-7f42-8064-cc1a4acc7535"
+author = "lkroll"
+body = "Partial review plan agreed. Follow-up implementation is intentionally paused at user request. The review plan covers protocol G-rule renumbering; projected type-kind helpers on NullableBasicValueRef/BasicValueRef; decode helper cleanup; checked RowValues construction with explicit unchecked paths; row metadata/value-batch naming and row-major layout fixes; safer push_row ordering and row offset indexing; projection helper narrowing with From wrappers; materialisation error naming; deterministic full CRDT-state equality tests; and P19 specifically prefers an inherent projection helper where the concrete linear string state type allows it."
+created_at = "2026-07-15T10:11:18.005744Z"
+
+[[comments]]
+id = "019f693a-a35f-7840-a285-bef839e16237"
+author = "lkroll"
+body = "Implemented the agreed partial review fixes R01-R24/R26: protocol G-rule numbering is fixed; projected value kind reporting lives on datamodel refs; decode helpers use require_not_null and branch-local mismatch values without cloning; RowValues is checked/private with explicit unchecked wire-boundary construction; materialisation errors and row-id handling are clearer; projection helpers return narrower types with ProjectedFieldValue wrappers; value batches use row metadata naming, row-major documentation, consistent push_row mutation, and precomputed row offsets; deterministic materialisation test now compares full CRDT row snapshots. Validation passed: cargo fmt; cargo check -p flotsync_data_types --tests; cargo check -p flotsync_replication --tests; cargo clippy -p flotsync_data_types -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_data_types --tests -- --test-threads=1; cargo test -p flotsync_replication --tests -- --test-threads=1; amm scripts/okf-docs.sc generate-index; amm scripts/okf-docs.sc check."
+created_at = "2026-07-16T04:41:18.431047Z"
+
+[[comments]]
+id = "019f69a9-a43b-7720-82ab-8e7ccf9082db"
+author = "lkroll"
+body = "Implemented full review pass R27-R49. Highlights: embedding terminology replaces initial-value materialisation naming; ValueType moved to schema/mod.rs; RowValues validation uses borrowed Field::can_initial; snapshot value-row aliases were removed and batches now reuse InMemoryValueData allocation; RowStateSnapshot implements RowValueRead so runtime avoids temporary InMemoryStateData; pending-group inline rows decode with schema context; create/bootstrap validation now reports creator/member-index issues precisely. Validation passed: cargo fmt; cargo check -p flotsync_data_types -p flotsync_replication; cargo test -p flotsync_data_types --test public_api_tests -- --test-threads=1; cargo test -p flotsync_replication runtime::component::tests -- --test-threads=1; cargo test -p flotsync_replication pending_group -- --test-threads=1; amm scripts/okf-docs.sc generate-index; amm scripts/okf-docs.sc check."
+created_at = "2026-07-16T06:42:33.147624Z"
+
+[[comments]]
+id = "019f69ae-3fc7-7d52-bbc4-309fab720d96"
+author = "lkroll"
+body = "Follow-up cleanup after the first clippy pass: merged duplicated integer validation arms, removed the public batch helper panic path, and boxed the new pending initial-row schema error source.  now passes cleanly."
+created_at = "2026-07-16T06:47:35.111378Z"
+
+[[comments]]
+id = "019f69ae-854e-78b2-afb6-6cadb6af3b45"
+author = "lkroll"
+body = "Correction to previous comment: cargo clippy -p flotsync_data_types -p flotsync_replication --tests -- -W clippy::pedantic now passes cleanly after the follow-up cleanup."
+created_at = "2026-07-16T06:47:52.910459Z"
+
+[[comments]]
+id = "019f6ee7-b2ac-75d1-9af2-878f7ff9bb3a"
+author = "lkroll"
+body = "Implemented follow-up review pass R51-R57. R50 is intentionally deferred to P1 follow-up flotsync-git-vy1, which covers the broader replication snapshot batching and storage row batch API redesign. Validation passed: cargo fmt; cargo check --workspace --tests; cargo clippy -p flotsync_data_types -p flotsync_replication --tests -- -W clippy::pedantic; cargo test -p flotsync_data_types --test public_api_tests -- --test-threads=1; cargo test -p flotsync_replication runtime::component::tests -- --test-threads=1; cargo test -p flotsync_io_examples replicated_checklist -- --test-threads=1 --format terse."
+created_at = "2026-07-17T07:08:26.156063Z"
+
+[[comments]]
+id = "019f7044-5e20-7d92-8a60-d74befc9cd2b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-17T13:29:16.576387Z"
