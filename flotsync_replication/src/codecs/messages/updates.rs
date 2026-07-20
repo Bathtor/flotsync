@@ -50,11 +50,7 @@ impl proto::ProtoCodecWith<MemberCountContext> for UpdateMessage {
         if proto.dataset_updates.is_empty() {
             return EmptyUpdateSnafu.fail();
         }
-        let dataset_updates = proto
-            .dataset_updates
-            .into_iter()
-            .map(DatasetUpdateMessage::decode_proto)
-            .collect::<Result<_, _>>()?;
+        let dataset_updates = DatasetUpdateMessage::decode_proto_collection(proto.dataset_updates)?;
         Ok(Self {
             group_id,
             update_id,
@@ -97,11 +93,8 @@ impl DecodeProtoViewWith<MemberCountContext> for UpdateMessage {
         if proto.dataset_updates.is_empty() {
             return EmptyUpdateSnafu.fail();
         }
-        let dataset_updates = proto
-            .dataset_updates
-            .iter()
-            .map(DatasetUpdateMessage::decode_proto_view)
-            .collect::<Result<_, _>>()?;
+        let dataset_updates =
+            DatasetUpdateMessage::decode_proto_view_collection(&proto.dataset_updates)?;
         Ok(Self {
             group_id,
             update_id,
@@ -390,11 +383,7 @@ impl proto::ProtoCodec for NeedRangeMessage {
     fn to_proto(&self) -> Self::Proto {
         replication_proto::NeedRange {
             group_id: self.group_id.0.as_bytes().to_vec(),
-            ranges: self
-                .ranges
-                .iter()
-                .map(UpdateRangeMessage::encode_proto)
-                .collect(),
+            ranges: UpdateRangeMessage::encode_proto_collection(&self.ranges),
             ..replication_proto::NeedRange::default()
         }
     }
@@ -408,11 +397,7 @@ impl proto::ProtoCodec for NeedRangeMessage {
         if message.ranges.is_empty() {
             return EmptyNeedRangeSnafu.fail();
         }
-        let ranges = message
-            .ranges
-            .into_iter()
-            .map(UpdateRangeMessage::decode_proto)
-            .collect::<Result<_, _>>()?;
+        let ranges = UpdateRangeMessage::decode_proto_collection(message.ranges)?;
         Ok(Self { group_id, ranges })
     }
 }
@@ -430,11 +415,7 @@ impl DecodeProtoView for NeedRangeMessage {
         if message.ranges.is_empty() {
             return EmptyNeedRangeSnafu.fail();
         }
-        let ranges = message
-            .ranges
-            .iter()
-            .map(UpdateRangeMessage::decode_proto_view)
-            .collect::<Result<_, _>>()?;
+        let ranges = UpdateRangeMessage::decode_proto_view_collection(&message.ranges)?;
         Ok(Self { group_id, ranges })
     }
 }
@@ -468,11 +449,7 @@ impl proto::ProtoCodecWith<MemberCountContext> for UpdateBatchMessage {
         if proto.updates.is_empty() {
             return EmptyUpdateBatchSnafu.fail();
         }
-        let updates = proto
-            .updates
-            .into_iter()
-            .map(|update| UpdateMessage::decode_proto_with(update, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let updates: Vec<_> = UpdateMessage::decode_proto_collection_with(proto.updates, context)?;
         validate_update_batch_groups(group_id, &updates)?;
         Ok(Self { group_id, updates })
     }
@@ -494,11 +471,8 @@ impl DecodeProtoViewWith<MemberCountContext> for UpdateBatchMessage {
         if proto.updates.is_empty() {
             return EmptyUpdateBatchSnafu.fail();
         }
-        let updates = proto
-            .updates
-            .iter()
-            .map(|update| UpdateMessage::decode_proto_view_with(update, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let updates: Vec<_> =
+            UpdateMessage::decode_proto_view_collection_with(&proto.updates, context)?;
         validate_update_batch_groups(group_id, &updates)?;
         Ok(Self { group_id, updates })
     }

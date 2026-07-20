@@ -62,7 +62,6 @@ use flotsync_messages::{
     replication as replication_proto,
     wire as message_wire,
 };
-use smallvec::SmallVec;
 use snafu::prelude::*;
 use uuid::Uuid;
 
@@ -256,12 +255,9 @@ impl EncodeProto for GroupInvitation {
             group_id: message_wire::group_id_to_wire_bytes(self.group_id),
             source: MessageField::some(EncodeProto::encode_proto(&self.source)),
             proposed_members: encode_member_identities(&self.proposed_members),
-            dataset_schemas: self
-                .group_schema
-                .datasets()
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            dataset_schemas: DatasetSchema::encode_proto_collection(
+                self.group_schema.datasets().iter(),
+            ),
             initial_snapshot: MessageField::some(EncodeProto::encode_proto(&self.initial_snapshot)),
             group_name: self.group_name.clone(),
             message: self.message.clone(),
@@ -459,12 +455,9 @@ impl EncodeProto for MigrationProposal {
                 VersionVectorProtoCodec::from(&self.final_versions).encode_proto(),
             ),
             proposed_members: encode_member_identities(&self.proposed_members),
-            dataset_schemas: self
-                .group_schema
-                .datasets()
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            dataset_schemas: DatasetSchema::encode_proto_collection(
+                self.group_schema.datasets().iter(),
+            ),
             initial_snapshot: MessageField::some(EncodeProto::encode_proto(&self.initial_snapshot)),
             group_name: self.group_name.clone(),
             message: self.message.clone(),
@@ -725,11 +718,7 @@ impl EncodeProto for InitialGroupValueRows {
 
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialGroupState {
-            datasets: self
-                .datasets
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            datasets: InitialDatasetValueRows::encode_proto_collection(&self.datasets),
             ..replication_proto::InitialGroupState::default()
         }
     }
@@ -743,11 +732,8 @@ impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialGroupValueRows {
         state: Self::Proto,
         group_schema: &'schema GroupSchema,
     ) -> Result<Self, Self::Error> {
-        let datasets = state
-            .datasets
-            .into_iter()
-            .map(|dataset| InitialDatasetValueRows::decode_proto_with(dataset, group_schema))
-            .collect::<Result<_, _>>()?;
+        let datasets =
+            InitialDatasetValueRows::decode_proto_collection_with(state.datasets, group_schema)?;
         Ok(Self { datasets })
     }
 }
@@ -760,11 +746,10 @@ impl<'schema> DecodeProtoViewWith<&'schema GroupSchema> for InitialGroupValueRow
         state: &Self::ProtoView<'_>,
         group_schema: &'schema GroupSchema,
     ) -> Result<Self, Self::Error> {
-        let datasets = state
-            .datasets
-            .iter()
-            .map(|dataset| InitialDatasetValueRows::decode_proto_view_with(dataset, group_schema))
-            .collect::<Result<_, _>>()?;
+        let datasets = InitialDatasetValueRows::decode_proto_view_collection_with(
+            &state.datasets,
+            group_schema,
+        )?;
         Ok(Self { datasets })
     }
 }
@@ -775,7 +760,7 @@ impl EncodeProto for InitialDatasetValueRows {
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialDatasetState {
             dataset_id: self.dataset_id.to_string(),
-            rows: self.rows.iter().map(EncodeProto::encode_proto).collect(),
+            rows: InitialValueRow::encode_proto_collection(&self.rows),
             ..replication_proto::InitialDatasetState::default()
         }
     }
@@ -799,19 +784,11 @@ impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialDatasetValueRows 
                 .context(MissingInitialDatasetSchemaSnafu {
                     dataset_id: dataset_id.clone(),
                 })?;
-        let rows = dataset
-            .rows
-            .into_iter()
-            .map(|row| {
-                InitialValueRow::decode_proto_with(
-                    row,
-                    InitialValueRowDecodeContext {
-                        dataset_id: &dataset_id,
-                        schema,
-                    },
-                )
-            })
-            .collect::<Result<_, _>>()?;
+        let row_context = InitialValueRowDecodeContext {
+            dataset_id: &dataset_id,
+            schema,
+        };
+        let rows = InitialValueRow::decode_proto_collection_with(dataset.rows, row_context)?;
         Ok(Self { dataset_id, rows })
     }
 }
@@ -834,19 +811,11 @@ impl<'schema> DecodeProtoViewWith<&'schema GroupSchema> for InitialDatasetValueR
                 .with_context(|| MissingInitialDatasetSchemaSnafu {
                     dataset_id: dataset_id.clone(),
                 })?;
-        let rows = dataset
-            .rows
-            .iter()
-            .map(|row| {
-                InitialValueRow::decode_proto_view_with(
-                    row,
-                    InitialValueRowDecodeContext {
-                        dataset_id: &dataset_id,
-                        schema,
-                    },
-                )
-            })
-            .collect::<Result<_, _>>()?;
+        let row_context = InitialValueRowDecodeContext {
+            dataset_id: &dataset_id,
+            schema,
+        };
+        let rows = InitialValueRow::decode_proto_view_collection_with(&dataset.rows, row_context)?;
         Ok(Self { dataset_id, rows })
     }
 }
@@ -951,11 +920,7 @@ impl EncodeProto for InitialSnapshotMetadata {
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialSnapshotMetadata {
             primary_ref: MessageField::some(EncodeProto::encode_proto(&self.primary_ref)),
-            equivalent_refs: self
-                .equivalent_refs
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            equivalent_refs: SnapshotRef::encode_proto_collection(&self.equivalent_refs),
             record_count: self.record_count,
             ..replication_proto::InitialSnapshotMetadata::default()
         }
@@ -974,18 +939,12 @@ impl DecodeProto for InitialSnapshotMetadata {
                 versions_field: "initial_snapshot_metadata.primary_ref.versions",
             },
         )?;
-        let equivalent_refs = metadata
-            .equivalent_refs
-            .into_iter()
-            .map(|snapshot_ref| {
-                SnapshotRef::decode_proto_with(
-                    snapshot_ref,
-                    SnapshotRefDecodeContext {
-                        versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
-                    },
-                )
-            })
-            .collect::<Result<SmallVec<[SnapshotRef; 1]>, _>>()?;
+        let equivalent_refs = SnapshotRef::decode_proto_collection_with(
+            metadata.equivalent_refs,
+            SnapshotRefDecodeContext {
+                versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
+            },
+        )?;
         Ok(Self {
             primary_ref,
             equivalent_refs,
@@ -1010,18 +969,12 @@ impl DecodeProtoView for InitialSnapshotMetadata {
                 versions_field: "initial_snapshot_metadata.primary_ref.versions",
             },
         )?;
-        let equivalent_refs = metadata
-            .equivalent_refs
-            .iter()
-            .map(|snapshot_ref| {
-                SnapshotRef::decode_proto_view_with(
-                    snapshot_ref,
-                    SnapshotRefDecodeContext {
-                        versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
-                    },
-                )
-            })
-            .collect::<Result<SmallVec<[SnapshotRef; 1]>, _>>()?;
+        let equivalent_refs = SnapshotRef::decode_proto_view_collection_with(
+            &metadata.equivalent_refs,
+            SnapshotRefDecodeContext {
+                versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
+            },
+        )?;
         Ok(Self {
             primary_ref,
             equivalent_refs,

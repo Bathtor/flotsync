@@ -1,13 +1,84 @@
 id = "019f5761-b690-7ee0-9d3a-416aa365e213"
 ref = "flotsync-git-gkd"
 title = "Add collection helpers for protobuf codecs"
-body = "Add default helpers to the EncodeProto/DecodeProto scheme for repeated fields and common collection conversions, so codecs do not need to hand-write trivial iter().map(...).collect() and into_iter().map(...).collect() logic. This was discovered while addressing the pending group-decision storage review batch."
-status = "open"
+body = """
+Add symmetric collection helpers to the established protobuf codec traits and adopt them wherever collection conversion is a direct application of those traits.
+
+Agreed holistic plan:
+
+P1. Add EncodeProto::encode_proto_collection. It accepts borrowed values and returns any FromIterator collection of owned generated protobuf messages. It covers 9 current production call sites.
+
+P2. Add DecodeProto::decode_proto_collection. It consumes owned generated messages, preserves element order and first-error propagation, and returns any FromIterator runtime collection. It covers 3 current production call sites.
+
+P3. Add DecodeProtoView::decode_proto_view_collection. It accepts iterators over generated borrowed views without owning those protobuf messages. It covers 3 current production call sites.
+
+P4. Add DecodeProtoWith::decode_proto_collection_with. It copies one Copy context for each owned element and covers 4 current production call sites. The Copy restriction makes the repeated per-element cost explicit and limits this convenience to cheap values or references instead of hiding potentially expensive clones.
+
+P5. Add DecodeProtoViewWith::decode_proto_view_collection_with. It combines borrowed-view iteration with the same Copy-context restriction and covers 4 current production call sites.
+
+P6. Adopt P1-P5 across the 23 direct production conversions in flotsync_replication and flotsync_discovery. Preserve generic FromIterator output so Vec and SmallVec call sites infer their existing collection types.
+
+P7. Leave 13 custom collection-shaped codec sites explicit: 3 group-setup member-key conversions, 2 checked group-schema decoders, 3 initial-row field conversions, 3 member-identity wire conversions, 1 stored dataset-update adapter, and 1 raw schema-operation view materialisation. Do not add mapping-closure overloads for these cases because their conversion-specific logic should remain visible.
+
+P8. Add flotsync_messages unit tests covering empty and ordered collections, generic output collection types, owned and borrowed-view decoding, contextual decoding, and first-error propagation.
+
+P9. Validate with formatting, flotsync_messages tests, the complete serial replication suite, all-target cargo checks, pedantic Clippy, the Rust instruction audit, and git diff checks.
+
+Concrete API:
+
+- EncodeProto::encode_proto_collection<'a, C>(values: impl IntoIterator<Item = &'a Self>) -> C where Self: 'a, C: FromIterator<Self::Proto>.
+- DecodeProto::decode_proto_collection<C>(protos: impl IntoIterator<Item = Self::Proto>) -> Result<C, Self::Error> where C: FromIterator<Self>.
+- DecodeProtoView::decode_proto_view_collection<'proto, 'view, C>(protos: impl IntoIterator<Item = &'view Self::ProtoView<'proto>>) -> Result<C, Self::Error> where 'proto: 'view, Self::ProtoView<'proto>: 'view, C: FromIterator<Self>.
+- DecodeProtoWith::decode_proto_collection_with<C>(protos: impl IntoIterator<Item = Self::Proto>, context: Context) -> Result<C, Self::Error> where Context: Copy, C: FromIterator<Self>.
+- DecodeProtoViewWith::decode_proto_view_collection_with<'proto, 'view, C>(protos: impl IntoIterator<Item = &'view Self::ProtoView<'proto>>, context: Context) -> Result<C, Self::Error> where 'proto: 'view, Self::ProtoView<'proto>: 'view, Context: Copy, C: FromIterator<Self>.
+
+Coverage and priority:
+
+- P1-P3 cover 15 of 23 direct cases with the smallest API surface.
+- P4-P5 cover the remaining 8 direct contextual cases. All four current production context shapes are Copy, so tightening Clone to Copy requires no call-site changes.
+- Together P1-P5 remove all direct EncodeProto/DecodeProto collection boilerplate while retaining the 13 intentionally custom conversions.
+- Single-value contextual decode APIs continue to support non-Copy contexts; only the collection conveniences are restricted.
+
+Estimated change size:
+
+P10. Trait methods and documentation: approximately 75-125 changed LOC, including the Copy-bound review refinement.
+
+P11. Tests and call-site adoption: approximately 210-340 changed LOC, with the call-site portion expected to be a net deletion.
+
+P12. Total: approximately 285-465 changed LOC, below 1,000 LOC; no task split is needed."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 created_at = "2026-07-12T17:30:49.360312Z"
-updated_at = "2026-07-12T17:58:59.273296Z"
+updated_at = "2026-07-20T15:10:30.101121Z"
+closed_at = "2026-07-20T15:10:30.101121Z"
 
 [[links]]
 target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
 label = "discovered from"
+
+[[comments]]
+id = "019f7ff7-7922-7aa2-97d6-a079d3ff73e1"
+author = "codex"
+body = "Implementation complete for review. Added the five agreed default collection methods and adopted them across all 23 direct production conversions (P1-P6). The borrowed-view signatures also include the compiler-required Self::ProtoView<'proto>: 'view bound. The 13 conversion-specific pipelines remain explicit as planned (P7). Added coverage for empty encode/decode, input order, generic VecDeque output, first-error propagation, owned and borrowed views, and contextual decoding (P8). Final diff is 285 insertions and 148 deletions: 433 changed lines, within the 285-465 estimate. Validation passed: cargo fmt check; flotsync_messages 38 unit + 7 public API tests; flotsync_discovery 28 tests; flotsync_replication 206 unit + 6 integration tests with all features; workspace all-target check; workspace all-target/all-feature pedantic Clippy; Rust instruction audit against the root AGENTS.md; git diff check. Pattern verification finds no remaining direct production collection conversions; only the intentionally custom stored dataset-update adapter remains alongside helper implementations and test setup."
+created_at = "2026-07-20T14:39:12.674879Z"
+
+[[comments]]
+id = "019f800c-59a6-7ed1-8cc5-c69450da11ea"
+author = "codex"
+body = "Review refinement agreed: restrict both contextual collection helpers to Context: Copy and document that the restriction prevents a potentially expensive clone from being hidden for every collection member. All eight adopted contextual call sites already use one of four Copy context shapes, so no production call-site churn is expected. Single-value contextual decoders retain support for non-Copy contexts."
+created_at = "2026-07-20T15:02:00.870323Z"
+
+[[comments]]
+id = "019f800e-bd5e-7e10-83b5-7257856a0a42"
+author = "codex"
+body = "Review refinement implemented: both contextual collection helpers now require Context: Copy and pass the context directly. Their public documentation explicitly explains that collection decoding duplicates context for every member and that Copy prevents hidden per-member clone costs by limiting the convenience to cheap values or references. All eight production contextual call sites remain unchanged. Validation passed: formatting, 38 message unit tests plus 7 public API tests, 206 replication unit tests plus 6 integration tests, workspace all-target check, workspace all-target/all-feature pedantic Clippy, Rust instruction audit, and git diff check."
+created_at = "2026-07-20T15:04:37.470377Z"
+
+[[comments]]
+id = "019f8014-1ed5-7231-bbe9-431d97d3a4d7"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-20T15:10:30.101121Z"

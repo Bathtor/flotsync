@@ -137,11 +137,7 @@ impl DecodeProto for DecodedPeer {
             discovery_protocol_error::EmptyPeerRoutesSnafu
         );
         let instance_id = uuid_from_wire(&peer.instance_uuid, "Peer.instance_uuid")?;
-        let mut listening_on = Vec::with_capacity(peer.listening_on.len());
-        for route in peer.listening_on {
-            let route = DiscoveryRoute::decode_proto(route)?;
-            listening_on.push(route);
-        }
+        let listening_on = DiscoveryRoute::decode_proto_collection(peer.listening_on)?;
         Ok(Self {
             instance_id,
             listening_on,
@@ -159,11 +155,7 @@ impl DecodeProtoView for DecodedPeer {
             discovery_protocol_error::EmptyPeerRoutesSnafu
         );
         let instance_id = uuid_from_wire(peer.instance_uuid, "Peer.instance_uuid")?;
-        let mut listening_on = Vec::with_capacity(peer.listening_on.len());
-        for route in &peer.listening_on {
-            let route = DiscoveryRoute::decode_proto_view(route)?;
-            listening_on.push(route);
-        }
+        let listening_on = DiscoveryRoute::decode_proto_view_collection(&peer.listening_on)?;
         Ok(Self {
             instance_id,
             listening_on,

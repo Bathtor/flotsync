@@ -99,11 +99,7 @@ impl EncodeProto for UpdateBatchMessageView<'_> {
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::UpdateBatch {
             group_id: self.group_id.0.as_bytes().to_vec(),
-            updates: self
-                .updates
-                .iter()
-                .map(|update| update.view().encode_proto())
-                .collect(),
+            updates: UpdateMessage::encode_proto_collection(self.updates.iter()),
             ..replication_proto::UpdateBatch::default()
         }
     }
@@ -121,10 +117,9 @@ impl DatasetUpdateProtoSources<'_> {
     /// Encode every borrowed dataset update into generated protobuf entries.
     fn encode_proto(&self) -> Vec<replication_proto::DatasetUpdate> {
         match self {
-            Self::Messages(dataset_updates) => dataset_updates
-                .iter()
-                .map(|message| message.view().encode_proto())
-                .collect(),
+            Self::Messages(dataset_updates) => {
+                DatasetUpdateMessage::encode_proto_collection(dataset_updates.iter())
+            }
             Self::Records(dataset_updates) => dataset_updates
                 .iter()
                 .map(|record| DatasetUpdateMessageView::from(record).encode_proto())
