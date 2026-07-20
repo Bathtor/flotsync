@@ -69,136 +69,112 @@ impl EncodeProtoOneof for RuntimeMessage {
     }
 }
 
-/// One decoded wire message before all runtime context is available.
-///
-/// Bootstrap messages can decode directly into their runtime form, but inbound
-/// updates and summaries may still carry compact version encodings that need
-/// the hosted group member count before they can become a full `VersionVector`.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum WireRuntimeMessage {
-    Update(WireUpdateMessage),
-    SummaryRequest(SummaryRequestMessage),
-    Summary(WireSummaryMessage),
-    NeedRange(NeedRangeMessage),
-    UpdateBatch(WireUpdateBatchMessage),
-    GroupInvitation(GroupInvitationMessage),
-    MigrationProposal(MigrationProposalMessage),
-}
-
-impl WireRuntimeMessage {
-    /// Return the replication group that scopes this message on delivery.
-    pub(crate) fn group_id(&self) -> GroupId {
-        match self {
-            Self::Update(message) => message.group_id,
-            Self::SummaryRequest(message) => message.group_id,
-            Self::Summary(message) => message.group_id,
-            Self::NeedRange(message) => message.group_id,
-            Self::UpdateBatch(message) => message.group_id,
-            Self::GroupInvitation(message) => message.invitation.group_id,
-            Self::MigrationProposal(message) => message.proposal.migration_id.old_group_id,
-        }
-    }
-}
-
-impl DecodeProto for WireRuntimeMessage {
+impl DecodeProtoWith<RuntimeMessageDecodeContext<'_>> for RuntimeMessage {
     type Error = RuntimeMessageError;
     type Proto = replication_proto::RuntimeMessage;
 
-    fn decode_proto(message: Self::Proto) -> Result<Self, Self::Error> {
-        <Self as DecodeProtoOneof>::decode_required_proto(
-            message.body,
-            RuntimeMessageOneofContext::Body,
-        )
-    }
-}
-
-impl DecodeProtoOneof for WireRuntimeMessage {
-    type Error = RuntimeMessageError;
-    type Proto = replication_proto::runtime_message::Body;
-
-    fn decode_proto(body: Self::Proto) -> Result<Self, Self::Error> {
+    fn decode_proto_with(
+        message: Self::Proto,
+        context: RuntimeMessageDecodeContext<'_>,
+    ) -> Result<Self, Self::Error> {
+        let Some(body) = message.body else {
+            return MissingBodySnafu.fail();
+        };
         match body {
             replication_proto::runtime_message::Body::Update(message) => {
-                let message = WireUpdateMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::Update(message))
+                let member_count =
+                    member_count_context(&message.group_id, "update.group_id", context)?;
+                let message = UpdateMessage::decode_proto_with(*message, member_count)?;
+                Ok(Self::Update(Box::new(message)))
             }
             replication_proto::runtime_message::Body::SummaryRequest(message) => {
                 let message = SummaryRequestMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::SummaryRequest(message))
+                Ok(Self::SummaryRequest(message))
             }
             replication_proto::runtime_message::Body::Summary(message) => {
-                let message = WireSummaryMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::Summary(message))
+                let member_count =
+                    member_count_context(&message.group_id, "summary.group_id", context)?;
+                let message = SummaryMessage::decode_proto_with(*message, member_count)?;
+                Ok(Self::Summary(message))
             }
             replication_proto::runtime_message::Body::NeedRange(message) => {
                 let message = NeedRangeMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::NeedRange(message))
+                Ok(Self::NeedRange(message))
             }
             replication_proto::runtime_message::Body::UpdateBatch(message) => {
-                let message = WireUpdateBatchMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::UpdateBatch(message))
+                let member_count =
+                    member_count_context(&message.group_id, "update_batch.group_id", context)?;
+                let message = UpdateBatchMessage::decode_proto_with(*message, member_count)?;
+                Ok(Self::UpdateBatch(message))
             }
             replication_proto::runtime_message::Body::GroupInvitation(message) => {
                 let message = GroupInvitationMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::GroupInvitation(message))
+                Ok(Self::GroupInvitation(message))
             }
             replication_proto::runtime_message::Body::MigrationProposal(message) => {
                 let message = MigrationProposalMessage::decode_proto(*message)?;
-                Ok(WireRuntimeMessage::MigrationProposal(message))
+                Ok(Self::MigrationProposal(message))
             }
         }
     }
 }
 
-impl DecodeProtoView for WireRuntimeMessage {
+impl DecodeProtoViewWith<RuntimeMessageDecodeContext<'_>> for RuntimeMessage {
     type Error = RuntimeMessageError;
     type ProtoView<'a> = replication_proto::RuntimeMessageView<'a>;
 
-    fn decode_proto_view(message: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+    fn decode_proto_view_with(
+        message: &Self::ProtoView<'_>,
+        context: RuntimeMessageDecodeContext<'_>,
+    ) -> Result<Self, Self::Error> {
         let Some(body) = message.body.as_ref() else {
             return MissingBodySnafu.fail();
         };
         match body {
             replication_proto::runtime_message::BodyView::Update(message) => {
-                let message = WireUpdateMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::Update(message))
+                let member_count =
+                    member_count_context(message.group_id, "update.group_id", context)?;
+                let message = UpdateMessage::decode_proto_view_with(message, member_count)?;
+                Ok(Self::Update(Box::new(message)))
             }
             replication_proto::runtime_message::BodyView::SummaryRequest(message) => {
                 let message = SummaryRequestMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::SummaryRequest(message))
+                Ok(Self::SummaryRequest(message))
             }
             replication_proto::runtime_message::BodyView::Summary(message) => {
-                let message = WireSummaryMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::Summary(message))
+                let member_count =
+                    member_count_context(message.group_id, "summary.group_id", context)?;
+                let message = SummaryMessage::decode_proto_view_with(message, member_count)?;
+                Ok(Self::Summary(message))
             }
             replication_proto::runtime_message::BodyView::NeedRange(message) => {
                 let message = NeedRangeMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::NeedRange(message))
+                Ok(Self::NeedRange(message))
             }
             replication_proto::runtime_message::BodyView::UpdateBatch(message) => {
-                let message = WireUpdateBatchMessage::decode_proto_view(message)?;
-                Ok(WireRuntimeMessage::UpdateBatch(message))
+                let member_count =
+                    member_count_context(message.group_id, "update_batch.group_id", context)?;
+                let message = UpdateBatchMessage::decode_proto_view_with(message, member_count)?;
+                Ok(Self::UpdateBatch(message))
             }
             replication_proto::runtime_message::BodyView::GroupInvitation(message) => {
-                // TODO(flotsync-git-i20): add borrowed contextual decoders for
-                // pending-group payloads so view decoding does not first own
-                // the generated payload.
-                let message =
-                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
-                        .context(DecodeSnafu)?;
-                let message = GroupInvitationMessage::decode_proto(message)?;
-                Ok(WireRuntimeMessage::GroupInvitation(message))
+                let message = GroupInvitationMessage::decode_proto_view(message)?;
+                Ok(Self::GroupInvitation(message))
             }
             replication_proto::runtime_message::BodyView::MigrationProposal(message) => {
-                // TODO(flotsync-git-i20): add borrowed contextual decoders for
-                // pending-group payloads so view decoding does not first own
-                // the generated payload.
-                let message =
-                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
-                        .context(DecodeSnafu)?;
-                let message = MigrationProposalMessage::decode_proto(message)?;
-                Ok(WireRuntimeMessage::MigrationProposal(message))
+                let message = MigrationProposalMessage::decode_proto_view(message)?;
+                Ok(Self::MigrationProposal(message))
             }
         }
     }
+}
+
+/// Resolve the compact-vector member count from one message group id.
+fn member_count_context(
+    group_id: &[u8],
+    field: &'static str,
+    context: RuntimeMessageDecodeContext<'_>,
+) -> Result<MemberCountContext, RuntimeMessageError> {
+    let group_id = group_id_from_wire(group_id, field).context(InvalidWireValueSnafu { field })?;
+    context.member_count_for(group_id)
 }

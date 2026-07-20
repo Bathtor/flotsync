@@ -24,7 +24,7 @@ use crate::{
         SchemaSource,
         SnapshotRef,
     },
-    codecs::messages::{RuntimeVersionVectorProtoSource, WireVersionVector},
+    codecs::messages::VersionVectorProtoCodec,
     delivery::wire::{
         group_id_from_wire,
         member_identity_from_wire,
@@ -32,10 +32,12 @@ use crate::{
     },
     runtime::BoxedError,
 };
-use flotsync_core::{GroupId, MemberIdentity, versions::VersionVector};
+#[cfg(test)]
+use flotsync_core::GroupId;
+use flotsync_core::MemberIdentity;
 use flotsync_data_types::InMemoryValueDataError;
 use flotsync_messages::{
-    buffa::MessageField,
+    buffa::{MessageField, MessageView as _},
     codecs::{
         datamodel::{
             CodecError as DatamodelCodecError,
@@ -48,6 +50,8 @@ use flotsync_messages::{
         self,
         DecodeProto,
         DecodeProtoOneof,
+        DecodeProtoView,
+        DecodeProtoViewWith,
         DecodeProtoWith,
         EncodeProto,
         EncodeProtoOneof,
@@ -58,9 +62,7 @@ use flotsync_messages::{
     replication as replication_proto,
     wire as message_wire,
 };
-use smallvec::SmallVec;
 use snafu::prelude::*;
-use std::num::NonZeroUsize;
 use uuid::Uuid;
 
 /// Generated payload body stored for one pending group work row.
@@ -70,13 +72,6 @@ pub(crate) enum PendingGroupPayloadKind {
     GroupInvitation,
     /// Payload bytes contain a [`replication_proto::MigrationProposalPayload`].
     MigrationProposal,
-}
-
-/// Store-provided context required to expand compact version vectors.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PendingGroupPayloadDecodeContext {
-    /// Member count for the old group when the payload references one.
-    pub(crate) old_group_member_count: Option<NonZeroUsize>,
 }
 
 /// Failure while decoding or validating a stored pending group payload.
@@ -96,14 +91,6 @@ pub enum PendingGroupPayloadError {
     /// Group schema payload listed the same dataset more than once.
     #[snafu(display("Pending group schema contained duplicate dataset id '{dataset_id}'."))]
     DuplicateDatasetSchema { dataset_id: DatasetId },
-    /// A compact version vector required old-group member-count context.
-    #[snafu(display(
-        "Pending payload version-vector field '{field}' for group {group_id} needs member-count context."
-    ))]
-    MissingVersionVectorContext {
-        field: &'static str,
-        group_id: GroupId,
-    },
     /// A wire-format group, member, or similarly encoded value was invalid.
     #[snafu(display("Pending payload wire value was invalid: {source}"))]
     InvalidWireValue { source: BoxedError },
@@ -213,15 +200,14 @@ pub(crate) fn encode_pending_group_decision_payload(
 pub(crate) fn decode_pending_group_decision_payload(
     kind: PendingGroupPayloadKind,
     payload: &[u8],
-    context: PendingGroupPayloadDecodeContext,
 ) -> Result<PendingGroupDecisionRecord, ProtoInputDecodeError<PendingGroupPayloadError>> {
     match kind {
         PendingGroupPayloadKind::GroupInvitation => {
-            GroupInvitation::try_decode_proto_from_slice_with(payload, context)
+            GroupInvitation::try_decode_proto_from_slice(payload)
                 .map(PendingGroupDecisionRecord::GroupInvitation)
         }
         PendingGroupPayloadKind::MigrationProposal => {
-            MigrationProposal::try_decode_proto_from_slice_with(payload, context)
+            MigrationProposal::try_decode_proto_from_slice(payload)
                 .map(PendingGroupDecisionRecord::MigrationProposal)
         }
     }
@@ -248,15 +234,14 @@ pub(crate) fn encode_pending_group_activation_payload(
 pub(crate) fn decode_pending_group_activation_payload(
     kind: PendingGroupPayloadKind,
     payload: &[u8],
-    context: PendingGroupPayloadDecodeContext,
 ) -> Result<PendingGroupActivationRecord, ProtoInputDecodeError<PendingGroupPayloadError>> {
     match kind {
         PendingGroupPayloadKind::GroupInvitation => {
-            GroupInvitation::try_decode_proto_from_slice_with(payload, context)
+            GroupInvitation::try_decode_proto_from_slice(payload)
                 .map(PendingGroupActivationRecord::GroupInvitation)
         }
         PendingGroupPayloadKind::MigrationProposal => {
-            MigrationProposal::try_decode_proto_from_slice_with(payload, context)
+            MigrationProposal::try_decode_proto_from_slice(payload)
                 .map(PendingGroupActivationRecord::MigrationProposal)
         }
     }
@@ -270,12 +255,9 @@ impl EncodeProto for GroupInvitation {
             group_id: message_wire::group_id_to_wire_bytes(self.group_id),
             source: MessageField::some(EncodeProto::encode_proto(&self.source)),
             proposed_members: encode_member_identities(&self.proposed_members),
-            dataset_schemas: self
-                .group_schema
-                .datasets()
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            dataset_schemas: DatasetSchema::encode_proto_collection(
+                self.group_schema.datasets().iter(),
+            ),
             initial_snapshot: MessageField::some(EncodeProto::encode_proto(&self.initial_snapshot)),
             group_name: self.group_name.clone(),
             message: self.message.clone(),
@@ -284,14 +266,11 @@ impl EncodeProto for GroupInvitation {
     }
 }
 
-impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for GroupInvitation {
+impl DecodeProto for GroupInvitation {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::GroupInvitationPayload;
 
-    fn decode_proto_with(
-        mut invitation: Self::Proto,
-        context: PendingGroupPayloadDecodeContext,
-    ) -> Result<Self, Self::Error> {
+    fn decode_proto(mut invitation: Self::Proto) -> Result<Self, Self::Error> {
         let group_id = group_id_from_wire(&invitation.group_id, "group_invitation.group_id")
             .boxed()
             .context(InvalidWireValueSnafu)?;
@@ -302,14 +281,7 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for GroupInvitation {
         let proposed_members =
             decode_member_identities(invitation.proposed_members, "group_invitation.members")?;
         let group_schema = decode_group_schema(invitation.dataset_schemas)?;
-        let vector_context = VersionVectorDecodeContext::from_group_invitation(
-            group_id,
-            source,
-            proposed_members.len(),
-            context,
-        )?;
         let snapshot_context = InitialSnapshotDecodeContext {
-            version_vector_context: vector_context,
             group_schema: &group_schema,
         };
         let initial_snapshot = match invitation.initial_snapshot.take() {
@@ -329,15 +301,40 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for GroupInvitation {
     }
 }
 
-impl DecodeProto for GroupInvitation {
+impl DecodeProtoView for GroupInvitation {
     type Error = PendingGroupPayloadError;
-    type Proto = replication_proto::GroupInvitationPayload;
+    type ProtoView<'a> = replication_proto::GroupInvitationPayloadView<'a>;
 
-    fn decode_proto(invitation: Self::Proto) -> Result<Self, Self::Error> {
-        // The default context only omits old-group member-count information.
-        // Creation invitations and new-group snapshot refs can still expand
-        // compact vectors from the proposed member list carried by the payload.
-        Self::decode_proto_with(invitation, PendingGroupPayloadDecodeContext::default())
+    fn decode_proto_view(invitation: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let group_id = group_id_from_wire(invitation.group_id, "group_invitation.group_id")
+            .boxed()
+            .context(InvalidWireValueSnafu)?;
+        let Some(source) = invitation.source.as_option() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "group_invitation.source",
+            ));
+        };
+        let source = GroupInvitationSource::decode_proto_view(source)?;
+        let proposed_members =
+            decode_member_identity_views(&invitation.proposed_members, "group_invitation.members")?;
+        let group_schema = decode_group_schema_view(&invitation.dataset_schemas)?;
+        let snapshot_context = InitialSnapshotDecodeContext {
+            group_schema: &group_schema,
+        };
+        let initial_snapshot = match invitation.initial_snapshot.as_option() {
+            Some(snapshot) => InitialSnapshot::decode_proto_view_with(snapshot, snapshot_context)?,
+            None => InitialSnapshot::Empty,
+        };
+        GroupInvitation::try_new(
+            group_id,
+            source,
+            proposed_members,
+            group_schema,
+            initial_snapshot,
+            invitation.group_name.map(str::to_owned),
+            invitation.message.map(str::to_owned),
+        )
+        .map_err(PendingGroupPayloadError::from)
     }
 }
 
@@ -358,6 +355,44 @@ impl DecodeProto for GroupInvitationSource {
 
     fn decode_proto(source: Self::Proto) -> Result<Self, Self::Error> {
         <Self as DecodeProtoOneof>::decode_required_proto(source.source, "group_invitation.source")
+    }
+}
+
+impl DecodeProtoView for GroupInvitationSource {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::GroupInvitationSourceView<'a>;
+
+    fn decode_proto_view(source: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let Some(source) = source.source.as_ref() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "group_invitation.source",
+            ));
+        };
+        match source {
+            replication_proto::group_invitation_source::SourceView::Creation(_) => {
+                Ok(Self::Creation)
+            }
+            replication_proto::group_invitation_source::SourceView::Migration(migration) => {
+                let old_group_id = group_id_from_wire(
+                    migration.old_group_id,
+                    "group_invitation.source.migration.old_group_id",
+                )
+                .boxed()
+                .context(InvalidWireValueSnafu)?;
+                let new_group_id = group_id_from_wire(
+                    migration.new_group_id,
+                    "group_invitation.source.migration.new_group_id",
+                )
+                .boxed()
+                .context(InvalidWireValueSnafu)?;
+                Ok(Self::Migration {
+                    migration_id: MigrationId {
+                        old_group_id,
+                        new_group_id,
+                    },
+                })
+            }
+        }
     }
 }
 
@@ -417,15 +452,12 @@ impl EncodeProto for MigrationProposal {
             old_group_id: message_wire::group_id_to_wire_bytes(self.migration_id.old_group_id),
             new_group_id: message_wire::group_id_to_wire_bytes(self.migration_id.new_group_id),
             final_versions: MessageField::some(
-                RuntimeVersionVectorProtoSource::from(&self.final_versions).encode_proto(),
+                VersionVectorProtoCodec::from(&self.final_versions).encode_proto(),
             ),
             proposed_members: encode_member_identities(&self.proposed_members),
-            dataset_schemas: self
-                .group_schema
-                .datasets()
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            dataset_schemas: DatasetSchema::encode_proto_collection(
+                self.group_schema.datasets().iter(),
+            ),
             initial_snapshot: MessageField::some(EncodeProto::encode_proto(&self.initial_snapshot)),
             group_name: self.group_name.clone(),
             message: self.message.clone(),
@@ -434,14 +466,11 @@ impl EncodeProto for MigrationProposal {
     }
 }
 
-impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for MigrationProposal {
+impl DecodeProto for MigrationProposal {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::MigrationProposalPayload;
 
-    fn decode_proto_with(
-        mut proposal: Self::Proto,
-        context: PendingGroupPayloadDecodeContext,
-    ) -> Result<Self, Self::Error> {
+    fn decode_proto(mut proposal: Self::Proto) -> Result<Self, Self::Error> {
         let old_group_id =
             group_id_from_wire(&proposal.old_group_id, "migration_proposal.old_group_id")
                 .boxed()
@@ -452,26 +481,21 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for MigrationProposal {
                 .context(InvalidWireValueSnafu)?;
         let proposed_members =
             decode_member_identities(proposal.proposed_members, "migration_proposal.members")?;
-        let vector_context = VersionVectorDecodeContext::from_migration_proposal(
-            old_group_id,
-            new_group_id,
-            proposed_members.len(),
-            context,
-        )?;
         let final_versions = proposal
             .final_versions
             .take_required_proto_field::<PendingGroupPayloadError>(
                 "migration_proposal.final_versions",
             )?;
-        let final_versions = decode_version_vector(
-            final_versions,
-            "migration_proposal.final_versions",
-            old_group_id,
-            vector_context,
-        )?;
+        let final_versions =
+            VersionVectorProtoCodec::decode_proto(final_versions).map_err(|source| {
+                PendingGroupPayloadError::invalid_version_vector(
+                    "migration_proposal.final_versions",
+                    &source,
+                )
+            })?;
+        let final_versions = final_versions.into_version_vector();
         let group_schema = decode_group_schema(proposal.dataset_schemas)?;
         let snapshot_context = InitialSnapshotDecodeContext {
-            version_vector_context: vector_context,
             group_schema: &group_schema,
         };
         let initial_snapshot = match proposal.initial_snapshot.take() {
@@ -489,6 +513,57 @@ impl DecodeProtoWith<PendingGroupPayloadDecodeContext> for MigrationProposal {
             initial_snapshot,
             group_name: proposal.group_name,
             message: proposal.message,
+        })
+    }
+}
+
+impl DecodeProtoView for MigrationProposal {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::MigrationProposalPayloadView<'a>;
+
+    fn decode_proto_view(proposal: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let old_group_id =
+            group_id_from_wire(proposal.old_group_id, "migration_proposal.old_group_id")
+                .boxed()
+                .context(InvalidWireValueSnafu)?;
+        let new_group_id =
+            group_id_from_wire(proposal.new_group_id, "migration_proposal.new_group_id")
+                .boxed()
+                .context(InvalidWireValueSnafu)?;
+        let proposed_members =
+            decode_member_identity_views(&proposal.proposed_members, "migration_proposal.members")?;
+        let Some(final_versions) = proposal.final_versions.as_option() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "migration_proposal.final_versions",
+            ));
+        };
+        let final_versions =
+            VersionVectorProtoCodec::decode_proto_view(final_versions).map_err(|source| {
+                PendingGroupPayloadError::invalid_version_vector(
+                    "migration_proposal.final_versions",
+                    &source,
+                )
+            })?;
+        let final_versions = final_versions.into_version_vector();
+        let group_schema = decode_group_schema_view(&proposal.dataset_schemas)?;
+        let snapshot_context = InitialSnapshotDecodeContext {
+            group_schema: &group_schema,
+        };
+        let initial_snapshot = match proposal.initial_snapshot.as_option() {
+            Some(snapshot) => InitialSnapshot::decode_proto_view_with(snapshot, snapshot_context)?,
+            None => InitialSnapshot::Empty,
+        };
+        Ok(Self {
+            migration_id: MigrationId {
+                old_group_id,
+                new_group_id,
+            },
+            final_versions,
+            proposed_members,
+            group_schema,
+            initial_snapshot,
+            group_name: proposal.group_name.map(str::to_owned),
+            message: proposal.message.map(str::to_owned),
         })
     }
 }
@@ -537,6 +612,34 @@ impl DecodeProto for DatasetSchema {
     }
 }
 
+impl DecodeProtoView for DatasetSchema {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::DatasetSchemaView<'a>;
+
+    fn decode_proto_view(dataset_schema: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let dataset_id = DatasetId::try_new(dataset_schema.dataset_id).with_context(|_| {
+            InvalidDatasetIdSnafu {
+                value: dataset_schema.dataset_id.to_owned(),
+            }
+        })?;
+        let Some(schema) = dataset_schema.schema.as_option() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "dataset_schema.schema",
+            ));
+        };
+        let schema = schema.to_owned_message().context(DecodeSnafu)?;
+        let schema = decode_schema_definition(schema).boxed().with_context(|_| {
+            InvalidDatasetSchemaSnafu {
+                dataset_id: dataset_id.clone(),
+            }
+        })?;
+        Ok(Self {
+            dataset_id,
+            schema: SchemaSource::from(schema),
+        })
+    }
+}
+
 impl EncodeProto for InitialSnapshot {
     type Proto = replication_proto::InitialSnapshot;
 
@@ -566,11 +669,33 @@ impl<'schema> DecodeProtoWith<InitialSnapshotDecodeContext<'schema>> for Initial
                     .map(Self::Inline)
             }
             replication_proto::initial_snapshot::State::Metadata(metadata) => {
-                InitialSnapshotMetadata::decode_proto_with(
-                    *metadata,
-                    context.version_vector_context,
-                )
-                .map(Self::Metadata)
+                InitialSnapshotMetadata::decode_proto(*metadata).map(Self::Metadata)
+            }
+        }
+    }
+}
+
+impl<'schema> DecodeProtoViewWith<InitialSnapshotDecodeContext<'schema>> for InitialSnapshot {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::InitialSnapshotView<'a>;
+
+    fn decode_proto_view_with(
+        snapshot: &Self::ProtoView<'_>,
+        context: InitialSnapshotDecodeContext<'schema>,
+    ) -> Result<Self, Self::Error> {
+        let Some(state) = snapshot.state.as_ref() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "initial_snapshot.state",
+            ));
+        };
+        match state {
+            replication_proto::initial_snapshot::StateView::Empty(_) => Ok(Self::Empty),
+            replication_proto::initial_snapshot::StateView::Inline(state) => {
+                InitialGroupValueRows::decode_proto_view_with(state, context.group_schema)
+                    .map(Self::Inline)
+            }
+            replication_proto::initial_snapshot::StateView::Metadata(metadata) => {
+                InitialSnapshotMetadata::decode_proto_view(metadata).map(Self::Metadata)
             }
         }
     }
@@ -593,11 +718,7 @@ impl EncodeProto for InitialGroupValueRows {
 
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialGroupState {
-            datasets: self
-                .datasets
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            datasets: InitialDatasetValueRows::encode_proto_collection(&self.datasets),
             ..replication_proto::InitialGroupState::default()
         }
     }
@@ -611,11 +732,24 @@ impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialGroupValueRows {
         state: Self::Proto,
         group_schema: &'schema GroupSchema,
     ) -> Result<Self, Self::Error> {
-        let datasets = state
-            .datasets
-            .into_iter()
-            .map(|dataset| InitialDatasetValueRows::decode_proto_with(dataset, group_schema))
-            .collect::<Result<_, _>>()?;
+        let datasets =
+            InitialDatasetValueRows::decode_proto_collection_with(state.datasets, group_schema)?;
+        Ok(Self { datasets })
+    }
+}
+
+impl<'schema> DecodeProtoViewWith<&'schema GroupSchema> for InitialGroupValueRows {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::InitialGroupStateView<'a>;
+
+    fn decode_proto_view_with(
+        state: &Self::ProtoView<'_>,
+        group_schema: &'schema GroupSchema,
+    ) -> Result<Self, Self::Error> {
+        let datasets = InitialDatasetValueRows::decode_proto_view_collection_with(
+            &state.datasets,
+            group_schema,
+        )?;
         Ok(Self { datasets })
     }
 }
@@ -626,7 +760,7 @@ impl EncodeProto for InitialDatasetValueRows {
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialDatasetState {
             dataset_id: self.dataset_id.to_string(),
-            rows: self.rows.iter().map(EncodeProto::encode_proto).collect(),
+            rows: InitialValueRow::encode_proto_collection(&self.rows),
             ..replication_proto::InitialDatasetState::default()
         }
     }
@@ -650,19 +784,38 @@ impl<'schema> DecodeProtoWith<&'schema GroupSchema> for InitialDatasetValueRows 
                 .context(MissingInitialDatasetSchemaSnafu {
                     dataset_id: dataset_id.clone(),
                 })?;
-        let rows = dataset
-            .rows
-            .into_iter()
-            .map(|row| {
-                InitialValueRow::decode_proto_with(
-                    row,
-                    InitialValueRowDecodeContext {
-                        dataset_id: &dataset_id,
-                        schema,
-                    },
-                )
-            })
-            .collect::<Result<_, _>>()?;
+        let row_context = InitialValueRowDecodeContext {
+            dataset_id: &dataset_id,
+            schema,
+        };
+        let rows = InitialValueRow::decode_proto_collection_with(dataset.rows, row_context)?;
+        Ok(Self { dataset_id, rows })
+    }
+}
+
+impl<'schema> DecodeProtoViewWith<&'schema GroupSchema> for InitialDatasetValueRows {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::InitialDatasetStateView<'a>;
+
+    fn decode_proto_view_with(
+        dataset: &Self::ProtoView<'_>,
+        group_schema: &'schema GroupSchema,
+    ) -> Result<Self, Self::Error> {
+        let dataset_id =
+            DatasetId::try_new(dataset.dataset_id).with_context(|_| InvalidDatasetIdSnafu {
+                value: dataset.dataset_id.to_owned(),
+            })?;
+        let schema =
+            group_schema
+                .schema(&dataset_id)
+                .with_context(|| MissingInitialDatasetSchemaSnafu {
+                    dataset_id: dataset_id.clone(),
+                })?;
+        let row_context = InitialValueRowDecodeContext {
+            dataset_id: &dataset_id,
+            schema,
+        };
+        let rows = InitialValueRow::decode_proto_view_collection_with(&dataset.rows, row_context)?;
         Ok(Self { dataset_id, rows })
     }
 }
@@ -723,52 +876,105 @@ impl<'schema> DecodeProtoWith<InitialValueRowDecodeContext<'schema>> for Initial
     }
 }
 
+impl<'schema> DecodeProtoViewWith<InitialValueRowDecodeContext<'schema>> for InitialValueRow {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::InitialRowStateView<'a>;
+
+    fn decode_proto_view_with(
+        row: &Self::ProtoView<'_>,
+        context: InitialValueRowDecodeContext<'schema>,
+    ) -> Result<Self, Self::Error> {
+        let row_key = Uuid::from_slice(row.row_key)
+            .map(RowKey)
+            .context(InvalidRowKeySnafu {
+                field: "initial_row_state.row_key",
+            })?;
+        let fields = row
+            .fields
+            .iter_unique()
+            .map(|(field_name, value)| {
+                let field_name = (*field_name).to_owned();
+                let value = value.to_owned_message().context(DecodeSnafu)?;
+                let value = decode_nullable_basic_value(value).with_context(|_| {
+                    InvalidRowFieldValueSnafu {
+                        field_name: field_name.clone(),
+                    }
+                })?;
+                Ok((field_name, value))
+            })
+            .collect::<Result<_, PendingGroupPayloadError>>()?;
+        let row =
+            RowValues::try_from_fields(context.schema.as_schema(), fields).with_context(|_| {
+                InvalidInitialRowSchemaSnafu {
+                    dataset_id: context.dataset_id.clone(),
+                    row_key,
+                }
+            })?;
+        Ok(Self { row_key, row })
+    }
+}
+
 impl EncodeProto for InitialSnapshotMetadata {
     type Proto = replication_proto::InitialSnapshotMetadata;
 
     fn encode_proto(&self) -> Self::Proto {
         replication_proto::InitialSnapshotMetadata {
             primary_ref: MessageField::some(EncodeProto::encode_proto(&self.primary_ref)),
-            equivalent_refs: self
-                .equivalent_refs
-                .iter()
-                .map(EncodeProto::encode_proto)
-                .collect(),
+            equivalent_refs: SnapshotRef::encode_proto_collection(&self.equivalent_refs),
             record_count: self.record_count,
             ..replication_proto::InitialSnapshotMetadata::default()
         }
     }
 }
 
-impl DecodeProtoWith<VersionVectorDecodeContext> for InitialSnapshotMetadata {
+impl DecodeProto for InitialSnapshotMetadata {
     type Error = PendingGroupPayloadError;
     type Proto = replication_proto::InitialSnapshotMetadata;
 
-    fn decode_proto_with(
-        mut metadata: Self::Proto,
-        context: VersionVectorDecodeContext,
-    ) -> Result<Self, Self::Error> {
+    fn decode_proto(mut metadata: Self::Proto) -> Result<Self, Self::Error> {
         let primary_ref = SnapshotRef::decode_required_proto_field_with(
             &mut metadata.primary_ref,
             "initial_snapshot_metadata.primary_ref",
             SnapshotRefDecodeContext {
                 versions_field: "initial_snapshot_metadata.primary_ref.versions",
-                version_vector_context: context,
             },
         )?;
-        let equivalent_refs = metadata
-            .equivalent_refs
-            .into_iter()
-            .map(|snapshot_ref| {
-                SnapshotRef::decode_proto_with(
-                    snapshot_ref,
-                    SnapshotRefDecodeContext {
-                        versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
-                        version_vector_context: context,
-                    },
-                )
-            })
-            .collect::<Result<SmallVec<[SnapshotRef; 1]>, _>>()?;
+        let equivalent_refs = SnapshotRef::decode_proto_collection_with(
+            metadata.equivalent_refs,
+            SnapshotRefDecodeContext {
+                versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
+            },
+        )?;
+        Ok(Self {
+            primary_ref,
+            equivalent_refs,
+            record_count: metadata.record_count,
+        })
+    }
+}
+
+impl DecodeProtoView for InitialSnapshotMetadata {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::InitialSnapshotMetadataView<'a>;
+
+    fn decode_proto_view(metadata: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let Some(primary_ref) = metadata.primary_ref.as_option() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                "initial_snapshot_metadata.primary_ref",
+            ));
+        };
+        let primary_ref = SnapshotRef::decode_proto_view_with(
+            primary_ref,
+            SnapshotRefDecodeContext {
+                versions_field: "initial_snapshot_metadata.primary_ref.versions",
+            },
+        )?;
+        let equivalent_refs = SnapshotRef::decode_proto_view_collection_with(
+            &metadata.equivalent_refs,
+            SnapshotRefDecodeContext {
+                versions_field: "initial_snapshot_metadata.equivalent_refs.versions",
+            },
+        )?;
         Ok(Self {
             primary_ref,
             equivalent_refs,
@@ -784,7 +990,7 @@ impl EncodeProto for SnapshotRef {
         replication_proto::SnapshotRef {
             group_id: message_wire::group_id_to_wire_bytes(self.group_id),
             versions: MessageField::some(
-                RuntimeVersionVectorProtoSource::from(&self.versions).encode_proto(),
+                VersionVectorProtoCodec::from(&self.versions).encode_proto(),
             ),
             ..replication_proto::SnapshotRef::default()
         }
@@ -805,12 +1011,34 @@ impl DecodeProtoWith<SnapshotRefDecodeContext> for SnapshotRef {
         let versions = snapshot_ref
             .versions
             .take_required_proto_field::<PendingGroupPayloadError>(context.versions_field)?;
-        let versions = decode_version_vector(
-            versions,
-            context.versions_field,
-            group_id,
-            context.version_vector_context,
-        )?;
+        let versions = VersionVectorProtoCodec::decode_proto(versions).map_err(|source| {
+            PendingGroupPayloadError::invalid_version_vector(context.versions_field, &source)
+        })?;
+        let versions = versions.into_version_vector();
+        Ok(Self { group_id, versions })
+    }
+}
+
+impl DecodeProtoViewWith<SnapshotRefDecodeContext> for SnapshotRef {
+    type Error = PendingGroupPayloadError;
+    type ProtoView<'a> = replication_proto::SnapshotRefView<'a>;
+
+    fn decode_proto_view_with(
+        snapshot_ref: &Self::ProtoView<'_>,
+        context: SnapshotRefDecodeContext,
+    ) -> Result<Self, Self::Error> {
+        let group_id = group_id_from_wire(snapshot_ref.group_id, "snapshot_ref.group_id")
+            .boxed()
+            .context(InvalidWireValueSnafu)?;
+        let Some(versions) = snapshot_ref.versions.as_option() else {
+            return Err(PendingGroupPayloadError::missing_required_field(
+                context.versions_field,
+            ));
+        };
+        let versions = VersionVectorProtoCodec::decode_proto_view(versions).map_err(|source| {
+            PendingGroupPayloadError::invalid_version_vector(context.versions_field, &source)
+        })?;
+        let versions = versions.into_version_vector();
         Ok(Self { group_id, versions })
     }
 }
@@ -820,15 +1048,11 @@ impl DecodeProtoWith<SnapshotRefDecodeContext> for SnapshotRef {
 struct SnapshotRefDecodeContext {
     /// Field path used when reporting an absent or invalid version vector.
     versions_field: &'static str,
-    /// Group/member-count information for expanding compact vector encodings.
-    version_vector_context: VersionVectorDecodeContext,
 }
 
 /// Context needed to decode inline initial snapshot rows against their schemas.
 #[derive(Clone, Copy, Debug)]
 struct InitialSnapshotDecodeContext<'schema> {
-    /// Group/member-count information for expanding compact vector encodings.
-    version_vector_context: VersionVectorDecodeContext,
     /// Decoded dataset schemas for validating inline value rows.
     group_schema: &'schema GroupSchema,
 }
@@ -842,95 +1066,29 @@ struct InitialValueRowDecodeContext<'schema> {
     schema: &'schema SchemaSource,
 }
 
-/// Context that expands compact version vectors in pending group payloads.
-///
-/// TODO(flotsync-git-i20): remove or substantially simplify this once version
-/// vector transfer has a clearer split between self-describing and compact
-/// context-dependent protobuf forms.
-#[derive(Clone, Copy, Debug, Default)]
-struct VersionVectorDecodeContext {
-    /// Existing group referenced by migration-sourced payload fields.
-    old_group_id: Option<GroupId>,
-    /// Member count loaded for `old_group_id`, when the store can provide it.
-    old_group_member_count: Option<NonZeroUsize>,
-    /// Target group being created or entered by the pending work.
-    new_group_id: Option<GroupId>,
-    /// Member count implied by the proposed target group membership order.
-    new_group_member_count: Option<NonZeroUsize>,
-}
-
-impl VersionVectorDecodeContext {
-    /// Build vector context for an invitation payload after its member list has decoded.
-    fn from_group_invitation(
-        group_id: GroupId,
-        source: GroupInvitationSource,
-        proposed_member_count: usize,
-        context: PendingGroupPayloadDecodeContext,
-    ) -> Result<Self, PendingGroupPayloadError> {
-        let new_group_member_count =
-            NonZeroUsize::new(proposed_member_count).context(MissingRequiredFieldSnafu {
-                field: "group_invitation.members",
-            })?;
-        let (old_group_id, old_group_member_count) = match source {
-            GroupInvitationSource::Creation => (None, None),
-            GroupInvitationSource::Migration { migration_id } => (
-                Some(migration_id.old_group_id),
-                context.old_group_member_count,
-            ),
-        };
-        Ok(Self {
-            old_group_id,
-            old_group_member_count,
-            new_group_id: Some(group_id),
-            new_group_member_count: Some(new_group_member_count),
-        })
-    }
-
-    /// Build vector context for a migration proposal payload after its member list has decoded.
-    fn from_migration_proposal(
-        old_group_id: GroupId,
-        new_group_id: GroupId,
-        proposed_member_count: usize,
-        context: PendingGroupPayloadDecodeContext,
-    ) -> Result<Self, PendingGroupPayloadError> {
-        let new_group_member_count =
-            NonZeroUsize::new(proposed_member_count).context(MissingRequiredFieldSnafu {
-                field: "migration_proposal.members",
-            })?;
-        Ok(Self {
-            old_group_id: Some(old_group_id),
-            old_group_member_count: context.old_group_member_count,
-            new_group_id: Some(new_group_id),
-            new_group_member_count: Some(new_group_member_count),
-        })
-    }
-
-    /// Return the member count needed to expand a vector field for `group_id`.
-    fn member_count_for(
-        self,
-        group_id: GroupId,
-        field: &'static str,
-    ) -> Result<NonZeroUsize, PendingGroupPayloadError> {
-        if self.new_group_id == Some(group_id) {
-            return self
-                .new_group_member_count
-                .context(MissingVersionVectorContextSnafu { field, group_id });
-        }
-        if self.old_group_id == Some(group_id) {
-            return self
-                .old_group_member_count
-                .context(MissingVersionVectorContextSnafu { field, group_id });
-        }
-        MissingVersionVectorContextSnafu { field, group_id }.fail()
-    }
-}
-
 fn decode_group_schema(
     dataset_schemas: Vec<replication_proto::DatasetSchema>,
 ) -> Result<GroupSchema, PendingGroupPayloadError> {
     let mut group_schema = GroupSchema::default();
     for dataset_schema in dataset_schemas {
         let dataset_schema = DatasetSchema::decode_proto(dataset_schema)?;
+        group_schema
+            .insert_checked(dataset_schema)
+            .map_err(PendingGroupPayloadError::from)?;
+    }
+    Ok(group_schema)
+}
+
+/// Decode borrowed dataset-schema entries while preserving duplicate-id validation.
+fn decode_group_schema_view(
+    dataset_schemas: &flotsync_messages::buffa::RepeatedView<
+        '_,
+        replication_proto::DatasetSchemaView<'_>,
+    >,
+) -> Result<GroupSchema, PendingGroupPayloadError> {
+    let mut group_schema = GroupSchema::default();
+    for dataset_schema in dataset_schemas {
+        let dataset_schema = DatasetSchema::decode_proto_view(dataset_schema)?;
         group_schema
             .insert_checked(dataset_schema)
             .map_err(PendingGroupPayloadError::from)?;
@@ -958,22 +1116,22 @@ fn decode_member_identities(
         .collect()
 }
 
-fn decode_version_vector(
-    version_vector: flotsync_messages::versions::VersionVector,
+/// Decode borrowed member identifiers into the owned identities required by the domain model.
+fn decode_member_identity_views(
+    members: &flotsync_messages::buffa::RepeatedView<
+        '_,
+        flotsync_messages::discovery::IdentifierView<'_>,
+    >,
     field: &'static str,
-    group_id: GroupId,
-    context: VersionVectorDecodeContext,
-) -> Result<VersionVector, PendingGroupPayloadError> {
-    let wire = WireVersionVector::decode_proto(version_vector)
-        .map_err(|source| PendingGroupPayloadError::invalid_version_vector(field, &source))?;
-    let member_count = match &wire {
-        WireVersionVector::Full(vector) => vector.len(),
-        WireVersionVector::Override { .. } | WireVersionVector::Synced { .. } => {
-            context.member_count_for(group_id, field)?
-        }
-    };
-    wire.to_runtime(member_count)
-        .map_err(|source| PendingGroupPayloadError::invalid_version_vector(field, &source))
+) -> Result<Vec<MemberIdentity>, PendingGroupPayloadError> {
+    members
+        .iter()
+        .map(|member| {
+            message_wire::member_identity_from_wire_view(member, field)
+                .boxed()
+                .context(InvalidWireValueSnafu)
+        })
+        .collect()
 }
 
 #[cfg(test)]

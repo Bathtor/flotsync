@@ -53,7 +53,7 @@ pub(super) async fn build_inline_initial_snapshot(
 ) -> Result<InitialSnapshot, ChangeGroupMembershipError> {
     let mut datasets = Vec::new();
     let mut total_rows = 0usize;
-    // TODO(flotsync-git-i20): once the Metadata path is supported, use the
+    // TODO(flotsync-git-qsg): once the Metadata path is supported, use the
     // inline threshold as this scan limit so snapshot preparation still needs a
     // single storage roundtrip when it decides to embed inline state.
     let row_limit = NonZeroUsize::new(usize::MAX).expect("row scan limit must be non-zero");

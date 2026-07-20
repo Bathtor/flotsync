@@ -6,7 +6,7 @@ use flotsync_core::{
     MemberIndex,
     member::Identifier,
     membership::GroupMembers,
-    versions::{PureVersionVector, UpdateId, VersionVector},
+    versions::{UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, Schema};
 use flotsync_replication::{
@@ -17,7 +17,6 @@ use flotsync_replication::{
     GroupMigrationPolicy,
     PolicyDecision,
     ReplicationConfig,
-    ReplicationStore,
     RowId,
     RowKey,
     RowMutation,
@@ -146,18 +145,6 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     }))
     .expect("old group should be created");
     bob_fixture.wait_for_group_install(old_group_id);
-
-    // TODO(flotsync-git-i20): remove this forced full vector and cover natural
-    // compact Synced and Override proposal vectors once inbound decode receives
-    // the old-group member count.
-    let mut transaction = wait_for_test_future(alice_fixture.store().begin_transaction())
-        .expect("version-vector transaction should start");
-    wait_for_test_future(transaction.update_replication_group_version_vector(
-        &old_group_id,
-        VersionVector::Full(PureVersionVector::from([0, 0])),
-    ))
-    .expect("full old-group vector should store");
-    wait_for_test_future(transaction.commit()).expect("version-vector transaction should commit");
 
     let migration_id = wait_for_test_reply(alice_fixture.api().change_group_membership(
         ChangeGroupMembershipRequest {

@@ -3,10 +3,10 @@ use crate::{
     codecs::messages::{
         NeedRangeMessage,
         RuntimeMessage,
+        RuntimeMessageDecodeContext,
         UpdateBatchMessage,
         UpdateMessage,
         UpdateRangeMessage,
-        WireRuntimeMessage,
     },
     delivery::{
         contracts::{GroupBroadcastPort, GroupBroadcastPortIndication, GroupBroadcastPortRequest},
@@ -21,7 +21,7 @@ use flotsync_core::{
     membership::SharedGroupMemberships,
     versions::{UpdateId, VersionVector},
 };
-use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
+use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_utils::{OptionExt as _, ResultExt as _, kompact_config::ConfigReadExt as _};
 use interval::prelude::{Bounded, Difference, IntervalSet, IsEmpty, Range, Union};
 use itertools::Itertools;
@@ -562,24 +562,28 @@ impl CatchUpManagerComponent {
     }
 
     fn handle_group_delivery(&mut self, deliver: &GroupBroadcastDeliver) -> HandlerResult {
-        let message =
-            WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
-                .with_whatever_benign(|_| {
-                    format!(
-                        "dropping inbound catch-up candidate from {} after decode error",
-                        deliver.envelope.header.sender
-                    )
-                })?;
+        let memberships = self.group_memberships.snapshot();
+        let decode_context = RuntimeMessageDecodeContext::new(memberships.as_ref());
+        let message = RuntimeMessage::decode_proto_view_from_slice_with(
+            &deliver.envelope.payload.bytes,
+            decode_context,
+        )
+        .with_whatever_benign(|_| {
+            format!(
+                "dropping inbound catch-up candidate from {} after decode error",
+                deliver.envelope.header.sender
+            )
+        })?;
         match message {
-            WireRuntimeMessage::NeedRange(message) => {
+            RuntimeMessage::NeedRange(message) => {
                 self.handle_inbound_need_range(&deliver.envelope.header.sender, message)
             }
-            WireRuntimeMessage::Update(_)
-            | WireRuntimeMessage::SummaryRequest(_)
-            | WireRuntimeMessage::Summary(_)
-            | WireRuntimeMessage::UpdateBatch(_)
-            | WireRuntimeMessage::GroupInvitation(_)
-            | WireRuntimeMessage::MigrationProposal(_) => Handled::OK,
+            RuntimeMessage::Update(_)
+            | RuntimeMessage::SummaryRequest(_)
+            | RuntimeMessage::Summary(_)
+            | RuntimeMessage::UpdateBatch(_)
+            | RuntimeMessage::GroupInvitation(_)
+            | RuntimeMessage::MigrationProposal(_) => Handled::OK,
         }
     }
 

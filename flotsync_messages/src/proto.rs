@@ -53,6 +53,15 @@ pub trait EncodeProto {
     /// Encode this value into an owned generated protobuf message.
     fn encode_proto(&self) -> Self::Proto;
 
+    /// Encode borrowed values into a collection of owned generated protobuf messages.
+    fn encode_proto_collection<'a, C>(values: impl IntoIterator<Item = &'a Self>) -> C
+    where
+        Self: 'a,
+        C: FromIterator<Self::Proto>,
+    {
+        values.into_iter().map(Self::encode_proto).collect()
+    }
+
     /// Encode this value into a boxed owned generated protobuf message.
     ///
     /// Generated `oneof` variants frequently box message payloads, so this
@@ -154,6 +163,24 @@ pub trait DecodeProto: Sized {
     /// Returns [`Self::Error`] when the protobuf message is malformed or cannot
     /// satisfy this runtime type's invariants.
     fn decode_proto(proto: Self::Proto) -> Result<Self, Self::Error>;
+
+    /// Decode owned generated protobuf messages into a runtime collection.
+    ///
+    /// Elements retain their input order and conversion stops at the first
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when any protobuf message cannot satisfy this
+    /// runtime type's invariants.
+    fn decode_proto_collection<C>(
+        protos: impl IntoIterator<Item = Self::Proto>,
+    ) -> Result<C, Self::Error>
+    where
+        C: FromIterator<Self>,
+    {
+        protos.into_iter().map(Self::decode_proto).collect()
+    }
 
     /// Decode this value from a required generated protobuf message field.
     ///
@@ -305,6 +332,33 @@ pub trait DecodeProtoWith<Context>: Sized {
     /// cannot satisfy this runtime type's invariants.
     fn decode_proto_with(proto: Self::Proto, context: Context) -> Result<Self, Self::Error>;
 
+    /// Decode owned generated protobuf messages with one reusable context.
+    ///
+    /// Collection decoding must duplicate the context for every element.
+    /// Requiring [`Copy`] restricts this convenience to cheap context values or
+    /// references instead of hiding a potentially expensive clone per member.
+    ///
+    /// Elements retain their input order and conversion stops at the first
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the context is incompatible with any
+    /// message or a message cannot satisfy this runtime type's invariants.
+    fn decode_proto_collection_with<C>(
+        protos: impl IntoIterator<Item = Self::Proto>,
+        context: Context,
+    ) -> Result<C, Self::Error>
+    where
+        Context: Copy,
+        C: FromIterator<Self>,
+    {
+        protos
+            .into_iter()
+            .map(|proto| Self::decode_proto_with(proto, context))
+            .collect()
+    }
+
     /// Decode this value from a required generated protobuf message field.
     ///
     /// # Errors
@@ -430,6 +484,26 @@ pub trait DecodeProtoView: Sized {
     /// satisfy this runtime type's invariants.
     fn decode_proto_view(proto: &Self::ProtoView<'_>) -> Result<Self, Self::Error>;
 
+    /// Decode generated borrowed protobuf views into a runtime collection.
+    ///
+    /// Elements retain their input order and conversion stops at the first
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when any protobuf view cannot satisfy this
+    /// runtime type's invariants.
+    fn decode_proto_view_collection<'proto, 'view, C>(
+        protos: impl IntoIterator<Item = &'view Self::ProtoView<'proto>>,
+    ) -> Result<C, Self::Error>
+    where
+        'proto: 'view,
+        Self::ProtoView<'proto>: 'view,
+        C: FromIterator<Self>,
+    {
+        protos.into_iter().map(Self::decode_proto_view).collect()
+    }
+
     /// Decode this value from a generated protobuf view over a byte slice.
     ///
     /// # Errors
@@ -490,6 +564,35 @@ pub trait DecodeProtoViewWith<Context>: Sized {
         proto: &Self::ProtoView<'_>,
         context: Context,
     ) -> Result<Self, Self::Error>;
+
+    /// Decode generated borrowed protobuf views with one reusable context.
+    ///
+    /// Collection decoding must duplicate the context for every element.
+    /// Requiring [`Copy`] restricts this convenience to cheap context values or
+    /// references instead of hiding a potentially expensive clone per member.
+    ///
+    /// Elements retain their input order and conversion stops at the first
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Self::Error`] when the context is incompatible with any view
+    /// or a view cannot satisfy this runtime type's invariants.
+    fn decode_proto_view_collection_with<'proto, 'view, C>(
+        protos: impl IntoIterator<Item = &'view Self::ProtoView<'proto>>,
+        context: Context,
+    ) -> Result<C, Self::Error>
+    where
+        'proto: 'view,
+        Self::ProtoView<'proto>: 'view,
+        Context: Copy,
+        C: FromIterator<Self>,
+    {
+        protos
+            .into_iter()
+            .map(|proto| Self::decode_proto_view_with(proto, context))
+            .collect()
+    }
 
     /// Decode this value from a generated protobuf view over a byte slice with
     /// explicit runtime context.
@@ -620,15 +723,18 @@ mod tests {
     use super::{
         DecodeProto,
         DecodeProtoView,
+        DecodeProtoViewWith,
+        DecodeProtoWith,
         EncodeProto,
         FromProtoDecodeError,
         ProtoCodec,
         ProtoInputDecodeError,
     };
     use crate::{
-        buffa::{self, Message as _},
+        buffa::{self, Message as _, MessageView as _},
         versions as versions_proto,
     };
+    use std::collections::VecDeque;
 
     #[derive(Debug, PartialEq, Eq)]
     struct SyncedVersion(u64);
@@ -648,23 +754,23 @@ mod tests {
 
     impl ProtoCodec for SyncedVersion {
         type DecodeError = SyncedVersionError;
-        type Proto = versions_proto::VersionVector;
+        type Proto = versions_proto::CompactVersionVector;
 
         fn to_proto(&self) -> Self::Proto {
-            versions_proto::VersionVector {
-                versions: Some(versions_proto::version_vector::Versions::Synced(Box::new(
-                    versions_proto::SyncedVersionVector {
+            versions_proto::CompactVersionVector {
+                versions: Some(versions_proto::compact_version_vector::Versions::Synced(
+                    Box::new(versions_proto::SyncedVersionVector {
                         group_version: self.0,
                         ..versions_proto::SyncedVersionVector::default()
-                    },
-                ))),
-                ..versions_proto::VersionVector::default()
+                    }),
+                )),
+                ..versions_proto::CompactVersionVector::default()
             }
         }
 
         fn from_proto(proto: Self::Proto) -> Result<Self, Self::DecodeError> {
             match proto.versions {
-                Some(versions_proto::version_vector::Versions::Synced(synced)) => {
+                Some(versions_proto::compact_version_vector::Versions::Synced(synced)) => {
                     Ok(Self(synced.group_version))
                 }
                 Some(_) => Err(SyncedVersionError::UnsupportedVersions),
@@ -675,16 +781,39 @@ mod tests {
 
     impl DecodeProtoView for SyncedVersion {
         type Error = SyncedVersionError;
-        type ProtoView<'a> = versions_proto::VersionVectorView<'a>;
+        type ProtoView<'a> = versions_proto::CompactVersionVectorView<'a>;
 
         fn decode_proto_view(proto: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
             match proto.versions.as_ref() {
-                Some(versions_proto::version_vector::VersionsView::Synced(synced)) => {
+                Some(versions_proto::compact_version_vector::VersionsView::Synced(synced)) => {
                     Ok(Self(synced.group_version))
                 }
                 Some(_) => Err(SyncedVersionError::UnsupportedVersions),
                 None => Err(SyncedVersionError::MissingVersions),
             }
+        }
+    }
+
+    impl DecodeProtoWith<u64> for SyncedVersion {
+        type Error = SyncedVersionError;
+        type Proto = versions_proto::CompactVersionVector;
+
+        fn decode_proto_with(proto: Self::Proto, offset: u64) -> Result<Self, Self::Error> {
+            let decoded = Self::decode_proto(proto)?;
+            Ok(Self(decoded.0 + offset))
+        }
+    }
+
+    impl DecodeProtoViewWith<u64> for SyncedVersion {
+        type Error = SyncedVersionError;
+        type ProtoView<'a> = versions_proto::CompactVersionVectorView<'a>;
+
+        fn decode_proto_view_with(
+            proto: &Self::ProtoView<'_>,
+            offset: u64,
+        ) -> Result<Self, Self::Error> {
+            let decoded = Self::decode_proto_view(proto)?;
+            Ok(Self(decoded.0 + offset))
         }
     }
 
@@ -695,6 +824,68 @@ mod tests {
 
         assert_eq!(version.encode_proto_to_bytes(), proto.encode_to_bytes());
         assert_eq!(version.encode_proto_to_vec(), proto.encode_to_vec());
+    }
+
+    #[test]
+    fn proto_collection_helpers_preserve_order_and_collection_type() {
+        let versions = [SyncedVersion(3), SyncedVersion(5), SyncedVersion(8)];
+        let protos: VecDeque<_> = SyncedVersion::encode_proto_collection(&versions);
+        let decoded: VecDeque<_> = SyncedVersion::decode_proto_collection(protos)
+            .expect("owned protobuf collection should decode");
+
+        assert_eq!(decoded, VecDeque::from(versions));
+
+        let no_versions: [SyncedVersion; 0] = [];
+        let no_protos: Vec<versions_proto::CompactVersionVector> =
+            SyncedVersion::encode_proto_collection(&no_versions);
+        assert!(no_protos.is_empty());
+
+        let empty: Vec<SyncedVersion> = SyncedVersion::decode_proto_collection(Vec::new())
+            .expect("empty protobuf collection should decode");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn proto_collection_helpers_return_the_first_conversion_error() {
+        let missing = versions_proto::CompactVersionVector::default();
+        let unsupported = versions_proto::CompactVersionVector {
+            versions: Some(versions_proto::compact_version_vector::Versions::Full(
+                Box::default(),
+            )),
+            ..versions_proto::CompactVersionVector::default()
+        };
+
+        let result = SyncedVersion::decode_proto_collection::<Vec<_>>([missing, unsupported]);
+
+        assert!(matches!(result, Err(SyncedVersionError::MissingVersions)));
+    }
+
+    #[test]
+    fn contextual_proto_collection_helpers_reuse_context_for_owned_and_views() {
+        let versions = [SyncedVersion(1), SyncedVersion(2)];
+        let owned_protos: Vec<_> = SyncedVersion::encode_proto_collection(&versions);
+        let owned: Vec<_> = SyncedVersion::decode_proto_collection_with(owned_protos, 10)
+            .expect("contextual owned collection should decode");
+        assert_eq!(owned, [SyncedVersion(11), SyncedVersion(12)]);
+
+        let payloads = versions
+            .iter()
+            .map(EncodeProto::encode_proto_to_vec)
+            .collect::<Vec<_>>();
+        let views = payloads
+            .iter()
+            .map(|payload| {
+                versions_proto::CompactVersionVectorView::decode_view(payload)
+                    .expect("protobuf view should decode")
+            })
+            .collect::<Vec<_>>();
+        let viewed: Vec<_> = SyncedVersion::decode_proto_view_collection_with(&views, 20)
+            .expect("contextual view collection should decode");
+        assert_eq!(viewed, [SyncedVersion(21), SyncedVersion(22)]);
+
+        let plain_viewed: Vec<_> = SyncedVersion::decode_proto_view_collection(&views)
+            .expect("plain view collection should decode");
+        assert_eq!(plain_viewed, versions);
     }
 
     #[test]
@@ -721,7 +912,7 @@ mod tests {
             Err(SyncedVersionError::Decode { .. })
         ));
 
-        let missing_versions = versions_proto::VersionVector::default().encode_to_vec();
+        let missing_versions = versions_proto::CompactVersionVector::default().encode_to_vec();
         assert!(matches!(
             SyncedVersion::try_decode_proto_from_slice(&missing_versions),
             Err(ProtoInputDecodeError::Convert {
@@ -745,7 +936,7 @@ mod tests {
             Err(ProtoInputDecodeError::Decode { .. })
         ));
 
-        let missing_versions = versions_proto::VersionVector::default().encode_to_vec();
+        let missing_versions = versions_proto::CompactVersionVector::default().encode_to_vec();
         assert!(matches!(
             SyncedVersion::try_decode_proto_view_from_slice(&missing_versions),
             Err(ProtoInputDecodeError::Convert {

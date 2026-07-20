@@ -54,13 +54,13 @@ mod tests {
         };
         assert_eq!(synced.group_version, 1);
 
-        let v = VersionVector {
-            versions: Some(version_vector::Versions::Synced(Box::new(synced))),
-            ..VersionVector::default()
+        let v = CompactVersionVector {
+            versions: Some(compact_version_vector::Versions::Synced(Box::new(synced))),
+            ..CompactVersionVector::default()
         };
         assert!(matches!(
             v.versions,
-            Some(version_vector::Versions::Synced(ref value)) if value.group_version == 1
+            Some(compact_version_vector::Versions::Synced(ref value)) if value.group_version == 1
         ));
     }
 }

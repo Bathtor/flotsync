@@ -543,13 +543,6 @@ pub(crate) enum InboundDeliveryError {
         producer_index: MemberIndex,
     },
     #[snafu(display(
-        "Inbound update for group {group_id} carried invalid read versions: {source}",
-    ))]
-    DecodeReadVersions {
-        group_id: GroupId,
-        source: RuntimeMessageError,
-    },
-    #[snafu(display(
         "Inbound update {update_id} for group {group_id} carried read versions that already include producer version {producer_read_version}.",
     ))]
     SelfDependentReadVersions {
@@ -622,7 +615,6 @@ impl InboundDeliveryError {
             | Self::UpdateSenderNotInGroup { .. }
             | Self::UpdateSenderIndexMismatch { .. }
             | Self::UpdateProducerIndexNotInGroup { .. }
-            | Self::DecodeReadVersions { .. }
             | Self::SelfDependentReadVersions { .. }
             | Self::ConflictingPersistedUpdate { .. }
             | Self::UpdateOperationIdMismatch { .. }

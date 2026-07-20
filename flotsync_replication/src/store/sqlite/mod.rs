@@ -41,13 +41,12 @@ use crate::{
     codecs::{
         messages::{
             MemberCountContext,
-            RuntimeVersionVectorProtoSource,
             UpdateMessage,
             UpdateMessageProtoSource,
-            WireVersionVector,
+            VersionVectorCodecError,
+            VersionVectorProtoCodec,
         },
         pending_group::{
-            PendingGroupPayloadDecodeContext,
             PendingGroupPayloadKind,
             decode_pending_group_activation_payload,
             decode_pending_group_decision_payload,

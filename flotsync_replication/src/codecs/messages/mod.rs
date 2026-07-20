@@ -8,9 +8,8 @@ use crate::{
         MemberKeyId,
         MigrationProposal,
         ReplicationUpdateRecord,
-        Summary,
     },
-    codecs::pending_group::{PendingGroupPayloadDecodeContext, PendingGroupPayloadError},
+    codecs::pending_group::PendingGroupPayloadError,
     delivery::wire::{
         WireValueDecodeError,
         group_id_from_wire,
@@ -23,6 +22,7 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     member::TrieMap,
+    membership::GroupMemberships,
     versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector, VersionVectorGap},
 };
 use flotsync_messages::{
@@ -32,13 +32,11 @@ use flotsync_messages::{
     proto::{
         self,
         DecodeProto,
-        DecodeProtoOneof,
         DecodeProtoView,
         DecodeProtoViewWith,
         DecodeProtoWith,
         EncodeProto,
         EncodeProtoOneof,
-        MissingRequiredProto,
     },
     replication as replication_proto,
     security as security_proto,
@@ -57,7 +55,7 @@ use flotsync_security::{
 };
 use flotsync_utils::option_when;
 use snafu::prelude::*;
-use std::{fmt, num::NonZeroUsize, sync::Arc};
+use std::{borrow::Cow, fmt, num::NonZeroUsize, sync::Arc};
 use uuid::Uuid;
 
 mod common;
@@ -67,9 +65,10 @@ mod group;
 #[cfg(test)]
 mod tests;
 mod updates;
+mod versions;
 
 pub(crate) use common::*;
-pub(crate) use control::{RuntimeMessage, WireRuntimeMessage};
+pub(crate) use control::RuntimeMessage;
 pub(crate) use encoding::*;
 pub(crate) use group::{
     BootstrapMemberKeyMessage,
@@ -80,3 +79,4 @@ pub(crate) use group::{
     validate_bootstrap_public_key_bundle_matches_fingerprint,
 };
 pub(crate) use updates::*;
+pub(crate) use versions::*;

@@ -485,12 +485,7 @@ impl PeerAnnouncementComponent {
     fn broadcast_message(&self) -> Peer {
         Peer {
             instance_uuid: self.options.instance_id.as_bytes().to_vec(),
-            listening_on: self
-                .advertised_routes
-                .iter()
-                .copied()
-                .map(|route| route.encode_proto())
-                .collect(),
+            listening_on: PeerAnnouncementRoute::encode_proto_collection(&self.advertised_routes),
             ..Default::default()
         }
     }

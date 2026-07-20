@@ -15,6 +15,9 @@ pub(crate) enum RuntimeMessageError {
     },
     #[snafu(display("Runtime message did not contain a body."))]
     MissingBody,
+    /// A compact vector referenced a group absent from the membership snapshot.
+    #[snafu(display("Runtime message for group {group_id} requires hosted group-member context."))]
+    MissingGroupMemberContext { group_id: GroupId },
     #[snafu(display("Group setup must include at least one member."))]
     EmptyGroupSetup,
     #[snafu(display("Pending-group runtime message did not include private group setup."))]
@@ -126,7 +129,7 @@ pub(crate) enum RuntimeMessageError {
     #[snafu(display("Version-vector field '{field}' was invalid: {source}"))]
     InvalidReadVersions {
         field: &'static str,
-        source: WireVersionVectorError,
+        source: VersionVectorCodecError,
     },
     #[snafu(display("Update dataset id '{value}' was invalid: {source}"))]
     InvalidDatasetId {
@@ -135,62 +138,55 @@ pub(crate) enum RuntimeMessageError {
     },
 }
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
-pub(crate) enum WireVersionVectorError {
-    #[snafu(display("Version-vector payload was missing."))]
-    MissingVersionsBody,
-    #[snafu(display("Full version vector must include at least one entry."))]
-    EmptyFullVector,
-    #[snafu(display(
-        "Compact read versions expected {expected_members} members, but the hosted group has {actual_members}."
-    ))]
-    MemberCountMismatch {
-        expected_members: usize,
-        actual_members: usize,
-    },
-    #[snafu(display(
-        "Override read versions used invalid override position {override_position} for {num_members} members."
-    ))]
-    InvalidOverridePosition {
-        num_members: usize,
-        override_position: u32,
-    },
-    #[snafu(display(
-        "Override read versions were invalid: group version {group_version}, override position {override_position}, override version {override_version}."
-    ))]
-    InvalidOverride {
-        group_version: u64,
-        override_position: u32,
-        override_version: u64,
-    },
-    #[snafu(display(
-        "Version-vector field '{field}' used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
-    ))]
-    VersionBoundTooLarge { field: &'static str, version: u64 },
-}
-
 impl proto::FromProtoDecodeError for RuntimeMessageError {
     fn from_proto_decode_error(source: flotsync_messages::buffa::DecodeError) -> Self {
         Self::Decode { source }
     }
 }
 
-/// Required-oneof contexts in runtime delivery messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RuntimeMessageOneofContext {
-    /// `RuntimeMessage.body`.
-    Body,
-}
-
-impl MissingRequiredProto for RuntimeMessageError {
-    type Context = RuntimeMessageOneofContext;
-
-    fn missing_required(context: Self::Context) -> Self {
-        match context {
-            RuntimeMessageOneofContext::Body => Self::MissingBody,
-        }
-    }
+/// Failure while validating a compact or self-describing version-vector protobuf.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum VersionVectorCodecError {
+    /// The protobuf omitted its compact representation body.
+    #[snafu(display("Version-vector payload was missing."))]
+    MissingVersionsBody,
+    /// A self-describing vector declared zero members.
+    #[snafu(display("Version-vector member count must be greater than zero."))]
+    InvalidMemberCount,
+    /// An explicit full-vector representation contained no member entries.
+    #[snafu(display("Full version vector must include at least one entry."))]
+    EmptyFullVector,
+    /// An explicit full-vector length disagreed with its member-count context.
+    #[snafu(display(
+        "Version vector contained {actual_members} members, but its context requires {expected_members}."
+    ))]
+    MemberCountMismatch {
+        expected_members: usize,
+        actual_members: usize,
+    },
+    /// An override position fell outside the owning group's membership order.
+    #[snafu(display(
+        "Version vector used invalid override position {override_position} for {num_members} members."
+    ))]
+    InvalidOverridePosition {
+        num_members: usize,
+        override_position: u32,
+    },
+    /// Override versions violated the runtime vector invariants.
+    #[snafu(display(
+        "Version-vector override was invalid: group version {group_version}, override position {override_position}, override version {override_version}."
+    ))]
+    InvalidOverride {
+        group_version: u64,
+        override_position: u32,
+        override_version: u64,
+    },
+    /// A version used the reserved upper bound unsupported by runtime arithmetic.
+    #[snafu(display(
+        "Version-vector field '{field}' used unsupported version bound {version}; maximum supported bound is {MAX_VERSION_VALUE}."
+    ))]
+    VersionBoundTooLarge { field: &'static str, version: u64 },
 }
 
 /// Hosted-group member count needed by compact runtime protobuf decoders.
@@ -209,5 +205,33 @@ impl MemberCountContext {
     /// Return the hosted-group member count.
     pub(crate) const fn member_count(self) -> NonZeroUsize {
         self.member_count
+    }
+}
+
+/// Hosted-group context available while decoding one runtime message.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeMessageDecodeContext<'a> {
+    /// Current immutable membership snapshot for locally hosted groups.
+    memberships: &'a GroupMemberships,
+}
+
+impl<'a> RuntimeMessageDecodeContext<'a> {
+    /// Create a runtime-message context from the current membership snapshot.
+    pub(crate) const fn new(memberships: &'a GroupMemberships) -> Self {
+        Self { memberships }
+    }
+
+    /// Return the member count for a compact vector scoped to `group_id`.
+    pub(crate) fn member_count_for(
+        self,
+        group_id: GroupId,
+    ) -> Result<MemberCountContext, RuntimeMessageError> {
+        let members = self
+            .memberships
+            .members(&group_id)
+            .context(MissingGroupMemberContextSnafu { group_id })?;
+        let member_count =
+            NonZeroUsize::new(members.len()).expect("hosted replication groups must not be empty");
+        Ok(MemberCountContext::new(member_count))
     }
 }

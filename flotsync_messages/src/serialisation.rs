@@ -149,17 +149,17 @@ mod tests {
     struct SerializableVersion(u64);
 
     impl EncodeProto for SerializableVersion {
-        type Proto = versions_proto::VersionVector;
+        type Proto = versions_proto::CompactVersionVector;
 
         fn encode_proto(&self) -> Self::Proto {
-            versions_proto::VersionVector {
-                versions: Some(versions_proto::version_vector::Versions::Synced(Box::new(
-                    versions_proto::SyncedVersionVector {
+            versions_proto::CompactVersionVector {
+                versions: Some(versions_proto::compact_version_vector::Versions::Synced(
+                    Box::new(versions_proto::SyncedVersionVector {
                         group_version: self.0,
                         ..versions_proto::SyncedVersionVector::default()
-                    },
-                ))),
-                ..versions_proto::VersionVector::default()
+                    }),
+                )),
+                ..versions_proto::CompactVersionVector::default()
             }
         }
     }
