@@ -18,7 +18,7 @@ env:
     CARGO_TERM_COLOR: always
     CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     RUST_TEST_TOOLCHAIN: nightly
-    RUST_STYLE_TOOLCHAIN: nightly-2026-04-11
+    RUST_STYLE_TOOLCHAIN: nightly-2026-07-18
 
 jobs:
     linux-style:
