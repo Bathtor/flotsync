@@ -57,8 +57,6 @@ use super::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::api::MemberKeyId;
-#[cfg(test)]
-use crate::codecs::messages::UpdateBatchMessage;
 #[cfg(any(test, feature = "test-support"))]
 use crate::test_support::{test_group_key, test_public_member_keys};
 use crate::{
@@ -131,14 +129,12 @@ use crate::{
         GroupSetupMessage,
         MigrationProposalMessage,
         RuntimeMessage,
+        RuntimeMessageDecodeContext,
         SummaryMessage,
         SummaryRequestMessage,
+        UpdateBatchMessage,
         UpdateMessage,
         UpdateRangeMessage,
-        WireRuntimeMessage,
-        WireSummaryMessage,
-        WireUpdateBatchMessage,
-        WireUpdateMessage,
     },
     delivery::{
         contracts::{
@@ -167,7 +163,7 @@ use flotsync_core::{
     membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
-use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
+use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, PublicKeyBundle};
 use flotsync_utils::{
     BoxFuture,
@@ -214,7 +210,7 @@ use inbound_support::{
     SummaryCatchUpObservation,
     handled_after_inbound_failure,
     panic_if_fatal_inbound_failure,
-    summary_from_wire,
+    summary_from_message,
 };
 use listeners::{
     ListenerDataChangeBatches,
@@ -2636,13 +2632,17 @@ impl ReplicationRuntimeComponent {
         deliver: ReliableDeliveryDeliver,
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::reliable(&deliver.envelope.header);
-        let message =
-            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-            };
+        let memberships = self.group_memberships.snapshot();
+        let decode_context = RuntimeMessageDecodeContext::new(memberships.as_ref());
+        let message_res = RuntimeMessage::decode_proto_view_from_slice_with(
+            &deliver.envelope.payload.bytes,
+            decode_context,
+        )
+        .context(inbound::DecodeMessageSnafu);
+        let message = match message_res {
+            Ok(message) => message,
+            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+        };
         let message_group_id = message.group_id();
         let ReliableMessageScope::Group {
             group_id: envelope_group_id,
@@ -2659,7 +2659,7 @@ impl ReplicationRuntimeComponent {
             return Err(InboundDeliveryFailure::new(context, error));
         }
         match message {
-            WireRuntimeMessage::GroupInvitation(message) => {
+            RuntimeMessage::GroupInvitation(message) => {
                 let (invitation, group_setup) = message.into_parts();
                 Ok(self.handle_inbound_pending_group_decision(
                     context,
@@ -2668,7 +2668,7 @@ impl ReplicationRuntimeComponent {
                     group_setup,
                 ))
             }
-            WireRuntimeMessage::MigrationProposal(message) => {
+            RuntimeMessage::MigrationProposal(message) => {
                 let (proposal, group_setup) = message.into_parts();
                 Ok(self.handle_inbound_pending_group_decision(
                     context,
@@ -2677,17 +2677,17 @@ impl ReplicationRuntimeComponent {
                     group_setup,
                 ))
             }
-            WireRuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
+            RuntimeMessage::Update(_) => Err(InboundDeliveryFailure::new(
                 context,
                 InboundDeliveryError::UnexpectedReliableMessage,
             )),
-            WireRuntimeMessage::NeedRange(_) | WireRuntimeMessage::UpdateBatch(_) => {
+            RuntimeMessage::NeedRange(_) | RuntimeMessage::UpdateBatch(_) => {
                 Err(InboundDeliveryFailure::new(
                     context,
                     InboundDeliveryError::UnexpectedReliableMessage,
                 ))
             }
-            WireRuntimeMessage::SummaryRequest(message) => {
+            RuntimeMessage::SummaryRequest(message) => {
                 let sender = deliver.envelope.header.sender.clone();
                 Ok(self.handle_inbound_summary_request(
                     context,
@@ -2698,11 +2698,9 @@ impl ReplicationRuntimeComponent {
                     message,
                 ))
             }
-            WireRuntimeMessage::Summary(message) => {
+            RuntimeMessage::Summary(message) => {
                 let sender = deliver.envelope.header.sender.clone();
-                let memberships = self.group_memberships.snapshot();
-                let summary = summary_from_wire(sender, message, memberships.as_ref())
-                    .map_err(|error| InboundDeliveryFailure::new(context.clone(), error))?;
+                let summary = summary_from_message(sender, message);
                 Ok(self.handle_observed_summary(summary))
             }
         }
@@ -2714,35 +2712,34 @@ impl ReplicationRuntimeComponent {
     ) -> Result<HandlerResult, InboundDeliveryFailure> {
         let context = InboundDeliveryContext::group(&deliver.envelope.header);
         let sender = deliver.envelope.header.sender.clone();
-        let message =
-            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
-            };
+        let memberships = self.group_memberships.snapshot();
+        let decode_context = RuntimeMessageDecodeContext::new(memberships.as_ref());
+        let message = match RuntimeMessage::decode_proto_view_from_slice_with(
+            &deliver.envelope.payload.bytes,
+            decode_context,
+        )
+        .context(inbound::DecodeMessageSnafu)
+        {
+            Ok(message) => message,
+            Err(error) => return Err(InboundDeliveryFailure::new(context, error)),
+        };
         match message {
-            WireRuntimeMessage::GroupInvitation(_) | WireRuntimeMessage::MigrationProposal(_) => {
-                Err(InboundDeliveryFailure::new(
-                    context,
-                    InboundDeliveryError::UnexpectedGroupMessage,
-                ))
-            }
-            WireRuntimeMessage::Update(message) => Ok(self.handle_update(context, sender, message)),
-            WireRuntimeMessage::UpdateBatch(message) => {
+            RuntimeMessage::GroupInvitation(_) | RuntimeMessage::MigrationProposal(_) => Err(
+                InboundDeliveryFailure::new(context, InboundDeliveryError::UnexpectedGroupMessage),
+            ),
+            RuntimeMessage::Update(message) => Ok(self.handle_update(context, sender, *message)),
+            RuntimeMessage::UpdateBatch(message) => {
                 Ok(self.handle_update_batch(context, sender, message))
             }
-            WireRuntimeMessage::NeedRange(_) => {
+            RuntimeMessage::NeedRange(_) => {
                 // CatchUpManagerComponent owns NeedRange processing on group broadcast.
                 Ok(Handled::OK)
             }
-            WireRuntimeMessage::Summary(message) => {
-                let memberships = self.group_memberships.snapshot();
-                let summary = summary_from_wire(sender, message, memberships.as_ref())
-                    .map_err(|error| InboundDeliveryFailure::new(context.clone(), error))?;
+            RuntimeMessage::Summary(message) => {
+                let summary = summary_from_message(sender, message);
                 Ok(self.handle_observed_summary(summary))
             }
-            WireRuntimeMessage::SummaryRequest(message) => Ok(self.handle_inbound_summary_request(
+            RuntimeMessage::SummaryRequest(message) => Ok(self.handle_inbound_summary_request(
                 context,
                 SummaryReplyRoute::GroupBroadcast,
                 message,
@@ -2759,7 +2756,7 @@ impl ReplicationRuntimeComponent {
     async fn persist_and_apply_update(
         &mut self,
         origin: InboundUpdateOrigin,
-        message: WireUpdateMessage,
+        message: UpdateMessage,
     ) -> Result<InboundUpdateOutcome, InboundDeliveryError> {
         let group_id = message.group_id;
         let mut transaction = self
@@ -2777,9 +2774,6 @@ impl ReplicationRuntimeComponent {
         let local_group =
             LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
                 .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
-        let message = message
-            .into_runtime(local_group.member_count())
-            .context(inbound::DecodeReadVersionsSnafu { group_id })?;
         let producer = Self::validated_inbound_update_producer(
             &local_group,
             group_id,
@@ -2997,7 +2991,7 @@ impl ReplicationRuntimeComponent {
     async fn persist_apply_and_notify_update_batch(
         &mut self,
         batch_sender: MemberIdentity,
-        message: WireUpdateBatchMessage,
+        message: UpdateBatchMessage,
     ) -> Result<(), InboundDeliveryError> {
         let group_id = message.group_id;
         let mut observed_available = Vec::new();
@@ -3038,7 +3032,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         context: InboundDeliveryContext,
         sender: MemberIdentity,
-        message: WireUpdateMessage,
+        message: UpdateMessage,
     ) -> HandlerResult {
         Handled::block_on(self, async move |mut async_self| {
             let group_id = message.group_id;
@@ -3068,7 +3062,7 @@ impl ReplicationRuntimeComponent {
         &mut self,
         context: InboundDeliveryContext,
         batch_sender: MemberIdentity,
-        message: WireUpdateBatchMessage,
+        message: UpdateBatchMessage,
     ) -> HandlerResult {
         // Keep batch application on the component's blocking path. These
         // helpers borrow component state mutably across awaits, and the
@@ -3547,10 +3541,7 @@ impl ReplicationRuntimeComponent {
         let (promise, (sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = match async_self
-                .persist_and_apply_update(
-                    InboundUpdateOrigin::Producer { sender },
-                    WireUpdateMessage::from(message),
-                )
+                .persist_and_apply_update(InboundUpdateOrigin::Producer { sender }, message)
                 .await
             {
                 Ok(outcome) => {
@@ -3572,10 +3563,7 @@ impl ReplicationRuntimeComponent {
         let (promise, (batch_sender, message)) = ask.take();
         Handled::block_on(self, async move |mut async_self| {
             let reply = async_self
-                .persist_apply_and_notify_update_batch(
-                    batch_sender,
-                    WireUpdateBatchMessage::from(message),
-                )
+                .persist_apply_and_notify_update_batch(batch_sender, message)
                 .await;
             let _ = promise.fulfil(reply);
             Handled::OK

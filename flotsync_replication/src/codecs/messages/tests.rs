@@ -2,6 +2,7 @@
 
 use super::{
     BootstrapMemberKeyMessage,
+    CompactVersionVectorProtoCodec,
     DatasetUpdateMessage,
     DatasetUpdateMessageView,
     GroupInvitationMessage,
@@ -11,17 +12,16 @@ use super::{
     MigrationProposalMessage,
     NeedRangeMessage,
     RuntimeMessage,
+    RuntimeMessageDecodeContext,
     RuntimeMessageError,
-    RuntimeVersionVectorProtoSource,
     SummaryMessage,
     SummaryRequestMessage,
     UpdateBatchMessage,
     UpdateMessage,
     UpdateMessageProtoSource,
     UpdateRangeMessage,
-    WireRuntimeMessage,
-    WireVersionVector,
-    WireVersionVectorError,
+    VersionVectorCodecError,
+    VersionVectorProtoCodec,
 };
 use crate::{
     api::{
@@ -39,12 +39,13 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     member::TrieMap,
+    membership::{GroupMembers, GroupMemberships},
     versions::{OverrideVersion, PureVersionVector, UpdateId, VersionVector},
 };
 use flotsync_messages::{
     buffa::{Message as _, MessageView as _},
     datamodel as datamodel_proto,
-    proto::{DecodeProto, DecodeProtoView, DecodeProtoViewWith, DecodeProtoWith, EncodeProto},
+    proto::{DecodeProto, DecodeProtoViewWith, DecodeProtoWith, EncodeProto},
     replication as replication_proto,
     versions as versions_proto,
 };
@@ -87,8 +88,31 @@ fn test_group_setup(members: &[MemberIdentity]) -> Arc<GroupSetupMessage> {
     )
 }
 
+fn test_memberships(groups: &[(GroupId, usize)]) -> GroupMemberships {
+    const MEMBER_NAMES: [&str; 4] = ["alice", "bob", "carol", "dave"];
+    GroupMemberships::from_groups(groups.iter().map(|(group_id, member_count)| {
+        let members: Vec<_> = MEMBER_NAMES[..*member_count]
+            .iter()
+            .map(|name| MemberIdentity::from_array(["runtime-message", *name]))
+            .collect();
+        let members = GroupMembers::from_ordered_members(members)
+            .expect("test group members should be valid");
+        (*group_id, members)
+    }))
+}
+
+fn decode_runtime_message(
+    payload: &[u8],
+    memberships: &GroupMemberships,
+) -> Result<RuntimeMessage, RuntimeMessageError> {
+    RuntimeMessage::decode_proto_view_from_slice_with(
+        payload,
+        RuntimeMessageDecodeContext::new(memberships),
+    )
+}
+
 #[test]
-fn wire_version_vector_round_trips_full_override_and_synced() {
+fn compact_and_self_describing_version_vectors_round_trip_all_representations() {
     let full = VersionVector::Full(PureVersionVector::from([2, 3, 4]));
     let override_vector = VersionVector::Override {
         num_members: NonZeroUsize::new(3).expect("three members"),
@@ -100,21 +124,45 @@ fn wire_version_vector_round_trips_full_override_and_synced() {
     };
 
     for vector in [full, override_vector, synced] {
-        let wire = WireVersionVector::from_runtime(&vector);
-        let proto = wire.encode_proto();
-        let payload = proto.encode_to_bytes();
-        let view =
-            versions_proto::VersionVectorView::decode_view(&payload).expect("view should decode");
-        assert_eq!(
-            WireVersionVector::decode_proto_view(&view).expect("wire view decode should work"),
-            wire
-        );
-        let decoded_wire = WireVersionVector::decode_proto(proto).expect("wire decode should work");
-        let decoded_vector = decoded_wire
-            .to_runtime(vector.num_members())
-            .expect("runtime decode should work");
-        assert_eq!(decoded_vector, vector);
+        let member_count = MemberCountContext::new(vector.num_members());
+        let compact = CompactVersionVectorProtoCodec::from(&vector).encode_proto();
+        let compact_payload = compact.encode_to_bytes();
+        let compact_view = versions_proto::CompactVersionVectorView::decode_view(&compact_payload)
+            .expect("compact view should decode");
+        let decoded_view =
+            CompactVersionVectorProtoCodec::decode_proto_view_with(&compact_view, member_count)
+                .expect("compact view should decode");
+        assert_eq!(decoded_view.into_version_vector(), vector);
+        let decoded = CompactVersionVectorProtoCodec::decode_proto_with(compact, member_count)
+            .expect("compact vector should decode");
+        assert_eq!(decoded.into_version_vector(), vector);
+
+        let self_describing = VersionVectorProtoCodec::from(&vector).encode_proto();
+        let decoded = VersionVectorProtoCodec::decode_proto(self_describing)
+            .expect("self-describing vector should decode");
+        assert_eq!(decoded.into_version_vector(), vector);
     }
+}
+
+#[test]
+fn self_describing_version_vector_rejects_invalid_member_counts() {
+    let vector = VersionVector::Full(PureVersionVector::from([2, 3]));
+    let mut missing_count = VersionVectorProtoCodec::from(&vector).encode_proto();
+    missing_count.num_members = 0;
+    assert!(matches!(
+        VersionVectorProtoCodec::decode_proto(missing_count),
+        Err(VersionVectorCodecError::InvalidMemberCount)
+    ));
+
+    let mut mismatched_count = VersionVectorProtoCodec::from(&vector).encode_proto();
+    mismatched_count.num_members = 3;
+    assert!(matches!(
+        VersionVectorProtoCodec::decode_proto(mismatched_count),
+        Err(VersionVectorCodecError::MemberCountMismatch {
+            expected_members: 3,
+            actual_members: 2,
+        })
+    ));
 }
 
 #[test]
@@ -126,11 +174,12 @@ fn summary_messages_round_trip_through_runtime_envelope() {
         correlation_id,
     });
     let request_payload = summary_request.encode_proto().encode_to_bytes();
+    let memberships = test_memberships(&[(group_id, 2)]);
 
     assert_eq!(
-        WireRuntimeMessage::decode_proto_view_from_slice(&request_payload)
+        decode_runtime_message(&request_payload, &memberships)
             .expect("summary request should decode"),
-        WireRuntimeMessage::SummaryRequest(SummaryRequestMessage {
+        RuntimeMessage::SummaryRequest(SummaryRequestMessage {
             group_id,
             correlation_id,
         })
@@ -143,16 +192,14 @@ fn summary_messages_round_trip_through_runtime_envelope() {
         has_versions.clone(),
     ));
     let summary_payload = summary.encode_proto().encode_to_bytes();
-    let decoded_summary = WireRuntimeMessage::decode_proto_view_from_slice(&summary_payload)
-        .expect("summary should decode");
+    let decoded_summary =
+        decode_runtime_message(&summary_payload, &memberships).expect("summary should decode");
 
-    let WireRuntimeMessage::Summary(decoded_summary) = decoded_summary else {
+    let RuntimeMessage::Summary(decoded_summary) = decoded_summary else {
         panic!("summary payload should decode as a summary");
     };
     assert_eq!(
-        decoded_summary
-            .into_runtime(NonZeroUsize::new(2).expect("two members"))
-            .expect("summary versions should normalise"),
+        decoded_summary,
         SummaryMessage::new(group_id, correlation_id, has_versions)
     );
 }
@@ -300,13 +347,16 @@ fn borrowed_proto_sources_match_owned_runtime_message_encoding() {
         updates: vec![update.clone()],
     };
 
+    let mut encoded_update = update.encode_proto();
+    let encoded_read_versions = encoded_update
+        .read_versions
+        .take()
+        .expect("update should include read versions");
     assert_eq!(
-        RuntimeVersionVectorProtoSource::from(&update.read_versions)
+        CompactVersionVectorProtoCodec::from(&update.read_versions)
             .encode_proto()
             .encode_to_bytes(),
-        WireVersionVector::from_runtime(&update.read_versions)
-            .encode_proto()
-            .encode_to_bytes()
+        encoded_read_versions.encode_to_bytes()
     );
     assert_eq!(
         update.dataset_updates[0]
@@ -379,6 +429,7 @@ fn pending_group_messages_round_trip_through_runtime_envelope() {
     ];
     let group_schema = docs_group_schema();
     let group_setup = test_group_setup(&members);
+    let memberships = GroupMemberships::new();
     let invitation = GroupInvitation::new_migration(
         migration_id,
         members.clone(),
@@ -396,37 +447,51 @@ fn pending_group_messages_round_trip_through_runtime_envelope() {
     let invitation_payload = RuntimeMessage::GroupInvitation(invitation_message.clone())
         .encode_proto()
         .encode_to_bytes();
-    let decoded_invitation = WireRuntimeMessage::decode_proto_view_from_slice(&invitation_payload)
+    let decoded_invitation = decode_runtime_message(&invitation_payload, &memberships)
         .expect("invitation should decode");
     assert_eq!(
         decoded_invitation,
-        WireRuntimeMessage::GroupInvitation(invitation_message)
+        RuntimeMessage::GroupInvitation(invitation_message)
     );
 
-    let proposal = MigrationProposal {
-        migration_id,
-        final_versions: VersionVector::Full(PureVersionVector::from([3, 4])),
-        proposed_members: members,
-        group_schema,
-        initial_snapshot: InitialSnapshot::Empty,
-        group_name: Some("docs".to_owned()),
-        message: Some("migrate".to_owned()),
-    };
-    let proposal_message = MigrationProposalMessage::try_new(proposal, group_setup)
-        .expect("proposal members should match setup");
-    assert_eq!(
-        RuntimeMessage::MigrationProposal(proposal_message.clone()).group_id(),
-        migration_id.old_group_id
-    );
-    let proposal_payload = RuntimeMessage::MigrationProposal(proposal_message.clone())
-        .encode_proto()
-        .encode_to_bytes();
-    let decoded_proposal = WireRuntimeMessage::decode_proto_view_from_slice(&proposal_payload)
-        .expect("proposal should decode");
-    assert_eq!(
-        decoded_proposal,
-        WireRuntimeMessage::MigrationProposal(proposal_message)
-    );
+    let final_versions = [
+        VersionVector::Full(PureVersionVector::from([3, 4])),
+        VersionVector::Synced {
+            num_members: NonZeroUsize::new(2).expect("two members"),
+            version: 3,
+        },
+        VersionVector::Override {
+            num_members: NonZeroUsize::new(2).expect("two members"),
+            version: OverrideVersion::new(3, 1, 4),
+        },
+    ];
+    for final_versions in final_versions {
+        let proposal = MigrationProposal {
+            migration_id,
+            final_versions,
+            proposed_members: members.clone(),
+            group_schema: group_schema.clone(),
+            initial_snapshot: InitialSnapshot::Empty,
+            group_name: Some("docs".to_owned()),
+            message: Some("migrate".to_owned()),
+        };
+        let proposal_message =
+            MigrationProposalMessage::try_new(proposal, Arc::clone(&group_setup))
+                .expect("proposal members should match setup");
+        assert_eq!(
+            RuntimeMessage::MigrationProposal(proposal_message.clone()).group_id(),
+            migration_id.old_group_id
+        );
+        let proposal_payload = RuntimeMessage::MigrationProposal(proposal_message.clone())
+            .encode_proto()
+            .encode_to_bytes();
+        let decoded_proposal = decode_runtime_message(&proposal_payload, &memberships)
+            .expect("proposal should decode");
+        assert_eq!(
+            decoded_proposal,
+            RuntimeMessage::MigrationProposal(proposal_message)
+        );
+    }
 }
 
 #[test]
@@ -470,7 +535,7 @@ fn update_range_rejects_reserved_max_bound() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+    let error = decode_runtime_message(&payload, &GroupMemberships::new())
         .expect_err("reserved max range bound should be rejected");
     assert!(matches!(
         error,
@@ -496,7 +561,8 @@ fn update_rejects_reserved_update_id_version() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+    let memberships = test_memberships(&[(group_id, 2)]);
+    let error = decode_runtime_message(&payload, &memberships)
         .expect_err("reserved update id version should be rejected");
     assert!(matches!(
         error,
@@ -521,13 +587,14 @@ fn update_rejects_reserved_read_version_bound() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+    let memberships = test_memberships(&[(group_id, 2)]);
+    let error = decode_runtime_message(&payload, &memberships)
         .expect_err("reserved read version should be rejected");
     assert!(matches!(
         error,
         RuntimeMessageError::InvalidReadVersions {
             field: "update.read_versions",
-            source: WireVersionVectorError::VersionBoundTooLarge {
+            source: VersionVectorCodecError::VersionBoundTooLarge {
                 field: "full.entries",
                 version: u64::MAX,
             },
@@ -550,13 +617,14 @@ fn summary_rejects_reserved_version_bound() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+    let memberships = test_memberships(&[(group_id, 2)]);
+    let error = decode_runtime_message(&payload, &memberships)
         .expect_err("reserved summary version should be rejected");
     assert!(matches!(
         error,
         RuntimeMessageError::InvalidReadVersions {
             field: "summary.has_versions",
-            source: WireVersionVectorError::VersionBoundTooLarge {
+            source: VersionVectorCodecError::VersionBoundTooLarge {
                 field: "synced.group_version",
                 version: u64::MAX,
             },
@@ -583,7 +651,8 @@ fn update_batch_rejects_mismatched_inner_group() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = WireRuntimeMessage::decode_proto_view_from_slice(&payload)
+    let memberships = test_memberships(&[(batch_group_id, 2)]);
+    let error = decode_runtime_message(&payload, &memberships)
         .expect_err("mismatched batch group should be rejected");
     assert!(matches!(
         error,

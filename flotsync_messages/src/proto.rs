@@ -648,23 +648,23 @@ mod tests {
 
     impl ProtoCodec for SyncedVersion {
         type DecodeError = SyncedVersionError;
-        type Proto = versions_proto::VersionVector;
+        type Proto = versions_proto::CompactVersionVector;
 
         fn to_proto(&self) -> Self::Proto {
-            versions_proto::VersionVector {
-                versions: Some(versions_proto::version_vector::Versions::Synced(Box::new(
-                    versions_proto::SyncedVersionVector {
+            versions_proto::CompactVersionVector {
+                versions: Some(versions_proto::compact_version_vector::Versions::Synced(
+                    Box::new(versions_proto::SyncedVersionVector {
                         group_version: self.0,
                         ..versions_proto::SyncedVersionVector::default()
-                    },
-                ))),
-                ..versions_proto::VersionVector::default()
+                    }),
+                )),
+                ..versions_proto::CompactVersionVector::default()
             }
         }
 
         fn from_proto(proto: Self::Proto) -> Result<Self, Self::DecodeError> {
             match proto.versions {
-                Some(versions_proto::version_vector::Versions::Synced(synced)) => {
+                Some(versions_proto::compact_version_vector::Versions::Synced(synced)) => {
                     Ok(Self(synced.group_version))
                 }
                 Some(_) => Err(SyncedVersionError::UnsupportedVersions),
@@ -675,11 +675,11 @@ mod tests {
 
     impl DecodeProtoView for SyncedVersion {
         type Error = SyncedVersionError;
-        type ProtoView<'a> = versions_proto::VersionVectorView<'a>;
+        type ProtoView<'a> = versions_proto::CompactVersionVectorView<'a>;
 
         fn decode_proto_view(proto: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
             match proto.versions.as_ref() {
-                Some(versions_proto::version_vector::VersionsView::Synced(synced)) => {
+                Some(versions_proto::compact_version_vector::VersionsView::Synced(synced)) => {
                     Ok(Self(synced.group_version))
                 }
                 Some(_) => Err(SyncedVersionError::UnsupportedVersions),
@@ -721,7 +721,7 @@ mod tests {
             Err(SyncedVersionError::Decode { .. })
         ));
 
-        let missing_versions = versions_proto::VersionVector::default().encode_to_vec();
+        let missing_versions = versions_proto::CompactVersionVector::default().encode_to_vec();
         assert!(matches!(
             SyncedVersion::try_decode_proto_from_slice(&missing_versions),
             Err(ProtoInputDecodeError::Convert {
@@ -745,7 +745,7 @@ mod tests {
             Err(ProtoInputDecodeError::Decode { .. })
         ));
 
-        let missing_versions = versions_proto::VersionVector::default().encode_to_vec();
+        let missing_versions = versions_proto::CompactVersionVector::default().encode_to_vec();
         assert!(matches!(
             SyncedVersion::try_decode_proto_view_from_slice(&missing_versions),
             Err(ProtoInputDecodeError::Convert {

@@ -50,11 +50,8 @@ impl DecodeProto for GroupInvitationMessage {
             return MissingGroupSetupSnafu.fail();
         };
         let group_setup = GroupSetupMessage::decode_proto(group_setup)?;
-        let invitation = GroupInvitation::decode_proto_with(
-            message,
-            PendingGroupPayloadDecodeContext::default(),
-        )
-        .context(InvalidPendingGroupPayloadSnafu)?;
+        let invitation =
+            GroupInvitation::decode_proto(message).context(InvalidPendingGroupPayloadSnafu)?;
         Self::try_new(invitation, Arc::new(group_setup))
     }
 }
@@ -107,16 +104,8 @@ impl DecodeProto for MigrationProposalMessage {
             return MissingGroupSetupSnafu.fail();
         };
         let group_setup = GroupSetupMessage::decode_proto(group_setup)?;
-        // TODO(flotsync-git-i20): this empty context cannot expand compact
-        // `Synced` or `Override` final-version vectors because their old-group
-        // member count is only available from runtime state. Keep the compact
-        // wire shape, defer resolution until that context can be supplied, and
-        // add proposal decode tests for both compact variants with that work.
-        let proposal = MigrationProposal::decode_proto_with(
-            message,
-            PendingGroupPayloadDecodeContext::default(),
-        )
-        .context(InvalidPendingGroupPayloadSnafu)?;
+        let proposal =
+            MigrationProposal::decode_proto(message).context(InvalidPendingGroupPayloadSnafu)?;
         Self::try_new(proposal, Arc::new(group_setup))
     }
 }

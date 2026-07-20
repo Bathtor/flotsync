@@ -2,57 +2,6 @@
 
 use super::*;
 
-/// Borrowed source for encoding a runtime version vector without first
-/// constructing the compact owned wire representation.
-pub(crate) struct RuntimeVersionVectorProtoSource<'a> {
-    /// Runtime version vector to encode into the generated protobuf shape.
-    version_vector: &'a VersionVector,
-}
-
-impl<'a> From<&'a VersionVector> for RuntimeVersionVectorProtoSource<'a> {
-    fn from(version_vector: &'a VersionVector) -> Self {
-        Self { version_vector }
-    }
-}
-
-impl EncodeProto for RuntimeVersionVectorProtoSource<'_> {
-    type Proto = versions_proto::VersionVector;
-
-    fn encode_proto(&self) -> Self::Proto {
-        let versions = match self.version_vector {
-            VersionVector::Full(vector) => versions_proto::version_vector::Versions::Full(
-                Box::new(versions_proto::FullVersionVector {
-                    entries: vector.0.to_vec(),
-                    ..versions_proto::FullVersionVector::default()
-                }),
-            ),
-            VersionVector::Override { version, .. } => {
-                versions_proto::version_vector::Versions::Override(Box::new(
-                    versions_proto::OverrideVersionVector {
-                        group_version: version.group_version(),
-                        override_position: u32::try_from(version.override_position)
-                            .expect("wire version override position must fit into u32"),
-                        override_version: version.override_version(),
-                        ..versions_proto::OverrideVersionVector::default()
-                    },
-                ))
-            }
-            VersionVector::Synced { version, .. } => {
-                versions_proto::version_vector::Versions::Synced(Box::new(
-                    versions_proto::SyncedVersionVector {
-                        group_version: *version,
-                        ..versions_proto::SyncedVersionVector::default()
-                    },
-                ))
-            }
-        };
-        versions_proto::VersionVector {
-            versions: Some(versions),
-            ..versions_proto::VersionVector::default()
-        }
-    }
-}
-
 impl<'a> From<&'a DatasetUpdateRecord> for DatasetUpdateMessageView<'a> {
     fn from(record: &'a DatasetUpdateRecord) -> Self {
         Self {
@@ -78,8 +27,7 @@ impl EncodeProto for UpdateMessageView<'_> {
     type Proto = replication_proto::Update;
 
     fn encode_proto(&self) -> Self::Proto {
-        let read_versions =
-            RuntimeVersionVectorProtoSource::from(self.read_versions).encode_proto();
+        let read_versions = CompactVersionVectorProtoCodec::from(self.read_versions).encode_proto();
         replication_proto::Update {
             group_id: self.group_id.0.as_bytes().to_vec(),
             update_id: MessageField::some(encode_update_id(*self.update_id)),
@@ -119,8 +67,7 @@ impl EncodeProto for UpdateMessageProtoSource<'_> {
     type Proto = replication_proto::Update;
 
     fn encode_proto(&self) -> Self::Proto {
-        let read_versions =
-            RuntimeVersionVectorProtoSource::from(self.read_versions).encode_proto();
+        let read_versions = CompactVersionVectorProtoCodec::from(self.read_versions).encode_proto();
         replication_proto::Update {
             group_id: self.group_id.0.as_bytes().to_vec(),
             update_id: MessageField::some(encode_update_id(self.update_id)),
@@ -139,7 +86,7 @@ impl EncodeProto for SummaryVersionsMessageView<'_, VersionVector> {
             group_id: self.group_id.0.as_bytes().to_vec(),
             correlation_id: self.correlation_id.as_bytes().to_vec(),
             has_versions: MessageField::some(
-                RuntimeVersionVectorProtoSource::from(self.has_versions).encode_proto(),
+                CompactVersionVectorProtoCodec::from(self.has_versions).encode_proto(),
             ),
             ..replication_proto::Summary::default()
         }
@@ -253,7 +200,7 @@ pub(crate) fn validate_bootstrap_member_key_coverage(
 pub(crate) fn ensure_version_vector_bound(
     field: &'static str,
     version: u64,
-) -> Result<(), WireVersionVectorError> {
+) -> Result<(), VersionVectorCodecError> {
     ensure!(
         version <= MAX_VERSION_VALUE,
         VersionBoundTooLargeSnafu { field, version }

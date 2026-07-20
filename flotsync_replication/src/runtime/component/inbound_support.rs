@@ -103,20 +103,13 @@ impl InboundDeliveryFailure {
     }
 }
 
-/// Convert a wire summary using an explicit membership snapshot for context.
-pub(super) fn summary_from_wire(
-    sender: MemberIdentity,
-    message: WireSummaryMessage,
-    memberships: &GroupMemberships,
-) -> Result<Summary, InboundDeliveryError> {
-    let group_id = message.group_id;
-    let members = memberships
-        .members(&group_id)
-        .context(inbound::UnknownHostedGroupSnafu { group_id })?;
-    let member_count = NonZeroUsize::new(members.len()).expect("group members must not be empty");
-    message
-        .into_summary(sender, member_count)
-        .context(inbound::DecodeReadVersionsSnafu { group_id })
+/// Convert a decoded summary message into the runtime summary representation.
+pub(super) fn summary_from_message(sender: MemberIdentity, message: SummaryMessage) -> Summary {
+    Summary {
+        group_id: message.group_id,
+        responder: sender,
+        has_versions: message.has_versions,
+    }
 }
 
 /// Finish inbound handling after escalating fatal failures.

@@ -2,8 +2,16 @@ syntax = "proto3";
 
 package flotsync.versions.v1;
 
-// The most general version vector that abstracts over the exact representation.
+// A self-describing version vector that carries the member count required to
+// expand compact synced and override representations.
 message VersionVector {
+  uint32 num_members = 1;
+  CompactVersionVector compact = 2;
+}
+
+// A context-dependent version vector whose member count is supplied by the
+// group-scoped message or other containing context.
+message CompactVersionVector {
   oneof versions {
     FullVersionVector full = 1;
     OverrideVersionVector override = 2;

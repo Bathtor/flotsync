@@ -61,7 +61,7 @@ message Update {
   //
   // Receivers use this together with the canonical group membership to enforce
   // dependency satisfaction before applying the batch.
-  flotsync.versions.v1.VersionVector read_versions = 3;
+  flotsync.versions.v1.CompactVersionVector read_versions = 3;
 
   repeated DatasetUpdate dataset_updates = 4;
 }
@@ -76,7 +76,7 @@ message SummaryRequest {
 message Summary {
   bytes group_id = 1;
   bytes correlation_id = 2;
-  flotsync.versions.v1.VersionVector has_versions = 3;
+  flotsync.versions.v1.CompactVersionVector has_versions = 3;
 }
 
 // Best-effort request for one or more missing producer update ranges.

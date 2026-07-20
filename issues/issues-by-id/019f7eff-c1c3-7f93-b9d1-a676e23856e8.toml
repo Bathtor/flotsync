@@ -1,0 +1,13 @@
+id = "019f7eff-c1c3-7f93-b9d1-a676e23856e8"
+ref = "flotsync-git-kmx"
+title = "Decode pending group payloads directly from borrowed protobuf views"
+body = "Add direct DecodeProtoView or DecodeProtoViewWith implementations for GroupInvitationPayload and MigrationProposalPayload so RuntimeMessage view decoding no longer converts the complete generated pending-group message into an owned protobuf value first. Reuse the existing contextual runtime decode path and retain ownership only for nested runtime values that actually require it. This is an allocation-focused follow-up and is intentionally outside flotsync-git-i20."
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-07-20T10:08:38.339146Z"
+updated_at = "2026-07-20T10:08:42.949942Z"
+
+[[links]]
+target = "019f5761-cef3-7582-a48f-dc777ea8da33"
+label = "discovered from"

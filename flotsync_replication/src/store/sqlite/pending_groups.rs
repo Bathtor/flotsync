@@ -5,7 +5,6 @@ use super::*;
 pub(super) struct StoredPendingGroupPayload {
     state: PendingGroupWorkState,
     key: PendingGroupSqlKey,
-    context: PendingGroupPayloadDecodeContext,
     payload: Vec<u8>,
 }
 
@@ -40,19 +39,16 @@ impl TryFrom<String> for PendingGroupWorkState {
     }
 }
 
-pub(super) async fn stored_pending_group_payload_from_row(
-    connection: &mut SqliteStoreConnection,
-    row: sqlx::sqlite::SqliteRow,
+pub(super) fn stored_pending_group_payload_from_row(
+    row: &sqlx::sqlite::SqliteRow,
 ) -> Result<StoredPendingGroupPayload, StoreError> {
     let raw_state = row.get::<String, _>("state");
     let state = PendingGroupWorkState::try_from(raw_state)
         .map_err(|source| invalid_stored_object("pending group work state", source))?;
-    let key = decode_pending_group_sql_key(&row)?;
-    let context = pending_group_payload_decode_context(connection, &key).await?;
+    let key = decode_pending_group_sql_key(row)?;
     Ok(StoredPendingGroupPayload {
         state,
         key,
-        context,
         payload: row.get::<Vec<u8>, _>("payload"),
     })
 }
@@ -74,7 +70,8 @@ WHERE state = ?1
     .context(SqlxSnafu)?;
     let mut payloads = Vec::with_capacity(rows.len());
     for row in rows {
-        payloads.push(stored_pending_group_payload_from_row(connection, row).await?);
+        let payload = stored_pending_group_payload_from_row(&row)?;
+        payloads.push(payload);
     }
     Ok(payloads)
 }
@@ -109,9 +106,7 @@ WHERE new_group_id = ?1
         query.await.context(SqlxSnafu)?
     };
     match row {
-        Some(row) => stored_pending_group_payload_from_row(connection, row)
-            .await
-            .map(Some),
+        Some(row) => stored_pending_group_payload_from_row(&row).map(Some),
         None => Ok(None),
     }
 }
@@ -125,7 +120,7 @@ pub(super) async fn load_pending_group_decisions(
     for stored in payloads {
         let record = decode_stored_proto(
             "pending group decision",
-            decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
+            decode_pending_group_decision_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
         records.push(record);
@@ -148,7 +143,7 @@ pub(super) async fn load_pending_group_decision(
     };
     let record = decode_stored_proto(
         "pending group decision",
-        decode_pending_group_decision_payload(stored.key.kind, &stored.payload, stored.context),
+        decode_pending_group_decision_payload(stored.key.kind, &stored.payload),
     )?;
     validate_pending_group_payload_key(record.key(), stored.key)?;
     Ok(Some(record))
@@ -163,11 +158,7 @@ pub(super) async fn load_pending_group_activations(
     for stored in payloads {
         let record = decode_stored_proto(
             "pending group activation",
-            decode_pending_group_activation_payload(
-                stored.key.kind,
-                &stored.payload,
-                stored.context,
-            ),
+            decode_pending_group_activation_payload(stored.key.kind, &stored.payload),
         )?;
         validate_pending_group_payload_key(record.key(), stored.key)?;
         records.push(record);
@@ -190,7 +181,7 @@ pub(super) async fn load_pending_group_activation(
     };
     let record = decode_stored_proto(
         "pending group activation",
-        decode_pending_group_activation_payload(stored.key.kind, &stored.payload, stored.context),
+        decode_pending_group_activation_payload(stored.key.kind, &stored.payload),
     )?;
     validate_pending_group_payload_key(record.key(), stored.key)?;
     Ok(Some(record))
@@ -427,20 +418,6 @@ pub(super) fn decode_pending_group_sql_key(
         kind,
         old_group_id,
         new_group_id,
-    })
-}
-
-/// Build the payload decode context available from the pending group SQL key.
-pub(super) async fn pending_group_payload_decode_context(
-    connection: &mut SqliteStoreConnection,
-    key: &PendingGroupSqlKey,
-) -> Result<PendingGroupPayloadDecodeContext, StoreError> {
-    let old_group_member_count = match key.old_group_id {
-        Some(group_id) => load_optional_group_member_count(connection, &group_id).await?,
-        None => None,
-    };
-    Ok(PendingGroupPayloadDecodeContext {
-        old_group_member_count,
     })
 }
 

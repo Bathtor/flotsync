@@ -1,13 +1,73 @@
 id = "019f5761-cef3-7582-a48f-dc777ea8da33"
 ref = "flotsync-git-i20"
 title = "Rethink version-vector protobuf transfer shapes"
-body = "Decide how Flotsync should represent version vectors across wire, storage, and in-memory partially decoded forms. In particular, evaluate whether we need separate self-describing and context-compact protobuf variants, and define how contextual decoders recover compact vectors when group membership knowledge can be assumed."
-status = "open"
+body = """
+Rethink version-vector protobuf transfer shapes around one compact body, one self-describing wrapper, and the established protobuf codec traits.
+
+Agreed holistic plan:
+
+R16. Keep one CompactVersionVector protobuf body containing the full, override, and synchronised representations.
+
+R17. Keep self-describing VersionVector as a non-zero member count plus that compact body, rejecting count/body mismatches.
+
+R18. Replace the public free-function version-vector codec API with compact and self-describing trait-backed adapters implementing EncodeProto, DecodeProto, contextual decode, and borrowed view decode as applicable. The adapters contain only the domain VersionVector and do not model protobuf variants or defer conversion. Private helpers may share representation validation inside the trait implementations.
+
+R19. Decode runtime messages directly with membership context and keep the intermediate Rust wire-vector and delayed wire-message types removed.
+
+R20. Use compact vectors only for frequent group-scoped Update.read_versions and Summary.has_versions traffic. Use self-describing vectors for MigrationProposalPayload.final_versions, SnapshotRef.versions, and SQLite storage.
+
+R21. Make pending invitation and migration proposal payload decoding context-free. Remove old-group member-count lookup, explicit-full count inference, and PendingGroupPayloadDecodeContext. Keep the owned fallback for pending-payload protobuf views; borrowed pending-payload decoding remains deferred to linked follow-up flotsync-git-kmx.
+
+R22. Assign contextual runtime decode results before the failure-handling matches in the runtime component and summary manager, retaining existing failure classification and escalation.
+
+R23. Decode SQLite vectors through the protobuf decode trait and continue validating the stored owning-group count against the self-described count.
+
+R24. Test both transfer forms through trait entry points, member-count validation, all three representations, stored values, and self-describing migration proposals without old-group context. Keep the forced-full-vector workaround removed.
+
+R25. Validate with formatting, focused serial tests, the complete single-threaded replication suite, cargo check, pedantic Clippy, the Rust instruction audit, and git diff --check.
+
+Review-pass estimate:
+
+E26. Trait-based codec refactor: 80-140 changed LOC.
+
+E27. Self-describing proposals and pending-context removal: 90-170 changed LOC, net deletion.
+
+E28. Match, SQLite, protobuf, and test adjustments: 55-110 changed LOC.
+
+E29. Total review-pass churn: approximately 225-420 LOC, likely removing 60-140 net lines. No task split is needed."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
+assignee = "codex"
 created_at = "2026-07-12T17:30:55.603866Z"
-updated_at = "2026-07-12T17:59:02.188105Z"
+updated_at = "2026-07-20T12:48:45.834831Z"
+closed_at = "2026-07-20T12:48:45.834831Z"
 
 [[links]]
 target = "019f51bf-be64-7ad2-8489-de9cc110f8cb"
 label = "discovered from"
+
+[[comments]]
+id = "019f7f2b-9109-7b33-bdcf-0043ae1a09d1"
+author = "codex"
+body = "Implemented the agreed reuse-first plan: one shared compact vector body/codec, self-describing snapshot and SQLite vectors, direct runtime decoding with membership context, and removal of WireVersionVector plus the delayed wire-message intermediates. Added all-representation/count validation and compact migration-proposal coverage; removed the forced-full workaround. Explicit full proposal vectors infer their count from their entries for restored pending rows, while override/synchronised forms require old-group context. Borrowed pending-payload view decoding remains deferred to linked follow-up flotsync-git-kmx. Validation passed: rustfmt, all-target cargo check, 205 replication library tests plus 6 integration tests serially, flotsync_messages tests, pedantic Clippy, Rust instruction audit, and git diff --check."
+created_at = "2026-07-20T10:56:29.449469Z"
+
+[[comments]]
+id = "019f7f78-61da-7a22-8bf9-61b1e74592c7"
+author = "codex"
+body = "Review round 2 agreed: use trait-backed version-vector codec adapters; make migration proposal final versions self-describing; remove pending-payload member-count context and explicit-full inference; simplify the two decode-result matches; and decode SQLite vectors through the protobuf trait API. The full issue body now reflects this revised holistic plan."
+created_at = "2026-07-20T12:20:23.642007Z"
+
+[[comments]]
+id = "019f7f83-ef1e-7fe1-b8aa-4553712fe408"
+author = "codex"
+body = "Review round 2 implemented. Version-vector conversion now enters through trait-backed compact and self-describing adapters; migration proposal final versions are self-describing; pending-payload member-count context, SQL lookup, and explicit-full inference are removed; both reviewed decode-result matches are split for readability; and SQLite decodes through try_decode_proto_from_slice. Focused codec, pending-payload, and SQLite tests passed. The complete serial replication suite passed 205 library and 6 integration tests; all-target check, pedantic Clippy, rustfmt, Rust instruction audit, and staged plus unstaged diff checks also passed."
+created_at = "2026-07-20T12:33:00.702056Z"
+
+[[comments]]
+id = "019f7f92-5b0a-76c2-b160-5cc66394a352"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-20T12:48:45.834831Z"

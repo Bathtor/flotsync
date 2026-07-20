@@ -84,25 +84,6 @@ WHERE active.group_id = ?1
     decode_non_zero_member_count(member_count)
 }
 
-pub(super) async fn load_optional_group_member_count(
-    connection: &mut SqliteStoreConnection,
-    group_id: &GroupId,
-) -> Result<Option<NonZeroUsize>, StoreError> {
-    let member_count = sqlx::query_scalar::<_, i64>(
-        "
-SELECT material.member_count
-FROM replication_groups AS active
-JOIN replication_group_material AS material ON material.group_id = active.group_id
-WHERE active.group_id = ?1
-",
-    )
-    .bind(group_id.to_string())
-    .fetch_optional(&mut *connection)
-    .await
-    .context(SqlxSnafu)?;
-    member_count.map(decode_non_zero_member_count).transpose()
-}
-
 pub(super) async fn dataset_exists_in_group(
     connection: &mut SqliteStoreConnection,
     group_id: &GroupId,
@@ -179,7 +160,7 @@ pub(super) fn decode_dataset_row_last_changed_versions(
 }
 
 pub(super) fn encode_stored_version_vector(version_vector: &VersionVector) -> Vec<u8> {
-    RuntimeVersionVectorProtoSource::from(version_vector).encode_proto_to_vec()
+    VersionVectorProtoCodec::from(version_vector).encode_proto_to_vec()
 }
 
 /// Return the stable `SQLite` label for one group lifecycle variant.
@@ -292,11 +273,19 @@ pub(super) fn decode_stored_version_vector(
 ) -> Result<VersionVector, StoreError> {
     let version_vector = decode_stored_proto(
         "version vector",
-        WireVersionVector::try_decode_proto_from_slice(bytes),
+        VersionVectorProtoCodec::try_decode_proto_from_slice(bytes),
     )?;
-    version_vector
-        .to_runtime(member_count)
-        .map_err(|source| invalid_stored_object("version vector", source))
+    let version_vector = version_vector.into_version_vector();
+    if version_vector.num_members() != member_count {
+        return Err(invalid_stored_object(
+            "version vector",
+            VersionVectorCodecError::MemberCountMismatch {
+                expected_members: member_count.get(),
+                actual_members: version_vector.num_members().get(),
+            },
+        ));
+    }
+    Ok(version_vector)
 }
 
 pub(super) fn decode_stored_update_row(

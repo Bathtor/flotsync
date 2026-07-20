@@ -3,9 +3,9 @@ use crate::{
     api::{ApiError, ApiExternalSnafu, Summary, SummaryRequest},
     codecs::messages::{
         RuntimeMessage,
+        RuntimeMessageDecodeContext,
+        SummaryMessage,
         SummaryRequestMessage,
-        WireRuntimeMessage,
-        WireSummaryMessage,
     },
     delivery::{
         contracts::{
@@ -23,11 +23,11 @@ use crate::{
     },
 };
 use flotsync_core::{GroupId, MemberIdentity, membership::SharedGroupMemberships};
-use flotsync_messages::proto::{DecodeProtoView, EncodeProto};
+use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;
-use std::{collections::HashMap, num::NonZeroUsize, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use uuid::Uuid;
 
 /// Local-actor messages understood by [`SummaryRequestManagerComponent`].
@@ -247,23 +247,12 @@ impl SummaryRequestManagerComponent {
         action
     }
 
-    fn member_count_for_group(
-        &self,
-        group_id: GroupId,
-    ) -> Result<NonZeroUsize, InboundDeliveryError> {
-        let memberships = self.group_memberships.snapshot();
-        let members = memberships
-            .members(&group_id)
-            .context(inbound::UnknownHostedGroupSnafu { group_id })?;
-        Ok(NonZeroUsize::new(members.len()).expect("group members must not be empty"))
-    }
-
     fn handle_summary(
         &mut self,
         context: SummaryInboundContext,
         sender: MemberIdentity,
         processed: KClaimablePromise<()>,
-        message: WireSummaryMessage,
+        message: SummaryMessage,
     ) -> HandlerResult {
         let reply = self.handle_summary_payload(sender, processed, message);
         if let Err(error) = reply {
@@ -278,51 +267,50 @@ impl SummaryRequestManagerComponent {
         &mut self,
         sender: MemberIdentity,
         processed: KClaimablePromise<()>,
-        message: WireSummaryMessage,
+        message: SummaryMessage,
     ) -> Result<(), InboundDeliveryError> {
-        let group_id = message.group_id;
-        let member_count = self.member_count_for_group(group_id)?;
-        let summary_message = message
-            .into_runtime(member_count)
-            .context(inbound::DecodeReadVersionsSnafu { group_id })?;
         let summary = Summary {
-            group_id: summary_message.group_id,
+            group_id: message.group_id,
             responder: sender,
-            has_versions: summary_message.has_versions,
+            has_versions: message.has_versions,
         };
-        self.fulfil_pending_summary(summary_message.correlation_id, summary);
+        self.fulfil_pending_summary(message.correlation_id, summary);
         processed
             .complete()
             .context(inbound::CompleteProcessedPromiseSnafu {
-                group_id: summary_message.group_id,
+                group_id: message.group_id,
             })?;
         Ok(())
     }
 
     fn handle_reliable_delivery(&mut self, deliver: ReliableDeliveryDeliver) -> HandlerResult {
         let context = SummaryInboundContext::reliable(&deliver.envelope.header);
-        let message =
-            match WireRuntimeMessage::decode_proto_view_from_slice(&deliver.envelope.payload.bytes)
-                .context(inbound::DecodeMessageSnafu)
-            {
-                Ok(message) => message,
-                Err(error) => {
-                    let failure = SummaryInboundFailure::new(context, error);
-                    let action = self.record_inbound_failure(&failure);
-                    return handled_after_inbound_failure(action, &failure);
-                }
-            };
+        let memberships = self.group_memberships.snapshot();
+        let decode_context = RuntimeMessageDecodeContext::new(memberships.as_ref());
+        let message_res = RuntimeMessage::decode_proto_view_from_slice_with(
+            &deliver.envelope.payload.bytes,
+            decode_context,
+        )
+        .context(inbound::DecodeMessageSnafu);
+        let message = match message_res {
+            Ok(message) => message,
+            Err(error) => {
+                let failure = SummaryInboundFailure::new(context, error);
+                let action = self.record_inbound_failure(&failure);
+                return handled_after_inbound_failure(action, &failure);
+            }
+        };
         match message {
-            WireRuntimeMessage::Summary(message) => {
+            RuntimeMessage::Summary(message) => {
                 let sender = deliver.envelope.header.sender.clone();
                 self.handle_summary(context, sender, deliver.processed, message)
             }
-            WireRuntimeMessage::Update(_)
-            | WireRuntimeMessage::SummaryRequest(_)
-            | WireRuntimeMessage::NeedRange(_)
-            | WireRuntimeMessage::UpdateBatch(_)
-            | WireRuntimeMessage::GroupInvitation(_)
-            | WireRuntimeMessage::MigrationProposal(_) => Handled::OK,
+            RuntimeMessage::Update(_)
+            | RuntimeMessage::SummaryRequest(_)
+            | RuntimeMessage::NeedRange(_)
+            | RuntimeMessage::UpdateBatch(_)
+            | RuntimeMessage::GroupInvitation(_)
+            | RuntimeMessage::MigrationProposal(_) => Handled::OK,
         }
     }
 
