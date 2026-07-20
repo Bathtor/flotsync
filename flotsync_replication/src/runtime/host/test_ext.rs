@@ -1,5 +1,9 @@
 //! Test-only host controls and route-observation helpers.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private host helper shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 pub(crate) trait DeliveryRuntimeHostTestExt {

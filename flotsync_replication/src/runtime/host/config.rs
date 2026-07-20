@@ -1,5 +1,9 @@
 //! Runtime-host configuration and startup/control error types.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private host helper shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Startup and shutdown failures for the internal delivery runtime host.

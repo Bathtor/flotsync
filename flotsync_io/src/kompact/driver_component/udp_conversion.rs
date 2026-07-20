@@ -1,5 +1,9 @@
 //! Conversion from raw UDP driver events to Kompact bridge events.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Return the socket that produced a raw UDP event.

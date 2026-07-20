@@ -1,5 +1,9 @@
 //! Schema snapshot reader sources and decoder contracts.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Streaming node source used by snapshot decoders.

@@ -1,5 +1,9 @@
 //! Kompact probe components and buffered receivers for tests.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Buffered synchronous receiver for test probes.

@@ -1,5 +1,9 @@
 //! Construction of exhaustive example schema operations.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Build one partial schema operation per example payload shape.

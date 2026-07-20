@@ -1,5 +1,9 @@
 //! Snapshot data contracts and visitor traits.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Snapshot node payload shapes for history-based CRDT snapshots.

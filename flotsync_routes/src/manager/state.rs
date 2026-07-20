@@ -1,5 +1,9 @@
 //! Local UDP/TCP route state owned by the route-transport manager.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Live UDP route handle owned by the manager.

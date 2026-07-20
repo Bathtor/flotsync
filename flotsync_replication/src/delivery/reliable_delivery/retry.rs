@@ -1,5 +1,9 @@
 //! Retry scheduling for the reliable-delivery component.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private delivery helper shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

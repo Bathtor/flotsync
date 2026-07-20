@@ -1,5 +1,9 @@
 //! Mailbox messages for the shared Kompact driver component.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Internal mailbox for the shared Kompact driver component.

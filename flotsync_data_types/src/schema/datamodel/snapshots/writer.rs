@@ -1,9 +1,11 @@
 //! Schema snapshot writer and field sinks.
 
-use super::{
-    codec::{is_history_data_type, validate_snapshot_state_value_for_type},
-    *,
-};
+use super::codec::{is_history_data_type, validate_snapshot_state_value_for_type};
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
+use super::*;
 
 /// Streaming snapshot writer that validates against a schema while fields are emitted.
 ///

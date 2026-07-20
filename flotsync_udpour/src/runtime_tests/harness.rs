@@ -1,4 +1,4 @@
-//! Runtime-system harness used by UDPour scenarios.
+//! Runtime-system harness used by `UDPour` scenarios.
 
 use super::{
     frames::{bind_socket, build_runtime_test_kompact_system},

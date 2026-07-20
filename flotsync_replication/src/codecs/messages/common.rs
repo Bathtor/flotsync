@@ -1,5 +1,9 @@
 //! Shared message errors and decode contexts.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private message-codec helper shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 #[derive(Debug, Snafu)]

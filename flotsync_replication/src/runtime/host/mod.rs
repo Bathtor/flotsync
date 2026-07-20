@@ -102,12 +102,20 @@ mod topology;
 #[cfg(any(test, feature = "test-support"))]
 mod test_ext;
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The host facade owns and reuses the local configuration implementation vocabulary."
+)]
 use config::*;
 pub(crate) use config::{RuntimeControlError, RuntimeHostError};
 use discovery::PreconfiguredPeerRoutesConfig;
 #[cfg(test)]
 pub(super) use discovery::PreconfiguredPeerRoutesPublishMode;
 use local_endpoint::LocalEndpointManager;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The host facade owns and reuses the local topology implementation vocabulary."
+)]
 use topology::*;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -198,8 +206,6 @@ pub(crate) struct DeliveryRuntimeHost {
     #[cfg(any(test, feature = "test-support"))]
     local_endpoint_lease: ReservedSocketLease,
 }
-
-/// Type-erased lifecycle operations for one concrete Kompact component.
 
 impl DeliveryRuntimeHost {
     fn new(

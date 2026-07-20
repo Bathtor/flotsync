@@ -901,11 +901,35 @@ mod security;
 mod shared;
 mod updates;
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use groups::*;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use pending_groups::*;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use rows::*;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use security::*;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use shared::*;
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The SQLite facade reuses local persistence-domain helpers across transaction methods."
+)]
 use updates::*;
 
 #[derive(Debug, Snafu)]

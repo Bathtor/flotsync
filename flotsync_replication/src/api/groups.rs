@@ -882,8 +882,6 @@ pub trait ReplicationApi: Send + Sync {
 pub(crate) const STORE_SECRET_CRYPTO_V1: StoreSecretCryptoVersion =
     StoreSecretCryptoVersion::new(1);
 
-/// Nonce width used by [`STORE_SECRET_CRYPTO_V1`] implementation.
-
 /// Canonical ordered member-key set for one persisted replication group.
 #[derive(Clone)]
 pub struct GroupMemberKeys {

@@ -1,5 +1,9 @@
 //! Synchronous wait helpers for tests.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Returns the loopback address for the supplied port.

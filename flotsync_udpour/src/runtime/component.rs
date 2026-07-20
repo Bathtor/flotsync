@@ -1,5 +1,9 @@
-//! The Kompact component implementation for UDPour runtime state.
+//! The Kompact component implementation for `UDPour` runtime state.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The component and queue are one private implementation boundary."
+)]
 use super::{queue::*, *};
 
 #[doc(hidden)]

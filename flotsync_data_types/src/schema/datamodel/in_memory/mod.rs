@@ -931,4 +931,8 @@ mod snapshots;
 pub use field_state::{InMemoryFieldState, LinearLatestValueWinsState, LinearListState};
 pub(crate) use field_state::{InMemoryStateRow, validate_in_memory_field_value};
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The parent module reuses the local snapshot implementation details across its state and operation code."
+)]
 use snapshots::*;

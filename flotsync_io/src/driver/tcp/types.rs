@@ -1,5 +1,9 @@
 //! Listener and connection records used by the TCP driver.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Driver-owned listener state for one reserved TCP listener handle.

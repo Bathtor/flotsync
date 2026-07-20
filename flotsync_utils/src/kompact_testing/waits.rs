@@ -1,7 +1,19 @@
 //! Polling helpers for asynchronous Kompact tests.
 
-use super::*;
+use super::EVENTUALLY_POLL_INTERVAL;
+use kompact::prelude::{Component, ComponentDefinition};
+use std::{
+    fmt,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
+/// Poll until `predicate` succeeds or `timeout` elapses.
+///
+/// # Panics
+///
+/// Panics with `failure_message` if `predicate` does not succeed before the timeout.
 pub fn eventually(
     timeout: Duration,
     mut predicate: impl FnMut() -> bool,

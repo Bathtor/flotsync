@@ -1,5 +1,9 @@
 //! Construction of the exhaustive example schema.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Build a schema that covers every supported CRDT/data-type combination in the operations model.

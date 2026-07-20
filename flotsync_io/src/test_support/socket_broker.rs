@@ -1,5 +1,9 @@
 //! Process-local socket reservations for network tests.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// One socket kind that the reserved-socket broker can hold on behalf of one

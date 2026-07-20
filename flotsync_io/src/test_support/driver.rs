@@ -1,5 +1,9 @@
 //! Helpers for driving IO requests and components in tests.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Waits for a driver request to complete within [`WAIT_TIMEOUT`].

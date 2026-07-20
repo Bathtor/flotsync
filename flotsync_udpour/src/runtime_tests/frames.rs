@@ -1,4 +1,4 @@
-//! Encoded UDPour frame builders and timing assertions for tests.
+//! Encoded `UDPour` frame builders and timing assertions for tests.
 
 use super::{harness::RuntimeHarness, support::TestSendRateControl, *};
 

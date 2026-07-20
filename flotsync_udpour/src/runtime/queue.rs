@@ -1,4 +1,4 @@
-//! Outbound UDPour datagram queue state and error classification.
+//! Outbound `UDPour` datagram queue state and error classification.
 
 use super::*;
 

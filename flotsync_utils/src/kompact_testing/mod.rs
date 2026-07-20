@@ -68,13 +68,7 @@ use crate::NonOwningPhantomData;
 use futures_util::FutureExt as _;
 use kompact::prelude::*;
 use snafu::{ResultExt as _, Whatever};
-use std::{
-    fmt,
-    marker::PhantomData,
-    sync::Arc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 
 mod component;
 mod events;

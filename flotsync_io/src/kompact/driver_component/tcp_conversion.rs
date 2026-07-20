@@ -1,5 +1,9 @@
 //! Conversion from raw TCP driver events to Kompact session events.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Convert a raw TCP session event and indicate whether it closes the session route.

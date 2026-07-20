@@ -2,6 +2,10 @@
 
 #[cfg(test)]
 use super::contracts::{HistorySnapshotNodeValue, HistorySnapshotNodeValueRef};
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private helper module intentionally shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Visitor used by serializers to encode one history node payload at a time.

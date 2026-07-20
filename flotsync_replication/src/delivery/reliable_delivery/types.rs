@@ -1,5 +1,9 @@
 //! Protocol data structures for reliable delivery.
 
+#[allow(
+    clippy::wildcard_imports,
+    reason = "The private delivery helper shares its parent's local implementation vocabulary."
+)]
 use super::*;
 
 /// Plaintext recipient-addressed envelope header.

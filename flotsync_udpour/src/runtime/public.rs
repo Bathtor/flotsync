@@ -1,4 +1,4 @@
-//! Public UDPour runtime messages, failures, port, and configuration.
+//! Public `UDPour` runtime messages, failures, port, and configuration.
 
 use super::*;
 
