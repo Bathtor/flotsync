@@ -113,6 +113,27 @@ impl DecodeProto for VersionVectorProtoCodec<'static> {
     }
 }
 
+impl DecodeProtoView for VersionVectorProtoCodec<'static> {
+    type Error = VersionVectorCodecError;
+    type ProtoView<'a> = versions_proto::VersionVectorView<'a>;
+
+    fn decode_proto_view(proto: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let num_members = usize::try_from(proto.num_members)
+            .expect("u32 version-vector member count must fit into usize");
+        let Some(num_members) = NonZeroUsize::new(num_members) else {
+            return InvalidMemberCountSnafu.fail();
+        };
+        let Some(compact) = proto.compact.as_option() else {
+            return MissingVersionsBodySnafu.fail();
+        };
+        let compact = CompactVersionVectorProtoCodec::decode_proto_view_with(
+            compact,
+            MemberCountContext::new(num_members),
+        )?;
+        Ok(Self(Cow::Owned(compact.into_version_vector())))
+    }
+}
+
 /// Encode the shared compact body used by both protobuf forms.
 fn encode_compact_version_vector(
     version_vector: &VersionVector,

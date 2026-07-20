@@ -158,23 +158,11 @@ impl DecodeProtoViewWith<RuntimeMessageDecodeContext<'_>> for RuntimeMessage {
                 Ok(Self::UpdateBatch(message))
             }
             replication_proto::runtime_message::BodyView::GroupInvitation(message) => {
-                // TODO(flotsync-git-kmx): add borrowed contextual decoders for
-                // pending-group payloads so view decoding does not first own
-                // the generated payload.
-                let message =
-                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
-                        .context(DecodeSnafu)?;
-                let message = GroupInvitationMessage::decode_proto(message)?;
+                let message = GroupInvitationMessage::decode_proto_view(message)?;
                 Ok(Self::GroupInvitation(message))
             }
             replication_proto::runtime_message::BodyView::MigrationProposal(message) => {
-                // TODO(flotsync-git-kmx): add borrowed contextual decoders for
-                // pending-group payloads so view decoding does not first own
-                // the generated payload.
-                let message =
-                    flotsync_messages::buffa::MessageView::to_owned_message(message.as_ref())
-                        .context(DecodeSnafu)?;
-                let message = MigrationProposalMessage::decode_proto(message)?;
+                let message = MigrationProposalMessage::decode_proto_view(message)?;
                 Ok(Self::MigrationProposal(message))
             }
         }

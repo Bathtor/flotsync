@@ -1,13 +1,53 @@
 id = "019f7eff-c1c3-7f93-b9d1-a676e23856e8"
 ref = "flotsync-git-kmx"
 title = "Decode pending group payloads directly from borrowed protobuf views"
-body = "Add direct DecodeProtoView or DecodeProtoViewWith implementations for GroupInvitationPayload and MigrationProposalPayload so RuntimeMessage view decoding no longer converts the complete generated pending-group message into an owned protobuf value first. Reuse the existing contextual runtime decode path and retain ownership only for nested runtime values that actually require it. This is an allocation-focused follow-up and is intentionally outside flotsync-git-i20."
-status = "open"
+body = """
+Decode pending-group runtime payloads directly from generated borrowed protobuf views, without first converting the complete invitation or proposal into its owned protobuf form.
+
+Agreed holistic plan:
+
+K1. Implement DecodeProtoView directly for GroupInvitationMessage and MigrationProposalMessage. Update RuntimeMessage view decoding to call those traits and remove the complete-message to_owned_message fallbacks and follow-up TODOs.
+
+K2. Add borrowed decoders for GroupInvitation and MigrationProposal. Parse borrowed group ids, invitation source, proposed members, and optional strings directly, allocating only the owned domain values required by the resulting objects.
+
+K3. Add borrowed trait implementations through dataset schemas and the initial-snapshot graph, including inline rows, metadata, and snapshot references. Extend the self-describing version-vector adapter with DecodeProtoView. Reuse the existing borrowed GroupSetupMessage decoder.
+
+K4. Convert only nested schema definitions and row-field protobuf values to owned messages where the existing datamodel decoders require ownership. Do not introduce new wire-domain representations.
+
+K5. Extract small shared construction or validation helpers where the owned and borrowed paths would otherwise duplicate domain invariants. Keep protobuf conversion entry points on the established codec traits.
+
+K6. Test invitation and proposal runtime decoding with empty, inline, and metadata snapshots; cover all self-describing vector representations; compare owned and borrowed results; and retain malformed-field plus member/setup validation coverage.
+
+K7. Validate with formatting, focused serial codec tests, the complete serial replication suite, all-target cargo check, pedantic Clippy, the Rust instruction audit, and git diff checks.
+
+Estimated change size:
+
+K8. Codec implementation: approximately 315-550 changed LOC.
+
+K9. Tests: approximately 100-180 changed LOC.
+
+K10. Total: approximately 415-730 changed LOC, below 1,000 LOC; no task split is needed."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 3
+assignee = "codex"
 created_at = "2026-07-20T10:08:38.339146Z"
-updated_at = "2026-07-20T10:08:42.949942Z"
+updated_at = "2026-07-20T14:01:28.802233Z"
+closed_at = "2026-07-20T14:01:28.802233Z"
 
 [[links]]
 target = "019f5761-cef3-7582-a48f-dc777ea8da33"
 label = "discovered from"
+
+[[comments]]
+id = "019f7fa9-e98a-7270-91e8-5c2caf6d0cbb"
+author = "codex"
+body = "Implemented direct borrowed decoding for pending-group runtime payloads. RuntimeMessage now calls DecodeProtoView on invitation and proposal wrappers; pending payloads decode borrowed ids, members, schemas, all initial-snapshot forms, metadata, snapshot references, group setup, and self-describing version vectors without owning the complete protobuf message. Ownership remains limited to domain-owned strings/identities plus nested schema definitions and individual row values required by existing datamodel decoders. Added owned/view parity coverage for empty, inline, and metadata snapshots, all vector representations, invalid vector counts, and missing/mismatched group setup. Validation passed: rustfmt, all-target cargo check, focused serial codec tests, 206 all-feature replication unit tests, 6 secure-runtime integration tests, pedantic Clippy, Rust instruction audit, and git diff --check."
+created_at = "2026-07-20T13:14:29.642467Z"
+
+[[comments]]
+id = "019f7fd4-ede2-72b3-bee1-14acbc3d19e4"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-20T14:01:28.802233Z"

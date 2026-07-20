@@ -56,6 +56,21 @@ impl DecodeProto for GroupInvitationMessage {
     }
 }
 
+impl DecodeProtoView for GroupInvitationMessage {
+    type Error = RuntimeMessageError;
+    type ProtoView<'a> = replication_proto::GroupInvitationPayloadView<'a>;
+
+    fn decode_proto_view(message: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let Some(group_setup) = message.group_setup.as_option() else {
+            return MissingGroupSetupSnafu.fail();
+        };
+        let group_setup = GroupSetupMessage::decode_proto_view(group_setup)?;
+        let invitation =
+            GroupInvitation::decode_proto_view(message).context(InvalidPendingGroupPayloadSnafu)?;
+        Self::try_new(invitation, Arc::new(group_setup))
+    }
+}
+
 /// Reliable migration proposal plus recipient-protected target-group setup.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MigrationProposalMessage {
@@ -106,6 +121,21 @@ impl DecodeProto for MigrationProposalMessage {
         let group_setup = GroupSetupMessage::decode_proto(group_setup)?;
         let proposal =
             MigrationProposal::decode_proto(message).context(InvalidPendingGroupPayloadSnafu)?;
+        Self::try_new(proposal, Arc::new(group_setup))
+    }
+}
+
+impl DecodeProtoView for MigrationProposalMessage {
+    type Error = RuntimeMessageError;
+    type ProtoView<'a> = replication_proto::MigrationProposalPayloadView<'a>;
+
+    fn decode_proto_view(message: &Self::ProtoView<'_>) -> Result<Self, Self::Error> {
+        let Some(group_setup) = message.group_setup.as_option() else {
+            return MissingGroupSetupSnafu.fail();
+        };
+        let group_setup = GroupSetupMessage::decode_proto_view(group_setup)?;
+        let proposal = MigrationProposal::decode_proto_view(message)
+            .context(InvalidPendingGroupPayloadSnafu)?;
         Self::try_new(proposal, Arc::new(group_setup))
     }
 }
