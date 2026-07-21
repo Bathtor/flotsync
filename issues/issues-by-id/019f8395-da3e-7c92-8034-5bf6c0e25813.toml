@@ -1,0 +1,32 @@
+id = "019f8395-da3e-7c92-8034-5bf6c0e25813"
+ref = "flotsync-git-d03.1"
+title = "Persist active replication group names"
+body = """
+Objective:
+N01. Make an optional group name part of active replication-group state so creators and recipients observe the same name before and after restart.
+
+Current gap:
+N02. Invitations and membership-change requests already carry optional names, but `CreateGroupRequest`, `ReplicationGroupRecord`, and `ReplicationGroupMaterialRecord` do not. Creator-side setup currently emits creation invitations without a name.
+
+Plan:
+N03. Add `group_name: Option<String>` to create-group and active group API/store records, including useful accessors and debug output.
+N04. Propagate the requested name through creator preparation, persisted material, live runtime installation, creation invitations, invitation acceptance, and membership-change activation.
+N05. Extend the current SQLite schema and read/write code directly for the optional name. This project has no deployed state, so do not add a migration.
+N06. Keep names descriptive rather than identity-bearing: duplicates and absence are valid, while applications resolve ambiguity with group UUIDs.
+N07. Update in-memory/store fixtures, conversion paths, and runtime tests for both `Some(name)` and `None`.
+
+Acceptance:
+N08. Creating a named group exposes the same name in the creator live view and persisted record.
+N09. A recipient receives, accepts, activates, persists, and reloads that name.
+N10. Membership-change successor groups retain the requested name.
+N11. Unnamed groups continue to round-trip without synthesising a name.
+
+Estimate:
+N12. Approximately 400-650 LOC across API, runtime, SQLite store, fixtures, and tests."""
+status = "open"
+type = "task"
+priority = 2
+blocks = ["019f8396-1861-7951-b169-fbd0fff06213"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:31:03.870215Z"
+updated_at = "2026-07-21T07:32:09.478845Z"

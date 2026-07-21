@@ -1,0 +1,31 @@
+id = "019f8396-1861-7951-b169-fbd0fff06213"
+ref = "flotsync-git-d03.2"
+title = "Move checklist key management into a zero-group REPL"
+body = """
+Objective:
+K01. Remove the replicated checklist static-group setup bridge and make established key-management operations available through one running, already-unlocked REPL.
+
+Plan:
+K02. Reduce checklist configuration to local member, application/profile, store-secret, runtime, route, and schema inputs. Remove configured group id, ordered members, group-secret password, and startup group installation.
+K03. Retain only `keys init-local <config>` before runtime startup because it creates the local private identity material needed to load the runtime.
+K04. Move export, inspect, trust, and block into the REPL. Route them through `ReplicationApi::local_public_key_bundle`, `assess_public_key_bundle`, and `record_public_key_bundle_feedback` rather than reopening the store or keychain.
+K05. Keep bundle-based trust and block flows: inspect before confirmation, bind trust to an explicit member identity, and derive the block fingerprint from the pasted bundle.
+K06. Let the checklist start successfully with zero active groups and present a key-management-capable shell without constructing a synthetic/static group. Preserve a compilable intermediate state for the later workspace child.
+K07. Delete static-group setup helpers and duplicate reporting paths once no longer used, and adjust command help/config examples.
+
+Acceptance:
+K08. Startup no longer inserts or verifies a configured replication group.
+K09. A zero-group peer enters the REPL after one keychain unlock and can export, inspect, trust, and block several bundles in that session.
+K10. `keys init-local` remains the sole top-level key subcommand and existing confirmation/security semantics remain covered by tests.
+K11. The result is a coherent intermediate application even before multi-group checklist commands arrive.
+
+Estimate:
+K12. Approximately 350-550 LOC, offset by deletion of static setup code."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f8395-da3e-7c92-8034-5bf6c0e25813"]
+blocks = ["019f8396-66d1-72c1-8fb0-0d2fffd66313"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:31:19.777487Z"
+updated_at = "2026-07-21T07:32:12.715669Z"

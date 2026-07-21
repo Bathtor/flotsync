@@ -1,0 +1,40 @@
+id = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+ref = "flotsync-git-d03.3"
+title = "Build the heterogeneous multi-group checklist workspace"
+body = """
+Objective:
+W01. Let one checklist REPL host zero or more named replication groups plus process-local unassociated items in a single heterogeneous working set.
+
+Replication API support:
+W02. Add a narrow read-only API/store query that enumerates distinct known member identities from stored public-key records and reports whether locally permitted usable key material exists. Use it for reference and validation; do not expose private material.
+
+Workspace plan:
+W03. Replace group-fixed checklist state with one working set whose items carry `Local` or `Group(GroupId)` association. Keep one display order and workspace-level listener/read-position bookkeeping, then route incoming snapshots and updates to items by RowId group.
+W04. Load every readable active group and its checklist snapshot at startup. Maintain group metadata including UUID, optional name, members, and lifecycle state.
+W05. Resolve group selectors by exact unique name first and UUID always. On duplicate names, reject the name and list candidate UUIDs.
+W06. Add `group list`, `group default <group>`, and `group clear-default`. The default is session-only, is never inferred, and is not changed by creation, acceptance, or restart.
+W07. Keep plain `add` with no group argument. It creates in the current real default group or creates an unassociated process-local item when no default exists.
+
+Creation and invitation plan:
+W08. Implement `group create <name>` as a flag-free wizard. Show the database-known member report first, prompt for a membership list, validate duplicates, local-member inclusion, and usable keys, display the final ordered membership, then request explicit confirmation before `create_group`.
+W09. Add positional invitation commands such as `group invitations`, `group accept <invitation>`, and `group reject <invitation>`. Feed listener events into REPL-visible pending state and refresh the group registry/working set after acceptance.
+W10. Continue rejecting membership-change proposals explicitly; interactive membership editing belongs outside this epic.
+
+Acceptance:
+W11. A peer with zero groups can add and edit process-local unassociated items.
+W12. The creation wizard displays identities actually known by the database, rejects unusable selections clearly, and creates a named group only after confirmation.
+W13. Several created or accepted groups coexist in one working set, load their snapshots, receive events, and reload after restart without choosing a default.
+W14. Unique names and UUIDs select groups as specified; ambiguity messages identify every UUID candidate.
+W15. Selecting and clearing the session default changes only where later plain adds are created.
+W16. Invitation inspection, acceptance, rejection, and restart behaviour have focused tests.
+
+Estimate:
+W17. Approximately 750-1,050 LOC across replication enumeration, REPL wizard, listener integration, workspace state, and tests. If implementation pressure pushes this materially beyond the upper bound, split the enumeration/API support from the workspace before coding further."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f8396-1861-7951-b169-fbd0fff06213"]
+blocks = ["019f8396-c396-75b2-a651-2866f60b79a9"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:31:39.857618Z"
+updated_at = "2026-07-21T07:32:16.823115Z"
