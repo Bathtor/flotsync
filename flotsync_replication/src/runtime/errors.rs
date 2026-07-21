@@ -69,6 +69,8 @@ pub(crate) enum AcceptMigrationError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(super)))]
 pub(super) enum CreateGroupError {
+    #[snafu(display("Group name must not be empty after trimming."))]
+    EmptyGroupName,
     #[snafu(display("Group members must include the local member {local_member}."))]
     LocalMemberMissing { local_member: MemberIdentity },
     #[snafu(display("Group creator {creator} must be included in the requested member list."))]
@@ -211,6 +213,10 @@ pub(super) enum RuntimeStartupError {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)), module(change_membership))]
 pub(crate) enum ChangeGroupMembershipError {
+    #[snafu(display("Successor group name must not be empty after trimming."))]
+    EmptyGroupName,
+    #[snafu(display("A membership change requires a non-nil group id."))]
+    NilGroupId,
     #[snafu(display("Group {group_id} is not hosted by this runtime."))]
     UnknownGroup { group_id: GroupId },
     #[snafu(display("Group {group_id} no longer accepts membership changes."))]

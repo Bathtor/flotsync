@@ -1,6 +1,11 @@
 use super::{
     component::ReplicationRuntimeComponent,
-    errors::{CreateGroupError, InboundDeliveryError, PublishChangesError},
+    errors::{
+        ChangeGroupMembershipError,
+        CreateGroupError,
+        InboundDeliveryError,
+        PublishChangesError,
+    },
     handle::{
         ReplicationRuntime,
         load_replication_runtime_typed_with_security_for_test,
@@ -42,6 +47,7 @@ use crate::{
         GroupInvitationResponder,
         GroupInvitationSource,
         GroupMemberKeys,
+        GroupNameUpdate,
         GroupSchema,
         InitialDatasetValueRows,
         InitialGroupValueRows,

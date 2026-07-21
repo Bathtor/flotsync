@@ -322,7 +322,10 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Store group material or confirm an identical record already exists.
+    /// Store group material or refresh metadata on a compatible existing record.
+    ///
+    /// Compatibility requires the same group definition and security material;
+    /// name and message metadata may differ and are replaced when they do.
     fn ensure_replication_group_material(
         &mut self,
         material: ReplicationGroupMaterialRecord,

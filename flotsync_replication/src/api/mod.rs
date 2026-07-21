@@ -76,6 +76,7 @@ mod tests;
 
 pub use changes::*;
 pub use groups::*;
+pub(crate) use security_material::invalid_default_group_security_material;
 pub use security_material::*;
 pub use snapshots::*;
 pub use store::*;

@@ -92,6 +92,7 @@ pub(super) async fn initialise_configured_group_if_ready(
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
             group_schema: checklist_group_schema(),
+            ..Default::default()
         })
         .await
         .context(static_group_error::StoreSnafu)?;

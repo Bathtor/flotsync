@@ -119,6 +119,8 @@ fn group_material_definition_matching_excludes_security_material() {
     let group_schema = docs_group_schema();
     let material = ReplicationGroupMaterialRecord {
         group_id,
+        group_name: Some("docs".to_owned()),
+        message: Some("shared".to_owned()),
         member_keys: member_keys.clone(),
         local_member_index: MemberIndex::new(0),
         group_schema: group_schema.clone(),
@@ -134,6 +136,9 @@ fn group_material_definition_matching_excludes_security_material() {
     let different_security_active = different_security
         .clone()
         .activate(VersionVector::initial(member_count));
+    let mut different_metadata = material.clone();
+    different_metadata.group_name = Some("renamed".to_owned());
+    different_metadata.message = None;
 
     assert!(material.matches_definition(
         group_id,
@@ -143,6 +148,7 @@ fn group_material_definition_matching_excludes_security_material() {
     ));
     assert!(active.matches_definition(&different_security_active));
     assert!(!active.matches_group_material(&different_security));
+    assert!(active.matches_group_material(&different_metadata));
     assert!(!material.matches_definition(
         GroupId(uuid::Uuid::from_u128(91_099)),
         &member_keys,
@@ -164,6 +170,8 @@ fn active_group_decomposition_preserves_progress_and_lifecycle() {
     };
     let group = ReplicationGroupRecord {
         group_id,
+        group_name: Some("active docs".to_owned()),
+        message: Some("active message".to_owned()),
         member_keys: GroupMemberKeys::from_ordered_member_keys([member_key_id(
             ["active-state", "alice"],
             1,
@@ -176,10 +184,66 @@ fn active_group_decomposition_preserves_progress_and_lifecycle() {
         security_material: current_slice_placeholder_group_security_material(group_id),
     };
 
-    let (_, active_state) = group.into_parts();
+    let (material, active_state) = group.into_parts();
 
+    assert_eq!(material.group_name.as_deref(), Some("active docs"));
+    assert_eq!(material.message.as_deref(), Some("active message"));
     assert_eq!(active_state.version_vector, versions);
     assert_eq!(active_state.lifecycle, lifecycle);
+}
+
+#[test]
+fn group_name_update_defaults_to_inherit() {
+    assert_eq!(GroupNameUpdate::default(), GroupNameUpdate::Inherit);
+}
+
+#[test]
+fn group_aggregate_defaults_are_explicitly_incomplete() {
+    assert_eq!(
+        CreateGroupRequest::default(),
+        CreateGroupRequest {
+            group_name: None,
+            message: None,
+            members: Vec::new(),
+            group_schema: GroupSchema::default(),
+        }
+    );
+    assert_eq!(
+        ChangeGroupMembershipRequest::default(),
+        ChangeGroupMembershipRequest {
+            group_id: GroupId::NIL,
+            add_members: HashSet::new(),
+            remove_members: HashSet::new(),
+            group_name: GroupNameUpdate::Inherit,
+            message: None,
+        }
+    );
+
+    let material = ReplicationGroupMaterialRecord::default();
+    assert_eq!(material.group_id, GroupId::NIL);
+    assert_eq!(material.group_name, None);
+    assert_eq!(material.message, None);
+    assert!(material.member_keys.is_empty());
+    assert_eq!(material.local_member_index, MemberIndex::new(u32::MAX));
+    assert_eq!(material.group_schema, GroupSchema::default());
+    assert_eq!(
+        material.security_material,
+        invalid_default_group_security_material()
+    );
+
+    let group = ReplicationGroupRecord::default();
+    assert_eq!(group.group_id, GroupId::NIL);
+    assert_eq!(group.group_name, None);
+    assert_eq!(group.message, None);
+    assert!(group.member_keys.is_empty());
+    assert_eq!(group.local_member_index, MemberIndex::new(u32::MAX));
+    assert_eq!(group.group_schema, GroupSchema::default());
+    assert_eq!(group.version_vector.num_members(), NonZeroUsize::MIN);
+    assert_eq!(group.lifecycle, ReplicationGroupLifecycle::Open);
+    assert_eq!(
+        group.security_material,
+        invalid_default_group_security_material()
+    );
 }
 
 #[test]
@@ -211,6 +275,57 @@ fn group_invitation_rejects_mismatched_migration_group_id() {
             new_group_id: actual_new_group_id,
         } if group_id == wrong_group_id && actual_new_group_id == new_group_id
     ));
+}
+
+#[test]
+fn pending_group_debug_includes_metadata_values() {
+    let old_group_id = GroupId(uuid::Uuid::from_u128(91_010));
+    let new_group_id = GroupId(uuid::Uuid::from_u128(91_011));
+    let invitation = GroupInvitation::new_creation(
+        new_group_id,
+        Vec::new(),
+        GroupSchema::default(),
+        InitialSnapshot::Empty,
+        Some("invited docs".to_owned()),
+        Some("invitation message".to_owned()),
+    );
+    let proposal = MigrationProposal {
+        migration_id: MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        final_versions: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
+        proposed_members: Vec::new(),
+        group_schema: GroupSchema::default(),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: Some("migrated docs".to_owned()),
+        message: Some("migration message".to_owned()),
+    };
+
+    assert_eq!(
+        format!("{invitation:?}"),
+        format!(
+            "GroupInvitation {{ group_id: {:?}, source: {:?}, proposed_member_count: 0, group_schema: {:?}, initial_snapshot: {:?}, group_name: {:?}, message: {:?} }}",
+            invitation.group_id,
+            invitation.source,
+            invitation.group_schema,
+            invitation.initial_snapshot,
+            invitation.group_name,
+            invitation.message,
+        )
+    );
+    assert_eq!(
+        format!("{proposal:?}"),
+        format!(
+            "MigrationProposal {{ migration_id: {:?}, final_versions: {:?}, proposed_member_count: 0, group_schema: {:?}, initial_snapshot: {:?}, group_name: {:?}, message: {:?} }}",
+            proposal.migration_id,
+            proposal.final_versions,
+            proposal.group_schema,
+            proposal.initial_snapshot,
+            proposal.group_name,
+            proposal.message,
+        )
+    );
 }
 
 #[test]

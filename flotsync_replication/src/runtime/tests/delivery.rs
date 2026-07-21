@@ -290,6 +290,7 @@ fn request_summary_returns_remote_current_version_vector() {
     let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     accept_one_creation_invitation(
@@ -350,6 +351,7 @@ fn group_invitation_persists_group_schema() {
     let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: group_schema.clone(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     accept_one_creation_invitation(&bob_fixture.listener, group_id, &[alice_member, bob_member]);

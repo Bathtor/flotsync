@@ -17,6 +17,7 @@ fn create_group_rejects_missing_permitted_keys_without_storing_group() {
     let error = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member.clone()],
         group_schema: GroupSchema::default(),
+        ..Default::default()
     }))
     .expect_err("missing permitted keys should reject group creation");
 

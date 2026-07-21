@@ -953,6 +953,7 @@ mod tests {
             version_vector: VersionVector::initial(NonZeroUsize::new(2).unwrap()),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
+            ..Default::default()
         }
     }
 

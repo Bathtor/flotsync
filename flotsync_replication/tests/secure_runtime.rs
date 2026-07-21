@@ -17,6 +17,8 @@ use flotsync_replication::{
     GroupMigrationPolicy,
     PolicyDecision,
     ReplicationConfig,
+    ReplicationGroupRecord,
+    ReplicationStore,
     RowId,
     RowKey,
     RowMutation,
@@ -63,11 +65,18 @@ fn create_group_bootstrap_installs_remote_membership() {
 
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
+        group_name: Some("  shared docs  ".to_owned()),
+        message: Some("created together".to_owned()),
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     bob_fixture.wait_for_group_install(group_id);
+    for fixture in [&alice_fixture, &bob_fixture] {
+        let stored = load_group(fixture, group_id);
+        assert_eq!(stored.group_name.as_deref(), Some("shared docs"));
+        assert_eq!(stored.message.as_deref(), Some("created together"));
+    }
 
     let alice_members = alice_fixture
         .group_members(group_id)
@@ -140,6 +149,8 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     alice_fixture.connect_direct_peer_routes(&charlie_fixture);
     let old_group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
+        group_name: Some("original docs".to_owned()),
+        message: Some("old message".to_owned()),
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: docs_group_schema(),
     }))
@@ -151,8 +162,7 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
             group_id: old_group_id,
             add_members: HashSet::from([charlie_member.clone()]),
             remove_members: HashSet::new(),
-            group_name: None,
-            message: None,
+            ..Default::default()
         },
     ))
     .expect("membership change should succeed");
@@ -166,6 +176,9 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
         assert!(members.contains(&alice_member));
         assert!(members.contains(&bob_member));
         assert!(members.contains(&charlie_member));
+        let stored = load_group(fixture, migration_id.new_group_id);
+        assert_eq!(stored.group_name.as_deref(), Some("original docs"));
+        assert_eq!(stored.message, None);
     }
 }
 
@@ -180,6 +193,7 @@ fn publish_changes_delivers_remote_data_changed_event() {
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     bob_fixture.wait_for_group_install(group_id);
@@ -378,6 +392,7 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
         members: vec![alice_member, bob_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed locally");
     bob_fixture.assert_group_never_installed(group_id);
@@ -425,6 +440,26 @@ fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -> RowId {
         dataset_id,
         row_key: RowKey(Uuid::from_u128(raw)),
     }
+}
+
+fn load_group(fixture: &RuntimeTestFixture, group_id: GroupId) -> ReplicationGroupRecord {
+    wait_for_test_future(async {
+        let mut transaction = fixture
+            .store()
+            .begin_read_transaction()
+            .await
+            .expect("group read transaction should start");
+        let group = transaction
+            .load_replication_group(&group_id)
+            .await
+            .expect("group should load")
+            .expect("group should exist");
+        transaction
+            .release()
+            .await
+            .expect("group read transaction should release");
+        group
+    })
 }
 
 fn load_title_runtime_pair_with_trust(

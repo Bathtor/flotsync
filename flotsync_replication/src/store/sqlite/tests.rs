@@ -324,11 +324,17 @@ fn pending_group_work_accepts_replay_and_rejects_conflicting_target_work() {
     let store = in_memory_store(local_member());
     let group_id = GroupId(Uuid::from_u128(11_100));
     let original = creation_invitation_decision(group_id);
+    let mut metadata_update = original.clone();
+    let PendingGroupDecisionRecord::GroupInvitation(invitation) = &mut metadata_update else {
+        panic!("creation invitation fixture must contain an invitation");
+    };
+    invitation.message = Some("different invitation".to_owned());
+    invitation.group_name = Some("renamed docs".to_owned());
     let mut conflicting = original.clone();
     let PendingGroupDecisionRecord::GroupInvitation(invitation) = &mut conflicting else {
         panic!("creation invitation fixture must contain an invitation");
     };
-    invitation.message = Some("different invitation".to_owned());
+    invitation.proposed_members.push(third_member());
 
     let conflict = wait_for_store_future(async {
         let mut transaction = store
@@ -348,6 +354,10 @@ fn pending_group_work_accepts_replay_and_rejects_conflicting_target_work() {
             .upsert_pending_group_decision(original.clone())
             .await
             .expect("exact pending decision replay should be idempotent");
+        transaction
+            .upsert_pending_group_decision(metadata_update.clone())
+            .await
+            .expect("metadata-only replay should update pending work");
         let conflict = transaction
             .upsert_pending_group_decision(conflicting)
             .await
@@ -375,7 +385,7 @@ fn pending_group_work_accepts_replay_and_rejects_conflicting_target_work() {
             .expect("read transaction should release");
         loaded
     });
-    assert_eq!(loaded, Some(original));
+    assert_eq!(loaded, Some(metadata_update));
 }
 
 #[test]
@@ -384,6 +394,13 @@ fn pending_group_decision_transitions_to_one_activation_for_target_group() {
     let group_id = GroupId(Uuid::from_u128(11_101));
     let decision = creation_invitation_decision(group_id);
     let activation = decision.clone().into_activation();
+    let mut metadata_update = decision.clone();
+    let PendingGroupDecisionRecord::GroupInvitation(invitation) = &mut metadata_update else {
+        panic!("creation invitation fixture must contain an invitation");
+    };
+    invitation.group_name = Some("latest docs".to_owned());
+    invitation.message = Some("latest message".to_owned());
+    let expected_activation = metadata_update.clone().into_activation();
 
     wait_for_store_future(async {
         let mut transaction = store
@@ -403,6 +420,10 @@ fn pending_group_decision_transitions_to_one_activation_for_target_group() {
             .upsert_pending_group_activation(activation.clone())
             .await
             .expect("pending decision should transition to activation");
+        transaction
+            .upsert_pending_group_decision(metadata_update)
+            .await
+            .expect("metadata replay should not regress accepted activation");
         transaction
             .commit()
             .await
@@ -429,7 +450,7 @@ fn pending_group_decision_transitions_to_one_activation_for_target_group() {
         (loaded_decision, loaded_activation)
     });
     assert_eq!(loaded_decision, None);
-    assert_eq!(loaded_activation, Some(activation));
+    assert_eq!(loaded_activation, Some(expected_activation));
 }
 
 #[test]
@@ -590,7 +611,58 @@ fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
         version_vector,
         lifecycle: ReplicationGroupLifecycle::Open,
         security_material: current_slice_placeholder_group_security_material(group_id),
+        ..Default::default()
     }
+}
+
+fn insert_group_expect_error(
+    store: &SqliteReplicationStore,
+    group: ReplicationGroupRecord,
+) -> StoreError {
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        let error = transaction
+            .insert_replication_group(group)
+            .await
+            .expect_err("incomplete group should fail");
+        transaction
+            .rollback()
+            .await
+            .expect("failed insert should roll back");
+        error
+    })
+}
+
+fn assert_sqlite_store_error(
+    error: &StoreError,
+    predicate: impl FnOnce(&SqliteStoreError) -> bool,
+) {
+    let StoreError::StoreExternal { source } = error;
+    let sqlite_error = source
+        .downcast_ref::<SqliteStoreError>()
+        .expect("store error should retain SQLite context");
+    assert!(predicate(sqlite_error), "unexpected store error: {error:?}");
+}
+
+fn load_all_groups(store: &SqliteReplicationStore) -> Vec<ReplicationGroupRecord> {
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read transaction should start");
+        let groups = transaction
+            .load_replication_groups()
+            .await
+            .expect("groups should load");
+        transaction
+            .release()
+            .await
+            .expect("read transaction should release");
+        groups
+    })
 }
 
 fn is_conflicting_member_security_material(
@@ -783,6 +855,155 @@ fn sqlite_store_roundtrips_replication_group_lifecycle() {
         }
     );
     wait_for_store_future(transaction.release()).expect("read should release");
+}
+
+#[test]
+fn sqlite_store_refreshes_compatible_group_metadata() {
+    let store = in_memory_store(local_member());
+    let group_id = GroupId(Uuid::from_u128(101));
+    let mut group = sample_group(group_id);
+    group.group_name = Some("first name".to_owned());
+    group.message = Some("first message".to_owned());
+
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        transaction
+            .insert_replication_group(group.clone())
+            .await
+            .expect("group should insert");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+    });
+
+    let mut refreshed = group.clone();
+    refreshed.group_name = Some("latest name".to_owned());
+    refreshed.message = None;
+    let (material, _) = refreshed.clone().into_parts();
+    wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        transaction
+            .ensure_replication_group_material(material)
+            .await
+            .expect("compatible metadata should refresh");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+    });
+
+    let stored = wait_for_store_future(async {
+        let mut transaction = store
+            .begin_read_transaction()
+            .await
+            .expect("read should start");
+        let stored = transaction
+            .load_replication_group(&group_id)
+            .await
+            .expect("group should load")
+            .expect("group should exist");
+        transaction.release().await.expect("read should release");
+        stored
+    });
+    assert_eq!(stored.group_name, refreshed.group_name);
+    assert_eq!(stored.message, refreshed.message);
+}
+
+#[test]
+fn sqlite_store_rejects_incomplete_group_defaults_before_writing() {
+    let store = in_memory_store(local_member());
+
+    let material_error = wait_for_store_future(async {
+        let mut transaction = store
+            .begin_transaction()
+            .await
+            .expect("transaction should start");
+        let error = transaction
+            .ensure_replication_group_material(ReplicationGroupMaterialRecord::default())
+            .await
+            .expect_err("default material should fail");
+        transaction
+            .rollback()
+            .await
+            .expect("failed material insert should roll back");
+        error
+    });
+    assert_sqlite_store_error(&material_error, |error| {
+        matches!(error, SqliteStoreError::NilGroupId)
+    });
+
+    let mut nil_group = sample_group(GroupId::NIL);
+    nil_group.group_id = GroupId::NIL;
+    let nil_error = insert_group_expect_error(&store, nil_group);
+    assert_sqlite_store_error(&nil_error, |error| {
+        matches!(error, SqliteStoreError::NilGroupId)
+    });
+
+    let mut empty_members = sample_group(GroupId(Uuid::from_u128(102)));
+    empty_members.member_keys = ReplicationGroupRecord::default().member_keys;
+    let members_error = insert_group_expect_error(&store, empty_members);
+    assert_sqlite_store_error(&members_error, |error| {
+        matches!(error, SqliteStoreError::EmptyGroupMembers)
+    });
+
+    let invalid_index_group_id = GroupId(Uuid::from_u128(107));
+    let mut invalid_index = sample_group(invalid_index_group_id);
+    invalid_index.local_member_index = MemberIndex::new(u32::MAX);
+    let index_error = insert_group_expect_error(&store, invalid_index);
+    assert_sqlite_store_error(&index_error, |error| {
+        matches!(error, SqliteStoreError::InvalidLocalMemberIndex { .. })
+    });
+
+    let invalid_security_group_id = GroupId(Uuid::from_u128(103));
+    let mut invalid_security = sample_group(invalid_security_group_id);
+    invalid_security.security_material = ReplicationGroupRecord::default().security_material;
+    let security_error = insert_group_expect_error(&store, invalid_security);
+    assert_sqlite_store_error(&security_error, |error| {
+        matches!(
+            error,
+            SqliteStoreError::InvalidDefaultGroupSecurityMaterial { group_id }
+                if *group_id == invalid_security_group_id
+        )
+    });
+
+    let mismatched_progress_group_id = GroupId(Uuid::from_u128(104));
+    let mut mismatched_progress = sample_group(mismatched_progress_group_id);
+    mismatched_progress.version_vector =
+        VersionVector::initial(NonZeroUsize::new(1).expect("test vector has members"));
+    let progress_error = insert_group_expect_error(&store, mismatched_progress);
+    assert_sqlite_store_error(&progress_error, |error| {
+        matches!(
+            error,
+            SqliteStoreError::ActiveVersionMemberCountMismatch { group_id, .. }
+                if *group_id == mismatched_progress_group_id
+        )
+    });
+
+    let mismatched_lifecycle_group_id = GroupId(Uuid::from_u128(105));
+    let mut mismatched_lifecycle = sample_group(mismatched_lifecycle_group_id);
+    mismatched_lifecycle.lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: GroupId(Uuid::from_u128(106)),
+        final_versions: VersionVector::initial(
+            NonZeroUsize::new(1).expect("test vector has members"),
+        ),
+    };
+    let lifecycle_error = insert_group_expect_error(&store, mismatched_lifecycle);
+    assert_sqlite_store_error(&lifecycle_error, |error| {
+        matches!(
+            error,
+            SqliteStoreError::LifecycleVersionMemberCountMismatch { group_id, .. }
+                if *group_id == mismatched_lifecycle_group_id
+        )
+    });
+
+    assert!(load_all_groups(&store).is_empty());
 }
 
 #[test]

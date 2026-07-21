@@ -423,6 +423,7 @@ mod tests {
                         checklist_dataset_id(),
                         CHECKLIST_SCHEMA.clone().into(),
                     )])),
+                    ..Default::default()
                 })
                 .await
                 .expect("test group should insert");

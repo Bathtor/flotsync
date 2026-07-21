@@ -725,6 +725,7 @@ pub(super) fn inactive_group_record(
         ),
         lifecycle: ReplicationGroupLifecycle::Open,
         security_material: current_slice_placeholder_group_security_material(group_id),
+        ..Default::default()
     }
 }
 
@@ -763,6 +764,7 @@ pub(super) fn persist_group_membership_for_member<S>(
             ),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
+            ..Default::default()
         },
     );
 }
@@ -782,6 +784,7 @@ pub(super) fn persist_alice_group_with_security_material(
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
+            ..Default::default()
         },
     );
 }

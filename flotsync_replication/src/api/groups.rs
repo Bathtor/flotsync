@@ -215,9 +215,32 @@ impl ReplicationSecuritySecrets {
     }
 }
 
+/// Requested name handling for a membership-change successor group.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GroupNameUpdate {
+    /// Create the successor without a name.
+    Clear,
+    /// Reuse the current group's name.
+    #[default]
+    Inherit,
+    /// Replace the current name with a value the local API will trim and validate.
+    Set(String),
+}
+
 /// Request to create a new replication group.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The default request has no members and must be completed before submission.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct CreateGroupRequest {
+    /// Optional display name supplied by the caller.
+    ///
+    /// The local API trims a present value and rejects it if the result is
+    /// empty. Absence creates an unnamed group.
+    pub group_name: Option<String>,
+    /// Optional user-facing message stored verbatim, including an empty value.
+    ///
+    /// Absence creates a group without a message.
+    pub message: Option<String>,
     pub members: Vec<MemberIdentity>,
     /// Dataset schemas fixed for the lifetime of the new group.
     pub group_schema: GroupSchema,
@@ -226,6 +249,8 @@ pub struct CreateGroupRequest {
 impl fmt::Debug for CreateGroupRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CreateGroupRequest")
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
             .field("members", &self.members)
             .field("group_schema", &self.group_schema)
             .finish()
@@ -233,13 +258,32 @@ impl fmt::Debug for CreateGroupRequest {
 }
 
 /// Request to change membership of an existing group.
+///
+/// The default request targets [`GroupId::NIL`] and must be completed before
+/// submission. Its successor-name behaviour defaults to inheritance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeGroupMembershipRequest {
     pub group_id: GroupId,
     pub add_members: HashSet<MemberIdentity>,
     pub remove_members: HashSet<MemberIdentity>,
-    pub group_name: Option<String>,
+    /// Name handling for the successor group.
+    pub group_name: GroupNameUpdate,
+    /// Optional successor message stored verbatim, including an empty value.
+    ///
+    /// Absence creates a successor without a message; messages are not inherited.
     pub message: Option<String>,
+}
+
+impl Default for ChangeGroupMembershipRequest {
+    fn default() -> Self {
+        Self {
+            group_id: GroupId::NIL,
+            add_members: HashSet::new(),
+            remove_members: HashSet::new(),
+            group_name: GroupNameUpdate::default(),
+            message: None,
+        }
+    }
 }
 
 /// Receipt returned by `publish_changes`.
@@ -273,7 +317,7 @@ pub struct GroupInvitation {
     pub initial_snapshot: InitialSnapshot,
     /// Optional display name supplied by the proposer.
     pub group_name: Option<String>,
-    /// Optional user-facing note supplied by the proposer.
+    /// Optional user-facing message supplied by the proposer.
     pub message: Option<String>,
 }
 
@@ -285,8 +329,8 @@ impl fmt::Debug for GroupInvitation {
             .field("proposed_member_count", &self.proposed_members.len())
             .field("group_schema", &self.group_schema)
             .field("initial_snapshot", &self.initial_snapshot)
-            .field("has_group_name", &self.group_name.is_some())
-            .field("has_message", &self.message.is_some())
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
             .finish()
     }
 }
@@ -306,6 +350,19 @@ pub enum GroupInvitationError {
 }
 
 impl GroupInvitation {
+    /// Return whether another invitation carries the same pending work.
+    ///
+    /// Name and message metadata are excluded; pending source and snapshot
+    /// values remain part of this implementation's comparison.
+    #[must_use]
+    pub(crate) fn matches_definition(&self, other: &Self) -> bool {
+        self.group_id == other.group_id
+            && self.source == other.source
+            && self.proposed_members == other.proposed_members
+            && self.group_schema == other.group_schema
+            && self.initial_snapshot == other.initial_snapshot
+    }
+
     /// Build an ordinary group invitation.
     #[must_use]
     pub fn new_creation(
@@ -414,7 +471,7 @@ pub struct MigrationProposal {
     pub initial_snapshot: InitialSnapshot,
     /// Optional display name supplied by the proposer.
     pub group_name: Option<String>,
-    /// Optional user-facing note supplied by the proposer.
+    /// Optional user-facing message supplied by the proposer.
     pub message: Option<String>,
 }
 
@@ -426,9 +483,24 @@ impl fmt::Debug for MigrationProposal {
             .field("proposed_member_count", &self.proposed_members.len())
             .field("group_schema", &self.group_schema)
             .field("initial_snapshot", &self.initial_snapshot)
-            .field("has_group_name", &self.group_name.is_some())
-            .field("has_message", &self.message.is_some())
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
             .finish()
+    }
+}
+
+impl MigrationProposal {
+    /// Return whether another proposal carries the same pending work.
+    ///
+    /// Name and message metadata are excluded; the pending initial snapshot
+    /// remains part of this implementation's comparison.
+    #[must_use]
+    pub(crate) fn matches_definition(&self, other: &Self) -> bool {
+        self.migration_id == other.migration_id
+            && self.final_versions == other.final_versions
+            && self.proposed_members == other.proposed_members
+            && self.group_schema == other.group_schema
+            && self.initial_snapshot == other.initial_snapshot
     }
 }
 
@@ -521,6 +593,24 @@ impl PendingGroupDecisionRecord {
         }
     }
 
+    /// Return the optional target-group display name carried by this work.
+    #[must_use]
+    pub fn group_name(&self) -> Option<&str> {
+        match self {
+            Self::GroupInvitation(invitation) => invitation.group_name.as_deref(),
+            Self::MigrationProposal(proposal) => proposal.group_name.as_deref(),
+        }
+    }
+
+    /// Return the optional target-group message carried by this work.
+    #[must_use]
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::GroupInvitation(invitation) => invitation.message.as_deref(),
+            Self::MigrationProposal(proposal) => proposal.message.as_deref(),
+        }
+    }
+
     /// Convert this pending decision into the listener event that asks for the decision.
     #[must_use]
     pub fn to_event<R>(self, responder: R) -> ReplicationEvent
@@ -609,6 +699,8 @@ impl PendingGroupActivationRecord {
                 migration_cutover: None,
                 proposed_members: invitation.proposed_members,
                 group_schema: invitation.group_schema,
+                group_name: invitation.group_name,
+                message: invitation.message,
                 initial_snapshot: invitation.initial_snapshot,
             },
             Self::MigrationProposal(proposal) => AcceptedGroupActivationRecord {
@@ -620,6 +712,8 @@ impl PendingGroupActivationRecord {
                 }),
                 proposed_members: proposal.proposed_members,
                 group_schema: proposal.group_schema,
+                group_name: proposal.group_name,
+                message: proposal.message,
                 initial_snapshot: proposal.initial_snapshot,
             },
         }
@@ -639,6 +733,10 @@ pub struct AcceptedGroupActivationRecord {
     pub proposed_members: Vec<MemberIdentity>,
     /// Dataset schemas fixed for the activated group.
     pub group_schema: GroupSchema,
+    /// Optional display name stored with the activated group; `None` means unnamed.
+    pub group_name: Option<String>,
+    /// Optional user-facing message; `None` means no message was supplied.
+    pub message: Option<String>,
     /// Initial dataset state required before the group becomes active.
     pub initial_snapshot: InitialSnapshot,
 }
@@ -838,6 +936,8 @@ pub trait ReplicationApi: Send + Sync {
     /// messages to the configured remote members, and returns the newly allocated
     /// [`GroupId`]. New groups are created empty; callers publish initial
     /// dataset contents through ordinary [`Self::publish_changes`] updates.
+    /// Locally supplied names are trimmed and rejected if the result is empty;
+    /// messages are stored verbatim and may be empty.
     ///
     /// The method returns [`ApiError`] when membership validation fails, the
     /// runtime is unavailable, or group storage fails.
@@ -853,6 +953,9 @@ pub trait ReplicationApi: Send + Sync {
     /// Continuing remote members receive old-group-scoped migration proposals;
     /// newly added members receive new-group-scoped invitations with migration
     /// source context.
+    /// [`GroupNameUpdate`] is resolved locally before those messages are built;
+    /// replacement names are trimmed and rejected if empty. The optional
+    /// message is never inherited and is stored verbatim.
     ///
     /// Receiver-side mediation is governed by [`GroupInvitationPolicy`] and
     /// [`GroupMigrationPolicy`].
@@ -1085,10 +1188,17 @@ impl ReplicationGroupLifecycle {
 /// because it defines the stable `MemberIndex` values used in version vectors
 /// and `UpdateId.node_index`. Sensitive group-security material is already
 /// encrypted by the setup/runtime boundary before it enters the store.
+///
+/// [`Default`] provides an incomplete base for named struct-update syntax.
+/// Store/runtime boundaries reject it until all required fields are supplied.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplicationGroupRecord {
     /// Stable replication-group identifier.
     pub group_id: GroupId,
+    /// Optional application-facing display name; `None` means unnamed.
+    pub group_name: Option<String>,
+    /// Optional application-facing message; `None` means no message is stored.
+    pub message: Option<String>,
     /// Canonical exact member-key order for the group.
     pub member_keys: GroupMemberKeys,
     /// Position of the local member within `member_keys`.
@@ -1103,12 +1213,30 @@ pub struct ReplicationGroupRecord {
     pub security_material: EncryptedGroupSecurityMaterial,
 }
 
+impl Default for ReplicationGroupRecord {
+    fn default() -> Self {
+        Self {
+            group_id: GroupId::NIL,
+            group_name: None,
+            message: None,
+            member_keys: invalid_default_group_member_keys(),
+            local_member_index: MemberIndex::new(u32::MAX),
+            group_schema: GroupSchema::default(),
+            version_vector: VersionVector::initial(NonZeroUsize::MIN),
+            lifecycle: ReplicationGroupLifecycle::Open,
+            security_material: invalid_default_group_security_material(),
+        }
+    }
+}
+
 impl ReplicationGroupRecord {
     /// Split active progress from group material shared with pending setup.
     #[must_use]
     pub fn into_parts(self) -> (ReplicationGroupMaterialRecord, ReplicationGroupActiveState) {
         let material = ReplicationGroupMaterialRecord {
             group_id: self.group_id,
+            group_name: self.group_name,
+            message: self.message,
             member_keys: self.member_keys,
             local_member_index: self.local_member_index,
             group_schema: self.group_schema,
@@ -1158,8 +1286,8 @@ impl ReplicationGroupRecord {
 
     /// Return whether another active record has the same group definition.
     ///
-    /// Active progress and encrypted security material are intentionally not
-    /// part of the definition comparison.
+    /// Name/message metadata, active progress, and encrypted security material
+    /// are intentionally not part of the definition comparison.
     #[must_use]
     pub fn matches_definition(&self, other: &Self) -> bool {
         self.group_id == other.group_id
@@ -1171,9 +1299,10 @@ impl ReplicationGroupRecord {
     /// Return whether this active group is compatible with stored material
     /// for the same group id.
     ///
-    /// This intentionally ignores `version_vector`: active groups may already
-    /// have applied local progress beyond the initial bootstrap state. All
-    /// identity, schema, and security material must still match exactly.
+    /// This intentionally ignores name/message metadata and `version_vector`:
+    /// active groups may refresh metadata and may already have applied local
+    /// progress beyond the initial bootstrap state. All identity, schema, and
+    /// security material must still match exactly.
     #[must_use]
     pub fn matches_group_material(&self, material: &ReplicationGroupMaterialRecord) -> bool {
         material.matches_definition(
@@ -1199,10 +1328,17 @@ pub struct ReplicationGroupActiveState {
 /// Material may exist before the group becomes externally active. Dataset rows,
 /// update logs, and active progress remain anchored to [`ReplicationGroupRecord`]
 /// through the store's separate active-group marker.
+///
+/// [`Default`] provides an incomplete base for named struct-update syntax.
+/// Store/runtime boundaries reject it until all required fields are supplied.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReplicationGroupMaterialRecord {
     /// Stable replication-group identifier.
     pub group_id: GroupId,
+    /// Optional application-facing display name; `None` means unnamed.
+    pub group_name: Option<String>,
+    /// Optional application-facing message; `None` means no message is stored.
+    pub message: Option<String>,
     /// Canonical exact member-key order for the group.
     pub member_keys: GroupMemberKeys,
     /// Position of the local member within `member_keys`.
@@ -1213,11 +1349,26 @@ pub struct ReplicationGroupMaterialRecord {
     pub security_material: EncryptedGroupSecurityMaterial,
 }
 
+impl Default for ReplicationGroupMaterialRecord {
+    fn default() -> Self {
+        Self {
+            group_id: GroupId::NIL,
+            group_name: None,
+            message: None,
+            member_keys: invalid_default_group_member_keys(),
+            local_member_index: MemberIndex::new(u32::MAX),
+            group_schema: GroupSchema::default(),
+            security_material: invalid_default_group_security_material(),
+        }
+    }
+}
+
 impl ReplicationGroupMaterialRecord {
     /// Return whether this material has the supplied group definition.
     ///
-    /// Encrypted security material is intentionally excluded so callers can
-    /// reject structural conflicts before performing cryptographic checks.
+    /// Name/message metadata and encrypted security material are intentionally
+    /// excluded so callers can reject structural conflicts before performing
+    /// metadata refreshes or cryptographic checks.
     #[must_use]
     pub fn matches_definition(
         &self,
@@ -1248,6 +1399,8 @@ impl ReplicationGroupMaterialRecord {
     pub fn activate(self, version_vector: VersionVector) -> ReplicationGroupRecord {
         ReplicationGroupRecord {
             group_id: self.group_id,
+            group_name: self.group_name,
+            message: self.message,
             member_keys: self.member_keys,
             local_member_index: self.local_member_index,
             group_schema: self.group_schema,
@@ -1262,6 +1415,8 @@ impl fmt::Debug for ReplicationGroupMaterialRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReplicationGroupMaterialRecord")
             .field("group_id", &self.group_id)
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
             .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
             .field("group_schema", &self.group_schema)
@@ -1273,6 +1428,8 @@ impl std::fmt::Debug for ReplicationGroupRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReplicationGroupRecord")
             .field("group_id", &self.group_id)
+            .field("group_name", &self.group_name)
+            .field("message", &self.message)
             .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
             .field("group_schema", &self.group_schema)
@@ -1280,5 +1437,13 @@ impl std::fmt::Debug for ReplicationGroupRecord {
             .field("lifecycle", &self.lifecycle)
             .field("security_material", &self.security_material)
             .finish()
+    }
+}
+
+/// Build the empty member-key sentinel used only by aggregate defaults.
+fn invalid_default_group_member_keys() -> GroupMemberKeys {
+    GroupMemberKeys {
+        ordered_member_keys: Vec::new(),
+        member_indices: TrieMap::new(),
     }
 }

@@ -272,6 +272,7 @@ fn load_replication_runtime_allows_unresolved_member_keys_for_stored_groups() {
                 group_id,
                 store_secret_key_id,
             ),
+            ..Default::default()
         },
     );
     let listener = Arc::new(ListenerStub::default());
@@ -325,6 +326,7 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
                 group_id,
                 store_secret_key_id,
             ),
+            ..Default::default()
         },
     );
     let listener = Arc::new(ListenerStub::default());

@@ -37,6 +37,7 @@ use crate::{
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        invalid_default_group_security_material,
     },
     codecs::{
         messages::{
@@ -777,6 +778,8 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "
 CREATE TABLE IF NOT EXISTS replication_group_material (
     group_id TEXT PRIMARY KEY NOT NULL,
+    group_name TEXT,
+    message TEXT,
     member_count INTEGER NOT NULL,
     local_member_index INTEGER NOT NULL,
     group_secret_crypto_version INTEGER NOT NULL,
@@ -942,6 +945,8 @@ enum SqliteStoreError {
     },
     #[snafu(display("Stored group id was not a valid UUID: {source}"))]
     InvalidGroupId { source: uuid::Error },
+    #[snafu(display("A stored replication group requires a non-nil group id."))]
+    NilGroupId,
     #[snafu(display("Stored row key was not a valid UUID: {source}"))]
     InvalidRowKey { source: uuid::Error },
     #[snafu(display("Stored store-secret key id was invalid: {source}"))]
@@ -953,8 +958,12 @@ enum SqliteStoreError {
         raw: String,
         source: IdentifierParseError,
     },
-    #[snafu(display("Stored group had no members."))]
+    #[snafu(display("A stored replication group requires at least one member."))]
     EmptyGroupMembers,
+    #[snafu(display(
+        "Replication group {group_id} still carries invalid default security material."
+    ))]
+    InvalidDefaultGroupSecurityMaterial { group_id: GroupId },
     #[snafu(display("Stored member count overflowed the supported range: {source}"))]
     MemberCountOverflow { source: std::num::TryFromIntError },
     #[snafu(display("Stored member index overflowed the supported range: {source}"))]
@@ -966,6 +975,22 @@ enum SqliteStoreError {
     ))]
     InvalidLocalMemberIndex {
         local_member_index: u32,
+        member_count: usize,
+    },
+    #[snafu(display(
+        "Replication group {group_id} has {version_member_count} active version-vector members, but its material has {member_count} members."
+    ))]
+    ActiveVersionMemberCountMismatch {
+        group_id: GroupId,
+        version_member_count: usize,
+        member_count: usize,
+    },
+    #[snafu(display(
+        "Replication group {group_id} has {version_member_count} lifecycle-cut members, but its material has {member_count} members."
+    ))]
+    LifecycleVersionMemberCountMismatch {
+        group_id: GroupId,
+        version_member_count: usize,
         member_count: usize,
     },
     #[snafu(display(

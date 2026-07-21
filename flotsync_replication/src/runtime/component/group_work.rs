@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Locally validated group-creation input before security material is prepared.
+pub(super) struct PreparedCreatedGroup {
+    pub(super) group_id: GroupId,
+    pub(super) group_name: Option<String>,
+    pub(super) message: Option<String>,
+    pub(super) members: GroupMembers,
+    pub(super) group_schema: GroupSchema,
+}
+
 /// Security records and private wire setup prepared for one new group.
 pub(in crate::runtime) struct PreparedGroupSetup {
     pub(super) security_material: EncryptedGroupSecurityMaterial,

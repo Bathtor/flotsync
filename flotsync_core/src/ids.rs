@@ -8,6 +8,17 @@ pub type MemberIdentity = Identifier;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GroupId(pub Uuid);
 
+impl GroupId {
+    /// Placeholder group id used by aggregate defaults.
+    pub const NIL: Self = Self(Uuid::nil());
+
+    /// Generate a fresh random UUID-v4 group id.
+    #[must_use]
+    pub fn new_random() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
 impl std::fmt::Display for GroupId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -58,5 +69,23 @@ impl TryFrom<usize> for MemberIndex {
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         u32::try_from(value).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_id_nil_wraps_the_nil_uuid() {
+        assert_eq!(GroupId::NIL.0, Uuid::nil());
+    }
+
+    #[test]
+    fn group_id_new_random_builds_a_random_uuid() {
+        let group_id = GroupId::new_random();
+
+        assert_ne!(group_id, GroupId::NIL);
+        assert_eq!(group_id.0.get_version(), Some(uuid::Version::Random));
     }
 }

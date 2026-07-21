@@ -194,35 +194,42 @@ pub(super) async fn upsert_pending_group_payload_row(
     payload: Vec<u8>,
 ) -> Result<(), StoreError> {
     if let Some(existing) = load_pending_group_payload(connection, &key.new_group_id, None).await? {
+        let existing_record = decode_stored_proto(
+            "existing pending group work",
+            decode_pending_group_decision_payload(existing.key.kind, &existing.payload),
+        )?;
+        let requested_record = decode_stored_proto(
+            "requested pending group work",
+            decode_pending_group_decision_payload(key.kind, &payload),
+        )?;
         ensure!(
-            existing.key == key && existing.payload == payload,
+            existing.key == key
+                && pending_group_records_match_definition(&existing_record, &requested_record),
             ConflictingPendingGroupWorkSnafu {
                 group_id: key.new_group_id
             }
         );
-        match (existing.state, state) {
-            (
-                PendingGroupWorkState::AwaitingDecision,
-                PendingGroupWorkState::AcceptedActivation,
-            ) => {
-                sqlx::query(
-                    "
+        let stored_state = match (existing.state, state) {
+            (PendingGroupWorkState::AcceptedActivation, _)
+            | (_, PendingGroupWorkState::AcceptedActivation) => {
+                PendingGroupWorkState::AcceptedActivation
+            }
+            _ => PendingGroupWorkState::AwaitingDecision,
+        };
+        if existing.state != stored_state || existing.payload != payload {
+            sqlx::query(
+                "
 UPDATE pending_group_work
-SET state = 'activation'
+SET state = ?2, payload = ?3
 WHERE new_group_id = ?1
 ",
-                )
-                .bind(key.new_group_id.to_string())
-                .execute(&mut *connection)
-                .await
-                .context(SqlxSnafu)?;
-            }
-            (existing_state, requested_state) => ensure!(
-                existing_state == requested_state,
-                ConflictingPendingGroupWorkSnafu {
-                    group_id: key.new_group_id
-                }
-            ),
+            )
+            .bind(key.new_group_id.to_string())
+            .bind(stored_state.as_sql())
+            .bind(payload)
+            .execute(&mut *connection)
+            .await
+            .context(SqlxSnafu)?;
         }
         return Ok(());
     }
@@ -241,6 +248,24 @@ VALUES (?1, ?2, ?3, ?4, ?5)
     .await
     .context(SqlxSnafu)?;
     Ok(())
+}
+
+/// Return whether pending records differ only in optional metadata.
+fn pending_group_records_match_definition(
+    existing: &PendingGroupDecisionRecord,
+    requested: &PendingGroupDecisionRecord,
+) -> bool {
+    match (existing, requested) {
+        (
+            PendingGroupDecisionRecord::GroupInvitation(existing),
+            PendingGroupDecisionRecord::GroupInvitation(requested),
+        ) => existing.matches_definition(requested),
+        (
+            PendingGroupDecisionRecord::MigrationProposal(existing),
+            PendingGroupDecisionRecord::MigrationProposal(requested),
+        ) => existing.matches_definition(requested),
+        _ => false,
+    }
 }
 
 pub(super) async fn upsert_pending_group_decision(

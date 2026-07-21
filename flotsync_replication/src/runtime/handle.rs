@@ -57,7 +57,9 @@ use super::errors::GroupInstallError;
 #[cfg(test)]
 use super::errors::InboundDeliveryError;
 #[cfg(test)]
-use crate::codecs::messages::{UpdateBatchMessage, UpdateMessage};
+use crate::api::PendingGroupDecisionRecord;
+#[cfg(test)]
+use crate::codecs::messages::{GroupSetupMessage, UpdateBatchMessage, UpdateMessage};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
@@ -496,6 +498,36 @@ impl ReplicationRuntime {
             Err(error) => {
                 panic!(
                     "replication runtime component became unavailable during test apply_update_batch: {error:?}"
+                )
+            }
+        }
+    }
+
+    /// Inject one pending-group delivery without transport for runtime logic tests.
+    #[cfg(test)]
+    pub(super) fn apply_pending_group_for_test(
+        &self,
+        sender: MemberIdentity,
+        record: PendingGroupDecisionRecord,
+        group_setup: Arc<GroupSetupMessage>,
+    ) -> Result<(), InboundDeliveryError> {
+        let runtime_ref = self
+            .runtime_ref("injecting test pending-group delivery")
+            .expect("replication runtime lifecycle should be readable during test injection")
+            .expect("replication runtime should be live during test injection");
+        let future = runtime_ref.ask_with(|promise| {
+            ReplicationRuntimeMessage::test_apply_pending_group(
+                promise,
+                sender,
+                record,
+                group_setup,
+            )
+        });
+        match wait_for_test_reply(future) {
+            Ok(reply) => reply,
+            Err(error) => {
+                panic!(
+                    "replication runtime component became unavailable during pending-group test injection: {error:?}"
                 )
             }
         }
