@@ -202,10 +202,15 @@ pub enum ChecklistCommand {
     },
     /// Publish local changes and apply received updates.
     Sync,
-    /// Print configured group members.
+    /// Print active group members.
     Members,
-    /// Ask each configured member for its current group summary.
+    /// Ask each active group member for its current group summary.
     Check,
+    /// Manage public identity keys through the running replication runtime.
+    Keys {
+        #[command(subcommand)]
+        command: ChecklistKeyCommand,
+    },
     /// Print local member and store details.
     Me,
     /// Print command help.
@@ -213,6 +218,30 @@ pub enum ChecklistCommand {
     /// Exit the REPL.
     #[command(alias = "exit")]
     Quit,
+}
+
+/// Runtime-backed public-key commands available inside the checklist REPL.
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum ChecklistKeyCommand {
+    /// Print this peer's copyable public key bundle.
+    ExportLocal,
+    /// Inspect a pasted public key bundle without changing local security state.
+    Inspect {
+        /// Pasteable public key bundle text.
+        public_bundle: String,
+    },
+    /// Trust a pasted public key bundle for one exact member identity.
+    Trust {
+        /// Exact member identity to trust for the bundle.
+        member_id: flotsync_core::MemberIdentity,
+        /// Pasteable public key bundle text.
+        public_bundle: String,
+    },
+    /// Block the fingerprint derived from a pasted public key bundle.
+    Block {
+        /// Pasteable public key bundle text.
+        public_bundle: String,
+    },
 }
 
 impl ChecklistCommand {
@@ -1248,6 +1277,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_key_commands() {
+        assert_eq!(
+            parse_checklist_command("keys export-local").expect("command should parse"),
+            Some(ChecklistCommand::Keys {
+                command: ChecklistKeyCommand::ExportLocal,
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("keys inspect bundle-text").expect("command should parse"),
+            Some(ChecklistCommand::Keys {
+                command: ChecklistKeyCommand::Inspect {
+                    public_bundle: "bundle-text".to_owned(),
+                },
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("keys trust bob bundle-text").expect("command should parse"),
+            Some(ChecklistCommand::Keys {
+                command: ChecklistKeyCommand::Trust {
+                    member_id: flotsync_core::MemberIdentity::from_array(["bob"]),
+                    public_bundle: "bundle-text".to_owned(),
+                },
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("keys block bundle-text").expect("command should parse"),
+            Some(ChecklistCommand::Keys {
+                command: ChecklistKeyCommand::Block {
+                    public_bundle: "bundle-text".to_owned(),
+                },
+            })
+        );
+    }
+
+    #[test]
     fn rejects_undo_style_status_commands() {
         assert_command_error_contains("undone 1", "unrecognized subcommand");
         assert_command_error_contains("status 1 open", "unrecognized subcommand");
@@ -1293,13 +1357,15 @@ mod tests {
             "sync",
             "members",
             "check",
+            "keys",
             "me",
             "help",
             "quit",
             "Add one new checklist item",
             "Publish local changes and apply received updates",
-            "Print configured group members",
-            "Ask each configured member for its current group summary",
+            "Print active group members",
+            "Ask each active group member for its current group summary",
+            "Manage public identity keys through the running replication runtime",
             "Exit the REPL",
         ] {
             assert!(

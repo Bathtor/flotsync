@@ -22,21 +22,18 @@ traffic between the peers.
 
 ## Setup
 
-Build or run the checklist binary from the repository root:
+The current dynamic-group transition supports a fresh zero-group key-management
+shell and stores containing exactly one existing active group. Fresh group
+creation and the heterogeneous multi-group workspace land in
+`flotsync-git-d03.3`. The data scenarios below therefore require an existing
+single-group store until that slice is complete.
+
+Initialise local identity material, then start each peer from the repository
+root:
 
 ```bash
 cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local alice.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local bob.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local alice.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local bob.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys inspect alice.toml BOB_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys inspect bob.toml ALICE_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys trust alice.toml bob BOB_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
 ```
@@ -46,24 +43,36 @@ For a release binary:
 ```bash
 target/release/replicated_checklist keys init-local alice.toml
 target/release/replicated_checklist keys init-local bob.toml
-target/release/replicated_checklist keys export-local alice.toml
-target/release/replicated_checklist keys export-local bob.toml
-target/release/replicated_checklist keys inspect alice.toml BOB_PUBLIC_BUNDLE
-target/release/replicated_checklist keys inspect bob.toml ALICE_PUBLIC_BUNDLE
-target/release/replicated_checklist keys trust alice.toml bob BOB_PUBLIC_BUNDLE
-target/release/replicated_checklist keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 target/release/replicated_checklist run alice.toml
 target/release/replicated_checklist run bob.toml
 ```
 
-Each peer first creates or reuses local identity keys in its configured store.
-Copy the `public bundle (copy this value)` output from `keys export-local` to
-the opposite peer, inspect it if desired, then trust it for the exact peer
-identity before first `run`. Each config needs `store-secret-profile` and the
-temporary `group-secret-password`. The profile selects a device-local
-store-secret slot. The group password remains a temporary static-group setup
-bridge for the current security MVP and must match across peers in the same
-group.
+Inside each running REPL, print the local bundle:
+
+```text
+keys export-local
+```
+
+Copy the printed bundle to the opposite peer. Alice can assess and trust Bob as
+follows; Bob performs the corresponding commands with Alice's bundle:
+
+```text
+keys inspect BOB_PUBLIC_BUNDLE
+keys trust bob BOB_PUBLIC_BUNDLE
+```
+
+Trust prints the assessment and records feedback only after an explicit `y` or
+`yes`. To block key material, supply its public bundle rather than transcribing
+its fingerprint:
+
+```text
+keys block UNTRUSTED_PUBLIC_BUNDLE
+```
+
+Each config needs `local-member`, `store-path`, and `store-secret-profile` in
+the replicated-checklist section. The profile selects a device-local
+store-secret slot. Static group ids, ordered members, and shared group-secret
+passwords are no longer application configuration.
 
 <!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
 proper local store-secret backend exists. -->
@@ -74,7 +83,7 @@ storage and derives the local store secret from the profile string. Changing
 that profile later makes existing local security material unreadable; delete the
 example store and start fresh if you change it.
 
-Use one terminal per peer. In each REPL, run:
+For an existing single-group store, use one terminal per peer and run:
 
 ```text
 me
@@ -85,7 +94,10 @@ Confirm that:
 
 - Alice prints `member: alice` and the expected config path.
 - Bob prints `member: bob` and the expected config path.
-- Both peers list the same group and the same ordered members.
+- Both peers list the same persisted group and ordered members.
+
+For a fresh zero-group store, `me` prints `group: none`; key commands remain
+available and `members` explains that no active group exists.
 
 The examples below use `ROW` when an item should be addressed by row UUID. Get it from `list`; the
 row UUID is printed in parentheses at the end of each row. Using row UUIDs avoids accidental index
@@ -280,7 +292,7 @@ Expected result:
 ## Scenario 4: Restart Keeps Durable Runtime State
 
 Goal: a peer can stop and restart with the same store path and continue participating in the same
-configured group.
+persisted group.
 
 Start from two running peers with the same config and stores.
 

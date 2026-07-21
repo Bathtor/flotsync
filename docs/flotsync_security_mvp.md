@@ -46,11 +46,11 @@ leaking into low-level security code.
 `flotsync_security` accepts typed key material and protocol inputs. It does not
 parse TOML or Kompact configuration.
 
-For this MVP slice, the replicated-checklist example reads setup inputs from
-its application config before replication starts: a local store-secret profile,
-a local private JWKS path, and trusted public JWKS paths.
-`ensure_configured_group` parses and validates those files, provisions the
-replication store, and then starts replication.
+For this MVP slice, the replicated-checklist example reads the local member,
+store path, and store-secret profile from application config. The pre-runtime
+`keys init-local` command creates or reuses encrypted local private identity
+material because runtime loading requires it. Other key operations run through
+the already-unlocked replication runtime.
 
 The replicated-checklist store-secret profile is scoped to the example
 application id and selects a device-local store-secret slot. The current
@@ -58,8 +58,8 @@ implementation stores that secret through OS-backed local storage and creates it
 on first run. The profile is intentionally not tied to member identity, so later
 multi-identity stores can share the same encrypted-store secret.
 
-Replication runtime reads provisioned security state from `ReplicationStore`
-with normal group metadata.
+Replication runtime reads provisioned identity, trust, block, and group-security
+state from `ReplicationStore` with normal group metadata.
 
 Rationale: the project should not grow multiple independent config parsers for
 the same application configuration, and security state that belongs to a group
@@ -67,38 +67,41 @@ should enter runtime through the same store path as the rest of the group state.
 
 ## 4. Identity Keys
 
-Identity key files use JWKS/JWK, parsed through `jose-jwk`.
-
-Each local private identity file contains two OKP keys:
+Each local private identity bundle contains two OKP keys:
 
 - Ed25519 identity keys used with Ed25519ph for signing and signature verification
 - X25519 for public-key encryption and HPKE key transport
 
-The matching public JWKS contains the two public keys and is intended to be easy
-to copy to trusted peers.
+The matching identity-free public bundle contains the two public keys and is
+encoded into a pasteable representation for transfer to peers. Private bundles
+are encrypted in the local replication store rather than retained as
+application configuration files.
 
 Rationale: signing and encryption keys have different roles and compromise
-properties, but a single identity key file keeps MVP configuration small.
+properties, but a single identity bundle keeps MVP setup small.
 
 ## 5. Key Generation
 
-`flotsync_security` provides helper functions to generate a local private JWKS
-and its matching public JWKS for a `MemberIdentity`.
+`flotsync_security` provides helper functions to generate a local private bundle
+and its matching public bundle for a `MemberIdentity`.
 
-The replicated-checklist example should use these helpers so users can create
-usable key files without external crypto tooling.
+The replicated-checklist example uses these helpers so users can initialise
+usable local identity material without external crypto tooling.
 
 Rationale: relying on manual OpenSSL or ad hoc key generation would make the
 first secure example harder to run and easier to misconfigure.
 
 ## 6. Trust Model
 
-The MVP uses trusted public JWKS files supplied during replicated-checklist
-setup.
+The MVP stores observed member/public-key bindings, explicit local trust
+evidence, and globally blocked fingerprints in the replication store. The
+replicated-checklist assesses pasteable public bundles through the running
+runtime before recording explicit trust for one member or blocking the bundle's
+fingerprint.
 
-Bootstrap messages also carry member public keys. For now, recipients validate
-bootstrap-carried keys against the public keys provisioned during setup when
-both are available, and reject mismatches.
+Bootstrap messages also carry member public keys. Recipients evaluate those
+keys against current local trust and block state before granting the authority
+required by the bootstrap flow.
 
 Rationale: this preserves the long-term bootstrap shape while avoiding an
 unauthenticated "trust whatever the bootstrap says" model.
@@ -112,10 +115,10 @@ an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
 material is encrypted at rest with a device-local application database secret.
 
 For this MVP slice, replicated-checklist loads or creates that database secret
-through OS-backed secure storage via the `keyring` crate. The shared
-static-group secret still comes from plaintext application config during setup
-and is derived with an example-local domain-separated hash. Long term, static
-group secret provisioning should be replaced by the next setup shape.
+through OS-backed secure storage via the `keyring` crate. Group creation and
+membership-change flows generate and distribute group secrets through the
+replication runtime; the checklist no longer accepts a plaintext shared group
+secret in application config.
 
 The stored group-security material includes the group symmetric key, cipher
 suite metadata, and member public keys needed to verify and open group traffic
