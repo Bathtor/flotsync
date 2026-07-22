@@ -33,6 +33,7 @@ use crate::{
         SummaryRequest,
         security::{
             AssessPublicKeyBundleRequest,
+            KnownMemberKeysReport,
             PublicKeyBundleReport,
             RecordPublicKeyBundleFeedbackRequest,
         },
@@ -350,6 +351,10 @@ impl ReplicationApi for ReplicationRuntime {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::RecordPublicKeyBundleFeedback(Ask::new(promise, request))
         })
+    }
+
+    fn known_member_keys(&self) -> ApiFuture<'_, KnownMemberKeysReport> {
+        self.ask(|promise| ReplicationRuntimeMessage::KnownMemberKeys(Ask::new(promise, ())))
     }
 
     fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {

@@ -374,6 +374,12 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         async move { load_member_public_keys(self.assert_open_connection(), key_id).await }.boxed()
     }
 
+    fn load_member_public_key_ids(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
+        async move { load_member_public_key_ids(self.assert_open_connection()).await }.boxed()
+    }
+
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,

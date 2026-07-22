@@ -120,6 +120,7 @@ use crate::{
         providers::VecRowProvider,
         security::{
             AssessPublicKeyBundleRequest,
+            KnownMemberKeysReport,
             PublicKeyBundleReport,
             RecordPublicKeyBundleFeedbackRequest,
         },
@@ -272,6 +273,8 @@ pub(crate) enum PendingGroupDecisionResponseKind {
 pub enum ReplicationRuntimeMessage {
     /// Return the local member's shareable public key bundle through the component interface.
     LocalPublicKeyBundle(Ask<(), Result<PublicKeyBundle, ApiError>>),
+    /// Return stored member-key bindings and local trust through the component interface.
+    KnownMemberKeys(Ask<(), Result<KnownMemberKeysReport, ApiError>>),
     /// Assess one decoded public key bundle through the component interface.
     AssessPublicKeyBundle(
         Ask<AssessPublicKeyBundleRequest, Result<PublicKeyBundleReport, ApiError>>,
@@ -3308,6 +3311,24 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
+    fn handle_known_member_keys(
+        &mut self,
+        ask: Ask<(), Result<KnownMemberKeysReport, ApiError>>,
+    ) -> HandlerResult {
+        let (promise, ()) = ask.take();
+        let security = self.security.clone();
+        self.spawn_local(move |async_self| async move {
+            let reply = security
+                .known_member_keys_report()
+                .await
+                .boxed()
+                .context(ApiExternalSnafu);
+            async_self.reply_api(promise, "known_member_keys", reply);
+            Handled::OK
+        });
+        Handled::OK
+    }
+
     fn handle_snapshot_rows(
         &mut self,
         ask: Ask<SnapshotRowsRequest, Result<SnapshotValueRows, ApiError>>,
@@ -3803,6 +3824,7 @@ impl Actor for ReplicationRuntimeComponent {
             ReplicationRuntimeMessage::LocalPublicKeyBundle(ask) => {
                 self.handle_local_public_key_bundle(ask)
             }
+            ReplicationRuntimeMessage::KnownMemberKeys(ask) => self.handle_known_member_keys(ask),
             ReplicationRuntimeMessage::AssessPublicKeyBundle(ask) => {
                 self.handle_assess_public_key_bundle(ask)
             }

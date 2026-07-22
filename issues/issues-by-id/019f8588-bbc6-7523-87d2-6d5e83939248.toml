@@ -1,0 +1,27 @@
+id = "019f8588-bbc6-7523-87d2-6d5e83939248"
+ref = "flotsync-git-d03.3.3"
+title = "Add checklist group creation and invitation mediation"
+body = """
+Objective:
+M01. Add named group creation and interactive invitation decisions to the multi-group checklist workspace.
+
+Plan:
+M02. Add flag-free group create <name>. Display the known-member trust report, prompt for an ordered whitespace-separated membership list, and validate syntax, duplicates, and local-member inclusion.
+M03. Treat the report as user reference only. Show trust state before confirmation, then let create_group perform the authoritative key-policy and blocked-key checks and report any failure directly.
+M04. Show creator-first order, name, and checklist schema before explicit confirmation; create with no message and never set the new group as default.
+M05. Queue group invitations and one-shot responders in the REPL. Add indexed group invitations, group accept <index>, and group reject <index>, then refresh registry and snapshots after acceptance without changing the default.
+M06. Continue rejecting membership-change proposals as unsupported and add focused parser, wizard, responder, refresh, restart, and multi-runtime tests.
+
+Deferrals:
+M07. Qualified item references, move/copy, all-group sync, and default repair after group deactivation remain in flotsync-git-d03.4.
+
+Estimate:
+M08. Approximately 750-1,150 LOC including end-to-end coverage."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f8588-861f-70a3-a154-f8e23e72baf7"]
+blocks = ["019f8396-c396-75b2-a651-2866f60b79a9"]
+parent = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+created_at = "2026-07-21T16:35:58.534541Z"
+updated_at = "2026-07-21T16:37:00.869613Z"

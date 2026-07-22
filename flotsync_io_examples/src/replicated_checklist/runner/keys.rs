@@ -282,7 +282,7 @@ mod tests {
         PublishReceipt,
         SnapshotValueRows,
         Summary,
-        security::PublicKeyBundleSchemeReport,
+        security::{KnownMemberKeysReport, PublicKeyBundleSchemeReport},
         test_support::test_public_member_keys,
     };
     use futures_util::future;
@@ -314,6 +314,13 @@ mod tests {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<PublicKeyBundle, ApiError>> + Send + '_>> {
             future::ready(Ok(self.local_bundle.clone())).boxed()
+        }
+
+        fn known_member_keys(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<KnownMemberKeysReport, ApiError>> + Send + '_>>
+        {
+            panic!("checklist key tests must not enumerate known members")
         }
 
         fn assess_public_key_bundle(

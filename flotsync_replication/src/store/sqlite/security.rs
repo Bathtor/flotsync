@@ -105,6 +105,29 @@ WHERE member_identity = ?1 AND key_fingerprint = ?2
     }))
 }
 
+pub(super) async fn load_member_public_key_ids(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<MemberKeyId>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT member_identity, key_fingerprint
+FROM member_public_keys
+",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut key_ids = Vec::with_capacity(rows.len());
+    for row in rows {
+        key_ids.push(MemberKeyId {
+            member_id: decode_member_identity(&row.get::<String, _>("member_identity"))?,
+            fingerprint: decode_key_fingerprint(&row.get::<Vec<u8>, _>("key_fingerprint"))?,
+        });
+    }
+    Ok(key_ids)
+}
+
 pub(super) async fn load_member_public_keys_for_member(
     connection: &mut SqliteStoreConnection,
     member_id: &MemberIdentity,

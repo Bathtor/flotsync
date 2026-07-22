@@ -13,6 +13,7 @@ use crate::{
         StoreSecretKeyId,
         security::{
             AssessPublicKeyBundleRequest,
+            KnownMemberKeysReport,
             PublicKeyBundleReport,
             RecordPublicKeyBundleFeedbackRequest,
         },

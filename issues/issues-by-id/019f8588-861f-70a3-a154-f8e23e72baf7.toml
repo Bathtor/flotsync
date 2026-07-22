@@ -1,0 +1,28 @@
+id = "019f8588-861f-70a3-a154-f8e23e72baf7"
+ref = "flotsync-git-d03.3.2"
+title = "Build the composite multi-group checklist workspace"
+body = """
+Objective:
+L01. Replace the transitional zero-or-one-group checklist session with one heterogeneous working set containing process-local and real-group items.
+
+Plan:
+L02. Introduce composite item identity from Local or Group(GroupId) association plus RowKey, and re-key rows, ordering, dirty state, events, and sync plans accordingly.
+L03. Load every readable group and checklist snapshot into one workspace, retain registry metadata, merge read tokens, and route listener rows by RowId group.
+L04. Resolve groups by UUID-first syntax or exact unique name, add group list/default/clear-default, and keep the default session-only and never inferred.
+L05. Plain add uses the current default or creates a process-local item. List indices remain always unambiguous and bare row UUIDs work only when unique until qualified references land in flotsync-git-d03.4.
+L06. Existing members and check commands use the default. Transitional sync publishes only the default group, drains events for all groups, reports remaining dirty groups, and leaves local items unsynchronised.
+L07. Add focused working-set, parser, startup/restart, selector, default, snapshot, listener-routing, and transitional-sync tests.
+
+Deferrals:
+L08. Group creation and invitations remain in flotsync-git-d03.3.3. Qualified references, move/copy, all-group sync, and default repair after lifecycle changes remain in flotsync-git-d03.4.
+
+Estimate:
+L09. Approximately 1,150-1,700 LOC including focused tests."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f8588-3cc9-7221-b0e9-b462f744d4e8"]
+blocks = ["019f8588-bbc6-7523-87d2-6d5e83939248"]
+parent = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+created_at = "2026-07-21T16:35:44.799934Z"
+updated_at = "2026-07-21T16:36:02.733086Z"

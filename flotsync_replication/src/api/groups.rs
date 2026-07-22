@@ -852,6 +852,13 @@ pub trait ReplicationApi: Send + Sync {
     /// identity, local trust evidence, private keys, or policy state.
     fn local_public_key_bundle(&self) -> BoxFuture<'_, Result<PublicKeyBundle, ApiError>>;
 
+    /// Return stored member-key identities together with local trust summaries.
+    ///
+    /// This report does not evaluate authority permissions, blocked-key policy,
+    /// or whether a later group-creation request will be accepted.
+    fn known_member_keys(&self)
+    -> BoxFuture<'_, Result<security::KnownMemberKeysReport, ApiError>>;
+
     /// Assess one decoded public key bundle against the running system's local security state.
     ///
     /// Read-only assessment does not store observed key material, record trust

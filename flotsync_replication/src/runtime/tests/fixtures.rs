@@ -477,6 +477,41 @@ pub(super) fn runtime_api_returns_local_public_key_bundle() {
 }
 
 #[test]
+pub(super) fn runtime_api_reports_known_member_key_trust() {
+    let alice = alice_member();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let record = MemberPublicKeysRecord::from_public_keys(&test_public_keys(&alice));
+    let mut transaction =
+        wait_for_test_reply(fixture.store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.ensure_member_public_keys(record.clone()))
+        .expect("local public keys should store");
+    wait_for_test_reply(transaction.ensure_member_key_trust_evidence(
+        MemberKeyTrustEvidenceRecord {
+            key_id: record.key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        },
+    ))
+    .expect("local trust evidence should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+
+    let report = wait_for_test_reply(fixture.runtime.known_member_keys())
+        .expect("known-member keys should load");
+
+    let local = report
+        .members
+        .iter()
+        .find(|member| member.member_id == alice)
+        .expect("local member keys should be reported");
+    assert_eq!(local.keys.len(), 1);
+    assert!(local.keys[0].trust.has_local_explicit_trust);
+    wait_for_test_reply(fixture.runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
 pub(super) fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
     let bob = bob_member();
     let fixture = load_runtime_fixture(

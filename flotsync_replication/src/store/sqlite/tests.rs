@@ -1289,6 +1289,44 @@ fn sqlite_store_roundtrips_member_public_keys_and_trust_evidence() {
 }
 
 #[test]
+fn sqlite_store_lists_all_member_public_key_ids() {
+    let store = in_memory_store(local_member());
+    let remote_first =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&remote_member()));
+    let mut local =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&third_member()));
+    local.key_id.member_id = local_member();
+    let mut remote_second =
+        MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&third_member()));
+    remote_second.key_id.member_id = remote_member();
+    let expected = HashSet::from([
+        remote_first.key_id.clone(),
+        local.key_id.clone(),
+        remote_second.key_id.clone(),
+    ]);
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    let empty = wait_for_store_future(transaction.load_member_public_key_ids())
+        .expect("empty member-key ids should load");
+    assert!(empty.is_empty());
+    wait_for_store_future(transaction.ensure_member_public_keys(remote_first.clone()))
+        .expect("first remote public keys should store");
+    wait_for_store_future(transaction.ensure_member_public_keys(local))
+        .expect("local public keys should store");
+    wait_for_store_future(transaction.ensure_member_public_keys(remote_second))
+        .expect("second remote public keys should store");
+
+    let loaded = wait_for_store_future(transaction.load_member_public_key_ids())
+        .expect("member-key ids should load")
+        .into_iter()
+        .collect::<HashSet<_>>();
+
+    assert_eq!(loaded, expected);
+    wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
+}
+
+#[test]
 fn sqlite_store_rejects_member_public_keys_with_mismatched_fingerprint() {
     let store = in_memory_store(local_member());
     let mut record =

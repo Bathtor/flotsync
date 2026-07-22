@@ -44,6 +44,16 @@ impl DeliverySecurity {
             .context(SecurityStoreSnafu)
     }
 
+    /// Report stored member-key bindings and their local trust evidence.
+    pub(crate) async fn known_member_keys_report(
+        &self,
+    ) -> Result<KnownMemberKeysReport, DeliverySecurityError> {
+        self.security_store
+            .known_member_keys_report()
+            .await
+            .context(SecurityStoreSnafu)
+    }
+
     /// Ensure one directly acquired public key bundle as candidate discovery key material.
     pub(crate) async fn ensure_discovery_public_key_bundle(
         &self,

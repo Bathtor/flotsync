@@ -1,0 +1,87 @@
+id = "019f8588-3cc9-7221-b0e9-b462f744d4e8"
+ref = "flotsync-git-d03.3.1"
+title = "Report known member key trust"
+body = """
+Objective:
+K01. Add the narrow read-only replication API needed for the checklist creation wizard to list member identities and key bindings already known by the local database, together with stored trust information.
+
+Boundary:
+K02. This answers only which member-key bindings are stored and whether each has local explicit trust. It does not expose key bytes or private material, query AuthorityScope values, include blocked-key policy, or predict that create_group will succeed.
+K03. Group creation remains the single authority-policy decision point. The later wizard uses this report as human-readable reference and reports any create_group validation failure directly.
+
+Store layer:
+K04. Add ReplicationStoreReadTransaction::load_member_public_key_ids returning every stored MemberKeyId without an ordering guarantee. Implement one SQLite query selecting member identity and fingerprint from member_public_keys, and update the failing runtime test transaction.
+K05. Cover an empty table, several identities, several fingerprints for one identity, and complete order-independent result comparison through the SQLite implementation.
+
+Report model:
+K06. Add KnownMemberKeysReport as a top-level application value containing KnownMemberReport entries. Each member entry contains its MemberIdentity and KnownMemberKeyReport bindings; each binding contains the fingerprint and the existing MemberKeyTrustReport. Public fields make no ordering promises.
+K07. Keep the current precise trust wording: local explicit trust yes or no. Absence of trust evidence must not be labelled distrusted, and the model can grow with MemberKeyTrustReport if more trust forms are added later.
+K08. Implement compact Display output grouped by member. Compare the complete rendered output in tests; an empty report prints an explicit no-known-members state.
+
+Security and runtime routing:
+K09. Add a security-store known_member_keys_report method that opens one read transaction, loads all ids once, loads trust evidence for each binding, groups bindings by identity through flotsync_core::member::TrieMap without depending on provider order, and consumes the map directly into report entries.
+K10. Implement From<MemberKeyTrustEvidenceSet> for MemberKeyTrustReport and use it in both known-member and public-bundle report paths without evaluating authority permissions for the new report.
+K11. Add ReplicationApi::known_member_keys, its runtime message/handler/handle dispatch, and public exports. The handler delegates to the security store and preserves existing ApiExternal error translation.
+
+Core collection API:
+K15. Add consuming IntoIterator implementations for TrieMap and TrieSet. Map iteration yields owned (Identifier, V) entries; set iteration yields owned Identifier values without requiring callers to clone or remove entries individually.
+K16. Cover consuming map and set iteration, including nested identifiers and owned non-Copy values, in the core trie tests.
+
+Coverage:
+K12. Add exact API display and trust-conversion tests, security-store tests for empty, trusted, not-locally-trusted, order-independent multi-binding grouping, runtime API dispatch coverage, plus compile updates for the one non-SQLite transaction implementation.
+K13. No checklist runner or wizard code changes in this child; flotsync-git-d03.3.3 consumes the API later.
+
+Estimate:
+K14. Approximately 380-650 LOC across public types, one store query, trust conversion, runtime routing, consuming trie iteration, and focused tests. This remains below 1,000 LOC and needs no further split."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocks = ["019f8588-861f-70a3-a154-f8e23e72baf7"]
+parent = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+created_at = "2026-07-21T16:35:26.025605Z"
+updated_at = "2026-07-22T05:39:07.299495Z"
+closed_at = "2026-07-22T05:39:07.299495Z"
+
+[[comments]]
+id = "019f858d-ab93-7843-8587-0325b507523b"
+author = "lkroll"
+body = "Plan agreed: expose stored member-key ids grouped by member with local explicit trust only; do not evaluate authority scopes, blocked-key policy, or group-creation viability. The checklist wizard will consume the report in flotsync-git-d03.3.3."
+created_at = "2026-07-21T16:41:22.067025Z"
+
+[[comments]]
+id = "019f8596-e30a-7430-8ad8-6b82eef83905"
+author = "lkroll"
+body = "Implementation complete: added deterministic member-key id enumeration, grouped known-member trust report/display, shared local-trust derivation, and runtime API routing without authority-scope or blocked-key evaluation. Coverage includes SQLite ordering/empty state, trusted and observed multi-binding grouping, public display/debug/equality, runtime dispatch, the full replication library suite, and existing checklist tests."
+created_at = "2026-07-21T16:51:26.090424Z"
+
+[[comments]]
+id = "019f85a4-397b-7713-8d5a-f948ba00166a"
+author = "lkroll"
+body = "Review delta agreed: remove all public/store ordering guarantees and order-dependent assertions; group arbitrary provider output with TrieMap; compare complete Display output; replace the private trust conversion helper with From<MemberKeyTrustEvidenceSet> for MemberKeyTrustReport."
+created_at = "2026-07-21T17:06:00.187842Z"
+
+[[comments]]
+id = "019f85aa-c284-73d3-b235-a46df692d8fa"
+author = "lkroll"
+body = "Review feedback addressed: public and store ordering guarantees are removed; SQLite returns ids without ORDER BY and its test compares sets; known-member grouping uses TrieMap and no longer depends on provider order; Display coverage compares the complete output; MemberKeyTrustReport now converts from MemberKeyTrustEvidenceSet through From. Focused tests, the full replication library suite (224 tests), checklist tests (31 tests), workspace check, pedantic Clippy, and whitespace checks all pass."
+created_at = "2026-07-21T17:13:08.48491Z"
+
+[[comments]]
+id = "019f884b-c9c3-7942-a7b8-29fbf9e1e076"
+author = "lkroll"
+body = "Final review delta agreed: make consuming iteration a reusable TrieMap and TrieSet API, then collect the grouped member-key report directly instead of collecting keys and removing values individually."
+created_at = "2026-07-22T05:28:16.06772Z"
+
+[[comments]]
+id = "019f884f-1cf3-7d00-a419-11615e91de8d"
+author = "lkroll"
+body = "Consuming trie iteration implemented: TrieMap now yields owned identifier/value entries and TrieSet yields owned identifiers through IntoIterator. The known-member report collects directly from TrieMap without cloning values or removing entries individually. Core (50), replication (224), and checklist (31) test suites pass, together with workspace check, pedantic Clippy, and whitespace checks."
+created_at = "2026-07-22T05:31:53.971726Z"
+
+[[comments]]
+id = "019f8855-b9a3-7770-8ab8-5dad44ff1ca9"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-22T05:39:07.299495Z"

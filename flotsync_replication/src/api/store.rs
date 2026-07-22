@@ -138,6 +138,10 @@ pub trait ReplicationStoreReadTransaction: Send {
         key_id: &'a MemberKeyId,
     ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
 
+    /// Load every observed member-key identity without returning public key material.
+    fn load_member_public_key_ids(&mut self)
+    -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>>;
+
     /// Load every observed public key material record for one member identity.
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,

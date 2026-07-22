@@ -326,6 +326,15 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_member_public_keys(key_id)
     }
 
+    fn load_member_public_key_ids(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_key_ids()
+    }
+
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,

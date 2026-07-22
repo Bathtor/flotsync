@@ -1,9 +1,60 @@
 //! Application-facing security assessment and feedback API types.
 
-use crate::api::{AuthorityScope, MemberKeyId, PermissionDecision};
+use crate::api::{
+    AuthorityScope,
+    MemberKeyId,
+    MemberKeyTrustEvidenceKind,
+    MemberKeyTrustEvidenceSet,
+    PermissionDecision,
+};
 use flotsync_core::MemberIdentity;
 use flotsync_security::{KeyFingerprint, PublicKeyBundle};
 use std::{collections::HashSet, fmt};
+
+/// Stored member-key bindings and their local trust summaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KnownMemberKeysReport {
+    /// Members with stored public key bindings.
+    pub members: Vec<KnownMemberReport>,
+}
+
+impl fmt::Display for KnownMemberKeysReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Known member keys")?;
+        if self.members.is_empty() {
+            return write!(f, "known members: none");
+        }
+        for member in &self.members {
+            writeln!(f, "member: {}", member.member_id)?;
+            for binding in &member.keys {
+                writeln!(
+                    f,
+                    "  - fingerprint: {}; {}",
+                    binding.fingerprint, binding.trust
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stored key bindings known for one member identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownMemberReport {
+    /// Member identity attached to all reported key bindings.
+    pub member_id: MemberIdentity,
+    /// Stored key bindings for this member.
+    pub keys: Vec<KnownMemberKeyReport>,
+}
+
+/// One stored key fingerprint and its local trust summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnownMemberKeyReport {
+    /// Fingerprint identifying this stored public key material.
+    pub fingerprint: KeyFingerprint,
+    /// Trust evidence summary for this exact member-key binding.
+    pub trust: MemberKeyTrustReport,
+}
 
 /// Request to assess one decoded public key bundle against local security state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +254,15 @@ pub struct MemberKeyTrustReport {
     pub has_local_explicit_trust: bool,
 }
 
+impl From<MemberKeyTrustEvidenceSet> for MemberKeyTrustReport {
+    fn from(evidence: MemberKeyTrustEvidenceSet) -> Self {
+        Self {
+            has_local_explicit_trust: evidence
+                .contains(MemberKeyTrustEvidenceKind::LocalExplicitTrust),
+        }
+    }
+}
+
 impl fmt::Display for MemberKeyTrustReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -254,6 +314,62 @@ fn yes_no(value: bool) -> &'static str {
 mod tests {
     use super::*;
     use crate::api::{PermissionDecision, PermissionDenialReason};
+
+    #[test]
+    fn known_member_keys_report_display_groups_bindings_by_member() {
+        let member_id = MemberIdentity::from_array(["display", "alice"]);
+        let trusted_fingerprint = KeyFingerprint::from_bytes([3; 32]);
+        let observed_fingerprint = KeyFingerprint::from_bytes([4; 32]);
+        let report = KnownMemberKeysReport {
+            members: vec![KnownMemberReport {
+                member_id: member_id.clone(),
+                keys: vec![
+                    KnownMemberKeyReport {
+                        fingerprint: trusted_fingerprint,
+                        trust: MemberKeyTrustReport {
+                            has_local_explicit_trust: true,
+                        },
+                    },
+                    KnownMemberKeyReport {
+                        fingerprint: observed_fingerprint,
+                        trust: MemberKeyTrustReport {
+                            has_local_explicit_trust: false,
+                        },
+                    },
+                ],
+            }],
+        };
+
+        let output = report.to_string();
+        let expected = indoc::formatdoc! {
+            "Known member keys
+            member: {member_id}
+              - fingerprint: {trusted_fingerprint}; local explicit trust: yes
+              - fingerprint: {observed_fingerprint}; local explicit trust: no
+            "
+        };
+
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn empty_known_member_keys_report_names_empty_state() {
+        assert_eq!(
+            KnownMemberKeysReport::default().to_string(),
+            "Known member keys\nknown members: none"
+        );
+    }
+
+    #[test]
+    fn member_key_trust_report_converts_stored_evidence() {
+        let absent = MemberKeyTrustReport::from(MemberKeyTrustEvidenceSet::empty());
+        let mut evidence = MemberKeyTrustEvidenceSet::empty();
+        evidence.insert(MemberKeyTrustEvidenceKind::LocalExplicitTrust);
+        let present = MemberKeyTrustReport::from(evidence);
+
+        assert!(!absent.has_local_explicit_trust);
+        assert!(present.has_local_explicit_trust);
+    }
 
     #[test]
     fn public_key_bundle_report_display_includes_cli_summary() {

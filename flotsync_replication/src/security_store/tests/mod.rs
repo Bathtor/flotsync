@@ -25,3 +25,4 @@ mod feedback;
 mod fixtures;
 mod key_material;
 mod permissions;
+mod reports;
