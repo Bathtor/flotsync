@@ -3,26 +3,73 @@ ref = "flotsync-git-d03.3.2"
 title = "Build the composite multi-group checklist workspace"
 body = """
 Objective:
-L01. Replace the transitional zero-or-one-group checklist session with one heterogeneous working set containing process-local and real-group items.
+W01. Replace the transitional optional single-group checklist session with one heterogeneous workspace containing process-local items and items from zero or more readable replication groups.
 
-Plan:
-L02. Introduce composite item identity from Local or Group(GroupId) association plus RowKey, and re-key rows, ordering, dirty state, events, and sync plans accordingly.
-L03. Load every readable group and checklist snapshot into one workspace, retain registry metadata, merge read tokens, and route listener rows by RowId group.
-L04. Resolve groups by UUID-first syntax or exact unique name, add group list/default/clear-default, and keep the default session-only and never inferred.
-L05. Plain add uses the current default or creates a process-local item. List indices remain always unambiguous and bare row UUIDs work only when unique until qualified references land in flotsync-git-d03.4.
-L06. Existing members and check commands use the default. Transitional sync publishes only the default group, drains events for all groups, reports remaining dirty groups, and leaves local items unsynchronised.
-L07. Add focused working-set, parser, startup/restart, selector, default, snapshot, listener-routing, and transitional-sync tests.
+Item identity and working set:
+W02. Add ChecklistItemAssociation with Local and Group(GroupId) variants plus ChecklistItemId combining the association and RowKey.
+W03. Re-key visible rows, display order, dirty state, queued changes, event history, listed items, and sync bookkeeping by ChecklistItemId.
+W04. Keep global list indices unambiguous. Resolve bare RowKey UUIDs only when exactly one visible item has that UUID and report all associations when ambiguous; qualified item syntax remains deferred to flotsync-git-d03.4.
+W05. Keep one workspace-wide optional ReadToken. Snapshot and accepted listener tokens merge through ReadToken::merge_applied.
+
+Group registry and default:
+W06. Retain every readable ReplicationGroupRecord in an application registry. Resolve syntactically valid UUID selectors first and otherwise resolve exact unique names, reporting candidate UUIDs for ambiguous names.
+W07. Add group list, group default <group>, and group clear-default. Selector commands consume their remaining words as the exact name, allowing whitespace without flag syntax.
+W08. Keep the default session-only and initially absent. Only writable groups can become default because the default controls insertion and publication.
+W09. Plain add targets the current default group or creates a process-local item when no default exists. Existing edits select items globally; members and check use the default.
+
+Startup, events, and transitional sync:
+W10. Use the store only before runtime startup to discover every readable group. Do not retain or access it from ChecklistRepl; checklist operations go through public ReplicationApi methods.
+W11. Always construct a workspace, load each readable group checklist snapshot serially into it, and merge the returned read tokens.
+W12. Route listener rows by their full RowId group and reject unknown groups or wrong datasets.
+W13. Decode each listener batch atomically and reject it if any change targets an item that remains dirty. Rejection does not change rows, display order, dirty state, queued events, event history, or the workspace read token. The transitional error tells the user to restart for a fresh snapshot; retry buffering remains intentionally absent.
+W14. Add group-specific sync planning and successful-plan clearing. Publish only the current default group, update its receipt token, clear its successful dirty plan before draining listener events, then accept clean listener batches and apply queued events. Other groups and local items remain dirty.
+W15. Remove application-level dirty-row rebasing. Clean listener upserts and deletes apply directly; add a TODO linked to flotsync-git-d03.4, where all-group synchronisation removes the temporary dirty-conflict rejection.
+W16. Update list, show, event, me, mutation-result, and sync output to display item association. Prefer unique group names while retaining UUIDs where needed, add ChecklistRowChange::item_id(), and format the sync summary legibly with indoc.
+
+Errors and coverage:
+W17. Replace the transitional multiple/no-active-group errors with precise unknown group, ambiguous group name, no default, non-writable default, ambiguous item, unknown event group, incoming dirty-row conflict, and missing read-token errors.
+W18. Cover duplicate RowKeys across local and group associations, local-only editing, unique and ambiguous selectors, group-specific dirty state, registry UUID/name resolution, default set/clear, multi-group startup snapshots, token merging, listener routing, default-only publication, successful default echoes, atomic dirty-conflict rejection with unchanged state/token, and remaining-dirty reporting.
+W19. Preserve all existing checklist behaviour and keep workspace checks and pedantic Clippy clean.
 
 Deferrals:
-L08. Group creation and invitations remain in flotsync-git-d03.3.3. Qualified references, move/copy, all-group sync, and default repair after lifecycle changes remain in flotsync-git-d03.4.
+W20. Group creation and invitation mediation remain in flotsync-git-d03.3.3.
+W21. Canonical qualified item references, copy/move, all-group sequential synchronisation, scenario documentation, automatic default hand-off after group lifecycle changes, and removal of the temporary dirty-listener conflict remain in flotsync-git-d03.4.
 
-Estimate:
-L09. Approximately 1,150-1,700 LOC including focused tests."""
-status = "open"
+Estimate and execution:
+W22. The original cohesive child remains approximately 1,120-1,670 LOC. This agreed review pass should add roughly 50-90 lines and remove roughly 100-170 lines.
+W23. Keep this as one cohesive child as explicitly agreed; do not subdivide it further."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "Codex"
 blocked_by = ["019f8588-3cc9-7221-b0e9-b462f744d4e8"]
 blocks = ["019f8588-bbc6-7523-87d2-6d5e83939248"]
 parent = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
 created_at = "2026-07-21T16:35:44.799934Z"
-updated_at = "2026-07-21T16:36:02.733086Z"
+updated_at = "2026-07-23T06:26:07.237198Z"
+closed_at = "2026-07-23T06:26:07.237198Z"
+
+[[comments]]
+id = "019f8862-b7ec-7a01-b248-27fb6b556b80"
+author = "lkroll"
+body = "Plan agreed against commit 22a3e49. Keep this as one child: composite local/group item identity, all-readable-group startup, exact name/UUID registry resolution, session-only writable default, default-group publication with all-group listener draining, and focused multi-group coverage. Creation/invitations remain in .3.3; qualified transfer and all-group sync remain in .4."
+created_at = "2026-07-22T05:53:18.828481Z"
+
+[[comments]]
+id = "019f887c-1411-7ee1-8b8d-d96c820eadd5"
+author = "Codex"
+body = "Implementation complete against W01-W21. The checklist now uses one composite local/group workspace, loads all readable groups and snapshots, supports exact UUID/name group selection with a session-only writable default, routes listener events by full row identity, and publishes only the default group while retaining local/other-group dirtiness. Added focused coverage for duplicate UUID associations, selector ambiguity, default lifecycle rules, multi-group snapshot/token merging, listener validation, and default-only sync. Validation: all 40 flotsync_io_examples library tests pass; workspace all-target pedantic Clippy is clean; git diff --check is clean. Ready for review."
+created_at = "2026-07-22T06:21:00.817238Z"
+
+[[comments]]
+id = "019f88a0-7714-7670-973e-247c27664a63"
+author = "Codex"
+body = "Addressed review V01-V09: removed the retained store from ChecklistRepl; formatted sync output with indoc; added ChecklistRowChange::item_id(); removed application-level rebasing; made listener batches reject dirty-row conflicts atomically; and clear successful default-group plans before listener draining so local echoes remain valid. The temporary conflict error points users to restart and carries a TODO for flotsync-git-d03.4. All 40 flotsync_io_examples library tests pass, workspace all-target pedantic Clippy is clean, and staged plus unstaged diff checks pass."
+created_at = "2026-07-22T07:00:45.46082Z"
+
+[[comments]]
+id = "019f8da7-1d05-7e50-be27-85f404e55595"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-23T06:26:07.237198Z"

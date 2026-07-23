@@ -1,7 +1,11 @@
 use super::{
     CHECKLIST_SCHEMA,
     ChecklistCommand,
+    ChecklistGroupCommand,
+    ChecklistItemAssociation,
+    ChecklistItemId,
     ChecklistKeyCommand,
+    ChecklistSyncPlan,
     ChecklistWorkingSet,
     ChecklistWorkingSetError,
     EditCommand,
@@ -60,11 +64,12 @@ use flotsync_security::{
     generate_member_key_bundles,
 };
 use futures_util::{FutureExt, future::join_all};
+use itertools::Itertools;
 use kompact::prelude::block_on;
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     future::Future,
     io::{self, Write},
@@ -77,6 +82,7 @@ use std::{
     },
     time::SystemTime,
 };
+use uuid::Uuid;
 
 mod keys;
 mod repl;
@@ -177,14 +183,23 @@ pub enum ReplicatedChecklistError {
     },
     #[snafu(display("Checklist listener queue closed."))]
     ListenerQueueClosed,
+    #[snafu(display("No readable checklist group matches {selector:?}."))]
+    UnknownGroup { selector: String },
     #[snafu(display(
-        "Checklist currently supports at most one active group; the store contains {actual_count}. Multi-group workspace support lands in flotsync-git-d03.3."
+        "Checklist group name {name:?} is ambiguous; matching group UUIDs: {candidate_ids:?}."
     ))]
-    MultipleActiveGroups { actual_count: usize },
+    AmbiguousGroupName {
+        name: String,
+        candidate_ids: Vec<GroupId>,
+    },
+    #[snafu(display("Checklist group {group_id} is not writable and cannot become default."))]
+    NonWritableDefaultGroup { group_id: GroupId },
     #[snafu(display(
-        "No active checklist group is available. Key commands remain available; group creation lands in flotsync-git-d03.3."
+        "No default checklist group is selected. Use 'group default <name-or-uuid>' first."
     ))]
-    NoActiveGroup,
+    NoDefaultGroup,
+    #[snafu(display("Listener reported changes for unknown checklist group {group_id}."))]
+    UnknownListenerGroup { group_id: GroupId },
     #[snafu(display(
         "Unexpected confirmation response {response:?}; enter y/yes to continue or n/no to cancel."
     ))]

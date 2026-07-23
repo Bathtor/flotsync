@@ -22,6 +22,7 @@ chrono = { workspace = true }
 futures-util = { workspace = true }
 http = "1"
 httparse = "1"
+indoc = { workspace = true }
 itertools = { workspace = true }
 itoa = "1"
 kompact = { workspace = true }

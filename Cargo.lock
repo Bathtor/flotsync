@@ -1575,6 +1575,7 @@ dependencies = [
  "futures-util",
  "http",
  "httparse",
+ "indoc",
  "itertools 0.14.0",
  "itoa",
  "kompact",
