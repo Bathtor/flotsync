@@ -462,7 +462,144 @@ fn default_selection_rejects_read_only_groups() {
             group_id: actual
         }) if actual == group_id
     ));
+    assert!(matches!(
+        session.resolve_target_association("archived"),
+        Err(ReplicatedChecklistError::NonWritableTargetGroup {
+            group_id: actual
+        }) if actual == group_id
+    ));
     assert_eq!(session.default_group, None);
+}
+
+#[test]
+fn item_references_resolve_qualified_and_bare_workspace_identities() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let shared_group = GroupId(Uuid::from_u128(71_051));
+    let other_group = GroupId(Uuid::from_u128(71_052));
+    let missing_group = GroupId(Uuid::from_u128(71_057));
+    let unique_row = RowKey(Uuid::from_u128(72_051));
+    let repeated_row = RowKey(Uuid::from_u128(72_052));
+    let missing_row = RowKey(Uuid::from_u128(72_057));
+    let local_id = ChecklistItemId::local(repeated_row);
+    let shared_unique_id = ChecklistItemId::group(shared_group, unique_row);
+    let shared_repeated_id = ChecklistItemId::group(shared_group, repeated_row);
+    let other_repeated_id = ChecklistItemId::group(other_group, repeated_row);
+    let missing_group_id = ChecklistItemId::group(missing_group, missing_row);
+    let mut working_set = ChecklistWorkingSet::new();
+    working_set.add_item_with_id(local_id, "local");
+    working_set.add_item_with_id(shared_unique_id, "unique");
+    working_set.add_item_with_id(shared_repeated_id, "shared");
+    working_set.add_item_with_id(other_repeated_id, "other");
+    working_set.add_item_with_id(missing_group_id, "missing registry metadata");
+    let session = ChecklistSession::new(
+        [
+            named_test_group(shared_group, &member, "shared"),
+            named_test_group(other_group, &member, "other"),
+        ],
+        working_set,
+    );
+
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::RowKey(unique_row))
+            .expect("unique bare UUID should resolve"),
+        shared_unique_id
+    );
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::ListIndex(
+                NonZeroUsize::new(2).expect("two is non-zero"),
+            ))
+            .expect("list position should resolve"),
+        shared_unique_id
+    );
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::Qualified {
+                association: ItemAssociationSelector::Local,
+                row_key: repeated_row,
+            })
+            .expect("local reference should resolve"),
+        local_id
+    );
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::Qualified {
+                association: ItemAssociationSelector::Group("shared".to_owned()),
+                row_key: repeated_row,
+            })
+            .expect("unique group name should resolve"),
+        shared_repeated_id
+    );
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::Qualified {
+                association: ItemAssociationSelector::Group(other_group.to_string()),
+                row_key: repeated_row,
+            })
+            .expect("group UUID should resolve"),
+        other_repeated_id
+    );
+    assert_eq!(
+        session.item_reference(missing_group_id),
+        format!("{missing_group}/{missing_row}")
+    );
+    assert_eq!(
+        session
+            .resolve_item(&ItemSelector::Qualified {
+                association: ItemAssociationSelector::Group(missing_group.to_string()),
+                row_key: missing_row,
+            })
+            .expect("group UUID should resolve without registry metadata"),
+        missing_group_id
+    );
+    assert!(matches!(
+        session.resolve_item(&ItemSelector::RowKey(repeated_row)),
+        Err(ReplicatedChecklistError::AmbiguousItemReference {
+            row_key,
+            candidates,
+        }) if row_key == repeated_row
+            && candidates == vec![
+                format!("local/{repeated_row}"),
+                format!("shared/{repeated_row}"),
+                format!("other/{repeated_row}"),
+            ]
+    ));
+}
+
+#[test]
+fn canonical_item_references_fall_back_to_group_uuids_for_unsafe_names() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let whitespace_group = GroupId(Uuid::from_u128(71_053));
+    let reserved_group = GroupId(Uuid::from_u128(71_054));
+    let duplicate_first = GroupId(Uuid::from_u128(71_055));
+    let duplicate_second = GroupId(Uuid::from_u128(71_056));
+    let uuid_named_group = GroupId(Uuid::from_u128(71_058));
+    let uuid_shaped_name = Uuid::from_u128(71_059).to_string();
+    let row_key = RowKey(Uuid::from_u128(72_053));
+    let session = ChecklistSession::new(
+        [
+            named_test_group(whitespace_group, &member, "shared errands"),
+            named_test_group(reserved_group, &member, "local"),
+            named_test_group(duplicate_first, &member, "duplicate"),
+            named_test_group(duplicate_second, &member, "duplicate"),
+            named_test_group(uuid_named_group, &member, &uuid_shaped_name),
+        ],
+        ChecklistWorkingSet::new(),
+    );
+
+    for group_id in [
+        whitespace_group,
+        reserved_group,
+        duplicate_first,
+        duplicate_second,
+        uuid_named_group,
+    ] {
+        assert_eq!(
+            session.item_reference(ChecklistItemId::group(group_id, row_key)),
+            format!("{group_id}/{row_key}")
+        );
+    }
 }
 
 #[test]

@@ -155,6 +155,112 @@ impl ChecklistSession {
         }
     }
 
+    /// Return the canonical unambiguous REPL reference for one item identity.
+    pub fn item_reference(&self, item_id: ChecklistItemId) -> String {
+        let association = match item_id.association {
+            ChecklistItemAssociation::Local => "local".to_owned(),
+            ChecklistItemAssociation::Group(group_id) => {
+                let Some(group) = self.groups.get(&group_id) else {
+                    return format!("{group_id}/{}", item_id.row_key);
+                };
+                let Some(name) = &group.group_name else {
+                    return format!("{group_id}/{}", item_id.row_key);
+                };
+                let name_is_usable = name != "local"
+                    && !name.chars().any(char::is_whitespace)
+                    && Uuid::parse_str(name).is_err()
+                    && self
+                        .groups
+                        .values()
+                        .filter(|candidate| candidate.group_name.as_ref() == Some(name))
+                        .count()
+                        == 1;
+                if name_is_usable {
+                    name.clone()
+                } else {
+                    group_id.to_string()
+                }
+            }
+        };
+        format!("{association}/{}", item_id.row_key)
+    }
+
+    /// Resolve one list position, bare UUID, or qualified item reference.
+    pub fn resolve_item(
+        &self,
+        selector: &ItemSelector,
+    ) -> Result<ChecklistItemId, ReplicatedChecklistError> {
+        let item_id = match selector {
+            ItemSelector::ListIndex(position) => self
+                .working_set
+                .listed_items()
+                .get(position.get() - 1)
+                .map(|listed| listed.item_id),
+            ItemSelector::RowKey(row_key) => {
+                let candidates = self.working_set.item_ids_with_row_key(*row_key);
+                match candidates.as_slice() {
+                    [item_id] => Some(*item_id),
+                    [] => None,
+                    _ => {
+                        return Err(ReplicatedChecklistError::AmbiguousItemReference {
+                            row_key: *row_key,
+                            candidates: candidates
+                                .into_iter()
+                                .map(|item_id| self.item_reference(item_id))
+                                .collect(),
+                        });
+                    }
+                }
+            }
+            ItemSelector::Qualified {
+                association,
+                row_key,
+            } => {
+                let association = match association {
+                    ItemAssociationSelector::Local => ChecklistItemAssociation::Local,
+                    ItemAssociationSelector::Group(group) => {
+                        let group_id = if let Ok(uuid) = Uuid::parse_str(group) {
+                            GroupId(uuid)
+                        } else {
+                            let group = self.resolve_group(group)?;
+                            group.group_id
+                        };
+                        ChecklistItemAssociation::Group(group_id)
+                    }
+                };
+                Some(ChecklistItemId {
+                    association,
+                    row_key: *row_key,
+                })
+            }
+        };
+        let Some(item_id) = item_id else {
+            return Err(ReplicatedChecklistError::UnknownItemReference {
+                selector: selector.clone(),
+            });
+        };
+        if self.working_set.item(item_id).is_none() {
+            return Err(ReplicatedChecklistError::UnknownItemReference {
+                selector: selector.clone(),
+            });
+        }
+        Ok(item_id)
+    }
+
+    /// Resolve one writable real-group target association.
+    pub fn resolve_target_association(
+        &self,
+        selector: &str,
+    ) -> Result<ChecklistItemAssociation, ReplicatedChecklistError> {
+        let group = self.resolve_group(selector)?;
+        if !group.lifecycle.is_writable() {
+            return Err(ReplicatedChecklistError::NonWritableTargetGroup {
+                group_id: group.group_id,
+            });
+        }
+        Ok(ChecklistItemAssociation::Group(group.group_id))
+    }
+
     /// Ensure a listener batch refers only to groups present in this registry.
     pub fn validate_listener_changes(
         &self,

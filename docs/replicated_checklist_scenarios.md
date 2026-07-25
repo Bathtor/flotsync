@@ -119,9 +119,12 @@ registry commands remain available. `add` without a default creates a
 process-local item. Such items are deliberately skipped by `sync` and disappear
 when the process exits.
 
-The examples below use `ROW` when an item should be addressed by row UUID. Get it from `list`; the
-row UUID is printed in parentheses at the end of each row. Using row UUIDs avoids accidental index
-selection when earlier scenarios left extra rows visible.
+The examples below use `ROW` when an item can be addressed by a globally unique
+row UUID. `list` prints a canonical qualified reference in parentheses at the
+end of each row. A bare UUID remains convenient while it is unique; use the
+qualified reference once the same UUID exists in several associations. Either
+form avoids accidental position selection when earlier scenarios left extra
+rows visible.
 
 ## Multi-group Defaults and Synchronisation
 
@@ -156,6 +159,48 @@ If a selected group becomes read-only or closed after an accepted membership
 change, the next registry refresh follows its successor chain. The first open
 successor becomes the new default; if no open successor is available, the
 default is cleared and the REPL reports why.
+
+## Qualified References and Item Transfer
+
+Every item keeps its row UUID when copied or moved. Because the same UUID may
+therefore appear in several groups, `list`, `show`, and `events` expose a
+canonical qualified reference:
+
+- process-local items use `local/ROW_UUID`;
+- a uniquely named group without whitespace uses `GROUP_NAME/ROW_UUID`;
+- ambiguous names, the reserved name `local`, and names containing whitespace
+  fall back to `GROUP_UUID/ROW_UUID`.
+
+Commands still accept a one-based list position or a bare UUID when that UUID
+is unique. An ambiguous bare UUID is rejected and the error lists its canonical
+qualified candidates. Qualified source references split at the final `/`, so a
+group name may itself contain `/` as long as it contains no whitespace.
+
+Editing uses item-first syntax. Replace `SOURCE` below with a list position,
+bare UUID, or canonical qualified reference. Target group names are the
+remaining words and may contain spaces:
+
+```text
+edit SOURCE note
+edit SOURCE copy work
+edit SOURCE move shared checklist
+```
+
+`copy` stages a complete target row under the same UUID and leaves the source
+unchanged. `move` stages the same target row and immediately removes the source
+from the visible working set. A previously replicated source becomes an
+ordinary tombstone; a process-local or never-published source simply
+disappears.
+
+Both target upserts and source tombstones are published by the next ordinary
+all-group `sync` in group UUID order. This example intentionally does not make
+move target-first or atomic: a source tombstone can publish before a target
+upsert that later fails. During the same process the complete target remains
+dirty and another `sync` retries it. Replication history retains tombstoned row
+data, but this slice does not automate recovery after restarting the checklist.
+
+An existing target with identical contents is an idempotent success. A target
+with different contents is rejected and never overwritten.
 
 ## Scenario 1: Concurrent Adds
 

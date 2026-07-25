@@ -150,7 +150,7 @@ pub enum ChecklistCommand {
     },
     /// Replace an item's text.
     Rename {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
         /// Replacement item text.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -158,6 +158,8 @@ pub enum ChecklistCommand {
     },
     /// Edit longer item fields.
     Edit {
+        /// Item list position, UUID, or qualified item reference.
+        item: ItemSelector,
         #[command(subcommand)]
         command: EditCommand,
     },
@@ -168,31 +170,31 @@ pub enum ChecklistCommand {
     },
     /// Mark an item as in progress.
     Claim {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
     },
     /// Mark an item as done.
     Complete {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
     },
     /// Set an item's priority.
     Priority {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
         /// Priority value to store on the item.
         priority: u8,
     },
     /// Delete an item.
     Delete {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
     },
     /// Print visible checklist items.
     List,
     /// Print all fields for one item.
     Show {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
     },
     /// Print queued replication events.
@@ -272,7 +274,7 @@ pub enum ChecklistGroupCommand {
         /// Positive invitation position from `group invitations`.
         invitation: NonZeroUsize,
     },
-    /// Select the writable group used by add, members, check, and sync.
+    /// Select the writable group used by add, members, and check.
     Default {
         /// Exact group UUID or name. Remaining words form one name.
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
@@ -296,9 +298,18 @@ impl ChecklistCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum EditCommand {
     /// Replace an item's note text.
-    Note {
-        /// Item list index or row UUID.
-        item: ItemSelector,
+    Note,
+    /// Copy an item into another group while preserving its row UUID.
+    Copy {
+        /// Exact target group UUID or name. Remaining words form one name.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        group: Vec<String>,
+    },
+    /// Move an item into another group while preserving its row UUID.
+    Move {
+        /// Exact target group UUID or name. Remaining words form one name.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        group: Vec<String>,
     },
 }
 
@@ -306,24 +317,42 @@ pub enum EditCommand {
 pub enum TagCommand {
     /// Add one tag to an item.
     Add {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
         /// Tag text to add.
         tag: String,
     },
     /// Remove one tag from an item.
     Rm {
-        /// Item list index or row UUID.
+        /// Item list position, UUID, or qualified reference.
         item: ItemSelector,
         /// Tag text to remove.
         tag: String,
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ItemSelector {
+    /// Transient one-based position from the current checklist display.
     ListIndex(NonZeroUsize),
+    /// Bare row UUID, accepted only when it is unique across associations.
     RowKey(RowKey),
+    /// Association-qualified row UUID.
+    Qualified {
+        /// Process-local marker or real-group selector.
+        association: ItemAssociationSelector,
+        /// Row UUID within the selected association.
+        row_key: RowKey,
+    },
+}
+
+/// Association portion of one qualified checklist item reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ItemAssociationSelector {
+    /// The process-local working-set association.
+    Local,
+    /// Exact real-group UUID or unique display name.
+    Group(String),
 }
 
 impl FromStr for ItemSelector {
@@ -338,7 +367,9 @@ impl FromStr for ItemSelector {
 pub enum ChecklistCommandParseError {
     #[snafu(display("{message}"))]
     Command { message: String },
-    #[snafu(display("Item reference '{value}' is not a positive list index or full item UUID."))]
+    #[snafu(display(
+        "Item reference '{value}' is not a positive list position, full item UUID, or qualified association/item UUID."
+    ))]
     InvalidItemReference { value: String },
 }
 
@@ -376,6 +407,28 @@ pub fn parse_item_selector(value: &str) -> Result<ItemSelector, ChecklistCommand
             });
         };
         return Ok(ItemSelector::ListIndex(index));
+    }
+
+    if let Some((association, row_key)) = value.rsplit_once('/') {
+        let Ok(row_key) = Uuid::parse_str(row_key) else {
+            return Err(ChecklistCommandParseError::InvalidItemReference {
+                value: value.to_owned(),
+            });
+        };
+        if association.is_empty() {
+            return Err(ChecklistCommandParseError::InvalidItemReference {
+                value: value.to_owned(),
+            });
+        }
+        let association = if association == "local" {
+            ItemAssociationSelector::Local
+        } else {
+            ItemAssociationSelector::Group(association.to_owned())
+        };
+        return Ok(ItemSelector::Qualified {
+            association,
+            row_key: RowKey(row_key),
+        });
     }
 
     let Ok(row_key) = Uuid::parse_str(value) else {
@@ -606,15 +659,19 @@ pub struct ListedChecklistItem<'a> {
 /// Errors raised while decoding rows or mutating the checklist working set.
 #[derive(Debug, Snafu)]
 pub enum ChecklistWorkingSetError {
-    #[snafu(display("Checklist item reference {selector:?} does not resolve to a visible row."))]
-    UnknownItem { selector: ItemSelector },
+    #[snafu(display("Checklist item {item_id:?} is not visible in the working set."))]
+    UnknownItem { item_id: ChecklistItemId },
     #[snafu(display(
-        "Checklist item UUID {row_key} is ambiguous across associations {candidates:?}."
+        "Checklist item {source_id:?} is already associated with target {target_association:?}."
     ))]
-    AmbiguousItem {
-        row_key: RowKey,
-        candidates: Vec<ChecklistItemId>,
+    SameTransferAssociation {
+        source_id: ChecklistItemId,
+        target_association: ChecklistItemAssociation,
     },
+    #[snafu(display(
+        "Checklist transfer target {target_id:?} already exists with different contents."
+    ))]
+    TransferTargetCollision { target_id: ChecklistItemId },
     #[snafu(display("Replicated row {row} does not belong to checklist dataset {dataset}."))]
     UnexpectedRowDataset { row: RowId, dataset: DatasetId },
     #[snafu(display("Failed to decode field {field} from checklist row {row_key}: {source}"))]
@@ -682,13 +739,25 @@ impl ChecklistWorkingSet {
     /// # Errors
     ///
     /// See `ChecklistWorkingSetError` for failure conditions.
-    pub fn selected_item(
+    pub fn require_listed_item(
         &self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
     ) -> Result<ListedChecklistItem<'_>, ChecklistWorkingSetError> {
-        let item_id = self.resolve_selector(selector)?;
         self.listed_item(item_id)
-            .ok_or(ChecklistWorkingSetError::UnknownItem { selector })
+            .ok_or(ChecklistWorkingSetError::UnknownItem { item_id })
+    }
+
+    /// Return every visible identity with one row UUID in stable association order.
+    #[must_use]
+    pub fn item_ids_with_row_key(&self, row_key: RowKey) -> Vec<ChecklistItemId> {
+        let mut item_ids = self
+            .rows
+            .keys()
+            .filter(|item_id| item_id.row_key == row_key)
+            .copied()
+            .collect::<Vec<_>>();
+        item_ids.sort();
+        item_ids
     }
 
     /// Return one visible item by its already-resolved workspace identity.
@@ -799,11 +868,11 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn rename_item(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         text: impl Into<String>,
     ) -> Result<(), ChecklistWorkingSetError> {
         let text = text.into();
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.text == text {
                 return false;
             }
@@ -818,11 +887,11 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn edit_note(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         note: impl Into<String>,
     ) -> Result<(), ChecklistWorkingSetError> {
         let note = note.into();
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.note == note {
                 return false;
             }
@@ -837,11 +906,11 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn add_tag(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         tag: impl Into<String>,
     ) -> Result<(), ChecklistWorkingSetError> {
         let tag = tag.into();
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.tags.insert(tag) {
                 item.increment_edit_count();
                 return true;
@@ -855,10 +924,10 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn remove_tag(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         tag: &str,
     ) -> Result<(), ChecklistWorkingSetError> {
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.tags.remove(tag) {
                 item.increment_edit_count();
                 return true;
@@ -870,8 +939,8 @@ impl ChecklistWorkingSet {
     /// # Errors
     ///
     /// See `ChecklistWorkingSetError` for failure conditions.
-    pub fn claim_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
-        self.advance_status(selector, ChecklistStatus::InProgress)
+    pub fn claim_item(&mut self, item_id: ChecklistItemId) -> Result<(), ChecklistWorkingSetError> {
+        self.advance_status(item_id, ChecklistStatus::InProgress)
     }
 
     /// # Errors
@@ -879,9 +948,9 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn complete_item(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
     ) -> Result<(), ChecklistWorkingSetError> {
-        self.advance_status(selector, ChecklistStatus::Done)
+        self.advance_status(item_id, ChecklistStatus::Done)
     }
 
     /// # Errors
@@ -889,10 +958,10 @@ impl ChecklistWorkingSet {
     /// See `ChecklistWorkingSetError` for failure conditions.
     pub fn set_priority(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         priority: u8,
     ) -> Result<(), ChecklistWorkingSetError> {
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.priority == priority {
                 return false;
             }
@@ -905,9 +974,13 @@ impl ChecklistWorkingSet {
     /// # Errors
     ///
     /// See `ChecklistWorkingSetError` for failure conditions.
-    pub fn delete_item(&mut self, selector: ItemSelector) -> Result<(), ChecklistWorkingSetError> {
-        let item_id = self.resolve_selector(selector)?;
-        self.rows.remove(&item_id);
+    pub fn delete_item(
+        &mut self,
+        item_id: ChecklistItemId,
+    ) -> Result<(), ChecklistWorkingSetError> {
+        let Some(_item) = self.rows.remove(&item_id) else {
+            return Err(ChecklistWorkingSetError::UnknownItem { item_id });
+        };
         self.display_order.retain(|candidate| *candidate != item_id);
         match self.dirty_rows.remove(&item_id) {
             Some(DirtyRowKind::Insert) => {}
@@ -916,6 +989,66 @@ impl ChecklistWorkingSet {
             }
         }
         Ok(())
+    }
+
+    /// Stage a complete UUID-preserving copy in another association.
+    ///
+    /// An identical existing target is treated as an idempotent success. A
+    /// divergent target is never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is absent, the target association is
+    /// unchanged, or the target identity already has different contents.
+    pub fn copy_item(
+        &mut self,
+        source_id: ChecklistItemId,
+        target_association: ChecklistItemAssociation,
+    ) -> Result<ChecklistItemId, ChecklistWorkingSetError> {
+        if source_id.association == target_association {
+            return Err(ChecklistWorkingSetError::SameTransferAssociation {
+                source_id,
+                target_association,
+            });
+        }
+        let source = self
+            .rows
+            .get(&source_id)
+            .cloned()
+            .ok_or(ChecklistWorkingSetError::UnknownItem { item_id: source_id })?;
+        let target_id = ChecklistItemId {
+            association: target_association,
+            row_key: source_id.row_key,
+        };
+        match self.rows.get(&target_id) {
+            Some(target) if *target == source => Ok(target_id),
+            Some(_) => Err(ChecklistWorkingSetError::TransferTargetCollision { target_id }),
+            None => {
+                self.rows.insert(target_id, source);
+                push_display_item(&mut self.display_order, target_id);
+                self.dirty_rows.insert(target_id, DirtyRowKind::Insert);
+                Ok(target_id)
+            }
+        }
+    }
+
+    /// Stage a complete UUID-preserving target copy and remove the source locally.
+    ///
+    /// Existing replicated sources become tombstones through the ordinary dirty
+    /// row path. Process-local and never-published sources simply disappear.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::copy_item`], or an error if
+    /// the source unexpectedly disappears before its local removal.
+    pub fn move_item(
+        &mut self,
+        source_id: ChecklistItemId,
+        target_association: ChecklistItemAssociation,
+    ) -> Result<ChecklistItemId, ChecklistWorkingSetError> {
+        let target_id = self.copy_item(source_id, target_association)?;
+        self.delete_item(source_id)?;
+        Ok(target_id)
     }
 
     /// # Errors
@@ -1055,10 +1188,10 @@ impl ChecklistWorkingSet {
 
     fn advance_status(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         target: ChecklistStatus,
     ) -> Result<(), ChecklistWorkingSetError> {
-        self.modify_item(selector, |item| {
+        self.modify_item(item_id, |item| {
             if item.status.rank() >= target.rank() {
                 return false;
             }
@@ -1070,19 +1203,16 @@ impl ChecklistWorkingSet {
 
     fn modify_item(
         &mut self,
-        selector: ItemSelector,
+        item_id: ChecklistItemId,
         update: impl FnOnce(&mut ChecklistItem) -> bool,
     ) -> Result<(), ChecklistWorkingSetError> {
-        let item_id = self.resolve_selector(selector)?;
-        let original = self
-            .rows
-            .get(&item_id)
-            .expect("resolved selector must point to a visible row")
-            .clone();
+        let Some(original) = self.rows.get(&item_id).cloned() else {
+            return Err(ChecklistWorkingSetError::UnknownItem { item_id });
+        };
         let item = self
             .rows
             .get_mut(&item_id)
-            .expect("resolved selector must point to a visible row");
+            .expect("item checked above must remain visible");
         if update(item) {
             self.mark_dirty(item_id, original);
         }
@@ -1093,36 +1223,6 @@ impl ChecklistWorkingSet {
         self.dirty_rows
             .entry(item_id)
             .or_insert(DirtyRowKind::Update { original });
-    }
-
-    fn resolve_selector(
-        &self,
-        selector: ItemSelector,
-    ) -> Result<ChecklistItemId, ChecklistWorkingSetError> {
-        match selector {
-            ItemSelector::RowKey(row_key) => {
-                let mut candidates = self
-                    .rows
-                    .keys()
-                    .filter(|item_id| item_id.row_key == row_key)
-                    .copied()
-                    .collect::<Vec<_>>();
-                candidates.sort();
-                match candidates.as_slice() {
-                    [item_id] => Ok(*item_id),
-                    [] => Err(ChecklistWorkingSetError::UnknownItem { selector }),
-                    _ => Err(ChecklistWorkingSetError::AmbiguousItem {
-                        row_key,
-                        candidates,
-                    }),
-                }
-            }
-            ItemSelector::ListIndex(index) => self
-                .listed_items()
-                .get(index.get() - 1)
-                .map(|listed| listed.item_id)
-                .ok_or(ChecklistWorkingSetError::UnknownItem { selector }),
-        }
     }
 
     fn checklist_change_from_row_change(
@@ -1346,24 +1446,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_qualified_item_references_and_item_first_edits() {
+        let row_key = Uuid::from_u128(43);
+        let local_reference = format!("local/{row_key}");
+        let named_reference = format!("shared/errands/{row_key}");
+
+        assert_eq!(
+            parse_item_selector(&local_reference).expect("local reference should parse"),
+            ItemSelector::Qualified {
+                association: ItemAssociationSelector::Local,
+                row_key: RowKey(row_key),
+            }
+        );
+        assert_eq!(
+            parse_item_selector(&named_reference).expect("final slash should delimit the UUID"),
+            ItemSelector::Qualified {
+                association: ItemAssociationSelector::Group("shared/errands".to_owned()),
+                row_key: RowKey(row_key),
+            }
+        );
+        assert_eq!(
+            parse_checklist_command(&format!("edit shared/{row_key} copy family errands"))
+                .expect("copy command should parse"),
+            Some(ChecklistCommand::Edit {
+                item: ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Group("shared".to_owned()),
+                    row_key: RowKey(row_key),
+                },
+                command: EditCommand::Copy {
+                    group: words(["family", "errands"]),
+                },
+            })
+        );
+        assert_eq!(
+            parse_checklist_command(&format!("edit local/{row_key} move shared"))
+                .expect("move command should parse"),
+            Some(ChecklistCommand::Edit {
+                item: ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Local,
+                    row_key: RowKey(row_key),
+                },
+                command: EditCommand::Move {
+                    group: words(["shared"]),
+                },
+            })
+        );
+    }
+
+    #[test]
     fn parses_status_tag_priority_and_observation_commands() {
         let first = ItemSelector::ListIndex(NonZeroUsize::new(1).unwrap());
 
         assert_eq!(
-            parse_checklist_command("").expect("empty line should parse"),
-            None
-        );
-        assert_eq!(
-            parse_checklist_command("edit note 1").expect("command should parse"),
+            parse_checklist_command("edit 1 note").expect("command should parse"),
             Some(ChecklistCommand::Edit {
-                command: EditCommand::Note { item: first },
+                item: first.clone(),
+                command: EditCommand::Note,
             })
         );
         assert_eq!(
             parse_checklist_command("tag add 1 sillytag").expect("command should parse"),
             Some(ChecklistCommand::Tag {
                 command: TagCommand::Add {
-                    item: first,
+                    item: first.clone(),
                     tag: "sillytag".to_owned(),
                 },
             })
@@ -1372,7 +1517,7 @@ mod tests {
             parse_checklist_command("tag rm 1 sillytag").expect("command should parse"),
             Some(ChecklistCommand::Tag {
                 command: TagCommand::Rm {
-                    item: first,
+                    item: first.clone(),
                     tag: "sillytag".to_owned(),
                 },
             })
@@ -1380,19 +1525,29 @@ mod tests {
         let claim = parse_checklist_command("claim 1")
             .expect("command should parse")
             .expect("line is not empty");
-        assert_eq!(claim, ChecklistCommand::Claim { item: first });
+        assert_eq!(
+            claim,
+            ChecklistCommand::Claim {
+                item: first.clone()
+            }
+        );
         assert_eq!(claim.status_target(), Some(ChecklistStatus::InProgress));
 
         let complete = parse_checklist_command("complete 1")
             .expect("command should parse")
             .expect("line is not empty");
-        assert_eq!(complete, ChecklistCommand::Complete { item: first });
+        assert_eq!(
+            complete,
+            ChecklistCommand::Complete {
+                item: first.clone()
+            }
+        );
         assert_eq!(complete.status_target(), Some(ChecklistStatus::Done));
 
         assert_eq!(
             parse_checklist_command("priority 1 255").expect("command should parse"),
             Some(ChecklistCommand::Priority {
-                item: first,
+                item: first.clone(),
                 priority: 255,
             })
         );
@@ -1410,7 +1565,9 @@ mod tests {
         );
         assert_eq!(
             parse_checklist_command("show 1").expect("command should parse"),
-            Some(ChecklistCommand::Show { item: first })
+            Some(ChecklistCommand::Show {
+                item: first.clone()
+            })
         );
         assert_eq!(
             parse_checklist_command("delete 1").expect("command should parse"),
@@ -1439,6 +1596,14 @@ mod tests {
         assert_eq!(
             parse_checklist_command("exit").expect("command should parse"),
             Some(ChecklistCommand::Quit)
+        );
+    }
+
+    #[test]
+    fn empty_repl_line_has_no_command() {
+        assert_eq!(
+            parse_checklist_command("").expect("empty line should parse"),
+            None
         );
     }
 
@@ -1549,11 +1714,8 @@ mod tests {
             Err(ChecklistCommandParseError::InvalidItemReference { value })
                 if value == "not-a-uuid"
         ));
-        assert_command_error_contains("claim 0", "positive list index or full item UUID");
-        assert_command_error_contains(
-            "complete not-a-uuid",
-            "positive list index or full item UUID",
-        );
+        assert_command_error_contains("claim 0", "positive list position");
+        assert_command_error_contains("complete not-a-uuid", "positive list position");
         assert_command_error_contains("priority 1 256", "invalid value");
         assert_command_error_contains("events no", "invalid digit");
     }
@@ -1637,14 +1799,12 @@ mod tests {
 
         checklist.add_item_with_id(item_id, "buy milk");
         checklist
-            .rename_item(ItemSelector::RowKey(row_key), "buy oat milk")
+            .rename_item(item_id, "buy oat milk")
             .expect("rename should apply");
         checklist
-            .add_tag(ItemSelector::RowKey(row_key), "errand")
+            .add_tag(item_id, "errand")
             .expect("tag should apply");
-        checklist
-            .claim_item(ItemSelector::RowKey(row_key))
-            .expect("claim should apply");
+        checklist.claim_item(item_id).expect("claim should apply");
 
         assert_eq!(checklist.dirty_row_count(), 1);
         assert_eq!(checklist.queued_event_count(), 0);
@@ -1708,13 +1868,13 @@ mod tests {
 
         checklist.add_item_with_id(item_id, "tagged");
         checklist
-            .add_tag(ItemSelector::RowKey(row_key), "zeta")
+            .add_tag(item_id, "zeta")
             .expect("tag should apply");
         checklist
-            .add_tag(ItemSelector::RowKey(row_key), "alpha")
+            .add_tag(item_id, "alpha")
             .expect("tag should apply");
         checklist
-            .add_tag(ItemSelector::RowKey(row_key), "zeta")
+            .add_tag(item_id, "zeta")
             .expect("duplicate tag should be a no-op");
 
         let item = checklist.item(item_id).expect("row should exist");
@@ -1740,7 +1900,7 @@ mod tests {
         checklist.drain_queued_events();
 
         checklist
-            .set_priority(ItemSelector::RowKey(row_key), 7)
+            .set_priority(item_id, 7)
             .expect("priority edit should apply");
 
         let plan = checklist
@@ -1800,7 +1960,7 @@ mod tests {
             .expect("initial listener change should enqueue");
         checklist.drain_queued_events();
         checklist
-            .rename_item(ItemSelector::RowKey(row_key), "local")
+            .rename_item(item_id, "local")
             .expect("local rename should apply");
 
         let plan = checklist
@@ -1883,9 +2043,7 @@ mod tests {
         let mut checklist = test_working_set();
 
         checklist.add_item_with_id(item_id, "transient");
-        checklist
-            .delete_item(ItemSelector::RowKey(row_key))
-            .expect("delete should apply");
+        checklist.delete_item(item_id).expect("delete should apply");
 
         assert!(checklist.item(item_id).is_none());
         assert_eq!(checklist.dirty_row_count(), 0);
@@ -1910,9 +2068,7 @@ mod tests {
             }])
             .expect("initial listener change should enqueue");
         checklist.drain_queued_events();
-        checklist
-            .delete_item(ItemSelector::RowKey(row_key))
-            .expect("delete should apply");
+        checklist.delete_item(item_id).expect("delete should apply");
 
         let plan = checklist
             .prepare_group_sync(test_group_id())
@@ -1930,6 +2086,164 @@ mod tests {
     }
 
     #[test]
+    fn copy_preserves_uuid_and_complete_contents_without_overwriting_collisions() {
+        let source_group = test_group_id();
+        let target_group = GroupId(Uuid::from_u128(21));
+        let row_key = RowKey(Uuid::from_u128(22));
+        let source_id = ChecklistItemId::group(source_group, row_key);
+        let target_id = ChecklistItemId::group(target_group, row_key);
+        let mut source = test_item("source", 4);
+        source.note = "complete note".to_owned();
+        source.tags.insert("copied".to_owned());
+        source.priority = 9;
+        let mut checklist = test_working_set();
+        checklist
+            .enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+                item_id: source_id,
+                item: source.clone(),
+            }])
+            .expect("source listener change should enqueue");
+        checklist.drain_queued_events();
+
+        assert_eq!(
+            checklist
+                .copy_item(source_id, ChecklistItemAssociation::Group(target_group))
+                .expect("copy should stage"),
+            target_id
+        );
+        assert_eq!(checklist.item(target_id), Some(&source));
+        assert_eq!(
+            checklist
+                .copy_item(source_id, ChecklistItemAssociation::Group(target_group))
+                .expect("identical retry should be idempotent"),
+            target_id
+        );
+        let plan = checklist
+            .prepare_group_sync(target_group)
+            .expect("target plan should build")
+            .expect("target should be dirty");
+        assert_eq!(plan.mutations.len(), 1);
+        let RowMutation::Upsert { row_id, row } = &plan.mutations[0] else {
+            panic!("copy should produce one target upsert");
+        };
+        assert_eq!(row_id.row_key, row_key);
+        assert_eq!(row.fields.len(), CHECKLIST_SCHEMA.columns.len());
+
+        let divergent_group = GroupId(Uuid::from_u128(23));
+        let divergent_id = ChecklistItemId::group(divergent_group, row_key);
+        checklist.add_item_with_id(divergent_id, "different");
+        assert!(matches!(
+            checklist.copy_item(source_id, ChecklistItemAssociation::Group(divergent_group)),
+            Err(ChecklistWorkingSetError::TransferTargetCollision { target_id })
+                if target_id == divergent_id
+        ));
+        assert!(matches!(
+            checklist.copy_item(source_id, ChecklistItemAssociation::Group(source_group)),
+            Err(ChecklistWorkingSetError::SameTransferAssociation {
+                source_id: actual_source,
+                target_association: ChecklistItemAssociation::Group(actual_group),
+            }) if actual_source == source_id && actual_group == source_group
+        ));
+    }
+
+    #[test]
+    fn move_stages_target_upsert_and_existing_source_tombstone_in_one_pass() {
+        let source_group = test_group_id();
+        let target_group = GroupId(Uuid::from_u128(24));
+        let row_key = RowKey(Uuid::from_u128(25));
+        let source_id = ChecklistItemId::group(source_group, row_key);
+        let target_id = ChecklistItemId::group(target_group, row_key);
+        let mut checklist = test_working_set();
+        checklist
+            .enqueue_checklist_changes(vec![ChecklistRowChange::Upsert {
+                item_id: source_id,
+                item: test_item("base", 1),
+            }])
+            .expect("source listener change should enqueue");
+        checklist.drain_queued_events();
+        checklist
+            .rename_item(source_id, "latest source")
+            .expect("dirty source edit should apply");
+
+        assert_eq!(
+            checklist
+                .move_item(source_id, ChecklistItemAssociation::Group(target_group))
+                .expect("move should stage"),
+            target_id
+        );
+        assert!(checklist.item(source_id).is_none());
+        assert_eq!(
+            checklist
+                .item(target_id)
+                .expect("target should remain visible")
+                .text,
+            "latest source"
+        );
+        let source_plan = checklist
+            .prepare_group_sync(source_group)
+            .expect("source plan should build")
+            .expect("existing source should stage a tombstone");
+        assert!(matches!(
+            source_plan.mutations.as_slice(),
+            [RowMutation::Delete { row_id }] if row_id.row_key == row_key
+        ));
+        let target_plan = checklist
+            .prepare_group_sync(target_group)
+            .expect("target plan should build")
+            .expect("target should stage an upsert");
+        assert!(matches!(
+            target_plan.mutations.as_slice(),
+            [RowMutation::Upsert { row_id, .. }] if row_id.row_key == row_key
+        ));
+    }
+
+    #[test]
+    fn move_removes_never_published_and_local_sources_without_tombstones() {
+        let source_group = test_group_id();
+        let target_group = GroupId(Uuid::from_u128(26));
+        let local_target_group = GroupId(Uuid::from_u128(27));
+        let final_group = GroupId(Uuid::from_u128(30));
+        let group_row = RowKey(Uuid::from_u128(28));
+        let local_row = RowKey(Uuid::from_u128(29));
+        let group_source = ChecklistItemId::group(source_group, group_row);
+        let local_source = ChecklistItemId::local(local_row);
+        let mut checklist = test_working_set();
+        checklist.add_item_with_id(group_source, "new group item");
+        checklist.add_item_with_id(local_source, "local item");
+
+        let intermediate_id = checklist
+            .move_item(group_source, ChecklistItemAssociation::Group(target_group))
+            .expect("new group source should move");
+        checklist
+            .move_item(
+                intermediate_id,
+                ChecklistItemAssociation::Group(final_group),
+            )
+            .expect("never-published target should support a chained move");
+        checklist
+            .move_item(
+                local_source,
+                ChecklistItemAssociation::Group(local_target_group),
+            )
+            .expect("local source should move");
+
+        assert!(
+            checklist
+                .prepare_group_sync(source_group)
+                .expect("source plan should build")
+                .is_none()
+        );
+        assert_eq!(checklist.dirty_local_item_count(), 0);
+        assert_eq!(
+            checklist.dirty_group_ids(),
+            HashSet::from([final_group, local_target_group])
+        );
+        assert!(checklist.item(group_source).is_none());
+        assert!(checklist.item(intermediate_id).is_none());
+        assert!(checklist.item(local_source).is_none());
+    }
+
+    #[test]
     fn composite_item_identity_keeps_duplicate_row_uuids_separately_addressable() {
         let row_key = RowKey(Uuid::from_u128(80));
         let first_group = test_group_id();
@@ -1943,24 +2257,13 @@ mod tests {
         checklist.add_item_with_id(first_group_id, "first group");
         checklist.add_item_with_id(second_group_id, "second group");
 
-        let error = checklist
-            .selected_item(ItemSelector::RowKey(row_key))
-            .expect_err("bare duplicate UUID should be ambiguous");
-        let ChecklistWorkingSetError::AmbiguousItem {
-            row_key: actual,
-            candidates,
-        } = error
-        else {
-            panic!("duplicate UUID should report ambiguity");
-        };
-        assert_eq!(actual, row_key);
-        assert_eq!(candidates.len(), 3);
+        assert_eq!(
+            checklist.item_ids_with_row_key(row_key),
+            vec![local_id, first_group_id, second_group_id]
+        );
 
         checklist
-            .rename_item(
-                ItemSelector::ListIndex(NonZeroUsize::new(2).unwrap()),
-                "updated first group",
-            )
+            .rename_item(first_group_id, "updated first group")
             .expect("global list index should resolve exactly");
         assert_eq!(
             checklist
@@ -2028,7 +2331,7 @@ mod tests {
             .expect("initial listener change should enqueue");
         checklist.drain_queued_events();
         checklist
-            .rename_item(ItemSelector::RowKey(dirty_id.row_key), "local title")
+            .rename_item(dirty_id, "local title")
             .expect("other-group edit should apply");
         checklist.add_item_with_id(synced_id, "publish me");
 

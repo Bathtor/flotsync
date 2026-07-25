@@ -8,6 +8,7 @@ use super::{
     ChecklistWorkingSet,
     ChecklistWorkingSetError,
     EditCommand,
+    ItemAssociationSelector,
     ItemSelector,
     ListedChecklistItem,
     TagCommand,
@@ -207,6 +208,18 @@ pub enum ReplicatedChecklistError {
     },
     #[snafu(display("Checklist group {group_id} is not writable and cannot become default."))]
     NonWritableDefaultGroup { group_id: GroupId },
+    #[snafu(display("Checklist group {group_id} is not writable and cannot receive items."))]
+    NonWritableTargetGroup { group_id: GroupId },
+    #[snafu(display("Checklist item reference {selector:?} does not resolve to a visible row."))]
+    UnknownItemReference { selector: ItemSelector },
+    #[snafu(display(
+        "Checklist item UUID {row_key} is ambiguous; use one of: {}.",
+        candidates.join(", ")
+    ))]
+    AmbiguousItemReference {
+        row_key: flotsync_replication::RowKey,
+        candidates: Vec<String>,
+    },
     #[snafu(display(
         "No default checklist group is selected. Use 'group default <name-or-uuid>' first."
     ))]

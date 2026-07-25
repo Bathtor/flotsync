@@ -4,59 +4,89 @@ title = "Add qualified checklist item transfer"
 body = """
 Objective
 
-T51. Add canonical qualified item references and UUID-preserving copy and move commands to the heterogeneous checklist workspace, with target-before-source safety and explicit retry behaviour.
+T51. Add canonical qualified item references plus UUID-preserving copy and move commands to the heterogeneous checklist workspace, using ordinary same-pass checklist mutations and accepting the example application's limited partial-publication recovery.
 
 Dependency and current state
 
-T52. This child follows flotsync-git-d03.4, which supplies deterministic all-group publication, composite-token advancement, partial-failure reports, and safe listener-drain gating. Transfer extends that synchroniser with ordered move phases rather than reimplementing publication.
+T52. This child follows flotsync-git-d03.4, which supplies deterministic all-group publication, composite-token advancement, partial-failure reports, and safe listener-drain gating. Transfer reuses that synchroniser unchanged rather than adding publication phases.
 T53. ChecklistItemId already scopes a RowKey by Local or Group association, the working set already detects ambiguous bare UUIDs, and complete ChecklistItem values can already produce full-row insertion patches.
 
 Qualified references and grammar
 
 T54. Change editing to item-first grammar: edit <item> note, edit <item> copy <target-group>, and edit <item> move <target-group>. Target group names remain tail words so the REPL keeps its simple whitespace parser and supports names containing spaces.
 T55. Parse qualified source references at the final slash. Continue accepting one-based list positions and bare RowKey UUIDs when globally unique.
-T56. Resolve item references through ChecklistSession and pass one resolved ChecklistItemId into working-set mutations. Resolve local/ROW_UUID directly; resolve GROUP_SELECTOR/ROW_UUID through exact unique group-name or UUID rules.
-T57. Display local/ROW_UUID for process-local items; UNIQUE_NAME/ROW_UUID only when the name is unambiguous, is not the reserved word local, and contains no whitespace; otherwise display GROUP_UUID/ROW_UUID. Ambiguous bare UUID errors list canonical qualified candidates.
+T56. Resolve item references through ChecklistSession and pass one resolved ChecklistItemId into working-set mutations. Resolve local/ROW_UUID directly. Resolve a UUID group qualifier directly to the exact group association even when its metadata is absent from the readable registry, then require the resulting item identity to be visible. Resolve non-UUID qualifiers through exact unique group-name rules.
+T57. Display local/ROW_UUID for process-local items. Use UNIQUE_NAME/ROW_UUID only when the name is unambiguous, is not the reserved word local, contains no whitespace, and is not itself UUID-shaped; otherwise display GROUP_UUID/ROW_UUID. This ensures every displayed canonical reference resolves back to the same visible item. Ambiguous bare UUID errors list canonical qualified candidates.
 
-Copy behaviour
+Copy and move behaviour
 
 T58. Copy the source's complete current ChecklistItem into the target group under the same RowKey, stage a complete target upsert, and keep the source unchanged.
-T59. Reject a target association equal to the source association and reject an existing target with different contents. Treat an identical existing target as idempotent success so retries do not overwrite divergent data.
+T59. Reject a target association equal to the source association and reject an existing target with different contents. Treat an identical existing target as idempotent success.
+T60. Move performs the same target staging and then immediately deletes the source locally in the same command. An existing replicated source becomes a dirty tombstone; a process-local or never-published source is simply removed.
+T61. Reuse the existing deterministic all-group sync for both target upserts and source tombstones. Their group UUID order may publish the source tombstone before the target upsert, and a later target failure can therefore leave the replicated source deleted. This limitation is explicitly accepted for the example.
+T62. Within one process, any failed group remains dirty and a later ordinary sync retries it. A source-delete failure leaves the target and the pending tombstone in the ordinary working-set state. Recovery after restart from a partially published move is not automated by this slice, although the replication history retains tombstoned data.
+T63. Do not add pending-transfer state, target/source phases, overlap tracking, transfer-specific outcomes, or special listener-drain rules. Chained local copy or move commands are governed by the same visible-row and collision rules as other edits.
 
-Move behaviour
+Synchronisation and reporting
 
-T60. Track pending moves in ChecklistWorkingSet. Keep the source visible while the target is pending, exclude pending move sources from ordinary dirty publication, and publish the complete target upsert through the d03.4 synchroniser first.
-T61. After target success, remove a process-local or never-published source locally. For an existing replicated source, submit a source tombstone in a second transfer phase using the updated composite read token.
-T62. Target failure leaves the source visible and the target dirty for retry. Source-delete failure leaves both copies visible and the pending move eligible for retry; it never reports the move as complete.
-T63. Re-running move after restart may treat an identical clean target as already confirmed and proceed with source deletion. Pending intent itself remains process-local, and process-local source loss on restart remains documented rather than gaining persistence or crash-atomic semantics.
-T64. Reject overlapping pending transfers and same-association moves so one source or target cannot participate in conflicting local transfer state.
-
-Synchronisation integration and reporting
-
-T65. Extend ChecklistSyncReport with explicit move-target and move-source-delete phases. A failed move target prevents its source phase but does not block unrelated groups or transfers.
-T66. Group multiple eligible source tombstones for the same group into one second-phase publication where possible. Advance the read token and clear transfer state only after the corresponding publication succeeds.
-T67. Preserve d03.4 listener-drain gating: apply listener events only after ordinary changes and every eligible transfer phase complete without a real-group failure.
+T64. Keep ChecklistRepl::synchronise_groups and ChecklistSyncReport group-oriented. Existing group outcomes, retained dirty rows, token advancement, and listener-drain gating cover copy and move without transfer-specific extensions.
+T65. Correct any stale checklist help or API documentation that still claims sync is limited to the default group.
 
 Coverage and documentation
 
-T68. Add parser, resolver, canonical-display, collision, idempotency, local-source, dirty-source, target-failure, source-failure, retry, restart, overlapping-transfer, and UUID-preservation tests.
-T69. Add handler and two-runtime coverage demonstrating copy convergence, move target-before-source ordering, safe duplicated state after partial failure, explicit retry, and independent transfers across several groups.
-T70. Update the replicated-checklist scenario runbook using repository OKF conventions with qualified references, item-first grammar, copy/move commands, partial-failure recovery, and the process-local lifetime limitation.
+T66. Add parser and resolver tests for item-first edit commands, final-slash qualification, local references, UUID and unique-name group selectors, ambiguous bare UUIDs, canonical candidate display, reserved local handling, whitespace-name fallback, UUID-shaped-name fallback, registry-missing UUID round trips, and list-position compatibility.
+T67. Add working-set tests for UUID-preserving copy, same-association rejection, divergent collision rejection, identical-target idempotency, move from clean replicated, dirty replicated, never-published, and process-local sources, plus chained operations.
+T68. Add handler and runtime-backed coverage demonstrating copy convergence, same-pass move publication, both group-order partial-failure directions with ordinary retry, and independent operations across several groups. In particular, prove that target success followed by source-delete failure leaves only the source tombstone dirty and does not drain listener events.
+T69. Update the replicated-checklist scenario runbook using repository OKF conventions with qualified references, item-first grammar, copy/move commands, accepted partial-publication limitation, retry within one process, and the absence of automated restart recovery.
 
 Acceptance
 
-T71. Items sharing one RowKey across associations remain separately addressable through canonical qualified references.
-T72. Copy and move preserve RowKey, reject unsafe collisions, and never delete a move source before target confirmation.
-T73. Partial move failures retain a visible recoverable state, and a retry can complete without overwriting divergent target data.
-T74. Transfer-aware sync continues independent work, reports both phases, and drains listeners only after safe completion.
+T70. Items sharing one RowKey across associations remain separately addressable through canonical qualified references.
+T71. Copy and move preserve RowKey, reject divergent target collisions, and use the ordinary all-group synchroniser without transfer-specific state.
+T72. A move stages its target upsert and source removal together, with the source becoming a tombstone when it was previously replicated.
+T73. Partial publication remains visible through ordinary group outcomes and dirty state, and retry within the same process requires only another sync.
+T74. Scenario documentation states the accepted ordering risk and restart-recovery limitation without claiming crash-atomic transfer semantics.
 
 Estimate
 
-T75. Approximately 700-1,000 LOC: 180-260 LOC for grammar and resolution, 260-380 LOC for transfer state and sync integration, and 260-360 LOC for tests and documentation. If implementation exceeds 1,000 LOC, parser/resolution and transfer execution are the clean review boundaries, but this child is intended to remain one cohesive transfer slice."""
-status = "open"
+T75. Approximately 500-800 LOC: 180-260 LOC for grammar and resolution, 100-180 LOC for copy/move working-set operations, and 220-360 LOC for handlers, tests, and documentation. The agreed simplification keeps this below 1,000 LOC and removes the former transfer-state and two-phase synchronisation boundary."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "Codex"
 blocked_by = ["019f8396-c396-75b2-a651-2866f60b79a9"]
 parent = "019f502e-2262-70a0-bf74-6da295fff88e"
 created_at = "2026-07-25T12:21:32.300965Z"
-updated_at = "2026-07-25T12:21:38.894129Z"
+updated_at = "2026-07-25T15:33:19.809311Z"
+closed_at = "2026-07-25T15:33:19.809311Z"
+
+[[comments]]
+id = "019f999e-d1b3-70d0-aa46-0f23fd3daa25"
+author = "Codex"
+body = "Plan simplification agreed: copy stages one complete target upsert; move stages the same upsert and immediately removes the source through ordinary dirty-row semantics. The slice now accepts group-order partial publication, relies on normal same-process sync retry, and removes pending-transfer state, target/source phases, overlap tracking, and transfer-specific reports."
+created_at = "2026-07-25T14:12:30.259705Z"
+
+[[comments]]
+id = "019f99af-dac5-7631-b296-bda60456fba7"
+author = "Codex"
+body = "Implementation complete: qualified item references resolve through the session and render canonically; item-first note/copy/move commands preserve row UUIDs; move stages an ordinary target upsert plus immediate source removal; divergent targets and non-writable groups are rejected; group-order partial failure retains the target as ordinary dirty state for same-process retry. Parser, working-set, runtime, failure-path, documentation, full example tests, OKF checks, formatting, and pedantic Clippy all pass."
+created_at = "2026-07-25T14:31:06.69339Z"
+
+[[comments]]
+id = "019f99c1-54d5-7431-b42c-33942413107b"
+author = "Codex"
+body = "Review delta agreed: canonical item references will reject UUID-shaped names as display qualifiers and resolve UUID qualifiers directly against visible working-set identities; the mirrored target-success/source-delete-failure retry path will be tested; exact item lookup and target-association resolution will be renamed; the nested error propagation will be corrected as mandatory instruction conformance."
+created_at = "2026-07-25T14:50:12.053384Z"
+
+[[comments]]
+id = "019f99c5-3fb2-7663-8f67-c5e7ff207cb9"
+author = "Codex"
+body = "Review fixes complete: canonical references now fall back from UUID-shaped names, UUID qualifiers round-trip visible items without registry metadata, the target-success/source-delete-failure path retains only the source tombstone for retry while deferring listener drain, and the two misleading helpers were renamed. The nested error propagation was removed. All 63 library tests, 21 smoke tests, focused checklist tests, formatting, diff checks, and pedantic Clippy pass."
+created_at = "2026-07-25T14:54:28.786047Z"
+
+[[comments]]
+id = "019f99e8-d141-7063-aceb-033aaf84dd54"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T15:33:19.809311Z"
