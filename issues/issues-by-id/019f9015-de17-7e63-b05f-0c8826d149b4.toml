@@ -17,11 +17,13 @@ R06. Verify formatting, pedantic Clippy, and the flotsync_io_examples test suite
 Estimate
 
 R07. Approximately 100-250 LOC of structural edits plus mechanical moves; expected to remain below 1,000 LOC because behaviour and tests should move without redesign."""
-status = "open"
+status = "in-progress"
+status_reason = "planning"
 type = "task"
 priority = 0
+assignee = "Codex"
 created_at = "2026-07-23T17:46:20.055901Z"
-updated_at = "2026-07-23T17:46:24.892143Z"
+updated_at = "2026-07-25T09:17:59.985563Z"
 
 [[links]]
 target = "019f8588-bbc6-7523-87d2-6d5e83939248"
