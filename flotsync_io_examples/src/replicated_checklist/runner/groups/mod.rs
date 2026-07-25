@@ -10,6 +10,15 @@ use indoc::printdoc;
 pub async fn load_readable_groups(
     store: &dyn ReplicationStore,
 ) -> Result<Vec<ReplicationGroupRecord>, ReplicatedChecklistError> {
+    let mut groups = load_group_records(store).await?;
+    groups.retain(|group| group.lifecycle.is_readable());
+    Ok(groups)
+}
+
+/// Load every stored group record in stable UUID order, including closed groups.
+pub async fn load_group_records(
+    store: &dyn ReplicationStore,
+) -> Result<Vec<ReplicationGroupRecord>, ReplicatedChecklistError> {
     let mut transaction = store
         .begin_read_transaction()
         .await
@@ -22,9 +31,27 @@ pub async fn load_readable_groups(
         .release()
         .await
         .context(repl_error::StoreSnafu)?;
-    groups.retain(|group| group.lifecycle.is_readable());
     groups.sort_by_key(|group| group.group_id);
     Ok(groups)
+}
+
+/// Change made to the process-local default after refreshing group lifecycles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefaultGroupRefresh {
+    /// No default was selected, or the selected group remains open.
+    Unchanged,
+    /// A non-writable default was replaced by its first open successor.
+    Reassigned {
+        /// Group that stopped being a valid default.
+        previous_group_id: GroupId,
+        /// Open successor selected as the new default.
+        successor_group_id: GroupId,
+    },
+    /// The previous default had no resolvable open successor.
+    Cleared {
+        /// Group that stopped being a valid default.
+        previous_group_id: GroupId,
+    },
 }
 
 impl ChecklistSession {
@@ -142,13 +169,43 @@ impl ChecklistSession {
         Ok(())
     }
 
-    /// Prepare only the current default group for transitional synchronisation.
-    pub fn prepare_default_sync(
-        &self,
-    ) -> Result<Option<ChecklistSyncPlan>, ChecklistWorkingSetError> {
-        match self.default_group {
-            Some(group_id) => self.working_set.prepare_group_sync(group_id),
-            None => Ok(None),
+    /// Replace the readable registry and repair the default from complete lifecycle records.
+    pub fn refresh_groups(
+        &mut self,
+        groups: impl IntoIterator<Item = ReplicationGroupRecord>,
+    ) -> DefaultGroupRefresh {
+        let all_groups = groups
+            .into_iter()
+            .map(|group| (group.group_id, group))
+            .collect::<HashMap<_, _>>();
+        let previous_default = self.default_group;
+        let repaired_default =
+            previous_default.and_then(|group_id| resolve_open_successor(group_id, &all_groups));
+        self.groups = all_groups
+            .into_iter()
+            .filter(|(_, group)| group.lifecycle.is_readable())
+            .collect();
+        self.default_group = repaired_default;
+
+        match (previous_default, repaired_default) {
+            (None, None) => DefaultGroupRefresh::Unchanged,
+            (None, Some(group_id)) => {
+                unreachable!(
+                    "group registry refresh cannot select default group {group_id} without a previous default"
+                )
+            }
+            (Some(previous_group_id), None) => DefaultGroupRefresh::Cleared { previous_group_id },
+            (Some(previous_group_id), Some(successor_group_id))
+                if previous_group_id == successor_group_id =>
+            {
+                DefaultGroupRefresh::Unchanged
+            }
+            (Some(previous_group_id), Some(successor_group_id)) => {
+                DefaultGroupRefresh::Reassigned {
+                    previous_group_id,
+                    successor_group_id,
+                }
+            }
         }
     }
 }
@@ -182,13 +239,29 @@ impl ChecklistRepl {
         Ok(())
     }
 
-    /// Reload application-readable group metadata through the temporary store workaround.
+    /// Reload group metadata and repair a default invalidated by lifecycle changes.
     pub async fn refresh_group_registry(&mut self) -> Result<(), ReplicatedChecklistError> {
-        let groups = load_readable_groups(self.store.as_ref()).await?;
-        self.session.groups = groups
-            .into_iter()
-            .map(|group| (group.group_id, group))
-            .collect();
+        let groups = load_group_records(self.store.as_ref()).await?;
+        match self.session.refresh_groups(groups) {
+            DefaultGroupRefresh::Unchanged => {
+                // No default is selected, or the selected default remains open;
+                // neither case has a selection change to report.
+            }
+            DefaultGroupRefresh::Reassigned {
+                previous_group_id,
+                successor_group_id,
+            } => {
+                println!(
+                    "default group updated: {previous_group_id} -> {}",
+                    self.session.group_label(successor_group_id)
+                );
+            }
+            DefaultGroupRefresh::Cleared { previous_group_id } => {
+                println!(
+                    "default group cleared: {previous_group_id} has no open successor in the local registry"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -526,6 +599,23 @@ pub fn print_group_invitation(position: NonZeroUsize, pending: &PendingGroupInvi
           initial snapshot: {initial_snapshot:?}
         "
     );
+}
+
+/// Follow stored successor links until an open group is found.
+fn resolve_open_successor(
+    initial_group_id: GroupId,
+    groups: &HashMap<GroupId, ReplicationGroupRecord>,
+) -> Option<GroupId> {
+    let mut visited = HashSet::new();
+    let mut group_id = initial_group_id;
+    while visited.insert(group_id) {
+        let group = groups.get(&group_id)?;
+        if group.lifecycle.is_writable() {
+            return Some(group_id);
+        }
+        group_id = group.lifecycle.successor_group_id()?;
+    }
+    None
 }
 
 #[cfg(test)]

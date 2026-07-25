@@ -7,7 +7,8 @@ status: draft
 
 # Replicated Checklist Manual Scenarios
 
-This runbook covers the manual acceptance scenarios for `flotsync-5j0.9`.
+This runbook covers manual acceptance scenarios for the replicated-checklist
+example application.
 
 The steps use the names `alice` and `bob`. If your local config uses different member names, map
 `alice` to the first terminal/machine and `bob` to the second. The checked-in examples in
@@ -21,12 +22,6 @@ endpoints. The no-static route scenarios require a network that forwards the pee
 traffic between the peers.
 
 ## Setup
-
-The current dynamic-group transition supports a fresh zero-group key-management
-shell and stores containing exactly one existing active group. Fresh group
-creation and the heterogeneous multi-group workspace land in
-`flotsync-git-d03.3`. The data scenarios below therefore require an existing
-single-group store until that slice is complete.
 
 Initialise local identity material, then start each peer from the repository
 root:
@@ -83,10 +78,32 @@ storage and derives the local store secret from the profile string. Changing
 that profile later makes existing local security material unreadable; delete the
 example store and start fresh if you change it.
 
-For an existing single-group store, use one terminal per peer and run:
+Create the first group on Alice. The creator is inserted automatically at
+member position 0; enter one additional member identity per prompt and submit a
+blank line to finish the member list:
+
+```text
+group create shared checklist
+additional member id (blank to finish)> bob
+additional member id (blank to finish)>
+Create this group and send invitations? [y/N] y
+```
+
+Bob can inspect and accept the listener-delivered invitation:
+
+```text
+group invitations
+group accept 1
+```
+
+Group creation and acceptance do not implicitly select a default. In each
+terminal, inspect the registry and explicitly select the group by its unique
+name or UUID:
 
 ```text
 me
+group list
+group default shared checklist
 members
 ```
 
@@ -94,14 +111,51 @@ Confirm that:
 
 - Alice prints `member: alice` and the expected config path.
 - Bob prints `member: bob` and the expected config path.
-- Both peers list the same persisted group and ordered members.
+- Both peers list the same group, display name, lifecycle, and ordered members.
+- `me` reports `shared checklist` as the process-local default after selection.
 
-For a fresh zero-group store, `me` prints `group: none`; key commands remain
-available and `members` explains that no active group exists.
+For a fresh zero-group store, `me` reports `default group: none`; key and group
+registry commands remain available. `add` without a default creates a
+process-local item. Such items are deliberately skipped by `sync` and disappear
+when the process exits.
 
 The examples below use `ROW` when an item should be addressed by row UUID. Get it from `list`; the
 row UUID is printed in parentheses at the end of each row. Using row UUIDs avoids accidental index
 selection when earlier scenarios left extra rows visible.
+
+## Multi-group Defaults and Synchronisation
+
+The default controls only where subsequent `add` commands place new items.
+Existing rows retain their own group association, and `sync` attempts every
+dirty real group in UUID order regardless of the current default. This keeps
+group selection separate from replication progress.
+
+With two writable groups named `shared checklist` and `work`, one peer can stage
+changes in both before a single sync:
+
+```text
+group default shared checklist
+add buy tea
+group default work
+add prepare status report
+group clear-default
+sync
+```
+
+Expected result:
+
+- The sync report contains one outcome for each dirty real group.
+- Both groups are published even though the default was cleared before `sync`.
+- A failed group remains dirty and is named in the report, while later groups
+  are still attempted.
+- Listener batches remain pending when any group publication fails; rerunning
+  `sync` retries the failed group before listener changes are applied.
+- Process-local items are counted in the report but never submitted.
+
+If a selected group becomes read-only or closed after an accepted membership
+change, the next registry refresh follows its successor chain. The first open
+successor becomes the new default; if no open successor is available, the
+default is cleared and the REPL reports why.
 
 ## Scenario 1: Concurrent Adds
 
@@ -292,7 +346,7 @@ Expected result:
 ## Scenario 4: Restart Keeps Durable Runtime State
 
 Goal: a peer can stop and restart with the same store path and continue participating in the same
-persisted group.
+persisted groups.
 
 Start from two running peers with the same config and stores.
 
@@ -310,6 +364,8 @@ Alice:
 
 ```text
 me
+group list
+group default shared checklist
 members
 add alice after restart
 sync
@@ -325,11 +381,12 @@ list
 Expected result:
 
 - Alice restarts without static-group mismatch or store initialisation errors.
-- Alice reports the same group id, member identity, config path, and store path after restart.
+- Alice reports the same group ids, member identity, config path, and store path after restart.
+- Alice starts without a default and explicitly selects one again because the
+  default is process-local session state.
+- Stored checklist snapshots repopulate the readable group rows in Alice's
+  working set.
 - Bob receives `alice after restart` after Bob syncs.
-- The current checklist REPL is an in-process working set; this scenario checks durable runtime
-  state and continued replication, not automatic UI rehydration of previously visible checklist
-  rows.
 
 ## Scenario 5: Custom UDP Discovery Without Static Routes
 

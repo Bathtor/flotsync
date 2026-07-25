@@ -500,38 +500,127 @@ fn listener_group_validation_rejects_rows_outside_the_registry() {
 }
 
 #[test]
-fn transitional_sync_plan_includes_only_the_default_group() {
+fn registry_refresh_reassigns_a_non_writable_default_to_its_open_successor() {
     let member = MemberIdentity::from_array(["alice"]);
-    let default_group = GroupId(Uuid::from_u128(71_009));
-    let other_group = GroupId(Uuid::from_u128(71_010));
-    let mut working_set = ChecklistWorkingSet::new();
-    working_set.add_item(
-        ChecklistItemAssociation::Group(default_group),
-        "default item",
-    );
-    working_set.add_item(ChecklistItemAssociation::Group(other_group), "other item");
-    working_set.add_item(ChecklistItemAssociation::Local, "local item");
-    let mut session = ChecklistSession::new(
-        [
-            test_group(default_group, &member),
-            test_group(other_group, &member),
-        ],
-        working_set,
-    );
-    session.default_group = Some(default_group);
+    let previous_group = GroupId(Uuid::from_u128(71_009));
+    let intermediate_group = GroupId(Uuid::from_u128(71_010));
+    let open_group = GroupId(Uuid::from_u128(71_011));
+    let mut previous = test_group(previous_group, &member);
+    previous.lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: intermediate_group,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    let mut intermediate = test_group(intermediate_group, &member);
+    intermediate.lifecycle = ReplicationGroupLifecycle::Closed {
+        successor_group_id: open_group,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    let open = test_group(open_group, &member);
+    let mut session = ChecklistSession::new([previous.clone()], ChecklistWorkingSet::new());
+    session.default_group = Some(previous_group);
 
-    let plan = session
-        .prepare_default_sync()
-        .expect("default sync plan should build")
-        .expect("default group should be dirty");
+    let refresh = session.refresh_groups([previous, intermediate, open]);
 
-    assert_eq!(plan.mutations.len(), 1);
-    assert!(
-        plan.mutations
-            .iter()
-            .all(|mutation| { mutation.row_id().group_id == default_group })
+    assert_eq!(
+        refresh,
+        DefaultGroupRefresh::Reassigned {
+            previous_group_id: previous_group,
+            successor_group_id: open_group,
+        }
     );
-    assert_eq!(session.working_set.dirty_row_count(), 3);
+    assert_eq!(session.default_group, Some(open_group));
+    assert!(session.groups.contains_key(&previous_group));
+    assert!(!session.groups.contains_key(&intermediate_group));
+    assert!(session.groups.contains_key(&open_group));
+
+    let mut closed_default_session = ChecklistSession::new([], ChecklistWorkingSet::new());
+    closed_default_session.default_group = Some(intermediate_group);
+    let mut closed = test_group(intermediate_group, &member);
+    closed.lifecycle = ReplicationGroupLifecycle::Closed {
+        successor_group_id: open_group,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    assert_eq!(
+        closed_default_session.refresh_groups([
+            test_group(previous_group, &member),
+            closed,
+            test_group(open_group, &member),
+        ]),
+        DefaultGroupRefresh::Reassigned {
+            previous_group_id: intermediate_group,
+            successor_group_id: open_group,
+        }
+    );
+    assert_eq!(closed_default_session.default_group, Some(open_group));
+}
+
+#[test]
+fn registry_refresh_clears_a_default_without_a_resolvable_open_successor() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let first_group = GroupId(Uuid::from_u128(71_012));
+    let second_group = GroupId(Uuid::from_u128(71_013));
+    let mut first = test_group(first_group, &member);
+    first.lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: second_group,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    let mut second = test_group(second_group, &member);
+    second.lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: first_group,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    let mut session =
+        ChecklistSession::new([first.clone(), second.clone()], ChecklistWorkingSet::new());
+    session.default_group = Some(first_group);
+
+    let refresh = session.refresh_groups([first, second]);
+
+    assert_eq!(
+        refresh,
+        DefaultGroupRefresh::Cleared {
+            previous_group_id: first_group,
+        }
+    );
+    assert_eq!(session.default_group, None);
+}
+
+#[test]
+fn registry_refresh_handles_open_missing_and_restart_defaults() {
+    let member = MemberIdentity::from_array(["alice"]);
+    let open_group = GroupId(Uuid::from_u128(71_014));
+    let missing_successor = GroupId(Uuid::from_u128(71_015));
+    let unavailable_group = GroupId(Uuid::from_u128(71_016));
+    let open = test_group(open_group, &member);
+    let mut unavailable = test_group(unavailable_group, &member);
+    unavailable.lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: missing_successor,
+        final_versions: VersionVector::initial(NonZeroUsize::MIN),
+    };
+    let mut session = ChecklistSession::new([open.clone()], ChecklistWorkingSet::new());
+    session.default_group = Some(open_group);
+
+    assert_eq!(
+        session.refresh_groups([open.clone(), unavailable.clone()]),
+        DefaultGroupRefresh::Unchanged
+    );
+    assert_eq!(session.default_group, Some(open_group));
+
+    session.default_group = Some(unavailable_group);
+    assert_eq!(
+        session.refresh_groups([open.clone(), unavailable]),
+        DefaultGroupRefresh::Cleared {
+            previous_group_id: unavailable_group,
+        }
+    );
+    assert_eq!(session.default_group, None);
+
+    let mut restarted = ChecklistSession::new([open.clone()], ChecklistWorkingSet::new());
+    assert_eq!(restarted.default_group, None);
+    assert_eq!(
+        restarted.refresh_groups([open]),
+        DefaultGroupRefresh::Unchanged
+    );
+    assert_eq!(restarted.default_group, None);
 }
 
 #[test]
@@ -560,6 +649,15 @@ fn readable_group_loader_supports_zero_and_several_groups() {
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
     block_on(insert_test_group(&store, closed_group));
+
+    let all_groups = block_on(load_group_records(&store)).expect("all groups should load");
+    assert_eq!(
+        all_groups
+            .iter()
+            .map(|group| group.group_id)
+            .collect::<Vec<_>>(),
+        vec![first_group_id, second_group_id, closed_group_id]
+    );
 
     let loaded =
         block_on(load_readable_groups(&store)).expect("several readable groups should load");

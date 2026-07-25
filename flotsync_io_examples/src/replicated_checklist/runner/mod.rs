@@ -5,7 +5,6 @@ use super::{
     ChecklistItemAssociation,
     ChecklistItemId,
     ChecklistKeyCommand,
-    ChecklistSyncPlan,
     ChecklistWorkingSet,
     ChecklistWorkingSetError,
     EditCommand,

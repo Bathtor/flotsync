@@ -62,6 +62,50 @@ pub struct PendingGroupInvitation {
     pub respond: Box<dyn GroupInvitationResponder>,
 }
 
+/// Result of publishing one dirty checklist group during an explicit sync.
+#[derive(Debug)]
+pub enum ChecklistGroupSyncOutcome {
+    /// Every mutation in the prepared group plan was published and marked clean.
+    Published {
+        /// Group whose dirty rows were published.
+        group_id: GroupId,
+        /// Number of row mutations included in the publication.
+        mutation_count: usize,
+    },
+    /// Publication failed, leaving this group's dirty rows available for retry.
+    Failed {
+        /// Group whose publication failed.
+        group_id: GroupId,
+        /// Concrete replication API failure returned for this group.
+        error: ApiError,
+    },
+}
+
+impl ChecklistGroupSyncOutcome {
+    /// Return whether this group was published successfully.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        matches!(self, Self::Published { .. })
+    }
+}
+
+/// Structured result of one all-group checklist synchronisation pass.
+#[derive(Debug)]
+pub struct ChecklistSyncReport {
+    /// Per-group outcomes in deterministic group UUID order.
+    pub group_outcomes: Vec<ChecklistGroupSyncOutcome>,
+    /// Whether listener draining was deferred because at least one group failed.
+    pub listener_drain_deferred: bool,
+    /// Listener batches ingested after every group publication succeeded.
+    pub listener_batch_count: usize,
+    /// Queued checklist events applied after listener ingestion.
+    pub applied_event_count: usize,
+    /// Process-local dirty items deliberately skipped by replication sync.
+    pub dirty_local_item_count: usize,
+    /// Groups that remain dirty after this pass, ordered by UUID.
+    pub remaining_dirty_groups: Vec<GroupId>,
+}
+
 impl ChecklistListener {
     /// Return the listener plus independent data and invitation receivers.
     pub fn pair() -> (Arc<Self>, ChecklistListenerReceivers) {
@@ -400,38 +444,15 @@ impl ChecklistRepl {
     }
 
     async fn sync(&mut self) -> Result<(), ReplicatedChecklistError> {
-        let plan = self
-            .session
-            .prepare_default_sync()
-            .context(repl_error::WorkingSetSnafu)?;
-        let published_group = plan
-            .as_ref()
-            .and(self.session.default_group)
-            .map(|group_id| self.session.group_label(group_id));
-        if let Some(plan) = &plan {
-            let read_token = self
-                .session
-                .working_set
-                .read_token()
-                .context(repl_error::WorkingSetSnafu)?;
-            let receipt = self
-                .replication
-                .publish_changes(PublishChangesRequest {
-                    read_token,
-                    changes: plan.mutations.clone(),
-                })
-                .await
-                .context(repl_error::ReplicationSnafu)?;
-            // The receipt token is our previous application read position with
-            // this local writer position advanced. Keeping it here makes the
-            // next local sync causally depend on the write we just published
-            // without waiting for the listener echo to be drained first.
-            self.session.working_set.set_read_token(receipt.read_token);
-        }
-        self.session.working_set.finish_successful_group_sync(plan);
-        let listener_batch_count = self.drain_listener_queue()?;
-        let applied_events = self.session.working_set.drain_queued_events();
-        let dirty_local = self.session.working_set.dirty_local_item_count();
+        let report = self.synchronise_groups().await?;
+        println!("{}", self.format_sync_report(&report));
+        Ok(())
+    }
+
+    /// Publish every dirty real group while preserving failures for display and retry.
+    pub async fn synchronise_groups(
+        &mut self,
+    ) -> Result<ChecklistSyncReport, ReplicatedChecklistError> {
         let mut dirty_groups = self
             .session
             .working_set
@@ -439,28 +460,133 @@ impl ChecklistRepl {
             .into_iter()
             .collect::<Vec<_>>();
         dirty_groups.sort();
-        let dirty_group_labels = dirty_groups
+
+        let mut group_outcomes = Vec::with_capacity(dirty_groups.len());
+        for group_id in dirty_groups {
+            let mut plan = self
+                .session
+                .working_set
+                .prepare_group_sync(group_id)
+                .context(repl_error::WorkingSetSnafu)?
+                .expect("dirty group must produce a non-empty sync plan");
+            let mutation_count = plan.mutations.len();
+            let changes = std::mem::take(&mut plan.mutations);
+            let read_token = self
+                .session
+                .working_set
+                .read_token()
+                .context(repl_error::WorkingSetSnafu)?;
+            let publish_result = self
+                .replication
+                .publish_changes(PublishChangesRequest {
+                    read_token,
+                    changes,
+                })
+                .await;
+            match publish_result {
+                Ok(receipt) => {
+                    // The working set already reflects this local write, but its read token
+                    // does not until we retain the receipt or receive the listener echo.
+                    // Retain the receipt immediately so a completed sync cannot leave the
+                    // token behind the local state. Carrying it into later requests merely
+                    // accumulates independent group positions; it creates no cross-group
+                    // causal dependency.
+                    self.session.working_set.set_read_token(receipt.read_token);
+                    self.session
+                        .working_set
+                        .finish_successful_group_sync(Some(plan));
+                    group_outcomes.push(ChecklistGroupSyncOutcome::Published {
+                        group_id,
+                        mutation_count,
+                    });
+                }
+                Err(error) => {
+                    group_outcomes.push(ChecklistGroupSyncOutcome::Failed { group_id, error });
+                }
+            }
+        }
+
+        let listener_drain_deferred = group_outcomes.iter().any(|outcome| !outcome.is_success());
+        let (listener_batch_count, applied_event_count) = if listener_drain_deferred {
+            (0, 0)
+        } else {
+            let listener_batch_count = self.drain_listener_queue()?;
+            let applied_event_count = self.session.working_set.drain_queued_events();
+            (listener_batch_count, applied_event_count)
+        };
+        let dirty_local_item_count = self.session.working_set.dirty_local_item_count();
+        let mut remaining_dirty_groups = self
+            .session
+            .working_set
+            .dirty_group_ids()
             .into_iter()
-            .map(|group_id| self.session.group_label(group_id))
+            .collect::<Vec<_>>();
+        remaining_dirty_groups.sort();
+        Ok(ChecklistSyncReport {
+            group_outcomes,
+            listener_drain_deferred,
+            listener_batch_count,
+            applied_event_count,
+            dirty_local_item_count,
+            remaining_dirty_groups,
+        })
+    }
+
+    /// Format one structured all-group sync report using current group labels.
+    #[must_use]
+    pub fn format_sync_report(&self, report: &ChecklistSyncReport) -> String {
+        let group_outcomes = if report.group_outcomes.is_empty() {
+            "    none".to_owned()
+        } else {
+            report
+                .group_outcomes
+                .iter()
+                .map(|outcome| match outcome {
+                    ChecklistGroupSyncOutcome::Published {
+                        group_id,
+                        mutation_count,
+                    } => {
+                        let group = self.session.group_label(*group_id);
+                        format!("    {group}: published {mutation_count} mutation(s)")
+                    }
+                    ChecklistGroupSyncOutcome::Failed { group_id, error } => {
+                        let group = self.session.group_label(*group_id);
+                        format!("    {group}: failed: {error}")
+                    }
+                })
+                .join("\n")
+        };
+        let listener_batches = if report.listener_drain_deferred {
+            "deferred because a group publication failed".to_owned()
+        } else {
+            report.listener_batch_count.to_string()
+        };
+        let dirty_group_labels = report
+            .remaining_dirty_groups
+            .iter()
+            .map(|group_id| self.session.group_label(*group_id))
             .join(", ");
         let dirty_group_summary = if dirty_group_labels.is_empty() {
             "none"
         } else {
             &dirty_group_labels
         };
-        let published_group = published_group.as_deref().unwrap_or("none");
-        println!(
-            "{}",
-            formatdoc! {"
-                sync complete:
-                  published group: {published_group}
-                  listener batches: {listener_batch_count}
-                  applied events: {applied_events}
-                  unsynchronised local items: {dirty_local}
-                  dirty groups: {dirty_group_summary}"
-            }
-        );
-        Ok(())
+        let heading = if report.listener_drain_deferred {
+            "sync incomplete:"
+        } else {
+            "sync complete:"
+        };
+        let applied_events = report.applied_event_count;
+        let dirty_local = report.dirty_local_item_count;
+        formatdoc! {"
+            {heading}
+              groups:
+            {group_outcomes}
+              listener batches: {listener_batches}
+              applied events: {applied_events}
+              unsynchronised local items: {dirty_local}
+              dirty groups: {dirty_group_summary}"
+        }
     }
 
     /// Drain queued listener batches into the working set and return the number of batches drained.
@@ -651,7 +777,12 @@ mod tests {
     use super::*;
     use crate::replicated_checklist::{
         ChecklistItem,
-        runner::groups::test_support::load_test_runtime_with_groups,
+        ChecklistRowChange,
+        runner::groups::test_support::{
+            load_test_runtime_with_groups,
+            named_test_group,
+            test_app_config,
+        },
     };
     use flotsync_replication::{
         RowId,
@@ -756,6 +887,189 @@ mod tests {
                     .expect("workspace token should load")
             )
             .contains("group_count: 2")
+        );
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
+
+    #[test]
+    fn sync_publishes_every_dirty_group_and_skips_local_items() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let first_group = GroupId(Uuid::from_u128(72_001));
+        let second_group = GroupId(Uuid::from_u128(72_002));
+        let (store, runtime, _listener, receivers) =
+            load_test_runtime_with_groups(&member, [second_group, first_group]);
+        let mut working_set = ChecklistWorkingSet::new();
+        block_on(load_group_snapshot(
+            runtime.as_ref(),
+            &mut working_set,
+            first_group,
+        ))
+        .expect("first group token should load");
+        block_on(load_group_snapshot(
+            runtime.as_ref(),
+            &mut working_set,
+            second_group,
+        ))
+        .expect("second group token should load");
+        let first_item = working_set.add_item(
+            ChecklistItemAssociation::Group(first_group),
+            "first group item",
+        );
+        let second_item = working_set.add_item(
+            ChecklistItemAssociation::Group(second_group),
+            "second group item",
+        );
+        working_set.add_item(ChecklistItemAssociation::Local, "local item");
+        let session = ChecklistSession::new(
+            [
+                named_test_group(first_group, &member, "first"),
+                named_test_group(second_group, &member, "second"),
+            ],
+            working_set,
+        );
+        let mut repl = ChecklistRepl::new(
+            test_app_config(member),
+            store,
+            runtime.clone(),
+            receivers,
+            session,
+        );
+
+        let report = block_on(repl.synchronise_groups()).expect("all groups should synchronise");
+
+        assert!(matches!(
+            report.group_outcomes.as_slice(),
+            [
+                ChecklistGroupSyncOutcome::Published {
+                    group_id: actual_first,
+                    mutation_count: 1,
+                },
+                ChecklistGroupSyncOutcome::Published {
+                    group_id: actual_second,
+                    mutation_count: 1,
+                },
+            ] if *actual_first == first_group && *actual_second == second_group
+        ));
+        assert!(!report.listener_drain_deferred);
+        assert_eq!(report.listener_batch_count, 2);
+        assert_eq!(report.applied_event_count, 2);
+        assert_eq!(report.dirty_local_item_count, 1);
+        assert!(report.remaining_dirty_groups.is_empty());
+        assert_eq!(
+            repl.format_sync_report(&report),
+            "sync complete:\n  groups:\n    first: published 1 mutation(s)\n    second: published 1 mutation(s)\n  listener batches: 2\n  applied events: 2\n  unsynchronised local items: 1\n  dirty groups: none"
+        );
+
+        let mut verified = ChecklistWorkingSet::new();
+        block_on(load_group_snapshot(
+            runtime.as_ref(),
+            &mut verified,
+            first_group,
+        ))
+        .expect("published first group should reload");
+        block_on(load_group_snapshot(
+            runtime.as_ref(),
+            &mut verified,
+            second_group,
+        ))
+        .expect("published second group should reload");
+        assert_eq!(
+            verified
+                .item(first_item)
+                .expect("first published item should exist")
+                .text,
+            "first group item"
+        );
+        assert_eq!(
+            verified
+                .item(second_item)
+                .expect("second published item should exist")
+                .text,
+            "second group item"
+        );
+
+        block_on(runtime.shutdown()).expect("test runtime should shut down");
+    }
+
+    #[test]
+    fn sync_continues_after_failure_and_defers_listener_draining() {
+        let member = MemberIdentity::from_array(["alice"]);
+        let unknown_group = GroupId(Uuid::from_u128(72_010));
+        let known_group = GroupId(Uuid::from_u128(72_011));
+        let (store, runtime, _listener, receivers) =
+            load_test_runtime_with_groups(&member, [known_group]);
+        let mut working_set = ChecklistWorkingSet::new();
+        block_on(load_group_snapshot(
+            runtime.as_ref(),
+            &mut working_set,
+            known_group,
+        ))
+        .expect("known group token should load");
+        working_set.add_item(
+            ChecklistItemAssociation::Group(unknown_group),
+            "cannot publish",
+        );
+        working_set.add_item(
+            ChecklistItemAssociation::Group(known_group),
+            "still publishes",
+        );
+        working_set
+            .enqueue_checklist_changes(vec![ChecklistRowChange::Delete {
+                item_id: ChecklistItemId::group(known_group, RowKey(Uuid::from_u128(72_012))),
+            }])
+            .expect("non-conflicting listener event should queue");
+        let session = ChecklistSession::new(
+            [named_test_group(known_group, &member, "known")],
+            working_set,
+        );
+        let mut repl = ChecklistRepl::new(
+            test_app_config(member),
+            store,
+            runtime.clone(),
+            receivers,
+            session,
+        );
+
+        let report = block_on(repl.synchronise_groups())
+            .expect("a group publication failure should remain in the report");
+
+        assert!(matches!(
+            report.group_outcomes.as_slice(),
+            [
+                ChecklistGroupSyncOutcome::Failed {
+                    group_id: actual_unknown,
+                    error: ApiError::ApiExternal { .. },
+                },
+                ChecklistGroupSyncOutcome::Published {
+                    group_id: actual_known,
+                    mutation_count: 1,
+                },
+            ] if *actual_unknown == unknown_group && *actual_known == known_group
+        ));
+        assert!(report.listener_drain_deferred);
+        assert_eq!(report.listener_batch_count, 0);
+        assert_eq!(report.applied_event_count, 0);
+        assert_eq!(report.remaining_dirty_groups, vec![unknown_group]);
+        assert_eq!(repl.session.working_set.queued_event_count(), 1);
+        assert!(
+            repl.batch_receiver.try_recv().is_ok(),
+            "the successful group's listener echo should remain deferred"
+        );
+        let failed_report = ChecklistSyncReport {
+            group_outcomes: vec![ChecklistGroupSyncOutcome::Failed {
+                group_id: known_group,
+                error: ApiError::RuntimeUnavailable,
+            }],
+            listener_drain_deferred: true,
+            listener_batch_count: 0,
+            applied_event_count: 0,
+            dirty_local_item_count: 0,
+            remaining_dirty_groups: vec![known_group],
+        };
+        assert_eq!(
+            repl.format_sync_report(&failed_report),
+            "sync incomplete:\n  groups:\n    known: failed: Replication runtime component became unavailable.\n  listener batches: deferred because a group publication failed\n  applied events: 0\n  unsynchronised local items: 0\n  dirty groups: known"
         );
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");

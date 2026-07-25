@@ -643,8 +643,8 @@ pub enum ChecklistWorkingSetError {
 ///
 /// Local commands update this working set and remember the original row state
 /// for dirty rows. Listener changes are queued here and applied when `sync`
-/// drains the queue. Listener batches that conflict with unsynchronised local
-/// changes are rejected until all-group synchronisation lands.
+/// drains the queue. Listener batches that unexpectedly conflict with an
+/// unsynchronised local change are rejected rather than rebased in the example.
 pub struct ChecklistWorkingSet {
     dataset_id: DatasetId,
     rows: HashMap<ChecklistItemId, ChecklistItem>,
@@ -945,8 +945,6 @@ impl ChecklistWorkingSet {
         if changes.is_empty() {
             return Ok(());
         }
-        // TODO(flotsync-git-d03.4): Remove this transitional rejection once
-        // sync publishes every dirty group before draining listener events.
         if let Some(item_id) = changes
             .iter()
             .map(ChecklistRowChange::item_id)

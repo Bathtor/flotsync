@@ -1,0 +1,62 @@
+id = "019f9939-3a0c-70a3-9e1f-8239fde87582"
+ref = "flotsync-git-d03.5"
+title = "Add qualified checklist item transfer"
+body = """
+Objective
+
+T51. Add canonical qualified item references and UUID-preserving copy and move commands to the heterogeneous checklist workspace, with target-before-source safety and explicit retry behaviour.
+
+Dependency and current state
+
+T52. This child follows flotsync-git-d03.4, which supplies deterministic all-group publication, composite-token advancement, partial-failure reports, and safe listener-drain gating. Transfer extends that synchroniser with ordered move phases rather than reimplementing publication.
+T53. ChecklistItemId already scopes a RowKey by Local or Group association, the working set already detects ambiguous bare UUIDs, and complete ChecklistItem values can already produce full-row insertion patches.
+
+Qualified references and grammar
+
+T54. Change editing to item-first grammar: edit <item> note, edit <item> copy <target-group>, and edit <item> move <target-group>. Target group names remain tail words so the REPL keeps its simple whitespace parser and supports names containing spaces.
+T55. Parse qualified source references at the final slash. Continue accepting one-based list positions and bare RowKey UUIDs when globally unique.
+T56. Resolve item references through ChecklistSession and pass one resolved ChecklistItemId into working-set mutations. Resolve local/ROW_UUID directly; resolve GROUP_SELECTOR/ROW_UUID through exact unique group-name or UUID rules.
+T57. Display local/ROW_UUID for process-local items; UNIQUE_NAME/ROW_UUID only when the name is unambiguous, is not the reserved word local, and contains no whitespace; otherwise display GROUP_UUID/ROW_UUID. Ambiguous bare UUID errors list canonical qualified candidates.
+
+Copy behaviour
+
+T58. Copy the source's complete current ChecklistItem into the target group under the same RowKey, stage a complete target upsert, and keep the source unchanged.
+T59. Reject a target association equal to the source association and reject an existing target with different contents. Treat an identical existing target as idempotent success so retries do not overwrite divergent data.
+
+Move behaviour
+
+T60. Track pending moves in ChecklistWorkingSet. Keep the source visible while the target is pending, exclude pending move sources from ordinary dirty publication, and publish the complete target upsert through the d03.4 synchroniser first.
+T61. After target success, remove a process-local or never-published source locally. For an existing replicated source, submit a source tombstone in a second transfer phase using the updated composite read token.
+T62. Target failure leaves the source visible and the target dirty for retry. Source-delete failure leaves both copies visible and the pending move eligible for retry; it never reports the move as complete.
+T63. Re-running move after restart may treat an identical clean target as already confirmed and proceed with source deletion. Pending intent itself remains process-local, and process-local source loss on restart remains documented rather than gaining persistence or crash-atomic semantics.
+T64. Reject overlapping pending transfers and same-association moves so one source or target cannot participate in conflicting local transfer state.
+
+Synchronisation integration and reporting
+
+T65. Extend ChecklistSyncReport with explicit move-target and move-source-delete phases. A failed move target prevents its source phase but does not block unrelated groups or transfers.
+T66. Group multiple eligible source tombstones for the same group into one second-phase publication where possible. Advance the read token and clear transfer state only after the corresponding publication succeeds.
+T67. Preserve d03.4 listener-drain gating: apply listener events only after ordinary changes and every eligible transfer phase complete without a real-group failure.
+
+Coverage and documentation
+
+T68. Add parser, resolver, canonical-display, collision, idempotency, local-source, dirty-source, target-failure, source-failure, retry, restart, overlapping-transfer, and UUID-preservation tests.
+T69. Add handler and two-runtime coverage demonstrating copy convergence, move target-before-source ordering, safe duplicated state after partial failure, explicit retry, and independent transfers across several groups.
+T70. Update the replicated-checklist scenario runbook using repository OKF conventions with qualified references, item-first grammar, copy/move commands, partial-failure recovery, and the process-local lifetime limitation.
+
+Acceptance
+
+T71. Items sharing one RowKey across associations remain separately addressable through canonical qualified references.
+T72. Copy and move preserve RowKey, reject unsafe collisions, and never delete a move source before target confirmation.
+T73. Partial move failures retain a visible recoverable state, and a retry can complete without overwriting divergent target data.
+T74. Transfer-aware sync continues independent work, reports both phases, and drains listeners only after safe completion.
+
+Estimate
+
+T75. Approximately 700-1,000 LOC: 180-260 LOC for grammar and resolution, 260-380 LOC for transfer state and sync integration, and 260-360 LOC for tests and documentation. If implementation exceeds 1,000 LOC, parser/resolution and transfer execution are the clean review boundaries, but this child is intended to remain one cohesive transfer slice."""
+status = "open"
+type = "task"
+priority = 2
+blocked_by = ["019f8396-c396-75b2-a651-2866f60b79a9"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-25T12:21:32.300965Z"
+updated_at = "2026-07-25T12:21:38.894129Z"

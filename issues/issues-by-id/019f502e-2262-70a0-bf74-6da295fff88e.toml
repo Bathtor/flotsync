@@ -2,62 +2,70 @@ id = "019f502e-2262-70a0-bf74-6da295fff88e"
 ref = "flotsync-git-d03"
 title = "Support dynamic groups in replicated checklist"
 body = """
-Goal:
-G01. Turn the replicated checklist into a dynamic multi-group application that creates and accepts groups through the running replication runtime, keeps one heterogeneous checklist working set, and no longer depends on one statically configured group.
+Goal
 
-Current state:
-C01. The replication runtime already creates groups, persists and reloads group material, delivers invitations, supports membership-change machinery, and can host several groups.
-C02. The checklist still requires one configured group, installs it during key setup/startup, keeps a group-fixed working set, and rejects group invitations.
-C03. Optional names currently travel on invitations and membership-change requests but are not part of create-group requests or active persisted group records, so creator-side names and restart-safe names are incomplete.
-C04. The security store can query keys for a supplied member or fingerprint but cannot enumerate all known member identities; the group-creation wizard therefore needs a narrow read-only enumeration/report API.
-C05. flotsync-git-d03 blocks flotsync-git-1i3. After this epic removes the static checklist bridge, flotsync-git-1i3 will reassess the remaining group-independent local-public-key provisioning boundary.
+G01. Turn the replicated checklist into a dynamic multi-group application that creates and accepts groups through the running replication runtime, keeps one heterogeneous checklist working set, synchronises every dirty real group, and supports safe UUID-preserving item transfer without a statically configured group.
 
-Agreed behaviour:
+Current state
+
+C01. flotsync-git-d03.1 is complete: optional group names and messages flow through the API, runtime, storage, invitations, and membership-change proposals.
+C02. flotsync-git-d03.2 is complete: only keys init-local remains a top-level command, while runtime-backed key export, inspection, trust, and blocking run inside the REPL.
+C03. flotsync-git-d03.3 is complete: the checklist starts with zero or several groups, loads one heterogeneous working set, manages an explicit session default, creates named groups, and mediates invitations.
+C04. The working set already scopes each RowKey by Local or Group association, tracks dirty groups, detects ambiguous bare UUIDs, and carries one opaque multi-group ReadToken.
+C05. flotsync-git-d03.4 now owns transfer-agnostic all-group synchronisation and automatic repair of a non-writable default. flotsync-git-d03.5 owns qualified references and copy/move semantics after the generic synchroniser exists.
+C06. This epic blocks flotsync-git-1i3. After the final children remove the remaining checklist limitations, flotsync-git-1i3 will reassess the group-independent local-public-key provisioning boundary.
+
+Agreed behaviour
+
 B01. Checklist configuration retains only local identity, store, profile, runtime, route, and schema inputs. It contains no static group id, ordered member list, group secret, or configured default.
-B02. Only `keys init-local <config>` remains a top-level command. `keys export-local`, `keys inspect`, `keys trust`, and `keys block` run inside the normal REPL through the already-unlocked runtime. Blocking may consume a pasted public bundle and derive its fingerprint.
-B03. `group create <name>` starts a wizard rather than accepting option flags. The wizard first lists known member identities from the database with enough usability/trust information to explain invalid selections, then prompts for the membership list, validates local membership and duplicates, presents a summary, and creates only after confirmation.
-B04. The workspace loads all readable groups. It tracks optional names, displays and resolves an exact unique name preferentially, reports ambiguity with candidate UUIDs, and always accepts a group UUID as the unambiguous fallback.
-B05. No group becomes default implicitly. `group default <group>` selects one real group as the session default and `group clear-default` removes that selection. Creation, invitation acceptance, and restart do not choose a default.
-B06. Plain `add` has no group argument. With a selected default it creates the item in that real group; without one it creates an unassociated process-local item. Unassociated items are intentionally lost when the process exits in this slice.
-B07. The application has one heterogeneous working set. Each item records whether it is unassociated or belongs to a real group; display order, listener ingestion, and read position are workspace concerns. Publication partitions pending work by group only when synchronising.
-B08. Item references expose origin: `local/ROW_UUID` for unassociated items, `GROUP_NAME/ROW_UUID` when the name is unique, and `GROUP_UUID/ROW_UUID` when a name is absent or ambiguous. A bare row UUID is accepted only when it resolves globally to exactly one current item.
-B09. Item editing uses item-first syntax: `edit <item> note`, `edit <item> move <new-group>`, and `edit <item> copy <new-group>`. No source group is supplied because the item reference determines it.
-B10. Copy and move preserve the source RowKey UUID while constructing a distinct target RowId from the target group. Copy retains the source. Move publishes the target upsert before submitting the source delete, so a partial failure can duplicate an item but does not lose it.
-B11. Unqualified `sync` drains pending events and synchronises every dirty real group sequentially. It submits one group per replication request and skips unassociated items until they are copied or moved into a real group.
-B12. The checklist exposes group listing, creation, invitation inspection, acceptance, and rejection. Membership-change commands remain outside this epic even though the runtime supports them.
+B02. Only keys init-local <config> remains a top-level command. keys export-local, keys inspect, keys trust, and keys block run inside the normal REPL through the already-unlocked runtime.
+B03. group create <name> starts a flag-free wizard that lists known member identities and trust summaries, prompts for ordered members, validates the proposal, displays a summary, and requires confirmation.
+B04. The workspace loads all readable groups, tracks optional names, resolves exact unique names preferentially, reports ambiguity with candidate UUIDs, and always accepts a group UUID as fallback.
+B05. No group becomes default implicitly. group default <group> selects one writable real group and group clear-default removes the session-only selection. A lifecycle change may hand an existing default to its writable successor or clear it.
+B06. Plain add targets the selected default or creates an unassociated process-local item when no default exists. Unassociated items intentionally disappear when the process exits.
+B07. The application has one heterogeneous working set. Each item records whether it is unassociated or belongs to a real group; display order, listener ingestion, and read position are workspace concerns.
+B08. One unqualified sync submits every dirty real group sequentially through separate replication requests, advances the composite token after each success, continues after independent failures, reports every outcome, and never submits process-local items.
+B09. Listener events are applied after complete real-group publication success and remain pending after partial failure so they cannot overwrite unsynchronised local rows.
+B10. Item references expose origin through local/ROW_UUID, a safe unique GROUP_NAME/ROW_UUID, or GROUP_UUID/ROW_UUID. A bare row UUID is accepted only when globally unique.
+B11. Item editing uses edit <item> note, edit <item> move <new-group>, and edit <item> copy <new-group>. The item reference determines the source.
+B12. Copy and move preserve RowKey while constructing a target RowId in the requested group. Copy retains the source. Move confirms the target upsert before submitting a replicated source tombstone.
+B13. Membership-change commands remain outside this epic even though the runtime supports the underlying machinery.
 
-Ordered children:
-S01. `flotsync-git-d03.1` — persist active replication group names.
-S02. `flotsync-git-d03.2` — move checklist key management into a zero-group REPL; blocked by S01.
-S03. `flotsync-git-d03.3` — build the heterogeneous multi-group checklist workspace and creation/invitation flow; blocked by S02.
-S04. `flotsync-git-d03.4` — add qualified item transfer and all-group synchronisation; blocked by S03.
-S05. Implement strictly in S01 -> S02 -> S03 -> S04 order. Each child body contains its self-contained plan, acceptance criteria, and LOC estimate.
+Ordered children
 
-Out of scope:
+S01. flotsync-git-d03.1 — persist active replication group names; completed.
+S02. flotsync-git-d03.2 — move checklist key management into a zero-group REPL; completed after S01.
+S03. flotsync-git-d03.3 — build the heterogeneous multi-group workspace and creation/invitation flow; completed after S02.
+S04. flotsync-git-d03.4 — add transfer-agnostic all-group synchronisation, partial-failure reports, safe listener draining, and default lifecycle repair; blocked by S03.
+S05. flotsync-git-d03.5 — add qualified references and UUID-preserving copy/move recovery; blocked by S04 so it can extend the generic synchroniser with target-before-source phases.
+S06. Complete S04 before S05. Each child body contains its current self-contained plan, acceptance criteria, and LOC estimate.
+
+Out of scope
+
 O01. Checklist commands for changing membership of an active group.
 O02. Replication-level stable record identity across group changes; flotsync-git-pvp owns that design. UUID preservation here is an application convention.
 O03. Persistence of unassociated local checklist items.
-O04. Atomic or crash-recoverable cross-group move. Target-first sequencing is sufficient for this example slice.
-O05. Full hierarchical identity trust/revocation, relay-assisted key lookup, and mDNS discovery unless the selected scenario specifically needs them.
-O06. Final ownership or replacement of `load_local_public_key_bundle`; flotsync-git-1i3 reassesses it after this epic.
+O04. Atomic or crash-recoverable cross-group move. Target-first sequencing and explicit retry are sufficient for this example.
+O05. Full hierarchical identity trust or revocation, relay-assisted key lookup, and mDNS discovery unless a selected scenario specifically needs them.
+O06. Final ownership or replacement of load_local_public_key_bundle; flotsync-git-1i3 reassesses it after this epic.
 
-Acceptance:
-A01. A checklist peer starts without any preconfigured group and can still use REPL key operations without repeated keychain prompts.
-A02. A named group can be created through the wizard from database-known members, and an invited peer can inspect, accept, persist, reload, and display it.
-A03. Several created or accepted groups coexist in one checklist working set and remain distinct across restart.
-A04. Unique names work as selectors; missing or ambiguous names fall back to UUID-qualified display and resolution with actionable ambiguity errors.
-A05. The explicit default can be selected and cleared; plain add targets it or creates a process-local unassociated item when none is selected.
-A06. Qualified item references resolve their source, copy/move preserve the RowKey UUID, and move follows target-upsert-before-source-delete ordering.
-A07. One sync command submits all dirty real groups one by one and reports per-group failures without preventing later independent groups from being attempted.
-A08. Unit and integration tests cover name persistence, zero-group startup, REPL key operations, the creation wizard, invitations, mixed-group state, selectors, default behaviour, transfer failure semantics, restart, and sequential all-group sync.
-A09. Scenario documentation reflects the flag-free REPL grammar, explicit session default, local-item lifetime, name ambiguity rules, and static/custom route assumptions.
+Acceptance
 
-Estimate and split rationale:
-E01. S01: approximately 400-650 LOC across API/runtime/store and tests.
-E02. S02: approximately 350-550 LOC, with substantial deletion of static setup code.
-E03. S03: approximately 750-1,050 LOC because it includes the enumeration/report API, wizard, invitations, and heterogeneous workspace.
-E04. S04: approximately 600-900 LOC across selectors, transfer/sync orchestration, integration tests, and documentation.
-E05. Total expected change is roughly 2,100-3,150 LOC, well over 1,000 LOC. The four ordered children are self-contained review boundaries and avoid one oversized implementation change."""
+A01. A checklist peer starts without a preconfigured group and can use REPL key operations without repeated keychain prompts.
+A02. A named group can be created through the wizard, and an invited peer can inspect, accept, persist, reload, and display it.
+A03. Several created or accepted groups coexist in one working set and remain distinct across restart.
+A04. The explicit default can be selected and cleared, and a stale non-writable default moves to an available Open successor or is cleared.
+A05. One sync attempts all dirty real groups one by one, preserves failed dirty state, continues later independent groups, reports every outcome, and gates listener application safely.
+A06. Qualified references resolve their source, copy and move preserve RowKey, collisions are rejected, and move follows target-upsert-before-source-delete ordering.
+A07. Unit, handler, and integration tests cover the completed foundation, all-group sync, lifecycle repair, selectors, transfer failures, retry, restart, and several groups across peers.
+A08. Scenario documentation reflects the flag-free REPL grammar, explicit default, local-item lifetime, all-group sync, name ambiguity, transfer recovery, and route assumptions.
+
+Estimate and split rationale
+
+E01. Completed children S01-S03 established the API/runtime metadata, REPL key workflow, and heterogeneous workspace.
+E02. S04 is estimated at 550-850 LOC across generic synchronisation, lifecycle repair, tests, and documentation.
+E03. S05 is estimated at 700-1,000 LOC across qualified references, transfer state, synchronisation integration, tests, and documentation.
+E04. Separating S04 from S05 keeps the generic all-group publisher reviewable without transfer state, while S05 can build target-before-source execution on a tested sequential synchronisation foundation."""
 status = "in-progress"
 status_reason = "plan agreed"
 type = "task"
@@ -73,9 +81,10 @@ children = [
     "019f8396-1861-7951-b169-fbd0fff06213",
     "019f8396-66d1-72c1-8fb0-0d2fffd66313",
     "019f8396-c396-75b2-a651-2866f60b79a9",
+    "019f9939-3a0c-70a3-9e1f-8239fde87582",
 ]
 created_at = "2026-07-11T07:57:08.578406Z"
-updated_at = "2026-07-21T07:33:03.037505Z"
+updated_at = "2026-07-25T12:22:48.077421Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5a616611082a"
