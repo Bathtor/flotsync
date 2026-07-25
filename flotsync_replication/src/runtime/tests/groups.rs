@@ -55,7 +55,7 @@ fn create_group_persists_membership_across_runtime_restart() {
         [(dataset_id.clone(), title_schema_static())],
     );
     let first_listener = Arc::new(ListenerStub::default());
-    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener);
+    let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), first_listener.clone());
     let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
         group_name: Some("  shared docs  ".to_owned()),
         message: Some(String::new()),
@@ -63,6 +63,12 @@ fn create_group_persists_membership_across_runtime_restart() {
         group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
+    let creation_events = first_listener.captured_data_changes();
+    assert_eq!(creation_events.len(), 1);
+    assert!(creation_events[0].rows.is_empty());
+    let creation_tokens = first_listener.captured_data_change_read_tokens();
+    assert_eq!(creation_tokens.len(), 1);
+    assert!(creation_tokens[0].group_version(&group_id).is_some());
     let created = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(created.group_name.as_deref(), Some("shared docs"));
     assert_eq!(created.message.as_deref(), Some(""));
@@ -698,6 +704,14 @@ fn active_group_invitation_replay_refreshes_metadata_without_reopening_decision(
         panic!("expected invitation event");
     };
     wait_for_test_reply(respond.accept()).expect("invitation should activate");
+    listener.wait_for_data_change_count(1);
+    assert_eq!(
+        listener.captured_data_changes(),
+        vec![CapturedDataChange { rows: Vec::new() }]
+    );
+    let activation_tokens = listener.captured_data_change_read_tokens();
+    assert_eq!(activation_tokens.len(), 1);
+    assert!(activation_tokens[0].group_version(&group_id).is_some());
 
     let mut replay = invitation;
     replay.group_name = Some(String::new());

@@ -202,38 +202,6 @@ fn decode_pasteable_public_bundle(
     })
 }
 
-/// Read one fail-closed confirmation from standard input.
-fn confirm(prompt: &str) -> Result<bool, ReplicatedChecklistError> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush().context(repl_error::IoSnafu {
-        action: "flushing confirmation prompt",
-    })?;
-    let mut answer = String::new();
-    let bytes_read = io::stdin()
-        .read_line(&mut answer)
-        .context(repl_error::IoSnafu {
-            action: "reading confirmation",
-        })?;
-    if bytes_read == 0 {
-        return Ok(false);
-    }
-    parse_confirmation(&answer)
-}
-
-/// Parse one confirmation answer while rejecting unrecognised input.
-fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
-    let answer = answer.trim();
-    if answer.is_empty() || answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("no") {
-        return Ok(false);
-    }
-    if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
-        return Ok(true);
-    }
-    Err(ReplicatedChecklistError::InvalidConfirmationResponse {
-        response: answer.to_owned(),
-    })
-}
-
 /// Store the local public-key binding needed by later member enumeration.
 async fn store_observed_public_key_binding(
     store: &dyn ReplicationStore,
@@ -388,27 +356,6 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<MigrationId, ApiError>> + Send + '_>> {
             panic!("checklist key tests must not change membership")
         }
-    }
-
-    #[test]
-    fn confirmation_distinguishes_yes_no_and_unexpected_answers() {
-        assert!(parse_confirmation("y").expect("y should confirm"));
-        assert!(parse_confirmation(" YES ").expect("yes should confirm"));
-        assert!(!parse_confirmation("").expect("empty input should cancel"));
-        assert!(!parse_confirmation("N").expect("n should cancel"));
-        assert!(!parse_confirmation("no").expect("no should cancel"));
-
-        let error = parse_confirmation("ABSOLUTE GASBEHVBEWVBWEKC")
-            .expect_err("unexpected confirmation should fail");
-        assert!(matches!(
-            &error,
-            ReplicatedChecklistError::InvalidConfirmationResponse { response }
-                if response == "ABSOLUTE GASBEHVBEWVBWEKC"
-        ));
-        assert_eq!(
-            error.to_string(),
-            "Unexpected confirmation response \"ABSOLUTE GASBEHVBEWVBWEKC\"; enter y/yes to continue or n/no to cancel."
-        );
     }
 
     #[test]

@@ -252,6 +252,10 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
         ..Default::default()
     }))
     .expect("create_group should succeed");
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange { rows: Vec::new() }]
+    );
     let row_id = test_row_id(group_id, dataset_id, 39);
 
     let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
@@ -268,12 +272,15 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
 
     assert_eq!(
         fixture.listener.captured_data_changes(),
-        vec![CapturedDataChange {
-            rows: vec![CapturedRowChange::Upsert {
-                row_id,
-                title: "local event".to_owned(),
-            }],
-        }]
+        vec![
+            CapturedDataChange { rows: Vec::new() },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "local event".to_owned(),
+                }],
+            },
+        ]
     );
 }
 

@@ -220,6 +220,7 @@ use listeners::{
     ListenerDataChangeBatches,
     ListenerDataChanges,
     notify_listener_batches,
+    notify_listener_data_change,
     notify_listener_data_changes,
     notify_pending_activation_data_changes,
 };
@@ -3480,6 +3481,37 @@ impl ReplicationRuntimeComponent {
         Handled::OK
     }
 
+    /// Persist and install a prepared local group, notify the application, and invite peers.
+    async fn complete_group_creation(
+        &mut self,
+        group_id: GroupId,
+        record: ReplicationGroupRecord,
+        group_setup: &GroupSetupMessage,
+        invitation_payload: &bytes::Bytes,
+    ) -> Result<GroupId, ApiError> {
+        let persisted_group = self
+            .store_new_replication_group(record)
+            .await
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        let read_token = Self::read_token_from_groups(std::iter::once(persisted_group.clone()));
+        self.install_group_membership_view(persisted_group)
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        notify_listener_data_change(
+            self.listener.clone(),
+            ListenerDataChanges {
+                read_token,
+                row_changes: Vec::new(),
+            },
+        )
+        .await
+        .boxed()
+        .context(ApiExternalSnafu)?;
+        self.submit_group_creation_invitation_messages(group_id, group_setup, invitation_payload);
+        Ok(group_id)
+    }
+
     fn handle_create_group(
         &mut self,
         ask: Ask<CreateGroupRequest, Result<GroupId, ApiError>>,
@@ -3552,25 +3584,14 @@ impl ReplicationRuntimeComponent {
                 group_schema,
                 prepared_setup.security_material,
             );
-            let persisted_group = async_self.store_new_replication_group(record).await;
-            let reply = match persisted_group {
-                Ok(persisted_group) => {
-                    match async_self.install_group_membership_view(persisted_group) {
-                        Ok(()) => {
-                            async_self.submit_group_creation_invitation_messages(
-                                group_id,
-                                &prepared_setup.group_setup,
-                                &invitation_payload,
-                            );
-                            Ok::<GroupId, GroupInstallError>(group_id)
-                                .boxed()
-                                .context(ApiExternalSnafu)
-                        }
-                        Err(error) => Err(error).boxed().context(ApiExternalSnafu),
-                    }
-                }
-                Err(error) => Err(error).boxed().context(ApiExternalSnafu),
-            };
+            let reply = async_self
+                .complete_group_creation(
+                    group_id,
+                    record,
+                    &prepared_setup.group_setup,
+                    &invitation_payload,
+                )
+                .await;
             async_self.reply_api(promise, "create_group", reply);
             Handled::OK
         })

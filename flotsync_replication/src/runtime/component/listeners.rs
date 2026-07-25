@@ -30,27 +30,35 @@ pub(super) async fn notify_listener_data_changes(
         if event_batch.row_changes.is_empty() {
             continue;
         }
-        listener
-            .on_event(ReplicationEvent::DataChanged {
-                read_token: event_batch.read_token,
-                rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
-            })
-            .await?;
+        notify_listener_data_change(listener.clone(), event_batch).await?;
     }
     Ok(())
 }
 
-/// Notify listeners when accepted pending activation produced externally visible rows.
+/// Notify the listener about one batch, including an empty batch that advances its read position.
+pub(super) async fn notify_listener_data_change(
+    listener: Arc<dyn ReplicationEventListener>,
+    event_batch: ListenerDataChanges,
+) -> Result<(), ListenerError> {
+    listener
+        .on_event(ReplicationEvent::DataChanged {
+            read_token: event_batch.read_token,
+            rows: Box::new(VecRowProvider::new(event_batch.row_changes)),
+        })
+        .await
+}
+
+/// Notify the listener after accepted activation, including an empty initial snapshot.
 pub(super) async fn notify_pending_activation_data_changes(
     listener: Arc<dyn ReplicationEventListener>,
     outcome: PendingGroupActivationOutcome,
 ) -> Result<(), ListenerError> {
-    notify_listener_data_changes(
+    notify_listener_data_change(
         listener,
-        smallvec![ListenerDataChanges {
+        ListenerDataChanges {
             read_token: outcome.read_token,
             row_changes: outcome.row_changes,
-        }],
+        },
     )
     .await
 }

@@ -197,6 +197,10 @@ fn publish_changes_delivers_remote_data_changed_event() {
     }))
     .expect("create_group should succeed");
     bob_fixture.wait_for_group_install(group_id);
+    assert_eq!(
+        bob_fixture.listener().wait_for_next_data_change(),
+        CapturedDataChange { rows: Vec::new() }
+    );
     let row_id = test_row_id(group_id, dataset_id.clone(), 11);
 
     let read_token = snapshot_read_token(alice_fixture.api(), group_id, dataset_id.clone());

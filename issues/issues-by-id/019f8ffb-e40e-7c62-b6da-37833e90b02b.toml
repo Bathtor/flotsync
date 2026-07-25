@@ -1,0 +1,38 @@
+id = "019f8ffb-e40e-7c62-b6da-37833e90b02b"
+ref = "flotsync-git-c9m"
+title = "Redesign shared group state behind restricted trait-object views"
+body = """
+Objective
+
+R01. Replace concrete SharedGroupMemberships sharing with one authoritative rich group-state snapshot exposed through restricted trait-object views.
+
+Scope
+
+R02. Inventory the group-state needs of routing, delivery, runtime, summary/catch-up, replication APIs, and applications.
+
+R03. Define an immutable underlying group-state model containing canonical membership plus runtime metadata such as group name, schema, and lifecycle. Invitation and membership-change messages remain pending-event metadata rather than group state.
+
+R04. Define object-safe read-only views for component consumers and application consumers. Each view exposes only the capabilities its consumers require and does not permit mutation.
+
+R05. Preserve one authoritative atomically replaceable snapshot, using ArcSwap or a justified successor, with adapters or trait objects over that same data rather than separately maintained maps.
+
+R06. Add a public ReplicationApi snapshot or query based on the restricted application view and document its snapshot-freshness semantics.
+
+R07. Centralise group creation, activation, lifecycle, membership-change, and replay updates so every view changes from the same atomic state transition.
+
+R08. Remove direct ReplicationStore reads from applications, including the temporary checklist workaround introduced by flotsync-git-d03.3.3.
+
+R09. Cover restricted capabilities, atomic snapshot replacement, name/schema/lifecycle updates, component consumers, and the application-facing API with focused tests.
+
+Planning note
+
+R10. This is expected to exceed 1,000 LOC because it crosses core, replication runtime, component crates, and public APIs. Align on the model first, then split implementation into independently reviewable children by view/API and consumer migration."""
+status = "open"
+type = "task"
+priority = 1
+created_at = "2026-07-23T17:17:57.646019Z"
+updated_at = "2026-07-23T17:18:00.718816Z"
+
+[[links]]
+target = "019f8588-bbc6-7523-87d2-6d5e83939248"
+label = "discovered from"

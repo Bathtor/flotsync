@@ -793,11 +793,17 @@ pub trait GroupInvitationResponder: Send {
     /// Accept the invitation into local activation state.
     ///
     /// Empty and inline initial snapshots activate before this call succeeds.
+    /// On success, the activated snapshot's rows and read position have also
+    /// been delivered through [`ReplicationEventListener`] as a
+    /// [`ReplicationEvent::DataChanged`] event. Applications should ingest the
+    /// activation through that listener event rather than independently loading
+    /// the same snapshot.
     /// Metadata-only snapshots are not fetchable by the current runtime and
     /// therefore cannot be accepted yet.
     fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
 
-    /// Refuse to join the invited group.
+    /// Refuse to join the invited group with the supplied reason and remove the
+    /// pending invitation from local storage.
     fn reject(self: Box<Self>, reason: RejectionReason)
     -> BoxFuture<'static, Result<(), ApiError>>;
 }
@@ -810,10 +816,15 @@ pub trait MigrationProposalResponder: Send {
     ///
     /// Empty and inline initial snapshots activate the new group before this
     /// call succeeds. Metadata-only snapshots are not fetchable by the current
-    /// runtime and therefore cannot be accepted yet.
+    /// runtime and therefore cannot be accepted yet. On success, the activated
+    /// snapshot's rows and read position have also been delivered through
+    /// [`ReplicationEventListener`] as a [`ReplicationEvent::DataChanged`]
+    /// event; applications should ingest activation through that event rather
+    /// than independently loading the same snapshot.
     fn accept(self: Box<Self>) -> BoxFuture<'static, Result<(), ApiError>>;
 
-    /// Refuse the proposed migration.
+    /// Refuse the proposed migration with the supplied reason and remove the
+    /// pending proposal from local storage.
     fn reject(self: Box<Self>, reason: RejectionReason)
     -> BoxFuture<'static, Result<(), ApiError>>;
 }
@@ -943,6 +954,11 @@ pub trait ReplicationApi: Send + Sync {
     /// messages to the configured remote members, and returns the newly allocated
     /// [`GroupId`]. New groups are created empty; callers publish initial
     /// dataset contents through ordinary [`Self::publish_changes`] updates.
+    /// Before returning successfully, the runtime delivers an empty
+    /// [`ReplicationEvent::DataChanged`] event containing the new group's read
+    /// position through [`ReplicationEventListener`]. Applications should merge
+    /// that event into their stored [`ReadToken`] before publishing the first
+    /// dataset changes for the group.
     /// Locally supplied names are trimmed and rejected if the result is empty;
     /// messages are stored verbatim and may be empty.
     ///

@@ -254,6 +254,24 @@ pub enum ChecklistKeyCommand {
 pub enum ChecklistGroupCommand {
     /// List every readable group known to this workspace.
     List,
+    /// Create a named replication group through a short interactive wizard.
+    Create {
+        /// Group name. Remaining words form one name.
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        name: Vec<String>,
+    },
+    /// List pending group invitations awaiting a local decision.
+    Invitations,
+    /// Accept one pending invitation by its displayed position.
+    Accept {
+        /// Positive invitation position from `group invitations`.
+        invitation: NonZeroUsize,
+    },
+    /// Reject one pending invitation by its displayed position.
+    Reject {
+        /// Positive invitation position from `group invitations`.
+        invitation: NonZeroUsize,
+    },
     /// Select the writable group used by add, members, check, and sync.
     Default {
         /// Exact group UUID or name. Remaining words form one name.
@@ -1432,6 +1450,36 @@ mod tests {
             parse_checklist_command("group list").expect("command should parse"),
             Some(ChecklistCommand::Group {
                 command: ChecklistGroupCommand::List,
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("group create shared errands").expect("command should parse"),
+            Some(ChecklistCommand::Group {
+                command: ChecklistGroupCommand::Create {
+                    name: words(["shared", "errands"]),
+                },
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("group invitations").expect("command should parse"),
+            Some(ChecklistCommand::Group {
+                command: ChecklistGroupCommand::Invitations,
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("group accept 2").expect("command should parse"),
+            Some(ChecklistCommand::Group {
+                command: ChecklistGroupCommand::Accept {
+                    invitation: NonZeroUsize::new(2).expect("two is non-zero"),
+                },
+            })
+        );
+        assert_eq!(
+            parse_checklist_command("group reject 1").expect("command should parse"),
+            Some(ChecklistCommand::Group {
+                command: ChecklistGroupCommand::Reject {
+                    invitation: NonZeroUsize::new(1).expect("one is non-zero"),
+                },
             })
         );
         assert_eq!(
