@@ -11,6 +11,12 @@ pub(crate) trait DeliveryRuntimeHostTestExt {
     fn advertised_loopback_udp_addr(&self) -> SocketAddr;
     /// Publish a direct unicast peer route and wait until delivery components observe it.
     fn publish_direct_peer_route(&self, peer: MemberIdentity, remote_addr: SocketAddr);
+    /// Replace route-establishment watches with test-selected routes.
+    #[cfg(test)]
+    fn replace_route_establishment_watches(
+        &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
+    );
     /// Publish configured static routes after a test has explicitly requested them.
     #[cfg(test)]
     fn publish_preconfigured_peer_routes(&self);
@@ -54,6 +60,18 @@ impl DeliveryRuntimeHostTestExt for DeliveryRuntimeHost {
             routes: vec![route],
         });
         wait_for_direct_peer_route(self.topology(), &peer);
+    }
+
+    #[cfg(test)]
+    fn replace_route_establishment_watches(
+        &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
+    ) {
+        let future = self
+            .topology()
+            .discovery
+            .replace_route_establishment_watches_for_test(watches, self.control_timeout);
+        wait_for_test_reply(future).expect("test route-establishment watches should be replaced");
     }
 
     #[cfg(test)]

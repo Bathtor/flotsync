@@ -125,6 +125,8 @@ message GroupInvitationPayload {
 
   // Local reason this invitation exists: ordinary creation/invitation or a
   // migration where the recipient sees the new group as an invitation.
+  // Pending work may compare this value. After activation, receivers may omit
+  // replay validation because proposed_members[0] still identifies the proposer.
   GroupInvitationSource source = 2;
 
   // Proposed canonical member order for the target group.
@@ -142,15 +144,21 @@ message GroupInvitationPayload {
   //
   // Empty means no rows are present at the activation cut. Inline carries all
   // rows in this payload. Metadata describes a snapshot that must be fetched by
-  // another protocol before the group becomes externally active.
+  // another protocol before the group becomes externally active. Pending work
+  // may compare this value; after activation consumes it, receivers may omit it
+  // from replay validation.
   InitialSnapshot initial_snapshot = 5;
 
-  // Optional display name supplied by the proposer. Absence means no display
-  // name was provided in the proposal payload.
+  // Optional display metadata supplied by the proposer. Presence carries the
+  // proposed group name; absence means no group name. It has no group identity,
+  // membership, or security semantics. Receivers may update or ignore a
+  // metadata-only difference when replaying otherwise matching work.
   optional string group_name = 6;
 
-  // Optional user-facing note supplied by the proposer. Absence means no note
-  // was provided in the proposal payload.
+  // Optional user-facing metadata supplied by the proposer. Presence carries
+  // the proposed message, including an empty string; absence means no message.
+  // It has no protocol semantics. Receivers may update or ignore a metadata-only
+  // difference when replaying otherwise matching work.
   optional string message = 7;
 
   // Private target-group setup protected by reliable delivery.
@@ -195,15 +203,21 @@ message MigrationProposalPayload {
   // Schema changes require migration to a new group.
   repeated DatasetSchema dataset_schemas = 5;
 
-  // Initial target-group dataset state at the migration cut.
+  // Initial target-group dataset state at the migration cut. Pending work may
+  // compare this value; after activation consumes it, receivers may omit it
+  // from replay validation.
   InitialSnapshot initial_snapshot = 6;
 
-  // Optional display name supplied by the proposer. Absence means no display
-  // name was provided in the proposal payload.
+  // Optional display metadata supplied by the proposer. Presence carries the
+  // proposed group name; absence means no group name. It has no group identity,
+  // membership, or security semantics. Receivers may update or ignore a
+  // metadata-only difference when replaying otherwise matching work.
   optional string group_name = 7;
 
-  // Optional user-facing note supplied by the proposer. Absence means no note
-  // was provided in the proposal payload.
+  // Optional user-facing metadata supplied by the proposer. Presence carries
+  // the proposed message, including an empty string; absence means no message.
+  // It has no protocol semantics. Receivers may update or ignore a metadata-only
+  // difference when replaying otherwise matching work.
   optional string message = 8;
 
   // Private target-group setup protected by reliable delivery.

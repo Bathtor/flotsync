@@ -531,10 +531,10 @@ impl fmt::Display for PrimitiveType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::String => f.write_str("STRING"),
-            Self::UInt => f.write_str("U64"),
-            Self::Int => f.write_str("I64"),
-            Self::Byte => f.write_str("U8"),
-            Self::Float => f.write_str("F64"),
+            Self::UInt => f.write_str("UINT"),
+            Self::Int => f.write_str("INT"),
+            Self::Byte => f.write_str("BYTE"),
+            Self::Float => f.write_str("FLOAT"),
             Self::Boolean => f.write_str("BOOL"),
             Self::Binary => f.write_str("BINARY"),
             Self::Date => f.write_str("DATE"),
@@ -658,7 +658,7 @@ mod tests {
 
         assert_eq!(
             schema.to_string(),
-            "SCHEMA (counter U64 NOT NULL USING MONOTONIC_COUNTER, priority U64 NOT NULL USING TOTAL_ORDER_REGISTER(DESC), `profile-bin` ARRAY<BINARY> USING LATEST_VALUE_WINS, status STRING USING TOTAL_ORDER_FSM(['draft', NULL, 'published']), tags ARRAY<STRING> NOT NULL USING LINEAR_LIST, title STRING NOT NULL USING LINEAR_STRING) TBLPROPERTIES (owner='sync', version='1')"
+            "SCHEMA (counter UINT NOT NULL USING MONOTONIC_COUNTER, priority UINT NOT NULL USING TOTAL_ORDER_REGISTER(DESC), `profile-bin` ARRAY<BINARY> USING LATEST_VALUE_WINS, status STRING USING TOTAL_ORDER_FSM(['draft', NULL, 'published']), tags ARRAY<STRING> NOT NULL USING LINEAR_LIST, title STRING NOT NULL USING LINEAR_STRING) TBLPROPERTIES (owner='sync', version='1')"
         );
     }
 
@@ -696,7 +696,7 @@ mod tests {
         };
         assert_eq!(
             data_type.to_string(),
-            "U64 NOT NULL USING TOTAL_ORDER_REGISTER(ASC)"
+            "UINT NOT NULL USING TOTAL_ORDER_REGISTER(ASC)"
         );
     }
 

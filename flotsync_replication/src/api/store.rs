@@ -138,6 +138,10 @@ pub trait ReplicationStoreReadTransaction: Send {
         key_id: &'a MemberKeyId,
     ) -> BoxFuture<'a, Result<Option<MemberPublicKeysRecord>, StoreError>>;
 
+    /// Load every observed member-key identity without returning public key material.
+    fn load_member_public_key_ids(&mut self)
+    -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>>;
+
     /// Load every observed public key material record for one member identity.
     fn load_member_public_keys_for_member<'a>(
         &'a mut self,
@@ -322,7 +326,10 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
         group: ReplicationGroupRecord,
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
-    /// Store group material or confirm an identical record already exists.
+    /// Store group material or refresh metadata on a compatible existing record.
+    ///
+    /// Compatibility requires the same group definition and security material;
+    /// name and message metadata may differ and are replaced when they do.
     fn ensure_replication_group_material(
         &mut self,
         material: ReplicationGroupMaterialRecord,

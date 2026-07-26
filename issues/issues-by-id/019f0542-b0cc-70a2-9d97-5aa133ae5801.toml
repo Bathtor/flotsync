@@ -13,10 +13,16 @@ Reliable delivery persists pending outbound sender work needed to resume retries
 Explore the idea of a Multicast-like request type to reliable delivery so that the individual messages don't have to be created all at once at the replication component level."""
 status = "open"
 type = "task"
-priority = 2
+priority = 1
 created_at = "2026-05-17T06:59:09Z"
-updated_at = "2026-05-29T14:42:04Z"
+updated_at = "2026-07-26T09:50:56.234104Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-55b3320f74ae"
 label = "discovered from"
+
+[[comments]]
+id = "019f9dd5-b4ea-7a20-8dfb-f61b698fdd87"
+author = "Codex"
+body = "Promoted from P2 to P1 after manual replicated-checklist testing confirmed that creator restarts lose unacknowledged group invitations, preventing automatic resend and making normal multi-node workflows unnecessarily fragile."
+created_at = "2026-07-26T09:50:56.234104Z"

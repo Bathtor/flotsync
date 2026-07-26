@@ -7,7 +7,8 @@ status: draft
 
 # Replicated Checklist Manual Scenarios
 
-This runbook covers the manual acceptance scenarios for `flotsync-5j0.9`.
+This runbook covers manual acceptance scenarios for the replicated-checklist
+example application.
 
 The steps use the names `alice` and `bob`. If your local config uses different member names, map
 `alice` to the first terminal/machine and `bob` to the second. The checked-in examples in
@@ -22,21 +23,12 @@ traffic between the peers.
 
 ## Setup
 
-Build or run the checklist binary from the repository root:
+Initialise local identity material, then start each peer from the repository
+root:
 
 ```bash
 cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local alice.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local bob.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local alice.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys export-local bob.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys inspect alice.toml BOB_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys inspect bob.toml ALICE_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys trust alice.toml bob BOB_PUBLIC_BUNDLE
-cargo run -p flotsync_io_examples --bin replicated_checklist -- \
-  keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
 ```
@@ -46,24 +38,36 @@ For a release binary:
 ```bash
 target/release/replicated_checklist keys init-local alice.toml
 target/release/replicated_checklist keys init-local bob.toml
-target/release/replicated_checklist keys export-local alice.toml
-target/release/replicated_checklist keys export-local bob.toml
-target/release/replicated_checklist keys inspect alice.toml BOB_PUBLIC_BUNDLE
-target/release/replicated_checklist keys inspect bob.toml ALICE_PUBLIC_BUNDLE
-target/release/replicated_checklist keys trust alice.toml bob BOB_PUBLIC_BUNDLE
-target/release/replicated_checklist keys trust bob.toml alice ALICE_PUBLIC_BUNDLE
 target/release/replicated_checklist run alice.toml
 target/release/replicated_checklist run bob.toml
 ```
 
-Each peer first creates or reuses local identity keys in its configured store.
-Copy the `public bundle (copy this value)` output from `keys export-local` to
-the opposite peer, inspect it if desired, then trust it for the exact peer
-identity before first `run`. Each config needs `store-secret-profile` and the
-temporary `group-secret-password`. The profile selects a device-local
-store-secret slot. The group password remains a temporary static-group setup
-bridge for the current security MVP and must match across peers in the same
-group.
+Inside each running REPL, print the local bundle:
+
+```text
+keys export-local
+```
+
+Copy the printed bundle to the opposite peer. Alice can assess and trust Bob as
+follows; Bob performs the corresponding commands with Alice's bundle:
+
+```text
+keys inspect BOB_PUBLIC_BUNDLE
+keys trust bob BOB_PUBLIC_BUNDLE
+```
+
+Trust prints the assessment and records feedback only after an explicit `y` or
+`yes`. To block key material, supply its public bundle rather than transcribing
+its fingerprint:
+
+```text
+keys block UNTRUSTED_PUBLIC_BUNDLE
+```
+
+Each config needs `local-member`, `store-path`, and `store-secret-profile` in
+the replicated-checklist section. The profile selects a device-local
+store-secret slot. Static group ids, ordered members, and shared group-secret
+passwords are no longer application configuration.
 
 <!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
 proper local store-secret backend exists. -->
@@ -74,10 +78,32 @@ storage and derives the local store secret from the profile string. Changing
 that profile later makes existing local security material unreadable; delete the
 example store and start fresh if you change it.
 
-Use one terminal per peer. In each REPL, run:
+Create the first group on Alice. The creator is inserted automatically at
+member position 0; enter one additional member identity per prompt and submit a
+blank line to finish the member list:
+
+```text
+group create shared checklist
+additional member id (blank to finish)> bob
+additional member id (blank to finish)>
+Create this group and send invitations? [y/N] y
+```
+
+Bob can inspect and accept the listener-delivered invitation:
+
+```text
+group invitations
+group accept 1
+```
+
+Group creation and acceptance do not implicitly select a default. In each
+terminal, inspect the registry and explicitly select the group by its unique
+name or UUID:
 
 ```text
 me
+group list
+group default shared checklist
 members
 ```
 
@@ -85,11 +111,96 @@ Confirm that:
 
 - Alice prints `member: alice` and the expected config path.
 - Bob prints `member: bob` and the expected config path.
-- Both peers list the same group and the same ordered members.
+- Both peers list the same group, display name, lifecycle, and ordered members.
+- `me` reports `shared checklist` as the process-local default after selection.
 
-The examples below use `ROW` when an item should be addressed by row UUID. Get it from `list`; the
-row UUID is printed in parentheses at the end of each row. Using row UUIDs avoids accidental index
-selection when earlier scenarios left extra rows visible.
+For a fresh zero-group store, `me` reports `default group: none`; key and group
+registry commands remain available. `add` without a default creates a
+process-local item. Such items are deliberately skipped by `sync` and disappear
+when the process exits.
+
+The examples below use `ROW` when an item can be addressed by a globally unique
+row UUID. `list` prints a canonical qualified reference in parentheses at the
+end of each row. A bare UUID remains convenient while it is unique; use the
+qualified reference once the same UUID exists in several associations. Either
+form avoids accidental position selection when earlier scenarios left extra
+rows visible.
+
+## Multi-group Defaults and Synchronisation
+
+The default controls only where subsequent `add` commands place new items.
+Existing rows retain their own group association, and `sync` attempts every
+dirty real group in UUID order regardless of the current default. This keeps
+group selection separate from replication progress.
+
+With two writable groups named `shared checklist` and `work`, one peer can stage
+changes in both before a single sync:
+
+```text
+group default shared checklist
+add buy tea
+group default work
+add prepare status report
+group clear-default
+sync
+```
+
+Expected result:
+
+- The sync report contains one outcome for each dirty real group.
+- Both groups are published even though the default was cleared before `sync`.
+- A failed group remains dirty and is named in the report, while later groups
+  are still attempted.
+- Listener batches remain pending when any group publication fails; rerunning
+  `sync` retries the failed group before listener changes are applied.
+- Process-local items are counted in the report but never submitted.
+
+If a selected group becomes read-only or closed after an accepted membership
+change, the next registry refresh follows its successor chain. The first open
+successor becomes the new default; if no open successor is available, the
+default is cleared and the REPL reports why.
+
+## Qualified References and Item Transfer
+
+Every item keeps its row UUID when copied or moved. Because the same UUID may
+therefore appear in several groups, `list`, `show`, and `events` expose a
+canonical qualified reference:
+
+- process-local items use `local/ROW_UUID`;
+- a uniquely named group without whitespace uses `GROUP_NAME/ROW_UUID`;
+- ambiguous names, the reserved name `local`, and names containing whitespace
+  fall back to `GROUP_UUID/ROW_UUID`.
+
+Commands still accept a one-based list position or a bare UUID when that UUID
+is unique. An ambiguous bare UUID is rejected and the error lists its canonical
+qualified candidates. Qualified source references split at the final `/`, so a
+group name may itself contain `/` as long as it contains no whitespace.
+
+Editing uses item-first syntax. Replace `SOURCE` below with a list position,
+bare UUID, or canonical qualified reference. Target group names are the
+remaining words and may contain spaces:
+
+```text
+edit SOURCE note
+edit SOURCE copy work
+edit SOURCE move shared checklist
+```
+
+`copy` stages a complete target row under the same UUID and leaves the source
+unchanged. `move` stages the same target row and immediately removes the source
+from the visible working set. A previously replicated source becomes an
+ordinary tombstone; a process-local or never-published source simply
+disappears.
+
+Both target upserts and source tombstones are published by the next ordinary
+all-group `sync` in group UUID order. This example intentionally does not make
+move target-first or atomic: a source tombstone can publish before a target
+upsert that later fails. During the same process the complete target remains
+dirty and another `sync` retries it. Replication history retains tombstoned row
+data, but this slice does not automate recovery after restarting the checklist.
+
+An existing target with identical contents is an idempotent success. A target
+with different contents is rejected and never overwritten.
 
 ## Scenario 1: Concurrent Adds
 
@@ -280,7 +391,7 @@ Expected result:
 ## Scenario 4: Restart Keeps Durable Runtime State
 
 Goal: a peer can stop and restart with the same store path and continue participating in the same
-configured group.
+persisted groups.
 
 Start from two running peers with the same config and stores.
 
@@ -298,6 +409,8 @@ Alice:
 
 ```text
 me
+group list
+group default shared checklist
 members
 add alice after restart
 sync
@@ -313,11 +426,12 @@ list
 Expected result:
 
 - Alice restarts without static-group mismatch or store initialisation errors.
-- Alice reports the same group id, member identity, config path, and store path after restart.
+- Alice reports the same group ids, member identity, config path, and store path after restart.
+- Alice starts without a default and explicitly selects one again because the
+  default is process-local session state.
+- Stored checklist snapshots repopulate the readable group rows in Alice's
+  working set.
 - Bob receives `alice after restart` after Bob syncs.
-- The current checklist REPL is an in-process working set; this scenario checks durable runtime
-  state and continued replication, not automatic UI rehydration of previously visible checklist
-  rows.
 
 ## Scenario 5: Custom UDP Discovery Without Static Routes
 

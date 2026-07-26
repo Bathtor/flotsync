@@ -81,8 +81,7 @@ message DiscoverySignature {
   bytes signature_bytes = 2;
 }
 
-// One introduction claim payload that a route is valid for one or more
-// replication groups.
+// One introduction claim payload that a route is valid for a member identity.
 //
 // The encoded bytes of this message are signed exactly as transmitted inside
 // SignedIntroductionClaim.claim_payload.
@@ -102,7 +101,8 @@ message IntroductionClaimPayload {
   // The exact route endpoint the receiver probed.
   SocketAddress route = 5;
 
-  // A 16 byte UUID for each replication group in this route claim.
+  // A 16 byte UUID for each replication group currently hosted by this member.
+  // This field may be empty.
   repeated bytes group_ids = 6;
 }
 

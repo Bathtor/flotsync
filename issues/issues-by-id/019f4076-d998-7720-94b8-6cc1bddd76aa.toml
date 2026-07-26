@@ -1,13 +1,31 @@
 id = "019f4076-d998-7720-94b8-6cc1bddd76aa"
 ref = "flotsync-git-1i3"
 title = "Reassess temporary local public key bundle provisioning API"
-body = "Review load_local_public_key_bundle after replicated-checklist key setup no longer depends on the temporary fixed static-group setup bridge. Decide whether this should remain a replication provisioning API, move behind a narrower example/setup boundary, or disappear in favour of a later key-management surface."
+body = """
+Reassess load_local_public_key_bundle after flotsync-git-d03 removes the replicated-checklist dependency on the temporary fixed static-group setup bridge.
+
+Current understanding:
+C01. The helper itself is already group-independent: it loads encrypted local private-key material and derives the shareable public bundle from the replication store.
+C02. Pre-runtime keys init-local and keys export-local still require this capability.
+C03. The current static-group coupling lives in replicated-checklist config parsing, runner startup, and the init-local/trust side effects rather than in the helper signature or implementation.
+C04. Moving the helper into the example would require exposing or duplicating lower-level encrypted-store handling, so reassessment should preserve that encapsulation.
+
+Scope:
+S01. Review the helper against the decoupled checklist setup produced by flotsync-git-d03.
+S02. Decide whether it should remain a replication provisioning API, move behind a narrower replication-owned setup/key-management boundary, or disappear only if the decoupled flow provides a real replacement.
+S03. Update its API placement, naming, documentation, exports, and focused tests as required by that decision.
+S04. Remove stale fixed-static-group wording and references from the surviving boundary.
+
+Acceptance:
+A01. The decision reflects the post-d03 callers rather than the temporary static-group bridge.
+A02. Local public-bundle initialisation/export remains possible without exposing encrypted store internals to the example.
+A03. The resulting API and documentation describe the actual ownership and stability of the capability."""
 status = "open"
 type = "task"
 priority = 3
-blocks = ["019f502e-2262-70a0-bf74-6da295fff88e"]
+blocked_by = ["019f502e-2262-70a0-bf74-6da295fff88e"]
 created_at = "2026-07-08T06:42:38.616686Z"
-updated_at = "2026-07-11T07:57:18.141448Z"
+updated_at = "2026-07-20T15:31:57.103594Z"
 
 [[links]]
 target = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"

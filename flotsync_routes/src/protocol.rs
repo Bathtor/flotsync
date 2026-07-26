@@ -631,12 +631,6 @@ fn decode_claim_group_ids<'a>(
     raw_group_ids: impl IntoIterator<Item = &'a [u8]>,
     group_count: usize,
 ) -> Result<HashSet<GroupId>, DiscoveryProtocolError> {
-    ensure!(
-        group_count > 0,
-        discovery_protocol_error::EmptyBytesSnafu {
-            field: "IntroductionClaimPayload.group_ids"
-        }
-    );
     let mut group_ids = HashSet::with_capacity(group_count);
     for raw_group_id in raw_group_ids {
         let group_id = group_id_from_wire(raw_group_id, "IntroductionClaimPayload.group_ids")?;
@@ -701,6 +695,33 @@ mod tests {
                 .expect("claim payload view should convert"),
             decoded
         );
+    }
+
+    #[test]
+    fn decodes_claim_payload_without_groups() {
+        let route = DiscoveryRoute::Udp(SocketAddr::from(([127, 0, 0, 1], 52157)));
+        let member = MemberIdentity::from_array(["test", "alice"]);
+        let key = KeyFingerprint::from_bytes([7; KEY_FINGERPRINT_LENGTH]);
+        let request_nonce = Uuid::from_bytes([0x42; 16]);
+        let (member_id, key_fingerprint) = encode_member_key_selector_fields(&member, key);
+        let payload = IntroductionClaimPayload {
+            instance_uuid: uuid_to_wire_bytes(Uuid::from_u128(0x1234)),
+            request_nonce: uuid_to_wire_bytes(request_nonce),
+            route: MessageField::some(route.encode_proto()),
+            group_ids: Vec::new(),
+            member_id: MessageField::some(member_id),
+            key_fingerprint,
+            ..IntroductionClaimPayload::default()
+        };
+
+        let owned = DecodedIntroductionClaimPayload::decode_proto(payload.clone())
+            .expect("group-independent owned claim should decode");
+        let viewed =
+            DecodedIntroductionClaimPayload::decode_proto_view_from_slice(&payload.encode_to_vec())
+                .expect("group-independent claim view should decode");
+
+        assert!(owned.group_ids.is_empty());
+        assert_eq!(viewed, owned);
     }
 
     #[test]

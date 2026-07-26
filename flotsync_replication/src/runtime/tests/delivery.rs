@@ -290,6 +290,7 @@ fn request_summary_returns_remote_current_version_vector() {
     let group_id = wait_for_test_reply(alice_runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     accept_one_creation_invitation(
@@ -350,6 +351,7 @@ fn group_invitation_persists_group_schema() {
     let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone(), bob_member.clone()],
         group_schema: group_schema.clone(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     accept_one_creation_invitation(&bob_fixture.listener, group_id, &[alice_member, bob_member]);
@@ -357,6 +359,30 @@ fn group_invitation_persists_group_schema() {
 
     let bob_group = load_persisted_group(bob_fixture.store.as_ref(), group_id);
     assert_eq!(bob_group.group_schema, group_schema);
+}
+
+#[test]
+fn group_invitation_reaches_trusted_member_without_shared_group() {
+    let (_runtime_endpoint_lease, [alice_fixture, bob_fixture]) =
+        load_mutually_trusted_runtime_mesh(&[
+            (app_alice_id(), alice_member()),
+            (app_bob_id(), bob_member()),
+        ]);
+    let members = vec![
+        alice_fixture.local_member.clone(),
+        bob_fixture.local_member.clone(),
+    ];
+    alice_fixture
+        .runtime
+        .wait_for_direct_peer_route_for_test(&bob_fixture.local_member);
+    let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
+        members: members.clone(),
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("create_group should succeed");
+
+    accept_one_creation_invitation(&bob_fixture.listener, group_id, &members);
 }
 
 #[test]

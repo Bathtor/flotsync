@@ -386,3 +386,19 @@ impl MemberKeyTrustEvidenceSet {
         self.evidence_kinds.contains(evidence_kind)
     }
 }
+
+/// Build deliberately invalid security material for aggregate defaults.
+///
+/// Operational store/runtime boundaries reject this exact value. It exists so
+/// struct-update syntax can default incidental fields without manufacturing
+/// apparently usable encrypted material.
+pub(crate) fn invalid_default_group_security_material() -> EncryptedGroupSecurityMaterial {
+    EncryptedGroupSecurityMaterial {
+        encrypted_group_secret: EncryptedStoreSecret {
+            crypto_version: StoreSecretCryptoVersion::new(0),
+            key_id: StoreSecretKeyId::from_bytes([0; StoreSecretKeyId::BYTE_LENGTH]),
+            nonce: Box::default(),
+            ciphertext: Box::default(),
+        },
+    }
+}

@@ -1,0 +1,88 @@
+id = "019f8396-c396-75b2-a651-2866f60b79a9"
+ref = "flotsync-git-d03.4"
+title = "Add all-group synchronisation and default repair"
+body = """
+Objective
+
+S41. Make one unqualified sync command publish every dirty real checklist group sequentially, report partial outcomes, and repair a session default when group lifecycle changes make it non-writable.
+
+Current state
+
+S42. The heterogeneous ChecklistWorkingSet already tracks composite ChecklistItemId values, process-local items, dirty real-group ids, one opaque multi-group ReadToken, and per-group ChecklistSyncPlan values.
+S43. ChecklistRepl::sync currently prepares and publishes only the session default group, then drains listener events even when other groups remain dirty. The working set therefore retains a temporary rejection for incoming events that target any dirty row.
+S44. ReadToken intentionally hides its group vectors. The runtime already selects the target group from each one-group PublishChangesRequest, so the application must reuse and advance the composite token rather than project it itself.
+S45. The group registry now lives in sibling runner::groups. Registry refresh currently keeps the selected default unchanged even when that group becomes ReadOnly or Closed.
+
+All-group synchronisation
+
+S46. Gather dirty real-group ids from the working set, sort them by GroupId for deterministic attempts and output, and prepare one ChecklistSyncPlan per group. Process-local items remain visible and dirty but are never submitted.
+S47. Submit each non-empty group plan through a separate ReplicationApi::publish_changes request using the current composite read token. Move the mutation vector out of the owned plan rather than cloning it. After each success, carry the receipt token forward so the final working-set token records every successful local write before listener echoes are drained; writes to distinct groups remain causally independent. Clear only that successful plan.
+S48. Continue attempting later independent groups after a publication failure. Retain each failed group's dirty rows and collect a structured per-group outcome instead of returning at the first ApiError.
+S49. Return and render a ChecklistSyncReport containing every attempted group and outcome, listener batches, applied events, remaining process-local items, and remaining dirty groups. Preserve concrete ApiError values in failed outcomes so diagnostics are not reduced to strings. Render complete success and partial failure with distinct headings so the user cannot mistake an incomplete pass for convergence.
+S50. Drain and apply listener events only when no real-group publication failed. If any group failed, leave listener channels and queued working-set events untouched so incoming rows cannot overwrite unsynchronised local changes. Keep the dirty-row conflict guard as an invariant check, but remove its transitional default-only-sync TODO once the normal path publishes all dirty groups first.
+
+Default lifecycle repair
+
+S51. During registry refresh, load the complete stored ReplicationGroupRecord set through the existing temporary direct-store workaround, use it to inspect lifecycle successor chains, and continue exposing only readable groups in the session registry.
+S52. Keep an Open default unchanged. When the selected default is ReadOnly or Closed, follow successor links with cycle protection until an Open successor is found. Promote that writable successor when present; otherwise clear the default. Report an automatic hand-off or clearing once when refresh changes the selection. When no default is selected, refresh must leave it absent; an absent-to-present transition is an explicit invariant failure rather than an unchanged result.
+S53. Restart continues with no default because default selection remains session-only.
+
+Coverage and documentation
+
+S54. Add focused working-set and REPL-handler tests for deterministic group ordering, one request per group, token advancement, successful-plan cleanup, continued attempts after failure, retained failed state, listener-drain gating, process-local exclusion, and exact complete-success and partial-failure report rendering. Extend registry refresh coverage to prove that refreshing an Open registry without a selected default leaves the default absent and reports no change.
+S55. Add group-registry tests for ReadOnly and Closed successor hand-off, multi-hop chains, missing successors, cycles, clearing, unchanged Open defaults, and restart semantics.
+S56. Add an integration test with two real runtime groups that publishes both through one checklist sync and verifies the resulting rows through snapshots. Use existing runtime test support rather than introducing a second application-side state model.
+S57. Update the replicated-checklist scenario runbook using the repository OKF conventions. Remove obsolete single-group and future-d03.3 wording, document explicit defaults and all-group sync, and retain the current route and process-local lifetime guidance. Qualified references and transfer recovery remain for flotsync-git-d03.5.
+
+Acceptance
+
+S58. One sync attempts every dirty real group exactly once in deterministic order and never submits process-local items.
+S59. A failed group remains dirty, later groups are still attempted, successful groups become clean, and the report identifies every outcome without labelling the pass complete.
+S60. Listener events are applied after complete real-group success and remain pending after partial failure.
+S61. A stale non-writable default moves to an available Open successor or is cleared with a visible explanation.
+S62. Unit, handler, integration, formatting, pedantic Clippy, and flotsync_io_examples test validation pass.
+
+Estimate
+
+S63. Approximately 550-850 LOC: 180-280 LOC for orchestration and reports, 80-140 LOC for lifecycle repair, and 290-430 LOC for tests and scenario documentation. This remains below 1,000 LOC after item-transfer work moves to flotsync-git-d03.5."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = ["019f8588-bbc6-7523-87d2-6d5e83939248"]
+blocks = ["019f9939-3a0c-70a3-9e1f-8239fde87582"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:32:03.606851Z"
+updated_at = "2026-07-25T13:46:34.278302Z"
+closed_at = "2026-07-25T13:46:34.278302Z"
+
+[[comments]]
+id = "019f993a-9a7d-7691-a0fc-86fc0bbe12c0"
+author = "Codex"
+body = "Plan split after alignment: this child is now transfer-agnostic and covers sequential all-group publication, partial-failure reporting, safe listener draining, and default lifecycle repair. Qualified item references plus copy/move state and recovery moved to new child flotsync-git-d03.5, which is linked under the epic and blocked by this generic synchronisation foundation. The parent epic now records the five-child ordering."
+created_at = "2026-07-25T12:23:02.525976Z"
+
+[[comments]]
+id = "019f9969-8776-7c73-b26b-3af59078b872"
+author = "Codex"
+body = "Review delta agreed: partial-failure reports will use a distinct incomplete heading with exact output coverage, and owned sync-plan mutations will be moved into the publish request instead of cloned. The suggested runner/sync.rs extraction is intentionally declined for this slice; the current module layout remains."
+created_at = "2026-07-25T13:14:17.846183Z"
+
+[[comments]]
+id = "019f997f-d7c2-7b60-93f6-c9994a998d7e"
+author = "Codex"
+body = "Review delta agreed: R04 makes an absent-to-present default transition an explicit invariant failure; R05 documents the exact no-op cases in registry refresh; R06 corrects the receipt-token rationale to describe accumulation of successful local writes without implying cross-group causal dependence."
+created_at = "2026-07-25T13:38:40.194996Z"
+
+[[comments]]
+id = "019f9986-b894-7303-a3f3-bbaecd49f6d4"
+author = "Codex"
+body = "Final review wording agreed: retain the receipt immediately because the working set already reflects the local write while its read token otherwise remains behind until the listener echo arrives; carrying the receipt into later requests accumulates independent group positions without creating cross-group causal dependency."
+created_at = "2026-07-25T13:46:10.964314Z"
+
+[[comments]]
+id = "019f9987-13a6-7870-b767-a1374fdf9311"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T13:46:34.278302Z"

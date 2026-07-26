@@ -105,3 +105,44 @@ fn ensure_store_parent_exists(path: &Path) -> Result<(), ReplicatedChecklistErro
         Some(_) | None => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config(profile: &str) -> ChecklistAppConfig {
+        ChecklistAppConfig {
+            source_path: PathBuf::from("test.toml"),
+            runtime_config_toml: String::new(),
+            local_member: MemberIdentity::from_array(["alice"]),
+            store_path: PathBuf::from("unused.sqlite"),
+            store_secret_profile: flotsync_replication::LocalStoreSecretProfile::new(profile)
+                .expect("test profile should build"),
+        }
+    }
+
+    #[test]
+    fn unsafe_store_secret_profile_derives_stable_security_without_keyring() {
+        let config = test_config("unsafe:test-profile");
+
+        let first =
+            load_checklist_replication_security(&config).expect("unsafe security should derive");
+        let second =
+            load_checklist_replication_security(&config).expect("unsafe security should derive");
+
+        assert_eq!(first.store_secret_key_id(), second.store_secret_key_id());
+    }
+
+    #[test]
+    fn unsafe_store_secret_profile_changes_derived_key_id() {
+        let first_config = test_config("unsafe:first-profile");
+        let second_config = test_config("unsafe:second-profile");
+
+        let first = load_checklist_replication_security(&first_config)
+            .expect("first unsafe security should derive");
+        let second = load_checklist_replication_security(&second_config)
+            .expect("second unsafe security should derive");
+
+        assert_ne!(first.store_secret_key_id(), second.store_secret_key_id());
+    }
+}

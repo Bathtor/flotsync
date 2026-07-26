@@ -18,6 +18,9 @@ use crate::api::{
     security::{
         AssessPublicKeyBundleRequest,
         CandidateMemberKeyReport,
+        KnownMemberKeyReport,
+        KnownMemberKeysReport,
+        KnownMemberReport,
         MemberKeyAuthorityReport,
         MemberKeyBindingReport,
         MemberKeyTrustReport,
@@ -49,7 +52,10 @@ use permissions::{
     request_member_key_permission_from_transaction,
     request_stored_member_key_permission_from_transaction,
 };
-use reports::public_key_bundle_report_from_transaction;
+use reports::{
+    known_member_keys_report_from_transaction,
+    public_key_bundle_report_from_transaction,
+};
 
 /// Policy for loading exact member-key public material before a separate authority decision.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +335,23 @@ impl SecurityStore {
                     Ok(report)
                 }
             }
+        }
+        .boxed()
+    }
+
+    /// Report stored member-key bindings and their local trust evidence.
+    pub(crate) fn known_member_keys_report(
+        &self,
+    ) -> BoxFuture<'_, Result<KnownMemberKeysReport, SecurityStoreError>> {
+        async move {
+            let mut transaction = self
+                .store
+                .begin_read_transaction()
+                .await
+                .context(StoreAccessSnafu)?;
+            let report = known_member_keys_report_from_transaction(transaction.as_mut()).await?;
+            transaction.release().await.context(StoreAccessSnafu)?;
+            Ok(report)
         }
         .boxed()
     }

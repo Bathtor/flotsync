@@ -163,6 +163,18 @@ impl<V> FromIterator<(Identifier, V)> for TrieMap<V> {
     }
 }
 
+impl<V> IntoIterator for TrieMap<V> {
+    type Item = (Identifier, V);
+    type IntoIter = TrieIntoEntries<V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TrieIntoEntries {
+            stack: vec![TrieIntoFrame::from_node(self.root)],
+            path: Vec::new(),
+        }
+    }
+}
+
 pub struct TrieEntries<'a, V> {
     /// DFS stack of nodes and their partially consumed child iterators.
     stack: Vec<(&'a TrieNode<V>, ChildrenIterator<'a, V>)>,
@@ -253,6 +265,37 @@ impl<V> Iterator for TrieOwnedKeys<'_, V> {
     }
 }
 
+/// Consuming iterator over owned trie-map entries.
+pub struct TrieIntoEntries<V> {
+    /// Traversal stack from the root through the current node.
+    stack: Vec<TrieIntoFrame<V>>,
+    /// Owned segments identifying the current node.
+    path: Vec<IdentifierSegment>,
+}
+
+impl<V> Iterator for TrieIntoEntries<V> {
+    type Item = (Identifier, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(frame) = self.stack.last_mut() {
+            if let Some(value) = frame.value.take() {
+                let key = Identifier::from_segments_unchecked(self.path.clone().into_boxed_slice());
+                return Some((key, value));
+            }
+            if let Some((segment, child)) = frame.children.next() {
+                self.path.push(segment);
+                self.stack.push(TrieIntoFrame::from_node(child));
+            } else {
+                self.stack.pop();
+                if !self.stack.is_empty() {
+                    self.path.pop();
+                }
+            }
+        }
+        None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrieSet(TrieMap<()>);
 impl TrieSet {
@@ -312,8 +355,51 @@ impl FromIterator<Identifier> for TrieSet {
     }
 }
 
+impl IntoIterator for TrieSet {
+    type Item = Identifier;
+    type IntoIter = TrieIntoKeys;
+
+    fn into_iter(self) -> Self::IntoIter {
+        TrieIntoKeys {
+            entries: self.0.into_iter(),
+        }
+    }
+}
+
+/// Consuming iterator over owned trie-set keys.
+pub struct TrieIntoKeys {
+    /// Underlying map-entry iterator whose unit values are discarded.
+    entries: TrieIntoEntries<()>,
+}
+
+impl Iterator for TrieIntoKeys {
+    type Item = Identifier;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.entries.next().map(|(key, ())| key)
+    }
+}
+
 /// Iterator over one node's child segment map.
 type ChildrenIterator<'a, V> = std::collections::hash_map::Iter<'a, IdentifierSegment, TrieNode<V>>;
+
+/// One owned trie node being visited by a consuming traversal.
+struct TrieIntoFrame<V> {
+    /// Value yielded before descending into this node's children.
+    value: Option<V>,
+    /// Remaining children below this node.
+    children: std::collections::hash_map::IntoIter<IdentifierSegment, TrieNode<V>>,
+}
+
+impl<V> TrieIntoFrame<V> {
+    /// Convert one owned node into its traversal state.
+    fn from_node(node: TrieNode<V>) -> Self {
+        Self {
+            value: node.value,
+            children: node.children.into_iter(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TrieNode<V> {
@@ -438,6 +524,36 @@ mod tests {
         seen_owned_set_keys.sort();
 
         assert_eq!(seen_owned_set_keys, expected_keys);
+    }
+
+    #[test]
+    fn test_consuming_iterators() {
+        let mut trie_map = TrieMap::new();
+        let mut trie_set = TrieSet::new();
+        let entries = [
+            (id(["a"]), String::from("root child")),
+            (id(["a", "b"]), String::from("nested child")),
+            (id(["x", "y"]), String::from("separate branch")),
+        ];
+
+        for (key, value) in &entries {
+            trie_map.insert(key.clone(), value.clone());
+            trie_set.insert(key.clone());
+        }
+
+        let mut consumed_entries = trie_map.into_iter().collect_vec();
+        consumed_entries.sort_by_key(|entry| entry.0.clone());
+        let mut expected_entries = entries.to_vec();
+        expected_entries.sort_by_key(|entry| entry.0.clone());
+
+        assert_eq!(consumed_entries, expected_entries);
+
+        let mut consumed_keys = trie_set.into_iter().collect_vec();
+        consumed_keys.sort();
+        let mut expected_keys = entries.map(|(key, _)| key).to_vec();
+        expected_keys.sort();
+
+        assert_eq!(consumed_keys, expected_keys);
     }
 
     #[test]

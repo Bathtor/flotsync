@@ -1520,6 +1520,7 @@ mod tests {
                     ),
                     lifecycle: ReplicationGroupLifecycle::Open,
                     security_material,
+                    ..Default::default()
                 };
                 transaction
                     .insert_replication_group(group)

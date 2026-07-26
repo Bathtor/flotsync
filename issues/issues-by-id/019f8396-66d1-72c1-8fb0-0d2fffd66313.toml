@@ -1,0 +1,72 @@
+id = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+ref = "flotsync-git-d03.3"
+title = "Build the heterogeneous multi-group checklist workspace"
+body = """
+Objective:
+H01. Let one checklist REPL host zero or more named replication groups plus process-local unassociated items in one heterogeneous working set.
+
+Current repo alignment:
+H02. The current runner supports zero or one readable group, runtime-backed key commands, snapshot loading, explicit sync, and queued row events. The ordered children replace the single ChecklistSession boundary without rebuilding the key path.
+H03. The current working set keys rows only by RowKey and embeds one group id, the store cannot enumerate all known member-key ids, and invitations are still rejected by the listener.
+
+Ordered children:
+H04. flotsync-git-d03.3.1 adds the narrow known-member trust report.
+H05. flotsync-git-d03.3.2 is blocked by .3.1 and builds composite workspace identity, multi-group loading, explicit default selection, and transitional default-group sync.
+H06. flotsync-git-d03.3.3 is blocked by .3.2 and adds the creation wizard, invitation mediation, registry refresh, and end-to-end coverage.
+
+Member discovery boundary:
+H07. Enumerate stored MemberKeyId values in deterministic member/fingerprint order and group them into an application-facing report.
+H08. Report the existing stored trust summary for each binding only. Do not evaluate every AuthorityScope or predict that a group can be created; authority policy, blocked keys, and ambiguity remain authoritative create_group concerns.
+
+Heterogeneous workspace:
+H09. Introduce ChecklistItemId from Local or Group(GroupId) association plus RowKey, then re-key rows, display order, dirty state, queued changes, and event history while retaining one workspace-wide ReadToken.
+H10. Load every readable group and checklist snapshot, retain registry metadata, refresh from the store after creation/acceptance, merge read tokens, and route listener rows by RowId group.
+H11. Keep list indices always unambiguous. A bare RowKey works only when unique; final qualified selectors remain in flotsync-git-d03.4.
+
+Group registry and default:
+H12. Resolve syntactically valid UUIDs as UUIDs first and otherwise resolve exact unique names; ambiguous names list candidate UUIDs.
+H13. Add group list, group default <group>, and group clear-default. The default is session-only, starts unset, and is not changed by creation or acceptance.
+H14. Plain add targets the default group or creates a process-local item when no default exists. members and check use the current default.
+
+Transitional synchronisation:
+H15. Until flotsync-git-d03.4, sync publishes only the current default group, drains listener events for all groups, reports remaining dirty groups, and leaves process-local items unsynchronised.
+H16. Prepare group-specific sync plans so all-group orchestration can be added later without another working-set rewrite.
+
+Creation and invitation:
+H17. group create <name> displays the known-member trust report, prompts for ordered members, validates syntax, duplicates, and local inclusion, then shows creator-first order and requires confirmation.
+H18. The report is reference information. create_group performs final security-policy validation and any failure is reported directly.
+H19. Queue invitations and responders for indexed group invitations, group accept <index>, and group reject <index>. Acceptance refreshes registry/snapshots without setting a default; migration proposals remain unsupported.
+
+Acceptance and deferrals:
+H20. Cover zero-group local editing, multi-group startup/restart, duplicate RowKeys, name/UUID selection, default lifecycle, snapshot/listener routing, known-member trust display, named creation, and invitation accept/reject.
+H21. Move/copy, canonical qualified references, all-group sync, scenario documentation, and automatic default repair after a default group is deactivated remain in flotsync-git-d03.4.
+
+Estimate:
+H22. flotsync-git-d03.3.1 is approximately 300-500 LOC, .3.2 approximately 1,150-1,700 LOC, and .3.3 approximately 750-1,150 LOC. The ordered split keeps each security/workspace/interaction boundary separately reviewable."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = ["019f8396-1861-7951-b169-fbd0fff06213"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+children = [
+    "019f8588-3cc9-7221-b0e9-b462f744d4e8",
+    "019f8588-861f-70a3-a154-f8e23e72baf7",
+    "019f8588-bbc6-7523-87d2-6d5e83939248",
+]
+created_at = "2026-07-21T07:31:39.857618Z"
+updated_at = "2026-07-25T09:11:55.281384Z"
+closed_at = "2026-07-25T09:11:55.281384Z"
+
+[[comments]]
+id = "019f857f-3bb9-7253-ae86-5d728bcf083e"
+author = "lkroll"
+body = "Repo alignment audit after flotsync-git-d03.2: the transitional runner now loads zero or one group and has runtime-backed key commands, but ChecklistWorkingSet still embeds one group id, the store/API cannot enumerate known members, and invitations are still rejected in the listener. The revised plan adds composite internal item identity, an explicit default-bound interim sync rule until d03.4, UUID-first group selector precedence, indexed invitation decisions, and a three-part implementation split because the realistic estimate is 2,550-3,800 LOC."
+created_at = "2026-07-21T16:25:35.92964Z"
+
+[[comments]]
+id = "019f988b-a091-7e83-bea3-fdee642b699d"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T09:11:55.281384Z"

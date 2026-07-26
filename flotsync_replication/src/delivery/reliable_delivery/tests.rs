@@ -317,6 +317,17 @@ impl FullStackHarness {
         );
     }
 
+    fn wait_for_ack_timeout_reported(&self, message_id: MessageId, expected: bool) {
+        eventually_component_state(
+            WAIT_TIMEOUT,
+            &self.reliable,
+            |component| component.reported_recipient_ack_timeout(message_id) == expected,
+            format_args!(
+                "timed out waiting for recipient-ack timeout reporting state {expected} for {message_id:?}"
+            ),
+        );
+    }
+
     fn expect_sender_ack_never_observed(&self, message_id: MessageId) {
         assert_never(
             REJECTED_ACK_OBSERVATION_WINDOW,
@@ -690,8 +701,8 @@ fn recipient_ack_timeout_redelivers_unprocessed_envelope() {
 
     let message_id = MessageId(Uuid::from_u128(41));
     sender.submit(reliable_submit(
-        alice,
-        bob,
+        alice.clone(),
+        bob.clone(),
         message_id,
         b"retry bootstrap payload",
     ));
@@ -703,11 +714,24 @@ fn recipient_ack_timeout_redelivers_unprocessed_envelope() {
     receiver.wait_for_inbound_clear(message_id);
 
     let redelivered = receiver.wait_for_delivery();
+    sender.wait_for_ack_timeout_reported(message_id, true);
     assert_eq!(redelivered.envelope.header.message_id, message_id);
     assert_eq!(
         redelivered.envelope.payload.bytes,
         Bytes::from_static(b"retry bootstrap payload")
     );
+    receiver.publish_direct_route(alice, sender.local_addr);
+    redelivered
+        .processed
+        .complete()
+        .expect("redelivered processing should complete exactly once");
+    sender.wait_for_sender_ack_observed(message_id);
+    sender.wait_for_ack_timeout_reported(message_id, false);
+}
+
+#[test]
+fn recipient_ack_timeout_default_targets_interactive_recovery() {
+    assert_eq!(DEFAULT_RECIPIENT_ACK_TIMEOUT, Duration::from_secs(10));
 }
 
 #[test]

@@ -14,6 +14,7 @@ fn publish_changes_persists_applied_update_and_snapshot_state() {
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 34);
@@ -65,6 +66,7 @@ fn publish_changes_linear_string_update_with_two_insert_hunks_reuses_operation_i
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 121_000);
@@ -117,6 +119,7 @@ fn request_summary_reports_local_versions() {
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member.clone()],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, dataset_id.clone());
@@ -157,6 +160,7 @@ fn snapshot_rows_streams_visible_rows_and_optional_tombstones() {
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let active_row_id = test_row_id(group_id, dataset_id.clone(), 35);
@@ -245,8 +249,13 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema(),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
+    assert_eq!(
+        fixture.listener.captured_data_changes(),
+        vec![CapturedDataChange { rows: Vec::new() }]
+    );
     let row_id = test_row_id(group_id, dataset_id, 39);
 
     let read_token = snapshot_read_token(fixture.runtime.as_ref(), group_id, docs_dataset_id());
@@ -263,12 +272,15 @@ fn publish_changes_emits_local_data_changed_event_before_reply() {
 
     assert_eq!(
         fixture.listener.captured_data_changes(),
-        vec![CapturedDataChange {
-            rows: vec![CapturedRowChange::Upsert {
-                row_id,
-                title: "local event".to_owned(),
-            }],
-        }]
+        vec![
+            CapturedDataChange { rows: Vec::new() },
+            CapturedDataChange {
+                rows: vec![CapturedRowChange::Upsert {
+                    row_id,
+                    title: "local event".to_owned(),
+                }],
+            },
+        ]
     );
 }
 
@@ -290,12 +302,13 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());
     let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        group_name: Some("old docs".to_owned()),
+        message: Some("old message".to_owned()),
         members: vec![alice_member.clone()],
         group_schema: docs_group_schema(),
     }))
     .expect("create_group should succeed");
     let old_row_id = test_row_id(old_group_id, dataset_id.clone(), 40);
-
     let read_token = snapshot_read_token(runtime.as_ref(), old_group_id, dataset_id.clone());
     publish_changes(
         runtime.as_ref(),
@@ -310,16 +323,15 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     listener.wait_for_data_change_count(1);
     let previous_event_count = listener.captured_data_changes().len();
 
-    let migration_id = wait_for_test_reply(runtime.change_group_membership(
-        ChangeGroupMembershipRequest {
-            group_id: old_group_id,
-            add_members: HashSet::from([bob_member]),
-            remove_members: HashSet::new(),
-            group_name: None,
-            message: None,
-        },
-    ))
-    .expect("membership change should succeed");
+    let request = ChangeGroupMembershipRequest {
+        group_id: old_group_id,
+        add_members: HashSet::from([bob_member]),
+        remove_members: HashSet::new(),
+        group_name: GroupNameUpdate::Set("  migrated docs  ".to_owned()),
+        message: Some("migration message".to_owned()),
+    };
+    let migration_id = wait_for_test_reply(runtime.change_group_membership(request))
+        .expect("membership change should succeed");
 
     listener.wait_for_data_change_count(previous_event_count + 1);
     let data_changes = listener.captured_data_changes();
@@ -346,6 +358,9 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
             final_versions: old_group.version_vector.clone(),
         }
     );
+    let new_group = load_persisted_group(store.as_ref(), migration_id.new_group_id);
+    assert_eq!(new_group.group_name.as_deref(), Some("migrated docs"));
+    assert_eq!(new_group.message.as_deref(), Some("migration message"));
     let migration_read_token = listener
         .captured_data_change_read_tokens()
         .last()
@@ -376,6 +391,78 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
 }
 
 #[test]
+fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
+    let alice_member = alice_member();
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let runtime = load_runtime_with_parts(
+        app_alice_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    let old_group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        group_name: Some("old docs".to_owned()),
+        message: Some("old message".to_owned()),
+        members: vec![alice_member],
+        group_schema: GroupSchema::default(),
+    }))
+    .expect("group creation should succeed");
+
+    let error = wait_for_test_reply(runtime.change_group_membership(
+        ChangeGroupMembershipRequest {
+            group_id: old_group_id,
+            add_members: HashSet::new(),
+            remove_members: HashSet::new(),
+            group_name: GroupNameUpdate::Set(" \t ".to_owned()),
+            message: None,
+        },
+    ))
+    .expect_err("empty-after-trim replacement name should fail");
+    match error {
+        ApiError::ApiExternal { source } => assert!(matches!(
+            source.downcast_ref::<ChangeGroupMembershipError>(),
+            Some(ChangeGroupMembershipError::EmptyGroupName)
+        )),
+        error => panic!("unexpected API error: {error:?}"),
+    }
+
+    let migration_id = wait_for_test_reply(runtime.change_group_membership(
+        ChangeGroupMembershipRequest {
+            group_id: old_group_id,
+            add_members: HashSet::new(),
+            remove_members: HashSet::new(),
+            group_name: GroupNameUpdate::Clear,
+            message: None,
+        },
+    ))
+    .expect("clearing successor metadata should succeed");
+    let successor = load_persisted_group(store.as_ref(), migration_id.new_group_id);
+    assert_eq!(successor.group_name, None);
+    assert_eq!(successor.message, None);
+}
+
+#[test]
+fn membership_change_default_rejects_nil_group_id() {
+    let alice_member = alice_member();
+    let store = sqlite_store_with_schemas(alice_member, Vec::<(DatasetId, SchemaSource)>::new());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, Arc::new(ListenerStub::default()));
+
+    let error = wait_for_test_reply(
+        runtime.change_group_membership(ChangeGroupMembershipRequest::default()),
+    )
+    .expect_err("default request should be incomplete");
+    match error {
+        ApiError::ApiExternal { source } => assert!(matches!(
+            source.downcast_ref::<ChangeGroupMembershipError>(),
+            Some(ChangeGroupMembershipError::NilGroupId)
+        )),
+        error => panic!("unexpected API error: {error:?}"),
+    }
+}
+
+#[test]
 fn read_only_group_allows_reads_but_rejects_application_writes() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -399,6 +486,7 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
                 final_versions: versions.clone(),
             },
             security_material: current_slice_placeholder_group_security_material(group_id),
+            ..Default::default()
         },
     );
     let listener = Arc::new(ListenerStub::default());
@@ -434,8 +522,7 @@ fn read_only_group_allows_reads_but_rejects_application_writes() {
                 group_id,
                 add_members: HashSet::new(),
                 remove_members: HashSet::new(),
-                group_name: None,
-                message: None,
+                ..Default::default()
             })
         )
         .is_err()
@@ -526,6 +613,7 @@ fn publish_changes_rebases_stale_field_patch_without_overwriting_newer_fields() 
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema_from_schema(title_note_schema_shared()),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id.clone(), 41);
@@ -606,6 +694,7 @@ fn publish_changes_error_display_includes_local_operation_source() {
     let group_id = wait_for_test_reply(fixture.runtime.create_group(CreateGroupRequest {
         members: vec![alice_member],
         group_schema: docs_group_schema_from_schema(schema),
+        ..Default::default()
     }))
     .expect("create_group should succeed");
     let row_id = test_row_id(group_id, dataset_id, 40);
@@ -666,6 +755,7 @@ fn publish_changes_rejects_reserved_local_update_version() {
             version_vector: version_vector.clone(),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
+            ..Default::default()
         },
     );
     let listener = Arc::new(ListenerStub::default());

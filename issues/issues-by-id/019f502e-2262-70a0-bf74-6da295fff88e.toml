@@ -2,40 +2,90 @@ id = "019f502e-2262-70a0-bf74-6da295fff88e"
 ref = "flotsync-git-d03"
 title = "Support dynamic groups in replicated checklist"
 body = """
-Implement the next replicated-checklist slice where checklist peers can move beyond one preconfigured static group and exercise dynamic group creation or membership changes through the replication runtime.
+Goal
 
-Context:
-D01. The current replicated-checklist runner still has a static-group setup bridge derived from config.
-D02. Store-native key setup is available, but group setup and checklist startup remain coupled to a fixed configured group.
-D03. This slice should start after the migration policy API shape and temporary local-public-bundle provisioning boundary have been settled.
+G01. Turn the replicated checklist into a dynamic multi-group application that creates and accepts groups through the running replication runtime, keeps one heterogeneous checklist working set, synchronises every dirty real group, and supports safe UUID-preserving item transfer without a statically configured group.
 
-Scope:
-S01. Define the concrete first dynamic-group checklist CUJ, likely creating or accepting a checklist group at runtime rather than pre-inserting one configured static group.
-S02. Update replicated-checklist config and runner flow so identity/trust setup is independent from group creation and group membership.
-S03. Add CLI/REPL commands or startup behaviour needed for the first dynamic group scenario.
-S04. Persist and reload the dynamically created or accepted group through the existing replication store/runtime path.
-S05. Update scenario docs and tests for the chosen dynamic-group checklist flow.
+Current state
 
-Out of scope:
-O01. Full hierarchical identity trust and revocation.
-O02. Relay-assisted key lookup.
-O03. mDNS discovery unless the selected CUJ explicitly needs it.
+C01. flotsync-git-d03.1 is complete: optional group names and messages flow through the API, runtime, storage, invitations, and membership-change proposals.
+C02. flotsync-git-d03.2 is complete: only keys init-local remains a top-level command, while runtime-backed key export, inspection, trust, and blocking run inside the REPL.
+C03. flotsync-git-d03.3 is complete: the checklist starts with zero or several groups, loads one heterogeneous working set, manages an explicit session default, creates named groups, and mediates invitations.
+C04. The working set already scopes each RowKey by Local or Group association, tracks dirty groups, detects ambiguous bare UUIDs, and carries one opaque multi-group ReadToken.
+C05. flotsync-git-d03.4 now owns transfer-agnostic all-group synchronisation and automatic repair of a non-writable default. flotsync-git-d03.5 owns qualified references and copy/move semantics after the generic synchroniser exists.
+C06. This epic blocks flotsync-git-1i3. After the final children remove the remaining checklist limitations, flotsync-git-1i3 will reassess the group-independent local-public-key provisioning boundary.
 
-Acceptance:
-A01. A replicated-checklist scenario can create or join a non-preconfigured group using stored local identity/trust material.
-A02. Restarting a peer reloads the dynamic group from the store without requiring static ordered-members config to recreate it.
-A03. Existing static-route or custom UDP route discovery assumptions remain explicit in docs.
-A04. Tests cover the new setup boundary and at least one dynamic-group checklist happy path."""
-status = "open"
+Agreed behaviour
+
+B01. Checklist configuration retains only local identity, store, profile, runtime, route, and schema inputs. It contains no static group id, ordered member list, group secret, or configured default.
+B02. Only keys init-local <config> remains a top-level command. keys export-local, keys inspect, keys trust, and keys block run inside the normal REPL through the already-unlocked runtime.
+B03. group create <name> starts a flag-free wizard that lists known member identities and trust summaries, prompts for ordered members, validates the proposal, displays a summary, and requires confirmation.
+B04. The workspace loads all readable groups, tracks optional names, resolves exact unique names preferentially, reports ambiguity with candidate UUIDs, and always accepts a group UUID as fallback.
+B05. No group becomes default implicitly. group default <group> selects one writable real group and group clear-default removes the session-only selection. A lifecycle change may hand an existing default to its writable successor or clear it.
+B06. Plain add targets the selected default or creates an unassociated process-local item when no default exists. Unassociated items intentionally disappear when the process exits.
+B07. The application has one heterogeneous working set. Each item records whether it is unassociated or belongs to a real group; display order, listener ingestion, and read position are workspace concerns.
+B08. One unqualified sync submits every dirty real group sequentially through separate replication requests, advances the composite token after each success, continues after independent failures, reports every outcome, and never submits process-local items.
+B09. Listener events are applied after complete real-group publication success and remain pending after partial failure so they cannot overwrite unsynchronised local rows.
+B10. Item references expose origin through local/ROW_UUID, a safe unique GROUP_NAME/ROW_UUID, or GROUP_UUID/ROW_UUID. A bare row UUID is accepted only when globally unique.
+B11. Item editing uses edit <item> note, edit <item> move <new-group>, and edit <item> copy <new-group>. The item reference determines the source.
+B12. Copy and move preserve RowKey while constructing a target RowId in the requested group. Copy retains the source. Move confirms the target upsert before submitting a replicated source tombstone.
+B13. Membership-change commands remain outside this epic even though the runtime supports the underlying machinery.
+
+Ordered children
+
+S01. flotsync-git-d03.1 — persist active replication group names; completed.
+S02. flotsync-git-d03.2 — move checklist key management into a zero-group REPL; completed after S01.
+S03. flotsync-git-d03.3 — build the heterogeneous multi-group workspace and creation/invitation flow; completed after S02.
+S04. flotsync-git-d03.4 — add transfer-agnostic all-group synchronisation, partial-failure reports, safe listener draining, and default lifecycle repair; blocked by S03.
+S05. flotsync-git-d03.5 — add qualified references and UUID-preserving copy/move recovery; blocked by S04 so it can extend the generic synchroniser with target-before-source phases.
+S06. Complete S04 before S05. Each child body contains its current self-contained plan, acceptance criteria, and LOC estimate.
+
+Out of scope
+
+O01. Checklist commands for changing membership of an active group.
+O02. Replication-level stable record identity across group changes; flotsync-git-pvp owns that design. UUID preservation here is an application convention.
+O03. Persistence of unassociated local checklist items.
+O04. Atomic or crash-recoverable cross-group move. Target-first sequencing and explicit retry are sufficient for this example.
+O05. Full hierarchical identity trust or revocation, relay-assisted key lookup, and mDNS discovery unless a selected scenario specifically needs them.
+O06. Final ownership or replacement of load_local_public_key_bundle; flotsync-git-1i3 reassesses it after this epic.
+
+Acceptance
+
+A01. A checklist peer starts without a preconfigured group and can use REPL key operations without repeated keychain prompts.
+A02. A named group can be created through the wizard, and an invited peer can inspect, accept, persist, reload, and display it.
+A03. Several created or accepted groups coexist in one working set and remain distinct across restart.
+A04. The explicit default can be selected and cleared, and a stale non-writable default moves to an available Open successor or is cleared.
+A05. One sync attempts all dirty real groups one by one, preserves failed dirty state, continues later independent groups, reports every outcome, and gates listener application safely.
+A06. Qualified references resolve their source, copy and move preserve RowKey, collisions are rejected, and move follows target-upsert-before-source-delete ordering.
+A07. Unit, handler, and integration tests cover the completed foundation, all-group sync, lifecycle repair, selectors, transfer failures, retry, restart, and several groups across peers.
+A08. Scenario documentation reflects the flag-free REPL grammar, explicit default, local-item lifetime, all-group sync, name ambiguity, transfer recovery, and route assumptions.
+
+Estimate and split rationale
+
+E01. Completed children S01-S03 established the API/runtime metadata, REPL key workflow, and heterogeneous workspace.
+E02. S04 is estimated at 550-850 LOC across generic synchronisation, lifecycle repair, tests, and documentation.
+E03. S05 is estimated at 700-1,000 LOC across qualified references, transfer state, synchronisation integration, tests, and documentation.
+E04. Separating S04 from S05 keeps the generic all-group publisher reviewable without transfer state, while S05 can build target-before-source execution on a tested sequential synchronisation foundation."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 2
+assignee = "Codex"
 blocked_by = [
     "019f0542-b0cc-70a2-9d97-5d4d41cf3bbf",
-    "019f4076-d998-7720-94b8-6cc1bddd76aa",
     "019f51bf-65a3-7b33-9d64-0e2f7390e4e2",
 ]
+blocks = ["019f4076-d998-7720-94b8-6cc1bddd76aa"]
+children = [
+    "019f8395-da3e-7c92-8034-5bf6c0e25813",
+    "019f8396-1861-7951-b169-fbd0fff06213",
+    "019f8396-66d1-72c1-8fb0-0d2fffd66313",
+    "019f8396-c396-75b2-a651-2866f60b79a9",
+    "019f9939-3a0c-70a3-9e1f-8239fde87582",
+]
 created_at = "2026-07-11T07:57:08.578406Z"
-updated_at = "2026-07-11T15:16:55.002742Z"
+updated_at = "2026-07-25T15:33:24.294539Z"
+closed_at = "2026-07-25T15:33:24.294539Z"
 
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5a616611082a"
@@ -44,3 +94,15 @@ label = "recommended"
 [[links]]
 target = "019f0542-b0cc-70a2-9d97-5b42c741ac8c"
 label = "recommended"
+
+[[comments]]
+id = "019f8397-abbd-7fb3-af6e-df1d636199cf"
+author = "Codex"
+body = "Plan aligned after review: commands remain positional and flag-free; `group create <name>` is an interactive wizard backed by database-known member enumeration; the checklist uses one heterogeneous working set with per-item group association; unassociated items are process-local; bundle-based key blocking is accepted; copy/move preserve RowKey UUIDs; and sync submits all groups sequentially. Work is split into ordered children flotsync-git-d03.1 through flotsync-git-d03.4 with immediate predecessor dependencies."
+created_at = "2026-07-21T07:33:03.037505Z"
+
+[[comments]]
+id = "019f99e8-e2c6-7070-852b-6cf3486f98d7"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T15:33:24.294539Z"

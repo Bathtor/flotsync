@@ -9,6 +9,8 @@ pub(super) async fn load_replication_group_material(
     let row = sqlx::query(
         "
 SELECT
+    group_name,
+    message,
     member_count,
     local_member_index,
     group_secret_crypto_version,
@@ -44,6 +46,8 @@ WHERE group_id = ?1
 
     Ok(Some(ReplicationGroupMaterialRecord {
         group_id: *group_id,
+        group_name: row.get("group_name"),
+        message: row.get("message"),
         member_keys,
         local_member_index,
         group_schema,
@@ -218,11 +222,15 @@ pub(super) async fn insert_replication_group(
 ) -> Result<(), StoreError> {
     let material = ReplicationGroupMaterialRecord {
         group_id: group.group_id,
+        group_name: group.group_name.clone(),
+        message: group.message.clone(),
         member_keys: group.member_keys.clone(),
         local_member_index: group.local_member_index,
         group_schema: group.group_schema.clone(),
         security_material: group.security_material.clone(),
     };
+    let member_count = validate_group_material_for_storage(&material)?;
+    validate_active_group_state_for_storage(group, member_count)?;
     ensure_replication_group_material(connection, &material).await?;
     activate_replication_group_with_lifecycle(
         connection,
@@ -233,22 +241,29 @@ pub(super) async fn insert_replication_group(
     .await
 }
 
-/// Store group material, accepting only exact idempotent replays.
+/// Store group material, refreshing metadata on compatible replays.
 pub(super) async fn ensure_replication_group_material(
     connection: &mut SqliteStoreConnection,
     material: &ReplicationGroupMaterialRecord,
 ) -> Result<(), StoreError> {
+    let member_count = validate_group_material_for_storage(material)?;
     if let Some(existing) = load_replication_group_material(connection, &material.group_id).await? {
         ensure!(
-            existing == *material,
+            existing.matches_definition(
+                material.group_id,
+                &material.member_keys,
+                material.local_member_index,
+                &material.group_schema,
+            ) && existing.security_material == material.security_material,
             ConflictingGroupMaterialSnafu {
                 group_id: material.group_id
             }
         );
+        if existing.group_name != material.group_name || existing.message != material.message {
+            update_replication_group_metadata(connection, material).await?;
+        }
         return Ok(());
     }
-    let member_count = material.member_count();
-    ensure_member_index_in_bounds(material.local_member_index, member_count)?;
 
     let stored_member_count =
         i64::try_from(member_count.get()).context(MemberCountOverflowSnafu)?;
@@ -256,6 +271,8 @@ pub(super) async fn ensure_replication_group_material(
         "
 INSERT INTO replication_group_material (
     group_id,
+    group_name,
+    message,
     member_count,
     local_member_index,
     group_secret_crypto_version,
@@ -263,10 +280,12 @@ INSERT INTO replication_group_material (
     group_secret_nonce,
     group_secret_ciphertext
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 ",
     )
     .bind(material.group_id.to_string())
+    .bind(&material.group_name)
+    .bind(&material.message)
     .bind(stored_member_count)
     .bind(i64::from(material.local_member_index.as_u32()))
     .bind(i64::from(
@@ -370,6 +389,7 @@ pub(super) async fn activate_replication_group_with_lifecycle(
     version_vector: &VersionVector,
     lifecycle: &ReplicationGroupLifecycle,
 ) -> Result<(), StoreError> {
+    ensure!(group_id != GroupId::NIL, NilGroupIdSnafu);
     let lifecycle_sql = replication_group_lifecycle_sql_label(lifecycle);
     let successor_group_id = lifecycle
         .successor_group_id()
@@ -473,5 +493,69 @@ WHERE group_id = ?1
             group_id: *group_id
         }
     );
+    Ok(())
+}
+
+/// Validate group material before any part of it is written.
+fn validate_group_material_for_storage(
+    material: &ReplicationGroupMaterialRecord,
+) -> Result<NonZeroUsize, StoreError> {
+    ensure!(material.group_id != GroupId::NIL, NilGroupIdSnafu);
+    let member_count =
+        NonZeroUsize::new(material.member_keys.len()).context(EmptyGroupMembersSnafu)?;
+    ensure_member_index_in_bounds(material.local_member_index, member_count)?;
+    ensure!(
+        material.security_material != invalid_default_group_security_material(),
+        InvalidDefaultGroupSecurityMaterialSnafu {
+            group_id: material.group_id,
+        }
+    );
+    Ok(member_count)
+}
+
+/// Validate active progress widths against already-validated group material.
+fn validate_active_group_state_for_storage(
+    group: &ReplicationGroupRecord,
+    member_count: NonZeroUsize,
+) -> Result<(), StoreError> {
+    ensure!(
+        group.version_vector.num_members() == member_count,
+        ActiveVersionMemberCountMismatchSnafu {
+            group_id: group.group_id,
+            version_member_count: group.version_vector.num_members().get(),
+            member_count: member_count.get(),
+        }
+    );
+    if let Some(final_versions) = group.lifecycle.final_versions() {
+        ensure!(
+            final_versions.num_members() == member_count,
+            LifecycleVersionMemberCountMismatchSnafu {
+                group_id: group.group_id,
+                version_member_count: final_versions.num_members().get(),
+                member_count: member_count.get(),
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Replace metadata after an otherwise compatible group-material replay.
+async fn update_replication_group_metadata(
+    connection: &mut SqliteStoreConnection,
+    material: &ReplicationGroupMaterialRecord,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "
+UPDATE replication_group_material
+SET group_name = ?2, message = ?3
+WHERE group_id = ?1
+",
+    )
+    .bind(material.group_id.to_string())
+    .bind(&material.group_name)
+    .bind(&material.message)
+    .execute(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
     Ok(())
 }

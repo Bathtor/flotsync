@@ -1,6 +1,11 @@
 use super::{
     component::ReplicationRuntimeComponent,
-    errors::{CreateGroupError, InboundDeliveryError, PublishChangesError},
+    errors::{
+        ChangeGroupMembershipError,
+        CreateGroupError,
+        InboundDeliveryError,
+        PublishChangesError,
+    },
     handle::{
         ReplicationRuntime,
         load_replication_runtime_typed_with_security_for_test,
@@ -42,6 +47,7 @@ use crate::{
         GroupInvitationResponder,
         GroupInvitationSource,
         GroupMemberKeys,
+        GroupNameUpdate,
         GroupSchema,
         InitialDatasetValueRows,
         InitialGroupValueRows,
@@ -140,7 +146,12 @@ use flotsync_core::{
     versions::{PureVersionVector, UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, RowValues, Schema, TableOperations};
-use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
+use flotsync_io::test_support::{
+    ReservedSocketKind,
+    ReservedSocketLease,
+    eventually,
+    reserve_sockets,
+};
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     KeyFingerprint,
@@ -318,6 +329,15 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_member_public_keys(key_id)
+    }
+
+    fn load_member_public_key_ids(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<MemberKeyId>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_member_public_key_ids()
     }
 
     fn load_member_public_keys_for_member<'a>(

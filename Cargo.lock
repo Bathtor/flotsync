@@ -1575,6 +1575,7 @@ dependencies = [
  "futures-util",
  "http",
  "httparse",
+ "indoc",
  "itertools 0.14.0",
  "itoa",
  "kompact",
@@ -1624,6 +1625,7 @@ dependencies = [
  "flotsync_security",
  "flotsync_utils",
  "futures-util",
+ "indoc",
  "intervallum",
  "itertools 0.14.0",
  "kompact",
@@ -2257,6 +2259,15 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
+]
+
+[[package]]
+name = "indoc"
+version = "2.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]

@@ -33,6 +33,7 @@ use crate::{
         SummaryRequest,
         security::{
             AssessPublicKeyBundleRequest,
+            KnownMemberKeysReport,
             PublicKeyBundleReport,
             RecordPublicKeyBundleFeedbackRequest,
         },
@@ -57,7 +58,9 @@ use super::errors::GroupInstallError;
 #[cfg(test)]
 use super::errors::InboundDeliveryError;
 #[cfg(test)]
-use crate::codecs::messages::{UpdateBatchMessage, UpdateMessage};
+use crate::api::PendingGroupDecisionRecord;
+#[cfg(test)]
+use crate::codecs::messages::{GroupSetupMessage, UpdateBatchMessage, UpdateMessage};
 #[cfg(any(test, feature = "test-support"))]
 use std::time::Duration;
 
@@ -350,6 +353,10 @@ impl ReplicationApi for ReplicationRuntime {
         })
     }
 
+    fn known_member_keys(&self) -> ApiFuture<'_, KnownMemberKeysReport> {
+        self.ask(|promise| ReplicationRuntimeMessage::KnownMemberKeys(Ask::new(promise, ())))
+    }
+
     fn publish_changes(&self, request: PublishChangesRequest) -> ApiFuture<'_, PublishReceipt> {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::PublishChanges(Ask::new(promise, request))
@@ -419,6 +426,14 @@ impl ReplicationRuntime {
         remote_addr: std::net::SocketAddr,
     ) {
         self.with_host_for_test(|host| host.publish_direct_peer_route(peer, remote_addr));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_route_establishment_watches_for_test(
+        &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
+    ) {
+        self.with_host_for_test(|host| host.replace_route_establishment_watches(watches));
     }
 
     // These route assertion helpers are only used by in-crate runtime tests.
@@ -496,6 +511,36 @@ impl ReplicationRuntime {
             Err(error) => {
                 panic!(
                     "replication runtime component became unavailable during test apply_update_batch: {error:?}"
+                )
+            }
+        }
+    }
+
+    /// Inject one pending-group delivery without transport for runtime logic tests.
+    #[cfg(test)]
+    pub(super) fn apply_pending_group_for_test(
+        &self,
+        sender: MemberIdentity,
+        record: PendingGroupDecisionRecord,
+        group_setup: Arc<GroupSetupMessage>,
+    ) -> Result<(), InboundDeliveryError> {
+        let runtime_ref = self
+            .runtime_ref("injecting test pending-group delivery")
+            .expect("replication runtime lifecycle should be readable during test injection")
+            .expect("replication runtime should be live during test injection");
+        let future = runtime_ref.ask_with(|promise| {
+            ReplicationRuntimeMessage::test_apply_pending_group(
+                promise,
+                sender,
+                record,
+                group_setup,
+            )
+        });
+        match wait_for_test_reply(future) {
+            Ok(reply) => reply,
+            Err(error) => {
+                panic!(
+                    "replication runtime component became unavailable during pending-group test injection: {error:?}"
                 )
             }
         }

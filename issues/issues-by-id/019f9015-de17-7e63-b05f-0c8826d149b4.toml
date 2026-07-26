@@ -1,0 +1,55 @@
+id = "019f9015-de17-7e63-b05f-0c8826d149b4"
+ref = "flotsync-git-r7j"
+title = "Split replicated checklist REPL by responsibility"
+body = """
+Objective
+
+R01. Split the oversized replicated-checklist REPL implementation into coherent sibling modules without changing user-visible behaviour.
+
+Module layout
+
+R02. Keep runner/repl.rs responsible for runtime startup and shutdown, listener wiring, the interactive loop, general workspace commands, synchronisation, startup snapshot loading, and item or event rendering.
+R03. Add the sibling runner::groups module, backed by runner/groups/mod.rs, for group-registry loading and refresh, default-group behaviour, group command dispatch, group creation, invitation decisions, member operations, and group-specific rendering.
+R04. Add runner/groups/tests.rs for group-specific fixtures and tests. Keep listener or general REPL tests with runner/repl.rs where they belong, and do not duplicate responder or runtime test wrappers.
+R05. Use ordinary pub visibility for shared example-application types, fields, methods, and helpers where the sibling modules need access. Do not add visibility machinery intended to simulate a library boundary.
+R06. Leave runner/keys.rs and runner/setup.rs as sibling responsibilities alongside runner::groups and runner::repl.
+
+Behaviour constraints
+
+R07. Preserve command syntax, output, runtime behaviour, listener delivery, state management, and replication API usage.
+R08. Preserve the temporary direct-store workaround and TODO(flotsync-git-c9m) until that architectural follow-up supplies the public application view.
+R09. Keep checklist working-set behaviour in its existing owning module and avoid redesigning the REPL state merely to perform the extraction.
+
+Validation
+
+R10. Verify formatting, pedantic Clippy for flotsync_io_examples, and the complete flotsync_io_examples test suite serially.
+R11. Compare the final diff with this plan and ensure substantive changes are limited to module boundaries, imports, visibility, and test placement.
+
+Estimate
+
+R12. Expect runner/repl.rs to fall from 2,005 LOC to roughly 750-850 LOC, runner/groups/mod.rs to contain roughly 500-600 LOC, and runner/groups/tests.rs roughly 600-750 LOC.
+R13. Roughly 1,100-1,300 existing lines will move, so the textual diff will exceed 1,000 LOC. Approximately 80-160 LOC should be newly written or materially changed. Keeping this as one structural task avoids an unnatural intermediate ownership boundary; production and test moves may be separated into focused commits if review benefits."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "Codex"
+created_at = "2026-07-23T17:46:20.055901Z"
+updated_at = "2026-07-25T11:40:25.87977Z"
+closed_at = "2026-07-25T11:40:25.87977Z"
+
+[[links]]
+target = "019f8588-bbc6-7523-87d2-6d5e83939248"
+label = "discovered from"
+
+[[comments]]
+id = "019f98ea-5298-7432-a532-e792a8308e4e"
+author = "Codex"
+body = "Implemented the agreed sibling-module extraction without behavioural changes. runner/repl.rs is now 762 LOC, runner/groups/mod.rs 720 LOC including shared test fixtures, and runner/groups/tests.rs 573 LOC. Group registry, defaults, creation, invitations, member operations, rendering, and their tests now live under runner::groups; runtime/listener wiring and general workspace behaviour remain in runner::repl. cargo fmt --all -- --check, pedantic Clippy for all flotsync_io_examples targets, the complete flotsync_io_examples test suite, and git diff --check pass."
+created_at = "2026-07-25T10:55:21.240393Z"
+
+[[comments]]
+id = "019f9913-9797-7802-907d-e60eb637d6af"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T11:40:25.87977Z"

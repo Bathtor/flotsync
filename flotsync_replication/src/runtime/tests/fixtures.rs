@@ -477,6 +477,41 @@ pub(super) fn runtime_api_returns_local_public_key_bundle() {
 }
 
 #[test]
+pub(super) fn runtime_api_reports_known_member_key_trust() {
+    let alice = alice_member();
+    let fixture = load_runtime_fixture(
+        app_alice_id(),
+        alice.clone(),
+        Vec::<(DatasetId, SchemaSource)>::new(),
+    );
+    let record = MemberPublicKeysRecord::from_public_keys(&test_public_keys(&alice));
+    let mut transaction =
+        wait_for_test_reply(fixture.store.begin_transaction()).expect("transaction should start");
+    wait_for_test_reply(transaction.ensure_member_public_keys(record.clone()))
+        .expect("local public keys should store");
+    wait_for_test_reply(transaction.ensure_member_key_trust_evidence(
+        MemberKeyTrustEvidenceRecord {
+            key_id: record.key_id,
+            evidence_kind: MemberKeyTrustEvidenceKind::LocalExplicitTrust,
+        },
+    ))
+    .expect("local trust evidence should store");
+    wait_for_test_reply(transaction.commit()).expect("transaction should commit");
+
+    let report = wait_for_test_reply(fixture.runtime.known_member_keys())
+        .expect("known-member keys should load");
+
+    let local = report
+        .members
+        .iter()
+        .find(|member| member.member_id == alice)
+        .expect("local member keys should be reported");
+    assert_eq!(local.keys.len(), 1);
+    assert!(local.keys[0].trust.has_local_explicit_trust);
+    wait_for_test_reply(fixture.runtime.shutdown()).expect("runtime should shut down");
+}
+
+#[test]
 pub(super) fn runtime_api_assesses_and_records_public_key_bundle_feedback() {
     let bob = bob_member();
     let fixture = load_runtime_fixture(
@@ -579,6 +614,62 @@ pub(super) fn load_title_runtime_pair_with_trust(
         [alice_member.clone()],
     );
     (alice_fixture, bob_fixture)
+}
+
+/// Load runtimes with mutual explicit trust and all-to-all route-establishment watches.
+pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
+    entries: &[(Identifier, MemberIdentity); N],
+) -> (
+    ReservedSocketLease,
+    [RuntimeFixture<SqliteReplicationStore>; N],
+) {
+    let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket; N]);
+    let stores = entries
+        .each_ref()
+        .map(|(_, member)| sqlite_store(member.clone()));
+
+    for (local_index, ((_, local_member), store)) in entries.iter().zip(stores.iter()).enumerate() {
+        let mut trusted_members = Vec::with_capacity(N.saturating_sub(1));
+        for (peer_index, (_, peer_member)) in entries.iter().enumerate() {
+            if peer_index != local_index {
+                trusted_members.push(peer_member.clone());
+            }
+        }
+        provision_test_security(store.as_ref(), local_member, trusted_members);
+    }
+
+    let fixtures = std::array::from_fn(|local_index| {
+        let (application_id, local_member) = &entries[local_index];
+        let listener = Arc::new(ListenerStub::default());
+        let runtime = load_runtime_with_parts(
+            application_id.clone(),
+            stores[local_index].clone(),
+            listener.clone(),
+        );
+        RuntimeFixture {
+            local_member: local_member.clone(),
+            runtime,
+            listener,
+            store: stores[local_index].clone(),
+        }
+    });
+    for (local_index, fixture) in fixtures.iter().enumerate() {
+        let mut watches = Vec::with_capacity(N.saturating_sub(1));
+        for (peer_index, peer_fixture) in fixtures.iter().enumerate() {
+            if peer_index != local_index {
+                watches.push(flotsync_routes::route_establishment::WatchedRoute {
+                    route: flotsync_discovery::protocol::DiscoveryRoute::Udp(
+                        peer_fixture.runtime.advertised_loopback_udp_addr_for_test(),
+                    ),
+                    expected_member: Some(peer_fixture.local_member.clone()),
+                });
+            }
+        }
+        fixture
+            .runtime
+            .replace_route_establishment_watches_for_test(watches);
+    }
+    (endpoint_lease, fixtures)
 }
 
 pub(super) fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
@@ -725,6 +816,7 @@ pub(super) fn inactive_group_record(
         ),
         lifecycle: ReplicationGroupLifecycle::Open,
         security_material: current_slice_placeholder_group_security_material(group_id),
+        ..Default::default()
     }
 }
 
@@ -763,6 +855,7 @@ pub(super) fn persist_group_membership_for_member<S>(
             ),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material: current_slice_placeholder_group_security_material(group_id),
+            ..Default::default()
         },
     );
 }
@@ -782,6 +875,7 @@ pub(super) fn persist_alice_group_with_security_material(
             version_vector: VersionVector::initial(NonZeroUsize::new(1).unwrap()),
             lifecycle: ReplicationGroupLifecycle::Open,
             security_material,
+            ..Default::default()
         },
     );
 }

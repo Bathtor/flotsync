@@ -86,6 +86,31 @@ fn manual_route_watch_without_expected_member_publishes_verified_group_member() 
 }
 
 #[test]
+fn manual_route_watch_publishes_permitted_member_with_unknown_group_context() {
+    let local_member = member(["alice"]);
+    let remote_member = member(["bob"]);
+    let memberships = SharedGroupMemberships::new(GroupMemberships::default());
+    let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 49_124));
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_185));
+    let remote_instance = Uuid::from_u128(85);
+    let harness = RouteEstablishmentHarness::new(local_member, memberships);
+    let nonce = harness.probe_manual_route(
+        SocketId(105),
+        local_endpoint,
+        [watched_udp_route(remote_route, Some(remote_member.clone()))],
+        remote_route,
+    );
+    let payload =
+        IntroductionSpec::new(&remote_member, remote_instance, remote_route, [group_id(1)])
+            .encode(nonce);
+
+    harness.receive_transport(remote_route, payload);
+
+    harness.expect_peer_route_update(&remote_member, &[remote_route], Some(local_endpoint));
+    harness.shutdown();
+}
+
+#[test]
 fn manual_route_watch_unions_constrained_duplicate_members() {
     let local_member = member(["alice"]);
     let first_expected_member = member(["bob"]);

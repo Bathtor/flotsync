@@ -1,0 +1,134 @@
+id = "019f9d52-a16e-7612-8445-a92ac094d9ac"
+ref = "flotsync-git-728"
+title = "Review replicated checklist manual scenario findings"
+body = """
+Purpose
+
+M01. Collect and resolve findings reported while manually running the replicated checklist scenarios.
+M02. Preserve the staged review boundary: reproduce F02 first, review the regression test, implement the fix, review the fix, address F01, then resume manual testing.
+
+Findings
+
+F01. When creating a group, the final summary is debug-printed instead of display-formatted.
+F02. Group invitations are not being delivered during the manual scenario. Release-mode logging is insufficient to identify where delivery stops; no warning or error is observed.
+F03. Add a command that lists discovered peers and their visible status. The current interface does not reveal whether two peers cannot discover or contact each other, or whether they are communicating but ignoring each other because they share no group.
+F04. Withdrawn. The apparent move-by-name failure resulted from running the command on the wrong node; the requested first-group and the listed second-group belonged to different node contexts.
+
+Progress
+
+S01. F02 is fixed and approved. Trusted peers can establish routes and deliver a first invitation without an existing shared group.
+S02. F01 is the remaining immediate repair before manual checklist testing resumes.
+S03. F03 is tracked separately as P1 follow-up flotsync-git-tos.
+
+Diagnosis
+
+D01. Group creation installs the local group and then submits invitations through reliable delivery.
+D02. Route establishment suppressed introduction responses when the local peer had no groups.
+D03. It also accepted route-publication claims only when the claimed group identifiers overlapped local memberships.
+D04. The older invitation test bypassed both checks by injecting direct peer routes, so it could not expose the first-invitation bootstrap cycle.
+D05. This explained both an entirely new recipient and peers whose existing groups were unrelated: invitation delivery required a route, while the route handshake required pre-existing shared membership.
+D06. Route establishment already has a separate authority capability. Shared group membership must not be a prerequisite.
+D07. Existing route-publication policy intentionally permits an authenticated member route once the exact public key material is stored. This remains distinct from the stronger replication-runtime authority.
+D08. F01 is caused by print_group_creation_summary formatting the group name with Debug and the complete GroupSchema with alternate Debug. GroupSchema has no user-facing Display implementation, but it exposes deterministically ordered DatasetSchema values whose underlying Schema already has suitable compact and alternate Display formats.
+
+Agreed plan
+
+R01. Keep the deterministic regression test for peers without a shared group. Use a reusable fixture helper accepting an array of application/member identities. The helper declares its socket budget, provisions every member with the other members' key material and explicit trust, starts every runtime, and installs symmetric all-to-all route-establishment watches using the runtimes' actual advertised endpoints.
+R02. Destructure the returned fixture array into named Alice and Bob bindings. Wait for Alice's verified route to Bob, create the group through Alice, and expect listener delivery through Bob. Do not inject direct delivery routes.
+R03. Preserve the committed failing regression checkpoint for the first review boundary.
+R04. Make member-route publication independent of shared membership while retaining the existing default authority requirement of StoredPublicKeyMaterial. ReplicationRuntime remains stricter and requires local explicit trust.
+R05. Allow introduction claims with no group IDs. Preserve decoded group IDs and validate them separately from route authority: empty and wholly unknown group sets do not block publication; locally known groups containing the claimant are consistent; any locally known group excluding the claimant rejects the claim, including mixed true/false sets.
+R06. Keep group IDs as optional signed protocol context. Document that the wire field may be empty without putting authorisation policy in the protobuf documentation.
+R07. Cover empty-group claim encoding/decoding, response generation, permitted route publication without shared membership, default trust decisions, local membership consistency, and the end-to-end first-invitation path.
+R08. Any later release-visible diagnostics must be transition- or action-driven and rate-bounded. Do not add timer-triggered visible logs that can clobber REPL input.
+R09. Extract a pure group-creation summary formatter. Render the name with Display, list members in their existing ordered form, and render every deterministically ordered dataset schema through Schema's alternate Display implementation with readable indentation. Print that returned string from the wizard.
+R10. Add an exact-output test for the checklist request so debug type names and internal SchemaSource/HashMap structure cannot reappear unnoticed.
+R11. Resume the manual scenarios once F01 is fixed.
+R12. Keep F03 in flotsync-git-tos rather than expanding this repair.
+
+Estimate
+
+E01. Regression fixture refactor and test: approximately 60–100 LOC.
+E02. Routing fix, review corrections, and focused authority coverage: approximately 250–550 LOC.
+E03. F01 should require approximately 40–70 LOC including exact-output coverage.
+E04. The complete immediate work remains well below 1000 LOC."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "Codex"
+created_at = "2026-07-26T07:27:46.030699Z"
+updated_at = "2026-07-26T09:26:27.05487Z"
+closed_at = "2026-07-26T09:26:27.05487Z"
+
+[[comments]]
+id = "019f9d6d-77c0-77f2-88bb-242050511b86"
+author = "Codex"
+body = "Plan delta after manual triage: F02 is now the P0. Evidence points to a bootstrap cycle in route establishment: invitation delivery needs a route, while introductions currently require shared group membership. Agreed to prove this with a real-route regression test first and stop for review. The later fix will make the existing route-publication capability authoritative for explicitly trusted peers without shared groups. No timer-triggered visible logs; defer F01 and F03 according to the staged plan."
+created_at = "2026-07-26T07:57:04.832988Z"
+
+[[comments]]
+id = "019f9d70-b451-71c2-9374-a177bf9273a7"
+author = "Codex"
+body = "Regression-test pass complete. Added group_invitation_reaches_trusted_member_without_shared_group using mutual explicit trust plus Alice's ordinary static route hint; it does not inject direct peer routes. The focused test reproduces F02: create_group succeeds, then Bob's listener times out after five seconds waiting for the invitation. No production, logging, F01, or F03 changes were made. Awaiting the first review gate."
+created_at = "2026-07-26T08:00:36.945516Z"
+
+[[comments]]
+id = "019f9d7a-b602-7062-b234-931bdc8d3620"
+author = "Codex"
+body = "First review delta agreed: replace the repetitive two-peer setup with a reusable mutually trusted runtime mesh. It will reserve fixed UDP endpoints, configure all-to-all static route hints, and provision all-to-all explicit trust. The regression test will destructure the fixture array into named Alice and Bob bindings, rerun against current production code, and stop again after confirming the same invitation timeout."
+created_at = "2026-07-26T08:11:32.738976Z"
+
+[[comments]]
+id = "019f9d7c-c9a2-7693-925b-2012adae9e70"
+author = "Codex"
+body = "Regression fixture refactor complete. load_mutually_trusted_runtime_mesh now reserves fixed UDP endpoints, provisions every supplied member with explicit trust for every other member, and configures all-to-all static route hints. The regression destructures the returned array into alice_fixture and bob_fixture. The focused test still reproduces F02 with the same five-second listener timeout. Pedantic clippy passes; no production changes were made. Awaiting review."
+created_at = "2026-07-26T08:13:48.834127Z"
+
+[[comments]]
+id = "019f9d80-cd3a-7fc3-b226-bd5b419720ee"
+author = "Codex"
+body = "First review gate passed. The mutually trusted symmetric runtime-mesh fixture and failing first-invitation regression are approved. Committing this test-only checkpoint before implementing the production route-authority fix."
+created_at = "2026-07-26T08:18:11.898533Z"
+
+[[comments]]
+id = "019f9d94-f457-7551-890a-b8880ac7a160"
+author = "Codex"
+body = "F02 production fix is ready for the second review gate. Route establishment now answers and accepts signed member claims without requiring shared group IDs; group IDs remain optional signed context. The default member-route-publication policy now requires local explicit trust, while unknown and blocked bindings remain denied. The symmetric runtime-mesh fixture now installs watches against the runtimes' actual broker-managed endpoints after startup. The end-to-end regression passes, as do all 55 flotsync_routes tests, all 226 flotsync_replication tests, formatting, and pedantic clippy. No periodic visible logging, F01, or F03 changes are included."
+created_at = "2026-07-26T08:40:12.631536Z"
+
+[[comments]]
+id = "019f9da5-f70f-7230-8e57-694c91358879"
+author = "Codex"
+body = "Second-review correction agreed. Restore StoredPublicKeyMaterial as the default MemberRoutePublication requirement and its original tests. Preserve verified claim group IDs, but treat them as a separate local-consistency check: empty and unknown groups do not block route publication, while any locally known group that excludes the claimant rejects the claim. Keep the protobuf field documentation limited to wire semantics."
+created_at = "2026-07-26T08:58:47.439235Z"
+
+[[comments]]
+id = "019f9da9-43d5-70e0-b68f-60fd67667983"
+author = "Codex"
+body = "Review corrections implemented. MemberRoutePublication is back to StoredPublicKeyMaterial, candidate discovery keys retain their prior route-publication behaviour, and ReplicationRuntime remains explicitly trusted. Verified claims retain group IDs; the new consistency helper accepts empty/unknown context but rejects any locally known contradiction, including mixed true/false sets. Protobuf documentation now states only that the field may be empty. All 56 flotsync_routes tests, all 225 flotsync_replication tests, formatting, and pedantic clippy pass."
+created_at = "2026-07-26T09:02:23.701818Z"
+
+[[comments]]
+id = "019f9dae-7519-7b91-b568-913fa65adb75"
+author = "Codex"
+body = "Second review passed. F02 is approved for commit. F01 is the remaining immediate repair before resuming manual scenarios; F03 remains a separate lower-priority usability follow-up."
+created_at = "2026-07-26T09:08:03.993194Z"
+
+[[comments]]
+id = "019f9db0-d68c-7510-a2ca-4bd8d3a1045d"
+author = "Codex"
+body = "F03 now has its own P1 follow-up: flotsync-git-tos (Expose discovered peers in replicated checklist REPL)."
+created_at = "2026-07-26T09:10:40.012804Z"
+
+[[comments]]
+id = "019f9db7-62e0-7773-a6ad-30ea4c2fa545"
+author = "Codex"
+body = "F01 implementation is ready for review. The group-creation wizard now formats its summary through a pure helper: names use Display, members retain their declared order, and each deterministically ordered dataset uses Schema's alternate Display form with UI-level indentation. An exact-output test guards against reintroducing Debug output. All 64 library tests plus 21 smoke tests pass; pedantic clippy, rustfmt check, and git diff check pass."
+created_at = "2026-07-26T09:17:49.15238Z"
+
+[[comments]]
+id = "019f9dbf-49ee-7fc0-bf7d-7e3b130d0d0b"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-26T09:26:27.05487Z"

@@ -1,0 +1,73 @@
+id = "019f8588-bbc6-7523-87d2-6d5e83939248"
+ref = "flotsync-git-d03.3.3"
+title = "Add checklist group creation and invitation mediation"
+body = """
+Objective
+
+P31. Add named group creation and interactive invitation decisions to the multi-group checklist workspace.
+
+Temporary group-state access
+
+P32. Retain Arc<SqliteReplicationStore> in the checklist runner and reload readable ReplicationGroupRecords before group-dependent commands and after group creation or invitation acceptance. Replace the session registry from each result rather than incrementally mirroring runtime state.
+P33. Use direct store access only for group metadata. Creation, invitation decisions, startup snapshot loading, and publication continue through public replication APIs. Add a prominent TODO(flotsync-git-c9m) at the workaround boundary requiring replacement by the future restricted application view.
+
+Group creation
+
+P34. Add flag-free group create <name>. Display known member identities with their trust summaries, sorted by member identity and fingerprint at the UI boundary, then prompt for one additional member identity per line until a blank line completes the ordered list. The local creator is always position zero.
+P35. Validate member syntax, duplicates, and accidental repetition of the local member. Preserve the typed member-identity parse source through Snafu. Treat the known-member report as a reference only and let create_group enforce authoritative key policy.
+P36. Define and document the immutable checklist GroupSchema once with LazyLock. Display the resolved name, creator-first member order, schema, and absent message using readable indoc-based multi-line output, then require explicit confirmation before creating and sending invitations.
+P37. Create through ReplicationApi::create_group. Successful local creation must notify ReplicationEventListener with an empty DataChanged event carrying the new group read position before returning. The checklist refreshes group metadata from the store, drains the listener event into the single working set, does not load the guaranteed-empty group through snapshot_rows, and leaves the current default unchanged.
+
+Invitation mediation
+
+P38. Queue membership invitations and their one-shot responders separately from dataset-change delivery. Name both channels explicitly as batch and invitation channels. Display source, group ID, optional name and message, ordered members, and schema using readable indoc-based multi-line output. The example may retain its existing <unnamed>/<none> placeholders.
+P39. Add group invitations, group accept <number>, and group reject <number>. Name one-based invitation values positions and derived zero-based values indices. Each decision consumes the corresponding responder; rejection reports UserDenied.
+P40. Accepted initial rows enter the application only through ReplicationEventListener. After successful acceptance, refresh group metadata from the store, drain and apply listener-delivered activation rows before returning, and do not call snapshot_rows for that group. Do not change the current default. Restart behaviour continues to rely on runtime replay of unresolved pending decisions.
+P41. Document the listener-before-success contract on local group creation and responder acceptance. Document responder rejection operationally as refusing the invitation or proposal with the supplied reason and removing the pending work from local storage. Continue rejecting membership-change proposals as unsupported. Automatic default repair after later group deactivation remains in flotsync-git-d03.4.
+
+Validation
+
+P42. Cover parsing, one-member-per-line wizard termination and validation, exact creation requests, confirmation behaviour, store-backed refreshes, listener delivery before local creation success, absence of post-creation snapshot loading, invitation queueing and decisions, listener-only accepted-row ingestion, unchanged defaults, and relevant single-runtime integration paths. Add handler-level tests with narrow injected wizard/confirmation boundaries rather than testing only disconnected ingredients. Existing replication tests remain responsible for transport-level multi-runtime behaviour.
+
+Deferrals
+
+P43. Defer the responsibility-based split of runner/repl.rs to P0 follow-up flotsync-git-r7j so this review remains behaviour-focused.
+
+Estimate
+
+P44. Approximately 950-1,450 LOC for the complete slice. The second review delta is expected to remain below 300 LOC; the larger module split is explicitly deferred."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = ["019f8588-861f-70a3-a154-f8e23e72baf7"]
+blocks = ["019f8396-c396-75b2-a651-2866f60b79a9"]
+parent = "019f8396-66d1-72c1-8fb0-0d2fffd66313"
+created_at = "2026-07-21T16:35:58.534541Z"
+updated_at = "2026-07-25T09:11:51.7119Z"
+closed_at = "2026-07-25T09:11:51.7119Z"
+
+[[comments]]
+id = "019f9016-7a2d-7692-b148-6e0618c97b69"
+author = "Codex"
+body = "Review alignment: accepted initial rows will be listener-only and the responder API will document that contract; handler-level tests, typed parse errors, channel naming, and UI sorting will be addressed. Sentinel metadata rendering remains unchanged by decision. The REPL module split is deferred to P0 follow-up flotsync-git-r7j."
+created_at = "2026-07-23T17:47:00.013003Z"
+
+[[comments]]
+id = "019f94d2-bbd7-7b82-8a7d-988efc2717bf"
+author = "Codex"
+body = "Second review alignment: local group creation will reuse listener notification to initialise the new read position before success; the checklist will remove its post-creation snapshot load. Invitation naming, one-member-per-line input, indoc output, explicit NonZeroUsize construction, and operational rejection documentation will be addressed in the same pass."
+created_at = "2026-07-24T15:51:06.455793Z"
+
+[[comments]]
+id = "019f9863-4652-73f3-99e9-4779e41993e7"
+author = "Codex"
+body = "Second review pass implemented: local creation now emits an empty listener data event before success using the shared notification path; the checklist drains it instead of loading a snapshot. Wizard input, output formatting, position naming, responder documentation, and focused tests were updated. Formatting, pedantic Clippy, and the complete affected test set pass."
+created_at = "2026-07-25T08:27:50.738348Z"
+
+[[comments]]
+id = "019f988b-929f-7f63-8ae9-904867e55e6c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-25T09:11:51.7119Z"

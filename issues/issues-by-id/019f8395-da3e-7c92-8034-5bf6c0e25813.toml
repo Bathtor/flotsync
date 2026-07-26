@@ -1,0 +1,116 @@
+id = "019f8395-da3e-7c92-8034-5bf6c0e25813"
+ref = "flotsync-git-d03.1"
+title = "Persist active replication group metadata"
+body = """
+Objective:
+G11. Persist optional group name and message metadata for created, invited, and membership-change successor groups so every participant observes the same locally stored values across activation and restart.
+
+Semantics:
+S11. Name and message are optional descriptive metadata. They do not identify a group, affect membership or security compatibility, or receive protocol interpretation.
+S12. Protocol documentation permits implementations to update or ignore metadata-only replay differences. This implementation replaces locally stored metadata after validating group material and security.
+S13. `CreateGroupRequest` accepts `group_name: Option<String>` and `message: Option<String>`.
+S14. Membership changes use a name-specific `GroupNameUpdate::{Clear, Inherit, Set(String)}` with `Inherit` as the default. Successor messages remain `Option<String>` and are never inherited.
+S15. Locally supplied creation names and replacement names are trimmed before use and rejected when the trimmed result is empty. The trimmed value is stored and transmitted. Messages are not trimmed and may be empty.
+S16. Inbound protocol names are accepted verbatim, including empty or whitespace-only values; local name sanitation is an application API constraint, not a protocol rule.
+S17. Duplicate names across different group UUIDs remain valid. Applications must resolve ambiguity using UUIDs.
+S18. Debug output includes the actual optional name and message values.
+S19. Pending replay work compares its complete protocol-relevant definition except name/message. After activation, validation of the already-consumed invitation source and initial snapshot is optional: the proposer remains represented by the position-zero member, and the snapshot no longer affects active state. This implementation validates active group material and security but may ignore those consumed fields.
+S20. Public Rust API documentation describes caller-visible behaviour only. Protocol replay rules and receiver freedom belong on protobuf definitions.
+S21. Aggregate defaults exist for named struct-update ergonomics. Persisted-record defaults are deliberately non-functional until all required identity, membership, index, and security fields are supplied.
+
+Implementation plan:
+P11. Extend create requests, active group records, inactive material records, accepted activation records, and preparation helpers with optional name and message metadata.
+P12. Add the documented public `GroupNameUpdate` enum, default it to `Inherit`, resolve it against the old active record before constructing a membership change, and add explicit empty-after-trim API errors.
+P13. Propagate resolved metadata through creator persistence, creation invitations, membership-change proposals/invitations, listener decisions, automatic acceptance, activation, and restart recovery.
+P14. Keep delivery membership snapshots metadata-free; persisted group records remain the authoritative application-facing metadata source.
+P15. Exclude name and message from group-definition and security compatibility checks while retaining conflicts for group id, members, local index, schema, and encrypted security material.
+P16. Add nullable `group_name` and `message` columns to the current SQLite replication-group material schema and update reads/inserts directly. There is no deployed state, so no database upgrade work is required.
+P17. For existing compatible material, update the metadata columns when a valid replay differs in metadata; leave exact replays as no-ops.
+P18. Make pending decision/activation persistence compare immutable pending-work content separately from metadata. Refresh metadata-only payload differences while preserving awaiting-decision versus accepted-activation state and never reopening accepted work.
+P19. Refresh metadata for replays of already-active groups after validating material and security, without emitting another invitation/proposal decision. Document that post-activation source/snapshot validation is optional.
+P20. Keep optional-field presence/absence and replay-validation policy on protobuf fields; keep the existing protobuf field names and numbers.
+P21. Update all request/record constructors and fixtures, using unnamed/unmessaged defaults except where metadata behaviour is under test.
+P22. Rewrite `GroupNameUpdate`, `GroupInvitation`, and `MigrationProposal` public documentation around caller-visible semantics. Describe internal definition matchers in terms of this implementation's comparison only.
+P23. Add `GroupId::new_random()` and const `GroupId::NIL`; replace the two production UUID-v4 wrapper constructions and use `NIL` in aggregate defaults.
+P24. Implement `Default` for `CreateGroupRequest`, `ChangeGroupMembershipRequest`, `ReplicationGroupMaterialRecord`, and `ReplicationGroupRecord` while preserving named struct-update syntax.
+P25. Give persisted-record defaults redundant invalid sentinels: nil group id, empty member keys, `u32::MAX` local index, and private `invalid_default_group_security_material()`. Keep absent metadata, empty schema, initial progress, and open lifecycle as neutral defaults.
+P26. Reject nil group ids, empty stored membership, inconsistent progress width, and the exact invalid default security tuple at operational boundaries before incomplete defaults can become active state.
+P27. Convert uncomplicated unnamed/unmessaged literals to `..Default::default()`; keep persistence decoding and deliberate protocol/metadata propagation explicit.
+P28. Keep deterministic test ids built from explicit UUID values unchanged.
+
+Acceptance:
+A11. Named/messaged creation persists trimmed local metadata for the creator, sends it to invited members, and reloads it unchanged after restart.
+A12. Empty-after-trim locally supplied names fail before group creation or membership-change preparation; messages, including empty messages, remain accepted.
+A13. Membership-change name inheritance, clearing, and replacement all work; the successor message is exactly the supplied option and never inherited.
+A14. Name/message differences do not cause pending-work or group-material conflicts. Pending immutable differences and active material/security differences still do; post-activation source/snapshot validation remains optional.
+A15. Metadata replays update material and pending payloads locally without regressing pending lifecycle state or reopening active work.
+A16. Inbound empty names remain accepted and stored verbatim.
+A17. Actual metadata values appear in invitation, proposal, request, material, and active-record debug output.
+A18. Existing unnamed and unmessaged creation, invitation, activation-recovery, membership-change, and restart flows continue to work.
+A19. Listener-facing API docs contain no protocol replay-policy prose; protobuf definitions retain the complete protocol contract.
+A20. Aggregate defaults support named struct updates, while wholly or partially incomplete persisted-record defaults fail closed with structured errors rather than becoming stored or active groups.
+A21. Random production group ids are allocated through `GroupId::new_random()`; `GroupId::NIL` is the single named nil sentinel.
+A22. Database decoding and protocol conversion continue to spell out metadata fields explicitly.
+
+Test plan:
+T11. Unit tests cover tri-state name resolution, trimming, empty-name rejection, empty messages, record conversion, compatibility, and exact debug output.
+T12. Codec tests cover optional name/message round-trips and document metadata-only semantics.
+T13. SQLite tests cover optional combinations, metadata replacement, immutable conflicts, and pending decision/activation metadata refresh without lifecycle regression.
+T14. Runtime tests cover creator persistence/restart, invited-peer activation, active invitation and accepted membership-change replay refresh, ignored post-activation snapshot differences, and inbound empty-name acceptance.
+T15. Multi-runtime membership-change tests cover inherited, cleared, and replacement names plus explicitly present or absent successor messages.
+T16. Unit tests cover `GroupId::NIL`, random group-id construction, and exact aggregate default values.
+T17. Store/runtime tests prove nil ids, empty memberships, invalid default security material, and progress-width mismatches fail without persistence or activation.
+T18. Existing fixtures and examples compile through named struct-update defaults, while metadata-specific tests remain explicit.
+
+Out of scope:
+O11. Group-name uniqueness or application selector resolution.
+O12. A runtime group-listing API; the later checklist workspace child consumes persisted records.
+O13. Protocol-level name sanitation or mandatory metadata replay-update policy.
+O14. Mandatory post-activation validation of consumed invitation source or initial-snapshot fields.
+O15. Checklist REPL syntax for entering names or messages.
+O16. Replacing deterministic test-only `GroupId(Uuid::from_u128(...))` construction.
+O17. Making `GroupId`, `MemberIndex`, or security primitives implement `Default`.
+
+Estimate:
+E11. The final implementation is approximately 1,467 added LOC and 115 deleted LOC after both review passes.
+E12. The total child exceeds 1,000 changed LOC. Replay test plumbing or pending-replay persistence could be split historically, but the work is acceptance-critical and already integrated; keeping this child cohesive remains recommended."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocks = ["019f8396-1861-7951-b169-fbd0fff06213"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:31:03.870215Z"
+updated_at = "2026-07-21T15:30:49.093477Z"
+closed_at = "2026-07-21T15:30:49.093477Z"
+
+[[comments]]
+id = "019f8442-3ba6-7060-bb10-f853e73e1bcc"
+author = "Codex"
+body = "Plan agreed after detailed review: persist optional group name and message metadata; treat metadata-only replay differences as non-conflicting and update them locally; use clear/inherit/set only for successor names with inherit as default; keep messages explicitly present or absent; trim locally supplied names and reject empty-after-trim results; leave inbound protocol names unconstrained; and log actual metadata values."
+created_at = "2026-07-21T10:39:20.998702Z"
+
+[[comments]]
+id = "019f84a8-c223-7b02-8f21-171d0c62d865"
+author = "Codex"
+body = "Code-review resolution: pending work retains full definition comparison, while validation of consumed source and initial-snapshot fields after activation is optional. This implementation continues to validate active group material and security before metadata refresh. Review fixes also cover stale public/protobuf docs, direct accepted membership-change replay coverage, and exact Debug assertions."
+created_at = "2026-07-21T12:31:20.099014Z"
+
+[[comments]]
+id = "019f84e6-e0c5-7f83-a8ef-b8eceab4f204"
+author = "Codex"
+body = "Inline-review plan agreed: keep listener-facing Rust docs API-focused; retain replay semantics on protobuf fields; add aggregate Default implementations with redundant fail-closed sentinels and named struct-update call sites; centralise UUID-v4 and nil construction as GroupId::new_random() and GroupId::NIL; and name the private security sentinel invalid_default_group_security_material()."
+created_at = "2026-07-21T13:39:11.173487Z"
+
+[[comments]]
+id = "019f84fc-037f-72d3-94e8-19c0acbe6022"
+author = "Codex"
+body = "Inline-review implementation complete: RF25-RF33 are resolved; public Rust docs are API-focused; aggregate defaults use fail-closed sentinels; GroupId owns random and nil construction; named struct-update literals replace incidental metadata fields; pedantic Clippy is clean; and the full workspace suite plus doctests pass."
+created_at = "2026-07-21T14:02:16.319424Z"
+
+[[comments]]
+id = "019f854d-1485-7823-a5ab-6c5edb9ed918"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-21T15:30:49.093477Z"

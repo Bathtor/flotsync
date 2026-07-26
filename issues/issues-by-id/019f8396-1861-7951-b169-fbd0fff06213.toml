@@ -1,0 +1,120 @@
+id = "019f8396-1861-7951-b169-fbd0fff06213"
+ref = "flotsync-git-d03.2"
+title = "Move checklist key management into a zero-group REPL"
+body = """
+Objective:
+Z01. Remove the replicated-checklist static-group bridge and make every established key-management operation except local identity initialisation available through one running, already-unlocked REPL.
+
+Current repository state:
+Z02. The previous child now persists optional group name and message metadata in active group records; this child does not need further replication metadata work.
+Z03. Checklist config still requires a group id, ordered members, and a plaintext group-secret password, derives a group key, and forwards the complete TOML to runtime loading.
+Z04. Startup still calls `ensure_configured_group`, selects the configured group, and constructs one mandatory group-fixed working set.
+Z05. `ReplicationApi` already provides `local_public_key_bundle`, `assess_public_key_bundle`, and `record_public_key_bundle_feedback`. `PublicKeyBundleReport` already has application-facing display output.
+Z06. Runtime loading already supports a provisioned store containing no active groups; the existing runtime-host test exercises that path. The missing work is checklist runner state and command handling.
+Z07. The current 498-line key module reopens config/store/security for every command and duplicates assessment, permission, warning, and display behaviour already owned by the runtime API. The 396-line static-group module and most runner tests around it become obsolete.
+
+Agreed and proposed behaviour:
+Z08. Keep exactly `keys init-local <config>` as a top-level command. It remains pre-runtime because runtime loading requires local private identity material.
+Z09. Add positional, flag-free REPL commands `keys export-local`, `keys inspect <public-bundle>`, `keys trust <member-id> <public-bundle>`, and `keys block <public-bundle>`.
+Z10. `keys inspect` performs a read-only runtime assessment with no candidate identity. `keys trust` assesses with the supplied exact member as its sole candidate, prints the report, asks for confirmation, then records `TrustMember`.
+Z11. `keys block` decodes and assesses the supplied bundle, prints the report, asks for confirmation, then records `BlockFingerprint`; the application never asks the user to transcribe a fingerprint.
+Z12. Confirmation is fail-closed: only `y` or `yes`, case-insensitively, records feedback. Empty input, EOF, `n`, or `no` cancels without changing security state; every other response returns an actionable error naming the accepted answers.
+Z13. `keys init-local` continues to persist the local public binding alongside encrypted private material so the local identity remains database-known for the later group-creation wizard. It no longer attempts static-group installation.
+Z14. During this intermediate child, startup supports zero or one readable active group. Zero groups enters a key-capable shell; one group preserves the existing checklist commands using the persisted record rather than config; more than one reports the temporary single-group limitation explicitly until flotsync-git-d03.3.
+Z15. With zero groups, `help`, `me`, all REPL key commands, and `quit` work. Checklist data/member/sync commands return one actionable no-active-group error instead of panicking or manufacturing a group.
+Z16. Group invitations and membership-change proposals remain rejected by policy in this child; flotsync-git-d03.3 owns interactive invitation state.
+
+Implementation plan:
+Z17. Reduce `ChecklistAppConfig` to source path, raw runtime TOML, local member, store path, and store-secret profile. Remove static group parsing, password derivation, related crypto imports, validation, and tests.
+Z18. Delete `runner/static_group.rs`, `StaticGroupError`, startup installation/verification, status printing, and static-group-only fixtures and tests.
+Z19. Before transferring the store into runtime loading, read active group records once and construct an intermediate `NoGroup` or `SingleGroup` checklist session. Reject multiple groups with a dedicated transitional error.
+Z20. Make the REPL own an optional single-group session containing the persisted group id, canonical member list, and working set. Load the snapshot only for the single-group case and derive `members`, `check`, `me`, and prompt/banner output from that session.
+Z21. Extend the existing Clap-backed REPL grammar with a nested key command enum while reducing the top-level key enum to `InitLocal`.
+Z22. Refactor `runner/keys.rs` into the pre-runtime initialiser plus small runtime handlers that decode bundles, construct API requests, print `PublicKeyBundleReport`, perform confirmation, and record feedback. Remove direct store trust/block operations and the duplicated local report/permission model.
+Z23. Keep the current local-key generation/provisioning path for `init-local`, including idempotent reuse and local public-binding storage, but remove all configured-group follow-up.
+Z24. Remove obsolete imports, errors, helpers, and tests from `runner/mod.rs`; keep runtime/API errors observable through the existing Snafu boundary.
+Z25. Update command help and the directly affected checklist configuration/runbooks so they show minimal config, top-level initialisation, then in-REPL export/inspect/trust/block. Mark data-group scenarios as pending the next child rather than documenting removed static setup.
+Z26. Make no replication API, store schema, protocol, or trust-policy changes in this child.
+
+Acceptance:
+Z27. A peer with provisioned local identity keys and no active groups loads the replication runtime and reaches the REPL after one store-secret unlock.
+Z28. The same REPL can export repeatedly and inspect, trust, or block several bundles without reopening config, store, or keychain state.
+Z29. Trust and block always show the runtime assessment before confirmation and make no change when confirmation is declined or input ends.
+Z30. Trust is bound to the explicit member identity; block derives the fingerprint only from the decoded bundle.
+Z31. Top-level parsing accepts `keys init-local <config>` and rejects the former top-level export, inspect, trust, and block forms.
+Z32. A store with one active group retains the current checklist editing, member, summary, snapshot, and sync behaviour without group fields in config.
+Z33. A zero-group session reports group-bound commands clearly while keeping key management and clean shutdown available.
+Z34. Static-group setup code, configured group secrets, configured group identifiers, and ordered configured members no longer exist in the checklist application.
+Z35. Existing runtime security semantics remain delegated to and covered by `flotsync_replication`; the checklist adds coverage for its command routing, confirmation, and zero/one-group shell states.
+
+Test plan:
+Z36. Config tests cover the minimal required application fields, relative store paths, store-secret profile validation, and preservation of raw runtime TOML.
+Z37. Parser/help tests cover the sole top-level initialiser and all four nested REPL key commands, including bundle-based block syntax.
+Z38. Key-handler tests use a narrow test double or extracted command boundary to assert exact assessment candidates/storage mode, feedback requests, report-before-confirm ordering, cancellation, and API error propagation.
+Z39. Startup/session tests cover zero groups, one persisted group, and the explicit multiple-group transitional error.
+Z40. Existing checklist working-set tests continue to cover the one-group command behaviour; static-group construction and secret-mismatch tests are removed.
+Z41. Focused runner tests cover idempotent `init-local` and preservation of the local public binding without creating a group.
+Z42. Validation runs formatting, pedantic Clippy for `flotsync_io_examples`, its focused test suite, and the full workspace suite serially.
+
+Out of scope:
+Z43. Multi-group workspace state, group selection/defaults, creation, and invitation handling; flotsync-git-d03.3 owns them.
+Z44. Qualified item references, transfer, and all-group synchronisation; flotsync-git-d03.4 owns them.
+Z45. Replacing the temporary pre-runtime local-key provisioning boundary; flotsync-git-1i3 reassesses it after this epic.
+Z46. New replication security APIs or changes to trust/block semantics.
+Z47. Preserving checklist data commands when more than one active group is already stored during this deliberately transitional child.
+
+Estimate and review split:
+Z48. Minimal config and static-bridge removal: approximately 500-700 changed LOC, mostly deletions.
+Z49. REPL grammar and runtime-backed key operations: approximately 300-450 changed LOC.
+Z50. Zero/one-group transitional session wiring: approximately 200-350 changed LOC.
+Z51. Test replacement and additions: approximately 300-500 changed LOC.
+Z52. Help and documentation updates: approximately 100-180 changed LOC.
+Z53. The final gross diff is 2,827 changed LOC: 1,007 additions and 1,820 deletions. The implementation exceeds the planning range but shrinks the codebase by 813 lines because the obsolete static bridge, duplicate security reporting, and their tests were removed.
+Z54. If a smaller review boundary is preferred, split the work into an initial config/static-bridge removal that temporarily retains the existing top-level key commands, followed by the REPL key move and documentation update. Otherwise, keep this child cohesive and use those two phases as separate commits."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 2
+assignee = "Codex"
+blocked_by = ["019f8395-da3e-7c92-8034-5bf6c0e25813"]
+blocks = ["019f8396-66d1-72c1-8fb0-0d2fffd66313"]
+parent = "019f502e-2262-70a0-bf74-6da295fff88e"
+created_at = "2026-07-21T07:31:19.777487Z"
+updated_at = "2026-07-21T16:20:12.782964Z"
+closed_at = "2026-07-21T16:20:12.782964Z"
+
+[[comments]]
+id = "019f8551-744b-7b40-8a70-50940504a99a"
+author = "Codex"
+body = "Current-state audit: the runtime API and zero-group load path already exist, while the checklist still owns a 396-line static-group bridge and a 498-line key module that duplicates runtime security reporting. The child plan now preserves exactly-one-group checklist behaviour as a transitional compatibility path, routes REPL keys through ReplicationApi, and updates the gross estimate above 1,000 changed LOC because of substantial deletions."
+created_at = "2026-07-21T15:35:35.755183Z"
+
+[[comments]]
+id = "019f8555-96e1-79f2-a1a7-3a03ce679746"
+author = "Codex"
+body = "Plan agreed: implement the fail-closed runtime-backed key flow, preserve zero-or-one-group checklist behaviour as the transitional application state, and keep this child cohesive in two implementation phases."
+created_at = "2026-07-21T15:40:06.753501Z"
+
+[[comments]]
+id = "019f8563-d4d7-73e3-b4b4-d6290d15982e"
+author = "Codex"
+body = "Implementation complete: static checklist group configuration/setup is removed; zero/one readable-group startup is supported; export, inspect, trust, and bundle-based block run through the unlocked ReplicationApi with fail-closed confirmation; focused tests, pedantic Clippy, OKF checks, the full workspace suite, and doctests all pass."
+created_at = "2026-07-21T15:55:40.119757Z"
+
+[[comments]]
+id = "019f856f-b051-7d13-bcb7-6f3bd78085d2"
+author = "Codex"
+body = "Review follow-up: confirmation keeps EOF, empty input, n, and no as explicit cancellation; unexpected responses now return an actionable error instead of silently behaving as no."
+created_at = "2026-07-21T16:08:37.201322Z"
+
+[[comments]]
+id = "019f8570-cdf2-79c2-800e-e930fc9dd69f"
+author = "Codex"
+body = "Review comment resolved: confirmation now accepts y/yes, cancels on EOF/empty/n/no, and reports every other response as InvalidConfirmationResponse with accepted-answer guidance. Focused tests and pedantic Clippy pass."
+created_at = "2026-07-21T16:09:50.322453Z"
+
+[[comments]]
+id = "019f857a-4d6e-7db0-8bfb-475ddd321962"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-21T16:20:12.782964Z"
