@@ -146,7 +146,12 @@ use flotsync_core::{
     versions::{PureVersionVector, UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, RowValues, Schema, TableOperations};
-use flotsync_io::test_support::{ReservedSocketKind, eventually, reserve_sockets};
+use flotsync_io::test_support::{
+    ReservedSocketKind,
+    ReservedSocketLease,
+    eventually,
+    reserve_sockets,
+};
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     KeyFingerprint,

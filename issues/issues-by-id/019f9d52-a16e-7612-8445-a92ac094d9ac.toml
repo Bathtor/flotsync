@@ -1,0 +1,79 @@
+id = "019f9d52-a16e-7612-8445-a92ac094d9ac"
+ref = "flotsync-git-728"
+title = "Review replicated checklist manual scenario findings"
+body = """
+Purpose
+
+M01. Collect and resolve findings reported while manually running the replicated checklist scenarios.
+M02. Preserve the staged review boundary: reproduce F02 first, review the regression test, implement the fix, review the fix, address F01, then resume manual testing.
+
+Findings
+
+F01. When creating a group, the final summary is debug-printed instead of display-formatted.
+F02. Group invitations are not being delivered during the manual scenario. Release-mode logging is insufficient to identify where delivery stops; no warning or error is observed.
+F03. Add a command that lists discovered peers and their visible status. The current interface does not reveal whether two peers cannot discover or contact each other, or whether they are communicating but ignoring each other because they share no group.
+F04. Withdrawn. The apparent move-by-name failure resulted from running the command on the wrong node; the requested first-group and the listed second-group belonged to different node contexts.
+
+F02 diagnosis
+
+D01. Group creation installs the local group and then submits invitations through reliable delivery.
+D02. Route establishment currently suppresses introduction responses when the local peer has no groups.
+D03. It also accepts route-publication claims only when the claimed group identifiers overlap local memberships.
+D04. The existing invitation test bypasses both checks by injecting direct peer routes, so it cannot expose the first-invitation bootstrap cycle.
+D05. This explains both an entirely new recipient and peers whose existing groups are unrelated: the invitation requires a route, while the current route handshake requires pre-existing shared membership.
+D06. Route establishment already has a separate authority capability. Shared group membership must not be a prerequisite. The intended pre-membership path is an exact locally trusted member-key binding; unknown or blocked bindings remain denied.
+
+Agreed staged plan
+
+R01. Keep the deterministic regression test for mutually trusted peers without a shared group. Refactor its repetitive setup into one reusable fixture helper accepting an array of application/member identities. The helper reserves one UDP endpoint per runtime, provisions every member with explicit trust for every other member, configures symmetric static route hints between all runtimes, and returns the live socket lease plus an array of runtime fixtures.
+R02. Destructure the returned fixture array into named Alice and Bob bindings. Create the group through Alice and expect listener delivery through Bob. Do not inject direct routes.
+R03. Run the focused regression against the current implementation and verify that it still fails at the invitation boundary, then stop for user review. Do not change production routing, logging, F01, or F03 in this pass.
+R04. After approval, make the route-publication capability authoritative independently of group membership. Preserve the shared-group route path, allow an empty-group introduction claim only for the explicitly trusted pre-membership path, and retain unknown and blocked denials.
+R05. Cover the corrected authority decisions and first-invitation path, then stop for a second review.
+R06. Any later release-visible diagnostics must be transition- or action-driven and rate-bounded. Do not add timer-triggered visible logs that can clobber REPL input.
+R07. Address F01 after the invitation fix review.
+R08. Resume the manual scenarios once F02 and F01 are fixed. An intermediate manual rerun is unnecessary if the automated regression reproduces the problem.
+R09. Treat F03 as follow-up usability work after invitation delivery is restored.
+
+Estimate
+
+E01. Regression fixture refactor and test: approximately 60–100 LOC, with the test itself becoming shorter.
+E02. Routing fix and focused authority coverage: approximately 200–500 LOC.
+E03. F01 is small and F03 remains separately scoped. The immediate F02 work is expected to remain well below 1000 LOC."""
+status = "in-progress"
+status_reason = "regression approved; routing fix next"
+type = "task"
+priority = 0
+assignee = "Codex"
+created_at = "2026-07-26T07:27:46.030699Z"
+updated_at = "2026-07-26T08:18:11.898533Z"
+
+[[comments]]
+id = "019f9d6d-77c0-77f2-88bb-242050511b86"
+author = "Codex"
+body = "Plan delta after manual triage: F02 is now the P0. Evidence points to a bootstrap cycle in route establishment: invitation delivery needs a route, while introductions currently require shared group membership. Agreed to prove this with a real-route regression test first and stop for review. The later fix will make the existing route-publication capability authoritative for explicitly trusted peers without shared groups. No timer-triggered visible logs; defer F01 and F03 according to the staged plan."
+created_at = "2026-07-26T07:57:04.832988Z"
+
+[[comments]]
+id = "019f9d70-b451-71c2-9374-a177bf9273a7"
+author = "Codex"
+body = "Regression-test pass complete. Added group_invitation_reaches_trusted_member_without_shared_group using mutual explicit trust plus Alice's ordinary static route hint; it does not inject direct peer routes. The focused test reproduces F02: create_group succeeds, then Bob's listener times out after five seconds waiting for the invitation. No production, logging, F01, or F03 changes were made. Awaiting the first review gate."
+created_at = "2026-07-26T08:00:36.945516Z"
+
+[[comments]]
+id = "019f9d7a-b602-7062-b234-931bdc8d3620"
+author = "Codex"
+body = "First review delta agreed: replace the repetitive two-peer setup with a reusable mutually trusted runtime mesh. It will reserve fixed UDP endpoints, configure all-to-all static route hints, and provision all-to-all explicit trust. The regression test will destructure the fixture array into named Alice and Bob bindings, rerun against current production code, and stop again after confirming the same invitation timeout."
+created_at = "2026-07-26T08:11:32.738976Z"
+
+[[comments]]
+id = "019f9d7c-c9a2-7693-925b-2012adae9e70"
+author = "Codex"
+body = "Regression fixture refactor complete. load_mutually_trusted_runtime_mesh now reserves fixed UDP endpoints, provisions every supplied member with explicit trust for every other member, and configures all-to-all static route hints. The regression destructures the returned array into alice_fixture and bob_fixture. The focused test still reproduces F02 with the same five-second listener timeout. Pedantic clippy passes; no production changes were made. Awaiting review."
+created_at = "2026-07-26T08:13:48.834127Z"
+
+[[comments]]
+id = "019f9d80-cd3a-7fc3-b226-bd5b419720ee"
+author = "Codex"
+body = "First review gate passed. The mutually trusted symmetric runtime-mesh fixture and failing first-invitation regression are approved. Committing this test-only checkpoint before implementing the production route-authority fix."
+created_at = "2026-07-26T08:18:11.898533Z"

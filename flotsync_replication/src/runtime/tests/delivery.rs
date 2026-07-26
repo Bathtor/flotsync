@@ -362,6 +362,27 @@ fn group_invitation_persists_group_schema() {
 }
 
 #[test]
+fn group_invitation_reaches_trusted_member_without_shared_group() {
+    let (_runtime_endpoint_lease, [alice_fixture, bob_fixture]) =
+        load_mutually_trusted_runtime_mesh(&[
+            (app_alice_id(), alice_member()),
+            (app_bob_id(), bob_member()),
+        ]);
+    let members = vec![
+        alice_fixture.local_member.clone(),
+        bob_fixture.local_member.clone(),
+    ];
+    let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
+        members: members.clone(),
+        group_schema: docs_group_schema(),
+        ..Default::default()
+    }))
+    .expect("create_group should succeed");
+
+    accept_one_creation_invitation(&bob_fixture.listener, group_id, &members);
+}
+
+#[test]
 fn inbound_updates_buffer_until_causal_dependencies_are_met_and_ignore_duplicates() {
     // Causal buffering path:
     // 1. install a two-member group only on Bob,

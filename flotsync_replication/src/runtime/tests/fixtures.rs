@@ -616,6 +616,56 @@ pub(super) fn load_title_runtime_pair_with_trust(
     (alice_fixture, bob_fixture)
 }
 
+/// Load runtimes with fixed endpoints, mutual explicit trust, and all-to-all route hints.
+pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
+    entries: &[(Identifier, MemberIdentity); N],
+) -> (
+    ReservedSocketLease,
+    [RuntimeFixture<SqliteReplicationStore>; N],
+) {
+    let endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket; N]);
+    let stores = entries
+        .each_ref()
+        .map(|(_, member)| sqlite_store(member.clone()));
+
+    for (local_index, ((_, local_member), store)) in entries.iter().zip(stores.iter()).enumerate() {
+        let mut trusted_members = Vec::with_capacity(N.saturating_sub(1));
+        for (peer_index, (_, peer_member)) in entries.iter().enumerate() {
+            if peer_index != local_index {
+                trusted_members.push(peer_member.clone());
+            }
+        }
+        provision_test_security(store.as_ref(), local_member, trusted_members);
+    }
+
+    let fixtures = std::array::from_fn(|local_index| {
+        let (application_id, local_member) = &entries[local_index];
+        let listener = Arc::new(ListenerStub::default());
+        let mut runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(local_index));
+        for (peer_index, (_, peer_member)) in entries.iter().enumerate() {
+            if peer_index != local_index {
+                runtime_config_toml.push_str(&static_peer_route_toml(
+                    peer_member,
+                    endpoint_lease.addr(peer_index),
+                ));
+            }
+        }
+        let runtime = load_runtime_with_parts_and_runtime_config_toml(
+            application_id.clone(),
+            stores[local_index].clone(),
+            listener.clone(),
+            &runtime_config_toml,
+        );
+        RuntimeFixture {
+            local_member: local_member.clone(),
+            runtime,
+            listener,
+            store: stores[local_index].clone(),
+        }
+    });
+    (endpoint_lease, fixtures)
+}
+
 pub(super) fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
     let store = sqlite_store(local_member.clone());
     provision_test_security(store.as_ref(), local_member, []);
