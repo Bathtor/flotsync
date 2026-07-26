@@ -8,10 +8,14 @@ use crate::replicated_checklist::{
 use flotsync_core::versions::VersionVector;
 use flotsync_data_types::RowValues;
 use flotsync_replication::{
+    InitialGroupValueRows,
     InitialSnapshot,
+    InitialSnapshotMetadata,
+    MigrationId,
     ReplicationGroupLifecycle,
     RowId,
     RowKey,
+    SnapshotRef,
     security::{KnownMemberKeyReport, KnownMemberReport, MemberKeyTrustReport},
     test_support::snapshot_read_token,
 };
@@ -64,6 +68,89 @@ fn group_creation_summary_uses_display_formatted_schema() {
                     text STRING NOT NULL USING LINEAR_STRING
                   )
         "}
+    );
+}
+
+#[test]
+fn group_invitation_uses_user_facing_creation_format() {
+    let group_id = GroupId(Uuid::from_u128(1));
+    let invitation = GroupInvitation::new_creation(
+        group_id,
+        vec![
+            MemberIdentity::from_array(["alice"]),
+            MemberIdentity::from_array(["bob"]),
+        ],
+        CHECKLIST_GROUP_SCHEMA.clone(),
+        InitialSnapshot::Empty,
+        Some("shared errands".to_owned()),
+        Some("join me".to_owned()),
+    );
+
+    assert_eq!(
+        format_group_invitation(NonZeroUsize::new(2).expect("two is non-zero"), &invitation),
+        indoc! {"
+            2. group 00000000-0000-0000-0000-000000000001
+              source: creation
+              name: shared errands
+              message: join me
+              members:
+                0: alice
+                1: bob
+              schema:
+                checklist_items:
+                  SCHEMA (
+                    edit_count UINT NOT NULL USING MONOTONIC_COUNTER,
+                    note STRING NOT NULL USING LINEAR_STRING,
+                    priority BYTE NOT NULL USING LATEST_VALUE_WINS,
+                    status STRING NOT NULL USING TOTAL_ORDER_FSM(['open', 'in_progress', 'done']),
+                    tags ARRAY<STRING> NOT NULL USING LINEAR_LIST,
+                    text STRING NOT NULL USING LINEAR_STRING
+                  )
+              initial snapshot: empty
+        "}
+    );
+}
+
+#[test]
+fn group_invitation_formats_migration_metadata_and_absent_optional_values() {
+    let old_group_id = GroupId(Uuid::from_u128(2));
+    let new_group_id = GroupId(Uuid::from_u128(3));
+    let invitation = GroupInvitation::new_migration(
+        MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        vec![MemberIdentity::from_array(["alice"])],
+        GroupSchema::default(),
+        InitialSnapshot::Metadata(InitialSnapshotMetadata {
+            primary_ref: SnapshotRef {
+                group_id: old_group_id,
+                versions: VersionVector::initial(NonZeroUsize::MIN),
+            },
+            equivalent_refs: Vec::new().into(),
+            record_count: None,
+        }),
+        None,
+        None,
+    );
+
+    assert_eq!(
+        format_group_invitation(NonZeroUsize::MIN, &invitation),
+        indoc! {"
+            1. group 00000000-0000-0000-0000-000000000003
+              source: migration 00000000-0000-0000-0000-000000000002->00000000-0000-0000-0000-000000000003
+              name: <unnamed>
+              message: <none>
+              members:
+                0: alice
+              schema:
+                none
+              initial snapshot: metadata (primary group: 00000000-0000-0000-0000-000000000002; versions: 〈0-0:0〉; equivalent references: 0; records: unknown)
+        "}
+    );
+    assert_eq!(
+        format_initial_snapshot(&InitialSnapshot::Inline(InitialGroupValueRows::default())),
+        "inline (datasets: 0; rows: 0)"
     );
 }
 

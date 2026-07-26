@@ -55,7 +55,7 @@ use flotsync_utils::{
 use kompact::{kompact_config, prelude::*};
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -115,6 +115,8 @@ pub struct ReliableDeliveryComponent {
     retry_timer: Option<ScheduledTimer>,
     retry_delay: Duration,
     recipient_ack_timeout: Duration,
+    /// Messages whose first missing recipient acknowledgement was already reported visibly.
+    reported_recipient_ack_timeouts: HashSet<MessageId>,
 }
 
 impl ReliableDeliveryComponent {
@@ -139,6 +141,7 @@ impl ReliableDeliveryComponent {
             retry_timer: None,
             retry_delay: DEFAULT_RETRY_DELAY,
             recipient_ack_timeout: DEFAULT_RECIPIENT_ACK_TIMEOUT,
+            reported_recipient_ack_timeouts: HashSet::new(),
         }
     }
 
@@ -412,6 +415,9 @@ impl ReliableDeliveryComponent {
                     "Reliable delivery dropped recipient ack that failed verification",
                 )?;
             async_self.cancel_retry(RetryKey::Sender(message_id));
+            async_self
+                .reported_recipient_ack_timeouts
+                .remove(&message_id);
             debug!(
                 async_self.log(),
                 "Reliable delivery observed recipient ack for message_id={} from recipient={} original_sender={}",
@@ -790,6 +796,7 @@ impl ReliableDeliveryComponent {
                 "Reliable delivery failed to seal outbound envelope for {message_id}; dropping sender work because the error is permanent: {error}"
             );
             self.cancel_retry(RetryKey::Sender(message_id));
+            self.reported_recipient_ack_timeouts.remove(&message_id);
             self.sender_work_items.remove(&message_id);
         }
     }
@@ -860,14 +867,25 @@ impl ReliableDeliveryComponent {
             RouteActiveState::AwaitingRecipientAck => {
                 let sender = work_item.submit.envelope.header.sender.clone();
                 let recipient = work_item.submit.envelope.header.recipient.clone();
-                warn!(
-                    self.log(),
-                    "Reliable delivery recipient ack timed out for message_id={} sender={} recipient={} after {:?}; retrying envelope delivery",
-                    message_id,
-                    sender,
-                    recipient,
-                    self.recipient_ack_timeout
-                );
+                if self.reported_recipient_ack_timeouts.insert(message_id) {
+                    warn!(
+                        self.log(),
+                        "Reliable delivery recipient ack timed out for message_id={} sender={} recipient={} after {:?}; retrying envelope delivery",
+                        message_id,
+                        sender,
+                        recipient,
+                        self.recipient_ack_timeout
+                    );
+                } else {
+                    debug!(
+                        self.log(),
+                        "Reliable delivery recipient ack remains absent for message_id={} sender={} recipient={} after another {:?}; retrying envelope delivery",
+                        message_id,
+                        sender,
+                        recipient,
+                        self.recipient_ack_timeout
+                    );
+                }
                 self.mark_sender_work_pending_retry(
                     message_id,
                     PendingRouteReason::BackoffInEffect,
@@ -899,6 +917,12 @@ impl ReliableDeliveryComponent {
     #[cfg(test)]
     fn sender_work_item(&self, message_id: MessageId) -> Option<&ReliableDeliveryWorkItem> {
         self.sender_work_items.get(&message_id)
+    }
+
+    /// Return whether this message has already emitted its one visible ack-timeout warning.
+    #[cfg(test)]
+    fn reported_recipient_ack_timeout(&self, message_id: MessageId) -> bool {
+        self.reported_recipient_ack_timeouts.contains(&message_id)
     }
 
     #[cfg(test)]
@@ -981,13 +1005,17 @@ mod config_keys {
         key = "flotsync.reliable-delivery.recipient-ack-timeout",
         type = DurationValue,
         default = DEFAULT_RECIPIENT_ACK_TIMEOUT,
-        doc = "Maximum wait for a semantic recipient acknowledgement after a reliable-delivery envelope send succeeds.",
+        doc = "Maximum wait for a semantic recipient acknowledgement after local transport submission succeeds.",
         version = "0.1.0"
     }
 }
 
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(30);
-const DEFAULT_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_mins(5);
+/// Interactive recovery interval for ambiguous loss after successful local transport submission.
+///
+/// Normal reliable messages are small, and listener-mediated group work is acknowledged after
+/// persistence plus successful listener notification rather than after a manual decision.
+const DEFAULT_RECIPIENT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Receiver-side state for one inbound reliable-delivery envelope after it was

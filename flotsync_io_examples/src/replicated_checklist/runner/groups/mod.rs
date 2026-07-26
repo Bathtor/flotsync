@@ -4,7 +4,8 @@ use super::{
     repl::{ChecklistRepl, ChecklistSession, PendingGroupInvitation, join_words},
     *,
 };
-use indoc::{formatdoc, printdoc};
+use flotsync_replication::{GroupInvitationSource, InitialSnapshot};
+use indoc::formatdoc;
 
 /// Load every group whose rows remain application-readable.
 pub async fn load_readable_groups(
@@ -666,23 +667,7 @@ pub fn format_group_creation_summary(request: &CreateGroupRequest) -> String {
         .enumerate()
         .map(|(index, member)| format!("    {index}: {member}"))
         .join("\n");
-    let schemas = request
-        .group_schema
-        .datasets()
-        .into_iter()
-        .map(|dataset| {
-            let schema = format!("{:#}", dataset.schema.as_schema())
-                .lines()
-                .map(|line| format!("      {line}"))
-                .join("\n");
-            format!("    {}:\n{schema}", dataset.dataset_id)
-        })
-        .join("\n");
-    let schemas = if schemas.is_empty() {
-        "    none"
-    } else {
-        &schemas
-    };
+    let schemas = format_group_schema(&request.group_schema);
     formatdoc!(
         "
         group creation summary:
@@ -701,9 +686,9 @@ pub fn print_group_creation_summary(request: &CreateGroupRequest) {
     print!("{}", format_group_creation_summary(request));
 }
 
-/// Print one pending invitation using its current one-based REPL position.
-pub fn print_group_invitation(position: NonZeroUsize, pending: &PendingGroupInvitation) {
-    let invitation = &pending.invitation;
+/// Format one pending invitation using its current one-based REPL position.
+#[must_use]
+pub fn format_group_invitation(position: NonZeroUsize, invitation: &GroupInvitation) -> String {
     let group_name = invitation.group_name.as_deref().unwrap_or("<unnamed>");
     let message = invitation.message.as_deref().unwrap_or("<none>");
     let members = invitation
@@ -713,21 +698,86 @@ pub fn print_group_invitation(position: NonZeroUsize, pending: &PendingGroupInvi
         .map(|(index, member)| format!("    {index}: {member}"))
         .join("\n");
     let group_id = invitation.group_id;
-    let source = &invitation.source;
-    let schema = &invitation.group_schema;
-    let initial_snapshot = &invitation.initial_snapshot;
-    printdoc!(
+    let source = format_group_invitation_source(invitation.source);
+    let schemas = format_group_schema(&invitation.group_schema);
+    let initial_snapshot = format_initial_snapshot(&invitation.initial_snapshot);
+    formatdoc!(
         "
         {position}. group {group_id}
-          source: {source:?}
-          name: {group_name:?}
-          message: {message:?}
+          source: {source}
+          name: {group_name}
+          message: {message}
           members:
         {members}
-          schema: {schema:#?}
-          initial snapshot: {initial_snapshot:?}
+          schema:
+        {schemas}
+          initial snapshot: {initial_snapshot}
         "
-    );
+    )
+}
+
+/// Print one pending invitation using its current one-based REPL position.
+pub fn print_group_invitation(position: NonZeroUsize, pending: &PendingGroupInvitation) {
+    print!("{}", format_group_invitation(position, &pending.invitation));
+}
+
+/// Format one group schema for inclusion beneath a two-space-indented heading.
+fn format_group_schema(group_schema: &GroupSchema) -> String {
+    let schemas = group_schema
+        .datasets()
+        .into_iter()
+        .map(|dataset| {
+            let schema = format!("{:#}", dataset.schema.as_schema())
+                .lines()
+                .map(|line| format!("      {line}"))
+                .join("\n");
+            format!("    {}:\n{schema}", dataset.dataset_id)
+        })
+        .join("\n");
+    if schemas.is_empty() {
+        "    none".to_owned()
+    } else {
+        schemas
+    }
+}
+
+/// Format one invitation source without exposing Rust enum syntax.
+fn format_group_invitation_source(source: GroupInvitationSource) -> String {
+    match source {
+        GroupInvitationSource::Creation => "creation".to_owned(),
+        GroupInvitationSource::Migration { migration_id } => {
+            format!("migration {migration_id}")
+        }
+    }
+}
+
+/// Summarise initial snapshot work without exposing internal type names.
+fn format_initial_snapshot(snapshot: &InitialSnapshot) -> String {
+    match snapshot {
+        InitialSnapshot::Empty => "empty".to_owned(),
+        InitialSnapshot::Inline(rows) => {
+            let row_count = rows
+                .datasets
+                .iter()
+                .map(|dataset| dataset.rows.len())
+                .sum::<usize>();
+            format!(
+                "inline (datasets: {}; rows: {row_count})",
+                rows.datasets.len()
+            )
+        }
+        InitialSnapshot::Metadata(metadata) => {
+            let record_count = metadata
+                .record_count
+                .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
+            format!(
+                "metadata (primary group: {}; versions: {}; equivalent references: {}; records: {record_count})",
+                metadata.primary_ref.group_id,
+                metadata.primary_ref.versions,
+                metadata.equivalent_refs.len(),
+            )
+        }
+    }
 }
 
 /// Follow stored successor links until an open group is found.

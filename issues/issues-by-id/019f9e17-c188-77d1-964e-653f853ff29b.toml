@@ -1,0 +1,57 @@
+id = "019f9e17-c188-77d1-964e-653f853ff29b"
+ref = "flotsync-git-vie"
+title = "Resolve second replicated checklist manual scenario findings"
+body = """
+Purpose
+
+M01. Resolve the two findings from the resumed replicated-checklist manual scenarios without expanding into unrelated example or delivery refactors.
+
+Findings
+
+F05. The group-invitation display has the same presentation defect previously fixed for group creation: it uses debug formatting instead of user-facing display formatting.
+
+F06. Reliable delivery currently waits 300 seconds for a recipient acknowledgement before retrying an ambiguously lost invitation envelope. The original five-minute choice assumed semantic processing might include a human accept/reject step, but the current runtime acknowledges after committed pending-work storage and successful listener notification. Human acceptance or rejection happens later and is not part of reliable-delivery completion.
+
+Agreed plan
+
+P01. Extract the existing user-facing group-schema formatting so group-creation summaries and invitation displays share the same deterministic Display-based rendering.
+
+P02. Add a pure group-invitation formatter. Render creation and migration sources explicitly, render optional name/message metadata without Debug quoting, retain canonical member order, display schemas using the shared formatter, and summarise initial snapshots without Rust type names. Keep the existing print wrapper as the REPL boundary.
+
+P03. Add exact-output invitation-formatting coverage, including creation and migration source rendering and the relevant initial-snapshot summaries.
+
+P04. Change the default flotsync.reliable-delivery.recipient-ack-timeout from five minutes to ten seconds while keeping it independently configurable. Ten seconds is deliberate: after successful local transport submission these messages are small, normal completion only requires persistence plus listener notification, and no manual decision lies on the acknowledgement path. This timeout detects ambiguous loss; it is distinct from the 30-second retry delay used after a known failure. Document this reasoning with the configuration default.
+
+P05. Keep visible timeout reporting rate-bounded: warn on the first recipient-ack timeout for a message, log subsequent timeouts for that message at debug level, and clear the reporting marker when an acknowledgement arrives. This prevents an unreachable peer from clobbering the REPL every ten seconds.
+
+P06. Preserve existing redelivery and receiver-side duplicate semantics. Extend focused tests only where needed to cover the new default/reporting state; do not redesign reliable delivery.
+
+Estimate
+
+E01. Invitation formatting and exact-output tests: approximately 90-160 LOC.
+E02. Timeout default, rate-bounded reporting, documentation, and focused tests: approximately 50-100 LOC.
+E03. Total expected change: approximately 140-260 LOC, below 1000 LOC and not worth subdividing."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 3
+assignee = "Codex"
+created_at = "2026-07-26T11:03:04.8405Z"
+updated_at = "2026-07-26T11:50:04.226574Z"
+closed_at = "2026-07-26T11:50:04.226574Z"
+
+[[links]]
+target = "019f9d52-a16e-7612-8445-a92ac094d9ac"
+label = "follow-up to"
+
+[[comments]]
+id = "019f9e39-ea80-7e03-bf5a-b66030a8744e"
+author = "Codex"
+body = "Implementation ready for review. Group invitations now use a pure user-facing formatter with shared Display-based schema rendering and exact output coverage for creation, migration, empty, inline, and metadata snapshot presentation. Reliable delivery now defaults the independently configurable recipient-ack timeout to ten seconds, documents why manual decisions are not on that path, warns only on the first timeout per message, and clears that reporting state after a verified acknowledgement. All 226 flotsync_replication tests and all 66 flotsync_io_examples unit tests plus 21 smoke tests pass; rustfmt and pedantic clippy pass."
+created_at = "2026-07-26T11:40:23.552995Z"
+
+[[comments]]
+id = "019f9e42-c6c2-7f50-b199-7c09e8209c50"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-26T11:50:04.226574Z"
