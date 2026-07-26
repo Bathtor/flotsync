@@ -4,7 +4,15 @@ use crate::{
     DEFAULT_DISCOVERY_PORT,
     SocketPort,
     config_keys,
-    endpoint_selection::{EndpointSelection, EndpointSelectionPort},
+    endpoint_selection::{
+        EndpointSelection,
+        EndpointSelectionPort,
+        InterfaceFlags,
+        InterfaceMacAddress,
+        InterfaceSnapshotEntry,
+        InterfaceSnapshotProvider,
+        SystemInterfaceSnapshotProvider,
+    },
     kompact::{config::Config, prelude::*},
 };
 use flotsync_io::prelude::{
@@ -28,7 +36,6 @@ use flotsync_messages::{
     proto::EncodeProto,
 };
 use itertools::Itertools;
-use pnet_datalink::{self as datalink, MacAddr, NetworkInterface};
 use snafu::Snafu;
 use std::{
     collections::{HashMap, HashSet},
@@ -231,7 +238,7 @@ pub struct PeerAnnouncementComponent {
     options: Options,
     startup_promise: Option<KPromise<PeerAnnouncementStartupResult>>,
     state: SocketState,
-    broadcast_addresses: HashMap<MacAddr, SocketAddr>,
+    broadcast_addresses: HashMap<InterfaceMacAddress, SocketAddr>,
     advertised_routes: Vec<PeerAnnouncementRoute>,
     next_transmission_id: TransmissionId,
     announcement_timer: Option<ScheduledTimer>,
@@ -383,38 +390,46 @@ impl PeerAnnouncementComponent {
         peer_announcement_bind_options_from_config(self.ctx.config())
     }
 
-    fn get_active_broadcast_interfaces() -> Vec<NetworkInterface> {
-        datalink::interfaces()
+    /// Snapshot interfaces that can receive an IPv4 broadcast announcement.
+    fn get_active_broadcast_interfaces() -> Vec<InterfaceSnapshotEntry> {
+        SystemInterfaceSnapshotProvider
+            .snapshot()
+            .interfaces
             .into_iter()
             .filter(|interface| {
-                interface.mac.is_some()
-                    && interface.is_up()
-                    && !interface.ips.is_empty()
-                    && (interface.is_loopback() || interface.is_broadcast())
+                interface.mac_address.is_some()
+                    && interface.flags.contains(InterfaceFlags::UP)
+                    && !interface.addresses.is_empty()
+                    && interface
+                        .flags
+                        .intersects(InterfaceFlags::LOOPBACK | InterfaceFlags::BROADCAST)
             })
             .collect()
     }
 
+    /// Derive the first IPv4 broadcast target reported for one interface.
     fn get_broadcast_address_for_interface(
         &self,
-        interface: &NetworkInterface,
+        interface: &InterfaceSnapshotEntry,
     ) -> Option<SocketAddr> {
-        if interface.ips.len() > 1 {
+        if interface.addresses.len() > 1 {
             trace!(
                 self.log(),
                 "Interface {} has {} IP ranges.\n{}\nArbitrarily picking the first IPv4.",
                 interface.name,
-                interface.ips.len(),
-                interface.ips.iter().join(", ")
+                interface.addresses.len(),
+                interface.addresses.iter().join(", ")
             );
         }
         interface
-            .ips
+            .addresses
             .iter()
-            .find(|network| network.is_ipv4())
-            .map(|network| {
-                let broadcast_addr = network.broadcast();
-                SocketAddr::new(broadcast_addr, *self.options.broadcast_target_port())
+            .find_map(|address| address.ipv4_broadcast())
+            .map(|broadcast_addr| {
+                SocketAddr::new(
+                    IpAddr::V4(broadcast_addr),
+                    *self.options.broadcast_target_port(),
+                )
             })
     }
 
@@ -434,10 +449,9 @@ impl PeerAnnouncementComponent {
             .broadcast_addresses
             .keys()
             .filter(|mac| {
-                let mac_opt = Some(**mac);
                 !active_interfaces
                     .iter()
-                    .any(|interface| interface.mac.as_ref() == mac_opt.as_ref())
+                    .any(|interface| interface.mac_address.as_ref() == Some(*mac))
             })
             .copied()
             .collect_vec();
@@ -450,7 +464,7 @@ impl PeerAnnouncementComponent {
         }
 
         for interface in active_interfaces {
-            let Some(mac) = interface.mac else {
+            let Some(mac) = interface.mac_address else {
                 trace!(
                     self.log(),
                     "Skipping active interface {} because it has no MAC address", interface.name
@@ -476,7 +490,7 @@ impl PeerAnnouncementComponent {
             } else {
                 trace!(
                     self.log(),
-                    "Could not find a broadcast address for interface: {interface}"
+                    "Could not find a broadcast address for interface: {}", interface.name
                 );
             }
         }
@@ -943,15 +957,16 @@ mod tests {
         );
     }
 
-    fn ipv4_interface(cidr: &str) -> NetworkInterface {
-        NetworkInterface {
-            name: "test0".to_string(),
-            description: "test interface".to_string(),
-            index: 0,
-            mac: Some(MacAddr(0, 1, 2, 3, 4, 5)),
-            ips: vec![cidr.parse().expect("valid IPv4 network")],
-            flags: 0,
-        }
+    fn ipv4_interface(address: Ipv4Addr, prefix: u8) -> InterfaceSnapshotEntry {
+        InterfaceSnapshotEntry::new(
+            "test0",
+            InterfaceFlags::UP | InterfaceFlags::BROADCAST,
+            [crate::endpoint_selection::InterfaceAddress::new(
+                IpAddr::V4(address),
+                prefix,
+            )],
+        )
+        .with_mac_address(InterfaceMacAddress::new([0, 1, 2, 3, 4, 5]))
     }
 
     #[test]
@@ -1023,7 +1038,7 @@ mod tests {
             53_000,
         )));
         let component = PeerAnnouncementComponent::with_options(options);
-        let interface = ipv4_interface("192.168.5.10/24");
+        let interface = ipv4_interface(Ipv4Addr::new(192, 168, 5, 10), 24);
 
         assert_eq!(
             component.get_broadcast_address_for_interface(&interface),
@@ -1043,7 +1058,7 @@ mod tests {
             )))
             .with_broadcast_target_port(Some(SocketPort(53_001)));
         let component = PeerAnnouncementComponent::with_options(options);
-        let interface = ipv4_interface("192.168.6.10/24");
+        let interface = ipv4_interface(Ipv4Addr::new(192, 168, 6, 10), 24);
 
         assert_eq!(
             component.socket_bind_addr().port(),
@@ -1113,11 +1128,11 @@ mod tests {
                 socket_id: SocketId(11),
             };
             component.broadcast_addresses.insert(
-                MacAddr(0, 1, 2, 3, 4, 5),
+                InterfaceMacAddress::new([0, 1, 2, 3, 4, 5]),
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 255), 52156)),
             );
             component.broadcast_addresses.insert(
-                MacAddr(0, 1, 2, 3, 4, 6),
+                InterfaceMacAddress::new([0, 1, 2, 3, 4, 6]),
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 255), 52156)),
             );
         });
@@ -1189,7 +1204,7 @@ mod tests {
                 socket_id: SocketId(12),
             };
             component.broadcast_addresses.insert(
-                MacAddr(0, 1, 2, 3, 4, 7),
+                InterfaceMacAddress::new([0, 1, 2, 3, 4, 7]),
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 2, 255), 52156)),
             );
         });
@@ -1237,7 +1252,7 @@ mod tests {
                 socket_id: SocketId(13),
             };
             component.broadcast_addresses.insert(
-                MacAddr(0, 1, 2, 3, 4, 8),
+                InterfaceMacAddress::new([0, 1, 2, 3, 4, 8]),
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 3, 255), 52156)),
             );
         });

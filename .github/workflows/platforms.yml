@@ -73,12 +73,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test --workspace --locked \
-              --exclude flotsync_discovery \
-              --exclude flotsync_discovery_cli
-          else
-            cargo test --workspace --locked
-          fi
+        run: cargo test --workspace --locked

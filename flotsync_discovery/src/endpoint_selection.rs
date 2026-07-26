@@ -7,9 +7,10 @@
 //! point-to-point links.
 
 use bitflags::bitflags;
-use pnet_datalink as datalink;
+use netdev::Interface;
 use std::{
     collections::BTreeSet,
+    fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
@@ -42,16 +43,16 @@ impl EndpointSelection {
     }
 }
 
-/// Interface snapshot provider backed by `pnet_datalink::interfaces`.
+/// Interface snapshot provider backed by the operating system's native interface APIs.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct PnetInterfaceSnapshotProvider;
+pub struct SystemInterfaceSnapshotProvider;
 
-impl InterfaceSnapshotProvider for PnetInterfaceSnapshotProvider {
+impl InterfaceSnapshotProvider for SystemInterfaceSnapshotProvider {
     fn snapshot(&self) -> InterfaceSnapshot {
         InterfaceSnapshot {
-            interfaces: datalink::interfaces()
+            interfaces: netdev::get_interfaces()
                 .into_iter()
-                .map(InterfaceSnapshotEntry::from_pnet)
+                .map(InterfaceSnapshotEntry::from_netdev)
                 .collect(),
         }
     }
@@ -79,6 +80,8 @@ impl InterfaceSnapshot {
 pub struct InterfaceSnapshotEntry {
     /// Stable OS-level interface name where available.
     pub name: String,
+    /// Link-layer address, when the interface exposes one.
+    pub mac_address: Option<InterfaceMacAddress>,
     /// Interface state and category flags used by endpoint selection.
     pub flags: InterfaceFlags,
     /// Assigned IP addresses.
@@ -95,18 +98,26 @@ impl InterfaceSnapshotEntry {
     ) -> Self {
         Self {
             name: name.into(),
+            mac_address: None,
             flags,
             addresses: addresses.into_iter().collect(),
         }
     }
 
-    /// Convert from a `pnet_datalink` interface without leaking that type into callers.
-    fn from_pnet(interface: datalink::NetworkInterface) -> Self {
+    /// Attach a link-layer address to this snapshot entry.
+    #[must_use]
+    pub const fn with_mac_address(mut self, mac_address: InterfaceMacAddress) -> Self {
+        self.mac_address = Some(mac_address);
+        self
+    }
+
+    /// Convert from a `netdev` interface without leaking that type into callers.
+    fn from_netdev(interface: Interface) -> Self {
         let mut flags = InterfaceFlags::empty();
         if interface.is_up() {
             flags.insert(InterfaceFlags::UP);
         }
-        if interface_is_running(&interface) {
+        if interface.is_running() {
             flags.insert(InterfaceFlags::RUNNING);
         }
         if interface.is_loopback() {
@@ -115,18 +126,91 @@ impl InterfaceSnapshotEntry {
         if interface.is_point_to_point() {
             flags.insert(InterfaceFlags::POINT_TO_POINT);
         }
+        if interface.is_broadcast() {
+            flags.insert(InterfaceFlags::BROADCAST);
+        }
+        let mac_address = interface
+            .mac_addr
+            .map(|address| InterfaceMacAddress::new(address.octets()));
+        let addresses = interface
+            .ipv4
+            .into_iter()
+            .map(|network| InterfaceAddress {
+                ip: IpAddr::V4(network.addr()),
+                prefix: network.prefix_len(),
+            })
+            .chain(interface.ipv6.into_iter().map(|network| InterfaceAddress {
+                ip: IpAddr::V6(network.addr()),
+                prefix: network.prefix_len(),
+            }))
+            .collect();
         Self {
             name: interface.name,
+            mac_address,
             flags,
-            addresses: interface
-                .ips
-                .into_iter()
-                .map(|network| InterfaceAddress {
-                    ip: network.ip(),
-                    prefix: network.prefix(),
-                })
-                .collect(),
+            addresses,
         }
+    }
+}
+
+/// Six-octet link-layer address used to identify an interface across snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InterfaceMacAddress([u8; 6]);
+
+impl InterfaceMacAddress {
+    /// Build an interface MAC address from its six octets.
+    #[must_use]
+    pub const fn new(octets: [u8; 6]) -> Self {
+        Self(octets)
+    }
+}
+
+impl fmt::Display for InterfaceMacAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5]
+        )
+    }
+}
+
+/// One IP address assigned to an interface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterfaceAddress {
+    /// Assigned unicast address.
+    pub ip: IpAddr,
+    /// Network prefix length reported with the address.
+    pub prefix: u8,
+}
+
+impl InterfaceAddress {
+    /// Build one interface address entry.
+    #[must_use]
+    pub const fn new(ip: IpAddr, prefix: u8) -> Self {
+        Self { ip, prefix }
+    }
+
+    /// Return the IPv4 broadcast address implied by this address and prefix.
+    #[must_use]
+    pub fn ipv4_broadcast(self) -> Option<Ipv4Addr> {
+        match self.ip {
+            IpAddr::V4(address) if self.prefix <= 32 => {
+                let network_mask = if self.prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.prefix)
+                };
+                Some(Ipv4Addr::from(u32::from(address) | !network_mask))
+            }
+            IpAddr::V4(_) | IpAddr::V6(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for InterfaceAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.ip, self.prefix)
     }
 }
 
@@ -146,23 +230,8 @@ bitflags! {
         const LOOPBACK = LOOPBACK_FLAG_BITS;
         /// Interface is point-to-point rather than broadcast/LAN-like.
         const POINT_TO_POINT = POINT_TO_POINT_FLAG_BITS;
-    }
-}
-
-/// One IP address assigned to an interface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InterfaceAddress {
-    /// Assigned unicast address.
-    pub ip: IpAddr,
-    /// Network prefix length reported with the address.
-    pub prefix: u8,
-}
-
-impl InterfaceAddress {
-    /// Build one interface address entry.
-    #[must_use]
-    pub const fn new(ip: IpAddr, prefix: u8) -> Self {
-        Self { ip, prefix }
+        /// Interface supports IPv4 broadcast traffic.
+        const BROADCAST = BROADCAST_FLAG_BITS;
     }
 }
 
@@ -292,6 +361,8 @@ const RUNNING_FLAG_BITS: u16 = 0b0000_0010;
 const LOOPBACK_FLAG_BITS: u16 = 0b0000_0100;
 /// Raw bit shared by interface and endpoint-selection policy flags for point-to-point endpoints.
 const POINT_TO_POINT_FLAG_BITS: u16 = 0b0000_1000;
+/// Raw interface flag for broadcast-capable interfaces.
+const BROADCAST_FLAG_BITS: u16 = 0b0100_0000;
 /// Raw policy bit for IPv4 link-local addresses.
 const IPV4_LINK_LOCAL_FLAG_BITS: u16 = 0b0001_0000;
 /// Raw policy bit for IPv6 link-local addresses.
@@ -353,18 +424,6 @@ fn address_is_ipv6_link_local(address: Ipv6Addr) -> bool {
     (segments[0] & 0xffc0) == 0xfe80
 }
 
-/// Return the platform running flag when available; otherwise treat up interfaces as running.
-fn interface_is_running(interface: &datalink::NetworkInterface) -> bool {
-    #[cfg(unix)]
-    {
-        interface.is_running()
-    }
-    #[cfg(not(unix))]
-    {
-        interface.is_up()
-    }
-}
-
 mod kompact_port {
     //! Kompact port for publishing endpoint-selection updates.
 
@@ -382,7 +441,63 @@ mod kompact_port {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use netdev::{
+        MacAddr,
+        interface::flags::{IFF_BROADCAST, IFF_LOOPBACK, IFF_POINTOPOINT, IFF_UP},
+        ipnet::{Ipv4Net, Ipv6Net},
+    };
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn netdev_interface_mapping_preserves_addresses_and_mac() {
+        let mut interface = Interface::dummy();
+        interface.name = "test0".to_string();
+        interface.mac_addr = Some(MacAddr::new(0, 1, 2, 3, 4, 5));
+        interface.flags = (IFF_UP | IFF_BROADCAST | IFF_LOOPBACK | IFF_POINTOPOINT) as u32;
+        interface.ipv4 =
+            vec![Ipv4Net::new(Ipv4Addr::new(192, 168, 1, 20), 24).expect("valid IPv4 network")];
+        interface.ipv6 = vec![
+            Ipv6Net::new("fd00::20".parse().expect("valid IPv6 address"), 64)
+                .expect("valid IPv6 network"),
+        ];
+
+        let snapshot = InterfaceSnapshotEntry::from_netdev(interface);
+
+        assert_eq!(snapshot.name, "test0");
+        assert!(snapshot.flags.contains(
+            InterfaceFlags::UP
+                | InterfaceFlags::BROADCAST
+                | InterfaceFlags::LOOPBACK
+                | InterfaceFlags::POINT_TO_POINT
+        ));
+        assert_eq!(
+            snapshot.mac_address,
+            Some(InterfaceMacAddress::new([0, 1, 2, 3, 4, 5]))
+        );
+        assert_eq!(
+            snapshot.addresses,
+            vec![
+                addr(Ipv4Addr::new(192, 168, 1, 20), 24),
+                InterfaceAddress::new(IpAddr::V6("fd00::20".parse().unwrap()), 64),
+            ]
+        );
+    }
+
+    #[test]
+    fn interface_address_calculates_ipv4_broadcast_from_prefix() {
+        assert_eq!(
+            addr(Ipv4Addr::new(192, 168, 1, 20), 24).ipv4_broadcast(),
+            Some(Ipv4Addr::new(192, 168, 1, 255))
+        );
+        assert_eq!(
+            addr(Ipv4Addr::new(192, 168, 1, 20), 32).ipv4_broadcast(),
+            Some(Ipv4Addr::new(192, 168, 1, 20))
+        );
+        assert_eq!(
+            InterfaceAddress::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 128).ipv4_broadcast(),
+            None
+        );
+    }
 
     #[test]
     fn concrete_bound_address_is_selected_without_interface_snapshot() {

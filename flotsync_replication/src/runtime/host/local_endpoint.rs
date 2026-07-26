@@ -13,7 +13,7 @@ use flotsync_discovery::endpoint_selection::{
     EndpointSelectionPort,
     InterfaceSnapshot,
     InterfaceSnapshotProvider,
-    PnetInterfaceSnapshotProvider,
+    SystemInterfaceSnapshotProvider,
 };
 use flotsync_io::prelude::{
     SocketId,
@@ -91,7 +91,7 @@ impl LocalEndpointManager {
     pub(super) fn new(configured_bind_addr: SocketAddr) -> Self {
         Self::with_interface_snapshot_provider(
             configured_bind_addr,
-            Arc::new(PnetInterfaceSnapshotProvider),
+            Arc::new(SystemInterfaceSnapshotProvider),
         )
     }
 
