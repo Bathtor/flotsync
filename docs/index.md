@@ -11,6 +11,10 @@ Do not edit it directly.
 
 - [HistorySnapshot Benchmark Baseline](history_snapshot_formats.md) - Records benchmark baselines for the canonical HistorySnapshot protobuf representation.
 
+## Crate Overview
+
+- [Flotsync Replication Example Applications](flotsync_replication_examples.md) - Describes runnable applications built against the Flotsync replication abstraction.
+
 ## Decision
 
 - [Group Delivery Domain Proposal](group_delivery_domain_proposal.md) - Proposes shared group delivery domain boundaries and crate placement decisions.

@@ -58,8 +58,9 @@ In particular:
 
 - `flotsync_replication/`: application-facing replication API and internal
   replication runtime.
-- `flotsync_io_examples/`: small examples and manual acceptance tools, including
-  `replicated_checklist`.
+- `flotsync_io_examples/`: small examples and manual acceptance tools for direct I/O.
+- `flotsync_replication_examples/`: applications built against the replication abstraction,
+  including `replicated_checklist`.
 - `flotsync_utils/`: shared utility helpers and test support.
 
 ## Design Documentation
@@ -79,7 +80,7 @@ Useful starting points include:
 - `docs/route_establishment.md` for verified direct UDP route discovery.
 - `docs/datagram_multipart_transfer.md` for UDPour.
 - `docs/group_broadcast_queue_model.md` for GroupBroadcast queue semantics.
-- `docs/flotsync_io_examples.md` and
+- `docs/flotsync_io_examples.md`, `docs/flotsync_replication_examples.md`, and
   `docs/replicated_checklist_scenarios.md` for example workflows.
 
 The documentation index is generated. Update the source documents and regenerate
@@ -148,10 +149,10 @@ project is still evolving.
 The most complete manual example is `replicated_checklist`:
 
 ```bash
-cargo run -p flotsync_io_examples --bin replicated_checklist -- --help
+cargo run -p flotsync_replication_examples --bin replicated_checklist -- --help
 ```
 
-See `docs/flotsync_io_examples.md` and
+See `docs/flotsync_replication_examples.md` and
 `docs/replicated_checklist_scenarios.md` for configuration notes and manual
 multi-peer scenarios.
 
