@@ -71,14 +71,9 @@ jobs:
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # TODO(flotsync-j3v): Remove once Windows CI is stabilised and routinely populates its cache.
+          cache-on-failure: ${{ runner.os == 'Windows' }}
 
       - name: Run workspace tests
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cargo test --workspace --locked \
-              --exclude flotsync_discovery \
-              --exclude flotsync_discovery_cli
-          else
-            cargo test --workspace --locked
-          fi
+        run: cargo test --workspace --locked

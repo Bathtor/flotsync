@@ -74,7 +74,7 @@ jobs:
 
       - name: Check portability-target libraries
         run: >
-          cargo check --locked --lib --target ${{ matrix.target }}
+          cargo check --locked --lib --no-default-features --target ${{ matrix.target }}
           -p flotsync_core
           -p flotsync_udpour
           -p flotsync_data_types

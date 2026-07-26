@@ -1,0 +1,76 @@
+id = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
+ref = "flotsync-ng3"
+title = "Repair nightly portability CI and replace pnet interface discovery"
+body = """
+Objective
+
+Repair the deterministic nightly CI failures without installing a packet-capture runtime merely to enumerate network interfaces.
+
+Plan
+
+- Add --no-default-features to the mobile portability cargo check so generic Linux cross-targets do not enable the local keychain backend. Estimated 1 LOC.
+- Commit the Linux workflow repair independently.
+- Replace pnet_datalink with netdev using default-features = false. Map native interface metadata into Flotsync-owned snapshot types shared by endpoint selection and peer announcement. Estimated 70-140 LOC.
+- Preserve interface filtering semantics: operational state, running state, loopback, point-to-point, broadcast capability, MAC identity, and address prefixes.
+- Re-enable flotsync_discovery and flotsync_discovery_cli in the Windows nightly tests. Estimated 2 LOC.
+- Add or adapt focused unit tests for the interface mapping and peer-announcement broadcast selection. Estimated 30-60 LOC.
+- Make the discovery decode-location display assertion platform-neutral by using the compiler-provided file path instead of hard-coded Unix separators. Estimated 1 LOC.
+- Make closed-port TCP failure tests deterministic on Windows by reserving distinct local and remote ports, explicitly binding the client locally, and removing the Windows ignore. Estimated 25-50 LOC.
+- Replace the empty-send listener forced termination with normal application shutdown and a genuine successful-exit assertion. Estimated 2-5 LOC.
+- Follow the documented Mio connection sequence by registering new outbound streams as pending and checking completion after readiness. Estimated 5-15 LOC.
+- Temporarily enable rust-cache failure saves only on Windows, with a TODO to remove the exception once Windows CI is stabilised. Estimated 3 LOC.
+- After registering an outbound stream, inspect take_error() once to catch a Windows failure that completed between connect and registration; if no error is pending, preserve the normal readiness-driven full completion check. Estimated 5-15 LOC.
+- Validate formatting, focused TCP and netcat tests, the complete flotsync_io suite, changed-crate pedantic Clippy, the Windows cross-target check, and one final pushed Windows CI run.
+
+Constraints
+
+- No Npcap or WinPcap runtime should be required.
+- Preserve current mobile target support.
+- Stop and report if netdev target support or interface semantics do not hold up.
+- The unrelated macOS reliable-delivery cleanup flake is explicitly deferred.
+- Do not iterate indefinitely on Windows-only behaviour from macOS; after this final pushed Windows run, continue any remaining platform-specific work on a Windows development machine.
+- Remove Windows cache-on-failure once Windows CI is stabilised.
+- Expected total implementation size: approximately 140-300 LOC, below 1000 LOC."""
+status = "in-progress"
+status_reason = "Windows-local diagnosis required"
+type = "task"
+priority = 3
+assignee = "codex"
+created_at = "2026-07-26T12:44:10.834567Z"
+updated_at = "2026-07-26T17:22:26.193786Z"
+
+[[comments]]
+id = "019f9e86-8d2a-7950-875a-3c5223187a45"
+author = "codex"
+body = "Implemented the agreed two-stage repair. Linux portability default features were disabled in commit 115a53e. Replaced pnet_datalink with feature-minimised netdev, moved peer-announcement broadcast selection onto Flotsync interface snapshots, restored Windows discovery tests, and added mapping/broadcast coverage. Native workspace tests, changed-crate pedantic Clippy, iOS portability checks, and the Windows peer-announcement compile path pass. A full default Windows cross-check from macOS reaches Bonjour binding generation and cannot continue without Windows SDK headers; the native Windows CI runner provides those headers."
+created_at = "2026-07-26T13:04:05.930588Z"
+
+[[comments]]
+id = "019f9ea7-c1c2-7ab1-aa5d-1c7ff765268f"
+author = "codex"
+body = "Made the discovery decode-location display assertion platform-neutral with file!(), matching the compiler's path spelling on Windows and Unix. The focused test, formatting check, and pedantic Clippy check all pass. The unrelated macOS reliable-delivery flake remains intentionally deferred."
+created_at = "2026-07-26T13:40:22.082527Z"
+
+[[comments]]
+id = "019f9f4e-612b-7ad2-bea9-97b8017cd74f"
+author = "codex"
+body = "Implemented the agreed Windows TCP follow-up: outbound connects now wait for Mio readiness before completion checks; closed-port tests reserve distinct explicit local and remote ports and run on Windows; the empty-send listener exits normally instead of being force-killed. The complete flotsync_io suite, the netcat smoke suite, formatting, changed-crate pedantic Clippy, and the Windows cross-target check pass locally. One pushed Windows CI run remains before further platform-specific work moves to a Windows development machine."
+created_at = "2026-07-26T16:42:21.867954Z"
+
+[[comments]]
+id = "019f9f65-f674-7e03-99ac-3e93e6d8b5d9"
+author = "codex"
+body = "Agreed one final bounded Windows attempt: temporarily save rust-cache artefacts on failed Windows jobs, with a removal TODO, and close the connect-to-registration race by checking take_error() immediately after registration before relying on readiness. If Windows still fails, continue from a Windows development machine."
+created_at = "2026-07-26T17:08:07.412914Z"
+
+[[comments]]
+id = "019f9f69-597a-7b53-a8e1-950db39d3790"
+author = "codex"
+body = "Implemented the final bounded Windows attempt. The driver now checks SO_ERROR once immediately after Mio registration and otherwise preserves readiness-driven completion. The platforms workflow temporarily saves failed Windows caches; removal is tracked by linked follow-up flotsync-j3v. The focused connect-failure test, all nine netcat smoke tests, the complete flotsync_io suite, formatting, changed-crate pedantic Clippy, and the Windows cross-target check pass locally."
+created_at = "2026-07-26T17:11:49.370291Z"
+
+[[comments]]
+id = "019f9f73-1111-78f3-a050-96f7203e403f"
+author = "codex"
+body = "Final bounded platforms run 30212119324 still timed out in driver::tcp::tests::tcp_connect_failure_is_reported after registering WRITABLE interest: the post-registration SO_ERROR probe observed no failure and Mio produced no readiness event. The Windows failure-cache path worked and uploaded 387,686,905 bytes under the expected cache key. macOS passed. Ubuntu independently timed out in tcp_listener_empty_scripted_line_closes_cleanly. No further remote Windows attempts; continue the explicit local-bind pending-connect diagnosis on a Windows development machine."
+created_at = "2026-07-26T17:22:26.193786Z"

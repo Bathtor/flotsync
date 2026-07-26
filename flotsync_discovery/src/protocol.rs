@@ -408,7 +408,7 @@ mod tests {
             "display should include the decode location: {display}"
         );
         assert!(
-            display.contains("flotsync_discovery/src/protocol.rs"),
+            display.contains(file!()),
             "display should include this module location: {display}"
         );
         assert!(

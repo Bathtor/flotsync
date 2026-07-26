@@ -137,7 +137,15 @@ fn udp_connect_client_exits_after_server_disappears() {
 
 #[test]
 fn tcp_connect_to_closed_port_fails() {
-    let closed_addr = closed_loopback_tcp_addr();
+    let mut socket_lease = reserve_sockets(&[
+        ReservedSocketKind::TcpListener,
+        ReservedSocketKind::TcpListener,
+    ]);
+    let local_addr = socket_lease.addr(0);
+    let closed_addr = socket_lease.addr(1);
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
+
     let client = spawn_netcat(&[
         "--send",
         "ping",
@@ -146,9 +154,17 @@ fn tcp_connect_to_closed_port_fails() {
         "connect",
         "--remote",
         &closed_addr.to_string(),
+        "--bind",
+        &local_addr.to_string(),
     ]);
 
     let output = client.wait_for_output();
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved local TCP socket");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved closed TCP socket");
 
     assert!(
         !output.status.success(),
@@ -195,8 +211,10 @@ fn tcp_listener_and_client_exchange_one_scripted_line() {
 
 #[test]
 fn tcp_connect_empty_scripted_line_exits_cleanly() {
-    let mut listener =
-        spawn_netcat_with_reserved_bind(ReservedSocketKind::TcpListener, &["tcp", "listen"]);
+    let mut listener = spawn_netcat_with_reserved_bind(
+        ReservedSocketKind::TcpListener,
+        &["--exit-after-send", "tcp", "listen"],
+    );
     let listener_addr = listener.wait_for_socket_addr("TCP listening on ");
 
     let client = spawn_netcat(&[
@@ -210,7 +228,7 @@ fn tcp_connect_empty_scripted_line_exits_cleanly() {
     ]);
 
     let client_output = client.wait_for_output();
-    let listener_output = listener.kill_and_collect();
+    let listener_output = listener.wait_for_output();
 
     assert!(
         client_output.status.success(),
@@ -220,7 +238,7 @@ fn tcp_connect_empty_scripted_line_exits_cleanly() {
     );
 
     assert!(
-        listener_output.status.success() || listener_output.status.code().is_none(),
+        listener_output.status.success(),
         "listener teardown failed unexpectedly\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&listener_output.stdout),
         String::from_utf8_lossy(&listener_output.stderr)
@@ -561,13 +579,6 @@ fn format_exit_status(status: ExitStatus) -> String {
         Some(code) => format!("code {code}"),
         None => "terminated by signal".to_owned(),
     }
-}
-
-fn closed_loopback_tcp_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temporary listener");
-    let addr = listener.local_addr().expect("temporary listener address");
-    drop(listener);
-    addr
 }
 
 fn spawn_netcat(args: &[&str]) -> SpawnedNetcat {

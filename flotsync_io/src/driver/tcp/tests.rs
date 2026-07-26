@@ -376,16 +376,17 @@ fn tcp_connect_send_and_receive_work() {
 }
 
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "Windows can self-connect after probing a freed loopback port."
-)]
 fn tcp_connect_failure_is_reported() {
     init_test_logger();
 
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind probe listener");
-    let remote_addr = listener.local_addr().expect("probe addr");
-    drop(listener);
+    let mut socket_lease = reserve_sockets(&[
+        ReservedSocketKind::TcpListener,
+        ReservedSocketKind::TcpListener,
+    ]);
+    let local_addr = socket_lease.addr(0);
+    let remote_addr = socket_lease.addr(1);
+    socket_lease.release_binding(0);
+    socket_lease.release_binding(1);
 
     let driver = IoDriver::start(DriverConfig::default()).expect("driver starts");
     let connection_id = resolve_request(driver.reserve_connection());
@@ -393,7 +394,7 @@ fn tcp_connect_failure_is_reported() {
     driver
         .dispatch(DriverCommand::Tcp(crate::api::TcpCommand::Connect {
             connection_id,
-            local_addr: None,
+            local_addr: Some(local_addr),
             remote_addr,
         }))
         .expect("dispatch failing TCP connect");
@@ -416,6 +417,12 @@ fn tcp_connect_failure_is_reported() {
         }
     }
 
+    socket_lease
+        .rebind_binding(0)
+        .expect("rebind reserved local TCP socket");
+    socket_lease
+        .rebind_binding(1)
+        .expect("rebind reserved remote TCP socket");
     driver.shutdown().expect("driver shuts down");
 }
 
