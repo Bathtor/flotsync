@@ -1,0 +1,31 @@
+id = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
+ref = "flotsync-ng3"
+title = "Repair nightly portability CI and replace pnet interface discovery"
+body = """
+Objective
+
+Repair the deterministic nightly CI failures without installing a packet-capture runtime merely to enumerate network interfaces.
+
+Plan
+
+- Add --no-default-features to the mobile portability cargo check so generic Linux cross-targets do not enable the local keychain backend. Estimated 1 LOC.
+- Commit the Linux workflow repair independently.
+- Replace pnet_datalink with netdev using default-features = false. Map native interface metadata into Flotsync-owned snapshot types shared by endpoint selection and peer announcement. Estimated 70-140 LOC.
+- Preserve interface filtering semantics: operational state, running state, loopback, point-to-point, broadcast capability, MAC identity, and address prefixes.
+- Re-enable flotsync_discovery and flotsync_discovery_cli in the Windows nightly tests. Estimated 2 LOC.
+- Add or adapt focused unit tests for the interface mapping and peer-announcement broadcast selection. Estimated 30-60 LOC.
+- Validate formatting, targeted tests, workspace tests where practical, clippy with pedantic warnings, and relevant cross-target checks.
+
+Constraints
+
+- No Npcap or WinPcap runtime should be required.
+- Preserve current mobile target support.
+- Stop and report if netdev target support or interface semantics do not hold up.
+- Expected total implementation size: approximately 100-200 LOC, below 1000 LOC."""
+status = "in-progress"
+status_reason = "plan agreed"
+type = "task"
+priority = 3
+assignee = "codex"
+created_at = "2026-07-26T12:44:10.834567Z"
+updated_at = "2026-07-26T12:45:26.663473Z"
