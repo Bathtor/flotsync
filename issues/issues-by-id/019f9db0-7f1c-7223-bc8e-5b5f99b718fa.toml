@@ -1,0 +1,43 @@
+id = "019f9db0-7f1c-7223-bc8e-5b5f99b718fa"
+ref = "flotsync-git-tos"
+title = "Expose discovered peers in replicated checklist REPL"
+body = """
+Objective
+
+O01. Add a replicated-checklist REPL command that reports discovered peers and enough current connection state to diagnose why two nodes are not communicating.
+
+User need
+
+U01. During manual scenarios, the application currently cannot distinguish between a peer that has not been discovered, a discovered peer without a usable route, and a reachable peer with whom no replication group is shared.
+U02. The command should make this state inspectable on demand without enabling periodic visible logs that overwrite active REPL input.
+
+Scope
+
+S01. Define an application-facing read API or restricted snapshot for the relevant current peer-discovery and route state rather than reading component internals or duplicating mutable state in the example application.
+S02. Expose known peer identities and a small, meaningful status vocabulary sufficient to distinguish discovery from usable route establishment. Do not expose security-sensitive route material unless it is genuinely required for diagnosis.
+S03. Add a simple REPL command and readable display output. Align its exact grammar with the existing top-level key and group command structure during planning.
+S04. Keep output action-driven: requesting the command prints one snapshot; timers and retries must not emit recurring visible output.
+S05. Cover the public snapshot semantics, status derivation, command parsing, empty state, stable UI ordering, and representative discovered/unreachable/reachable peers.
+S06. Document the command in the replicated-checklist scenario instructions.
+
+Acceptance
+
+A01. A user can tell whether the runtime currently knows a peer and whether it has a usable route.
+A02. The command remains useful before any replication group is shared.
+A03. Running the normal REPL remains quiet between commands.
+A04. The application consumes a public runtime abstraction rather than directly inspecting stores or Kompact components.
+
+Estimate
+
+E01. Expect approximately 200–500 LOC across the runtime API, component snapshot plumbing, checklist command/display code, tests, and documentation.
+E02. The task should remain below 1000 LOC. If exposing current state requires the broader group/runtime-view redesign, split the public observation seam from the checklist UI rather than folding that redesign into this task."""
+status = "open"
+type = "task"
+priority = 1
+labels = ["area:examples"]
+created_at = "2026-07-26T09:10:17.628041Z"
+updated_at = "2026-07-26T09:10:25.187599Z"
+
+[[links]]
+target = "019f9d52-a16e-7612-8445-a92ac094d9ac"
+label = "discovered from"

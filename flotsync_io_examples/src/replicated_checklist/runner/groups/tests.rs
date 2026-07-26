@@ -15,6 +15,7 @@ use flotsync_replication::{
     security::{KnownMemberKeyReport, KnownMemberReport, MemberKeyTrustReport},
     test_support::snapshot_read_token,
 };
+use indoc::indoc;
 use std::{cell::Cell, sync::Mutex};
 
 #[test]
@@ -33,6 +34,37 @@ fn creation_request_keeps_creator_first_and_uses_the_checklist_schema() {
     assert_eq!(request.message, None);
     assert_eq!(request.members, vec![creator, bob, carol]);
     assert_eq!(request.group_schema, *CHECKLIST_GROUP_SCHEMA);
+}
+
+#[test]
+fn group_creation_summary_uses_display_formatted_schema() {
+    let request = checklist_group_creation_request(
+        "shared errands".to_owned(),
+        MemberIdentity::from_array(["alice"]),
+        vec![MemberIdentity::from_array(["bob"])],
+    );
+
+    assert_eq!(
+        format_group_creation_summary(&request),
+        indoc! {"
+            group creation summary:
+              name: shared errands
+              message: none
+              members:
+                0: alice
+                1: bob
+              schema:
+                checklist_items:
+                  SCHEMA (
+                    edit_count UINT NOT NULL USING MONOTONIC_COUNTER,
+                    note STRING NOT NULL USING LINEAR_STRING,
+                    priority BYTE NOT NULL USING LATEST_VALUE_WINS,
+                    status STRING NOT NULL USING TOTAL_ORDER_FSM(['open', 'in_progress', 'done']),
+                    tags ARRAY<STRING> NOT NULL USING LINEAR_LIST,
+                    text STRING NOT NULL USING LINEAR_STRING
+                  )
+        "}
+    );
 }
 
 #[test]

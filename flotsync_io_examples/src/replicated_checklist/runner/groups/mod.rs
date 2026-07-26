@@ -4,7 +4,7 @@ use super::{
     repl::{ChecklistRepl, ChecklistSession, PendingGroupInvitation, join_words},
     *,
 };
-use indoc::printdoc;
+use indoc::{formatdoc, printdoc};
 
 /// Load every group whose rows remain application-readable.
 pub async fn load_readable_groups(
@@ -656,8 +656,9 @@ pub fn read_prompted_line(
     Ok(line)
 }
 
-/// Print the final group-creation request before confirmation.
-pub fn print_group_creation_summary(request: &CreateGroupRequest) {
+/// Format the final group-creation request for confirmation.
+#[must_use]
+pub fn format_group_creation_summary(request: &CreateGroupRequest) -> String {
     let group_name = request.group_name.as_deref().unwrap_or("<unnamed>");
     let members = request
         .members
@@ -665,17 +666,39 @@ pub fn print_group_creation_summary(request: &CreateGroupRequest) {
         .enumerate()
         .map(|(index, member)| format!("    {index}: {member}"))
         .join("\n");
-    let schema = &request.group_schema;
-    printdoc!(
+    let schemas = request
+        .group_schema
+        .datasets()
+        .into_iter()
+        .map(|dataset| {
+            let schema = format!("{:#}", dataset.schema.as_schema())
+                .lines()
+                .map(|line| format!("      {line}"))
+                .join("\n");
+            format!("    {}:\n{schema}", dataset.dataset_id)
+        })
+        .join("\n");
+    let schemas = if schemas.is_empty() {
+        "    none"
+    } else {
+        &schemas
+    };
+    formatdoc!(
         "
         group creation summary:
-          name: {group_name:?}
+          name: {group_name}
           message: none
           members:
         {members}
-          schema: {schema:#?}
+          schema:
+        {schemas}
         "
-    );
+    )
+}
+
+/// Print the final group-creation request before confirmation.
+pub fn print_group_creation_summary(request: &CreateGroupRequest) {
+    print!("{}", format_group_creation_summary(request));
 }
 
 /// Print one pending invitation using its current one-based REPL position.
