@@ -14,6 +14,7 @@ Plan
 - Preserve interface filtering semantics: operational state, running state, loopback, point-to-point, broadcast capability, MAC identity, and address prefixes.
 - Re-enable flotsync_discovery and flotsync_discovery_cli in the Windows nightly tests. Estimated 2 LOC.
 - Add or adapt focused unit tests for the interface mapping and peer-announcement broadcast selection. Estimated 30-60 LOC.
+- Make the discovery decode-location display assertion platform-neutral by using the compiler-provided file path instead of hard-coded Unix separators. Estimated 1 LOC.
 - Validate formatting, targeted tests, workspace tests where practical, clippy with pedantic warnings, and relevant cross-target checks.
 
 Constraints
@@ -21,17 +22,24 @@ Constraints
 - No Npcap or WinPcap runtime should be required.
 - Preserve current mobile target support.
 - Stop and report if netdev target support or interface semantics do not hold up.
-- Expected total implementation size: approximately 100-200 LOC, below 1000 LOC."""
+- The unrelated macOS reliable-delivery cleanup flake is explicitly deferred.
+- Expected total implementation size: approximately 100-210 LOC, below 1000 LOC."""
 status = "in-progress"
 status_reason = "in review"
 type = "task"
 priority = 3
 assignee = "codex"
 created_at = "2026-07-26T12:44:10.834567Z"
-updated_at = "2026-07-26T13:04:11.847993Z"
+updated_at = "2026-07-26T13:40:22.082527Z"
 
 [[comments]]
 id = "019f9e86-8d2a-7950-875a-3c5223187a45"
 author = "codex"
 body = "Implemented the agreed two-stage repair. Linux portability default features were disabled in commit 115a53e. Replaced pnet_datalink with feature-minimised netdev, moved peer-announcement broadcast selection onto Flotsync interface snapshots, restored Windows discovery tests, and added mapping/broadcast coverage. Native workspace tests, changed-crate pedantic Clippy, iOS portability checks, and the Windows peer-announcement compile path pass. A full default Windows cross-check from macOS reaches Bonjour binding generation and cannot continue without Windows SDK headers; the native Windows CI runner provides those headers."
 created_at = "2026-07-26T13:04:05.930588Z"
+
+[[comments]]
+id = "019f9ea7-c1c2-7ab1-aa5d-1c7ff765268f"
+author = "codex"
+body = "Made the discovery decode-location display assertion platform-neutral with file!(), matching the compiler's path spelling on Windows and Unix. The focused test, formatting check, and pedantic Clippy check all pass. The unrelated macOS reliable-delivery flake remains intentionally deferred."
+created_at = "2026-07-26T13:40:22.082527Z"
