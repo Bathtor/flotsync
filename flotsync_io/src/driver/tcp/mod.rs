@@ -199,22 +199,10 @@ impl TcpRuntimeState {
             }
         };
 
-        let connect_pending = match check_tcp_connect_result(&stream) {
-            Ok(true) => false,
-            Ok(false) => true,
-            Err(error_kind) => {
-                event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
-                    connection_id,
-                    remote_addr,
-                    error_kind,
-                }))?;
-                return Ok(());
-            }
-        };
-
         entry.stream = Some(stream);
         entry.remote_addr = Some(remote_addr);
-        entry.connect_pending = connect_pending;
+        // Mio requires registration and readiness before portable connect-completion checks.
+        entry.connect_pending = true;
         entry.read_suspended = false;
         entry.pending_send = None;
         entry.close_after_flush = false;
@@ -227,13 +215,6 @@ impl TcpRuntimeState {
                 error_kind: error.kind(),
             }))?;
             return Ok(());
-        }
-
-        if !connect_pending {
-            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::Connected {
-                connection_id,
-                peer_addr: remote_addr,
-            }))?;
         }
 
         Ok(())
