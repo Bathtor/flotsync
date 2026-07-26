@@ -616,7 +616,7 @@ pub(super) fn load_title_runtime_pair_with_trust(
     (alice_fixture, bob_fixture)
 }
 
-/// Load runtimes with fixed endpoints, mutual explicit trust, and all-to-all route hints.
+/// Load runtimes with mutual explicit trust and all-to-all route-establishment watches.
 pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
     entries: &[(Identifier, MemberIdentity); N],
 ) -> (
@@ -641,20 +641,10 @@ pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
     let fixtures = std::array::from_fn(|local_index| {
         let (application_id, local_member) = &entries[local_index];
         let listener = Arc::new(ListenerStub::default());
-        let mut runtime_config_toml = local_endpoint_toml(endpoint_lease.addr(local_index));
-        for (peer_index, (_, peer_member)) in entries.iter().enumerate() {
-            if peer_index != local_index {
-                runtime_config_toml.push_str(&static_peer_route_toml(
-                    peer_member,
-                    endpoint_lease.addr(peer_index),
-                ));
-            }
-        }
-        let runtime = load_runtime_with_parts_and_runtime_config_toml(
+        let runtime = load_runtime_with_parts(
             application_id.clone(),
             stores[local_index].clone(),
             listener.clone(),
-            &runtime_config_toml,
         );
         RuntimeFixture {
             local_member: local_member.clone(),
@@ -663,6 +653,22 @@ pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
             store: stores[local_index].clone(),
         }
     });
+    for (local_index, fixture) in fixtures.iter().enumerate() {
+        let mut watches = Vec::with_capacity(N.saturating_sub(1));
+        for (peer_index, peer_fixture) in fixtures.iter().enumerate() {
+            if peer_index != local_index {
+                watches.push(flotsync_routes::route_establishment::WatchedRoute {
+                    route: flotsync_discovery::protocol::DiscoveryRoute::Udp(
+                        peer_fixture.runtime.advertised_loopback_udp_addr_for_test(),
+                    ),
+                    expected_member: Some(peer_fixture.local_member.clone()),
+                });
+            }
+        }
+        fixture
+            .runtime
+            .replace_route_establishment_watches_for_test(watches);
+    }
     (endpoint_lease, fixtures)
 }
 

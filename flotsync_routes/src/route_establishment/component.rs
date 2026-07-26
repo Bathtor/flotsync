@@ -618,13 +618,6 @@ impl RouteEstablishmentComponent {
             return Handled::OK;
         };
         let group_ids = local_claim_group_ids(&self.group_memberships, &self.local_member);
-        if group_ids.is_empty() {
-            trace!(
-                self.log(),
-                "ignored introduction request from {} because there are no local groups", source
-            );
-            return Handled::OK;
-        }
         if self.claim_routes.is_empty() {
             trace!(
                 self.log(),
@@ -689,8 +682,7 @@ impl RouteEstablishmentComponent {
         Handled::OK
     }
 
-    /// Verify a signed introduction response and publish the route if it proves shared group
-    /// membership.
+    /// Verify a signed introduction response and publish each permitted member route.
     async fn handle_introduction_async(
         &mut self,
         source: SocketAddr,
@@ -726,8 +718,7 @@ impl RouteEstablishmentComponent {
         if accepted_members.is_empty() {
             trace!(
                 self.log(),
-                "ignored introduction from {} because no verified claim matched local group memberships",
-                source
+                "ignored introduction from {} because no verified claim was publishable", source
             );
             self.mark_route_stale(prepared.route);
             return;
@@ -807,18 +798,23 @@ impl RouteEstablishmentComponent {
         }
     }
 
-    /// Return the claim member if membership and route-publication policy both accept it.
+    /// Return the claim member when its group context is locally consistent and policy permits it.
     async fn member_accepted_for_route_publication(
         &mut self,
         source: SocketAddr,
         memberships: &GroupMemberships,
         verified_claim: VerifiedIntroductionClaim,
     ) -> Option<MemberIdentity> {
-        if !claim_matches_group_memberships(
+        if !claim_is_consistent_with_group_memberships(
             memberships,
             &verified_claim.member,
             &verified_claim.group_ids,
         ) {
+            debug!(
+                self.log(),
+                "ignored introduction claim from {} because its group context contradicts local membership state",
+                source
+            );
             return None;
         }
         let route_publication = self
@@ -1180,7 +1176,7 @@ fn manual_filters_from_watches(
     Ok(filters)
 }
 
-/// Verify the signature on a prepared claim and keep its group ids with its member.
+/// Verify the signature and selector consistency of a prepared claim.
 async fn verify_prepared_claim(
     credentials: &dyn DiscoveryCredentials,
     claim: PendingClaimVerification,
@@ -1232,16 +1228,19 @@ pub(super) fn local_claim_group_ids(
         .collect()
 }
 
-/// Return whether the verified claim names at least one group that currently contains `member`.
-pub(super) fn claim_matches_group_memberships(
+/// Return whether every locally known claimed group contains `member`.
+///
+/// Empty and locally unknown group sets return `true`: they provide no locally
+/// verifiable membership evidence, but also do not contradict local state.
+pub(super) fn claim_is_consistent_with_group_memberships(
     memberships: &GroupMemberships,
     member: &MemberIdentity,
     group_ids: &HashSet<GroupId>,
 ) -> bool {
-    group_ids.iter().any(|group_id| {
+    group_ids.iter().all(|group_id| {
         memberships
             .members(group_id)
-            .is_some_and(|members| members.contains(member))
+            .is_none_or(|members| members.contains(member))
     })
 }
 
@@ -1251,7 +1250,7 @@ struct VerifiedIntroductionClaim {
     member: MemberIdentity,
     /// Exact public key bundle fingerprint that verified the signed claim payload.
     key_fingerprint: flotsync_security::KeyFingerprint,
-    /// Decoded claim group ids after the signature check succeeded.
+    /// Decoded signed group context retained for local consistency validation.
     group_ids: HashSet<GroupId>,
 }
 

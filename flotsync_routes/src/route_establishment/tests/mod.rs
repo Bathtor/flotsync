@@ -1,7 +1,7 @@
 //! Route-establishment component tests.
 
 use super::{
-    component::{claim_matches_group_memberships, local_claim_group_ids},
+    component::{claim_is_consistent_with_group_memberships, local_claim_group_ids},
     *,
 };
 use crate::{

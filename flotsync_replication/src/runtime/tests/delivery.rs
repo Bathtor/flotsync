@@ -372,6 +372,9 @@ fn group_invitation_reaches_trusted_member_without_shared_group() {
         alice_fixture.local_member.clone(),
         bob_fixture.local_member.clone(),
     ];
+    alice_fixture
+        .runtime
+        .wait_for_direct_peer_route_for_test(&bob_fixture.local_member);
     let group_id = wait_for_test_reply(alice_fixture.runtime.create_group(CreateGroupRequest {
         members: members.clone(),
         group_schema: docs_group_schema(),

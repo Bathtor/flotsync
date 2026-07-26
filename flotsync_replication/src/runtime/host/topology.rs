@@ -535,14 +535,25 @@ impl DiscoveryTopology {
         &self,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        self.replace_manual_route_watches(control_timeout).await
+        self.replace_manual_route_watches(self.static_route_hints.watched_routes(), control_timeout)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(in crate::runtime::host) async fn replace_route_establishment_watches_for_test(
+        &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
+        control_timeout: Duration,
+    ) -> Result<(), RuntimeHostError> {
+        self.replace_manual_route_watches(watches, control_timeout)
+            .await
     }
 
     async fn replace_manual_route_watches(
         &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
         control_timeout: Duration,
     ) -> Result<(), RuntimeHostError> {
-        let watches = self.static_route_hints.watched_routes();
         let route_establishment_ref = self
             .route_establishment
             .actor_ref()

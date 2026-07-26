@@ -428,6 +428,14 @@ impl ReplicationRuntime {
         self.with_host_for_test(|host| host.publish_direct_peer_route(peer, remote_addr));
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_route_establishment_watches_for_test(
+        &self,
+        watches: Vec<flotsync_routes::route_establishment::WatchedRoute>,
+    ) {
+        self.with_host_for_test(|host| host.replace_route_establishment_watches(watches));
+    }
+
     // These route assertion helpers are only used by in-crate runtime tests.
     // Building them for the broader `test-support` feature leaves dead code.
     #[cfg(test)]

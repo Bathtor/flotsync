@@ -14,39 +14,48 @@ F02. Group invitations are not being delivered during the manual scenario. Relea
 F03. Add a command that lists discovered peers and their visible status. The current interface does not reveal whether two peers cannot discover or contact each other, or whether they are communicating but ignoring each other because they share no group.
 F04. Withdrawn. The apparent move-by-name failure resulted from running the command on the wrong node; the requested first-group and the listed second-group belonged to different node contexts.
 
+Progress
+
+S01. F02 is fixed and approved. Trusted peers can establish routes and deliver a first invitation without an existing shared group.
+S02. F01 is the remaining immediate repair before manual checklist testing resumes.
+S03. F03 remains recorded as lower-priority follow-up usability work after the invitation and summary fixes.
+
 F02 diagnosis
 
 D01. Group creation installs the local group and then submits invitations through reliable delivery.
-D02. Route establishment currently suppresses introduction responses when the local peer has no groups.
-D03. It also accepts route-publication claims only when the claimed group identifiers overlap local memberships.
-D04. The existing invitation test bypasses both checks by injecting direct peer routes, so it cannot expose the first-invitation bootstrap cycle.
-D05. This explains both an entirely new recipient and peers whose existing groups are unrelated: the invitation requires a route, while the current route handshake requires pre-existing shared membership.
-D06. Route establishment already has a separate authority capability. Shared group membership must not be a prerequisite. The intended pre-membership path is an exact locally trusted member-key binding; unknown or blocked bindings remain denied.
+D02. Route establishment suppressed introduction responses when the local peer had no groups.
+D03. It also accepted route-publication claims only when the claimed group identifiers overlapped local memberships.
+D04. The older invitation test bypassed both checks by injecting direct peer routes, so it could not expose the first-invitation bootstrap cycle.
+D05. This explained both an entirely new recipient and peers whose existing groups were unrelated: invitation delivery required a route, while the route handshake required pre-existing shared membership.
+D06. Route establishment already has a separate authority capability. Shared group membership must not be a prerequisite.
+D07. Existing route-publication policy intentionally permits an authenticated member route once the exact public key material is stored. This remains distinct from the stronger replication-runtime authority.
 
 Agreed staged plan
 
-R01. Keep the deterministic regression test for mutually trusted peers without a shared group. Refactor its repetitive setup into one reusable fixture helper accepting an array of application/member identities. The helper reserves one UDP endpoint per runtime, provisions every member with explicit trust for every other member, configures symmetric static route hints between all runtimes, and returns the live socket lease plus an array of runtime fixtures.
-R02. Destructure the returned fixture array into named Alice and Bob bindings. Create the group through Alice and expect listener delivery through Bob. Do not inject direct routes.
-R03. Run the focused regression against the current implementation and verify that it still fails at the invitation boundary, then stop for user review. Do not change production routing, logging, F01, or F03 in this pass.
-R04. After approval, make the route-publication capability authoritative independently of group membership. Preserve the shared-group route path, allow an empty-group introduction claim only for the explicitly trusted pre-membership path, and retain unknown and blocked denials.
-R05. Cover the corrected authority decisions and first-invitation path, then stop for a second review.
-R06. Any later release-visible diagnostics must be transition- or action-driven and rate-bounded. Do not add timer-triggered visible logs that can clobber REPL input.
-R07. Address F01 after the invitation fix review.
-R08. Resume the manual scenarios once F02 and F01 are fixed. An intermediate manual rerun is unnecessary if the automated regression reproduces the problem.
-R09. Treat F03 as follow-up usability work after invitation delivery is restored.
+R01. Keep the deterministic regression test for peers without a shared group. Use a reusable fixture helper accepting an array of application/member identities. The helper declares its socket budget, provisions every member with the other members' key material and explicit trust, starts every runtime, and installs symmetric all-to-all route-establishment watches using the runtimes' actual advertised endpoints.
+R02. Destructure the returned fixture array into named Alice and Bob bindings. Wait for Alice's verified route to Bob, create the group through Alice, and expect listener delivery through Bob. Do not inject direct delivery routes.
+R03. Preserve the committed failing regression checkpoint for the first review boundary.
+R04. Make member-route publication independent of shared membership while retaining the existing default authority requirement of StoredPublicKeyMaterial. ReplicationRuntime remains stricter and requires local explicit trust.
+R05. Allow introduction claims with no group IDs. Preserve decoded group IDs and validate them separately from route authority: empty and wholly unknown group sets do not block publication; locally known groups containing the claimant are consistent; any locally known group excluding the claimant rejects the claim, including mixed true/false sets.
+R06. Keep group IDs as optional signed protocol context. Document that the wire field may be empty without putting authorisation policy in the protobuf documentation.
+R07. Cover empty-group claim encoding/decoding, response generation, permitted route publication without shared membership, default trust decisions, local membership consistency, and the end-to-end first-invitation path.
+R08. Any later release-visible diagnostics must be transition- or action-driven and rate-bounded. Do not add timer-triggered visible logs that can clobber REPL input.
+R09. Address F01 next.
+R10. Resume the manual scenarios once F01 is fixed. An intermediate manual rerun is unnecessary because the automated regression reproduces F02.
+R11. Treat F03 as follow-up usability work after invitation delivery is restored.
 
 Estimate
 
-E01. Regression fixture refactor and test: approximately 60–100 LOC, with the test itself becoming shorter.
-E02. Routing fix and focused authority coverage: approximately 200–500 LOC.
-E03. F01 is small and F03 remains separately scoped. The immediate F02 work is expected to remain well below 1000 LOC."""
+E01. Regression fixture refactor and test: approximately 60–100 LOC.
+E02. Routing fix, review corrections, and focused authority coverage: approximately 250–550 LOC.
+E03. F01 is small and F03 remains separately scoped. The immediate work remains well below 1000 LOC."""
 status = "in-progress"
-status_reason = "regression approved; routing fix next"
+status_reason = "F02 complete; F01 next"
 type = "task"
 priority = 0
 assignee = "Codex"
 created_at = "2026-07-26T07:27:46.030699Z"
-updated_at = "2026-07-26T08:18:11.898533Z"
+updated_at = "2026-07-26T09:08:03.993194Z"
 
 [[comments]]
 id = "019f9d6d-77c0-77f2-88bb-242050511b86"
@@ -77,3 +86,27 @@ id = "019f9d80-cd3a-7fc3-b226-bd5b419720ee"
 author = "Codex"
 body = "First review gate passed. The mutually trusted symmetric runtime-mesh fixture and failing first-invitation regression are approved. Committing this test-only checkpoint before implementing the production route-authority fix."
 created_at = "2026-07-26T08:18:11.898533Z"
+
+[[comments]]
+id = "019f9d94-f457-7551-890a-b8880ac7a160"
+author = "Codex"
+body = "F02 production fix is ready for the second review gate. Route establishment now answers and accepts signed member claims without requiring shared group IDs; group IDs remain optional signed context. The default member-route-publication policy now requires local explicit trust, while unknown and blocked bindings remain denied. The symmetric runtime-mesh fixture now installs watches against the runtimes' actual broker-managed endpoints after startup. The end-to-end regression passes, as do all 55 flotsync_routes tests, all 226 flotsync_replication tests, formatting, and pedantic clippy. No periodic visible logging, F01, or F03 changes are included."
+created_at = "2026-07-26T08:40:12.631536Z"
+
+[[comments]]
+id = "019f9da5-f70f-7230-8e57-694c91358879"
+author = "Codex"
+body = "Second-review correction agreed. Restore StoredPublicKeyMaterial as the default MemberRoutePublication requirement and its original tests. Preserve verified claim group IDs, but treat them as a separate local-consistency check: empty and unknown groups do not block route publication, while any locally known group that excludes the claimant rejects the claim. Keep the protobuf field documentation limited to wire semantics."
+created_at = "2026-07-26T08:58:47.439235Z"
+
+[[comments]]
+id = "019f9da9-43d5-70e0-b68f-60fd67667983"
+author = "Codex"
+body = "Review corrections implemented. MemberRoutePublication is back to StoredPublicKeyMaterial, candidate discovery keys retain their prior route-publication behaviour, and ReplicationRuntime remains explicitly trusted. Verified claims retain group IDs; the new consistency helper accepts empty/unknown context but rejects any locally known contradiction, including mixed true/false sets. Protobuf documentation now states only that the field may be empty. All 56 flotsync_routes tests, all 225 flotsync_replication tests, formatting, and pedantic clippy pass."
+created_at = "2026-07-26T09:02:23.701818Z"
+
+[[comments]]
+id = "019f9dae-7519-7b91-b568-913fa65adb75"
+author = "Codex"
+body = "Second review passed. F02 is approved for commit. F01 is the remaining immediate repair before resuming manual scenarios; F03 remains a separate lower-priority usability follow-up."
+created_at = "2026-07-26T09:08:03.993194Z"

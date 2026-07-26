@@ -63,6 +63,35 @@ fn local_claim_groups_only_include_groups_hosted_by_local_member() {
 }
 
 #[test]
+fn introduction_response_does_not_require_local_group_membership() {
+    let local_member = member(["alice"]);
+    let memberships = SharedGroupMemberships::new(GroupMemberships::default());
+    let local_endpoint = SocketAddr::from(([0, 0, 0, 0], 45_102));
+    let selected_endpoint = SocketAddr::from(([192, 168, 1, 22], 45_102));
+    let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_102));
+    let request_nonce = Uuid::from_u128(42_102);
+    let harness = RouteEstablishmentHarness::new(local_member.clone(), memberships);
+
+    harness.publish_endpoint_selection_and_wait_until_applied([selected_endpoint]);
+    harness.bind_endpoint(SocketId(44), local_endpoint);
+    let frame = DiscoveryEndpointFrameView::IntroductionRequest { request_nonce }.encode_proto();
+    let payload = endpoint_payload(&frame);
+    harness.receive_transport(remote_route, payload);
+    let response = harness.recv_transport_submit();
+
+    assert_introduction_claims_route(
+        &response,
+        local_endpoint,
+        remote_route,
+        &local_member,
+        TEST_DISCOVERY_KEY_FINGERPRINT,
+        request_nonce,
+        selected_endpoint,
+    );
+    harness.shutdown();
+}
+
+#[test]
 fn endpoint_selection_port_updates_introduction_claim_routes() {
     let local_member = member(["alice"]);
     let remote_member = member(["bob"]);
@@ -129,35 +158,47 @@ fn oversized_introduction_response_is_submitted_through_route_transport() {
 }
 
 #[test]
-fn verified_claim_acceptance_uses_group_membership_snapshot() {
+fn claim_group_context_rejects_only_locally_known_contradictions() {
     let local_member = member(["alice"]);
-    let remote_member = member(["bob"]);
-    let unknown_member = member(["charlie"]);
-    let shared_group = group_id(1);
-    let unrelated_group = group_id(2);
-    let memberships = GroupMemberships::from_groups([(
-        shared_group,
-        group_members([local_member.clone(), remote_member.clone()]),
-    )]);
-    let memberships = SharedGroupMemberships::new(memberships);
-    let matching_claim = HashSet::from([shared_group]);
-    let unrelated_claim = HashSet::from([unrelated_group]);
+    let claimed_member = member(["bob"]);
+    let other_member = member(["charlie"]);
+    let matching_group = group_id(1);
+    let contradicted_group = group_id(2);
+    let unknown_group = group_id(3);
+    let memberships = GroupMemberships::from_groups([
+        (
+            matching_group,
+            group_members([local_member.clone(), claimed_member.clone()]),
+        ),
+        (
+            contradicted_group,
+            group_members([local_member, other_member]),
+        ),
+    ]);
 
-    let snapshot = memberships.snapshot();
-
-    assert!(claim_matches_group_memberships(
-        snapshot.as_ref(),
-        &remote_member,
-        &matching_claim,
+    assert!(claim_is_consistent_with_group_memberships(
+        &memberships,
+        &claimed_member,
+        &HashSet::new(),
     ));
-    assert!(!claim_matches_group_memberships(
-        snapshot.as_ref(),
-        &remote_member,
-        &unrelated_claim,
+    assert!(claim_is_consistent_with_group_memberships(
+        &memberships,
+        &claimed_member,
+        &HashSet::from([unknown_group]),
     ));
-    assert!(!claim_matches_group_memberships(
-        snapshot.as_ref(),
-        &unknown_member,
-        &matching_claim,
+    assert!(claim_is_consistent_with_group_memberships(
+        &memberships,
+        &claimed_member,
+        &HashSet::from([matching_group, unknown_group]),
+    ));
+    assert!(!claim_is_consistent_with_group_memberships(
+        &memberships,
+        &claimed_member,
+        &HashSet::from([contradicted_group]),
+    ));
+    assert!(!claim_is_consistent_with_group_memberships(
+        &memberships,
+        &claimed_member,
+        &HashSet::from([matching_group, contradicted_group]),
     ));
 }
