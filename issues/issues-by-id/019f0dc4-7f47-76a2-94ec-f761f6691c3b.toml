@@ -1,5 +1,5 @@
 id = "019f0dc4-7f47-76a2-94ec-f761f6691c3b"
-ref = "flotsync-git-h13"
+ref = "flotsync-u36"
 title = "Design local identity naming and device allocation"
 body = """
 Deferred design task outside flotsync-ist for application-facing identity lifecycle and naming.
@@ -26,7 +26,7 @@ status = "open"
 type = "task"
 priority = 3
 created_at = "2026-06-28T10:26:49.287356Z"
-updated_at = "2026-06-28T10:26:54.782296Z"
+updated_at = "2026-07-26T12:04:18.09793Z"
 
 [[links]]
 target = "019f099f-876d-7941-b100-7fe8771dd3a6"

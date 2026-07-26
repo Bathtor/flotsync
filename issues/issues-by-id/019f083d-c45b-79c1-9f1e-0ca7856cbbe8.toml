@@ -1,5 +1,5 @@
 id = "019f083d-c45b-79c1-9f1e-0ca7856cbbe8"
-ref = "flotsync-git-02c"
+ref = "flotsync-cax"
 title = "Evaluate schema-operation view decoding payoff"
 body = """
 Evaluate whether direct borrowed-view decoding for datamodel SchemaOperation payloads is worth implementing.
@@ -17,7 +17,7 @@ status = "open"
 type = "task"
 priority = 2
 created_at = "2026-06-27T08:41:33.531362Z"
-updated_at = "2026-06-27T09:06:38.539324Z"
+updated_at = "2026-07-26T12:04:18.037946Z"
 
 [[links]]
 target = "019f0593-d303-7692-b7d3-f7694772d7fe"

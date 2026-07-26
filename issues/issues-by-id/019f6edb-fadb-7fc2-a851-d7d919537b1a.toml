@@ -1,5 +1,5 @@
 id = "019f6edb-fadb-7fc2-a851-d7d919537b1a"
-ref = "flotsync-git-vy1"
+ref = "flotsync-nk9"
 title = "Rethink replication snapshot batching and storage row batch API"
 body = """
 The current storage snapshot batch API returns row records whose RowStateSnapshot payload repeats field names for every row. That makes the replication snapshot export path choose between per-row allocation/index material, repeated field-name storage, or O(rows * fields^2) projection when building application-facing value batches.
@@ -30,7 +30,7 @@ labels = [
     "area:store",
 ]
 created_at = "2026-07-17T06:55:38.203915Z"
-updated_at = "2026-07-17T06:55:44.995422Z"
+updated_at = "2026-07-26T12:04:17.981693Z"
 
 [[links]]
 target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"

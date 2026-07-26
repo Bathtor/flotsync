@@ -1,5 +1,5 @@
 id = "019f51d6-02d0-7b60-af94-765e99b4ea03"
-ref = "flotsync-git-5la"
+ref = "flotsync-8k4"
 title = "Design read-token remapping across group migrations"
 body = """
 Design whether and how an application read position from an old replication group can safely be used as the basis for a write to the migrated new group.
@@ -25,7 +25,7 @@ priority = 4
 labels = ["area:replication"]
 blocked_by = ["019f51bf-65a3-7b33-9d64-0e2f7390e4e2"]
 created_at = "2026-07-11T15:40:07.760812Z"
-updated_at = "2026-07-11T15:40:13.637533Z"
+updated_at = "2026-07-26T12:04:18.131804Z"
 
 [[links]]
 target = "019f51bf-9095-72a0-94f6-bcbd4ca68271"

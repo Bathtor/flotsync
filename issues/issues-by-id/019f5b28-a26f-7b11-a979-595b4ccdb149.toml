@@ -1,5 +1,5 @@
 id = "019f5b28-a26f-7b11-a979-595b4ccdb149"
-ref = "flotsync-git-lg9"
+ref = "flotsync-yty"
 title = "Add GroupClose protocol message shape"
 body = """
 Add the protocol/runtime message shape and local access-state handling for optional old-group close signalling after the inline migration activation slice is complete.
@@ -26,4 +26,4 @@ blocked_by = [
     "019f51c0-171b-7cf2-b327-0cc4670d4ef0",
 ]
 created_at = "2026-07-13T11:06:57.519537Z"
-updated_at = "2026-07-13T11:20:01.784175Z"
+updated_at = "2026-07-26T12:04:18.060732Z"

@@ -1,5 +1,5 @@
 id = "019f6e9b-6f3c-75b1-98c9-df0758e68876"
-ref = "flotsync-git-ial"
+ref = "flotsync-get"
 title = "Build deterministic flotsync_io network simulator"
 body = """
 Build a simple network simulator for flotsync_io tests that can run Kompact-based flows against controlled simulation time instead of wall-clock IO.
@@ -43,4 +43,4 @@ labels = [
 ]
 blocks = ["019f6e9b-9da0-7ac1-adf2-3a79ef3e2a90"]
 created_at = "2026-07-17T05:45:08.15654Z"
-updated_at = "2026-07-17T05:50:35.139472Z"
+updated_at = "2026-07-26T12:04:36.512495Z"

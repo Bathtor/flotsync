@@ -1,5 +1,5 @@
 id = "019f6e9b-9da0-7ac1-adf2-3a79ef3e2a90"
-ref = "flotsync-git-kui"
+ref = "flotsync-xrs"
 title = "Build flotsync fuzz tests on deterministic network simulator"
 body = """
 Build a fuzz test suite for Flotsync on top of the deterministic flotsync_io network simulator.
@@ -33,4 +33,4 @@ labels = [
 ]
 blocked_by = ["019f6e9b-6f3c-75b1-98c9-df0758e68876"]
 created_at = "2026-07-17T05:45:20.032751Z"
-updated_at = "2026-07-17T05:50:39.375427Z"
+updated_at = "2026-07-26T12:04:18.110116Z"

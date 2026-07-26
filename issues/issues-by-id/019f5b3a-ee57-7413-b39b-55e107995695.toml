@@ -1,5 +1,5 @@
 id = "019f5b3a-ee57-7413-b39b-55e107995695"
-ref = "flotsync-git-pvp"
+ref = "flotsync-9fs"
 title = "Design application-facing record identity across group changes"
 body = """
 Design and implement application-facing record identity/projection semantics so membership or schema changes do not appear as duplicated rows to applications.
@@ -25,4 +25,4 @@ priority = 1
 labels = ["area:replication"]
 blocked_by = ["019f51c0-171b-7cf2-b327-0cc4670d4ef0"]
 created_at = "2026-07-13T11:26:56.59962Z"
-updated_at = "2026-07-13T11:26:56.59962Z"
+updated_at = "2026-07-26T12:04:17.994087Z"

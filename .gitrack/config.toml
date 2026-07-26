@@ -1,5 +1,5 @@
 version = 1
-ref_prefix = "flotsync-git"
+ref_prefix = "flotsync"
 issue_dir = "issues"
 default_type = "task"
 default_priority = 3

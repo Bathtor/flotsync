@@ -1,5 +1,5 @@
 id = "019f8ffb-e40e-7c62-b6da-37833e90b02b"
-ref = "flotsync-git-c9m"
+ref = "flotsync-bym"
 title = "Redesign shared group state behind restricted trait-object views"
 body = """
 Objective
@@ -31,7 +31,7 @@ status = "open"
 type = "task"
 priority = 1
 created_at = "2026-07-23T17:17:57.646019Z"
-updated_at = "2026-07-23T17:18:00.718816Z"
+updated_at = "2026-07-26T12:04:17.971311Z"
 
 [[links]]
 target = "019f8588-bbc6-7523-87d2-6d5e83939248"

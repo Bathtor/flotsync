@@ -1,5 +1,5 @@
 id = "019f64c4-b767-78d3-9171-6ce82db0f45b"
-ref = "flotsync-git-a17"
+ref = "flotsync-kti"
 title = "Design explicit group leave semantics"
 body = """
 Design how a member explicitly leaves a replication group without breaking bootstrap and migration invariants that rely on the group creator occupying `node_index=0` in new groups.
@@ -28,7 +28,7 @@ labels = [
     "area:protocol",
 ]
 created_at = "2026-07-15T07:54:01.447181Z"
-updated_at = "2026-07-15T07:54:08.383948Z"
+updated_at = "2026-07-26T12:04:18.026714Z"
 
 [[links]]
 target = "019f61e0-b7ba-70c1-995c-c02a0f45ba39"
