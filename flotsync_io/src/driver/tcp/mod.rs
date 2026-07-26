@@ -217,6 +217,36 @@ impl TcpRuntimeState {
             return Ok(());
         }
 
+        // A non-blocking connect can fail between `connect` and Mio registration, particularly
+        // for a refused loopback connection on Windows. Inspect `SO_ERROR` once after registration
+        // to cover that gap; otherwise the normal readiness path remains responsible.
+        let initial_error_kind = {
+            let stream = entry
+                .stream
+                .as_ref()
+                .expect("registered TCP connection missing stream handle");
+            match stream.take_error() {
+                Ok(error) => error.map(|error| error.kind()),
+                Err(error) => Some(error.kind()),
+            }
+        };
+        if let Some(error_kind) = initial_error_kind {
+            let reset_error = reset_connection_after_failure(entry, registry);
+            if let Err(error) = reset_error {
+                warn!(
+                    self.logger,
+                    "failed to reset TCP connection {} after connect failure: {}",
+                    connection_id,
+                    error
+                );
+            }
+            event_sink.publish(super::DriverEvent::Tcp(TcpEvent::ConnectFailed {
+                connection_id,
+                remote_addr,
+                error_kind,
+            }))?;
+        }
+
         Ok(())
     }
 

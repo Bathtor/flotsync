@@ -1,0 +1,24 @@
+id = "019f9f68-bd59-7861-a5e5-39bdbc8e2102"
+ref = "flotsync-j3v"
+title = "Remove temporary Windows failure caching"
+body = """
+Objective
+
+Remove the temporary Windows-only rust-cache failure-saving exception once Windows CI is stabilised.
+
+Plan
+
+- Confirm the Windows platforms job completes successfully and populates the normal cache.
+- Remove the cache-on-failure input and its temporary TODO from .github/workflows/platforms.yml.
+- Validate the workflow configuration.
+
+Expected implementation size: approximately 3 LOC, below 1000 LOC."""
+status = "open"
+type = "task"
+priority = 4
+created_at = "2026-07-26T17:11:09.401951Z"
+updated_at = "2026-07-26T17:11:14.35954Z"
+
+[[links]]
+target = "019f9e74-50d2-7bb1-8968-cdc9c89d0ca2"
+label = "discovered from"
