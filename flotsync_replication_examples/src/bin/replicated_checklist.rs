@@ -1,5 +1,5 @@
 use clap::Parser;
-use flotsync_io_examples::replicated_checklist::{ReplicatedChecklistArgs, run};
+use flotsync_replication_examples::replicated_checklist::{ReplicatedChecklistArgs, run};
 
 fn main() {
     let args = ReplicatedChecklistArgs::parse();

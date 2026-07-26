@@ -4,52 +4,48 @@ title = "Split I/O and replication example crates"
 body = """
 Objective
 
-X01. Split the current mixed flotsync_io_examples package into flotsync_io_examples for direct transport/I/O examples and flotsync_replication_examples for applications built against the replication abstraction.
-
-Current state
-
-X02. flotsync_io_examples currently combines the netcat and HTTP server examples, which exercise flotsync_io directly, with replicated_checklist, which primarily exercises flotsync_replication and its application-facing APIs.
-X03. The replicated checklist is approximately 6,750 source lines and has its own configuration, runtime setup, REPL, group/key workflows, and tests. It does not use the shared ExampleRuntime or support helpers used by the direct I/O examples.
-X04. The combined manifest consequently makes the direct I/O example crate depend on replication, security, data-model, key-management, and checklist-specific libraries and features.
+Split the mixed flotsync_io_examples package into two runnable example crates without changing the replicated_checklist binary, CLI grammar, configuration format, or runtime behaviour.
 
 Crate boundary
 
-X05. Keep netcat, http_server, their shared ExampleRuntime/support code, the HTTP smoke script, and both direct I/O smoke-test suites in flotsync_io_examples.
-X06. Create the workspace member flotsync_replication_examples and move replicated_checklist plus its binary into it without changing the binary name, CLI grammar, configuration format, or runtime behaviour.
-X07. Give each crate only the dependencies and features required by its own abstraction level. Move local-secret-manager and replication test-support feature wiring to flotsync_replication_examples; remove replication/checklist-only dependencies from flotsync_io_examples.
-X08. Do not introduce a shared examples utility crate unless the move reveals genuine reused code. The current direct I/O runtime helpers remain private to flotsync_io_examples.
+P01. Keep netcat, http_server, app, support, the HTTP smoke script, and both direct-I/O smoke-test suites in flotsync_io_examples.
+P02. Create flotsync_replication_examples as a workspace member. Move the complete replicated_checklist module tree and its binary there, retaining the binary name replicated_checklist.
+P03. The checklist currently does not use flotsync_io_examples::ExampleRuntime, so do not introduce a shared runtime or utility crate unless the move reveals genuinely shared code.
+P04. Give the new crate its replication-level dependencies and features. Move local-secret-manager feature wiring and replication test-support wiring to it; remove replication and checklist-only dependencies from flotsync_io_examples.
 
 Repository alignment
 
-X09. Update the workspace manifest and lockfile for the new package and ensure package-qualified build, run, test, and lint commands address the correct crate.
-X10. Update source imports and package paths after the move while preserving public visibility only where the example binaries or tests require it.
-X11. Separate the documentation by abstraction level: keep direct transport material in the I/O examples document, place replicated-checklist setup and workflows under replication examples, update the documentation index and README, and correct every package-qualified command and filesystem path.
-X12. Update any CI, scripts, Nix configuration, issue references, or developer instructions that explicitly enumerate flotsync_io_examples or the replicated_checklist path.
+P05. Update workspace membership, package-qualified commands, and Cargo.lock.
+P06. Split documentation by abstraction level: retain direct-I/O material in docs/flotsync_io_examples.md; add replication-example material for replicated-checklist setup and usage; preserve the manual scenario documentation; update docs/index.md and README.
+P07. Search CI, scripts, Nix configuration, issue references, and developer instructions for paths or package-qualified commands coupled to the old layout. Update only references genuinely affected by the split.
+P08. Apply the repository OKF documentation conventions while editing docs/.
 
-Coverage
+Coverage and acceptance
 
-X13. Preserve the existing netcat and HTTP unit/smoke coverage in flotsync_io_examples.
-X14. Preserve all replicated-checklist parser, working-set, runtime, invitation, security, multi-group, synchronisation, and transfer coverage in flotsync_replication_examples.
-X15. Validate both crates independently with formatting, complete tests, all-target pedantic Clippy, workspace checks, and the OKF documentation checker after the documentation split.
+P09. Preserve existing netcat and HTTP unit/smoke coverage in flotsync_io_examples, and all replicated-checklist parser, working-set, runtime, invitation, security, multi-group, synchronisation, and transfer coverage in flotsync_replication_examples.
+P10. Validate both crates independently with formatting, complete tests, all-target pedantic Clippy, workspace checks, and the OKF documentation checker.
+P11. Building flotsync_io_examples must not build or expose the replication application solely because the packages were formerly combined; flotsync_replication_examples must contain and run replicated_checklist with unchanged user-facing behaviour.
 
-Acceptance
+Estimate and review structure
 
-X16. Building flotsync_io_examples does not build or expose the replication application solely because the two formerly shared one package.
-X17. flotsync_replication_examples contains and runs replicated_checklist under the same binary and user-facing behaviour.
-X18. The two manifests and documentation clearly communicate the abstraction boundary, and no stale package/path references remain.
-X19. The full workspace remains buildable and both example suites retain their existing coverage.
-
-Estimate and review split
-
-X20. Expect roughly 100-250 lines of substantive manifest, import, documentation, and repository-reference edits, plus a mechanical relocation of approximately 6,750 existing Rust lines. The raw diff will therefore exceed 1,000 lines even though behavioural changes should be near zero.
-X21. Keep this as one atomic task because the crate boundary should not land half-applied. For review, use two commits if useful: first the pure crate/module move plus workspace manifests with tests compiling, then dependency trimming and documentation/repository-reference cleanup. If substantive changes grow beyond this estimate, split those behavioural changes into follow-up tasks rather than mixing them into the relocation."""
-status = "open"
+P12. Expect approximately 6,750 mechanically relocated Rust lines plus 150-300 substantive lines of manifests, imports, documentation, and repository-reference updates. The raw diff exceeds 1,000 LOC, but behavioural change should be zero.
+P13. Keep this as one atomic task because the crate boundary must not land half-applied. For review, use two commits if useful: first the pure crate/module move plus workspace manifests, then dependency trimming and documentation/repository-reference cleanup. Split any substantive behavioural work into follow-up tasks."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 0
 labels = ["area:examples"]
+assignee = "Codex"
 created_at = "2026-07-26T07:18:20.154017Z"
-updated_at = "2026-07-26T12:04:17.94767Z"
+updated_at = "2026-07-26T12:20:17.475512Z"
+closed_at = "2026-07-26T12:20:17.475512Z"
 
 [[links]]
 target = "019f502e-2262-70a0-bf74-6da295fff88e"
 label = "follow-up from"
+
+[[comments]]
+id = "019f9e5e-71c3-7431-87b8-047942538006"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-26T12:20:17.475512Z"

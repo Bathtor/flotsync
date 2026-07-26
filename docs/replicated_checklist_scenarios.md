@@ -27,10 +27,10 @@ Initialise local identity material, then start each peer from the repository
 root:
 
 ```bash
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local alice.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- keys init-local bob.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- run alice.toml
-cargo run -p flotsync_io_examples --bin replicated_checklist -- run bob.toml
+cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local alice.toml
+cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local bob.toml
+cargo run -p flotsync_replication_examples --bin replicated_checklist -- run alice.toml
+cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob.toml
 ```
 
 For a release binary:

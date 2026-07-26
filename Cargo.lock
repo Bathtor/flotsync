@@ -1570,8 +1570,6 @@ dependencies = [
  "flotsync_core",
  "flotsync_data_types",
  "flotsync_io",
- "flotsync_replication",
- "flotsync_security",
  "futures-util",
  "http",
  "httparse",
@@ -1634,6 +1632,30 @@ dependencies = [
  "smallvec",
  "snafu",
  "sqlx",
+ "uuid",
+]
+
+[[package]]
+name = "flotsync_replication_examples"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "flotsync_core",
+ "flotsync_data_types",
+ "flotsync_replication",
+ "flotsync_security",
+ "futures-util",
+ "indoc",
+ "itertools 0.14.0",
+ "kompact",
+ "log",
+ "sha2",
+ "slog",
+ "slog-scope",
+ "slog-stdlog",
+ "slog-term",
+ "snafu",
  "uuid",
 ]
 
