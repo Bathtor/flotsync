@@ -4,40 +4,117 @@ title = "Expose discovered peers in replicated checklist REPL"
 body = """
 Objective
 
-O01. Add a replicated-checklist REPL command that reports discovered peers and enough current connection state to diagnose why two nodes are not communicating.
+O01. Add a replicated-checklist REPL command that reports current peer-route diagnostics so a user can distinguish no observed route, route establishment in progress or failed, a currently usable route, and a usable route without shared group membership.
 
 User need
 
-U01. During manual scenarios, the application currently cannot distinguish between a peer that has not been discovered, a discovered peer without a usable route, and a reachable peer with whom no replication group is shared.
-U02. The command should make this state inspectable on demand without enabling periodic visible logs that overwrite active REPL input.
+U01. Manual scenarios need an action-driven view of discovery and route state without recurring visible logs overwriting active REPL input.
+U02. Diagnostics should remain clearly separate from the main replication control surface because further runtime diagnostics are expected later.
 
-Scope
+Public API design
 
-S01. Define an application-facing read API or restricted snapshot for the relevant current peer-discovery and route state rather than reading component internals or duplicating mutable state in the example application.
-S02. Expose known peer identities and a small, meaningful status vocabulary sufficient to distinguish discovery from usable route establishment. Do not expose security-sensitive route material unless it is genuinely required for diagnosis.
-S03. Add a simple REPL command and readable display output. Align its exact grammar with the existing top-level key and group command structure during planning.
-S04. Keep output action-driven: requesting the command prints one snapshot; timers and retries must not emit recurring visible output.
-S05. Cover the public snapshot semantics, status derivation, command parsing, empty state, stable UI ordering, and representative discovered/unreachable/reachable peers.
-S06. Document the command in the replicated-checklist scenario instructions.
+D01. Add `ReplicationApi::diagnostics(&self) -> Arc<dyn FlotsyncDiagnostics>`.
+D02. Keep operational queries on the separate object-safe `FlotsyncDiagnostics` trait rather than adding them directly to `ReplicationApi`.
+D03. Have the concrete `ReplicationRuntime` implement both traits. Construct it with stable `Arc::new_cyclic`, retain a `Weak<ReplicationRuntime>` self-view, and implement `diagnostics(&self)` by upgrading and coercing the same allocation to the diagnostics trait object.
+D04. Do not use `Arc::new_cyclic_in`; no custom allocator is required, and the allocator-specific API would add an unnecessary nightly feature dependency.
+D05. Keep one shared runtime lifecycle: either trait object keeps the same concrete runtime alive, and explicit shutdown makes subsequent replication and diagnostics operations report runtime unavailability consistently.
+D06. Keep the crate dependency direction one-way. `flotsync_routes` owns the canonical route diagnostic types and `flotsync_replication` re-exports those exact types alongside its diagnostics trait.
+D07. Encode announced and configured route interest once in the public DTO. Do not duplicate configured presence in both a boolean source flag and an optional configured-member constraint.
+D08. Use the canonical route-establishment type names directly rather than maintaining isomorphic replication-layer DTOs.
+D09. Document the diagnostics query failure contract directly, including runtime unavailability after shutdown.
+D10. Keep `ReplicationApi::diagnostics` documentation independent of the concrete trait-object allocation and lifecycle implementation.
 
-Acceptance
+Peer-route diagnostics semantics
 
-A01. A user can tell whether the runtime currently knows a peer and whether it has a usable route.
-A02. The command remains useful before any replication group is shared.
-A03. Running the normal REPL remains quiet between commands.
-A04. The application consumes a public runtime abstraction rather than directly inspecting stores or Kompact components.
+R01. Return a redacted per-route snapshot rather than a member-level aggregate.
+R02. Include the local bound endpoint, locally advertised endpoints, and one entry per known remote route without imposing presentation order in the producer.
+R03. Each remote route entry includes its protocol and socket address, interest sources such as announcement and configured watch, current phase, configured expected identities, authenticated identified identities, and currently reachable identities.
+R04. Use explicit route phases corresponding to the authoritative lifecycle: known, probing, reachable, and stale.
+R05. Retain identities authenticated by the most recent introduction response containing at least one valid signed claim. Replace the previous set atomically when a later response authenticates one or more identities; preserve the set across responses with no authenticated claims, route-publication denial, and later staleness.
+R06. Never present an unsigned member selector as an identified peer.
+R07. Exclude probe nonces, timers, signatures, key fingerprints, and key material. Document that socket addresses are local diagnostic information which callers should treat carefully when exporting telemetry.
+R08. Do not retain or expose structured last-failure reasons in this slice. The diagnostics capability provides the extension point for that later.
+R09. Do not collapse routes with a precedence rule in the public snapshot. Every route appears exactly once; consumers may count routes by phase.
+R10. Leave snapshot collections in producer order. Sort the checklist-owned snapshot immediately before presentation so repeated CLI output remains stable without imposing that cost or contract on API consumers.
+R11. Provide useful composable `Display` implementations for the canonical snapshot, route entry, configured-member constraint, and phase types.
 
-Estimate
+Checklist command
 
-E01. Expect approximately 200–500 LOC across the runtime API, component snapshot plumbing, checklist command/display code, tests, and documentation.
-E02. The task should remain below 1000 LOC. If exposing current state requires the broader group/runtime-view redesign, split the public observation seam from the checklist UI rather than folding that redesign into this task."""
-status = "open"
+C01. Add a top-level `peers` command because diagnostics are runtime-wide and must work before any group exists.
+C02. Print one snapshot only when requested. Do not add periodic visible output from timers, retries, or route transitions.
+C03. Display the local and advertised endpoints, every remote route with source, phase, expected and identified members, and a summary count for every phase.
+C04. Where an identified member appears, use the existing checklist group registry to report whether that member shares any currently readable group. Do not expand this task into the broader shared-group-view redesign.
+C05. Display unidentified announced routes by address and state rather than collapsing them to a count.
+C06. Cover empty output and stable readable formatting through `Display` implementations, using `indoc` for multiline expectations.
+C07. Keep checklist-specific group annotations in a dedicated diagnostics presentation module and append them to the canonical snapshot rendering.
+
+Implementation plan
+
+P01. Add public diagnostics DTOs and the `FlotsyncDiagnostics` trait under a dedicated replication API diagnostics module.
+P02. Add the cyclic weak self-view to `ReplicationRuntime`, implement both trait-object views on the same allocation, and preserve shutdown and drop semantics.
+P03. Add a route-establishment actor snapshot request that derives route entries directly from authoritative component state without duplicating mutable state or sorting collections.
+P04. Refactor introduction processing to accumulate authenticated and publishable identities separately. Replace retained identities once per response only when the response authenticated at least one claim.
+P05. Re-export the canonical route-layer diagnostic types from the replication API and return the actor snapshot directly without a conversion layer.
+P06. Add the `peers` parser and command handler, then move stable checklist-side sorting and group annotations into a dedicated `Display` presentation module which delegates the base report to the canonical snapshot formatter.
+P07. Document the command and expected troubleshooting workflow in the replicated-checklist manual scenarios.
+P08. Apply the agreed review refinements: eliminate redundant configured-source state, keep public docs implementation-independent, add canonical `Display` implementations, use `indoc` expectations, and give combined test helpers names which expose all state transitions.
+
+Test plan
+
+T01. Route tests cover empty state, announced and configured sources, known, probing, reachable and stale phases, expected identities, replacement and retention of authenticated identities, multiple routes, producer-order-independent content assertions, and every canonical `Display` implementation.
+T02. Runtime API tests cover same-allocation diagnostics access, independent Arc lifetimes, explicit shutdown, runtime unavailability, and direct canonical snapshot return.
+T03. Checklist tests cover command parsing, generated help, empty state, identified and unidentified routes, consumer-side sorting, phase counts, shared-group annotations, address formatting, and stable exact output through readable `indoc` strings.
+T04. Relevant Rust changes must pass rustfmt, focused tests, broader affected-crate tests, and pedantic Clippy. Cargo commands run sequentially, with sandbox test threading following repository instructions.
+
+Scope and estimate
+
+E01. Route snapshot model, bounded identity retention, query, and tests: approximately 220-380 LOC.
+E02. Public diagnostics API, cyclic runtime view, mapping, and tests: approximately 120-220 LOC.
+E03. Checklist command, formatting, and tests: approximately 100-180 LOC.
+E04. Scenario documentation: approximately 20-40 LOC.
+E05. Canonical `Display` implementations and checklist presentation tests require approximately 180-280 LOC, offset by removing approximately 180-240 LOC of duplicated DTO, mapping, and REPL formatting code.
+E06. The completed implementation adds approximately 1110 source and documentation LOC, excluding gitrack metadata, which is 110 LOC over the planning threshold.
+E07. The natural smaller delivery remains the route/runtime diagnostics core and the replicated-checklist `peers` presentation plus documentation; the current worktree keeps the agreed cohesive implementation together."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
 labels = ["area:examples"]
+assignee = "codex"
 created_at = "2026-07-26T09:10:17.628041Z"
-updated_at = "2026-07-26T12:04:17.959134Z"
+updated_at = "2026-07-27T11:36:00.944824Z"
+closed_at = "2026-07-27T11:36:00.944824Z"
 
 [[links]]
 target = "019f9d52-a16e-7612-8445-a92ac094d9ac"
 label = "discovered from"
+
+[[comments]]
+id = "019f9f96-5c0b-7643-84cd-5749f7f3a927"
+author = "codex"
+body = "Plan agreed after API-design review. Diagnostics will remain behind `ReplicationApi::diagnostics()` and a separate `FlotsyncDiagnostics` trait. The concrete runtime will implement both views on one `Arc::new_cyclic` allocation using a stored weak self-view; route diagnostics will expose deterministic per-route endpoint, source, phase, expected identity, authenticated identity, and reachable identity data without lossy aggregation or retained failure reasons."
+created_at = "2026-07-26T18:00:59.147388Z"
+
+[[comments]]
+id = "019f9fb9-7c02-7f03-aeba-26fda0a26e14"
+author = "codex"
+body = "Post-implementation review agreed. The public DTO will encode configured interest once; new diagnostic types will use precise singular names; the query will document shutdown errors; deterministic multi-identity ordering will be tested; and retained identities will be replaced atomically by the latest response containing authenticated claims while surviving zero-authentication responses and later staleness."
+created_at = "2026-07-26T18:39:21.09025Z"
+
+[[comments]]
+id = "019fa329-5212-7873-965c-9cff52447643"
+author = "codex"
+body = "Second review plan agreed. Route-establishment diagnostic types become canonical and are re-exported through replication; generic rendering moves to Display; checklist-only ordering and group annotations move to a dedicated presentation module; producer sorting is removed; and the combined reachable-state test helper is renamed and documented to expose both identity replacement and reachability."
+created_at = "2026-07-27T10:40:22.034874Z"
+
+[[comments]]
+id = "019fa337-93cb-7773-b7ad-be45347d360c"
+author = "codex"
+body = "Second review revisions implemented and verified. Replication now re-exports the canonical route diagnostic types, every diagnostic type has composable Display output, route collection ordering is left to consumers, checklist presentation sorts its owned snapshot in a dedicated module, multiline expectations use indoc, and the combined test helper is explicitly named and documented. Full affected-crate tests and pedantic Clippy pass."
+created_at = "2026-07-27T10:55:56.363204Z"
+
+[[comments]]
+id = "019fa35c-44b0-7f70-878a-c538afe799cc"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-27T11:36:00.944824Z"

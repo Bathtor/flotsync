@@ -274,6 +274,10 @@ mod tests {
     }
 
     impl ReplicationApi for RecordingApi {
+        fn diagnostics(&self) -> Arc<dyn flotsync_replication::FlotsyncDiagnostics> {
+            panic!("checklist key tests must not request diagnostics")
+        }
+
         fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + '_>> {
             future::ready(Ok(())).boxed()
         }

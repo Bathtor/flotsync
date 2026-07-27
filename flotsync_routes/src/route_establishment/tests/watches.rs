@@ -342,6 +342,10 @@ fn manual_route_watch_rejects_claim_without_route_publication_permission() {
     harness.expect_no_route_update(
         "claim without route-publication permission should not publish a watched route",
     );
+    let route = &harness.diagnostics().routes[0];
+    assert_eq!(route.phase, RouteDiagnosticPhase::Stale);
+    assert_eq!(route.identified_members, vec![remote_member]);
+    assert!(route.reachable_members.is_empty());
     harness.shutdown();
 }
 

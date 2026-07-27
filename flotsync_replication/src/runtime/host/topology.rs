@@ -468,7 +468,9 @@ impl DiscoveryTopology {
         }
     }
 
-    fn route_discovery_provider(&self) -> &Arc<Component<RouteEstablishmentComponent>> {
+    pub(in crate::runtime::host) fn route_discovery_provider(
+        &self,
+    ) -> &Arc<Component<RouteEstablishmentComponent>> {
         &self.route_establishment
     }
 

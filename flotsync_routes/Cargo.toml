@@ -24,4 +24,5 @@ uuid = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
 futures-util = { workspace = true }
+indoc = { workspace = true }
 rand = "0.9"

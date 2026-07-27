@@ -1,6 +1,11 @@
 //! REPL and runtime wiring for the replicated checklist runner.
 
-use super::{groups::load_readable_groups, setup::load_checklist_store_setup, *};
+use super::{
+    diagnostics::ChecklistPeerDiagnostics,
+    groups::load_readable_groups,
+    setup::load_checklist_store_setup,
+    *,
+};
 use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
@@ -303,6 +308,10 @@ impl ChecklistRepl {
                 self.print_me();
                 return Ok(true);
             }
+            ChecklistCommand::Peers => {
+                self.print_peer_routes().await?;
+                return Ok(true);
+            }
             ChecklistCommand::Group { command } => {
                 self.drain_invitation_queue()?;
                 self.handle_group_registry_command(command).await?;
@@ -414,6 +423,7 @@ impl ChecklistRepl {
             ChecklistCommand::Group { .. }
             | ChecklistCommand::Keys { .. }
             | ChecklistCommand::Me
+            | ChecklistCommand::Peers
             | ChecklistCommand::Help
             | ChecklistCommand::Quit => {
                 unreachable!("commands available without a group are handled before dispatch")
@@ -727,6 +737,18 @@ impl ChecklistRepl {
             self.session.working_set.dirty_row_count(),
             self.session.working_set.queued_event_count()
         );
+    }
+
+    /// Query and print one action-driven peer-route diagnostic snapshot.
+    async fn print_peer_routes(&self) -> Result<(), ReplicatedChecklistError> {
+        let diagnostics_api = self.replication.diagnostics();
+        let snapshot = diagnostics_api
+            .peer_routes()
+            .await
+            .context(repl_error::ReplicationSnafu)?;
+        let report = ChecklistPeerDiagnostics::new(snapshot, &self.session.groups);
+        println!("{report}");
+        Ok(())
     }
 
     /// Print one row from an already-resolved workspace identity.

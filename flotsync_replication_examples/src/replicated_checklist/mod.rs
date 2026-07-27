@@ -208,6 +208,8 @@ pub enum ChecklistCommand {
     Members,
     /// Ask each active group member for its current group summary.
     Check,
+    /// Print current peer-route diagnostics.
+    Peers,
     /// Inspect groups and manage the session default.
     Group {
         #[command(subcommand)]
@@ -1600,6 +1602,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_peer_diagnostics_command() {
+        assert_eq!(
+            parse_checklist_command("peers").expect("command should parse"),
+            Some(ChecklistCommand::Peers)
+        );
+    }
+
+    #[test]
     fn empty_repl_line_has_no_command() {
         assert_eq!(
             parse_checklist_command("").expect("empty line should parse"),
@@ -1739,6 +1749,7 @@ mod tests {
             "sync",
             "members",
             "check",
+            "peers",
             "group",
             "keys",
             "me",
