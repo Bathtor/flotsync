@@ -64,6 +64,21 @@ its fingerprint:
 keys block UNTRUSTED_PUBLIC_BUNDLE
 ```
 
+Before creating a group, inspect route establishment in each REPL:
+
+```text
+peers
+```
+
+This is a one-shot snapshot. It prints the local and advertised UDP endpoints,
+then each known remote route with its source, phase, expected members,
+cryptographically identified members, and currently reachable members. An
+identified peer with `shared groups=0` confirms that the route and peer
+authentication work before the peers share a replication group. A route that
+remains `probing` or becomes `stale` points to route establishment rather than
+group membership; no matching route usually points to discovery or static-route
+configuration.
+
 Each config needs `local-member`, `store-path`, and `store-secret-profile` in
 the replicated-checklist section. The profile selects a device-local
 store-secret slot. Static group ids, ordered members, and shared group-secret

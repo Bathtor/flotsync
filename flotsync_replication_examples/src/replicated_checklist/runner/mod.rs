@@ -90,6 +90,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod diagnostics;
 mod groups;
 mod keys;
 mod repl;

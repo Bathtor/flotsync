@@ -24,14 +24,19 @@ pub struct WatchedRouteState {
     pub interest: RouteInterest,
     /// Current verification lifecycle for this route.
     pub verification: RouteVerificationState,
+    /// Members authenticated by the latest response containing a valid signed claim.
+    pub identified_members: TrieSet,
 }
 
 impl WatchedRouteState {
     /// Initial route state for a route with newly observed interest.
-    pub const NEW: Self = Self {
-        interest: RouteInterest::NONE,
-        verification: RouteVerificationState::Known,
-    };
+    pub fn new() -> Self {
+        Self {
+            interest: RouteInterest::NONE,
+            verification: RouteVerificationState::Known,
+            identified_members: TrieSet::new(),
+        }
+    }
 
     /// Return whether any source currently wants this route watched.
     pub fn should_watch(&self) -> bool {
@@ -51,6 +56,11 @@ impl WatchedRouteState {
     /// Return members currently published through this route without cloning the set.
     pub fn reachable_members(&self) -> Option<&TrieSet> {
         self.verification.reachable_members()
+    }
+
+    /// Replace identities with those authenticated by the latest qualifying response.
+    pub fn replace_identified_members(&mut self, members: TrieSet) {
+        self.identified_members = members;
     }
 
     /// Reconcile currently published members after route interest changes.
@@ -81,6 +91,12 @@ impl WatchedRouteState {
             requires_snapshot_changes: true,
             timer_to_cancel: None,
         }
+    }
+}
+
+impl Default for WatchedRouteState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

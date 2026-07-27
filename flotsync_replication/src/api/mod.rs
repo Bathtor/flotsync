@@ -67,6 +67,7 @@ macro_rules! row_values {
 }
 
 mod changes;
+mod diagnostics;
 mod groups;
 mod security_material;
 mod snapshots;
@@ -75,6 +76,7 @@ mod store;
 mod tests;
 
 pub use changes::*;
+pub use diagnostics::*;
 pub use groups::*;
 pub(crate) use security_material::invalid_default_group_security_material;
 pub use security_material::*;

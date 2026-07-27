@@ -43,7 +43,7 @@ fn endpoint_rebinding_withdraws_routes_and_reprobes() {
     harness.observe_peer_route(instance_id, remote_route);
     harness.bind_endpoint(SocketId(83), first_local_endpoint);
     harness.expect_transport_probe(first_local_endpoint, remote_route);
-    harness.mark_route_reachable(remote_route, [remote_member.clone()]);
+    harness.mark_route_reachable_with_identified_members(remote_route, [remote_member.clone()]);
     harness.expect_peer_route_update(&remote_member, &[remote_route], Some(first_local_endpoint));
 
     harness.close_endpoint(SocketId(83), first_local_endpoint);
@@ -72,7 +72,7 @@ fn published_routes_are_rebuilt_from_current_reachable_state() {
     harness.expect_no_transport_submit(
         "duplicate announcements for one route should share a single route state",
     );
-    harness.mark_route_reachable(remote_route, [remote_member.clone()]);
+    harness.mark_route_reachable_with_identified_members(remote_route, [remote_member.clone()]);
     harness.expect_peer_route_update(&remote_member, &[remote_route], Some(local_endpoint));
     harness.expect_no_route_update(
         "adding the same reachable route from another instance should not republish",

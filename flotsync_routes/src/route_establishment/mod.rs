@@ -6,11 +6,19 @@ use flotsync_utils::{BoxError, BoxFuture};
 
 mod component;
 mod config;
+mod diagnostics;
 mod state;
 mod wire;
 
 pub use component::{RouteEstablishmentComponent, RouteEstablishmentMessage};
 pub use config::{ConcreteRoutes, RouteEstablishmentConfig, RouteEstablishmentConfigError};
+pub use diagnostics::{
+    ConfiguredRouteMembers,
+    RouteDiagnostic,
+    RouteDiagnosticPhase,
+    RouteEstablishmentDiagnostics,
+};
+pub use flotsync_discovery::protocol::DiscoveryRoute;
 pub use state::{ManualRouteWatchError, WatchedRoute};
 pub use wire::RouteEstablishmentError;
 

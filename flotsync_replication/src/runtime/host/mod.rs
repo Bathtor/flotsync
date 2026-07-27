@@ -244,6 +244,13 @@ impl DeliveryRuntimeHost {
         &self.topology().runtime.runtime_component
     }
 
+    /// Return the route-establishment component that owns peer-route diagnostic state.
+    pub(crate) fn route_establishment_component(
+        &self,
+    ) -> &Arc<Component<RouteEstablishmentComponent>> {
+        self.topology().discovery.route_discovery_provider()
+    }
+
     /// Start one new delivery runtime host with an additional in-memory TOML
     /// config fragment merged into the Kompact runtime config.
     pub(crate) async fn start_with_runtime_config_toml(

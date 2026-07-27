@@ -78,6 +78,7 @@ use std::{
 use uuid::Uuid;
 
 mod claims;
+mod diagnostics;
 mod fixtures;
 mod lifecycle;
 mod watches;

@@ -481,13 +481,16 @@ impl RouteEstablishmentHarness {
             .on_definition(|component| observe_peer_route(component, instance_id, route));
     }
 
-    pub(super) fn mark_route_reachable(
+    /// Replace retained identified members, then mark the route reachable for the same members.
+    pub(super) fn mark_route_reachable_with_identified_members(
         &self,
         route: SocketAddr,
         members: impl IntoIterator<Item = MemberIdentity>,
     ) {
         let reachable_members = member_set(members);
         self.component.on_definition(move |component| {
+            component
+                .replace_identified_members(DiscoveryRoute::Udp(route), reachable_members.clone());
             component.mark_route_reachable(DiscoveryRoute::Udp(route), reachable_members);
         });
     }
@@ -496,6 +499,27 @@ impl RouteEstablishmentHarness {
         self.component.on_definition(move |component| {
             component.mark_route_stale(DiscoveryRoute::Udp(route));
         });
+    }
+
+    /// Seed the last authenticated response identities without changing verification phase.
+    pub(super) fn replace_identified_members(
+        &self,
+        route: SocketAddr,
+        members: impl IntoIterator<Item = MemberIdentity>,
+    ) {
+        let members = member_set(members);
+        self.component.on_definition(move |component| {
+            component.replace_identified_members(DiscoveryRoute::Udp(route), members);
+        });
+    }
+
+    /// Query one route-establishment diagnostic snapshot.
+    pub(super) fn diagnostics(&self) -> RouteEstablishmentDiagnostics {
+        let future = self
+            .component
+            .actor_ref()
+            .ask_with(|promise| RouteEstablishmentMessage::Diagnostics(Ask::new(promise, ())));
+        block_on(future).expect("route-establishment diagnostics ask should complete")
     }
 
     pub(super) fn replace_manual_route_watches(

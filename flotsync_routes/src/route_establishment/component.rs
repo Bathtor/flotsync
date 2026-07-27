@@ -1,6 +1,13 @@
 //! Kompact component implementing route establishment probes and introductions.
 
-use super::{DiscoveryCredentials, DiscoveryKeyMaterialStatus};
+use super::{
+    ConfiguredRouteMembers,
+    DiscoveryCredentials,
+    DiscoveryKeyMaterialStatus,
+    RouteDiagnostic,
+    RouteDiagnosticPhase,
+    RouteEstablishmentDiagnostics,
+};
 use crate::{
     DatagramRouteScope,
     RouteDiscoveryPort,
@@ -78,6 +85,8 @@ use super::{
 /// Actor messages accepted by [`RouteEstablishmentComponent`].
 #[derive(Debug)]
 pub enum RouteEstablishmentMessage {
+    /// Return one read-only snapshot of current route-establishment state.
+    Diagnostics(Ask<(), RouteEstablishmentDiagnostics>),
     /// Replace all manual route watches currently configured on this component.
     ReplaceManualRouteWatches(Ask<Vec<WatchedRoute>, Result<(), ManualRouteWatchError>>),
     /// Test hook that withdraws one route without waiting for a wall-clock timer.
@@ -206,6 +215,32 @@ impl RouteEstablishmentComponent {
         self.claim_routes.routes()
     }
 
+    /// Build one read-only diagnostic snapshot from authoritative component state.
+    fn diagnostics(&self) -> RouteEstablishmentDiagnostics {
+        let routes = self
+            .route_state
+            .iter()
+            .map(|(route, state)| RouteDiagnostic {
+                route: *route,
+                peer_announced: state.interest.peer_announced,
+                configured_members: configured_route_members(&state.interest.manual),
+                phase: route_diagnostic_phase(&state.verification),
+                identified_members: collect_members(&state.identified_members),
+                reachable_members: state
+                    .reachable_members()
+                    .map_or_else(Vec::new, collect_members),
+            })
+            .collect::<Vec<_>>();
+        RouteEstablishmentDiagnostics {
+            local_endpoint: self
+                .local_endpoint
+                .binding()
+                .map(|binding| binding.local_addr),
+            advertised_endpoints: self.claim_routes.routes().iter().copied().collect(),
+            routes,
+        }
+    }
+
     /// Return the endpoint-selection port reference used by tests to inject selected endpoints.
     #[cfg(test)]
     pub(super) fn endpoint_selection_port(&mut self) -> RequiredRef<EndpointSelectionPort> {
@@ -331,10 +366,7 @@ impl RouteEstablishmentComponent {
 
         let mut probes = Vec::with_capacity(peer.routes.len());
         for route in peer.routes {
-            let route_state = self
-                .route_state
-                .entry(route)
-                .or_insert(WatchedRouteState::NEW);
+            let route_state = self.route_state.entry(route).or_default();
             route_state.interest.peer_announced = true;
             if !route_state.has_active_timeout() {
                 probes.push(route);
@@ -366,10 +398,7 @@ impl RouteEstablishmentComponent {
             // The default is `None`, so for old routes not present in the new watches,
             // this effectively removes the manual filter.
             let new_manual_filter = manual_filters.remove(&route).unwrap_or_default();
-            let route_state = self
-                .route_state
-                .entry(route)
-                .or_insert(WatchedRouteState::NEW);
+            let route_state = self.route_state.entry(route).or_default();
             let manual_filter_changed = route_state.interest.manual != new_manual_filter;
             route_state.interest.manual = new_manual_filter;
 
@@ -701,10 +730,11 @@ impl RouteEstablishmentComponent {
             return;
         }
         let memberships = self.group_memberships.snapshot();
+        let mut authenticated_members = TrieSet::new();
         let mut accepted_members = TrieSet::new();
         for claim in prepared.claims {
-            if let Some(member) = self
-                .accept_prepared_introduction_claim(
+            if let Some(outcome) = self
+                .authenticate_prepared_introduction_claim(
                     source,
                     prepared.route,
                     memberships.as_ref(),
@@ -712,8 +742,18 @@ impl RouteEstablishmentComponent {
                 )
                 .await
             {
-                accepted_members.insert(member);
+                let AuthenticatedClaimOutcome {
+                    authenticated_member,
+                    publishable_member,
+                } = outcome;
+                authenticated_members.insert(authenticated_member);
+                if let Some(member) = publishable_member {
+                    accepted_members.insert(member);
+                }
             }
+        }
+        if !authenticated_members.is_empty() {
+            self.replace_identified_members(prepared.route, authenticated_members);
         }
         if accepted_members.is_empty() {
             trace!(
@@ -726,14 +766,14 @@ impl RouteEstablishmentComponent {
         self.mark_route_reachable(prepared.route, accepted_members);
     }
 
-    /// Return the claim member when one prepared claim verifies and is publishable.
-    async fn accept_prepared_introduction_claim(
+    /// Authenticate one prepared claim and classify whether its member is publishable.
+    async fn authenticate_prepared_introduction_claim(
         &mut self,
         source: SocketAddr,
         route: DiscoveryRoute,
         memberships: &GroupMemberships,
         claim: PendingClaimVerification,
-    ) -> Option<MemberIdentity> {
+    ) -> Option<AuthenticatedClaimOutcome> {
         if !self.route_interest_permits_member(route, &claim.member) {
             debug!(
                 self.log(),
@@ -785,8 +825,14 @@ impl RouteEstablishmentComponent {
         }
         match verify_prepared_claim(self.credentials.as_ref(), claim).await {
             Ok(verified_claim) => {
-                self.member_accepted_for_route_publication(source, memberships, verified_claim)
-                    .await
+                let authenticated_member = verified_claim.member.clone();
+                let publishable_member = self
+                    .member_accepted_for_route_publication(source, memberships, verified_claim)
+                    .await;
+                Some(AuthenticatedClaimOutcome {
+                    authenticated_member,
+                    publishable_member,
+                })
             }
             Err(error) => {
                 debug!(
@@ -943,6 +989,13 @@ impl RouteEstablishmentComponent {
             self.cancel_timer(timer);
         }
         self.rebuild_published_member_routes();
+    }
+
+    /// Replace identified members if `route` remains tracked; otherwise this is a no-op.
+    pub(super) fn replace_identified_members(&mut self, route: DiscoveryRoute, members: TrieSet) {
+        if let Some(route_state) = self.route_state.get_mut(&route) {
+            route_state.replace_identified_members(members);
+        }
     }
 
     /// Expire one reachable lease if it still owns the active timer, then schedule a refresh probe.
@@ -1137,6 +1190,16 @@ impl Actor for RouteEstablishmentComponent {
 
     fn receive_local(&mut self, msg: Self::Message) -> HandlerResult {
         match msg {
+            RouteEstablishmentMessage::Diagnostics(diagnostics) => {
+                let (promise, ()) = diagnostics.take();
+                if promise.fulfil(self.diagnostics()).is_err() {
+                    debug!(
+                        self.log(),
+                        "route-establishment diagnostics promise was dropped before reply"
+                    );
+                }
+                Handled::OK
+            }
             RouteEstablishmentMessage::ReplaceManualRouteWatches(watches) => {
                 Handled::block_on(self, async move |mut async_self| {
                     let (promise, watches) = watches.take();
@@ -1157,6 +1220,35 @@ impl Actor for RouteEstablishmentComponent {
             }
         }
     }
+}
+
+/// Convert one manual route filter into its diagnostic representation.
+fn configured_route_members(filter: &ManualMemberFilter) -> Option<ConfiguredRouteMembers> {
+    match filter {
+        ManualMemberFilter::None => None,
+        ManualMemberFilter::Any => Some(ConfiguredRouteMembers::Any),
+        ManualMemberFilter::Member(member) => {
+            Some(ConfiguredRouteMembers::Members(vec![member.clone()]))
+        }
+        ManualMemberFilter::Members(members) => {
+            Some(ConfiguredRouteMembers::Members(collect_members(members)))
+        }
+    }
+}
+
+/// Return the public diagnostic phase corresponding to one internal verification state.
+fn route_diagnostic_phase(state: &super::state::RouteVerificationState) -> RouteDiagnosticPhase {
+    match state {
+        super::state::RouteVerificationState::Known => RouteDiagnosticPhase::Known,
+        super::state::RouteVerificationState::Probing { .. } => RouteDiagnosticPhase::Probing,
+        super::state::RouteVerificationState::Reachable { .. } => RouteDiagnosticPhase::Reachable,
+        super::state::RouteVerificationState::Stale => RouteDiagnosticPhase::Stale,
+    }
+}
+
+/// Copy one trie-backed member set into a diagnostic collection.
+fn collect_members(members: &TrieSet) -> Vec<MemberIdentity> {
+    members.owned_keys().collect()
 }
 
 /// Collapse caller-provided watches into one manual filter per route.
@@ -1252,6 +1344,14 @@ struct VerifiedIntroductionClaim {
     key_fingerprint: flotsync_security::KeyFingerprint,
     /// Decoded signed group context retained for local consistency validation.
     group_ids: HashSet<GroupId>,
+}
+
+/// Result of authenticating one introduction claim before route-publication aggregation.
+struct AuthenticatedClaimOutcome {
+    /// Member whose signature authenticated the route claim.
+    authenticated_member: MemberIdentity,
+    /// Same member when group context and local policy also permit route publication.
+    publishable_member: Option<MemberIdentity>,
 }
 
 #[derive(Clone, Copy, Debug)]

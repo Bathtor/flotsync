@@ -17,7 +17,10 @@ use flotsync_messages::{
     wire::{UUID_BYTE_LENGTH, WireValueDecodeError, fixed_bytes_field},
 };
 use snafu::{Location, prelude::*};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 use uuid::Uuid;
 
 /// Number of bytes in a discovery peer-instance id.
@@ -36,6 +39,14 @@ impl DiscoveryRoute {
     pub const fn udp_addr(self) -> SocketAddr {
         match self {
             Self::Udp(address) => address,
+        }
+    }
+}
+
+impl fmt::Display for DiscoveryRoute {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Udp(address) => write!(formatter, "udp://{address}"),
         }
     }
 }

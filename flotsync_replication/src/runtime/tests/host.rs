@@ -60,6 +60,50 @@ fn runtime_shutdown_is_graceful_idempotent_and_marks_runtime_unavailable() {
 }
 
 #[test]
+fn diagnostics_share_the_runtime_allocation_and_lifecycle() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime_api: Arc<dyn ReplicationApi> = runtime.clone();
+
+    let diagnostics = runtime_api.diagnostics();
+
+    assert_eq!(
+        Arc::as_ptr(&runtime).cast::<()>(),
+        Arc::as_ptr(&diagnostics).cast::<()>(),
+        "replication and diagnostics trait objects should share one allocation"
+    );
+    let snapshot = wait_for_test_reply(diagnostics.peer_routes())
+        .expect("live runtime should return peer-route diagnostics");
+    assert!(snapshot.local_endpoint.is_some());
+    assert!(snapshot.routes.is_empty());
+
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down gracefully");
+    let error = wait_for_test_reply(diagnostics.peer_routes())
+        .expect_err("diagnostics should be unavailable after shared runtime shutdown");
+    assert!(matches!(error, ApiError::RuntimeUnavailable));
+}
+
+#[test]
+fn diagnostics_arc_keeps_the_concrete_runtime_alive() {
+    let store = sqlite_store(alice_member());
+    provision_test_security(store.as_ref(), &alice_member(), []);
+    let listener = Arc::new(ListenerStub::default());
+    let runtime = load_runtime_with_parts(app_alice_id(), store, listener);
+    let runtime_weak = Arc::downgrade(&runtime);
+    let diagnostics = runtime.diagnostics();
+
+    drop(runtime);
+
+    assert!(runtime_weak.upgrade().is_some());
+    wait_for_test_reply(diagnostics.peer_routes())
+        .expect("diagnostics Arc should keep the shared runtime alive");
+    drop(diagnostics);
+    assert!(runtime_weak.upgrade().is_none());
+}
+
+#[test]
 fn dropping_runtime_inside_test_executor_does_not_reenter_local_pool() {
     let store = sqlite_store(alice_member());
     provision_test_security(store.as_ref(), &alice_member(), []);

@@ -847,6 +847,11 @@ pub trait ReplicationEventListener: Send + Sync {
 
 /// Application-facing replication control surface.
 pub trait ReplicationApi: Send + Sync {
+    /// Return a separate read-only diagnostics API for this runtime.
+    ///
+    /// Queries through the returned API report [`ApiError::RuntimeUnavailable`] after shutdown.
+    fn diagnostics(&self) -> Arc<dyn FlotsyncDiagnostics>;
+
     /// Shut this runtime down gracefully.
     ///
     /// Shutdown stops the live replication components in dependency order and

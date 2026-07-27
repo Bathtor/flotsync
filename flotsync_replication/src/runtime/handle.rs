@@ -17,6 +17,7 @@ use crate::{
         ApiResult,
         ChangeGroupMembershipRequest,
         CreateGroupRequest,
+        FlotsyncDiagnostics,
         LoadError,
         MigrationId,
         PublishChangesRequest,
@@ -26,6 +27,7 @@ use crate::{
         ReplicationEventListener,
         ReplicationSecuritySecrets,
         ReplicationStore,
+        RouteEstablishmentDiagnostics,
         RuntimeSnafu,
         SnapshotRowsRequest,
         SnapshotValueRows,
@@ -46,12 +48,13 @@ use flotsync_core::MemberIdentity;
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_core::membership::{GroupMembers, GroupMemberships};
 use flotsync_core::{GroupId, member::Identifier};
+use flotsync_routes::route_establishment::RouteEstablishmentMessage;
 use flotsync_security::PublicKeyBundle;
 use flotsync_utils::BoxFuture;
 use futures_util::{FutureExt, future};
 use kompact::{KompactLogger, prelude::*};
 use snafu::prelude::*;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 #[cfg(any(test, feature = "test-support"))]
 use super::errors::GroupInstallError;
@@ -229,10 +232,22 @@ async fn load_replication_runtime_typed_with_security(
         .actor_ref()
         .hold()
         .expect("replication runtime component must expose a strong actor ref");
+    let route_establishment_ref = host
+        .route_establishment_component()
+        .actor_ref()
+        .hold()
+        .expect("route establishment must expose a strong actor ref");
     let logger = host.logger().clone();
-    Ok(Arc::new(ReplicationRuntime {
+    // The weak self-view permits independently owned trait-object handles without either a
+    // second runtime allocation or a strong reference cycle.
+    Ok(Arc::new_cyclic(move |self_weak| ReplicationRuntime {
         _application_id: application_id,
-        lifecycle: RwLock::new(Some(RuntimeLifecycle { runtime_ref, host })),
+        self_weak: self_weak.clone(),
+        lifecycle: RwLock::new(Some(RuntimeLifecycle {
+            runtime_ref,
+            route_establishment_ref,
+            host,
+        })),
         logger,
         _config: config,
     }))
@@ -241,6 +256,8 @@ async fn load_replication_runtime_typed_with_security(
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
 pub(crate) struct ReplicationRuntime {
     _application_id: Identifier,
+    /// Non-owning self-view used to expose another trait object for this exact allocation.
+    self_weak: Weak<Self>,
     /// Live runtime ownership, taken exactly once during graceful shutdown.
     lifecycle: RwLock<Option<RuntimeLifecycle>>,
     /// Logger clone kept outside the lifecycle lock for hot-path diagnostics.
@@ -252,6 +269,8 @@ pub(crate) struct ReplicationRuntime {
 struct RuntimeLifecycle {
     /// Strong actor ref used by public API calls while the runtime is live.
     runtime_ref: ActorRefStrong<ReplicationRuntimeMessage>,
+    /// Strong actor reference used by read-only peer-route diagnostic queries.
+    route_establishment_ref: ActorRefStrong<RouteEstablishmentMessage>,
     /// Internal Kompact runtime host that owns component topology and system shutdown.
     host: DeliveryRuntimeHost,
 }
@@ -294,6 +313,19 @@ impl ReplicationRuntime {
         }
         .boxed()
     }
+
+    /// Return the live route-establishment actor used by diagnostic queries.
+    fn route_establishment_ref(
+        &self,
+        operation: &'static str,
+    ) -> ApiResult<Option<ActorRefStrong<RouteEstablishmentMessage>>> {
+        let Ok(lifecycle) = self.lifecycle.read() else {
+            return Err(ApiError::RuntimeLifecyclePoisoned { operation });
+        };
+        Ok(lifecycle
+            .as_ref()
+            .map(|lifecycle| lifecycle.route_establishment_ref.clone()))
+    }
 }
 
 impl Drop for ReplicationRuntime {
@@ -313,6 +345,12 @@ impl Drop for ReplicationRuntime {
 }
 
 impl ReplicationApi for ReplicationRuntime {
+    fn diagnostics(&self) -> Arc<dyn FlotsyncDiagnostics> {
+        self.self_weak
+            .upgrade()
+            .expect("a live replication runtime reference must have a strong Arc owner")
+    }
+
     fn shutdown(&self) -> ApiFuture<'_, ()> {
         async move {
             let lifecycle = {
@@ -384,6 +422,33 @@ impl ReplicationApi for ReplicationRuntime {
         self.ask(move |promise| {
             ReplicationRuntimeMessage::ChangeGroupMembership(Ask::new(promise, req))
         })
+    }
+}
+
+impl FlotsyncDiagnostics for ReplicationRuntime {
+    fn peer_routes(&self) -> ApiFuture<'_, RouteEstablishmentDiagnostics> {
+        let route_establishment_ref =
+            match self.route_establishment_ref("requesting peer-route diagnostics") {
+                Ok(Some(route_establishment_ref)) => route_establishment_ref,
+                Ok(None) => return future::ready(Err(ApiError::RuntimeUnavailable)).boxed(),
+                Err(error) => return future::ready(Err(error)).boxed(),
+            };
+        let future = route_establishment_ref
+            .ask_with(|promise| RouteEstablishmentMessage::Diagnostics(Ask::new(promise, ())));
+        let logger = self.logger.clone();
+        async move {
+            match future.await {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error) => {
+                    warn!(
+                        logger,
+                        "route-establishment diagnostics ask failed: {error}"
+                    );
+                    Err(ApiError::RuntimeUnavailable)
+                }
+            }
+        }
+        .boxed()
     }
 }
 
