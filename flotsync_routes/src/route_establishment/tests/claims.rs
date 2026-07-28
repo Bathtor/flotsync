@@ -48,16 +48,16 @@ fn local_claim_groups_only_include_groups_hosted_by_local_member() {
     let remote_member = member(["bob"]);
     let local_group = group_id(1);
     let remote_only_group = group_id(2);
-    let memberships = GroupMemberships::from_groups([
+    let memberships = TestGroupMemberships::from_groups([
         (
             local_group,
             group_members([local_member.clone(), remote_member.clone()]),
         ),
         (remote_only_group, group_members([remote_member])),
     ]);
-    let memberships = SharedGroupMemberships::new(memberships);
+    let memberships = memberships.shared();
 
-    let advertised_groups = local_claim_group_ids(&memberships, &local_member);
+    let advertised_groups = local_claim_group_ids(memberships.as_ref(), &local_member);
 
     assert_eq!(advertised_groups, vec![local_group]);
 }
@@ -65,7 +65,7 @@ fn local_claim_groups_only_include_groups_hosted_by_local_member() {
 #[test]
 fn introduction_response_does_not_require_local_group_membership() {
     let local_member = member(["alice"]);
-    let memberships = SharedGroupMemberships::new(GroupMemberships::default());
+    let memberships = TestGroupMemberships::default().shared();
     let local_endpoint = SocketAddr::from(([0, 0, 0, 0], 45_102));
     let selected_endpoint = SocketAddr::from(([192, 168, 1, 22], 45_102));
     let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_102));
@@ -165,7 +165,7 @@ fn claim_group_context_rejects_only_locally_known_contradictions() {
     let matching_group = group_id(1);
     let contradicted_group = group_id(2);
     let unknown_group = group_id(3);
-    let memberships = GroupMemberships::from_groups([
+    let memberships = TestGroupMemberships::from_groups([
         (
             matching_group,
             group_members([local_member.clone(), claimed_member.clone()]),

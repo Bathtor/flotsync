@@ -9,12 +9,19 @@ use super::{
         RuntimeIdentityContext,
         RuntimeSecurityContext,
     },
+    group_state::SharedGroupState,
     summary_request_manager::SummaryRequestManagerComponent,
 };
 #[cfg(test)]
 use super::{ReplicationRuntimeMessage, handle::wait_for_test_reply};
 use crate::{
-    api::{BoxError, ReplicationConfig, ReplicationEventListener, ReplicationStore},
+    api::{
+        BoxError,
+        ReplicationConfig,
+        ReplicationEventListener,
+        ReplicationGroupSnapshot,
+        ReplicationStore,
+    },
     delivery::{
         contracts::{GroupBroadcastPort, ReliableDeliveryPort},
         group_broadcast::{GroupBroadcastComponent, GroupBroadcastInboundPort},
@@ -23,10 +30,7 @@ use crate::{
         security::DeliverySecurity,
     },
 };
-use flotsync_core::{
-    MemberIdentity,
-    membership::{GroupMemberships, SharedGroupMemberships},
-};
+use flotsync_core::{MemberIdentity, membership::SharedGroupMemberships};
 use flotsync_discovery::{
     config_keys as discovery_config_keys,
     endpoint_selection::EndpointSelectionPort,
@@ -199,7 +203,7 @@ mod config_keys {
 pub(crate) struct DeliveryRuntimeHost {
     system: Option<KompactSystem>,
     topology: Option<RuntimeTopology>,
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<SharedGroupState>,
     control_timeout: Duration,
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
     external_udp_addr: SocketAddr,
@@ -211,7 +215,7 @@ impl DeliveryRuntimeHost {
     fn new(
         system: KompactSystem,
         topology: RuntimeTopology,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<SharedGroupState>,
         control_timeout: Duration,
         external_udp_addr: SocketAddr,
         #[cfg(any(test, feature = "test-support"))] local_endpoint_lease: ReservedSocketLease,
@@ -287,7 +291,7 @@ impl DeliveryRuntimeHost {
         let system = built_system.system.clone();
         let host_config = DeliveryRuntimeHostConfig::from_system_config(&system)?;
         let routes_config = PreconfiguredPeerRoutesConfig::from_config(system.config())?;
-        let group_memberships = SharedGroupMemberships::new(GroupMemberships::new());
+        let group_memberships = Arc::new(SharedGroupState::new());
         let topology = RuntimeTopology::build(
             &system,
             RuntimeTopologyBuildInput {
@@ -391,12 +395,6 @@ impl DeliveryRuntimeHost {
         Ok(())
     }
 
-    /// Replace the authoritative shared group-membership snapshot.
-    #[cfg(test)]
-    pub(crate) fn replace_group_memberships(&self, memberships: GroupMemberships) {
-        self.group_memberships.replace(memberships);
-    }
-
     /// Publish one route-discovery update into both semantic delivery owners.
     ///
     /// This is temporary until the replication runtime is wired to the real
@@ -426,8 +424,15 @@ impl DeliveryRuntimeHost {
 
     /// Read the current authoritative membership snapshot.
     #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-    pub(crate) fn membership_snapshot(&self) -> Arc<GroupMemberships> {
+    pub(crate) fn membership_snapshot(
+        &self,
+    ) -> Arc<dyn flotsync_core::membership::GroupMemberships> {
         self.group_memberships.snapshot()
+    }
+
+    /// Read the current restricted application group-state snapshot.
+    pub(crate) fn group_state_snapshot(&self) -> Arc<dyn ReplicationGroupSnapshot> {
+        self.group_memberships.application_snapshot()
     }
 }
 

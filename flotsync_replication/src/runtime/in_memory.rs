@@ -75,6 +75,31 @@ impl LoadedGroupMeta {
         local_member: &MemberIdentity,
         group: ReplicationGroupRecord,
     ) -> Result<Self, GroupInstallError> {
+        let (members, local_member_index) =
+            Self::validate_replication_group_record(local_member, &group)?;
+
+        Ok(Self {
+            members,
+            local_member_index,
+            version_vector: group.version_vector,
+        })
+    }
+
+    /// Validate one persisted group and return its canonical member set.
+    pub(super) fn validated_members_from_replication_group_record(
+        local_member: &MemberIdentity,
+        group: &ReplicationGroupRecord,
+    ) -> Result<GroupMembers, GroupInstallError> {
+        let (members, _local_member_index) =
+            Self::validate_replication_group_record(local_member, group)?;
+        Ok(members)
+    }
+
+    /// Validate invariants shared by transaction and runtime-state projections.
+    fn validate_replication_group_record(
+        local_member: &MemberIdentity,
+        group: &ReplicationGroupRecord,
+    ) -> Result<(GroupMembers, MemberIndex), GroupInstallError> {
         let group_id = group.group_id;
         let members = group
             .member_keys
@@ -117,11 +142,7 @@ impl LoadedGroupMeta {
             );
         }
 
-        Ok(Self {
-            members,
-            local_member_index,
-            version_vector: group.version_vector,
-        })
+        Ok((members, local_member_index))
     }
 
     /// Return the fixed member count for this transaction-scoped group view.

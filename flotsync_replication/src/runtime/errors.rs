@@ -125,6 +125,8 @@ pub(super) enum SummaryError {
 pub(crate) enum GroupInstallError {
     #[snafu(display("Group {group_id} already exists with a different group definition."))]
     ConflictingExistingGroup { group_id: GroupId },
+    #[snafu(display("Persisted group registry contains duplicate group {group_id}."))]
+    DuplicateStoredGroup { group_id: GroupId },
     #[snafu(display("Group members do not include the local member {local_member}."))]
     InstallMissingLocalMember { local_member: MemberIdentity },
     #[snafu(display(
@@ -187,8 +189,6 @@ pub(super) enum RuntimeStartupError {
         #[snafu(implicit)]
         location: Location,
     },
-    #[snafu(display("Persisted replication runtime state contained duplicate group {group_id}."))]
-    DuplicateGroup { group_id: GroupId },
     #[snafu(display(
         "Persisted replication group {group_id} could not be rebuilt into the runtime read model: {source}"
     ))]

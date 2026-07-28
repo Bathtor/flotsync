@@ -360,7 +360,6 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     );
     let new_group = load_persisted_group(store.as_ref(), migration_id.new_group_id);
     assert_eq!(new_group.group_name.as_deref(), Some("migrated docs"));
-    assert_eq!(new_group.message.as_deref(), Some("migration message"));
     let migration_read_token = listener
         .captured_data_change_read_tokens()
         .last()
@@ -440,7 +439,6 @@ fn membership_change_rejects_empty_replacement_name_and_can_clear_metadata() {
     .expect("clearing successor metadata should succeed");
     let successor = load_persisted_group(store.as_ref(), migration_id.new_group_id);
     assert_eq!(successor.group_name, None);
-    assert_eq!(successor.message, None);
 }
 
 #[test]

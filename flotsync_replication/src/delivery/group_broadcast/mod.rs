@@ -175,7 +175,7 @@ pub struct GroupBroadcastComponent {
     discovery_port: RequiredPort<TransportRouteDiscoveryPort>,
     /// Shared read-mostly group-membership snapshot used both for local
     /// self-delivery decisions and outbound direct fan-out.
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<dyn SharedGroupMemberships>,
     /// Route-transport actor used for one-shot direct fan-out submissions.
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
     /// Security state used to seal outbound payloads and open inbound payloads.
@@ -191,7 +191,7 @@ impl GroupBroadcastComponent {
     /// group-membership view and route-transport actor.
     #[must_use]
     pub(crate) fn new(
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         security: DeliverySecurity,
     ) -> Self {
@@ -538,6 +538,7 @@ mod tests {
             wire::{group_id_from_wire, message_id_from_wire},
         },
         test_support::{
+            TestGroupMemberships,
             load_test_delivery_security,
             provision_test_security,
             test_group_key,
@@ -591,7 +592,7 @@ mod tests {
     impl FullStackHarness {
         fn new(
             local_member: MemberIdentity,
-            group_memberships: GroupMemberships,
+            group_memberships: TestGroupMemberships,
             bind_external_socket: bool,
         ) -> Self {
             let trusted_members = trusted_members_for(&local_member, &group_memberships);
@@ -605,7 +606,7 @@ mod tests {
 
         fn new_with_trusted_members(
             local_member: MemberIdentity,
-            group_memberships: GroupMemberships,
+            group_memberships: TestGroupMemberships,
             bind_external_socket: bool,
             trusted_members: HashSet<MemberIdentity>,
         ) -> Self {
@@ -621,7 +622,7 @@ mod tests {
         /// Build a harness whose persisted group expects selected non-default key fingerprints.
         fn new_with_member_key_fingerprint_overrides(
             local_member: MemberIdentity,
-            group_memberships: GroupMemberships,
+            group_memberships: TestGroupMemberships,
             bind_external_socket: bool,
             trusted_members: HashSet<MemberIdentity>,
             member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
@@ -641,7 +642,7 @@ mod tests {
                 trusted_members,
                 member_key_fingerprint_overrides,
             );
-            let shared_group_memberships = SharedGroupMemberships::new(group_memberships);
+            let shared_group_memberships = group_memberships.shared();
             let manager_ref = core.manager_ref();
             let ingress_group_memberships = shared_group_memberships.clone();
             let ingress = core.system().create(move || {
@@ -1394,15 +1395,15 @@ mod tests {
     fn group_memberships(
         group_id: GroupId,
         members: impl IntoIterator<Item = MemberIdentity>,
-    ) -> GroupMemberships {
+    ) -> TestGroupMemberships {
         let group_members =
             GroupMembers::from_ordered_members(members).expect("test memberships should build");
-        GroupMemberships::from_groups([(group_id, group_members)])
+        TestGroupMemberships::from_groups([(group_id, group_members)])
     }
 
     fn test_group_security(
         local_member: &MemberIdentity,
-        group_memberships: &GroupMemberships,
+        group_memberships: &dyn GroupMemberships,
     ) -> DeliverySecurity {
         let trusted_members = trusted_members_for(local_member, group_memberships);
         test_group_security_with_trusted_members(local_member, group_memberships, trusted_members)
@@ -1410,7 +1411,7 @@ mod tests {
 
     fn test_group_security_with_trusted_members(
         local_member: &MemberIdentity,
-        group_memberships: &GroupMemberships,
+        group_memberships: &dyn GroupMemberships,
         trusted_members: HashSet<MemberIdentity>,
     ) -> DeliverySecurity {
         let (security, _) = test_group_security_with_trusted_members_and_store(
@@ -1425,7 +1426,7 @@ mod tests {
     /// Build delivery security plus its backing store so tests can mutate evidence later.
     fn test_group_security_with_trusted_members_and_store(
         local_member: &MemberIdentity,
-        group_memberships: &GroupMemberships,
+        group_memberships: &dyn GroupMemberships,
         trusted_members: HashSet<MemberIdentity>,
         member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
     ) -> (DeliverySecurity, Arc<SqliteReplicationStore>) {
@@ -1458,13 +1459,10 @@ mod tests {
 
     fn trusted_members_for(
         local_member: &MemberIdentity,
-        group_memberships: &GroupMemberships,
+        group_memberships: &dyn GroupMemberships,
     ) -> HashSet<MemberIdentity> {
         let mut trusted_members = HashSet::new();
-        for group_id in group_memberships.group_ids() {
-            let members = group_memberships
-                .members(group_id)
-                .expect("group id came from the same membership snapshot");
+        for (_group_id, members) in group_memberships.groups() {
             for member in members.iter() {
                 if &member != local_member {
                     trusted_members.insert(member);
@@ -1478,7 +1476,7 @@ mod tests {
     fn persist_group_security(
         store: &dyn ReplicationStore,
         local_member: &MemberIdentity,
-        group_memberships: &GroupMemberships,
+        group_memberships: &dyn GroupMemberships,
         security: &DeliverySecurity,
         member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
     ) {
@@ -1487,10 +1485,7 @@ mod tests {
                 .begin_transaction()
                 .await
                 .expect("security transaction should start");
-            for group_id in group_memberships.group_ids() {
-                let members = group_memberships
-                    .members(group_id)
-                    .expect("group id came from the same membership snapshot");
+            for (group_id, members) in group_memberships.groups() {
                 let ordered_members = members.ordered_members();
                 let member_keys = ordered_members
                     .iter()
@@ -1508,10 +1503,10 @@ mod tests {
                     .member_index(local_member)
                     .expect("test local member should belong to every hosted group");
                 let security_material = security
-                    .seal_group_secret(group_id.0, &test_group_key(*group_id))
+                    .seal_group_secret(group_id.0, &test_group_key(group_id))
                     .expect("test group secret should seal");
                 let group = ReplicationGroupRecord {
-                    group_id: *group_id,
+                    group_id,
                     member_keys,
                     local_member_index,
                     group_schema: GroupSchema::default(),

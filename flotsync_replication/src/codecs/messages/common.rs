@@ -209,15 +209,15 @@ impl MemberCountContext {
 }
 
 /// Hosted-group context available while decoding one runtime message.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct RuntimeMessageDecodeContext<'a> {
     /// Current immutable membership snapshot for locally hosted groups.
-    memberships: &'a GroupMemberships,
+    memberships: &'a dyn GroupMemberships,
 }
 
 impl<'a> RuntimeMessageDecodeContext<'a> {
     /// Create a runtime-message context from the current membership snapshot.
-    pub(crate) const fn new(memberships: &'a GroupMemberships) -> Self {
+    pub(crate) const fn new(memberships: &'a dyn GroupMemberships) -> Self {
         Self { memberships }
     }
 

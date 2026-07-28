@@ -49,6 +49,17 @@ pub struct DatasetRowStateBatch {
 /// Complete row state snapshot used by replication storage.
 pub type ReplicationRowStateSnapshot = RowStateSnapshot<'static, UpdateId>;
 
+/// Stored progress for one writable replication group.
+///
+/// Storage queries may return these records in any order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WritableReplicationGroupVersionRecord {
+    /// Stable replication-group identifier.
+    pub group_id: GroupId,
+    /// Last applied version vector stored for the group.
+    pub version_vector: VersionVector,
+}
+
 /// Row image loaded from or written to replication storage.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReplicationRowStateRecord {
@@ -109,6 +120,13 @@ pub trait ReplicationStoreReadTransaction: Send {
     fn load_replication_groups(
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>>;
+
+    /// Load ids and stored progress for all currently writable replication groups.
+    ///
+    /// Results have no ordering guarantee and exclude non-writable lifecycle states.
+    fn load_writable_replication_group_versions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>>;
 
     /// Load persisted replication groups whose ids are included in `group_ids`.
     ///
@@ -329,7 +347,7 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     /// Store group material or refresh metadata on a compatible existing record.
     ///
     /// Compatibility requires the same group definition and security material;
-    /// name and message metadata may differ and are replaced when they do.
+    /// name metadata may differ and is replaced when it does.
     fn ensure_replication_group_material(
         &mut self,
         material: ReplicationGroupMaterialRecord,

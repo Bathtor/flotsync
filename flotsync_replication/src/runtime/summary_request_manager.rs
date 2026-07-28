@@ -27,7 +27,7 @@ use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
 use flotsync_utils::{KClaimablePromise, OptionExt as _};
 use kompact::prelude::*;
 use snafu::prelude::*;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 /// Local-actor messages understood by [`SummaryRequestManagerComponent`].
@@ -102,7 +102,7 @@ pub(super) struct SummaryRequestManagerComponent {
     ctx: ComponentContext<Self>,
     reliable_delivery: RequiredPort<ReliableDeliveryPort>,
     local_member: MemberIdentity,
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<dyn SharedGroupMemberships>,
     request_timeout: Duration,
     pending_summaries: HashMap<Uuid, PendingSummaryRequest>,
 }
@@ -110,7 +110,7 @@ pub(super) struct SummaryRequestManagerComponent {
 impl SummaryRequestManagerComponent {
     pub(super) fn new(
         local_member: MemberIdentity,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         request_timeout: Duration,
     ) -> Self {
         Self {

@@ -28,6 +28,7 @@ itertools = { workspace = true }
 kompact = { workspace = true }
 log = { workspace = true }
 roaring = { workspace = true }
+sealed = { workspace = true }
 smallvec = { workspace = true }
 snafu = { workspace = true }
 sqlx = { workspace = true }

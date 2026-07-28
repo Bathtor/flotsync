@@ -22,6 +22,7 @@ pub mod config_keys {
 mod catch_up_manager;
 mod component;
 mod errors;
+mod group_state;
 pub mod handle;
 pub(crate) mod host;
 mod in_memory;
@@ -32,6 +33,8 @@ mod summary_request_manager;
 
 pub use component::{ReplicationRuntimeComponent, ReplicationRuntimeMessage};
 pub(crate) use errors::BoxedError;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use group_state::application_snapshot_from_records;
 pub use handle::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
 
 #[cfg(test)]

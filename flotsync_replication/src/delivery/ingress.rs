@@ -37,21 +37,11 @@ use std::{collections::HashSet, sync::Arc};
 pub struct DeliveryInterestConfig {
     /// Dynamically changing group-membership view used for early local
     /// admission checks and group-broadcast fan-out.
-    pub group_memberships: SharedGroupMemberships,
+    pub group_memberships: Arc<dyn SharedGroupMemberships>,
     /// Member identities hosted locally by this node.
     pub local_members: Arc<HashSet<MemberIdentity>>,
     /// Mailboxes this node is currently willing to serve as a relay.
     pub hosted_mailboxes: Arc<HashSet<MemberIdentity>>,
-}
-
-impl Default for DeliveryInterestConfig {
-    fn default() -> Self {
-        Self {
-            group_memberships: SharedGroupMemberships::default(),
-            local_members: Arc::new(HashSet::new()),
-            hosted_mailboxes: Arc::new(HashSet::new()),
-        }
-    }
 }
 
 /// Early routing hint derived from the shallow public delivery-wire header.
@@ -245,10 +235,11 @@ type TransportReliableDeliveryInboundPort = ReliableDeliveryInboundPort<Transpor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestGroupMemberships;
     use bytes::Bytes;
     use flotsync_core::{
         member::{IdentifierBuf, IdentifierLike},
-        membership::GroupMemberships,
+        membership::GroupMembers,
     };
     use flotsync_io::{
         prelude::IoPayload,
@@ -276,13 +267,12 @@ mod tests {
         let transport_ref = transport.actor_ref();
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
-                group_memberships: SharedGroupMemberships::new(GroupMemberships::from_groups([(
+                group_memberships: TestGroupMemberships::from_groups([(
                     active_group,
-                    flotsync_core::membership::GroupMembers::from_ordered_members([member(&[
-                        "probe",
-                    ])])
-                    .expect("probe group members should build"),
-                )])),
+                    GroupMembers::from_ordered_members([member(&["probe"])])
+                        .expect("probe group members should build"),
+                )])
+                .shared(),
                 local_members: Arc::new(HashSet::new()),
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })
@@ -358,7 +348,7 @@ mod tests {
         let transport_ref = transport.actor_ref();
         let ingress = system.create(|| {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
-                group_memberships: SharedGroupMemberships::default(),
+                group_memberships: TestGroupMemberships::default().shared(),
                 local_members: Arc::new([original_sender.clone()].into_iter().collect()),
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })

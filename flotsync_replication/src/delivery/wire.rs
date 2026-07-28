@@ -194,9 +194,9 @@ pub(crate) enum DecodedDeliveryFrame {
 /// Grouping these sets into one struct makes the call sites less repetitive and
 /// makes it explicit that classification is always evaluated against one
 /// coherent local-interest view.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct DeliveryInterestView<'a> {
-    pub group_memberships: &'a GroupMemberships,
+    pub group_memberships: &'a dyn GroupMemberships,
     pub local_members: &'a HashSet<MemberIdentity>,
     pub hosted_mailboxes: &'a HashSet<MemberIdentity>,
 }
@@ -737,6 +737,7 @@ struct RelevantShallowClassification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestGroupMemberships;
     use bytes::Bytes;
     use flotsync_core::member::IdentifierBuf;
     use flotsync_messages::buffa::{Message, MessageField};
@@ -774,7 +775,7 @@ mod tests {
         IoPayload::from(frame.encode_to_bytes())
     }
 
-    fn group_memberships(groups: impl IntoIterator<Item = GroupId>) -> GroupMemberships {
+    fn group_memberships(groups: impl IntoIterator<Item = GroupId>) -> TestGroupMemberships {
         let groups = groups.into_iter().map(|group_id| {
             (
                 group_id,
@@ -782,7 +783,7 @@ mod tests {
                     .expect("probe group members should build"),
             )
         });
-        GroupMemberships::from_groups(groups)
+        TestGroupMemberships::from_groups(groups)
     }
 
     fn members(values: impl IntoIterator<Item = MemberIdentity>) -> HashSet<MemberIdentity> {

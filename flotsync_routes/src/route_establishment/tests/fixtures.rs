@@ -1,6 +1,57 @@
 //! Shared harness and credential doubles for route-establishment component tests.
 
+use std::collections::HashMap;
+
 use super::*;
+
+/// Fixed membership snapshot used by route-establishment tests.
+#[derive(Default)]
+pub(super) struct TestGroupMemberships {
+    /// Fixed member sets keyed by group identifier.
+    groups: HashMap<GroupId, GroupMembers>,
+}
+
+impl TestGroupMemberships {
+    /// Build one fixed route-test snapshot from complete group entries.
+    pub(super) fn from_groups(groups: impl IntoIterator<Item = (GroupId, GroupMembers)>) -> Self {
+        Self {
+            groups: groups.into_iter().collect(),
+        }
+    }
+
+    /// Wrap this snapshot in the shared component-facing source interface.
+    pub(super) fn shared(self) -> Arc<dyn SharedGroupMemberships> {
+        Arc::new(TestSharedGroupMemberships {
+            snapshot: Arc::new(self),
+        })
+    }
+}
+
+impl GroupMemberships for TestGroupMemberships {
+    fn members(&self, group_id: &GroupId) -> Option<&GroupMembers> {
+        self.groups.get(group_id)
+    }
+
+    fn groups(&self) -> Box<dyn Iterator<Item = (GroupId, &GroupMembers)> + '_> {
+        Box::new(
+            self.groups
+                .iter()
+                .map(|(group_id, members)| (*group_id, members)),
+        )
+    }
+}
+
+/// Shared source retaining one fixed route-test snapshot.
+pub(super) struct TestSharedGroupMemberships {
+    /// Fixed snapshot returned by every load.
+    snapshot: Arc<TestGroupMemberships>,
+}
+
+impl SharedGroupMemberships for TestSharedGroupMemberships {
+    fn snapshot(&self) -> Arc<dyn GroupMemberships> {
+        self.snapshot.clone()
+    }
+}
 
 pub(super) fn group_id(value: u128) -> GroupId {
     GroupId(Uuid::from_u128(value))
@@ -132,7 +183,7 @@ impl TestCredentialDecision {
 pub(super) fn shared_memberships(
     local_member: &MemberIdentity,
     remote_member: &MemberIdentity,
-) -> SharedGroupMemberships {
+) -> Arc<dyn SharedGroupMemberships> {
     single_group_memberships([local_member.clone(), remote_member.clone()])
 }
 
@@ -141,7 +192,7 @@ pub(super) fn many_shared_group_memberships(
     local_member: &MemberIdentity,
     remote_member: &MemberIdentity,
     group_count: usize,
-) -> SharedGroupMemberships {
+) -> Arc<dyn SharedGroupMemberships> {
     let groups = (0..group_count).map(|offset| {
         let group_index = u128::try_from(offset).expect("test group index should fit u128");
         (
@@ -149,21 +200,18 @@ pub(super) fn many_shared_group_memberships(
             group_members([local_member.clone(), remote_member.clone()]),
         )
     });
-    SharedGroupMemberships::new(GroupMemberships::from_groups(groups))
+    TestGroupMemberships::from_groups(groups).shared()
 }
 
 pub(super) fn single_group_memberships(
     members: impl IntoIterator<Item = MemberIdentity>,
-) -> SharedGroupMemberships {
-    SharedGroupMemberships::new(GroupMemberships::from_groups([(
-        group_id(1),
-        group_members(members),
-    )]))
+) -> Arc<dyn SharedGroupMemberships> {
+    TestGroupMemberships::from_groups([(group_id(1), group_members(members))]).shared()
 }
 
 pub(super) fn route_establishment_component_with_credentials(
     local_member: MemberIdentity,
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<dyn SharedGroupMemberships>,
     credentials: Arc<dyn DiscoveryCredentials>,
     route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
 ) -> RouteEstablishmentComponent {
@@ -416,7 +464,7 @@ pub(super) struct RouteEstablishmentHarness {
 impl RouteEstablishmentHarness {
     pub(super) fn new(
         local_member: MemberIdentity,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
     ) -> Self {
         Self::with_credentials(
             local_member,
@@ -427,7 +475,7 @@ impl RouteEstablishmentHarness {
 
     pub(super) fn with_credentials(
         local_member: MemberIdentity,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         credentials: Arc<dyn DiscoveryCredentials>,
     ) -> Self {
         let system = build_test_kompact_system();

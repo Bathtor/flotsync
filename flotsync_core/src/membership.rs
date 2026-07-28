@@ -1,99 +1,28 @@
-use crate::{
-    GroupId,
-    MemberIdentity,
-    MemberIndex,
-    member::{IdentifierRef, TrieMap},
-};
-use arc_swap::ArcSwap;
+use crate::{GroupId, MemberIdentity, MemberIndex, member::TrieMap};
 use snafu::prelude::*;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-/// Immutable snapshot of the groups currently hosted locally and their
-/// currently known members.
-#[derive(Clone, Debug, Default)]
-pub struct GroupMemberships {
-    /// One immutable member snapshot per locally hosted group.
-    groups: HashMap<GroupId, GroupMembers>,
-}
+/// Read-only membership capabilities exposed by one coherent group-state snapshot.
+pub trait GroupMemberships: Send + Sync {
+    /// Return the currently known members for `group_id` when the group is hosted locally.
+    fn members(&self, group_id: &GroupId) -> Option<&GroupMembers>;
 
-impl GroupMemberships {
-    /// Create one empty membership snapshot.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
+    /// Iterate locally hosted groups in an unspecified order.
+    fn groups(&self) -> Box<dyn Iterator<Item = (GroupId, &GroupMembers)> + '_>;
 
-    /// Build one snapshot from the provided full group-to-members mapping.
-    pub fn from_groups(groups: impl IntoIterator<Item = (GroupId, GroupMembers)>) -> Self {
-        Self {
-            groups: groups.into_iter().collect(),
-        }
-    }
-
-    /// Returns `true` when the given group currently exists in the local
-    /// delivery view.
-    #[must_use]
-    pub fn contains_group(&self, group_id: &GroupId) -> bool {
-        self.groups.contains_key(group_id)
-    }
-
-    /// Return the currently known members for the given group when present.
-    #[must_use]
-    pub fn members(&self, group_id: &GroupId) -> Option<&GroupMembers> {
-        self.groups.get(group_id)
-    }
-
-    /// Return the ids of all locally hosted groups in this snapshot.
-    pub fn group_ids(&self) -> impl Iterator<Item = &GroupId> {
-        self.groups.keys()
-    }
-
-    /// Replace the membership set for one group inside this snapshot.
-    pub fn insert(&mut self, group_id: GroupId, members: GroupMembers) -> Option<GroupMembers> {
-        self.groups.insert(group_id, members)
+    /// Return whether `group_id` currently exists in this membership snapshot.
+    fn contains_group(&self, group_id: &GroupId) -> bool {
+        self.members(group_id).is_some()
     }
 }
 
-/// Shared handle to the current local group-membership view.
-///
-/// Each call to [`snapshot`](Self::snapshot) returns the immutable view that was current at that
-/// instant. Later updates may replace the shared view, so callers should treat the returned
-/// snapshot as a short-lived consistency boundary and reload it when they need current membership
-/// information.
-#[derive(Clone, Debug)]
-pub struct SharedGroupMemberships {
-    /// ArcSwap-backed pointer to the current immutable membership snapshot.
-    inner: Arc<ArcSwap<GroupMemberships>>,
-}
-
-impl SharedGroupMemberships {
-    /// Create one new shared snapshot handle around the provided initial view.
-    #[must_use]
-    pub fn new(initial: GroupMemberships) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(initial)),
-        }
-    }
-
-    /// Load the current immutable snapshot.
+/// Shared source of atomically replaceable immutable membership snapshots.
+pub trait SharedGroupMemberships: Send + Sync {
+    /// Load the snapshot current at this instant.
     ///
-    /// The returned snapshot remains valid for as long as the [`Arc`] is held, but it may become
-    /// stale as soon as another task replaces the shared membership view.
-    #[must_use]
-    pub fn snapshot(&self) -> Arc<GroupMemberships> {
-        self.inner.load_full()
-    }
-
-    /// Replace the full shared snapshot atomically.
-    pub fn replace(&self, memberships: GroupMemberships) {
-        self.inner.store(Arc::new(memberships));
-    }
-}
-
-impl Default for SharedGroupMemberships {
-    fn default() -> Self {
-        Self::new(GroupMemberships::new())
-    }
+    /// The returned snapshot remains valid while its [`Arc`] is held, but may become stale as soon
+    /// as the shared source publishes a replacement.
+    fn snapshot(&self) -> Arc<dyn GroupMemberships>;
 }
 
 /// Construction failures for indexed group member sets.
@@ -111,12 +40,11 @@ pub enum GroupMembersError {
 
 /// Indexed members for one replication group.
 ///
-/// The trie remains the authoritative membership representation. The value part
-/// stores the fixed canonical member index from the group's bootstrap order so
-/// delivery and replication can both query membership and producer positions
-/// from one shared snapshot.
-#[derive(Clone, Debug)]
+/// The trie is the authoritative representation. Its values retain the canonical bootstrap
+/// indices so callers can reconstruct that order when they explicitly require it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroupMembers {
+    /// Direct identity lookup whose values form a permutation of `0..member_indices.len()`.
     member_indices: TrieMap<MemberIndex>,
 }
 
@@ -136,24 +64,17 @@ impl GroupMembers {
     ///
     /// See `GroupMembersError` for failure conditions.
     ///
-    /// # Panics
-    ///
-    /// Panics if a member index cannot be represented after the group size was already checked
-    /// against [`u32::MAX`].
     pub fn from_ordered_members(
         ordered_members: impl IntoIterator<Item = MemberIdentity>,
     ) -> Result<Self, GroupMembersError> {
-        let ordered_members: Vec<_> = ordered_members.into_iter().collect();
-        if ordered_members.len() > (u32::MAX as usize) {
-            return TooManyMembersSnafu {
-                member_count: ordered_members.len(),
-            }
-            .fail();
-        }
-
         let mut member_indices = TrieMap::new();
-        for (index, member) in ordered_members.iter().cloned().enumerate() {
-            let index = MemberIndex::try_from(index).expect("checked group size above");
+        for (index, member) in ordered_members.into_iter().enumerate() {
+            let Ok(index) = MemberIndex::try_from(index) else {
+                return TooManyMembersSnafu {
+                    member_count: index + 1,
+                }
+                .fail();
+            };
             if member_indices.insert(member.clone(), index).is_some() {
                 return DuplicateMemberSnafu { member }.fail();
             }
@@ -173,11 +94,6 @@ impl GroupMembers {
         self.member_indices.get(member).copied()
     }
 
-    /// Return the fixed producer index for a member view borrowed from trie traversal.
-    fn member_index_ref(&self, member: IdentifierRef<'_>) -> Option<MemberIndex> {
-        self.member_indices.get(&member).copied()
-    }
-
     /// Return the member assigned to one canonical group index.
     #[must_use]
     pub fn member_at_index(&self, index: MemberIndex) -> Option<MemberIdentity> {
@@ -190,24 +106,40 @@ impl GroupMembers {
         None
     }
 
-    /// Iterate all members currently in this group.
+    /// Iterate all members currently in this group in an unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = MemberIdentity> + '_ {
         self.member_indices.owned_keys()
     }
 
     /// Return the canonical bootstrap order for this group.
+    // Panics here only indicate a broken private `GroupMembers` representation invariant.
+    #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn ordered_members(&self) -> Vec<MemberIdentity> {
-        let mut ordered_members: Vec<_> = self
-            .member_indices
-            .owned_entries()
-            .map(|(member, index)| (*index, member))
-            .collect();
-        ordered_members.sort_by_key(|(index, _)| *index);
+        let num_members = self.member_indices.len();
+        let mut ordered_members = Vec::with_capacity(num_members);
+
+        let raw_storage = &mut ordered_members.spare_capacity_mut()[..num_members];
+        let mut members_added = 0usize;
+        for (member, index) in self.member_indices.owned_entries() {
+            let slot = raw_storage
+                .get_mut(index.as_usize())
+                .expect("Member indices should not exceed number of members");
+            slot.write(member);
+            members_added += 1;
+        }
+
+        assert_eq!(members_added, num_members);
+        // SAFETY: `from_ordered_members` is the only constructor and assigns every unique trie key
+        // exactly one unique index in `0..num_members`. `GroupMembers` exposes no mutation that can
+        // invalidate this permutation, and `owned_entries` visits every trie value exactly once.
+        // The loop therefore initialised every slot in the logical prefix exactly once, while
+        // `Vec::with_capacity(num_members)` guarantees sufficient capacity for that prefix.
+        unsafe {
+            ordered_members.set_len(num_members);
+        }
+
         ordered_members
-            .into_iter()
-            .map(|(_, member)| member)
-            .collect()
     }
 
     /// Return whether this member set is empty.
@@ -223,30 +155,12 @@ impl GroupMembers {
     }
 }
 
-impl PartialEq for GroupMembers {
-    fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-        let mut entries = self.member_indices.entries();
-        while let Some((member, index)) = entries.next() {
-            if other.member_index_ref(member) != Some(*index) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-impl Eq for GroupMembers {}
-
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
 
     use super::*;
     use crate::member::Identifier;
-    use uuid::Uuid;
 
     fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
         Identifier::from_array(segments)
@@ -265,7 +179,11 @@ mod tests {
         assert_eq!(members.member_index(&bob), Some(MemberIndex::new(0)));
         assert_eq!(members.member_index(&alice), Some(MemberIndex::new(1)));
         assert_eq!(members.member_index(&charlie), Some(MemberIndex::new(2)));
-        assert_eq!(members.member_at_index(MemberIndex::new(1)), Some(alice));
+        assert_eq!(
+            members.member_at_index(MemberIndex::new(1)),
+            Some(alice.clone())
+        );
+        assert_eq!(members.ordered_members(), vec![bob, alice, charlie]);
     }
 
     #[test]
@@ -297,21 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn shared_group_memberships_replace_snapshot_atomically() {
+    fn group_members_compare_canonical_member_indices() {
         let alice = member(["alice"]);
         let bob = member(["bob"]);
-        let group_id = GroupId(Uuid::from_u128(7));
-        let snapshot = GroupMemberships::from_groups([(
-            group_id,
-            GroupMembers::from_ordered_members(vec![alice.clone(), bob.clone()])
-                .expect("members should build"),
-        )]);
-        let memberships = SharedGroupMemberships::new(snapshot);
+        let first = GroupMembers::from_ordered_members([alice.clone(), bob.clone()])
+            .expect("first member set should build");
+        let equal = GroupMembers::from_ordered_members([alice.clone(), bob.clone()])
+            .expect("equal member set should build");
+        let reordered = GroupMembers::from_ordered_members([bob, alice])
+            .expect("reordered member set should build");
 
-        let snapshot = memberships.snapshot();
-        let members = snapshot.members(&group_id).expect("group should exist");
-
-        assert_eq!(members.member_index(&alice), Some(MemberIndex::new(0)));
-        assert_eq!(members.member_index(&bob), Some(MemberIndex::new(1)));
+        assert_eq!(first, equal);
+        assert_ne!(first, reordered);
     }
 }

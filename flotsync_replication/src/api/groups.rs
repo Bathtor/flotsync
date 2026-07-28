@@ -237,9 +237,10 @@ pub struct CreateGroupRequest {
     /// The local API trims a present value and rejects it if the result is
     /// empty. Absence creates an unnamed group.
     pub group_name: Option<String>,
-    /// Optional user-facing message stored verbatim, including an empty value.
+    /// Optional user-facing invitation message carried verbatim, including an empty value.
     ///
-    /// Absence creates a group without a message.
+    /// The message is retained only while invitation work is pending and is discarded after
+    /// activation.
     pub message: Option<String>,
     pub members: Vec<MemberIdentity>,
     /// Dataset schemas fixed for the lifetime of the new group.
@@ -268,9 +269,9 @@ pub struct ChangeGroupMembershipRequest {
     pub remove_members: HashSet<MemberIdentity>,
     /// Name handling for the successor group.
     pub group_name: GroupNameUpdate,
-    /// Optional successor message stored verbatim, including an empty value.
+    /// Optional successor invitation/proposal message carried verbatim, including an empty value.
     ///
-    /// Absence creates a successor without a message; messages are not inherited.
+    /// Messages are not inherited and are discarded after activation.
     pub message: Option<String>,
 }
 
@@ -852,6 +853,18 @@ pub trait ReplicationApi: Send + Sync {
     /// Queries through the returned API report [`ApiError::RuntimeUnavailable`] after shutdown.
     fn diagnostics(&self) -> Arc<dyn FlotsyncDiagnostics>;
 
+    /// Return the immutable local group-state snapshot current at this instant.
+    ///
+    /// The returned snapshot remains internally consistent while its [`Arc`] is held, but may
+    /// become stale as soon as the runtime publishes a later group transition. This operation
+    /// performs no store access or peer catch-up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::RuntimeUnavailable`] after shutdown and
+    /// [`ApiError::RuntimeLifecyclePoisoned`] if runtime lifecycle access fails.
+    fn group_state(&self) -> Result<Arc<dyn ReplicationGroupSnapshot>, ApiError>;
+
     /// Shut this runtime down gracefully.
     ///
     /// Shutdown stops the live replication components in dependency order and
@@ -965,7 +978,8 @@ pub trait ReplicationApi: Send + Sync {
     /// that event into their stored [`ReadToken`] before publishing the first
     /// dataset changes for the group.
     /// Locally supplied names are trimmed and rejected if the result is empty;
-    /// messages are stored verbatim and may be empty.
+    /// invitation messages are carried verbatim, may be empty, and are discarded after
+    /// activation.
     ///
     /// The method returns [`ApiError`] when membership validation fails, the
     /// runtime is unavailable, or group storage fails.
@@ -983,7 +997,8 @@ pub trait ReplicationApi: Send + Sync {
     /// source context.
     /// [`GroupNameUpdate`] is resolved locally before those messages are built;
     /// replacement names are trimmed and rejected if empty. The optional
-    /// message is never inherited and is stored verbatim.
+    /// message is never inherited, is carried verbatim while setup is pending, and is discarded
+    /// after activation.
     ///
     /// Receiver-side mediation is governed by [`GroupInvitationPolicy`] and
     /// [`GroupMigrationPolicy`].
@@ -1225,8 +1240,6 @@ pub struct ReplicationGroupRecord {
     pub group_id: GroupId,
     /// Optional application-facing display name; `None` means unnamed.
     pub group_name: Option<String>,
-    /// Optional application-facing message; `None` means no message is stored.
-    pub message: Option<String>,
     /// Canonical exact member-key order for the group.
     pub member_keys: GroupMemberKeys,
     /// Position of the local member within `member_keys`.
@@ -1246,7 +1259,6 @@ impl Default for ReplicationGroupRecord {
         Self {
             group_id: GroupId::NIL,
             group_name: None,
-            message: None,
             member_keys: invalid_default_group_member_keys(),
             local_member_index: MemberIndex::new(u32::MAX),
             group_schema: GroupSchema::default(),
@@ -1264,7 +1276,6 @@ impl ReplicationGroupRecord {
         let material = ReplicationGroupMaterialRecord {
             group_id: self.group_id,
             group_name: self.group_name,
-            message: self.message,
             member_keys: self.member_keys,
             local_member_index: self.local_member_index,
             group_schema: self.group_schema,
@@ -1314,7 +1325,7 @@ impl ReplicationGroupRecord {
 
     /// Return whether another active record has the same group definition.
     ///
-    /// Name/message metadata, active progress, and encrypted security material
+    /// Name metadata, active progress, and encrypted security material
     /// are intentionally not part of the definition comparison.
     #[must_use]
     pub fn matches_definition(&self, other: &Self) -> bool {
@@ -1327,7 +1338,7 @@ impl ReplicationGroupRecord {
     /// Return whether this active group is compatible with stored material
     /// for the same group id.
     ///
-    /// This intentionally ignores name/message metadata and `version_vector`:
+    /// This intentionally ignores name metadata and `version_vector`:
     /// active groups may refresh metadata and may already have applied local
     /// progress beyond the initial bootstrap state. All identity, schema, and
     /// security material must still match exactly.
@@ -1365,8 +1376,6 @@ pub struct ReplicationGroupMaterialRecord {
     pub group_id: GroupId,
     /// Optional application-facing display name; `None` means unnamed.
     pub group_name: Option<String>,
-    /// Optional application-facing message; `None` means no message is stored.
-    pub message: Option<String>,
     /// Canonical exact member-key order for the group.
     pub member_keys: GroupMemberKeys,
     /// Position of the local member within `member_keys`.
@@ -1382,7 +1391,6 @@ impl Default for ReplicationGroupMaterialRecord {
         Self {
             group_id: GroupId::NIL,
             group_name: None,
-            message: None,
             member_keys: invalid_default_group_member_keys(),
             local_member_index: MemberIndex::new(u32::MAX),
             group_schema: GroupSchema::default(),
@@ -1394,7 +1402,7 @@ impl Default for ReplicationGroupMaterialRecord {
 impl ReplicationGroupMaterialRecord {
     /// Return whether this material has the supplied group definition.
     ///
-    /// Name/message metadata and encrypted security material are intentionally
+    /// Name metadata and encrypted security material are intentionally
     /// excluded so callers can reject structural conflicts before performing
     /// metadata refreshes or cryptographic checks.
     #[must_use]
@@ -1428,7 +1436,6 @@ impl ReplicationGroupMaterialRecord {
         ReplicationGroupRecord {
             group_id: self.group_id,
             group_name: self.group_name,
-            message: self.message,
             member_keys: self.member_keys,
             local_member_index: self.local_member_index,
             group_schema: self.group_schema,
@@ -1444,7 +1451,6 @@ impl fmt::Debug for ReplicationGroupMaterialRecord {
         f.debug_struct("ReplicationGroupMaterialRecord")
             .field("group_id", &self.group_id)
             .field("group_name", &self.group_name)
-            .field("message", &self.message)
             .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
             .field("group_schema", &self.group_schema)
@@ -1457,7 +1463,6 @@ impl std::fmt::Debug for ReplicationGroupRecord {
         f.debug_struct("ReplicationGroupRecord")
             .field("group_id", &self.group_id)
             .field("group_name", &self.group_name)
-            .field("message", &self.message)
             .field("member_keys", &self.member_keys)
             .field("local_member_index", &self.local_member_index)
             .field("group_schema", &self.group_schema)

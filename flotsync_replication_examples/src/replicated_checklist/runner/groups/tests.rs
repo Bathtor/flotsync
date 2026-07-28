@@ -17,10 +17,22 @@ use flotsync_replication::{
     RowKey,
     SnapshotRef,
     security::{KnownMemberKeyReport, KnownMemberReport, MemberKeyTrustReport},
-    test_support::snapshot_read_token,
+    test_support::{replication_group_snapshot, snapshot_read_token},
 };
 use indoc::indoc;
 use std::{cell::Cell, sync::Mutex};
+
+fn test_group_state(
+    groups: impl IntoIterator<Item = flotsync_replication::ReplicationGroupRecord>,
+) -> Arc<dyn ReplicationGroupSnapshot> {
+    let groups = groups.into_iter().collect::<Vec<_>>();
+    let local_member = groups
+        .first()
+        .expect("test group state should contain at least one group")
+        .local_member()
+        .clone();
+    replication_group_snapshot(&local_member, groups)
+}
 
 #[test]
 fn creation_request_keeps_creator_first_and_uses_the_checklist_schema() {
@@ -316,16 +328,10 @@ fn listener_queues_group_invitations_without_deciding_them() {
 #[test]
 fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_clear() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (store, runtime, _listener, receivers) =
+    let (_store, runtime, _listener, receivers) =
         load_test_runtime_with_groups(&member, std::iter::empty());
-    let session = ChecklistSession::new([], ChecklistWorkingSet::new());
-    let mut repl = ChecklistRepl::new(
-        test_app_config(member),
-        store,
-        runtime.clone(),
-        receivers,
-        session,
-    );
+    let session = ChecklistSession::new(ChecklistWorkingSet::new());
+    let mut repl = ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
     let mut read_members = || Ok(String::new());
     let confirmation_count = Cell::new(0);
     let mut confirm_creation = |prompt: &str| {
@@ -343,13 +349,15 @@ fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_cle
 
     assert_eq!(confirmation_count.get(), 1);
     assert_eq!(repl.session.default_group, None);
-    assert_eq!(repl.session.groups.len(), 1);
+    let group_state = runtime
+        .group_state()
+        .expect("group state should be available");
+    assert_eq!(group_state.groups().count(), 1);
     assert_eq!(
-        repl.session
-            .groups
-            .values()
+        group_state
+            .groups()
             .next()
-            .and_then(|group| group.group_name.as_deref()),
+            .and_then(|group| group.group_name()),
         Some("shared")
     );
     assert!(repl.session.working_set.read_token().is_ok());
@@ -362,9 +370,8 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
     let member = MemberIdentity::from_array(["alice"]);
     let default_group_id = GroupId::new_random();
     let invited_group_id = GroupId::new_random();
-    let (store, runtime, listener, receivers) =
+    let (_store, runtime, listener, receivers) =
         load_test_runtime_with_groups(&member, [default_group_id, invited_group_id]);
-    let groups = block_on(load_readable_groups(store.as_ref())).expect("test groups should load");
     let mut working_set = ChecklistWorkingSet::new();
     block_on(load_group_snapshot(
         runtime.as_ref(),
@@ -372,11 +379,10 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
         default_group_id,
     ))
     .expect("default group snapshot should load");
-    let mut session = ChecklistSession::new(groups, working_set);
+    let mut session = ChecklistSession::new(working_set);
     session.default_group = Some(default_group_id);
     let mut repl = ChecklistRepl::new(
         test_app_config(member.clone()),
-        store,
         runtime.clone(),
         receivers,
         session,
@@ -444,12 +450,11 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
 #[test]
 fn invitation_reject_handler_reports_user_denied_without_changing_the_default() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (store, runtime, listener, receivers) =
+    let (_store, runtime, listener, receivers) =
         load_test_runtime_with_groups(&member, std::iter::empty());
-    let session = ChecklistSession::new([], ChecklistWorkingSet::new());
+    let session = ChecklistSession::new(ChecklistWorkingSet::new());
     let mut repl = ChecklistRepl::new(
         test_app_config(member.clone()),
-        store,
         runtime.clone(),
         receivers,
         session,
@@ -491,18 +496,22 @@ fn invitation_reject_handler_reports_user_denied_without_changing_the_default() 
 }
 
 #[test]
-fn created_group_is_visible_to_the_store_registry_and_listener() {
+fn created_group_is_visible_to_the_runtime_registry_and_listener() {
     let member = MemberIdentity::from_array(["alice"]);
-    let (store, runtime, _listener, receivers) =
+    let (_store, runtime, _listener, receivers) =
         load_test_runtime_with_groups(&member, std::iter::empty());
     let request = checklist_group_creation_request("shared".to_owned(), member, Vec::new());
 
     let group_id = block_on(runtime.create_group(request)).expect("group should be created");
-    let groups =
-        block_on(load_readable_groups(store.as_ref())).expect("temporary registry should reload");
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].group_id, group_id);
-    assert_eq!(groups[0].group_name.as_deref(), Some("shared"));
+    let groups = runtime
+        .group_state()
+        .expect("group state should be available");
+    assert_eq!(groups.groups().count(), 1);
+    let group = groups
+        .group(&group_id)
+        .expect("created group should be visible");
+    assert_eq!(group.group_id(), group_id);
+    assert_eq!(group.group_name(), Some("shared"));
 
     let listener_batch = receivers
         .batches
@@ -524,26 +533,27 @@ fn group_registry_resolves_uuid_before_exact_names_and_reports_ambiguity() {
     let uuid_named_id = GroupId(Uuid::from_u128(71_002));
     let first_shared_id = GroupId(Uuid::from_u128(71_003));
     let second_shared_id = GroupId(Uuid::from_u128(71_004));
-    let mut session = ChecklistSession::new(
-        [
-            named_test_group(uuid_selected_id, &member, "ordinary"),
-            named_test_group(uuid_named_id, &member, &uuid_selected_id.to_string()),
-            named_test_group(first_shared_id, &member, "shared"),
-            named_test_group(second_shared_id, &member, "shared"),
-        ],
-        ChecklistWorkingSet::new(),
-    );
+    let groups = test_group_state([
+        named_test_group(uuid_selected_id, &member, "ordinary"),
+        named_test_group(uuid_named_id, &member, &uuid_selected_id.to_string()),
+        named_test_group(first_shared_id, &member, "shared"),
+        named_test_group(second_shared_id, &member, "shared"),
+    ]);
+    let mut session = ChecklistSession::new(ChecklistWorkingSet::new());
 
     assert_eq!(
-        session
-            .resolve_group(&uuid_selected_id.to_string())
+        ChecklistSession::resolve_group(groups.as_ref(), &uuid_selected_id.to_string())
             .expect("UUID should resolve")
-            .group_id,
+            .group_id(),
         uuid_selected_id
     );
-    let error = session
-        .resolve_group("shared")
-        .expect_err("duplicate names should be ambiguous");
+    let error = match ChecklistSession::resolve_group(groups.as_ref(), "shared") {
+        Ok(group) => panic!(
+            "duplicate names unexpectedly resolved to {}",
+            group.group_id()
+        ),
+        Err(error) => error,
+    };
     assert!(matches!(
         error,
         ReplicatedChecklistError::AmbiguousGroupName { candidate_ids, .. }
@@ -552,14 +562,14 @@ fn group_registry_resolves_uuid_before_exact_names_and_reports_ambiguity() {
 
     assert_eq!(
         session
-            .set_default("ordinary")
+            .set_default(groups.as_ref(), "ordinary")
             .expect("writable named group should become default"),
         uuid_selected_id
     );
     assert_eq!(session.default_group, Some(uuid_selected_id));
     session.default_group = None;
     assert!(matches!(
-        session.default_group(),
+        session.default_group(groups.as_ref()),
         Err(ReplicatedChecklistError::NoDefaultGroup)
     ));
 }
@@ -573,16 +583,17 @@ fn default_selection_rejects_read_only_groups() {
         successor_group_id: GroupId(Uuid::from_u128(71_006)),
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
-    let mut session = ChecklistSession::new([group], ChecklistWorkingSet::new());
+    let groups = test_group_state([group]);
+    let mut session = ChecklistSession::new(ChecklistWorkingSet::new());
 
     assert!(matches!(
-        session.set_default("archived"),
+        session.set_default(groups.as_ref(), "archived"),
         Err(ReplicatedChecklistError::NonWritableDefaultGroup {
             group_id: actual
         }) if actual == group_id
     ));
     assert!(matches!(
-        session.resolve_target_association("archived"),
+        ChecklistSession::resolve_target_association(groups.as_ref(), "archived"),
         Err(ReplicatedChecklistError::NonWritableTargetGroup {
             group_id: actual
         }) if actual == group_id
@@ -591,6 +602,10 @@ fn default_selection_rejects_read_only_groups() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "The assertions cover the complete item-selector precedence in one scenario."
+)]
 fn item_references_resolve_qualified_and_bare_workspace_identities() {
     let member = MemberIdentity::from_array(["alice"]);
     let shared_group = GroupId(Uuid::from_u128(71_051));
@@ -610,70 +625,81 @@ fn item_references_resolve_qualified_and_bare_workspace_identities() {
     working_set.add_item_with_id(shared_repeated_id, "shared");
     working_set.add_item_with_id(other_repeated_id, "other");
     working_set.add_item_with_id(missing_group_id, "missing registry metadata");
-    let session = ChecklistSession::new(
-        [
-            named_test_group(shared_group, &member, "shared"),
-            named_test_group(other_group, &member, "other"),
-        ],
-        working_set,
-    );
+    let groups = test_group_state([
+        named_test_group(shared_group, &member, "shared"),
+        named_test_group(other_group, &member, "other"),
+    ]);
+    let session = ChecklistSession::new(working_set);
 
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::RowKey(unique_row))
+            .resolve_item(groups.as_ref(), &ItemSelector::RowKey(unique_row))
             .expect("unique bare UUID should resolve"),
         shared_unique_id
     );
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::ListIndex(
-                NonZeroUsize::new(2).expect("two is non-zero"),
-            ))
+            .resolve_item(
+                groups.as_ref(),
+                &ItemSelector::ListIndex(NonZeroUsize::new(2).expect("two is non-zero"),)
+            )
             .expect("list position should resolve"),
         shared_unique_id
     );
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::Qualified {
-                association: ItemAssociationSelector::Local,
-                row_key: repeated_row,
-            })
+            .resolve_item(
+                groups.as_ref(),
+                &ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Local,
+                    row_key: repeated_row,
+                }
+            )
             .expect("local reference should resolve"),
         local_id
     );
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::Qualified {
-                association: ItemAssociationSelector::Group("shared".to_owned()),
-                row_key: repeated_row,
-            })
+            .resolve_item(
+                groups.as_ref(),
+                &ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Group("shared".to_owned()),
+                    row_key: repeated_row,
+                }
+            )
             .expect("unique group name should resolve"),
         shared_repeated_id
     );
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::Qualified {
-                association: ItemAssociationSelector::Group(other_group.to_string()),
-                row_key: repeated_row,
-            })
+            .resolve_item(
+                groups.as_ref(),
+                &ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Group(other_group.to_string()),
+                    row_key: repeated_row,
+                }
+            )
             .expect("group UUID should resolve"),
         other_repeated_id
     );
     assert_eq!(
-        session.item_reference(missing_group_id),
+        ChecklistSession::item_reference(groups.as_ref(), missing_group_id),
         format!("{missing_group}/{missing_row}")
     );
     assert_eq!(
         session
-            .resolve_item(&ItemSelector::Qualified {
-                association: ItemAssociationSelector::Group(missing_group.to_string()),
-                row_key: missing_row,
-            })
+            .resolve_item(
+                groups.as_ref(),
+                &ItemSelector::Qualified {
+                    association: ItemAssociationSelector::Group(missing_group.to_string()),
+                    row_key: missing_row,
+                }
+            )
             .expect("group UUID should resolve without registry metadata"),
         missing_group_id
     );
     assert!(matches!(
-        session.resolve_item(&ItemSelector::RowKey(repeated_row)),
+        session.resolve_item(groups.as_ref(), &ItemSelector::RowKey(repeated_row)),
         Err(ReplicatedChecklistError::AmbiguousItemReference {
             row_key,
             candidates,
@@ -696,16 +722,13 @@ fn canonical_item_references_fall_back_to_group_uuids_for_unsafe_names() {
     let uuid_named_group = GroupId(Uuid::from_u128(71_058));
     let uuid_shaped_name = Uuid::from_u128(71_059).to_string();
     let row_key = RowKey(Uuid::from_u128(72_053));
-    let session = ChecklistSession::new(
-        [
-            named_test_group(whitespace_group, &member, "shared errands"),
-            named_test_group(reserved_group, &member, "local"),
-            named_test_group(duplicate_first, &member, "duplicate"),
-            named_test_group(duplicate_second, &member, "duplicate"),
-            named_test_group(uuid_named_group, &member, &uuid_shaped_name),
-        ],
-        ChecklistWorkingSet::new(),
-    );
+    let groups = test_group_state([
+        named_test_group(whitespace_group, &member, "shared errands"),
+        named_test_group(reserved_group, &member, "local"),
+        named_test_group(duplicate_first, &member, "duplicate"),
+        named_test_group(duplicate_second, &member, "duplicate"),
+        named_test_group(uuid_named_group, &member, &uuid_shaped_name),
+    ]);
 
     for group_id in [
         whitespace_group,
@@ -715,7 +738,10 @@ fn canonical_item_references_fall_back_to_group_uuids_for_unsafe_names() {
         uuid_named_group,
     ] {
         assert_eq!(
-            session.item_reference(ChecklistItemId::group(group_id, row_key)),
+            ChecklistSession::item_reference(
+                groups.as_ref(),
+                ChecklistItemId::group(group_id, row_key),
+            ),
             format!("{group_id}/{row_key}")
         );
     }
@@ -726,10 +752,7 @@ fn listener_group_validation_rejects_rows_outside_the_registry() {
     let member = MemberIdentity::from_array(["alice"]);
     let known_group = GroupId(Uuid::from_u128(71_007));
     let unknown_group = GroupId(Uuid::from_u128(71_008));
-    let session = ChecklistSession::new(
-        [test_group(known_group, &member)],
-        ChecklistWorkingSet::new(),
-    );
+    let groups = test_group_state([test_group(known_group, &member)]);
     let known = RowChange::Delete {
         row_id: RowId {
             group_id: known_group,
@@ -745,18 +768,17 @@ fn listener_group_validation_rejects_rows_outside_the_registry() {
         },
     };
 
-    session
-        .validate_listener_changes(&[known])
+    ChecklistSession::validate_listener_changes(groups.as_ref(), &[known])
         .expect("known group should validate");
     assert!(matches!(
-        session.validate_listener_changes(&[unknown]),
+        ChecklistSession::validate_listener_changes(groups.as_ref(), &[unknown]),
         Err(ReplicatedChecklistError::UnknownListenerGroup { group_id })
             if group_id == unknown_group
     ));
 }
 
 #[test]
-fn registry_refresh_reassigns_a_non_writable_default_to_its_open_successor() {
+fn default_repair_reassigns_a_non_writable_default_to_its_open_successor() {
     let member = MemberIdentity::from_array(["alice"]);
     let previous_group = GroupId(Uuid::from_u128(71_009));
     let intermediate_group = GroupId(Uuid::from_u128(71_010));
@@ -772,37 +794,36 @@ fn registry_refresh_reassigns_a_non_writable_default_to_its_open_successor() {
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
     let open = test_group(open_group, &member);
-    let mut session = ChecklistSession::new([previous.clone()], ChecklistWorkingSet::new());
+    let groups = test_group_state([previous, intermediate, open]);
+    let mut session = ChecklistSession::new(ChecklistWorkingSet::new());
     session.default_group = Some(previous_group);
 
-    let refresh = session.refresh_groups([previous, intermediate, open]);
+    let repair = session.repair_default_group(groups.as_ref());
 
     assert_eq!(
-        refresh,
-        DefaultGroupRefresh::Reassigned {
+        repair,
+        DefaultGroupRepair::Reassigned {
             previous_group_id: previous_group,
             successor_group_id: open_group,
         }
     );
     assert_eq!(session.default_group, Some(open_group));
-    assert!(session.groups.contains_key(&previous_group));
-    assert!(!session.groups.contains_key(&intermediate_group));
-    assert!(session.groups.contains_key(&open_group));
 
-    let mut closed_default_session = ChecklistSession::new([], ChecklistWorkingSet::new());
+    let mut closed_default_session = ChecklistSession::new(ChecklistWorkingSet::new());
     closed_default_session.default_group = Some(intermediate_group);
     let mut closed = test_group(intermediate_group, &member);
     closed.lifecycle = ReplicationGroupLifecycle::Closed {
         successor_group_id: open_group,
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
+    let groups = test_group_state([
+        test_group(previous_group, &member),
+        closed,
+        test_group(open_group, &member),
+    ]);
     assert_eq!(
-        closed_default_session.refresh_groups([
-            test_group(previous_group, &member),
-            closed,
-            test_group(open_group, &member),
-        ]),
-        DefaultGroupRefresh::Reassigned {
+        closed_default_session.repair_default_group(groups.as_ref()),
+        DefaultGroupRepair::Reassigned {
             previous_group_id: intermediate_group,
             successor_group_id: open_group,
         }
@@ -811,7 +832,7 @@ fn registry_refresh_reassigns_a_non_writable_default_to_its_open_successor() {
 }
 
 #[test]
-fn registry_refresh_clears_a_default_without_a_resolvable_open_successor() {
+fn default_repair_clears_a_default_without_a_resolvable_open_successor() {
     let member = MemberIdentity::from_array(["alice"]);
     let first_group = GroupId(Uuid::from_u128(71_012));
     let second_group = GroupId(Uuid::from_u128(71_013));
@@ -825,15 +846,15 @@ fn registry_refresh_clears_a_default_without_a_resolvable_open_successor() {
         successor_group_id: first_group,
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
-    let mut session =
-        ChecklistSession::new([first.clone(), second.clone()], ChecklistWorkingSet::new());
+    let groups = test_group_state([first, second]);
+    let mut session = ChecklistSession::new(ChecklistWorkingSet::new());
     session.default_group = Some(first_group);
 
-    let refresh = session.refresh_groups([first, second]);
+    let repair = session.repair_default_group(groups.as_ref());
 
     assert_eq!(
-        refresh,
-        DefaultGroupRefresh::Cleared {
+        repair,
+        DefaultGroupRepair::Cleared {
             previous_group_id: first_group,
         }
     );
@@ -841,7 +862,7 @@ fn registry_refresh_clears_a_default_without_a_resolvable_open_successor() {
 }
 
 #[test]
-fn registry_refresh_handles_open_missing_and_restart_defaults() {
+fn default_repair_handles_open_missing_and_restart_defaults() {
     let member = MemberIdentity::from_array(["alice"]);
     let open_group = GroupId(Uuid::from_u128(71_014));
     let missing_successor = GroupId(Uuid::from_u128(71_015));
@@ -852,76 +873,49 @@ fn registry_refresh_handles_open_missing_and_restart_defaults() {
         successor_group_id: missing_successor,
         final_versions: VersionVector::initial(NonZeroUsize::MIN),
     };
-    let mut session = ChecklistSession::new([open.clone()], ChecklistWorkingSet::new());
+    let mut session = ChecklistSession::new(ChecklistWorkingSet::new());
     session.default_group = Some(open_group);
 
+    let groups = test_group_state([open.clone(), unavailable.clone()]);
     assert_eq!(
-        session.refresh_groups([open.clone(), unavailable.clone()]),
-        DefaultGroupRefresh::Unchanged
+        session.repair_default_group(groups.as_ref()),
+        DefaultGroupRepair::Unchanged
     );
     assert_eq!(session.default_group, Some(open_group));
 
     session.default_group = Some(unavailable_group);
     assert_eq!(
-        session.refresh_groups([open.clone(), unavailable]),
-        DefaultGroupRefresh::Cleared {
+        session.repair_default_group(groups.as_ref()),
+        DefaultGroupRepair::Cleared {
             previous_group_id: unavailable_group,
         }
     );
     assert_eq!(session.default_group, None);
 
-    let mut restarted = ChecklistSession::new([open.clone()], ChecklistWorkingSet::new());
+    let mut restarted = ChecklistSession::new(ChecklistWorkingSet::new());
     assert_eq!(restarted.default_group, None);
+    let groups = test_group_state([open]);
     assert_eq!(
-        restarted.refresh_groups([open]),
-        DefaultGroupRefresh::Unchanged
+        restarted.repair_default_group(groups.as_ref()),
+        DefaultGroupRepair::Unchanged
     );
     assert_eq!(restarted.default_group, None);
 }
 
 #[test]
-fn readable_group_loader_supports_zero_and_several_groups() {
+fn runtime_group_state_lists_several_groups_without_store_reads() {
     let member = MemberIdentity::from_array(["alice"]);
-    let store = block_on(SqliteReplicationStore::in_memory(member.clone()))
-        .expect("test store should open");
-
-    let empty = block_on(load_readable_groups(&store)).expect("zero-group store should load");
-    assert!(empty.is_empty());
-
     let first_group_id = GroupId(Uuid::from_u128(70_001));
-    block_on(insert_test_group(
-        &store,
-        test_group(first_group_id, &member),
-    ));
     let second_group_id = GroupId(Uuid::from_u128(70_002));
-    block_on(insert_test_group(
-        &store,
-        test_group(second_group_id, &member),
-    ));
-    let closed_group_id = GroupId(Uuid::from_u128(70_003));
-    let mut closed_group = test_group(closed_group_id, &member);
-    closed_group.lifecycle = ReplicationGroupLifecycle::Closed {
-        successor_group_id: GroupId(Uuid::from_u128(70_004)),
-        final_versions: VersionVector::initial(NonZeroUsize::MIN),
-    };
-    block_on(insert_test_group(&store, closed_group));
-
-    let all_groups = block_on(load_group_records(&store)).expect("all groups should load");
-    assert_eq!(
-        all_groups
-            .iter()
-            .map(|group| group.group_id)
-            .collect::<Vec<_>>(),
-        vec![first_group_id, second_group_id, closed_group_id]
-    );
-
-    let loaded =
-        block_on(load_readable_groups(&store)).expect("several readable groups should load");
-    assert_eq!(
-        loaded
-            .into_iter()
-            .map(|group| group.group_id)
-            .collect::<Vec<_>>(),
-        vec![first_group_id, second_group_id]
-    );
+    let (_store, runtime, _listener, _receivers) =
+        load_test_runtime_with_groups(&member, [first_group_id, second_group_id]);
+    let groups = runtime
+        .group_state()
+        .expect("group state should be available");
+    let group_ids = groups
+        .groups()
+        .map(ReplicationGroupView::group_id)
+        .collect::<HashSet<_>>();
+    assert_eq!(group_ids, HashSet::from([first_group_id, second_group_id]));
+    block_on(runtime.shutdown()).expect("test runtime should shut down");
 }

@@ -37,6 +37,7 @@ use crate::{
         StoreError,
         StoreSecretCryptoVersion,
         StoreSecretKeyId,
+        WritableReplicationGroupVersionRecord,
         invalid_default_group_security_material,
     },
     codecs::{
@@ -338,6 +339,13 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
         &mut self,
     ) -> BoxFuture<'_, Result<Vec<ReplicationGroupRecord>, StoreError>> {
         async move { load_replication_groups(self.assert_open_connection()).await }.boxed()
+    }
+
+    fn load_writable_replication_group_versions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>> {
+        async move { load_writable_replication_group_versions(self.assert_open_connection()).await }
+            .boxed()
     }
 
     fn load_replication_groups_for_ids<'a>(
@@ -785,7 +793,6 @@ const SCHEMA_STATEMENTS: &[&str] = &[
 CREATE TABLE IF NOT EXISTS replication_group_material (
     group_id TEXT PRIMARY KEY NOT NULL,
     group_name TEXT,
-    message TEXT,
     member_count INTEGER NOT NULL,
     local_member_index INTEGER NOT NULL,
     group_secret_crypto_version INTEGER NOT NULL,

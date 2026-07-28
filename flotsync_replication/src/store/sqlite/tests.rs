@@ -863,7 +863,6 @@ fn sqlite_store_refreshes_compatible_group_metadata() {
     let group_id = GroupId(Uuid::from_u128(101));
     let mut group = sample_group(group_id);
     group.group_name = Some("first name".to_owned());
-    group.message = Some("first message".to_owned());
 
     wait_for_store_future(async {
         let mut transaction = store
@@ -882,7 +881,6 @@ fn sqlite_store_refreshes_compatible_group_metadata() {
 
     let mut refreshed = group.clone();
     refreshed.group_name = Some("latest name".to_owned());
-    refreshed.message = None;
     let (material, _) = refreshed.clone().into_parts();
     wait_for_store_future(async {
         let mut transaction = store
@@ -913,7 +911,6 @@ fn sqlite_store_refreshes_compatible_group_metadata() {
         stored
     });
     assert_eq!(stored.group_name, refreshed.group_name);
-    assert_eq!(stored.message, refreshed.message);
 }
 
 #[test]
@@ -1178,6 +1175,49 @@ fn sqlite_store_loads_replication_groups_by_requested_ids() {
         vec![first_group_id]
     );
     wait_for_store_future(read_transaction.release()).expect("release should succeed");
+}
+
+#[test]
+fn sqlite_store_loads_only_writable_group_versions_without_ordering() {
+    let store = in_memory_store(local_member());
+    let read_only_group_id = GroupId(Uuid::from_u128(10_011));
+    let writable_group_id = GroupId(Uuid::from_u128(10_012));
+    let successor_group_id = GroupId(Uuid::from_u128(10_013));
+    let read_only_group = sample_group(read_only_group_id);
+    let final_versions = read_only_group.version_vector.clone();
+    let mut writable_group = sample_group(writable_group_id);
+    writable_group.version_vector.increment_at(1);
+    let expected_writable_versions = writable_group.version_vector.clone();
+
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.insert_replication_group(read_only_group))
+        .expect("read-only group should store while open");
+    wait_for_store_future(transaction.insert_replication_group(writable_group))
+        .expect("writable group should store");
+    wait_for_store_future(transaction.update_replication_group_lifecycle(
+        &read_only_group_id,
+        ReplicationGroupLifecycle::ReadOnly {
+            successor_group_id,
+            final_versions,
+        },
+    ))
+    .expect("group should become read-only");
+    wait_for_store_future(transaction.commit()).expect("transaction should commit");
+
+    let mut transaction =
+        wait_for_store_future(store.begin_read_transaction()).expect("transaction should start");
+    let group_versions =
+        wait_for_store_future(transaction.load_writable_replication_group_versions())
+            .expect("writable group versions should load")
+            .into_iter()
+            .map(|record| (record.group_id, record.version_vector))
+            .collect::<HashMap<_, _>>();
+    assert_eq!(
+        group_versions,
+        HashMap::from([(writable_group_id, expected_writable_versions)])
+    );
+    wait_for_store_future(transaction.release()).expect("transaction should release");
 }
 
 #[test]

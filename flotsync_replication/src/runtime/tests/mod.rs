@@ -3,9 +3,11 @@ use super::{
     errors::{
         ChangeGroupMembershipError,
         CreateGroupError,
+        GroupInstallError,
         InboundDeliveryError,
         PublishChangesError,
     },
+    group_state::RuntimeGroupStateSnapshot,
     handle::{
         ReplicationRuntime,
         load_replication_runtime_typed_with_security_for_test,
@@ -86,6 +88,7 @@ use crate::{
         ReplicationGroupLifecycle,
         ReplicationGroupMaterialRecord,
         ReplicationGroupRecord,
+        ReplicationGroupView,
         ReplicationSecuritySecrets,
         ReplicationStore,
         ReplicationStoreReadTransaction,
@@ -108,6 +111,7 @@ use crate::{
         StoreSecretKeyId,
         SummaryRequest,
         TrustPolicy,
+        WritableReplicationGroupVersionRecord,
         current_slice_placeholder_group_security_material,
         current_slice_placeholder_group_security_material_with_key_id,
         process_batches,
@@ -142,7 +146,7 @@ use flotsync_core::{
     MemberIdentity,
     MemberIndex,
     member::{Identifier, TrieMap},
-    membership::{GroupMembers, GroupMemberships},
+    membership::GroupMembers,
     versions::{PureVersionVector, UpdateId, VersionVector},
 };
 use flotsync_data_types::{Field, RowOperations, RowValues, Schema, TableOperations};
@@ -190,11 +194,12 @@ struct RuntimeFixture<S> {
     store: Arc<S>,
 }
 
-/// Test-only store wrapper that can fail one future row-patch write while
+/// Test-only store wrapper that can fail selected future writes while
 /// delegating all stored state to the wrapped `SQLite` store.
 struct FailingStore<S> {
     inner: Arc<S>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
+    fail_next_activate_replication_group: Arc<Mutex<bool>>,
     fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
 }
 
@@ -203,6 +208,7 @@ impl<S> FailingStore<S> {
         Self {
             inner,
             fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
+            fail_next_activate_replication_group: Arc::new(Mutex::new(false)),
             fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
         }
     }
@@ -217,6 +223,13 @@ impl<S> FailingStore<S> {
     fn fail_after_next_pending_group_commit(&self) {
         *self
             .fail_after_next_pending_group_commit
+            .lock()
+            .expect("failing store mutex must not be poisoned") = true;
+    }
+
+    fn fail_next_activate_replication_group(&self) {
+        *self
+            .fail_next_activate_replication_group
             .lock()
             .expect("failing store mutex must not be poisoned") = true;
     }
@@ -242,6 +255,8 @@ where
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
         let inner = self.inner.clone();
         let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
+        let fail_next_activate_replication_group =
+            self.fail_next_activate_replication_group.clone();
         let fail_after_next_pending_group_commit =
             self.fail_after_next_pending_group_commit.clone();
         async move {
@@ -249,6 +264,7 @@ where
             Ok(Box::new(FailingStoreTransaction {
                 inner: Some(inner),
                 fail_next_apply_dataset_row_patch,
+                fail_next_activate_replication_group,
                 fail_after_next_pending_group_commit,
                 wrote_pending_group_work: false,
             }) as Box<dyn ReplicationStoreTransaction>)
@@ -266,6 +282,7 @@ where
 struct FailingStoreTransaction {
     inner: Option<Box<dyn ReplicationStoreTransaction>>,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
+    fail_next_activate_replication_group: Arc<Mutex<bool>>,
     fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
     wrote_pending_group_work: bool,
 }
@@ -288,6 +305,15 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")
             .load_replication_groups()
+    }
+
+    fn load_writable_replication_group_versions(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Vec<WritableReplicationGroupVersionRecord>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_writable_replication_group_versions()
     }
 
     fn load_replication_groups_for_ids<'a>(
@@ -522,6 +548,21 @@ impl ReplicationStoreTransaction for FailingStoreTransaction {
         group_id: GroupId,
         version_vector: VersionVector,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
+        let should_fail = {
+            let mut failure = self
+                .fail_next_activate_replication_group
+                .lock()
+                .expect("failing store mutex must not be poisoned");
+            std::mem::take(&mut *failure)
+        };
+        if should_fail {
+            return async move {
+                let source =
+                    std::io::Error::other("failing store intentionally rejected group activation");
+                Err::<(), _>(source).boxed().context(StoreExternalSnafu)
+            }
+            .boxed();
+        }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated writes")

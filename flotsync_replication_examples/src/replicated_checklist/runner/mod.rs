@@ -38,7 +38,7 @@ use flotsync_replication::{
     ReplicationConfig,
     ReplicationEvent,
     ReplicationEventListener,
-    ReplicationGroupRecord,
+    ReplicationGroupView,
     ReplicationSecuritySecrets,
     ReplicationStore,
     RowChange,

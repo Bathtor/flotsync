@@ -1,12 +1,12 @@
 //! Stable checklist presentation for peer-route diagnostics.
 
-use flotsync_core::{GroupId, MemberIdentity};
+use flotsync_core::MemberIdentity;
 use flotsync_replication::{
     ConfiguredRouteMembers,
-    ReplicationGroupRecord,
+    ReplicationGroupSnapshot,
     RouteEstablishmentDiagnostics,
 };
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 /// Checklist-specific diagnostic report with stable ordering and group annotations.
 pub(super) struct ChecklistPeerDiagnostics<'a> {
@@ -15,14 +15,14 @@ pub(super) struct ChecklistPeerDiagnostics<'a> {
     /// Distinct identified members in stable order for group annotations.
     identified_members: Vec<MemberIdentity>,
     /// Application-readable group registry used for membership counts.
-    groups: &'a HashMap<GroupId, ReplicationGroupRecord>,
+    groups: &'a dyn ReplicationGroupSnapshot,
 }
 
 impl<'a> ChecklistPeerDiagnostics<'a> {
     /// Build one stable checklist presentation from an owned diagnostic snapshot.
     pub(super) fn new(
         mut snapshot: RouteEstablishmentDiagnostics,
-        groups: &'a HashMap<GroupId, ReplicationGroupRecord>,
+        groups: &'a dyn ReplicationGroupSnapshot,
     ) -> Self {
         sort_snapshot_for_presentation(&mut snapshot);
         let mut identified_members = snapshot
@@ -75,13 +75,10 @@ fn sort_snapshot_for_presentation(snapshot: &mut RouteEstablishmentDiagnostics) 
 }
 
 /// Count currently readable groups containing `member`.
-fn shared_group_count(
-    groups: &HashMap<GroupId, ReplicationGroupRecord>,
-    member: &MemberIdentity,
-) -> usize {
+fn shared_group_count(groups: &dyn ReplicationGroupSnapshot, member: &MemberIdentity) -> usize {
     groups
-        .values()
-        .filter(|group| group.member_ids().any(|candidate| candidate == member))
+        .readable_groups()
+        .filter(|group| group.members().any(|candidate| candidate == *member))
         .count()
 }
 
