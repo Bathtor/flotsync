@@ -10,7 +10,6 @@ pub(super) async fn load_replication_group_material(
         "
 SELECT
     group_name,
-    message,
     member_count,
     local_member_index,
     group_secret_crypto_version,
@@ -47,7 +46,6 @@ WHERE group_id = ?1
     Ok(Some(ReplicationGroupMaterialRecord {
         group_id: *group_id,
         group_name: row.get("group_name"),
-        message: row.get("message"),
         member_keys,
         local_member_index,
         group_schema,
@@ -107,6 +105,48 @@ ORDER BY group_id
         }
     }
     Ok(groups)
+}
+
+pub(super) async fn load_writable_replication_group_versions(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Vec<WritableReplicationGroupVersionRecord>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT
+    active.group_id,
+    active.version_vector,
+    active.successor_group_id,
+    active.final_versions,
+    material.member_count
+FROM replication_groups AS active
+JOIN replication_group_material AS material USING (group_id)
+WHERE active.lifecycle = ?1
+",
+    )
+    .bind(GROUP_LIFECYCLE_OPEN_SQL)
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+
+    let mut group_versions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let successor_group_id = row.get::<Option<String>, _>("successor_group_id");
+        let final_versions = row.get::<Option<Vec<u8>>, _>("final_versions");
+        validate_open_group_lifecycle_fields(
+            successor_group_id.as_deref(),
+            final_versions.as_deref(),
+        )
+        .map_err(|source| invalid_stored_object("replication group lifecycle", source))?;
+        let group_id = decode_group_id(&row.get::<String, _>("group_id"))?;
+        let member_count = decode_non_zero_member_count(row.get::<i64, _>("member_count"))?;
+        let version_vector =
+            decode_stored_version_vector(&row.get::<Vec<u8>, _>("version_vector"), member_count)?;
+        group_versions.push(WritableReplicationGroupVersionRecord {
+            group_id,
+            version_vector,
+        });
+    }
+    Ok(group_versions)
 }
 
 pub(super) async fn load_replication_groups_for_ids(
@@ -223,7 +263,6 @@ pub(super) async fn insert_replication_group(
     let material = ReplicationGroupMaterialRecord {
         group_id: group.group_id,
         group_name: group.group_name.clone(),
-        message: group.message.clone(),
         member_keys: group.member_keys.clone(),
         local_member_index: group.local_member_index,
         group_schema: group.group_schema.clone(),
@@ -259,7 +298,7 @@ pub(super) async fn ensure_replication_group_material(
                 group_id: material.group_id
             }
         );
-        if existing.group_name != material.group_name || existing.message != material.message {
+        if existing.group_name != material.group_name {
             update_replication_group_metadata(connection, material).await?;
         }
         return Ok(());
@@ -272,7 +311,6 @@ pub(super) async fn ensure_replication_group_material(
 INSERT INTO replication_group_material (
     group_id,
     group_name,
-    message,
     member_count,
     local_member_index,
     group_secret_crypto_version,
@@ -280,12 +318,11 @@ INSERT INTO replication_group_material (
     group_secret_nonce,
     group_secret_ciphertext
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
 ",
     )
     .bind(material.group_id.to_string())
     .bind(&material.group_name)
-    .bind(&material.message)
     .bind(stored_member_count)
     .bind(i64::from(material.local_member_index.as_u32()))
     .bind(i64::from(
@@ -547,13 +584,12 @@ async fn update_replication_group_metadata(
     sqlx::query(
         "
 UPDATE replication_group_material
-SET group_name = ?2, message = ?3
+SET group_name = ?2
 WHERE group_id = ?1
 ",
     )
     .bind(material.group_id.to_string())
     .bind(&material.group_name)
-    .bind(&material.message)
     .execute(&mut *connection)
     .await
     .context(SqlxSnafu)?;

@@ -89,7 +89,7 @@ fn manual_route_watch_without_expected_member_publishes_verified_group_member() 
 fn manual_route_watch_publishes_permitted_member_with_unknown_group_context() {
     let local_member = member(["alice"]);
     let remote_member = member(["bob"]);
-    let memberships = SharedGroupMemberships::new(GroupMemberships::default());
+    let memberships = TestGroupMemberships::default().shared();
     let local_endpoint = SocketAddr::from(([127, 0, 0, 1], 49_124));
     let remote_route = SocketAddr::from(([127, 0, 0, 1], 62_185));
     let remote_instance = Uuid::from_u128(85);

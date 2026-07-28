@@ -1508,7 +1508,6 @@ name = "flotsync_core"
 version = "0.1.0"
 dependencies = [
  "ahash 0.8.12",
- "arc-swap",
  "base64",
  "flotsync_utils",
  "itertools 0.14.0",
@@ -1661,6 +1660,7 @@ dependencies = [
  "kompact",
  "log",
  "roaring",
+ "sealed",
  "smallvec",
  "snafu",
  "sqlx",
@@ -3618,6 +3618,17 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "sealed"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b68e2ea526d9fb32f23ca8894fb5da9e743f34c2f41701f0501dc8a25c4b343"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.0",
+]
 
 [[package]]
 name = "security-framework"

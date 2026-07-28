@@ -1,0 +1,84 @@
+id = "019fa45d-3250-71f0-ab69-7e4d4a74a8d8"
+ref = "flotsync-r9z"
+title = "Add authoritative runtime group-state APIs"
+body = """
+Objective
+
+C01. Implement the authoritative runtime group-state snapshot, restricted component and application APIs, and all runtime/storage transitions agreed in parent flotsync-bym.
+
+Storage and state model
+
+C02. Remove message from ReplicationGroupRecord, ReplicationGroupMaterialRecord, and the initial SQLite active-group schema. Retain messages only in pending decision, activation, and protocol records until activation.
+
+C03. Introduce private RuntimeGroupStateSnapshot and entry types independent of storage records. Project active records into canonical membership, name, schema, and lifecycle only; include Closed groups and exclude pending or inactive material. Complete projection rejects duplicate group ids with a structured GroupInstallError.
+
+C04. Keep one Arc<SharedGroupState> owning ArcSwap<RuntimeGroupStateSnapshot>. Do not maintain another membership map.
+
+C05. Validate storage records through a borrowed LoadedGroupMeta projection so complete records are not cloned merely to build runtime state.
+
+C06. Restore GroupMembers to one TrieMap<MemberIndex> representation. Reconstruct canonical member order on demand in linear time by initialising only the logical spare-capacity prefix. Document the private permutation invariant and give an explicit safety proof before exposing the initialised Vec length; suppress the public panic-documentation lint because failures indicate an internal invariant violation. Implement PartialEq and Eq generically on TrieMap<V> with value equality bounds and let GroupMembers equality use the trie directly.
+
+Restricted APIs
+
+C07. Replace concrete GroupMemberships and SharedGroupMemberships with the agreed object-safe traits, including borrowed membership lookup and unordered boxed group iteration.
+
+C08. Add sealed ReplicationGroupView and ReplicationGroupSnapshot application traits using the sealed crate. Add group-level is_readable and is_writable default methods plus a readable_groups default iterator and a direct production override without ordering guarantees.
+
+C09. Add ReplicationApi::group_state() with documented snapshot-freshness and shutdown behaviour.
+
+Authoritative progress API
+
+C10. Add WritableReplicationGroupVersionRecord with group_id and version_vector, plus ReplicationStoreReadTransaction::load_writable_replication_group_versions returning an unordered vector.
+
+C11. Implement the SQLite query as one authoritative active-state query filtered to Open groups. Load only group id, version vector, member count needed for decoding, and lifecycle auxiliary columns needed to reject malformed Open rows. Do not load complete group material.
+
+C12. Use a direct operation-local application snapshot lookup for snapshot-row group existence and lifecycle. Build snapshot and inbound listener read tokens from the narrow store query without filtering authoritative store state through runtime group ids.
+
+Consumer and transition integration
+
+C13. Rewire routing, delivery, codecs, summary, catch-up, runtime logic, host topology, fixtures, and tests to consume Arc<dyn SharedGroupMemberships>. Consume member sets directly from group iterators rather than repeating lookups.
+
+C14. Before each registry-changing commit, construct and validate the full next runtime snapshot from resulting active records. After commit, replace the ArcSwap value once.
+
+C15. Cover startup, creation, invitation activation, migration ReadOnly acceptance, old-Closed plus new-Open activation, replay, active replay metadata refresh, and test installation through the same replacement path. Auto-accepted migration acceptance must publish ReadOnly even if subsequent activation fails.
+
+Testing support
+
+C16. Replace TestReplicationGroupSnapshot with a test-support factory that invokes the actual RuntimeGroupStateSnapshot::from_records projection and returns Arc<dyn ReplicationGroupSnapshot>. Retain the smaller membership-only fake for isolated consumers that do not construct complete records.
+
+Validation and conformance
+
+C17. Cover restricted views, readable/writable conveniences, retained-old-snapshot stability, projection fields and exclusions, duplicate-id rejection, trie equality, canonical member reconstruction and its index-permutation invariant, authoritative writable-version loading, snapshot and inbound read tokens, active invitation and migration replay name refreshes, observable ReadOnly state after failed auto-accepted activation, component consumers, all transition paths, production-backed test snapshots, and RuntimeUnavailable after shutdown.
+
+C18. Correct stale storage compatibility and runtime component ownership documentation. Keep the unused DeliveryInterestConfig Default implementation removed.
+
+Estimate
+
+C19. Approximately 1,500-2,350 touched LOC across the complete child, including all three review rounds."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+parent = "019f8ffb-e40e-7c62-b6da-37833e90b02b"
+created_at = "2026-07-27T16:16:38.992744Z"
+updated_at = "2026-07-28T17:13:40.345815Z"
+closed_at = "2026-07-28T17:13:40.345815Z"
+
+[[comments]]
+id = "019fa4b8-66b8-7191-89f3-c8045b00bd85"
+author = "codex"
+body = "Code review agreed: publish auto-accepted ReadOnly and active replay metadata states, reject duplicate projected ids, avoid complete-record clones, reuse iterator-provided memberships, and correct stale contracts. DeliveryInterestConfig Default remains removed."
+created_at = "2026-07-27T17:56:16.184312Z"
+
+[[comments]]
+id = "019fa9b4-63a8-7542-b7cf-41af0779b8a6"
+author = "lkroll"
+body = "Third review direction agreed: constrain unsafe canonical reconstruction to the logical spare-capacity prefix, document the private index-permutation proof explicitly, and suppress missing_panics_doc locally because the guarded panic can only signal an internal invariant violation."
+created_at = "2026-07-28T17:09:59.336376Z"
+
+[[comments]]
+id = "019fa9b7-c2f9-7481-b33f-d3a2bb0c8de0"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-28T17:13:40.345815Z"

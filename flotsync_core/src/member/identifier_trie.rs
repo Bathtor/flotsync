@@ -474,6 +474,23 @@ mod tests {
     }
 
     #[test]
+    fn test_equality_compares_keys_and_values_independent_of_insertion_order() {
+        let a = id(["a"]);
+        let ab = id(["a", "b"]);
+        let mut first = TrieMap::new();
+        first.insert(a.clone(), 1);
+        first.insert(ab.clone(), 2);
+        let mut equal = TrieMap::new();
+        equal.insert(ab.clone(), 2);
+        equal.insert(a.clone(), 1);
+        let mut different_value = equal.clone();
+        different_value.insert(ab, 3);
+
+        assert_eq!(first, equal);
+        assert_ne!(first, different_value);
+    }
+
+    #[test]
     fn test_entries_and_owned_iterators() {
         let mut trie_map = TrieMap::new();
         let mut trie_set = TrieSet::new();

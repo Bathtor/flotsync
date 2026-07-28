@@ -4,12 +4,9 @@ use super::*;
 use crate::{
     SqliteReplicationStore,
     delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-    test_support::{load_test_delivery_security, provision_test_security},
+    test_support::{TestGroupMemberships, load_test_delivery_security, provision_test_security},
 };
-use flotsync_core::{
-    GroupId,
-    membership::{GroupMemberships, SharedGroupMemberships},
-};
+use flotsync_core::GroupId;
 use flotsync_io::{
     prelude::UdpLocalBind,
     test_support::{
@@ -131,7 +128,7 @@ impl FullStackHarness {
             Arc::new([local_member].into_iter().collect());
         let ingress = core.system().create(move || {
             DeliveryIngressComponent::new(DeliveryInterestConfig {
-                group_memberships: SharedGroupMemberships::new(GroupMemberships::new()),
+                group_memberships: TestGroupMemberships::default().shared(),
                 local_members,
                 hosted_mailboxes: Arc::new(HashSet::new()),
             })

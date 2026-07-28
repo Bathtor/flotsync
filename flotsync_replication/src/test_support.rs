@@ -21,6 +21,8 @@ use crate::{
         ReplicationConfig,
         ReplicationEvent,
         ReplicationEventListener,
+        ReplicationGroupRecord,
+        ReplicationGroupSnapshot,
         ReplicationSecuritySecrets,
         ReplicationStore,
         RowChange,
@@ -35,13 +37,18 @@ use crate::{
         process_batches,
     },
     delivery::security::DeliverySecurity,
-    runtime::handle::{
-        ReplicationRuntime,
-        load_replication_runtime_typed_with_security_for_test,
-        load_replication_runtime_with_runtime_config_toml,
+    runtime::{
+        application_snapshot_from_records,
+        handle::{
+            ReplicationRuntime,
+            load_replication_runtime_typed_with_security_for_test,
+            load_replication_runtime_with_runtime_config_toml,
+        },
     },
     security_store::SecurityStore,
 };
+#[cfg(test)]
+use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
 use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
 use flotsync_data_types::{Field, RowOperations, Schema};
 use flotsync_security::{
@@ -69,6 +76,74 @@ use std::{
 const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Project complete active-group records through the production runtime snapshot implementation.
+///
+/// # Panics
+///
+/// Panics if production runtime projection rejects an invalid record or duplicate group id.
+#[must_use]
+pub fn replication_group_snapshot(
+    local_member: &MemberIdentity,
+    records: impl IntoIterator<Item = ReplicationGroupRecord>,
+) -> Arc<dyn ReplicationGroupSnapshot> {
+    application_snapshot_from_records(local_member, records)
+        .expect("test group records should pass production runtime projection")
+}
+
+/// Fixed membership snapshot used by delivery, codec, and runtime unit tests.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TestGroupMemberships {
+    /// Fixed member sets keyed by group identifier.
+    groups: HashMap<GroupId, GroupMembers>,
+}
+
+#[cfg(test)]
+impl TestGroupMemberships {
+    /// Build one fixed snapshot from complete group membership entries.
+    pub(crate) fn from_groups(groups: impl IntoIterator<Item = (GroupId, GroupMembers)>) -> Self {
+        Self {
+            groups: groups.into_iter().collect(),
+        }
+    }
+
+    /// Wrap this fixed snapshot in the shared component-facing interface.
+    pub(crate) fn shared(self) -> Arc<dyn SharedGroupMemberships> {
+        Arc::new(TestSharedGroupMemberships {
+            snapshot: Arc::new(self),
+        })
+    }
+}
+
+#[cfg(test)]
+impl GroupMemberships for TestGroupMemberships {
+    fn members(&self, group_id: &GroupId) -> Option<&GroupMembers> {
+        self.groups.get(group_id)
+    }
+
+    fn groups(&self) -> Box<dyn Iterator<Item = (GroupId, &GroupMembers)> + '_> {
+        Box::new(
+            self.groups
+                .iter()
+                .map(|(group_id, members)| (*group_id, members)),
+        )
+    }
+}
+
+/// Shared source retaining one fixed test membership snapshot.
+#[cfg(test)]
+struct TestSharedGroupMemberships {
+    /// Fixed snapshot returned by every load.
+    snapshot: Arc<TestGroupMemberships>,
+}
+
+#[cfg(test)]
+impl SharedGroupMemberships for TestSharedGroupMemberships {
+    fn snapshot(&self) -> Arc<dyn GroupMemberships> {
+        self.snapshot.clone()
+    }
+}
 
 /// Dataset id used by the common title-schema fixtures.
 ///

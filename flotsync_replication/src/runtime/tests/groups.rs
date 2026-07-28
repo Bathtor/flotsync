@@ -3,6 +3,28 @@
 use super::*;
 
 #[test]
+fn runtime_group_state_projection_rejects_duplicate_group_ids() {
+    let local_member = alice_member();
+    let group_id = GroupId(Uuid::from_u128(30));
+    let record = inactive_group_record(
+        group_id,
+        vec![local_member.clone(), bob_member()],
+        GroupSchema::default(),
+    );
+
+    let result = RuntimeGroupStateSnapshot::from_records(&local_member, [record.clone(), record]);
+    let Err(error) = result else {
+        panic!("duplicate group identifiers should be rejected");
+    };
+    assert!(matches!(
+        error,
+        GroupInstallError::DuplicateStoredGroup {
+            group_id: duplicate_group_id,
+        } if duplicate_group_id == group_id
+    ));
+}
+
+#[test]
 fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let alice_member = alice_member();
     let dataset_id = docs_dataset_id();
@@ -33,6 +55,22 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
     let row_id = test_row_id(group_id, dataset_id, 32);
 
     wait_for_group_install(&runtime, group_id);
+    let group_state = runtime
+        .group_state()
+        .expect("startup group state should be available");
+    let hydrated_group = group_state
+        .group(&group_id)
+        .expect("persisted group should be published at startup");
+    assert_eq!(hydrated_group.group_id(), group_id);
+    assert_eq!(hydrated_group.group_schema(), &docs_group_schema());
+    assert_eq!(hydrated_group.lifecycle(), &ReplicationGroupLifecycle::Open);
+    assert!(hydrated_group.is_readable());
+    assert!(hydrated_group.is_writable());
+    assert_eq!(group_state.readable_groups().count(), 1);
+    assert_eq!(
+        hydrated_group.members().collect::<HashSet<_>>(),
+        HashSet::from([alice_member.clone(), bob_member()])
+    );
     let read_token = snapshot_read_token(runtime.as_ref(), group_id, docs_dataset_id());
     publish_changes(
         runtime.as_ref(),
@@ -44,6 +82,52 @@ fn runtime_startup_hydrates_persisted_group_memberships_from_store() {
             },
         }],
     );
+}
+
+#[test]
+fn group_state_retains_one_coherent_view_across_publications() {
+    let alice_member = alice_member();
+    let group_schema = docs_group_schema();
+    let store = sqlite_store_with_schemas(
+        alice_member.clone(),
+        [(docs_dataset_id(), title_schema_static())],
+    );
+    let runtime = load_runtime_with_parts(app_alice_id(), store, Arc::new(ListenerStub::default()));
+    let before_creation = runtime
+        .group_state()
+        .expect("initial group state should be available");
+
+    let group_id = wait_for_test_reply(runtime.create_group(CreateGroupRequest {
+        group_name: Some("project notes".to_owned()),
+        message: Some("discard after activation".to_owned()),
+        members: vec![alice_member.clone()],
+        group_schema: group_schema.clone(),
+    }))
+    .expect("group creation should succeed");
+
+    let after_creation = runtime
+        .group_state()
+        .expect("updated group state should be available");
+    assert!(before_creation.group(&group_id).is_none());
+    assert_eq!(before_creation.groups().count(), 0);
+    let created_group = after_creation
+        .group(&group_id)
+        .expect("created group should be published");
+    assert_eq!(created_group.group_id(), group_id);
+    assert_eq!(created_group.group_name(), Some("project notes"));
+    assert_eq!(created_group.group_schema(), &group_schema);
+    assert_eq!(created_group.lifecycle(), &ReplicationGroupLifecycle::Open);
+    assert_eq!(
+        created_group.members().collect::<Vec<_>>(),
+        vec![alice_member]
+    );
+    assert_eq!(after_creation.groups().count(), 1);
+
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
+    assert!(matches!(
+        runtime.group_state(),
+        Err(ApiError::RuntimeUnavailable)
+    ));
 }
 
 #[test]
@@ -71,7 +155,6 @@ fn create_group_persists_membership_across_runtime_restart() {
     assert!(creation_tokens[0].group_version(&group_id).is_some());
     let created = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(created.group_name.as_deref(), Some("shared docs"));
-    assert_eq!(created.message.as_deref(), Some(""));
     drop(runtime);
 
     let restarted_listener = Arc::new(ListenerStub::default());
@@ -82,7 +165,6 @@ fn create_group_persists_membership_across_runtime_restart() {
     wait_for_group_install(&restarted_runtime, group_id);
     let restarted = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(restarted.group_name.as_deref(), Some("shared docs"));
-    assert_eq!(restarted.message.as_deref(), Some(""));
     let read_token = snapshot_read_token(restarted_runtime.as_ref(), group_id, docs_dataset_id());
     publish_changes(
         restarted_runtime.as_ref(),
@@ -273,6 +355,40 @@ fn runtime_groups_competing_migration_proposals_and_activates_only_the_selected_
         load_persisted_group(store.as_ref(), selected_group_id).lifecycle,
         ReplicationGroupLifecycle::Open
     );
+    let group_state = runtime
+        .group_state()
+        .expect("activated group state should be available");
+    assert!(matches!(
+        group_state
+            .group(&old_group_id)
+            .expect("source group should remain visible")
+            .lifecycle(),
+        ReplicationGroupLifecycle::Closed {
+            successor_group_id,
+            ..
+        } if *successor_group_id == selected_group_id
+    ));
+    assert!(
+        !group_state
+            .group(&old_group_id)
+            .expect("source group should remain visible")
+            .is_readable()
+    );
+    assert_eq!(
+        group_state
+            .group(&selected_group_id)
+            .expect("selected target should be visible")
+            .lifecycle(),
+        &ReplicationGroupLifecycle::Open
+    );
+    assert_eq!(
+        group_state
+            .readable_groups()
+            .map(ReplicationGroupView::group_id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([selected_group_id])
+    );
+    assert!(group_state.group(&competing_group_id).is_none());
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
@@ -353,6 +469,72 @@ fn auto_accept_commit_failure_restarts_from_activation_instead_of_listener_decis
     assert!(load_pending_group_activations(bob_sqlite_store.as_ref()).is_empty());
     wait_for_test_reply(restarted_runtime.shutdown()).expect("restarted runtime should shut down");
     wait_for_test_reply(alice_runtime.shutdown()).expect("alice runtime should shut down");
+}
+
+#[test]
+fn failed_auto_accepted_migration_activation_keeps_published_source_read_only() {
+    let alice_member = alice_member();
+    let bob_member = bob_member();
+    let old_group_id = GroupId(Uuid::from_u128(60_123));
+    let new_group_id = GroupId(Uuid::from_u128(60_124));
+    let members =
+        GroupMembers::from_ordered_members(vec![alice_member.clone(), bob_member.clone()])
+            .expect("group members should build");
+    let group_setup = prepare_group_setup_for_members(new_group_id, &alice_member, &members);
+    let sqlite_store = sqlite_store(bob_member.clone());
+    provision_test_security(sqlite_store.as_ref(), &bob_member, [alice_member.clone()]);
+    let store = Arc::new(FailingStore::new(sqlite_store.clone()));
+    let runtime = load_runtime_with_parts(
+        app_bob_id(),
+        store.clone(),
+        Arc::new(ListenerStub::default()),
+    );
+    runtime
+        .install_group_for_test(old_group_id, members.clone())
+        .expect("source group should install");
+    let final_versions = load_persisted_group(sqlite_store.as_ref(), old_group_id).version_vector;
+    let proposal = MigrationProposal {
+        migration_id: MigrationId {
+            old_group_id,
+            new_group_id,
+        },
+        final_versions: final_versions.clone(),
+        proposed_members: members.ordered_members(),
+        group_schema: GroupSchema::default(),
+        initial_snapshot: InitialSnapshot::Empty,
+        group_name: Some("replacement".to_owned()),
+        message: None,
+    };
+    store.fail_next_activate_replication_group();
+
+    runtime
+        .apply_pending_group_for_test(
+            alice_member,
+            PendingGroupDecisionRecord::MigrationProposal(proposal),
+            group_setup,
+        )
+        .expect_err("target activation should fail after acceptance commits");
+
+    let expected_lifecycle = ReplicationGroupLifecycle::ReadOnly {
+        successor_group_id: new_group_id,
+        final_versions,
+    };
+    assert_eq!(
+        load_persisted_group(sqlite_store.as_ref(), old_group_id).lifecycle,
+        expected_lifecycle
+    );
+    let group_state = runtime
+        .group_state()
+        .expect("accepted source lifecycle should remain available");
+    assert_eq!(
+        group_state
+            .group(&old_group_id)
+            .expect("source group should remain published")
+            .lifecycle(),
+        &expected_lifecycle
+    );
+    assert!(group_state.group(&new_group_id).is_none());
+    wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
 #[test]
@@ -583,7 +765,6 @@ fn runtime_accepts_replayed_invitation_with_stored_group_material() {
     let members = vec![alice_member.clone(), bob_member.clone()];
     let mut inactive_group = inactive_group_record(group_id, members.clone(), docs_group_schema());
     inactive_group.group_name = Some("stored name".to_owned());
-    inactive_group.message = Some("stored message".to_owned());
     store_inactive_group_material(store.as_ref(), inactive_group);
     store_pending_group_decision(
         store.as_ref(),
@@ -640,7 +821,6 @@ fn runtime_accepts_replayed_invitation_with_stored_group_material() {
     let stored = load_persisted_group(store.as_ref(), group_id);
     assert_eq!(stored.group_id, group_id);
     assert_eq!(stored.group_name.as_deref(), Some(""));
-    assert_eq!(stored.message.as_deref(), Some(""));
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
@@ -727,7 +907,16 @@ fn active_group_invitation_replay_refreshes_metadata_without_reopening_decision(
     assert!(listener.take_pending_group_events().is_empty());
     let stored = load_persisted_group(bob_store.as_ref(), group_id);
     assert_eq!(stored.group_name.as_deref(), Some(""));
-    assert_eq!(stored.message, None);
+    let group_state = runtime
+        .group_state()
+        .expect("active replay state should be available");
+    assert_eq!(
+        group_state
+            .group(&group_id)
+            .expect("active group should remain published")
+            .group_name(),
+        Some("")
+    );
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }
 
@@ -777,7 +966,6 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
         expected_new_group.group_name.as_deref(),
         Some("first migration")
     );
-    assert_eq!(expected_new_group.message.as_deref(), Some("first message"));
 
     let mut replay = proposal;
     replay.initial_snapshot = InitialSnapshot::Inline(InitialGroupValueRows {
@@ -794,7 +982,6 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
         .expect("active migration replay should ignore the consumed snapshot");
 
     expected_new_group.group_name = Some("replayed migration".to_owned());
-    expected_new_group.message = None;
     assert!(listener.take_pending_group_events().is_empty());
     assert_eq!(
         load_persisted_group(bob_store.as_ref(), old_group_id),
@@ -803,6 +990,16 @@ fn active_migration_replay_refreshes_metadata_and_ignores_consumed_snapshot() {
     assert_eq!(
         load_persisted_group(bob_store.as_ref(), new_group_id),
         expected_new_group
+    );
+    let group_state = runtime
+        .group_state()
+        .expect("active migration replay state should be available");
+    assert_eq!(
+        group_state
+            .group(&new_group_id)
+            .expect("active target should remain published")
+            .group_name(),
+        Some("replayed migration")
     );
     wait_for_test_reply(runtime.shutdown()).expect("runtime should shut down");
 }

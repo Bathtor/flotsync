@@ -13,7 +13,6 @@ use super::{
         ConflictingExistingGroupSnafu,
         CreateGroupError,
         CreatorNotInMembersSnafu,
-        DuplicateGroupSnafu,
         EmptyGroupNameSnafu,
         GroupActivationError,
         GroupInstallError,
@@ -41,6 +40,7 @@ use super::{
         snapshot,
         summary,
     },
+    group_state::{RuntimeGroupStateSnapshot, SharedGroupState},
     in_memory::{
         LoadedGroupMeta,
         PendingUpdateSet,
@@ -117,6 +117,7 @@ use crate::{
         StoreError,
         Summary,
         SummaryRequest,
+        WritableReplicationGroupVersionRecord,
         providers::VecRowProvider,
         security::{
             AssessPublicKeyBundleRequest,
@@ -163,7 +164,7 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     MemberIndex,
-    membership::{GroupMembers, GroupMemberships, SharedGroupMemberships},
+    membership::{GroupMembers, SharedGroupMemberships},
     versions::{UpdateId, VersionVector},
 };
 use flotsync_messages::proto::{DecodeProtoViewWith, EncodeProto};
@@ -407,8 +408,9 @@ impl ReplicationRuntimeMessage {
 /// Stateful Kompact component that hosts one replication runtime.
 ///
 /// Durable replication state now lives entirely in `ReplicationStore`. This
-/// component only owns membership-routing snapshots plus the imperative bridge
-/// from public API calls and delivery events into transactional store work.
+/// component owns the authoritative runtime group-state snapshot plus the
+/// imperative bridge from public API calls and delivery events into
+/// transactional store work.
 #[derive(ComponentDefinition)]
 pub struct ReplicationRuntimeComponent {
     ctx: ComponentContext<Self>,
@@ -419,7 +421,7 @@ pub struct ReplicationRuntimeComponent {
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
     security: DeliverySecurity,
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<SharedGroupState>,
     summary_request_manager: ActorRefStrong<SummaryRequestManagerMessage>,
     catch_up_manager: ActorRefStrong<CatchUpManagerMessage>,
     /// Resolved group-size limit for including inline public key bundles in bootstrap messages.
@@ -430,7 +432,7 @@ pub struct ReplicationRuntimeComponent {
 #[derive(Clone)]
 pub(super) struct RuntimeIdentityContext {
     pub(super) local_member: MemberIdentity,
-    pub(super) group_memberships: SharedGroupMemberships,
+    pub(super) group_memberships: Arc<SharedGroupState>,
 }
 
 /// Application-facing services consumed by the replication runtime component.
@@ -572,15 +574,16 @@ impl ReplicationRuntimeComponent {
         request: SnapshotRowsRequest,
     ) -> Result<SnapshotValueRows, SnapshotRowsError> {
         ensure!(!request.datasets.is_empty(), snapshot::EmptyDatasetsSnafu);
-        let hosted_group_ids = self
-            .group_memberships
-            .snapshot()
-            .group_ids()
-            .copied()
-            .collect::<HashSet<_>>();
+        let group_state = self.group_memberships.application_snapshot();
+        let requested_group =
+            group_state
+                .group(&request.group_id)
+                .context(snapshot::UnknownGroupSnafu {
+                    group_id: request.group_id,
+                })?;
         ensure!(
-            hosted_group_ids.contains(&request.group_id),
-            snapshot::UnknownGroupSnafu {
+            requested_group.is_readable(),
+            snapshot::GroupClosedSnafu {
                 group_id: request.group_id,
             }
         );
@@ -590,23 +593,11 @@ impl ReplicationRuntimeComponent {
             .begin_read_transaction()
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        let groups = transaction
-            .load_replication_groups_for_ids(&hosted_group_ids)
+        let group_versions = transaction
+            .load_writable_replication_group_versions()
             .await
             .context(snapshot::StoreAccessSnafu)?;
-        let requested_group = groups
-            .iter()
-            .find(|group| group.group_id == request.group_id)
-            .context(snapshot::UnknownGroupSnafu {
-                group_id: request.group_id,
-            })?;
-        ensure!(
-            requested_group.lifecycle.is_readable(),
-            snapshot::GroupClosedSnafu {
-                group_id: request.group_id,
-            }
-        );
-        let read_token = Self::read_token_from_groups(groups);
+        let read_token = Self::read_token_from_group_versions(group_versions);
 
         let mut schemas = HashMap::with_capacity(request.datasets.len());
         for dataset_id in &request.datasets {
@@ -653,7 +644,6 @@ impl ReplicationRuntimeComponent {
         &self,
         group_id: GroupId,
         group_name: Option<String>,
-        message: Option<String>,
         member_keys: GroupMemberKeys,
         group_schema: GroupSchema,
         security_material: crate::api::EncryptedGroupSecurityMaterial,
@@ -661,7 +651,6 @@ impl ReplicationRuntimeComponent {
         let material = self.build_replication_group_material_record(
             group_id,
             group_name,
-            message,
             member_keys,
             group_schema,
             security_material,
@@ -675,7 +664,6 @@ impl ReplicationRuntimeComponent {
         &self,
         group_id: GroupId,
         group_name: Option<String>,
-        message: Option<String>,
         member_keys: GroupMemberKeys,
         group_schema: GroupSchema,
         security_material: crate::api::EncryptedGroupSecurityMaterial,
@@ -688,7 +676,6 @@ impl ReplicationRuntimeComponent {
         ReplicationGroupMaterialRecord {
             group_id,
             group_name,
-            message,
             member_keys,
             local_member_index,
             group_schema,
@@ -703,6 +690,17 @@ impl ReplicationRuntimeComponent {
         let group_versions = groups
             .into_iter()
             .filter(|group| group.lifecycle.is_writable())
+            .map(|group| (group.group_id, group.version_vector))
+            .collect();
+        ReadToken::from_group_versions(group_versions)
+    }
+
+    /// Build one opaque application read token from narrow writable-group progress records.
+    fn read_token_from_group_versions(
+        groups: impl IntoIterator<Item = WritableReplicationGroupVersionRecord>,
+    ) -> ReadToken {
+        let group_versions = groups
+            .into_iter()
             .map(|group| (group.group_id, group.version_vector))
             .collect();
         ReadToken::from_group_versions(group_versions)
@@ -1210,58 +1208,37 @@ impl ReplicationRuntimeComponent {
             .load_replication_group(&group_id)
             .await
             .context(StoreGroupSnafu { group_id })?;
-        if let Some(existing) = existing {
-            transaction
-                .commit()
-                .await
-                .context(StoreGroupSnafu { group_id })?;
+        let persisted_group = if let Some(existing) = existing {
             ensure!(
                 existing.matches_definition(&record),
                 ConflictingExistingGroupSnafu { group_id }
             );
-            return Ok(existing);
-        }
-
-        transaction
-            .insert_replication_group(record.clone())
+            existing
+        } else {
+            transaction
+                .insert_replication_group(record.clone())
+                .await
+                .context(StoreGroupSnafu { group_id })?;
+            record
+        };
+        let active_groups = transaction
+            .load_replication_groups()
             .await
             .context(StoreGroupSnafu { group_id })?;
+        let next_group_state =
+            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)?;
         transaction
             .commit()
             .await
             .context(StoreGroupSnafu { group_id })?;
-        Ok(record)
+        self.group_memberships.replace(next_group_state);
+        Ok(persisted_group)
     }
 
-    /// Install one validated group view into the shared delivery-membership
-    /// snapshot.
-    fn install_group_membership_view(
+    /// Load the persisted active-group registry into one runtime snapshot during startup.
+    async fn load_hydrated_runtime_group_state(
         &mut self,
-        group: ReplicationGroupRecord,
-    ) -> Result<(), GroupInstallError> {
-        let group_id = group.group_id;
-        let local_group =
-            LoadedGroupMeta::from_replication_group_record(&self.local_member, group)?;
-
-        let mut memberships = self.group_memberships.snapshot().as_ref().clone();
-        let existing_members = memberships.insert(group_id, local_group.members.clone());
-        if let Some(existing_members) = existing_members {
-            ensure!(
-                existing_members == local_group.members,
-                ConflictingExistingGroupSnafu { group_id }
-            );
-            return Ok(());
-        }
-        self.group_memberships.replace(memberships);
-        Ok(())
-    }
-
-    /// Load the persisted group registry into the shared membership snapshot during
-    /// component startup.
-    async fn load_hydrated_runtime_memberships(
-        &mut self,
-    ) -> Result<GroupMemberships, RuntimeStartupError> {
-        let initial_memberships = self.group_memberships.snapshot().as_ref().clone();
+    ) -> Result<RuntimeGroupStateSnapshot, RuntimeStartupError> {
         let mut transaction = self
             .store
             .begin_read_transaction()
@@ -1272,19 +1249,15 @@ impl ReplicationRuntimeComponent {
             .await
             .context(StoreStartupSnafu)?;
 
-        let mut memberships = initial_memberships;
+        let mut group_state = RuntimeGroupStateSnapshot::new();
         for persisted_group in persisted_groups {
             let group_id = persisted_group.group_id;
-            let local_group =
-                LoadedGroupMeta::from_replication_group_record(&self.local_member, persisted_group)
-                    .context(InvalidGroupSnafu { group_id })?;
-            let existing_members = memberships.insert(group_id, local_group.members.clone());
-            if existing_members.is_some() {
-                return DuplicateGroupSnafu { group_id }.fail();
-            }
+            group_state
+                .insert_record(&self.local_member, persisted_group)
+                .context(InvalidGroupSnafu { group_id })?;
         }
 
-        Ok(memberships)
+        Ok(group_state)
     }
 
     /// Re-fire unresolved listener-mediated group decisions after startup.
@@ -1537,11 +1510,21 @@ impl ReplicationRuntimeComponent {
                     .context(ApiExternalSnafu)?;
             }
         }
+        let active_groups = transaction
+            .load_replication_groups()
+            .await
+            .boxed()
+            .context(ApiExternalSnafu)?;
+        let next_group_state =
+            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
+                .boxed()
+                .context(ApiExternalSnafu)?;
         transaction
             .commit()
             .await
             .boxed()
             .context(ApiExternalSnafu)?;
+        self.group_memberships.replace(next_group_state);
         if let Some(PendingGroupActivationRecord::MigrationProposal(proposal)) =
             accepted_activation.as_deref()
         {
@@ -1951,7 +1934,6 @@ impl ReplicationRuntimeComponent {
         Ok(self.build_replication_group_record(
             prepared.migration_id.new_group_id,
             prepared.group_name.clone(),
-            prepared.message.clone(),
             member_keys,
             prepared.group_schema.clone(),
             prepared.prepared_setup.security_material.clone(),
@@ -1978,10 +1960,21 @@ impl ReplicationRuntimeComponent {
             .await
             .context(accept_migration::StoreAccessSnafu)?;
         let activation = Self::accept_migration_proposal(transaction.as_mut(), proposal).await?;
+        let active_groups = transaction
+            .load_replication_groups()
+            .await
+            .context(accept_migration::StoreAccessSnafu)?;
+        let next_group_state =
+            RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
+                .context(activation::InstallGroupSnafu {
+                    group_id: prepared.migration_id.new_group_id,
+                })
+                .context(accept_migration::PrepareTargetSnafu)?;
         transaction
             .commit()
             .await
             .context(accept_migration::StoreAccessSnafu)?;
+        self.group_memberships.replace(next_group_state);
         self.notify_catch_up_finalised(
             prepared.migration_id.old_group_id,
             prepared.final_versions.clone(),
@@ -2009,7 +2002,6 @@ impl ReplicationRuntimeComponent {
             .context(activation::StoreAccessSnafu)?
             .context(activation::MissingGroupMaterialSnafu { group_id })?;
         material.group_name = activation_record.group_name;
-        material.message = activation_record.message;
         transaction
             .ensure_replication_group_material(material.clone())
             .await
@@ -2066,13 +2058,17 @@ impl ReplicationRuntimeComponent {
             .load_replication_groups()
             .await
             .context(activation::StoreAccessSnafu)?;
+        let next_group_state = RuntimeGroupStateSnapshot::from_records(
+            &self.local_member,
+            active_groups.iter().cloned(),
+        )
+        .context(activation::InstallGroupSnafu { group_id })?;
         let read_token = Self::read_token_from_groups(active_groups);
         transaction
             .commit()
             .await
             .context(activation::StoreAccessSnafu)?;
-        self.install_group_membership_view(group_record)
-            .context(activation::InstallGroupSnafu { group_id })?;
+        self.group_memberships.replace(next_group_state);
         Ok(PendingGroupActivationOutcome {
             read_token,
             row_changes,
@@ -2467,7 +2463,6 @@ impl ReplicationRuntimeComponent {
     ) -> Result<ValidatedInboundGroupSetup, InboundDeliveryError> {
         let group_id = record.group_id();
         let group_name = record.group_name().map(str::to_owned);
-        let message = record.message().map(str::to_owned);
         let members = GroupMembers::from_ordered_members(group_setup.members().to_vec())
             .context(inbound::InvalidGroupSetupMembersSnafu)?;
         Self::validate_group_setup_membership(group_id, &members, &self.local_member, sender)?;
@@ -2520,7 +2515,6 @@ impl ReplicationRuntimeComponent {
                 .boxed()
                 .context(inbound::GroupSetupSecuritySnafu)?;
             existing_material.group_name = group_name;
-            existing_material.message = message;
             existing_material
         } else {
             let security_material = self
@@ -2532,7 +2526,6 @@ impl ReplicationRuntimeComponent {
             ReplicationGroupMaterialRecord {
                 group_id,
                 group_name,
-                message,
                 member_keys,
                 local_member_index,
                 group_schema,
@@ -2629,10 +2622,27 @@ impl ReplicationRuntimeComponent {
                     .context(inbound::AcceptMigrationSnafu)?
             }
         };
+        let next_group_state =
+            if let PendingGroupActivationRecord::MigrationProposal(proposal) = &activation {
+                let group_id = proposal.migration_id.old_group_id;
+                let active_groups = transaction
+                    .load_replication_groups()
+                    .await
+                    .context(inbound::StoreAccessSnafu)?;
+                let snapshot =
+                    RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
+                        .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+                Some(snapshot)
+            } else {
+                None
+            };
         transaction
             .commit()
             .await
             .context(inbound::StoreAccessSnafu)?;
+        if let Some(next_group_state) = next_group_state {
+            self.group_memberships.replace(next_group_state);
+        }
         if let PendingGroupActivationRecord::MigrationProposal(proposal) = &activation {
             self.notify_catch_up_finalised(
                 proposal.migration_id.old_group_id,
@@ -2667,10 +2677,18 @@ impl ReplicationRuntimeComponent {
                 .ensure_replication_group_material(validated.material)
                 .await
                 .context(inbound::StoreAccessSnafu)?;
+            let active_groups = transaction
+                .load_replication_groups()
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+            let next_group_state =
+                RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
+                    .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
             transaction
                 .commit()
                 .await
                 .context(inbound::StoreAccessSnafu)?;
+            self.group_memberships.replace(next_group_state);
             return Ok(());
         }
 
@@ -2712,6 +2730,8 @@ impl ReplicationRuntimeComponent {
         let validated = self
             .validate_inbound_group_setup(&record, group_setup.as_ref(), &sender)
             .await?;
+        let group_id = record.group_id();
+        let already_active = validated.already_active;
         let mut transaction = self
             .store
             .begin_transaction()
@@ -2721,16 +2741,32 @@ impl ReplicationRuntimeComponent {
             .ensure_replication_group_material(validated.material)
             .await
             .context(inbound::StoreAccessSnafu)?;
-        if !validated.already_active {
+        if !already_active {
             transaction
                 .upsert_pending_group_activation(record.into_activation())
                 .await
                 .context(inbound::StoreAccessSnafu)?;
         }
+        let next_group_state = if already_active {
+            let active_groups = transaction
+                .load_replication_groups()
+                .await
+                .context(inbound::StoreAccessSnafu)?;
+            let snapshot =
+                RuntimeGroupStateSnapshot::from_records(&self.local_member, active_groups)
+                    .context(inbound::InvalidPersistedGroupSnafu { group_id })?;
+            Some(snapshot)
+        } else {
+            None
+        };
         transaction
             .commit()
             .await
-            .context(inbound::StoreAccessSnafu)
+            .context(inbound::StoreAccessSnafu)?;
+        if let Some(next_group_state) = next_group_state {
+            self.group_memberships.replace(next_group_state);
+        }
+        Ok(())
     }
 
     /// Classify migration arrivals before installing admissible pending work.
@@ -3063,17 +3099,11 @@ impl ReplicationRuntimeComponent {
         .context(inbound::StoreAccessSnafu)?;
         let mut working_datasets =
             replay::materialise_dataset_slices(&loaded_schemas, touched_dataset_slices);
-        let hosted_group_ids = self
-            .group_memberships
-            .snapshot()
-            .group_ids()
-            .copied()
-            .collect::<HashSet<_>>();
-        let hosted_groups = transaction
-            .load_replication_groups_for_ids(&hosted_group_ids)
+        let writable_group_versions = transaction
+            .load_writable_replication_group_versions()
             .await
             .context(inbound::StoreAccessSnafu)?;
-        let mut listener_read_token = Self::read_token_from_groups(hosted_groups);
+        let mut listener_read_token = Self::read_token_from_group_versions(writable_group_versions);
         if lifecycle.is_writable() && listener_read_token.group_version(&group_id).is_none() {
             listener_read_token = listener_read_token
                 .with_group_version(group_id, local_group.version_vector.clone());
@@ -3495,9 +3525,6 @@ impl ReplicationRuntimeComponent {
             .boxed()
             .context(ApiExternalSnafu)?;
         let read_token = Self::read_token_from_groups(std::iter::once(persisted_group.clone()));
-        self.install_group_membership_view(persisted_group)
-            .boxed()
-            .context(ApiExternalSnafu)?;
         notify_listener_data_change(
             self.listener.clone(),
             ListenerDataChanges {
@@ -3579,7 +3606,6 @@ impl ReplicationRuntimeComponent {
             let record = async_self.build_replication_group_record(
                 group_id,
                 group_name,
-                message,
                 member_keys,
                 group_schema,
                 prepared_setup.security_material,
@@ -3698,17 +3724,15 @@ impl ReplicationRuntimeComponent {
         let record = self.build_replication_group_record(
             group_id,
             None,
-            None,
             member_keys,
             GroupSchema::default(),
             security_material,
         );
         Handled::block_on(self, async move |mut async_self| {
-            let persisted_group = async_self.store_new_replication_group(record).await;
-            let reply = match persisted_group {
-                Ok(persisted_group) => async_self.install_group_membership_view(persisted_group),
-                Err(error) => Err(error),
-            };
+            let reply = async_self
+                .store_new_replication_group(record)
+                .await
+                .map(|_persisted_group| ());
             let _ = promise.fulfil(reply);
             Handled::OK
         })
@@ -3780,11 +3804,11 @@ impl ComponentLifecycle for ReplicationRuntimeComponent {
         self.max_inline_bootstrap_public_key_bundles =
             self.read_max_inline_bootstrap_public_key_bundles();
         Handled::block_on(self, async move |mut async_self| {
-            let hydrated_memberships = async_self
-                .load_hydrated_runtime_memberships()
+            let hydrated_group_state = async_self
+                .load_hydrated_runtime_group_state()
                 .await
                 .whatever_unrecoverable("replication runtime startup failed")?;
-            async_self.group_memberships.replace(hydrated_memberships);
+            async_self.group_memberships.replace(hydrated_group_state);
             let runtime_ref = async_self
                 .ctx
                 .actor_ref()

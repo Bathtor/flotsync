@@ -1,0 +1,50 @@
+id = "019fa45d-51d7-7ac3-b612-5f092a714f16"
+ref = "flotsync-ile"
+title = "Switch checklist to runtime group-state views"
+body = """
+Objective
+
+D01. Switch the replicated checklist application to the runtime group-state API from flotsync-r9z and remove obsolete active-group store access.
+
+Application behaviour
+
+D02. Query ReplicationApi::group_state() at each group-dependent operation and keep the returned snapshot only for that operation.
+
+D03. Keep ChecklistSession limited to selected default and working-set state. Do not retain a group snapshot or replication store handle.
+
+D04. Add and use public ReplicationGroupView::is_readable and is_writable conveniences plus ReplicationGroupSnapshot::readable_groups. Keep the default readable iterator unordered and let the production snapshot filter its underlying map directly.
+
+D05. Use complete operation-local snapshots for lifecycle successor repair, including Closed groups, while displaying and loading rows only for readable groups.
+
+D06. Keep deterministic sorting at checklist presentation boundaries. Do not rely on or imply group or member iteration order from the runtime API.
+
+D07. Rename DefaultGroupRefresh to DefaultGroupRepair and both session/runtime refresh methods to repair_default_group so the API describes repairing only the selected default.
+
+Cleanup
+
+D08. Remove ChecklistRepl store retention, load_group_records, load_readable_groups, direct active-group ReplicationStore reads, registry terminology, and the stale flotsync-git-c9m TODO. Preserve pre-runtime security provisioning access.
+
+Testing
+
+D09. Reuse the production runtime snapshot through the flotsync_replication test-support factory rather than maintaining a parallel TestReplicationGroupSnapshot implementation.
+
+D10. Update focused checklist tests for runtime-backed lookup, lifecycle conveniences, creation and invitation repair, default repair naming and outcomes, UI sorting, and absence of direct active-group store reads.
+
+Estimate
+
+D11. Approximately 450-750 touched LOC across the complete child."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 1
+assignee = "codex"
+parent = "019f8ffb-e40e-7c62-b6da-37833e90b02b"
+created_at = "2026-07-27T16:16:47.063762Z"
+updated_at = "2026-07-28T17:13:44.713762Z"
+closed_at = "2026-07-28T17:13:44.713762Z"
+
+[[comments]]
+id = "019fa9b7-d409-7ee0-a0c9-3bf65e60f6ad"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-28T17:13:44.713762Z"

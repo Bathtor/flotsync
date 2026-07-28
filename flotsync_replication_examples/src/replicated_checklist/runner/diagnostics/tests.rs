@@ -2,21 +2,28 @@
 
 use super::*;
 use crate::replicated_checklist::runner::groups::test_support::named_test_group;
-use flotsync_replication::{DiscoveryRoute, RouteDiagnostic, RouteDiagnosticPhase};
+use flotsync_core::GroupId;
+use flotsync_replication::{
+    DiscoveryRoute,
+    RouteDiagnostic,
+    RouteDiagnosticPhase,
+    test_support::replication_group_snapshot,
+};
 use indoc::indoc;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
 #[test]
 fn peer_diagnostics_display_empty_state() {
-    let groups = HashMap::new();
+    let local_member = MemberIdentity::from_array(["local"]);
+    let groups = replication_group_snapshot(&local_member, []);
     let report = ChecklistPeerDiagnostics::new(
         RouteEstablishmentDiagnostics {
             local_endpoint: None,
             advertised_endpoints: Vec::new(),
             routes: Vec::new(),
         },
-        &groups,
+        groups.as_ref(),
     );
 
     assert_eq!(
@@ -35,10 +42,8 @@ fn peer_diagnostics_display_sorts_at_presentation_and_appends_shared_groups() {
     let bob = MemberIdentity::from_array(["bob"]);
     let carol = MemberIdentity::from_array(["carol"]);
     let group_id = GroupId(Uuid::from_u128(72_013));
-    let groups = HashMap::from([(
-        group_id,
-        named_test_group(group_id, &bob, "shared with bob"),
-    )]);
+    let groups =
+        replication_group_snapshot(&bob, [named_test_group(group_id, &bob, "shared with bob")]);
     let snapshot = RouteEstablishmentDiagnostics {
         local_endpoint: Some(SocketAddr::from(([0, 0, 0, 0], 45_100))),
         advertised_endpoints: vec![
@@ -82,7 +87,7 @@ fn peer_diagnostics_display_sorts_at_presentation_and_appends_shared_groups() {
     };
 
     assert_eq!(
-        ChecklistPeerDiagnostics::new(snapshot, &groups).to_string(),
+        ChecklistPeerDiagnostics::new(snapshot, groups.as_ref()).to_string(),
         indoc! {"
             Peer route diagnostics
             local endpoint: udp://0.0.0.0:45100

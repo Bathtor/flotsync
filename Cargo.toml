@@ -32,6 +32,7 @@ snafu = "0.9"
 itertools = "0.14"
 ordered-float = { version = "5.0", default-features = false }
 roaring = "0.10"
+sealed = "0.7"
 uuid = "1"
 kompact = "0.12"
 log = "0.4"

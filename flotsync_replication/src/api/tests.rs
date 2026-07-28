@@ -120,7 +120,6 @@ fn group_material_definition_matching_excludes_security_material() {
     let material = ReplicationGroupMaterialRecord {
         group_id,
         group_name: Some("docs".to_owned()),
-        message: Some("shared".to_owned()),
         member_keys: member_keys.clone(),
         local_member_index: MemberIndex::new(0),
         group_schema: group_schema.clone(),
@@ -138,7 +137,6 @@ fn group_material_definition_matching_excludes_security_material() {
         .activate(VersionVector::initial(member_count));
     let mut different_metadata = material.clone();
     different_metadata.group_name = Some("renamed".to_owned());
-    different_metadata.message = None;
 
     assert!(material.matches_definition(
         group_id,
@@ -171,7 +169,6 @@ fn active_group_decomposition_preserves_progress_and_lifecycle() {
     let group = ReplicationGroupRecord {
         group_id,
         group_name: Some("active docs".to_owned()),
-        message: Some("active message".to_owned()),
         member_keys: GroupMemberKeys::from_ordered_member_keys([member_key_id(
             ["active-state", "alice"],
             1,
@@ -187,7 +184,6 @@ fn active_group_decomposition_preserves_progress_and_lifecycle() {
     let (material, active_state) = group.into_parts();
 
     assert_eq!(material.group_name.as_deref(), Some("active docs"));
-    assert_eq!(material.message.as_deref(), Some("active message"));
     assert_eq!(active_state.version_vector, versions);
     assert_eq!(active_state.lifecycle, lifecycle);
 }
@@ -222,7 +218,6 @@ fn group_aggregate_defaults_are_explicitly_incomplete() {
     let material = ReplicationGroupMaterialRecord::default();
     assert_eq!(material.group_id, GroupId::NIL);
     assert_eq!(material.group_name, None);
-    assert_eq!(material.message, None);
     assert!(material.member_keys.is_empty());
     assert_eq!(material.local_member_index, MemberIndex::new(u32::MAX));
     assert_eq!(material.group_schema, GroupSchema::default());
@@ -234,7 +229,6 @@ fn group_aggregate_defaults_are_explicitly_incomplete() {
     let group = ReplicationGroupRecord::default();
     assert_eq!(group.group_id, GroupId::NIL);
     assert_eq!(group.group_name, None);
-    assert_eq!(group.message, None);
     assert!(group.member_keys.is_empty());
     assert_eq!(group.local_member_index, MemberIndex::new(u32::MAX));
     assert_eq!(group.group_schema, GroupSchema::default());

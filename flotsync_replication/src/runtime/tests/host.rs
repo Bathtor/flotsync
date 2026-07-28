@@ -3,22 +3,6 @@
 use super::*;
 
 #[test]
-fn delivery_runtime_host_updates_shared_group_memberships() {
-    let local_member = Identifier::from_array(ALICE_MEMBER_SEGMENTS);
-    let mut host = start_host(&local_member);
-    let group_id = GroupId(Uuid::from_u128(1));
-    let memberships = GroupMemberships::from_groups([(
-        group_id,
-        GroupMembers::singleton(local_member).expect("group should build"),
-    )]);
-
-    host.replace_group_memberships(memberships);
-
-    assert!(host.membership_snapshot().contains_group(&group_id));
-    wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");
-}
-
-#[test]
 fn load_replication_runtime_accepts_store_provisioned_security() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let application_id = app_probe_id();

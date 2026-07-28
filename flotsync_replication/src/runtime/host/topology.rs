@@ -268,7 +268,7 @@ pub(in crate::runtime::host) struct DeliveryTopology {
 impl DeliveryTopology {
     fn build(
         system: &KompactSystem,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         local_member: MemberIdentity,
         manager_ref: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         security: DeliverySecurity,
@@ -404,7 +404,7 @@ impl DiscoveryTopology {
     fn build(
         system: &KompactSystem,
         host_config: DeliveryRuntimeHostConfig,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         local_member: MemberIdentity,
         security: DeliverySecurity,
         transport_handles: DiscoveryTransportHandles,
@@ -758,7 +758,7 @@ pub(in crate::runtime::host) struct RuntimeTopology {
 
 /// Inputs needed to assemble a full runtime topology.
 pub(in crate::runtime::host) struct RuntimeTopologyBuildInput {
-    pub(in crate::runtime::host) group_memberships: SharedGroupMemberships,
+    pub(in crate::runtime::host) group_memberships: Arc<SharedGroupState>,
     pub(in crate::runtime::host) local_member: MemberIdentity,
     pub(in crate::runtime::host) store: Arc<dyn ReplicationStore>,
     pub(in crate::runtime::host) listener: Arc<dyn ReplicationEventListener>,

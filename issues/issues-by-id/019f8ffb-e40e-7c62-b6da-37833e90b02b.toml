@@ -4,35 +4,114 @@ title = "Redesign shared group state behind restricted trait-object views"
 body = """
 Objective
 
-R01. Replace concrete SharedGroupMemberships sharing with one authoritative rich group-state snapshot exposed through restricted trait-object views.
+P01. Replace the concrete shared membership map with one authoritative immutable runtime group-state snapshot that projects active storage records into restricted membership and application views.
 
-Scope
+State model
 
-R02. Inventory the group-state needs of routing, delivery, runtime, summary/catch-up, replication APIs, and applications.
+P02. Introduce a private RuntimeGroupStateSnapshot and private entry representation independent of the public ReplicationGroupRecord storage API. The snapshot contains active groups, including Closed groups, with canonical membership, group name, group schema, and lifecycle.
 
-R03. Define an immutable underlying group-state model containing canonical membership plus runtime metadata such as group name, schema, and lifecycle. Invitation and membership-change messages remain pending-event metadata rather than group state.
+P03. Keep pending invitation and membership-change messages only in pending decision, activation, and protocol records. Remove message from ReplicationGroupRecord, ReplicationGroupMaterialRecord, and the initial SQLite active-group schema because it is no longer needed after activation. No database migration is required.
 
-R04. Define object-safe read-only views for component consumers and application consumers. Each view exposes only the capabilities its consumers require and does not permit mutation.
+P04. Keep one Arc<SharedGroupState> whose SharedGroupState owns ArcSwap<RuntimeGroupStateSnapshot> directly. All component and application views load the same Arc-backed snapshot; do not maintain a second membership map.
 
-R05. Preserve one authoritative atomically replaceable snapshot, using ArcSwap or a justified successor, with adapters or trait objects over that same data rather than separately maintained maps.
+Restricted component API
 
-R06. Add a public ReplicationApi snapshot or query based on the restricted application view and document its snapshot-freshness semantics.
+P05. Turn GroupMemberships from a concrete map into an object-safe Send + Sync trait with members(group_id), contains_group(group_id), and an unordered boxed groups() iterator yielding group id plus borrowed GroupMembers.
 
-R07. Centralise group creation, activation, lifecycle, membership-change, and replay updates so every view changes from the same atomic state transition.
+P06. Turn SharedGroupMemberships into an object-safe Send + Sync trait whose snapshot() method returns Arc<dyn GroupMemberships>. RuntimeGroupStateSnapshot implements GroupMemberships, and SharedGroupState implements SharedGroupMemberships.
 
-R08. Remove direct ReplicationStore reads from applications, including the temporary checklist workaround introduced by flotsync-git-d03.3.3.
+P07. Route establishment, delivery ingress, group broadcast, runtime codecs, summary handling, catch-up handling, and runtime logic receive Arc<dyn SharedGroupMemberships>. A snapshot acquisition adds one source-trait dispatch and each query adds one membership-trait dispatch, but the design adds no persistent heap allocation, ArcSwap, or snapshot map.
 
-R09. Cover restricted capabilities, atomic snapshot replacement, name/schema/lifecycle updates, component consumers, and the application-facing API with focused tests.
+P08. Keep GroupMembers backed only by its identity trie. Reconstruct canonical order on demand and implement value-aware PartialEq and Eq on TrieMap itself so membership equality compares the authoritative representation without duplicating identities or reconstructing order.
 
-Planning note
+Restricted application API
 
-R10. This is expected to exceed 1,000 LOC because it crosses core, replication runtime, component crates, and public APIs. Align on the model first, then split implementation into independently reviewable children by view/API and consumer migration."""
-status = "open"
+P09. Add sealed public ReplicationGroupView and ReplicationGroupSnapshot traits using the sealed crate. ReplicationGroupView exposes group id, optional name, unordered member iteration, schema, lifecycle, and readable/writable conveniences. ReplicationGroupSnapshot exposes lookup plus unordered boxed group and readable-group iterators. Neither trait exposes storage records, key bindings, progress vectors, local member index, security material, or messages.
+
+P10. Add ReplicationApi::group_state() -> Result<Arc<dyn ReplicationGroupSnapshot>, ApiError>. The returned snapshot is the latest state published by the running local runtime, remains internally consistent while retained, may become stale after return, performs no store access or peer catch-up, and returns RuntimeUnavailable after shutdown.
+
+State transitions and progress reads
+
+P11. Build and validate an ordinary next RuntimeGroupStateSnapshot from the resulting active group records before each registry-changing store commit. Reject duplicate group ids instead of silently replacing entries. After a successful commit, replace the shared ArcSwap value once. Do not expose a prepare/publish protocol.
+
+P12. Apply the same full-snapshot replacement path to startup hydration, local creation, invitation activation, migration acceptance to ReadOnly, migration activation to old Closed plus new Open, replayed activation, active replay metadata refresh, and test installation. Auto-accepted migration acceptance publishes its ReadOnly state even when subsequent activation fails. API and responder completion occurs only after the corresponding state publication.
+
+P13. Keep version-vector updates out of group state because they are represented by read tokens and transaction-scoped records. Keep pending and inactive group material out until activation.
+
+P14. Project storage records without cloning complete records merely for validation. Validation may borrow the record while the runtime snapshot moves only the application-facing fields and canonical membership it retains.
+
+P15. Add a narrow unordered public storage projection and transaction query for writable group ids and version vectors. SQLite loads it in one authoritative query without loading names, members, schemas, key material, or security material. Snapshot and inbound listener-token construction use this query directly instead of collecting runtime ids and loading complete records.
+
+Testing support
+
+P16. Reuse the production RuntimeGroupStateSnapshot projection for application-facing test snapshots through a test-support factory. Keep only the smaller membership fake for unit tests that intentionally exercise membership consumers without complete storage/application records.
+
+Checklist application
+
+P17. Remove ChecklistRepl store retention and direct active-group ReplicationStore reads. Pre-runtime key provisioning remains outside the live group-state API scope.
+
+P18. Query ReplicationApi::group_state() at each group-dependent checklist operation and retain the result only as that operation consistency boundary. ChecklistSession retains the selected default and working set, not a group snapshot.
+
+P19. Keep all deterministic sorting in checklist presentation code. Neither restricted group API promises group or member iteration order.
+
+P20. Run default repair against one operation-local complete snapshot, including Closed groups for successor traversal, while showing and loading rows only for readable groups. Use the public readable_groups, is_readable, and is_writable conveniences. Rename refresh terminology to repair_default_group and DefaultGroupRepair. Remove load_group_records, load_readable_groups, the retained store field, and the stale flotsync-git-c9m TODO.
+
+Coverage and conformance
+
+P21. Cover snapshot replacement and retained-old-snapshot stability, identical membership and application projections, name/schema/lifecycle projection, message exclusion, unordered iterator contracts, trie equality, on-demand canonical member reconstruction, duplicate-id rejection, authoritative writable-version reads, startup hydration, every lifecycle transition, observable ReadOnly state after failed auto-accepted activation, active replay metadata publication, atomic old/new activation publication, runtime-unavailable behaviour, production-backed test snapshots, lifecycle conveniences, default repair, and application use without direct group-store reads.
+
+P22. Preserve all repository Rust, Snafu, Kompact, formatting, pedantic Clippy, socket-reservation, and single-threaded sandbox test requirements. Keep storage and runtime component documentation aligned with the final contracts.
+
+Implementation split and estimate
+
+P23. Part one covers runtime APIs and related crates: storage-message removal, trie representation and equality, private state model, restricted traits, narrow writable-version storage API, component rewiring, central state replacement, public runtime API, production-backed test support, and focused tests. Estimate 1,500-2,350 touched LOC across the complete child.
+
+P24. Part two covers checklist application usage and cleanup: operation-local runtime snapshots, lifecycle conveniences, UI-boundary sorting, default repair naming, removal of store-backed registry APIs, and focused tests. Estimate 450-750 touched LOC across the complete child.
+
+P25. Implement the two parts as linked child issues, with the checklist child blocked by the runtime/API child."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 1
+assignee = "codex"
+children = [
+    "019fa45d-3250-71f0-ab69-7e4d4a74a8d8",
+    "019fa45d-51d7-7ac3-b612-5f092a714f16",
+]
 created_at = "2026-07-23T17:17:57.646019Z"
-updated_at = "2026-07-26T12:04:17.971311Z"
+updated_at = "2026-07-28T17:13:47.268159Z"
+closed_at = "2026-07-28T17:13:47.268159Z"
 
 [[links]]
 target = "019f8588-bbc6-7523-87d2-6d5e83939248"
 label = "discovered from"
+
+[[comments]]
+id = "019fa4c5-adcf-7f93-bed9-e7d480bdd71e"
+author = "codex"
+body = "Review corrections implemented: migration acceptance and active replay paths now publish complete snapshots, duplicate ids are rejected, storage validation is borrowed, route claims reuse yielded memberships, stale contracts are corrected, and public group/member iteration remains unordered with checklist sorting at the UI boundary. Full affected test suites and workspace pedantic Clippy pass."
+created_at = "2026-07-27T18:10:46.351812Z"
+
+[[comments]]
+id = "019fa980-d130-70c3-ac62-e290d2fd96ac"
+author = "codex"
+body = "Second review plan agreed: remove resident ordered-member duplication and add generic trie equality; use the sealed crate; replace snapshot-id/full-record progress loads with direct group lookup and a narrow authoritative writable-version query; reuse the production application snapshot in test support; add lifecycle conveniences; and rename checklist refresh APIs around default repair."
+created_at = "2026-07-28T16:13:39.504137Z"
+
+[[comments]]
+id = "019fa98f-0fe4-7f90-a32c-4dbac2a6403b"
+author = "codex"
+body = "Second review corrections implemented: GroupMembers again stores only its trie and derives equality from the existing generic TrieMap equality; sealed 0.6 replaces the local marker; snapshot and inbound read tokens use a one-query writable group-version projection; snapshot group validation is a direct group-state lookup; test-support application snapshots use the production projection; lifecycle conveniences and default-repair naming are applied throughout the checklist. Core, replication, and checklist tests pass; workspace all-target checks and pedantic Clippy are clean."
+created_at = "2026-07-28T16:29:13.060239Z"
+
+[[comments]]
+id = "019fa990-98db-74f0-aecb-4b140d54bba1"
+author = "codex"
+body = "Dependency correction: the final implementation uses sealed 0.7.0, the current crates.io release; the preceding implementation comment naming 0.6 reflected the initially resolved documentation version."
+created_at = "2026-07-28T16:30:53.659186Z"
+
+[[comments]]
+id = "019fa9b7-de04-7401-ba68-ecbaba19ab1c"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-28T17:13:47.268159Z"

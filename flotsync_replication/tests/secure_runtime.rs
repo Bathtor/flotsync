@@ -17,6 +17,7 @@ use flotsync_replication::{
     GroupMigrationPolicy,
     PolicyDecision,
     ReplicationConfig,
+    ReplicationGroupLifecycle,
     ReplicationGroupRecord,
     ReplicationStore,
     RowId,
@@ -75,7 +76,16 @@ fn create_group_bootstrap_installs_remote_membership() {
     for fixture in [&alice_fixture, &bob_fixture] {
         let stored = load_group(fixture, group_id);
         assert_eq!(stored.group_name.as_deref(), Some("shared docs"));
-        assert_eq!(stored.message.as_deref(), Some("created together"));
+        let state = fixture
+            .api()
+            .group_state()
+            .expect("group state should remain available");
+        let group = state
+            .group(&group_id)
+            .expect("created group should be published");
+        assert_eq!(group.group_name(), Some("shared docs"));
+        assert_eq!(group.group_schema(), &docs_group_schema());
+        assert_eq!(group.lifecycle(), &ReplicationGroupLifecycle::Open);
     }
 
     let alice_members = alice_fixture
@@ -169,6 +179,27 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     bob_fixture.wait_for_group_install(migration_id.new_group_id);
     charlie_fixture.wait_for_group_install(migration_id.new_group_id);
 
+    for fixture in [&alice_fixture, &bob_fixture] {
+        let state = fixture
+            .api()
+            .group_state()
+            .expect("group state should remain available");
+        let old_group = state
+            .group(&old_group_id)
+            .expect("continuing member should retain the closed source group");
+        assert!(matches!(
+            old_group.lifecycle(),
+            ReplicationGroupLifecycle::Closed {
+                successor_group_id,
+                ..
+            } if *successor_group_id == migration_id.new_group_id
+        ));
+        let new_group = state
+            .group(&migration_id.new_group_id)
+            .expect("successor group should be published in the same snapshot");
+        assert_eq!(new_group.lifecycle(), &ReplicationGroupLifecycle::Open);
+    }
+
     for fixture in [&alice_fixture, &bob_fixture, &charlie_fixture] {
         let members = fixture
             .group_members(migration_id.new_group_id)
@@ -178,7 +209,6 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
         assert!(members.contains(&charlie_member));
         let stored = load_group(fixture, migration_id.new_group_id);
         assert_eq!(stored.group_name.as_deref(), Some("original docs"));
-        assert_eq!(stored.message, None);
     }
 }
 

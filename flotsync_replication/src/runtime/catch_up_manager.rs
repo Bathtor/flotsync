@@ -316,7 +316,7 @@ pub(super) struct CatchUpManagerComponent {
     ctx: ComponentContext<Self>,
     group_broadcast: RequiredPort<GroupBroadcastPort>,
     local_member: MemberIdentity,
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<dyn SharedGroupMemberships>,
     store: Arc<dyn ReplicationStore>,
     /// Delay between rebroadcasts while any pending need remains unsatisfied.
     retry_delay: Duration,
@@ -333,7 +333,7 @@ pub(super) struct CatchUpManagerComponent {
 impl CatchUpManagerComponent {
     pub(super) fn new(
         local_member: MemberIdentity,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
         store: Arc<dyn ReplicationStore>,
     ) -> Self {
         Self {
@@ -887,13 +887,9 @@ mod tests {
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
-        test_support::test_public_member_keys,
+        test_support::{TestGroupMemberships, test_public_member_keys},
     };
-    use flotsync_core::{
-        member::Identifier,
-        membership::{GroupMembers, GroupMemberships},
-        versions::VersionVector,
-    };
+    use flotsync_core::{member::Identifier, membership::GroupMembers, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
     use flotsync_messages::datamodel as datamodel_proto;
     use uuid::Uuid;
@@ -999,8 +995,7 @@ mod tests {
         let local_member = local_member();
         let members = GroupMembers::from_ordered_members([local_member.clone(), remote_member()])
             .expect("test group members should build");
-        let memberships =
-            SharedGroupMemberships::new(GroupMemberships::from_groups([(group_id, members)]));
+        let memberships = TestGroupMemberships::from_groups([(group_id, members)]).shared();
         let store: Arc<dyn ReplicationStore> = Arc::new(
             wait_for_store_future(SqliteReplicationStore::in_memory(local_member.clone()))
                 .expect("store should build"),

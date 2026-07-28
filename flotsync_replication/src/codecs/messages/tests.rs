@@ -41,6 +41,7 @@ use crate::{
         SnapshotRef,
     },
     test_support::{
+        TestGroupMemberships,
         docs_dataset_id,
         docs_group_schema,
         docs_schema_source,
@@ -138,9 +139,9 @@ fn metadata_snapshot(migration_id: MigrationId) -> InitialSnapshot {
     })
 }
 
-fn test_memberships(groups: &[(GroupId, usize)]) -> GroupMemberships {
+fn test_memberships(groups: &[(GroupId, usize)]) -> TestGroupMemberships {
     const MEMBER_NAMES: [&str; 4] = ["alice", "bob", "carol", "dave"];
-    GroupMemberships::from_groups(groups.iter().map(|(group_id, member_count)| {
+    TestGroupMemberships::from_groups(groups.iter().map(|(group_id, member_count)| {
         let members: Vec<_> = MEMBER_NAMES[..*member_count]
             .iter()
             .map(|name| MemberIdentity::from_array(["runtime-message", *name]))
@@ -153,7 +154,7 @@ fn test_memberships(groups: &[(GroupId, usize)]) -> GroupMemberships {
 
 fn decode_runtime_message(
     payload: &[u8],
-    memberships: &GroupMemberships,
+    memberships: &dyn GroupMemberships,
 ) -> Result<RuntimeMessage, RuntimeMessageError> {
     RuntimeMessage::decode_proto_view_from_slice_with(
         payload,
@@ -163,7 +164,7 @@ fn decode_runtime_message(
 
 fn assert_runtime_decode_paths(
     payload: &[u8],
-    memberships: &GroupMemberships,
+    memberships: &dyn GroupMemberships,
     expected: &RuntimeMessage,
 ) {
     let borrowed = decode_runtime_message(payload, memberships)
@@ -520,7 +521,7 @@ fn pending_group_messages_round_trip_through_runtime_envelope() {
     ];
     let group_schema = docs_group_schema();
     let group_setup = test_group_setup(&members);
-    let memberships = GroupMemberships::new();
+    let memberships = TestGroupMemberships::default();
     let snapshots = [
         InitialSnapshot::Empty,
         inline_snapshot(),
@@ -592,7 +593,7 @@ fn pending_group_message_view_preserves_group_setup_validation() {
         None,
         None,
     );
-    let memberships = GroupMemberships::new();
+    let memberships = TestGroupMemberships::default();
 
     let missing_setup = replication_proto::RuntimeMessage {
         body: Some(replication_proto::runtime_message::Body::GroupInvitation(
@@ -687,7 +688,7 @@ fn update_range_rejects_reserved_max_bound() {
     .encode_proto()
     .encode_to_bytes();
 
-    let error = decode_runtime_message(&payload, &GroupMemberships::new())
+    let error = decode_runtime_message(&payload, &TestGroupMemberships::default())
         .expect_err("reserved max range bound should be rejected");
     assert!(matches!(
         error,

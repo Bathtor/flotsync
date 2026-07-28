@@ -1,19 +1,12 @@
 //! REPL and runtime wiring for the replicated checklist runner.
 
-use super::{
-    diagnostics::ChecklistPeerDiagnostics,
-    groups::load_readable_groups,
-    setup::load_checklist_store_setup,
-    *,
-};
+use super::{diagnostics::ChecklistPeerDiagnostics, setup::load_checklist_store_setup, *};
 use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
     let setup = load_checklist_store_setup(config_path).await?;
-    let persisted_groups = load_readable_groups(setup.store.as_ref()).await?;
 
     let (listener, listener_receivers) = ChecklistListener::pair();
-    let store = setup.store.clone();
     let replication = load_replication_runtime_with_runtime_config_toml(
         checklist_application_id(),
         setup.store,
@@ -26,17 +19,18 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
     .context(repl_error::LoadRuntimeSnafu)?;
 
     let mut working_set = ChecklistWorkingSet::new();
-    for group in &persisted_groups {
-        load_group_snapshot(replication.as_ref(), &mut working_set, group.group_id).await?;
+    let group_state = replication
+        .group_state()
+        .context(repl_error::ReplicationSnafu)?;
+    let readable_group_ids = group_state
+        .readable_groups()
+        .map(ReplicationGroupView::group_id)
+        .collect::<Vec<_>>();
+    for group_id in readable_group_ids {
+        load_group_snapshot(replication.as_ref(), &mut working_set, group_id).await?;
     }
-    let session = ChecklistSession::new(persisted_groups, working_set);
-    let mut repl = ChecklistRepl::new(
-        setup.config,
-        store,
-        replication,
-        listener_receivers,
-        session,
-    );
+    let session = ChecklistSession::new(working_set);
+    let mut repl = ChecklistRepl::new(setup.config, replication, listener_receivers, session);
     let run_result = repl.run().await;
     let shutdown_result = repl.shutdown().await;
     run_result?;
@@ -199,45 +193,60 @@ impl ReplicationEventListener for ChecklistListener {
 
 /// Interactive checklist state and the runtime handles used by its commands.
 pub struct ChecklistRepl {
+    /// Current application configuration and local identity.
     pub config: ChecklistAppConfig,
-    /// Temporary application-side access to rich group records.
-    ///
-    /// TODO(flotsync-git-c9m): Replace these direct store reads with the
-    /// restricted public application view over the runtime's authoritative
-    /// group state. Runtime-changing operations must continue to use
-    /// `ReplicationApi` rather than this store handle.
-    pub store: Arc<SqliteReplicationStore>,
+    /// Runtime control and operation-local group-state access.
     pub replication: Arc<dyn ReplicationApi>,
+    /// Listener-delivered row batches awaiting command-loop ingestion.
     pub batch_receiver: Receiver<ChecklistListenerBatch>,
+    /// Listener-delivered invitations awaiting user decisions.
     pub invitation_receiver: Receiver<PendingGroupInvitation>,
+    /// Stable user-facing invitation queue with one-shot responders.
     pub pending_invitations: Vec<PendingGroupInvitation>,
+    /// Process-local default selection and checklist working set.
     pub session: ChecklistSession,
 }
 
-/// Group registry, session default, and heterogeneous checklist working set.
+/// Process-local default selection and heterogeneous checklist working set.
 pub struct ChecklistSession {
-    pub groups: HashMap<GroupId, ReplicationGroupRecord>,
+    /// Writable group selected for unqualified new checklist items.
     pub default_group: Option<GroupId>,
+    /// Visible rows, local edits, listener events, and read position.
     pub working_set: ChecklistWorkingSet,
 }
 
 impl ChecklistRepl {
+    /// Build one REPL around a running replication API and listener queues.
     pub fn new(
         config: ChecklistAppConfig,
-        store: Arc<SqliteReplicationStore>,
         replication: Arc<dyn ReplicationApi>,
         listener_receivers: ChecklistListenerReceivers,
         session: ChecklistSession,
     ) -> Self {
         Self {
             config,
-            store,
             replication,
             batch_receiver: listener_receivers.batches,
             invitation_receiver: listener_receivers.invitations,
             pending_invitations: Vec::new(),
             session,
         }
+    }
+
+    /// Load the current operation-local group-state view.
+    fn group_state(
+        &self,
+    ) -> Result<Arc<dyn flotsync_replication::ReplicationGroupSnapshot>, ReplicatedChecklistError>
+    {
+        self.replication
+            .group_state()
+            .context(repl_error::ReplicationSnafu)
+    }
+
+    /// Count groups whose rows remain application-readable in the current runtime view.
+    fn readable_group_count(&self) -> Result<usize, ReplicatedChecklistError> {
+        let groups = self.group_state()?;
+        Ok(groups.readable_groups().count())
     }
 
     #[allow(
@@ -247,7 +256,7 @@ impl ChecklistRepl {
     async fn run(&mut self) -> Result<(), ReplicatedChecklistError> {
         println!(
             "replicated checklist: {} readable groups, no default selected",
-            self.session.groups.len()
+            self.readable_group_count()?
         );
         println!("type 'help' for commands");
 
@@ -297,7 +306,7 @@ impl ChecklistRepl {
             command,
             ChecklistCommand::Keys { .. } | ChecklistCommand::Help | ChecklistCommand::Quit
         ) {
-            self.refresh_group_registry().await?;
+            self.repair_default_group()?;
         }
         match command {
             ChecklistCommand::Keys { command } => {
@@ -305,7 +314,7 @@ impl ChecklistRepl {
                 return Ok(true);
             }
             ChecklistCommand::Me => {
-                self.print_me();
+                self.print_me()?;
                 return Ok(true);
             }
             ChecklistCommand::Peers => {
@@ -333,6 +342,7 @@ impl ChecklistRepl {
         &mut self,
         command: ChecklistCommand,
     ) -> Result<(), ReplicatedChecklistError> {
+        let groups = self.group_state()?;
         match command {
             ChecklistCommand::Add { text } => {
                 let association = self.session.default_group.map_or(
@@ -344,79 +354,79 @@ impl ChecklistRepl {
                     .working_set
                     .add_item(association, join_words(text));
                 println!("added:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
             }
             ChecklistCommand::Rename { item, text } => {
-                let item_id = self.session.resolve_item(&item)?;
+                let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                 self.session
                     .working_set
                     .rename_item(item_id, join_words(text))
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("renamed:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
             }
             ChecklistCommand::Edit { item, command } => {
-                self.handle_edit_command(&item, command)?;
+                self.handle_edit_command(groups.as_ref(), &item, command)?;
             }
             ChecklistCommand::Tag { command } => match command {
                 TagCommand::Add { item, tag } => {
-                    let item_id = self.session.resolve_item(&item)?;
+                    let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                     self.session
                         .working_set
                         .add_tag(item_id, tag)
                         .context(repl_error::WorkingSetSnafu)?;
                     println!("tag added:");
-                    self.print_item_id(item_id)?;
+                    self.print_item_id(groups.as_ref(), item_id)?;
                 }
                 TagCommand::Rm { item, tag } => {
-                    let item_id = self.session.resolve_item(&item)?;
+                    let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                     self.session
                         .working_set
                         .remove_tag(item_id, &tag)
                         .context(repl_error::WorkingSetSnafu)?;
                     println!("tag removed:");
-                    self.print_item_id(item_id)?;
+                    self.print_item_id(groups.as_ref(), item_id)?;
                 }
             },
             ChecklistCommand::Claim { item } => {
-                let item_id = self.session.resolve_item(&item)?;
+                let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                 self.session
                     .working_set
                     .claim_item(item_id)
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("claimed:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
             }
             ChecklistCommand::Complete { item } => {
-                let item_id = self.session.resolve_item(&item)?;
+                let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                 self.session
                     .working_set
                     .complete_item(item_id)
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("completed:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
             }
             ChecklistCommand::Priority { item, priority } => {
-                let item_id = self.session.resolve_item(&item)?;
+                let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                 self.session
                     .working_set
                     .set_priority(item_id, priority)
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("priority set:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
             }
             ChecklistCommand::Delete { item } => {
-                let item_id = self.session.resolve_item(&item)?;
+                let item_id = self.session.resolve_item(groups.as_ref(), &item)?;
                 println!("deleted:");
-                self.print_item_id(item_id)?;
+                self.print_item_id(groups.as_ref(), item_id)?;
                 self.session
                     .working_set
                     .delete_item(item_id)
                     .context(repl_error::WorkingSetSnafu)?;
             }
-            ChecklistCommand::List => self.print_list(),
-            ChecklistCommand::Show { item } => self.print_item(&item)?,
-            ChecklistCommand::Events { limit } => self.print_events(limit),
+            ChecklistCommand::List => self.print_list(groups.as_ref()),
+            ChecklistCommand::Show { item } => self.print_item(groups.as_ref(), &item)?,
+            ChecklistCommand::Events { limit } => self.print_events(groups.as_ref(), limit),
             ChecklistCommand::Sync => self.sync().await?,
             ChecklistCommand::Members => self.print_members()?,
             ChecklistCommand::Check => self.check_members().await?,
@@ -435,39 +445,44 @@ impl ChecklistRepl {
     /// Apply one item-first note, copy, or move command.
     fn handle_edit_command(
         &mut self,
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
         item: &ItemSelector,
         command: EditCommand,
     ) -> Result<(), ReplicatedChecklistError> {
-        let item_id = self.session.resolve_item(item)?;
+        let item_id = self.session.resolve_item(groups, item)?;
         match command {
-            EditCommand::Note => self.edit_note(item_id)?,
+            EditCommand::Note => self.edit_note(groups, item_id)?,
             EditCommand::Copy { group } => {
                 let group = join_words(group);
-                let target = self.session.resolve_target_association(&group)?;
+                let target = ChecklistSession::resolve_target_association(groups, &group)?;
                 let target_id = self
                     .session
                     .working_set
                     .copy_item(item_id, target)
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("copied:");
-                self.print_item_id(target_id)?;
+                self.print_item_id(groups, target_id)?;
             }
             EditCommand::Move { group } => {
                 let group = join_words(group);
-                let target = self.session.resolve_target_association(&group)?;
+                let target = ChecklistSession::resolve_target_association(groups, &group)?;
                 let target_id = self
                     .session
                     .working_set
                     .move_item(item_id, target)
                     .context(repl_error::WorkingSetSnafu)?;
                 println!("moved:");
-                self.print_item_id(target_id)?;
+                self.print_item_id(groups, target_id)?;
             }
         }
         Ok(())
     }
 
-    fn edit_note(&mut self, item_id: ChecklistItemId) -> Result<(), ReplicatedChecklistError> {
+    fn edit_note(
+        &mut self,
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
+        item_id: ChecklistItemId,
+    ) -> Result<(), ReplicatedChecklistError> {
         let selected = self
             .session
             .working_set
@@ -489,13 +504,13 @@ impl ChecklistRepl {
             .edit_note(item_id, note.trim_end_matches(['\r', '\n']))
             .context(repl_error::WorkingSetSnafu)?;
         println!("note updated:");
-        self.print_item_id(item_id)?;
+        self.print_item_id(groups, item_id)?;
         Ok(())
     }
 
     async fn sync(&mut self) -> Result<(), ReplicatedChecklistError> {
         let report = self.synchronise_groups().await?;
-        println!("{}", self.format_sync_report(&report));
+        println!("{}", self.format_sync_report(&report)?);
         Ok(())
     }
 
@@ -583,8 +598,11 @@ impl ChecklistRepl {
     }
 
     /// Format one structured all-group sync report using current group labels.
-    #[must_use]
-    pub fn format_sync_report(&self, report: &ChecklistSyncReport) -> String {
+    pub fn format_sync_report(
+        &self,
+        report: &ChecklistSyncReport,
+    ) -> Result<String, ReplicatedChecklistError> {
+        let groups = self.group_state()?;
         let group_outcomes = if report.group_outcomes.is_empty() {
             "    none".to_owned()
         } else {
@@ -596,11 +614,11 @@ impl ChecklistRepl {
                         group_id,
                         mutation_count,
                     } => {
-                        let group = self.session.group_label(*group_id);
+                        let group = ChecklistSession::group_label(groups.as_ref(), *group_id);
                         format!("    {group}: published {mutation_count} mutation(s)")
                     }
                     ChecklistGroupSyncOutcome::Failed { group_id, error } => {
-                        let group = self.session.group_label(*group_id);
+                        let group = ChecklistSession::group_label(groups.as_ref(), *group_id);
                         format!("    {group}: failed: {error}")
                     }
                 })
@@ -614,7 +632,7 @@ impl ChecklistRepl {
         let dirty_group_labels = report
             .remaining_dirty_groups
             .iter()
-            .map(|group_id| self.session.group_label(*group_id))
+            .map(|group_id| ChecklistSession::group_label(groups.as_ref(), *group_id))
             .join(", ");
         let dirty_group_summary = if dirty_group_labels.is_empty() {
             "none"
@@ -628,7 +646,7 @@ impl ChecklistRepl {
         };
         let applied_events = report.applied_event_count;
         let dirty_local = report.dirty_local_item_count;
-        formatdoc! {"
+        Ok(formatdoc! {"
             {heading}
               groups:
             {group_outcomes}
@@ -636,14 +654,15 @@ impl ChecklistRepl {
               applied events: {applied_events}
               unsynchronised local items: {dirty_local}
               dirty groups: {dirty_group_summary}"
-        }
+        })
     }
 
     /// Drain queued listener batches into the working set and return the number of batches drained.
     pub fn drain_listener_queue(&mut self) -> Result<usize, ReplicatedChecklistError> {
+        let groups = self.group_state()?;
         let mut drained_batch_count = 0;
         while let Some(batch) = self.receive_listener_batch()? {
-            self.session.validate_listener_changes(&batch.changes)?;
+            ChecklistSession::validate_listener_changes(groups.as_ref(), &batch.changes)?;
             self.session
                 .working_set
                 .enqueue_row_changes(batch.changes)
@@ -668,29 +687,36 @@ impl ChecklistRepl {
         }
     }
 
-    fn print_list(&self) {
+    fn print_list(&self, groups: &dyn flotsync_replication::ReplicationGroupSnapshot) {
         let items = self.session.working_set.listed_items();
         if items.is_empty() {
             println!("checklist is empty");
         } else {
             for item in items {
-                self.print_row(&item);
+                Self::print_row(groups, &item);
             }
         }
     }
 
-    fn print_item(&self, item: &ItemSelector) -> Result<(), ReplicatedChecklistError> {
-        let item_id = self.session.resolve_item(item)?;
+    fn print_item(
+        &self,
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
+        item: &ItemSelector,
+    ) -> Result<(), ReplicatedChecklistError> {
+        let item_id = self.session.resolve_item(groups, item)?;
         let listed = self
             .session
             .working_set
             .require_listed_item(item_id)
             .context(repl_error::WorkingSetSnafu)?;
         println!("index: {}", listed.index);
-        println!("item: {}", self.session.item_reference(listed.item_id));
+        println!(
+            "item: {}",
+            ChecklistSession::item_reference(groups, listed.item_id)
+        );
         println!(
             "association: {}",
-            self.session.association_label(listed.item_id.association)
+            ChecklistSession::association_label(groups, listed.item_id.association)
         );
         println!("row: {}", listed.item_id.row_key);
         println!("text: {}", listed.item.text);
@@ -702,13 +728,20 @@ impl ChecklistRepl {
         Ok(())
     }
 
-    fn print_events(&self, limit: Option<usize>) {
+    fn print_events(
+        &self,
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
+        limit: Option<usize>,
+    ) {
         let events = self.session.working_set.events();
         for event in events.iter().rev().take(limit.unwrap_or(usize::MAX)) {
             println!("event {}:", format_timestamp(event.timestamp));
             for change in &event.changes {
                 let item_id = change.item_id();
-                println!("  {}: {change:?}", self.session.item_reference(item_id));
+                println!(
+                    "  {}: {change:?}",
+                    ChecklistSession::item_reference(groups, item_id)
+                );
             }
         }
         if events.is_empty() {
@@ -723,13 +756,18 @@ impl ChecklistRepl {
             .context(repl_error::ReplicationSnafu)
     }
 
-    fn print_me(&self) {
+    fn print_me(&self) -> Result<(), ReplicatedChecklistError> {
+        let groups = self.group_state()?;
         println!("member: {}", self.config.local_member);
         match self.session.default_group {
-            Some(group_id) => println!("default group: {}", self.session.group_label(group_id)),
+            Some(group_id) => println!(
+                "default group: {}",
+                ChecklistSession::group_label(groups.as_ref(), group_id)
+            ),
             None => println!("default group: none"),
         }
-        println!("readable groups: {}", self.session.groups.len());
+        let readable_group_count = groups.readable_groups().count();
+        println!("readable groups: {readable_group_count}");
         println!("store: {}", self.config.store_path.display());
         println!("config: {}", self.config.source_path.display());
         println!(
@@ -737,6 +775,7 @@ impl ChecklistRepl {
             self.session.working_set.dirty_row_count(),
             self.session.working_set.queued_event_count()
         );
+        Ok(())
     }
 
     /// Query and print one action-driven peer-route diagnostic snapshot.
@@ -746,13 +785,18 @@ impl ChecklistRepl {
             .peer_routes()
             .await
             .context(repl_error::ReplicationSnafu)?;
-        let report = ChecklistPeerDiagnostics::new(snapshot, &self.session.groups);
+        let groups = self.group_state()?;
+        let report = ChecklistPeerDiagnostics::new(snapshot, groups.as_ref());
         println!("{report}");
         Ok(())
     }
 
     /// Print one row from an already-resolved workspace identity.
-    fn print_item_id(&self, item_id: ChecklistItemId) -> Result<(), ReplicatedChecklistError> {
+    fn print_item_id(
+        &self,
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
+        item_id: ChecklistItemId,
+    ) -> Result<(), ReplicatedChecklistError> {
         let selected = self.session.working_set.listed_item(item_id).ok_or(
             ReplicatedChecklistError::UnknownItemReference {
                 selector: ItemSelector::Qualified {
@@ -766,14 +810,17 @@ impl ChecklistRepl {
                 },
             },
         )?;
-        self.print_row(&selected);
+        Self::print_row(groups, &selected);
         Ok(())
     }
 
     /// Print one compact row with its workspace association.
-    fn print_row(&self, item: &ListedChecklistItem<'_>) {
+    fn print_row(
+        groups: &dyn flotsync_replication::ReplicationGroupSnapshot,
+        item: &ListedChecklistItem<'_>,
+    ) {
         let tags = item.item.formatted_tags();
-        let reference = self.session.item_reference(item.item_id);
+        let reference = ChecklistSession::item_reference(groups, item.item_id);
         println!(
             "{:>3}. [{}] p{} edits={} {} ({reference}) {tags}",
             item.index, item.item.status, item.item.priority, item.item.edit_count, item.item.text,
@@ -831,6 +878,7 @@ mod tests {
         ChecklistItem,
         ChecklistRowChange,
         runner::groups::test_support::{
+            load_test_runtime_with_group_records,
             load_test_runtime_with_groups,
             named_test_group,
             test_app_config,
@@ -949,8 +997,13 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let first_group = GroupId(Uuid::from_u128(72_001));
         let second_group = GroupId(Uuid::from_u128(72_002));
-        let (store, runtime, _listener, receivers) =
-            load_test_runtime_with_groups(&member, [second_group, first_group]);
+        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+            &member,
+            [
+                named_test_group(second_group, &member, "second"),
+                named_test_group(first_group, &member, "first"),
+            ],
+        );
         let mut working_set = ChecklistWorkingSet::new();
         block_on(load_group_snapshot(
             runtime.as_ref(),
@@ -973,20 +1026,9 @@ mod tests {
             "second group item",
         );
         working_set.add_item(ChecklistItemAssociation::Local, "local item");
-        let session = ChecklistSession::new(
-            [
-                named_test_group(first_group, &member, "first"),
-                named_test_group(second_group, &member, "second"),
-            ],
-            working_set,
-        );
-        let mut repl = ChecklistRepl::new(
-            test_app_config(member),
-            store,
-            runtime.clone(),
-            receivers,
-            session,
-        );
+        let session = ChecklistSession::new(working_set);
+        let mut repl =
+            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
 
         let report = block_on(repl.synchronise_groups()).expect("all groups should synchronise");
 
@@ -1009,7 +1051,8 @@ mod tests {
         assert_eq!(report.dirty_local_item_count, 1);
         assert!(report.remaining_dirty_groups.is_empty());
         assert_eq!(
-            repl.format_sync_report(&report),
+            repl.format_sync_report(&report)
+                .expect("sync report should format"),
             "sync complete:\n  groups:\n    first: published 1 mutation(s)\n    second: published 1 mutation(s)\n  listener batches: 2\n  applied events: 2\n  unsynchronised local items: 1\n  dirty groups: none"
         );
 
@@ -1049,8 +1092,13 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let source_group = GroupId(Uuid::from_u128(72_003));
         let target_group = GroupId(Uuid::from_u128(72_004));
-        let (store, runtime, _listener, receivers) =
-            load_test_runtime_with_groups(&member, [source_group, target_group]);
+        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+            &member,
+            [
+                named_test_group(source_group, &member, "source"),
+                named_test_group(target_group, &member, "target"),
+            ],
+        );
         let mut working_set = ChecklistWorkingSet::new();
         block_on(load_group_snapshot(
             runtime.as_ref(),
@@ -1068,20 +1116,9 @@ mod tests {
             working_set.add_item(ChecklistItemAssociation::Group(source_group), "copy source");
         let moved_source =
             working_set.add_item(ChecklistItemAssociation::Group(source_group), "move source");
-        let session = ChecklistSession::new(
-            [
-                named_test_group(source_group, &member, "source"),
-                named_test_group(target_group, &member, "target"),
-            ],
-            working_set,
-        );
-        let mut repl = ChecklistRepl::new(
-            test_app_config(member),
-            store,
-            runtime.clone(),
-            receivers,
-            session,
-        );
+        let session = ChecklistSession::new(working_set);
+        let mut repl =
+            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
         block_on(repl.synchronise_groups()).expect("source setup should publish");
 
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
@@ -1147,93 +1184,17 @@ mod tests {
     }
 
     #[test]
-    fn move_target_failure_retains_an_ordinary_dirty_upsert_for_retry() {
-        let member = MemberIdentity::from_array(["alice"]);
-        let source_group = GroupId(Uuid::from_u128(72_005));
-        let unavailable_target = GroupId(Uuid::from_u128(72_006));
-        let (store, runtime, _listener, receivers) =
-            load_test_runtime_with_groups(&member, [source_group]);
-        let mut working_set = ChecklistWorkingSet::new();
-        block_on(load_group_snapshot(
-            runtime.as_ref(),
-            &mut working_set,
-            source_group,
-        ))
-        .expect("source token should load");
-        let source_id = working_set.add_item(
-            ChecklistItemAssociation::Group(source_group),
-            "at-risk move",
-        );
-        let target_id = ChecklistItemId::group(unavailable_target, source_id.row_key);
-        let session = ChecklistSession::new(
-            [
-                named_test_group(source_group, &member, "source"),
-                named_test_group(unavailable_target, &member, "unavailable"),
-            ],
-            working_set,
-        );
-        let mut repl = ChecklistRepl::new(
-            test_app_config(member),
-            store,
-            runtime.clone(),
-            receivers,
-            session,
-        );
-        block_on(repl.synchronise_groups()).expect("source setup should publish");
-        block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
-            item: ItemSelector::RowKey(source_id.row_key),
-            command: EditCommand::Move {
-                group: vec!["unavailable".to_owned()],
-            },
-        }))
-        .expect("move should stage against the readable target registry");
-
-        let first_report = block_on(repl.synchronise_groups())
-            .expect("partial publication should return a report");
-
-        assert!(matches!(
-            first_report.group_outcomes.as_slice(),
-            [
-                ChecklistGroupSyncOutcome::Published {
-                    group_id: actual_source,
-                    mutation_count: 1,
-                },
-                ChecklistGroupSyncOutcome::Failed {
-                    group_id: actual_target,
-                    ..
-                },
-            ] if *actual_source == source_group && *actual_target == unavailable_target
-        ));
-        assert!(repl.session.working_set.item(source_id).is_none());
-        assert!(repl.session.working_set.item(target_id).is_some());
-        assert_eq!(
-            first_report.remaining_dirty_groups,
-            vec![unavailable_target]
-        );
-
-        let retry_report = block_on(repl.synchronise_groups())
-            .expect("ordinary retry should return another partial report");
-        assert!(matches!(
-            retry_report.group_outcomes.as_slice(),
-            [ChecklistGroupSyncOutcome::Failed { group_id, .. }]
-                if *group_id == unavailable_target
-        ));
-        assert_eq!(
-            retry_report.remaining_dirty_groups,
-            vec![unavailable_target]
-        );
-        assert!(repl.session.working_set.item(target_id).is_some());
-
-        block_on(runtime.shutdown()).expect("test runtime should shut down");
-    }
-
-    #[test]
     fn move_source_failure_retains_only_the_tombstone_for_retry() {
         let member = MemberIdentity::from_array(["alice"]);
         let target_group = GroupId(Uuid::from_u128(72_007));
         let unavailable_source = GroupId(Uuid::from_u128(72_008));
-        let (store, runtime, _listener, receivers) =
-            load_test_runtime_with_groups(&member, [target_group]);
+        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+            &member,
+            [
+                named_test_group(target_group, &member, "target"),
+                named_test_group(unavailable_source, &member, "unavailable source"),
+            ],
+        );
         let mut working_set = ChecklistWorkingSet::new();
         block_on(load_group_snapshot(
             runtime.as_ref(),
@@ -1251,20 +1212,9 @@ mod tests {
             }])
             .expect("clean source item should queue");
         working_set.drain_queued_events();
-        let session = ChecklistSession::new(
-            [
-                named_test_group(target_group, &member, "target"),
-                named_test_group(unavailable_source, &member, "unavailable source"),
-            ],
-            working_set,
-        );
-        let mut repl = ChecklistRepl::new(
-            test_app_config(member),
-            store,
-            runtime.clone(),
-            receivers,
-            session,
-        );
+        let session = ChecklistSession::new(working_set);
+        let mut repl =
+            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
             item: ItemSelector::RowKey(row_key),
             command: EditCommand::Move {
@@ -1333,8 +1283,10 @@ mod tests {
         let member = MemberIdentity::from_array(["alice"]);
         let unknown_group = GroupId(Uuid::from_u128(72_010));
         let known_group = GroupId(Uuid::from_u128(72_011));
-        let (store, runtime, _listener, receivers) =
-            load_test_runtime_with_groups(&member, [known_group]);
+        let (_store, runtime, _listener, receivers) = load_test_runtime_with_group_records(
+            &member,
+            [named_test_group(known_group, &member, "known")],
+        );
         let mut working_set = ChecklistWorkingSet::new();
         block_on(load_group_snapshot(
             runtime.as_ref(),
@@ -1355,17 +1307,9 @@ mod tests {
                 item_id: ChecklistItemId::group(known_group, RowKey(Uuid::from_u128(72_012))),
             }])
             .expect("non-conflicting listener event should queue");
-        let session = ChecklistSession::new(
-            [named_test_group(known_group, &member, "known")],
-            working_set,
-        );
-        let mut repl = ChecklistRepl::new(
-            test_app_config(member),
-            store,
-            runtime.clone(),
-            receivers,
-            session,
-        );
+        let session = ChecklistSession::new(working_set);
+        let mut repl =
+            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
 
         let report = block_on(repl.synchronise_groups())
             .expect("a group publication failure should remain in the report");
@@ -1404,7 +1348,8 @@ mod tests {
             remaining_dirty_groups: vec![known_group],
         };
         assert_eq!(
-            repl.format_sync_report(&failed_report),
+            repl.format_sync_report(&failed_report)
+                .expect("failed sync report should format"),
             "sync incomplete:\n  groups:\n    known: failed: Replication runtime component became unavailable.\n  listener batches: deferred because a group publication failed\n  applied events: 0\n  unsynchronised local items: 0\n  dirty groups: known"
         );
 

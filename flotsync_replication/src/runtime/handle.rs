@@ -25,6 +25,7 @@ use crate::{
         ReplicationApi,
         ReplicationConfig,
         ReplicationEventListener,
+        ReplicationGroupSnapshot,
         ReplicationSecuritySecrets,
         ReplicationStore,
         RouteEstablishmentDiagnostics,
@@ -351,6 +352,17 @@ impl ReplicationApi for ReplicationRuntime {
             .expect("a live replication runtime reference must have a strong Arc owner")
     }
 
+    fn group_state(&self) -> Result<Arc<dyn ReplicationGroupSnapshot>, ApiError> {
+        let lifecycle = self
+            .lifecycle
+            .read()
+            .map_err(|_| ApiError::RuntimeLifecyclePoisoned {
+                operation: "loading group state",
+            })?;
+        let lifecycle = lifecycle.as_ref().ok_or(ApiError::RuntimeUnavailable)?;
+        Ok(lifecycle.host.group_state_snapshot())
+    }
+
     fn shutdown(&self) -> ApiFuture<'_, ()> {
         async move {
             let lifecycle = {
@@ -477,7 +489,7 @@ impl ReplicationRuntime {
         read(&lifecycle.host)
     }
 
-    pub(crate) fn membership_snapshot_for_test(&self) -> Arc<GroupMemberships> {
+    pub(crate) fn membership_snapshot_for_test(&self) -> Arc<dyn GroupMemberships> {
         self.with_host_for_test(DeliveryRuntimeHost::membership_snapshot)
     }
 

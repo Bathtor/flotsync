@@ -157,7 +157,7 @@ pub struct RouteEstablishmentComponent {
     /// Discovery claim signing and verification provider.
     credentials: Arc<dyn DiscoveryCredentials>,
     /// Shared local group membership snapshot used for outgoing and accepted discovery claims.
-    group_memberships: SharedGroupMemberships,
+    group_memberships: Arc<dyn SharedGroupMemberships>,
     /// Configured route establishment timing values.
     timing: RouteEstablishmentTiming,
     /// Runtime endpoint socket used for `IntroductionRequest`, `Introduction`, and replication.
@@ -178,7 +178,7 @@ impl RouteEstablishmentComponent {
         route_transport: ActorRefStrong<RouteTransportActorMessage<TransportRouteKey>>,
         local_member: MemberIdentity,
         credentials: Arc<dyn DiscoveryCredentials>,
-        group_memberships: SharedGroupMemberships,
+        group_memberships: Arc<dyn SharedGroupMemberships>,
     ) -> Self {
         let claim_routes = config.advertised_routes().clone();
         Self {
@@ -646,7 +646,7 @@ impl RouteEstablishmentComponent {
             );
             return Handled::OK;
         };
-        let group_ids = local_claim_group_ids(&self.group_memberships, &self.local_member);
+        let group_ids = local_claim_group_ids(self.group_memberships.as_ref(), &self.local_member);
         if self.claim_routes.is_empty() {
             trace!(
                 self.log(),
@@ -771,7 +771,7 @@ impl RouteEstablishmentComponent {
         &mut self,
         source: SocketAddr,
         route: DiscoveryRoute,
-        memberships: &GroupMemberships,
+        memberships: &dyn GroupMemberships,
         claim: PendingClaimVerification,
     ) -> Option<AuthenticatedClaimOutcome> {
         if !self.route_interest_permits_member(route, &claim.member) {
@@ -848,7 +848,7 @@ impl RouteEstablishmentComponent {
     async fn member_accepted_for_route_publication(
         &mut self,
         source: SocketAddr,
-        memberships: &GroupMemberships,
+        memberships: &dyn GroupMemberships,
         verified_claim: VerifiedIntroductionClaim,
     ) -> Option<MemberIdentity> {
         if !claim_is_consistent_with_group_memberships(
@@ -1305,18 +1305,13 @@ async fn verify_prepared_claim(
 
 /// Return the local groups whose current membership snapshot includes the local member.
 pub(super) fn local_claim_group_ids(
-    group_memberships: &SharedGroupMemberships,
+    group_memberships: &dyn SharedGroupMemberships,
     local_member: &MemberIdentity,
 ) -> Vec<GroupId> {
     let memberships = group_memberships.snapshot();
     memberships
-        .group_ids()
-        .copied()
-        .filter(|group_id| {
-            memberships
-                .members(group_id)
-                .is_some_and(|members| members.contains(local_member))
-        })
+        .groups()
+        .filter_map(|(group_id, members)| option_when!(members.contains(local_member), group_id))
         .collect()
 }
 
@@ -1325,7 +1320,7 @@ pub(super) fn local_claim_group_ids(
 /// Empty and locally unknown group sets return `true`: they provide no locally
 /// verifiable membership evidence, but also do not contradict local state.
 pub(super) fn claim_is_consistent_with_group_memberships(
-    memberships: &GroupMemberships,
+    memberships: &dyn GroupMemberships,
     member: &MemberIdentity,
     group_ids: &HashSet<GroupId>,
 ) -> bool {

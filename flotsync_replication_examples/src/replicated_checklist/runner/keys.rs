@@ -278,6 +278,12 @@ mod tests {
             panic!("checklist key tests must not request diagnostics")
         }
 
+        fn group_state(
+            &self,
+        ) -> Result<Arc<dyn flotsync_replication::ReplicationGroupSnapshot>, ApiError> {
+            panic!("checklist key tests must not request group state")
+        }
+
         fn shutdown(&self) -> Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + '_>> {
             future::ready(Ok(())).boxed()
         }
