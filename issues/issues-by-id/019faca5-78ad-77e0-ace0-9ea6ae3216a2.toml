@@ -1,0 +1,41 @@
+id = "019faca5-78ad-77e0-ace0-9ea6ae3216a2"
+ref = "flotsync-mrl"
+title = "Remove checklist local member identity from configuration"
+body = """
+Objective
+
+P01. Remove the replicated-checklist local member identity from application configuration and make locally stored identity state authoritative.
+
+Current problem
+
+P02. ChecklistAppConfig still requires local-member and passes it into SqliteReplicationStore construction before runtime loading.
+P03. Local private-key records and runtime loading also depend on a local member identity, so configuration and stored identity state can disagree even though the store should own the established local identity.
+P04. The flotsync-bks startup flow will centralise local identity initialisation, making this the next boundary to correct.
+
+Scope
+
+P05. Decide and implement how a new store selects and persists its local member identity during first-run local identity initialisation.
+P06. Make an existing store expose its authoritative local member identity without requiring the checklist configuration to repeat it.
+P07. Remove local-member from ChecklistAppConfig, example configuration, startup wiring, and relevant documentation.
+P08. Rework SqliteReplicationStore construction and the initial SQLite schema as needed so callers do not inject redundant local identity state.
+P09. Ensure runtime loading and local identity initialisation use the same stored identity source.
+P10. Reject missing, ambiguous, or inconsistent stored identity state with precise actionable errors rather than silently selecting an identity.
+P11. No migration or compatibility work is required because there are no deployed stores.
+
+Acceptance
+
+P12. A new checklist store can initialise one local identity without local-member configuration.
+P13. Restarting loads the same authoritative local identity from the store.
+P14. Configuration cannot override or conflict with the stored local identity.
+P15. Runtime startup, public-bundle export, group creation, and invitation handling continue to use the authoritative identity.
+P16. Focused tests cover first-run identity selection, restart, malformed or ambiguous identity state, and configuration parsing without local-member."""
+status = "open"
+type = "task"
+priority = 0
+blocked_by = ["019f4076-d998-7720-94b8-6cc1bddd76aa"]
+created_at = "2026-07-29T06:52:33.32526Z"
+updated_at = "2026-07-29T06:52:40.322141Z"
+
+[[links]]
+target = "019f4076-d998-7720-94b8-6cc1bddd76aa"
+label = "discovered from"
