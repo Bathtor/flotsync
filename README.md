@@ -76,7 +76,7 @@ Useful starting points include:
 
 - `docs/communication_protocol_spec.md` for the high-level replication protocol
   model.
-- `docs/flotsync_security_mvp.md` for the initial security model.
+- `docs/flotsync_security.md` for the security protocol and ownership model.
 - `docs/route_establishment.md` for verified direct UDP route discovery.
 - `docs/datagram_multipart_transfer.md` for UDPour.
 - `docs/group_broadcast_queue_model.md` for GroupBroadcast queue semantics.

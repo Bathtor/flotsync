@@ -369,8 +369,11 @@ impl ChecklistRepl {
                 "reading proposed group members",
             )
         };
-        let mut confirm_creation = confirm;
-        self.create_group_with_prompts(name, &mut read_member, &mut confirm_creation)
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
+        self.create_group_with_prompts(name, &mut read_member, &mut confirmation)
             .await
     }
 
@@ -379,7 +382,7 @@ impl ChecklistRepl {
         &mut self,
         name: Vec<String>,
         read_member: &mut dyn FnMut() -> Result<String, ReplicatedChecklistError>,
-        confirm_creation: &mut dyn FnMut(&str) -> Result<bool, ReplicatedChecklistError>,
+        confirmation: &mut ConfirmationDialog<'_>,
     ) -> Result<(), ReplicatedChecklistError> {
         let group_name = join_words(name).trim().to_owned();
         let mut known_members = self
@@ -398,7 +401,7 @@ impl ChecklistRepl {
             additional_members,
         );
         print_group_creation_summary(&request);
-        if !confirm_creation("Create this group and send invitations?")? {
+        if !confirmation.confirm("Create this group and send invitations?")? {
             println!("group creation cancelled");
             return Ok(());
         }
@@ -828,6 +831,7 @@ pub mod test_support {
         MemberKeyId,
         ReplicationGroupLifecycle,
         ReplicationGroupRecord,
+        ReplicationStore,
         current_slice_placeholder_group_security_material,
         current_slice_placeholder_group_security_material_with_key_id,
         providers::VecRowProvider,

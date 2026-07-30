@@ -33,23 +33,18 @@ store-path = "alice.sqlite"
 store-secret-profile = "alice-dev"
 ```
 
-Initialise the local private identity material before starting the runtime:
-
-```bash
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local alice.toml
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local bob.toml
-```
-
-`keys init-local` creates or reuses the peer's local identity keys in its
-configured store. It is the only key operation that runs before the replication
-runtime because loading that runtime requires the private identity material.
-
 Start each peer in a separate terminal:
 
 ```bash
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob.toml
 ```
+
+When the configured store does not exist, `run` asks before creating setup
+state and initialising local identity keys. Declining exits without creating the
+store or its local secret. When an existing store lacks local private keys,
+`run` offers the same initialisation and retries runtime startup exactly once
+after acceptance. Other startup errors are reported without invoking recovery.
 
 Once inside the REPL, export, inspect, trust, and block through the already
 unlocked runtime:
@@ -67,8 +62,7 @@ derives its fingerprint locally.
 
 `store-secret-profile` selects the device-local store secret for this
 application profile; the current implementation keeps that secret in OS-backed
-local storage and creates it on first use. The checklist no longer accepts a
-configured group id, ordered member list, or shared group-secret password.
+local storage and creates it only after first-run confirmation.
 
 ## Networking and Group Availability
 

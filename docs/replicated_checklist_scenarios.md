@@ -23,12 +23,9 @@ traffic between the peers.
 
 ## Setup
 
-Initialise local identity material, then start each peer from the repository
-root:
+Start each peer from the repository root:
 
 ```bash
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local alice.toml
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local bob.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob.toml
 ```
@@ -36,11 +33,15 @@ cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob
 For a release binary:
 
 ```bash
-target/release/replicated_checklist keys init-local alice.toml
-target/release/replicated_checklist keys init-local bob.toml
 target/release/replicated_checklist run alice.toml
 target/release/replicated_checklist run bob.toml
 ```
+
+On first use, each process asks whether it should create the store and initialise
+local identity keys. Answer `y` or `yes` to continue. Declining exits without
+creating the store or its setup state. An existing store that lacks local
+private identity keys offers the same initialisation and retries runtime startup
+once after acceptance.
 
 Inside each running REPL, print the local bundle:
 

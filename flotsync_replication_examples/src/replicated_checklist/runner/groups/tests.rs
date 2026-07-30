@@ -20,7 +20,7 @@ use flotsync_replication::{
     test_support::{replication_group_snapshot, snapshot_read_token},
 };
 use indoc::indoc;
-use std::{cell::Cell, sync::Mutex};
+use std::{io::Cursor, sync::Mutex};
 
 fn test_group_state(
     groups: impl IntoIterator<Item = flotsync_replication::ReplicationGroupRecord>,
@@ -333,21 +333,21 @@ fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_cle
     let session = ChecklistSession::new(ChecklistWorkingSet::new());
     let mut repl = ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
     let mut read_members = || Ok(String::new());
-    let confirmation_count = Cell::new(0);
-    let mut confirm_creation = |prompt: &str| {
-        assert_eq!(prompt, "Create this group and send invitations?");
-        confirmation_count.set(confirmation_count.get() + 1);
-        Ok(true)
-    };
+    let mut input = Cursor::new(b"yes\n".as_slice());
+    let mut output = Vec::new();
+    let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
 
     block_on(repl.create_group_with_prompts(
         vec!["shared".to_owned()],
         &mut read_members,
-        &mut confirm_creation,
+        &mut confirmation,
     ))
     .expect("creation handler should complete");
 
-    assert_eq!(confirmation_count.get(), 1);
+    assert_eq!(
+        String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+        "Create this group and send invitations? [y/N] "
+    );
     assert_eq!(repl.session.default_group, None);
     let group_state = runtime
         .group_state()

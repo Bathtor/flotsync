@@ -26,11 +26,10 @@ use flotsync_replication::{
     GroupInvitation,
     GroupInvitationResponder,
     GroupSchema,
+    InitialiseLocalIdentityError,
     ListenerError,
     LoadError,
     LoadSecurityError,
-    MemberPublicKeysRecord,
-    ProvisionSecurityError,
     PublishChangesRequest,
     ReadToken,
     RejectionReason,
@@ -40,7 +39,6 @@ use flotsync_replication::{
     ReplicationEventListener,
     ReplicationGroupView,
     ReplicationSecuritySecrets,
-    ReplicationStore,
     RowChange,
     RowProviderError,
     SnapshotRowsRequest,
@@ -48,9 +46,8 @@ use flotsync_replication::{
     StoreError,
     StoreSecretKeyId,
     SummaryRequest,
-    load_local_public_key_bundle,
+    initialise_local_identity,
     load_replication_runtime_with_runtime_config_toml,
-    provision_replication_security,
     security::{
         AssessPublicKeyBundleRequest,
         KnownMemberKeysReport,
@@ -66,7 +63,6 @@ use flotsync_security::{
     STORE_SECRET_KEY_LENGTH,
     SecurityError,
     StoreSecretKey,
-    generate_member_key_bundles,
 };
 use futures_util::{FutureExt, future::join_all};
 use itertools::Itertools;
@@ -77,7 +73,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     future::Future,
-    io::{self, Write},
+    io::{self, BufRead, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
@@ -128,21 +124,6 @@ pub enum ReplicatedChecklistCommand {
         /// Path to the node-specific checklist TOML config.
         config: PathBuf,
     },
-    /// Initialise store-native checklist identity keys before runtime startup.
-    Keys {
-        #[command(subcommand)]
-        command: ReplicatedChecklistKeyCommand,
-    },
-}
-
-/// Pre-runtime local identity commands.
-#[derive(Clone, Debug, Subcommand)]
-pub enum ReplicatedChecklistKeyCommand {
-    /// Create or reuse this peer's local identity keys.
-    InitLocal {
-        /// Path to the node-specific checklist TOML config.
-        config: PathBuf,
-    },
 }
 
 /// Run one configured replicated checklist REPL.
@@ -157,7 +138,6 @@ pub enum ReplicatedChecklistKeyCommand {
 pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError> {
     match args.command {
         ReplicatedChecklistCommand::Run { config } => block_on(repl::run_configured_peer(&config)),
-        ReplicatedChecklistCommand::Keys { command } => block_on(keys::run_key_command(command)),
     }
 }
 
@@ -174,10 +154,9 @@ pub enum ReplicatedChecklistError {
         action: &'static str,
         source: SecurityError,
     },
-    #[snafu(display("Security provisioning failed while {action}: {source}"))]
-    ProvisionSecurity {
-        action: &'static str,
-        source: ProvisionSecurityError,
+    #[snafu(display("Failed to initialise local identity: {source}"))]
+    InitialiseLocalIdentity {
+        source: InitialiseLocalIdentityError,
     },
     #[snafu(display("Failed to prepare checklist store directory {}: {source}", path.display()))]
     CreateStoreDirectory { path: PathBuf, source: io::Error },
@@ -248,24 +227,6 @@ pub enum ReplicatedChecklistError {
     InvalidConfirmationResponse { response: String },
 }
 
-/// Read one fail-closed confirmation from standard input.
-fn confirm(prompt: &str) -> Result<bool, ReplicatedChecklistError> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush().context(repl_error::IoSnafu {
-        action: "flushing confirmation prompt",
-    })?;
-    let mut answer = String::new();
-    let bytes_read = io::stdin()
-        .read_line(&mut answer)
-        .context(repl_error::IoSnafu {
-            action: "reading confirmation",
-        })?;
-    if bytes_read == 0 {
-        return Ok(false);
-    }
-    parse_confirmation(&answer)
-}
-
 /// Parse one confirmation answer while rejecting unrecognised input.
 fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
     let answer = answer.trim();
@@ -280,34 +241,46 @@ fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
     })
 }
 
+/// Fail-closed confirmation interaction over an explicit input and output pair.
+struct ConfirmationDialog<'io> {
+    /// Buffered source of confirmation answers.
+    input: &'io mut dyn BufRead,
+    /// Destination for prompts shown before reading an answer.
+    output: &'io mut dyn Write,
+}
+
+impl<'io> ConfirmationDialog<'io> {
+    /// Build one confirmation dialog over the supplied input and output.
+    fn new(input: &'io mut dyn BufRead, output: &'io mut dyn Write) -> Self {
+        Self { input, output }
+    }
+
+    /// Prompt once and interpret a missing or negative answer as refusal.
+    fn confirm(&mut self, prompt: &str) -> Result<bool, ReplicatedChecklistError> {
+        write!(self.output, "{prompt} [y/N] ").context(repl_error::IoSnafu {
+            action: "writing confirmation prompt",
+        })?;
+        self.output.flush().context(repl_error::IoSnafu {
+            action: "flushing confirmation prompt",
+        })?;
+        let mut answer = String::new();
+        let bytes_read = self
+            .input
+            .read_line(&mut answer)
+            .context(repl_error::IoSnafu {
+                action: "reading confirmation",
+            })?;
+        if bytes_read == 0 {
+            Ok(false)
+        } else {
+            parse_confirmation(&answer)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn top_level_retains_only_local_key_initialisation() {
-        let init = ReplicatedChecklistArgs::try_parse_from([
-            "replicated-checklist",
-            "keys",
-            "init-local",
-            "alice.toml",
-        ])
-        .expect("init command should parse");
-        assert!(matches!(
-            init.command,
-            ReplicatedChecklistCommand::Keys {
-                command: ReplicatedChecklistKeyCommand::InitLocal { .. }
-            }
-        ));
-
-        let former_export = ReplicatedChecklistArgs::try_parse_from([
-            "replicated-checklist",
-            "keys",
-            "export-local",
-            "alice.toml",
-        ]);
-        assert!(former_export.is_err());
-    }
 
     #[test]
     fn confirmation_distinguishes_yes_no_and_unexpected_answers() {

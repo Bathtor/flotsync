@@ -99,16 +99,49 @@ Estimate and conformance
 
 B37. Estimated implementation size is 700-950 touched LOC across the replication initialisation boundary, checklist startup and CLI cleanup, focused tests, exports, and documentation. The work should remain below 1,000 LOC and does not need splitting.
 
-B38. Preserve repository Rust, Snafu, formatting, pedantic Clippy, socket-reservation, documentation, and single-threaded sandbox test requirements. No migration or compatibility work is required."""
-status = "in-progress"
-status_reason = "plan agreed"
+B38. Preserve repository Rust, Snafu, formatting, pedantic Clippy, socket-reservation, documentation, and single-threaded sandbox test requirements. No migration or compatibility work is required.
+
+Agreed review fixes
+
+B39. Exercise first-run refusal with a unique managed store-secret profile and the process-global sample keyring. Assert that the profile remains missing as well as that no filesystem setup state exists.
+
+B40. Keep decoded LocalMemberKeys through local identity initialisation. Build the stored public-key record directly from its identity-bound public keys and derive the returned identity-free bundle once, avoiding a clone-and-rebind round trip.
+
+B41. Split wrong-secret and store-secret-key-id mismatch tests into precisely named cases. Add correctly sealed malformed private material that must return InvalidPrivateBundle.
+
+B42. Assert complete, exact recovery error rendering rather than substring membership when the full display contract is knowable.
+
+B43. Use separate confirmation text for first-run setup and existing-store key recovery. The first-run prompt names the store path and explains that acceptance sets up the store, local secret, and identity keys; tests assert complete prompt text.
+
+B44. Rename docs/flotsync_security_mvp.md to docs/flotsync_security.md and maintain it as the current Flotsync security protocol overview. Remove obsolete MVP and first-slice framing, remove already-completed deferred work, update README links, regenerate docs/index.md, and validate the OKF corpus while preserving still-current protocol rules.
+
+B45. Do not add a local-identity partial-write failure-injection test. Both security writes occur before the sole commit in one rollback-by-default ReplicationStoreTransaction; partial application is excluded by the store transaction contract and belongs to store transaction testing.
+
+B46. The agreed review-fix delta is estimated at 160-240 LOC and remains a single self-contained review pass.
+
+Second agreed review fixes
+
+B47. Remove obsolete negative documentation about checklist configuration fields that no longer exist; document only the current store-secret profile behaviour.
+
+B48. Remove the low-value top-level parser test for the sole remaining command while retaining behavioural confirmation parsing coverage.
+
+B49. Report declined identity initialisation inside the setup or recovery helper that observes the decision. At the entry point, report the affected operation as store setup cancelled or runtime load aborted.
+
+B50. Replace opaque mutable confirmation callbacks throughout checklist startup and runtime key commands with one private ConfirmationDialog over borrowed buffered input and writable output. Production binds it to standard input/output; tests use in-memory cursors and buffers.
+
+B51. Preserve exact prompt assertions through the dialog output and scripted answer input while retaining acceptance, refusal, no-prompt, retry-once, and runtime-key confirmation coverage.
+
+B52. The second agreed review delta is estimated at 130-230 touched LOC and remains a single self-contained review pass below 1,000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 3
 assignee = "codex"
 blocked_by = ["019f502e-2262-70a0-bf74-6da295fff88e"]
 blocks = ["019faca5-78ad-77e0-ace0-9ea6ae3216a2"]
 created_at = "2026-07-08T06:42:38.616686Z"
-updated_at = "2026-07-29T06:57:52.349049Z"
+updated_at = "2026-07-30T15:56:54.574228Z"
+closed_at = "2026-07-30T15:56:54.574228Z"
 
 [[links]]
 target = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"
@@ -119,3 +152,39 @@ id = "019facaa-56dd-7d51-aab3-ccb34c616b99"
 author = "lkroll"
 body = "Plan agreed: replace piecemeal provisioning with one idempotent replication-owned local identity initialiser; remove the top-level checklist key-init command; prompt and recover during ordinary startup; preserve a truly side-effect-free decline when the store path is absent; make missing-key recovery discoverable through LoadError and its documentation; and defer configuration-owned member identity removal to P0 follow-up flotsync-mrl."
 created_at = "2026-07-29T06:57:52.349049Z"
+
+[[comments]]
+id = "019faf17-534b-7cf0-9600-f380b98144ad"
+author = "codex"
+body = "Implementation completed against B01-B38: added the replication-owned initialise_local_identity API and missing-key classifier/guidance; switched checklist run startup to confirmed first-run creation and one-shot missing-key recovery; removed the separate key initialisation command and obsolete provisioning surface; retained runtime key commands; updated usage/security documentation; and added coverage for create/reuse/repair, invalid security, prompt acceptance/refusal, no-prompt startup, non-missing errors, and retry-once behaviour. Validation passed for the replication library (234 tests), checklist example library (73 tests), workspace all-target check, pedantic Clippy, rustfmt check, and focused post-Clippy startup tests."
+created_at = "2026-07-29T18:16:09.291541Z"
+
+[[comments]]
+id = "019faf29-cc01-7121-9ae5-e7b0fe01482c"
+author = "codex"
+body = "Review plan agreed: strengthen first-run refusal coverage with the sample keyring; remove the public-bundle clone/rebind round trip; separate invalid-material tests and add malformed plaintext coverage; assert complete recovery error and prompt rendering; use distinct first-run and existing-store prompts; and rename the maintained security protocol overview to docs/flotsync_security.md with OKF link/index updates. The proposed partial-write failure-injection test was withdrawn because both writes are enclosed by the same rollback-by-default transaction and a single commit."
+created_at = "2026-07-29T18:36:19.84132Z"
+
+[[comments]]
+id = "019faf31-8adc-7b42-a055-65bf44fdd399"
+author = "codex"
+body = "Review fixes C01-C07 reconciled. Implemented sample-keyring refusal verification; retained identity-bound LocalMemberKeys without clone/rebind; split wrong-secret and key-id tests and added correctly sealed malformed material; switched recovery error and startup prompt tests to exact complete strings; separated first-run and existing-store prompts; and renamed the maintained security overview to docs/flotsync_security.md with regenerated links/index. C02 remains intentionally withdrawn because private and public writes share one rollback-by-default transaction and one commit. Validation passed: 236 flotsync_replication tests, 73 flotsync_replication_examples tests, workspace all-target check, pedantic Clippy, rustfmt check, git diff check, and OKF validation for 16 documents."
+created_at = "2026-07-29T18:44:47.452635Z"
+
+[[comments]]
+id = "019fb1c1-0591-7a50-9c35-e90020bf39fb"
+author = "codex"
+body = "Second review plan agreed: remove obsolete negative documentation and the low-value top-level parser test; report identity-decline causes inside setup/recovery helpers and operation-level cancellation at the entry point; replace opaque mutable confirmation callbacks with a concrete ConfirmationDialog backed by borrowed input/output; and adapt startup plus runtime-key tests to scripted input and exact rendered prompts."
+created_at = "2026-07-30T06:40:44.945836Z"
+
+[[comments]]
+id = "019fb1cc-1f3c-7581-a40f-af9af5aa93f3"
+author = "codex"
+body = "Review fixes C08-C12 implemented: removed obsolete negative checklist documentation and the low-value top-level parser test; moved identity-decline feedback into setup/recovery helpers with store-setup and runtime-abort messages at the entry point; replaced every checklist confirmation callback, including startup, key commands, and group creation, with the concrete ConfirmationDialog over borrowed buffered input/output; and converted affected tests to scripted answers plus exact rendered prompts. Validation passed: 236 replication tests, 72 checklist tests, workspace all-target check, warning-free pedantic Clippy, rustfmt, diff checks, Rust instruction audit, and OKF validation for 16 documents."
+created_at = "2026-07-30T06:52:52.412715Z"
+
+[[comments]]
+id = "019fb3be-33ae-7e33-910e-8e3b2894f0f5"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-30T15:56:54.574228Z"

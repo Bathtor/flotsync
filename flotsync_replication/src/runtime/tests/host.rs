@@ -8,8 +8,13 @@ fn load_replication_runtime_accepts_store_provisioned_security() {
     let application_id = app_probe_id();
     let store = sqlite_store(alice_member());
     let security = setup_api_test_security_secrets();
-    let expected_public_bundle =
-        provision_runtime_security_through_setup_api(store.as_ref(), &alice_member(), &security);
+    let initialised = initialise_runtime_security_through_setup_api(store.as_ref(), &security);
+    assert_eq!(initialised.member_id(), &alice_member());
+    assert!(initialised.was_created());
+    let expected_public_bundle = initialised.into_public_bundle();
+    let reused = initialise_runtime_security_through_setup_api(store.as_ref(), &security);
+    assert!(!reused.was_created());
+    assert_eq!(reused.public_bundle(), &expected_public_bundle);
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
 
@@ -131,6 +136,17 @@ fn load_replication_runtime_rejects_missing_local_private_keys() {
         panic!("public runtime loading should reject missing security provisioning");
     };
 
+    assert_eq!(
+        error.missing_local_private_keys_member(),
+        Some(&alice_member())
+    );
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "Failed to load replication security for application '{application_id}': Local private keys for member {} are not initialised. Call flotsync_replication::initialise_local_identity before retrying runtime loading.",
+            alice_member()
+        )
+    );
     let error = security_load_error(error, &application_id);
     assert!(matches!(
         &error,
@@ -162,6 +178,7 @@ fn load_replication_runtime_rejects_wrong_store_secret_key() {
         panic!("public runtime loading should reject wrong store-secret key");
     };
 
+    assert_eq!(error.missing_local_private_keys_member(), None);
     let error = security_load_error(error, &application_id);
     assert!(matches!(
         &error,

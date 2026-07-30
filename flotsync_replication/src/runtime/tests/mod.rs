@@ -31,6 +31,7 @@ use super::{
     load_replication_runtime_with_runtime_config_toml,
 };
 use crate::{
+    LocalIdentityInitialisation,
     MAX_VERSION_VALUE,
     SqliteReplicationStore,
     api::{
@@ -131,7 +132,7 @@ use crate::{
         UpdateMessage,
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
-    provision_replication_security,
+    initialise_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
     test_support::{
         load_test_delivery_security,
@@ -159,11 +160,9 @@ use flotsync_io::test_support::{
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     KeyFingerprint,
-    PublicKeyBundle,
     PublicMemberKeys,
     StoreSecretKey,
     install_local_store_secret_test_store,
-    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_bundles_from_seed},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;

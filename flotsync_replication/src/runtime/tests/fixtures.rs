@@ -123,29 +123,17 @@ pub(super) fn provision_test_security<S>(
     .expect("test security should provision");
 }
 
-/// Provision local keys through the public setup API so runtime-loading tests
-/// cover the same store records normal application setup writes.
-pub(super) fn provision_runtime_security_through_setup_api<S>(
+/// Initialise local keys through the public setup API so runtime-loading tests cover the same
+/// store records as normal application setup.
+pub(super) fn initialise_runtime_security_through_setup_api<S>(
     store: &S,
-    local_member: &MemberIdentity,
     security: &ReplicationSecuritySecrets,
-) -> PublicKeyBundle
+) -> LocalIdentityInitialisation
 where
     S: ReplicationStore,
 {
-    let seed = [37; TEST_MEMBER_KEY_SEED_LENGTH];
-    let generated = member_key_bundles_from_seed(local_member.clone(), &seed);
-    let public_bundle = PublicKeyBundle::from_bytes(&generated.public_bundle)
-        .expect("generated public bundle should decode");
-    wait_for_test_reply(provision_replication_security(
-        store,
-        local_member,
-        security,
-        generated.local_private_bundle.as_bytes(),
-        std::iter::empty(),
-    ))
-    .expect("setup API security should provision");
-    public_bundle
+    wait_for_test_reply(initialise_local_identity(store, security))
+        .expect("setup API security should initialise")
 }
 
 pub(super) fn setup_api_test_security_secrets() -> ReplicationSecuritySecrets {
