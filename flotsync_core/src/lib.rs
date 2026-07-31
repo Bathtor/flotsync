@@ -5,4 +5,4 @@ pub mod membership;
 pub mod uuid_encodings;
 pub mod versions;
 
-pub use ids::{GroupId, MemberIdentity, MemberIndex};
+pub use ids::{ApplicationId, GroupId, MemberIdentity, MemberIndex};

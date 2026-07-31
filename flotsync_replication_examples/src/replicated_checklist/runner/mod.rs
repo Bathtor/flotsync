@@ -29,8 +29,8 @@ use flotsync_replication::{
     ListenerError,
     LoadError,
     LoadSecurityError,
-    MemberPublicKeysRecord,
-    ProvisionSecurityError,
+    LocalIdentityProvisioningStore,
+    ProvisionLocalIdentityError,
     PublishChangesRequest,
     ReadToken,
     RejectionReason,
@@ -45,12 +45,12 @@ use flotsync_replication::{
     RowProviderError,
     SnapshotRowsRequest,
     SqliteReplicationStore,
+    SqliteReplicationStoreProvisioner,
     StoreError,
     StoreSecretKeyId,
     SummaryRequest,
-    load_local_public_key_bundle,
     load_replication_runtime_with_runtime_config_toml,
-    provision_replication_security,
+    provision_local_identity,
     security::{
         AssessPublicKeyBundleRequest,
         KnownMemberKeysReport,
@@ -66,7 +66,6 @@ use flotsync_security::{
     STORE_SECRET_KEY_LENGTH,
     SecurityError,
     StoreSecretKey,
-    generate_member_key_bundles,
 };
 use futures_util::{FutureExt, future::join_all};
 use itertools::Itertools;
@@ -77,7 +76,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     future::Future,
-    io::{self, Write},
+    io::{self, BufRead, Write},
     num::NonZeroUsize,
     path::{Path, PathBuf},
     pin::Pin,
@@ -128,21 +127,6 @@ pub enum ReplicatedChecklistCommand {
         /// Path to the node-specific checklist TOML config.
         config: PathBuf,
     },
-    /// Initialise store-native checklist identity keys before runtime startup.
-    Keys {
-        #[command(subcommand)]
-        command: ReplicatedChecklistKeyCommand,
-    },
-}
-
-/// Pre-runtime local identity commands.
-#[derive(Clone, Debug, Subcommand)]
-pub enum ReplicatedChecklistKeyCommand {
-    /// Create or reuse this peer's local identity keys.
-    InitLocal {
-        /// Path to the node-specific checklist TOML config.
-        config: PathBuf,
-    },
 }
 
 /// Run one configured replicated checklist REPL.
@@ -157,7 +141,6 @@ pub enum ReplicatedChecklistKeyCommand {
 pub fn run(args: ReplicatedChecklistArgs) -> Result<(), ReplicatedChecklistError> {
     match args.command {
         ReplicatedChecklistCommand::Run { config } => block_on(repl::run_configured_peer(&config)),
-        ReplicatedChecklistCommand::Keys { command } => block_on(keys::run_key_command(command)),
     }
 }
 
@@ -174,11 +157,8 @@ pub enum ReplicatedChecklistError {
         action: &'static str,
         source: SecurityError,
     },
-    #[snafu(display("Security provisioning failed while {action}: {source}"))]
-    ProvisionSecurity {
-        action: &'static str,
-        source: ProvisionSecurityError,
-    },
+    #[snafu(display("Failed to provision local identity: {source}"))]
+    ProvisionLocalIdentity { source: ProvisionLocalIdentityError },
     #[snafu(display("Failed to prepare checklist store directory {}: {source}", path.display()))]
     CreateStoreDirectory { path: PathBuf, source: io::Error },
     #[snafu(display("Failed to open checklist replication store: {source}"))]
@@ -227,8 +207,8 @@ pub enum ReplicatedChecklistError {
     NoDefaultGroup,
     #[snafu(display("Listener reported changes for unknown checklist group {group_id}."))]
     UnknownListenerGroup { group_id: GroupId },
-    #[snafu(display("Proposed group member identity is invalid: {source}"))]
-    InvalidGroupMemberIdentity { source: IdentifierParseError },
+    #[snafu(display("Member identity is invalid: {source}"))]
+    InvalidMemberIdentity { source: IdentifierParseError },
     #[snafu(display("Member {member_id} occurs more than once in the proposed group."))]
     DuplicateGroupMember { member_id: MemberIdentity },
     #[snafu(display(
@@ -248,24 +228,6 @@ pub enum ReplicatedChecklistError {
     InvalidConfirmationResponse { response: String },
 }
 
-/// Read one fail-closed confirmation from standard input.
-fn confirm(prompt: &str) -> Result<bool, ReplicatedChecklistError> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush().context(repl_error::IoSnafu {
-        action: "flushing confirmation prompt",
-    })?;
-    let mut answer = String::new();
-    let bytes_read = io::stdin()
-        .read_line(&mut answer)
-        .context(repl_error::IoSnafu {
-            action: "reading confirmation",
-        })?;
-    if bytes_read == 0 {
-        return Ok(false);
-    }
-    parse_confirmation(&answer)
-}
-
 /// Parse one confirmation answer while rejecting unrecognised input.
 fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
     let answer = answer.trim();
@@ -280,34 +242,77 @@ fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
     })
 }
 
+/// Typed checklist interaction over an explicit input and output pair.
+struct ChecklistDialog<'io> {
+    /// Buffered source of checklist answers.
+    input: &'io mut dyn BufRead,
+    /// Destination for prompts shown before reading an answer.
+    output: &'io mut dyn Write,
+}
+
+impl<'io> ChecklistDialog<'io> {
+    /// Build one checklist dialog over the supplied input and output.
+    fn new(input: &'io mut dyn BufRead, output: &'io mut dyn Write) -> Self {
+        Self { input, output }
+    }
+
+    /// Prompt once and interpret a missing or negative answer as refusal.
+    fn confirm(&mut self, prompt: &str) -> Result<bool, ReplicatedChecklistError> {
+        let answer = self.read_line(&format!("{prompt} [y/N] "), "reading confirmation")?;
+        parse_confirmation(&answer)
+    }
+
+    /// Prompt once and return the entered line without its line terminator.
+    fn read_line(
+        &mut self,
+        prompt: &str,
+        action: &'static str,
+    ) -> Result<String, ReplicatedChecklistError> {
+        write!(self.output, "{prompt}").context(repl_error::IoSnafu {
+            action: "writing checklist prompt",
+        })?;
+        self.output.flush().context(repl_error::IoSnafu {
+            action: "flushing checklist prompt",
+        })?;
+        let mut answer = String::new();
+        self.input
+            .read_line(&mut answer)
+            .context(repl_error::IoSnafu { action })?;
+        Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    /// Read one required member identity.
+    fn read_member_identity(
+        &mut self,
+        prompt: &str,
+    ) -> Result<MemberIdentity, ReplicatedChecklistError> {
+        let raw = self.read_line(prompt, "reading member identity")?;
+        raw.trim()
+            .parse()
+            .context(repl_error::InvalidMemberIdentitySnafu)
+    }
+
+    /// Read one optional member identity, interpreting a blank line as completion.
+    fn read_optional_member_identity(
+        &mut self,
+        prompt: &str,
+    ) -> Result<Option<MemberIdentity>, ReplicatedChecklistError> {
+        let raw = self.read_line(prompt, "reading member identity")?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            Ok(None)
+        } else {
+            let member = raw
+                .parse()
+                .context(repl_error::InvalidMemberIdentitySnafu)?;
+            Ok(Some(member))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn top_level_retains_only_local_key_initialisation() {
-        let init = ReplicatedChecklistArgs::try_parse_from([
-            "replicated-checklist",
-            "keys",
-            "init-local",
-            "alice.toml",
-        ])
-        .expect("init command should parse");
-        assert!(matches!(
-            init.command,
-            ReplicatedChecklistCommand::Keys {
-                command: ReplicatedChecklistKeyCommand::InitLocal { .. }
-            }
-        ));
-
-        let former_export = ReplicatedChecklistArgs::try_parse_from([
-            "replicated-checklist",
-            "keys",
-            "export-local",
-            "alice.toml",
-        ]);
-        assert!(former_export.is_err());
-    }
 
     #[test]
     fn confirmation_distinguishes_yes_no_and_unexpected_answers() {

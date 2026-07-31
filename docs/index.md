@@ -23,7 +23,7 @@ Do not edit it directly.
 ## Protocol
 
 - [FlotSync Communication Protocol](communication_protocol_spec.md) - Defines the high-level Flotsync replication communication model and its sub-protocol boundaries.
-- [Flotsync Security MVP](flotsync_security_mvp.md) - Defines the initial Flotsync security model for identities, group secrets, encryption, and signatures.
+- [Flotsync Security](flotsync_security.md) - Defines the Flotsync security model for identities, group secrets, encryption, and signatures.
 - [Route Establishment Protocol](route_establishment.md) - Specifies non-mDNS route establishment for verified replication route candidates.
 - [Single-Recipient Durable Delivery](single_recipient_durable_delivery.md) - Specifies sender, recipient, and relay rules for single-recipient delivery with crash-survival expectations.
 - [UDPour](datagram_multipart_transfer.md) - Specifies the multipart datagram protocol for carrying oversized logical payloads over one UDP route.

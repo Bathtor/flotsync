@@ -1,5 +1,5 @@
 use super::StoreSecretKeyId;
-use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembersError};
+use flotsync_core::{ApplicationId, GroupId, MemberIdentity, membership::GroupMembersError};
 use flotsync_security::LocalStoreSecretError;
 pub use flotsync_utils::BoxError;
 use snafu::{Location, prelude::*};
@@ -81,9 +81,6 @@ pub enum LoadSecurityError {
         #[snafu(source(from(LocalStoreSecretError, Box::new)))]
         source: Box<LocalStoreSecretError>,
     },
-    /// The store does not contain private keys for the local member.
-    #[snafu(display("Local private keys for member {member_id} are not provisioned."))]
-    MissingLocalPrivateKeys { member_id: MemberIdentity },
     /// The local private-key record exists but cannot be used with the provided setup.
     #[snafu(display("Local private keys for member {member_id} are invalid: {source}"))]
     InvalidLocalPrivateKeys {
@@ -173,16 +170,16 @@ pub enum LoadSecurityError {
 pub enum LoadError {
     #[snafu(display("Failed to load replication for application '{application_id}': {source}"))]
     Runtime {
-        application_id: Identifier,
+        application_id: ApplicationId,
         source: BoxError,
     },
     #[snafu(display(
         "Failed to load replication security for application '{application_id}': {source}"
     ))]
     Security {
-        application_id: Identifier,
+        application_id: ApplicationId,
         source: Box<LoadSecurityError>,
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
-    Unavailable { application_id: Identifier },
+    Unavailable { application_id: ApplicationId },
 }

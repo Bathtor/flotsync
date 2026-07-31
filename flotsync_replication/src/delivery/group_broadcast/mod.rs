@@ -541,12 +541,13 @@ mod tests {
             TestGroupMemberships,
             load_test_delivery_security,
             provision_test_security,
+            provisioned_sqlite_store,
             test_group_key,
             test_public_member_keys,
         },
     };
     use bytes::Bytes;
-    use flotsync_core::{membership::GroupMemberships, versions::VersionVector};
+    use flotsync_core::{ApplicationId, membership::GroupMemberships, versions::VersionVector};
     use flotsync_io::{
         prelude::UdpLocalBind,
         test_support::{WAIT_TIMEOUT, eventually_component_state, localhost, start_component},
@@ -1430,11 +1431,11 @@ mod tests {
         trusted_members: HashSet<MemberIdentity>,
         member_key_fingerprint_overrides: &HashMap<MemberIdentity, KeyFingerprint>,
     ) -> (DeliverySecurity, Arc<SqliteReplicationStore>) {
-        let store = block_on(SqliteReplicationStore::in_memory(local_member.clone()))
-            .expect("security store should build");
-        let store = Arc::new(store);
+        let store = provisioned_sqlite_store(local_member);
+        let application_id =
+            ApplicationId::from_array(["group-broadcast", "delivery-security-test"]);
         block_on(provision_test_security(
-            local_member.clone(),
+            application_id.clone(),
             store.as_ref(),
             local_member,
             trusted_members,
@@ -1442,7 +1443,7 @@ mod tests {
         .expect("test security should provision");
         let security_store: Arc<dyn ReplicationStore> = store.clone();
         let security = block_on(load_test_delivery_security(
-            local_member.clone(),
+            application_id,
             security_store,
             local_member,
         ))

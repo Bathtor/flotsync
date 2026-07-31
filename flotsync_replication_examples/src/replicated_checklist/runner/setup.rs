@@ -2,39 +2,56 @@
 
 use super::*;
 
-/// Store and security resources shared by pre-runtime commands and runtime loading.
+/// Load and validate checklist configuration without creating setup state.
+pub(super) fn load_checklist_config(
+    config_path: &Path,
+) -> Result<ChecklistAppConfig, ReplicatedChecklistError> {
+    ChecklistAppConfig::load(config_path).context(repl_error::ConfigSnafu)
+}
+
+/// Create one empty checklist store provisioner after first-run confirmation.
+pub(super) async fn create_checklist_store_provisioner(
+    config: ChecklistAppConfig,
+) -> Result<ChecklistStoreProvisioning, ReplicatedChecklistError> {
+    ensure_store_parent_exists(&config.store_path)?;
+    let store = SqliteReplicationStoreProvisioner::create_file_with_schema_sources(
+        &config.store_path,
+        [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
+    )
+    .await
+    .context(repl_error::StoreSnafu)?;
+    Ok(ChecklistStoreProvisioning { config, store })
+}
+
+/// Open an existing checklist store without assuming that it has been provisioned.
+pub(super) async fn open_checklist_store_provisioner(
+    config: ChecklistAppConfig,
+) -> Result<ChecklistStoreProvisioning, ReplicatedChecklistError> {
+    let store = SqliteReplicationStoreProvisioner::open_file_with_schema_sources(
+        &config.store_path,
+        [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
+    )
+    .await
+    .context(repl_error::StoreSnafu)?;
+    Ok(ChecklistStoreProvisioning { config, store })
+}
+
+/// Store resources available while local identity provisioning is still optional.
+pub(super) struct ChecklistStoreProvisioning {
+    pub(super) config: ChecklistAppConfig,
+    pub(super) store: SqliteReplicationStoreProvisioner,
+}
+
+/// Store and security resources used while loading one configured runtime.
 pub(super) struct ChecklistStoreSetup {
     pub(super) config: ChecklistAppConfig,
+    pub(super) local_member: MemberIdentity,
     pub(super) replication_security: ReplicationSecuritySecrets,
     pub(super) store: Arc<SqliteReplicationStore>,
 }
 
-/// Load config, local store secret, and the `SQLite` store for a checklist command.
-pub(super) async fn load_checklist_store_setup(
-    config_path: &Path,
-) -> Result<ChecklistStoreSetup, ReplicatedChecklistError> {
-    let config = ChecklistAppConfig::load(config_path).context(repl_error::ConfigSnafu)?;
-    let replication_security =
-        load_checklist_replication_security(&config).context(repl_error::LocalStoreSecretSnafu)?;
-    ensure_store_parent_exists(&config.store_path)?;
-    let store = Arc::new(
-        SqliteReplicationStore::file_with_schema_sources(
-            config.local_member.clone(),
-            &config.store_path,
-            [(checklist_dataset_id(), &*CHECKLIST_SCHEMA)],
-        )
-        .await
-        .context(repl_error::StoreSnafu)?,
-    );
-    Ok(ChecklistStoreSetup {
-        config,
-        replication_security,
-        store,
-    })
-}
-
-/// Resolve the local store-secret profile into runtime security input.
-pub(super) fn load_checklist_replication_security(
+/// Load the existing local store secret required by an existing checklist store.
+pub(super) fn load_existing_checklist_replication_security(
     config: &ChecklistAppConfig,
 ) -> Result<ReplicationSecuritySecrets, LoadSecurityError> {
     if config
@@ -42,15 +59,53 @@ pub(super) fn load_checklist_replication_security(
         .as_str()
         .starts_with(UNSAFE_STORE_SECRET_PROFILE_PREFIX)
     {
-        // TODO(flotsync-lsi8): Route headless configs through the real local
-        // store-secret backend instead of deriving secrets from config text.
-        return Ok(derive_unsafe_checklist_replication_security(config));
+        Ok(derive_unsafe_checklist_replication_security(config))
+    } else {
+        ReplicationSecuritySecrets::load_local(
+            &checklist_application_id(),
+            &config.store_secret_profile,
+        )
     }
+}
 
-    ReplicationSecuritySecrets::load_or_create_local(
-        &checklist_application_id(),
-        &config.store_secret_profile,
-    )
+/// Load or create the local store secret for an accepted first-run setup.
+pub(super) fn load_or_create_checklist_replication_security(
+    config: &ChecklistAppConfig,
+) -> Result<ReplicationSecuritySecrets, LoadSecurityError> {
+    if config
+        .store_secret_profile
+        .as_str()
+        .starts_with(UNSAFE_STORE_SECRET_PROFILE_PREFIX)
+    {
+        Ok(derive_unsafe_checklist_replication_security(config))
+    } else {
+        ReplicationSecuritySecrets::load_or_create_local(
+            &checklist_application_id(),
+            &config.store_secret_profile,
+        )
+    }
+}
+
+/// Activate a provisioned checklist store and retain its authoritative local identity.
+pub(super) async fn activate_checklist_store_setup(
+    provisioning: ChecklistStoreProvisioning,
+    replication_security: ReplicationSecuritySecrets,
+) -> Result<ChecklistStoreSetup, ReplicatedChecklistError> {
+    let store = provisioning
+        .store
+        .into_replication_store()
+        .await
+        .context(repl_error::StoreSnafu)?;
+    let local_member = store
+        .local_member_identity()
+        .await
+        .context(repl_error::StoreSnafu)?;
+    Ok(ChecklistStoreSetup {
+        config: provisioning.config,
+        local_member,
+        replication_security,
+        store: Arc::new(store),
+    })
 }
 
 /// Derive temporary headless example secrets from plaintext config.
@@ -114,7 +169,6 @@ mod tests {
         ChecklistAppConfig {
             source_path: PathBuf::from("test.toml"),
             runtime_config_toml: String::new(),
-            local_member: MemberIdentity::from_array(["alice"]),
             store_path: PathBuf::from("unused.sqlite"),
             store_secret_profile: flotsync_replication::LocalStoreSecretProfile::new(profile)
                 .expect("test profile should build"),
@@ -125,10 +179,10 @@ mod tests {
     fn unsafe_store_secret_profile_derives_stable_security_without_keyring() {
         let config = test_config("unsafe:test-profile");
 
-        let first =
-            load_checklist_replication_security(&config).expect("unsafe security should derive");
-        let second =
-            load_checklist_replication_security(&config).expect("unsafe security should derive");
+        let first = load_existing_checklist_replication_security(&config)
+            .expect("unsafe security should derive");
+        let second = load_or_create_checklist_replication_security(&config)
+            .expect("unsafe security should derive");
 
         assert_eq!(first.store_secret_key_id(), second.store_secret_key_id());
     }
@@ -138,9 +192,9 @@ mod tests {
         let first_config = test_config("unsafe:first-profile");
         let second_config = test_config("unsafe:second-profile");
 
-        let first = load_checklist_replication_security(&first_config)
+        let first = load_existing_checklist_replication_security(&first_config)
             .expect("first unsafe security should derive");
-        let second = load_checklist_replication_security(&second_config)
+        let second = load_existing_checklist_replication_security(&second_config)
             .expect("second unsafe security should derive");
 
         assert_ne!(first.store_secret_key_id(), second.store_secret_key_id());

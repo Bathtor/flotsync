@@ -363,23 +363,18 @@ impl ChecklistRepl {
         &mut self,
         name: Vec<String>,
     ) -> Result<(), ReplicatedChecklistError> {
-        let mut read_member = || {
-            read_prompted_line(
-                "additional member id (blank to finish)> ",
-                "reading proposed group members",
-            )
-        };
-        let mut confirm_creation = confirm;
-        self.create_group_with_prompts(name, &mut read_member, &mut confirm_creation)
-            .await
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        self.create_group_with_dialog(name, &mut dialog).await
     }
 
-    /// Run group creation with injected prompt boundaries for deterministic handler tests.
-    pub async fn create_group_with_prompts(
+    /// Run group creation through an injected dialog for deterministic handler tests.
+    pub async fn create_group_with_dialog(
         &mut self,
         name: Vec<String>,
-        read_member: &mut dyn FnMut() -> Result<String, ReplicatedChecklistError>,
-        confirm_creation: &mut dyn FnMut(&str) -> Result<bool, ReplicatedChecklistError>,
+        dialog: &mut ChecklistDialog<'_>,
     ) -> Result<(), ReplicatedChecklistError> {
         let group_name = join_words(name).trim().to_owned();
         let mut known_members = self
@@ -389,16 +384,15 @@ impl ChecklistRepl {
             .context(repl_error::ReplicationSnafu)?;
         sort_known_members_for_display(&mut known_members);
         println!("{known_members}");
-        println!("creator (position 0): {}", self.config.local_member);
-        let additional_members =
-            read_additional_group_members(read_member, &self.config.local_member)?;
+        println!("creator (position 0): {}", self.local_member);
+        let additional_members = read_additional_group_members(dialog, &self.local_member)?;
         let request = checklist_group_creation_request(
             group_name,
-            self.config.local_member.clone(),
+            self.local_member.clone(),
             additional_members,
         );
         print_group_creation_summary(&request);
-        if !confirm_creation("Create this group and send invitations?")? {
+        if !dialog.confirm("Create this group and send invitations?")? {
             println!("group creation cancelled");
             return Ok(());
         }
@@ -526,7 +520,7 @@ impl ChecklistRepl {
         let mut members = group.members().collect::<Vec<_>>();
         members.sort();
         for (index, member) in members.into_iter().enumerate() {
-            let marker = if member == self.config.local_member {
+            let marker = if member == self.local_member {
                 " (me)"
             } else {
                 ""
@@ -562,7 +556,7 @@ impl ChecklistRepl {
             }
         });
         let summaries = join_all(requests).await;
-        let local_member = self.config.local_member.clone();
+        let local_member = self.local_member.clone();
         for (index, member, result) in summaries {
             let marker = if member == local_member { " (me)" } else { "" };
             match result {
@@ -620,18 +614,15 @@ pub fn sort_known_members_for_display(report: &mut KnownMemberKeysReport) {
 }
 
 /// Read ordered members after the automatically inserted creator until a blank line.
-pub fn read_additional_group_members(
-    read_member: &mut dyn FnMut() -> Result<String, ReplicatedChecklistError>,
+fn read_additional_group_members(
+    dialog: &mut ChecklistDialog<'_>,
     local_member: &MemberIdentity,
 ) -> Result<Vec<MemberIdentity>, ReplicatedChecklistError> {
     let mut members = Vec::new();
     let mut seen = HashSet::new();
-    let mut member_input = read_member()?;
-    while !member_input.trim().is_empty() {
-        let member = member_input
-            .trim()
-            .parse::<MemberIdentity>()
-            .context(repl_error::InvalidGroupMemberIdentitySnafu)?;
+    while let Some(member) =
+        dialog.read_optional_member_identity("additional member id (blank to finish)> ")?
+    {
         if member == *local_member {
             return Err(ReplicatedChecklistError::RepeatedGroupCreator { member_id: member });
         }
@@ -639,7 +630,6 @@ pub fn read_additional_group_members(
             return Err(ReplicatedChecklistError::DuplicateGroupMember { member_id: member });
         }
         members.push(member);
-        member_input = read_member()?;
     }
     Ok(members)
 }
@@ -659,22 +649,6 @@ pub fn checklist_group_creation_request(
         members,
         group_schema: CHECKLIST_GROUP_SCHEMA.clone(),
     }
-}
-
-/// Read one wizard line after displaying its prompt.
-pub fn read_prompted_line(
-    prompt: &str,
-    action: &'static str,
-) -> Result<String, ReplicatedChecklistError> {
-    print!("{prompt}");
-    io::stdout()
-        .flush()
-        .context(repl_error::IoSnafu { action })?;
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .context(repl_error::IoSnafu { action })?;
-    Ok(line)
 }
 
 /// Format the final group-creation request for confirmation.
@@ -828,11 +802,13 @@ pub mod test_support {
         MemberKeyId,
         ReplicationGroupLifecycle,
         ReplicationGroupRecord,
+        ReplicationStore,
         current_slice_placeholder_group_security_material,
         current_slice_placeholder_group_security_material_with_key_id,
         providers::VecRowProvider,
         test_support::{
             provision_test_security,
+            provisioned_sqlite_store_with_schemas,
             test_public_member_keys,
             test_replication_security_secrets,
         },
@@ -919,11 +895,10 @@ pub mod test_support {
     }
 
     /// Build the minimum application config needed by an in-memory REPL test.
-    pub fn test_app_config(member: MemberIdentity) -> ChecklistAppConfig {
+    pub fn test_app_config() -> ChecklistAppConfig {
         ChecklistAppConfig {
             source_path: PathBuf::from("test.toml"),
             runtime_config_toml: String::new(),
-            local_member: member,
             store_path: PathBuf::from("test.sqlite"),
             store_secret_profile: LocalStoreSecretProfile::new("unsafe:test")
                 .expect("test profile should be valid"),
@@ -972,12 +947,9 @@ pub mod test_support {
         Arc<ChecklistListener>,
         ChecklistListenerReceivers,
     ) {
-        let store = Arc::new(
-            block_on(SqliteReplicationStore::in_memory_with_schema_sources(
-                member.clone(),
-                [(checklist_dataset_id(), CHECKLIST_SCHEMA.clone())],
-            ))
-            .expect("test store should open"),
+        let store = provisioned_sqlite_store_with_schemas(
+            member,
+            [(checklist_dataset_id(), CHECKLIST_SCHEMA.clone())],
         );
         block_on(provision_test_security(
             checklist_application_id(),

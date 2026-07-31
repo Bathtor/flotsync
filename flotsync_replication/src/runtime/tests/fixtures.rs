@@ -6,16 +6,16 @@ pub(super) fn docs_dataset_id() -> DatasetId {
     DatasetId::try_new("docs").expect("dataset id should be valid")
 }
 
-pub(super) fn alice_member() -> Identifier {
-    Identifier::from_array(ALICE_MEMBER_SEGMENTS)
+pub(super) fn alice_member() -> MemberIdentity {
+    MemberIdentity::from_array(ALICE_MEMBER_SEGMENTS)
 }
 
-pub(super) fn bob_member() -> Identifier {
-    Identifier::from_array(BOB_MEMBER_SEGMENTS)
+pub(super) fn bob_member() -> MemberIdentity {
+    MemberIdentity::from_array(BOB_MEMBER_SEGMENTS)
 }
 
-pub(super) fn carol_member() -> Identifier {
-    Identifier::from_array(["app", "carol"])
+pub(super) fn carol_member() -> MemberIdentity {
+    MemberIdentity::from_array(["app", "carol"])
 }
 
 pub(super) fn runtime_test_migration_id() -> MigrationId {
@@ -123,31 +123,6 @@ pub(super) fn provision_test_security<S>(
     .expect("test security should provision");
 }
 
-/// Provision local keys through the public setup API so runtime-loading tests
-/// cover the same store records normal application setup writes.
-pub(super) fn provision_runtime_security_through_setup_api<S>(
-    store: &S,
-    local_member: &MemberIdentity,
-    security: &ReplicationSecuritySecrets,
-) -> PublicKeyBundle
-where
-    S: ReplicationStore,
-{
-    let seed = [37; TEST_MEMBER_KEY_SEED_LENGTH];
-    let generated = member_key_bundles_from_seed(local_member.clone(), &seed);
-    let public_bundle = PublicKeyBundle::from_bytes(&generated.public_bundle)
-        .expect("generated public bundle should decode");
-    wait_for_test_reply(provision_replication_security(
-        store,
-        local_member,
-        security,
-        generated.local_private_bundle.as_bytes(),
-        std::iter::empty(),
-    ))
-    .expect("setup API security should provision");
-    public_bundle
-}
-
 pub(super) fn setup_api_test_security_secrets() -> ReplicationSecuritySecrets {
     ReplicationSecuritySecrets::from_unmanaged_store_secret(
         StoreSecretKeyId::from_bytes(*b"setup-api-test!!"),
@@ -171,16 +146,16 @@ where
     .expect("runtime security state should load")
 }
 
-pub(super) fn app_alice_id() -> Identifier {
-    Identifier::from_array(APP_ALICE_SEGMENTS)
+pub(super) fn app_alice_id() -> ApplicationId {
+    ApplicationId::from_array(APP_ALICE_SEGMENTS)
 }
 
-pub(super) fn app_bob_id() -> Identifier {
-    Identifier::from_array(APP_BOB_SEGMENTS)
+pub(super) fn app_bob_id() -> ApplicationId {
+    ApplicationId::from_array(APP_BOB_SEGMENTS)
 }
 
-pub(super) fn app_probe_id() -> Identifier {
-    Identifier::from_array(APP_PROBE_SEGMENTS)
+pub(super) fn app_probe_id() -> ApplicationId {
+    ApplicationId::from_array(APP_PROBE_SEGMENTS)
 }
 
 pub(super) fn title_schema_shared() -> Arc<Schema> {
@@ -225,6 +200,10 @@ pub(super) fn test_row_id(group_id: GroupId, dataset_id: DatasetId, raw: u128) -
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Runtime fixture callers consistently transfer or clone member identities into store construction."
+)]
 pub(super) fn sqlite_store_with_schemas<I, S>(
     local_member: MemberIdentity,
     schemas: I,
@@ -233,22 +212,27 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
-        local_member,
-        schemas,
+    let provisioner = wait_for_test_future(
+        SqliteReplicationStoreProvisioner::in_memory_with_schema_sources(schemas),
+    )
+    .expect("store provisioner should build");
+    wait_for_test_reply(provision_shared_test_identity(
+        app_probe_id(),
+        &provisioner,
+        &local_member,
+        [],
     ))
-    .expect("store should build");
-    let store = Arc::new(store);
-    let local_member = wait_for_test_reply(store.local_member_identity())
-        .expect("local member identity should load");
-    provision_test_security(store.as_ref(), &local_member, []);
-    store
+    .expect("local test identity should provision");
+    let store = wait_for_test_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate");
+    Arc::new(store)
 }
 
 pub(super) fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
-    let store = wait_for_test_future(SqliteReplicationStore::in_memory(local_member))
-        .expect("store should build");
-    Arc::new(store)
+    sqlite_store_with_schemas(
+        local_member,
+        std::iter::empty::<(DatasetId, SchemaSource)>(),
+    )
 }
 
 pub(super) fn store_pending_group_decision(
@@ -438,7 +422,7 @@ pub(super) fn accept_one_creation_invitation(
 }
 
 pub(super) fn load_runtime_fixture<I, S>(
-    application_id: Identifier,
+    application_id: ApplicationId,
     local_member: MemberIdentity,
     schemas: I,
 ) -> RuntimeFixture<SqliteReplicationStore>
@@ -618,7 +602,7 @@ pub(super) fn load_title_runtime_pair_with_trust(
 
 /// Load runtimes with mutual explicit trust and all-to-all route-establishment watches.
 pub(super) fn load_mutually_trusted_runtime_mesh<const N: usize>(
-    entries: &[(Identifier, MemberIdentity); N],
+    entries: &[(ApplicationId, MemberIdentity); N],
 ) -> (
     ReservedSocketLease,
     [RuntimeFixture<SqliteReplicationStore>; N],
@@ -691,7 +675,7 @@ pub(super) fn start_host(local_member: &MemberIdentity) -> DeliveryRuntimeHost {
 }
 
 pub(super) fn load_runtime_with_parts<S>(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<S>,
     listener: Arc<ListenerStub>,
 ) -> Arc<ReplicationRuntime>
@@ -707,7 +691,7 @@ where
 }
 
 pub(super) fn load_runtime_with_parts_and_config<S>(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<S>,
     listener: Arc<ListenerStub>,
     config: ReplicationConfig,
@@ -730,7 +714,7 @@ where
 }
 
 pub(super) fn load_runtime_with_parts_and_runtime_config_toml<S>(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<S>,
     listener: Arc<ListenerStub>,
     runtime_config_toml: &str,
@@ -882,7 +866,7 @@ pub(super) fn persist_alice_group_with_security_material(
 
 pub(super) fn security_load_error(
     error: LoadError,
-    expected_application_id: &Identifier,
+    expected_application_id: &ApplicationId,
 ) -> LoadSecurityError {
     match error {
         LoadError::Security {

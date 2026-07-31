@@ -26,7 +26,10 @@ pub(super) async fn known_member_keys_report_from_transaction(
     }
     let members = keys_by_member
         .into_iter()
-        .map(|(member_id, keys)| KnownMemberReport { member_id, keys })
+        .map(|(member_id, keys)| KnownMemberReport {
+            member_id: MemberIdentity::from(member_id),
+            keys,
+        })
         .collect();
     Ok(KnownMemberKeysReport { members })
 }

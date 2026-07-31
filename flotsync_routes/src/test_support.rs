@@ -15,10 +15,7 @@ use crate::{
     TransportRouteKey,
     manager::{RouteTransportManager, configure_replication_runtime},
 };
-use flotsync_core::{
-    MemberIdentity,
-    member::{Identifier, IdentifierBuf},
-};
+use flotsync_core::{MemberIdentity, member::IdentifierBuf};
 use flotsync_io::{
     kompact::shutdown_system_bounded,
     prelude::{
@@ -81,7 +78,7 @@ pub type TestRouteTransportPort = RouteTransportPort<TransportRouteKey>;
 /// Build one member identity from static path segments.
 #[must_use]
 pub fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
-    Identifier::from_array(segments)
+    MemberIdentity::from_array(segments)
 }
 
 /// Build an egress buffer pool for endpoint-frame encoding in route-component tests.
@@ -822,5 +819,5 @@ pub fn member_identity(segments: &[&str]) -> MemberIdentity {
             .push_checked((*segment).to_owned())
             .expect("test member identifier segment must be valid");
     }
-    identifier.into_identifier()
+    MemberIdentity::from(identifier.into_identifier())
 }

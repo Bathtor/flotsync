@@ -875,7 +875,6 @@ impl Actor for CatchUpManagerComponent {
 mod tests {
     use super::*;
     use crate::{
-        SqliteReplicationStore,
         api::{
             DatasetId,
             DatasetUpdateRecord,
@@ -887,9 +886,9 @@ mod tests {
             ReplicationUpdateRecord,
             current_slice_placeholder_group_security_material,
         },
-        test_support::{TestGroupMemberships, test_public_member_keys},
+        test_support::{TestGroupMemberships, provisioned_sqlite_store, test_public_member_keys},
     };
-    use flotsync_core::{member::Identifier, membership::GroupMembers, versions::VersionVector};
+    use flotsync_core::{membership::GroupMembers, versions::VersionVector};
     use flotsync_io::test_support::{build_test_kompact_system, wait_for_future};
     use flotsync_messages::datamodel as datamodel_proto;
     use uuid::Uuid;
@@ -920,11 +919,11 @@ mod tests {
     }
 
     fn local_member() -> MemberIdentity {
-        Identifier::from_array(["catch-up", "alice"])
+        MemberIdentity::from_array(["catch-up", "alice"])
     }
 
     fn remote_member() -> MemberIdentity {
-        Identifier::from_array(["catch-up", "bob"])
+        MemberIdentity::from_array(["catch-up", "bob"])
     }
 
     fn sample_group(group_id: GroupId) -> ReplicationGroupRecord {
@@ -996,10 +995,7 @@ mod tests {
         let members = GroupMembers::from_ordered_members([local_member.clone(), remote_member()])
             .expect("test group members should build");
         let memberships = TestGroupMemberships::from_groups([(group_id, members)]).shared();
-        let store: Arc<dyn ReplicationStore> = Arc::new(
-            wait_for_store_future(SqliteReplicationStore::in_memory(local_member.clone()))
-                .expect("store should build"),
-        );
+        let store: Arc<dyn ReplicationStore> = provisioned_sqlite_store(&local_member);
         system.create(move || CatchUpManagerComponent::new(local_member, memberships, store))
     }
 
@@ -1129,10 +1125,7 @@ mod tests {
     #[test]
     fn load_update_batch_honours_unlimited_batch_mode() {
         let group_id = GroupId(Uuid::from_u128(80_001));
-        let store: Arc<dyn ReplicationStore> = Arc::new(
-            wait_for_store_future(SqliteReplicationStore::in_memory(local_member()))
-                .expect("store should build"),
-        );
+        let store: Arc<dyn ReplicationStore> = provisioned_sqlite_store(&local_member());
         persist_group_with_updates(&store, group_id, 20);
         let system = build_test_kompact_system();
         let logger = system.logger().clone();

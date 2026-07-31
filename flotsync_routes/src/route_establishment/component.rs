@@ -1067,7 +1067,7 @@ impl RouteEstablishmentComponent {
         }
         self.member_route_snapshots = new_member_routes;
         for member in changed_members.owned_keys() {
-            self.publish_member_routes(member);
+            self.publish_member_routes(MemberIdentity::from(member));
         }
     }
 
@@ -1248,7 +1248,7 @@ fn route_diagnostic_phase(state: &super::state::RouteVerificationState) -> Route
 
 /// Copy one trie-backed member set into a diagnostic collection.
 fn collect_members(members: &TrieSet) -> Vec<MemberIdentity> {
-    members.owned_keys().collect()
+    members.owned_keys().map(MemberIdentity::from).collect()
 }
 
 /// Collapse caller-provided watches into one manual filter per route.

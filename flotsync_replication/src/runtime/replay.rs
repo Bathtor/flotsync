@@ -315,7 +315,7 @@ mod tests {
         api::{DatasetRowStateWrite, DatasetUpdateRecord, ReplicationRowStateRecord},
         row_values,
     };
-    use flotsync_core::{MemberIdentity, member::Identifier, versions::PureVersionVector};
+    use flotsync_core::{MemberIdentity, versions::PureVersionVector};
     use flotsync_data_types::{Field, RowOperations, Schema, TableOperations};
     use std::sync::Arc;
     use uuid::Uuid;
@@ -331,7 +331,7 @@ mod tests {
     }
 
     fn local_member() -> MemberIdentity {
-        Identifier::from_array(["app", "alice"])
+        MemberIdentity::from_array(["app", "alice"])
     }
 
     fn update_id(version: u64) -> UpdateId {

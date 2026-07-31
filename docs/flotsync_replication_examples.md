@@ -22,27 +22,15 @@ terminals or machines can stage local edits and exchange them when the user runs
 
 ## Setup
 
-Each peer needs its local identity, store, and store-secret profile in the
-application section. Runtime and route settings may remain in the same TOML.
+Each peer needs its store and store-secret profile in the application section.
+Runtime and route settings may remain in the same TOML.
 
 ```toml
 # alice.toml
 [flotsync.examples.replicated-checklist]
-local-member = "alice"
 store-path = "alice.sqlite"
 store-secret-profile = "alice-dev"
 ```
-
-Initialise the local private identity material before starting the runtime:
-
-```bash
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local alice.toml
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local bob.toml
-```
-
-`keys init-local` creates or reuses the peer's local identity keys in its
-configured store. It is the only key operation that runs before the replication
-runtime because loading that runtime requires the private identity material.
 
 Start each peer in a separate terminal:
 
@@ -50,6 +38,13 @@ Start each peer in a separate terminal:
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob.toml
 ```
+
+When the configured store does not exist, `run` asks before creating setup
+state. After acceptance it prompts for the local member identity, then commits
+that identity, its encrypted private keys, and the matching public-key binding
+together. Declining exits without creating the store or its local secret. An
+existing empty store uses the same provisioning dialogue. Provisioned stores
+load their local identity from the store without prompting.
 
 Once inside the REPL, export, inspect, trust, and block through the already
 unlocked runtime:
@@ -67,8 +62,7 @@ derives its fingerprint locally.
 
 `store-secret-profile` selects the device-local store secret for this
 application profile; the current implementation keeps that secret in OS-backed
-local storage and creates it on first use. The checklist no longer accepts a
-configured group id, ordered member list, or shared group-secret password.
+local storage and creates it only after first-run confirmation.
 
 ## Networking and Group Availability
 

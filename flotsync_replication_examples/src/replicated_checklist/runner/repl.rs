@@ -1,22 +1,44 @@
 //! REPL and runtime wiring for the replicated checklist runner.
 
-use super::{diagnostics::ChecklistPeerDiagnostics, setup::load_checklist_store_setup, *};
+use super::{
+    diagnostics::ChecklistPeerDiagnostics,
+    setup::{
+        ChecklistStoreSetup,
+        activate_checklist_store_setup,
+        create_checklist_store_provisioner,
+        load_checklist_config,
+        load_existing_checklist_replication_security,
+        load_or_create_checklist_replication_security,
+        open_checklist_store_provisioner,
+    },
+    *,
+};
 use indoc::formatdoc;
 
 pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path).await?;
+    let config = load_checklist_config(config_path)?;
+    let (config, local_member, listener_receivers, replication) = {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        let setup = prepare_checklist_store_setup(config, &mut dialog).await?;
+        let Some(setup) = setup else {
+            println!("store setup cancelled");
+            return Ok(());
+        };
 
-    let (listener, listener_receivers) = ChecklistListener::pair();
-    let replication = load_replication_runtime_with_runtime_config_toml(
-        checklist_application_id(),
-        setup.store,
-        listener,
-        ReplicationConfig::default(),
-        setup.replication_security,
-        &setup.config.runtime_config_toml,
-    )
-    .await
-    .context(repl_error::LoadRuntimeSnafu)?;
+        let (listener, listener_receivers) = ChecklistListener::pair();
+        let replication = load_checklist_runtime(&setup, listener)
+            .await
+            .context(repl_error::LoadRuntimeSnafu)?;
+        (
+            setup.config,
+            setup.local_member,
+            listener_receivers,
+            replication,
+        )
+    };
 
     let mut working_set = ChecklistWorkingSet::new();
     let group_state = replication
@@ -30,7 +52,13 @@ pub async fn run_configured_peer(config_path: &Path) -> Result<(), ReplicatedChe
         load_group_snapshot(replication.as_ref(), &mut working_set, group_id).await?;
     }
     let session = ChecklistSession::new(working_set);
-    let mut repl = ChecklistRepl::new(setup.config, replication, listener_receivers, session);
+    let mut repl = ChecklistRepl::new(
+        config,
+        local_member,
+        replication,
+        listener_receivers,
+        session,
+    );
     let run_result = repl.run().await;
     let shutdown_result = repl.shutdown().await;
     run_result?;
@@ -193,8 +221,10 @@ impl ReplicationEventListener for ChecklistListener {
 
 /// Interactive checklist state and the runtime handles used by its commands.
 pub struct ChecklistRepl {
-    /// Current application configuration and local identity.
+    /// Current application configuration.
     pub config: ChecklistAppConfig,
+    /// Authoritative local identity loaded from the replication store.
+    pub local_member: MemberIdentity,
     /// Runtime control and operation-local group-state access.
     pub replication: Arc<dyn ReplicationApi>,
     /// Listener-delivered row batches awaiting command-loop ingestion.
@@ -219,12 +249,14 @@ impl ChecklistRepl {
     /// Build one REPL around a running replication API and listener queues.
     pub fn new(
         config: ChecklistAppConfig,
+        local_member: MemberIdentity,
         replication: Arc<dyn ReplicationApi>,
         listener_receivers: ChecklistListenerReceivers,
         session: ChecklistSession,
     ) -> Self {
         Self {
             config,
+            local_member,
             replication,
             batch_receiver: listener_receivers.batches,
             invitation_receiver: listener_receivers.invitations,
@@ -758,7 +790,7 @@ impl ChecklistRepl {
 
     fn print_me(&self) -> Result<(), ReplicatedChecklistError> {
         let groups = self.group_state()?;
-        println!("member: {}", self.config.local_member);
+        println!("member: {}", self.local_member);
         match self.session.default_group {
             Some(group_id) => println!(
                 "default group: {}",
@@ -865,6 +897,98 @@ pub fn join_words(words: Vec<String>) -> String {
     words.join(" ")
 }
 
+/// Open an existing checklist store or create a new one only after explicit confirmation.
+async fn prepare_checklist_store_setup(
+    config: ChecklistAppConfig,
+    dialog: &mut ChecklistDialog<'_>,
+) -> Result<Option<ChecklistStoreSetup>, ReplicatedChecklistError> {
+    let store_exists = config
+        .store_path
+        .try_exists()
+        .context(repl_error::IoSnafu {
+            action: "checking checklist store path",
+        })?;
+    let (provisioning, provisioning_confirmed) = if store_exists {
+        (open_checklist_store_provisioner(config).await?, false)
+    } else {
+        let prompt = first_run_provisioning_prompt(&config.store_path);
+        let accepted = dialog.confirm(&prompt)?;
+        if accepted {
+            (create_checklist_store_provisioner(config).await?, true)
+        } else {
+            println!("local identity provisioning declined; no store setup was created");
+            return Ok(None);
+        }
+    };
+
+    let existing_member = provisioning
+        .store
+        .local_member_identity()
+        .await
+        .context(repl_error::StoreSnafu)?;
+    let replication_security = if let Some(member_id) = existing_member {
+        println!("local identity loaded: {member_id}");
+        load_existing_checklist_replication_security(&provisioning.config)
+            .context(repl_error::LocalStoreSecretSnafu)?
+    } else {
+        let accepted = if provisioning_confirmed {
+            true
+        } else {
+            let prompt = unprovisioned_store_prompt(&provisioning.config.store_path);
+            dialog.confirm(&prompt)?
+        };
+        if !accepted {
+            println!("local identity provisioning declined");
+            return Ok(None);
+        }
+        let local_member = dialog.read_member_identity("local member identity> ")?;
+        let replication_security =
+            load_or_create_checklist_replication_security(&provisioning.config)
+                .context(repl_error::LocalStoreSecretSnafu)?;
+        let provisioned =
+            provision_local_identity(&provisioning.store, local_member, &replication_security)
+                .await
+                .context(repl_error::ProvisionLocalIdentitySnafu)?;
+        println!("local identity provisioned: {}", provisioned.member_id());
+        replication_security
+    };
+
+    let setup = activate_checklist_store_setup(provisioning, replication_security).await?;
+    Ok(Some(setup))
+}
+
+/// Load the configured replication runtime once without applying recovery policy.
+async fn load_checklist_runtime(
+    setup: &ChecklistStoreSetup,
+    listener: Arc<ChecklistListener>,
+) -> Result<Arc<dyn ReplicationApi>, LoadError> {
+    load_replication_runtime_with_runtime_config_toml(
+        checklist_application_id(),
+        setup.store.clone(),
+        listener,
+        ReplicationConfig::default(),
+        setup.replication_security.clone(),
+        &setup.config.runtime_config_toml,
+    )
+    .await
+}
+
+/// Build the confirmation prompt shown before creating any first-run setup state.
+fn first_run_provisioning_prompt(store_path: &Path) -> String {
+    format!(
+        "Checklist store {} does not exist. Create it and provision a local identity and keys?",
+        store_path.display()
+    )
+}
+
+/// Build the confirmation prompt for an existing store without local identity material.
+fn unprovisioned_store_prompt(store_path: &Path) -> String {
+    format!(
+        "Checklist store {} has no local identity. Provision a local identity and keys?",
+        store_path.display()
+    )
+}
+
 fn format_timestamp(timestamp: SystemTime) -> String {
     DateTime::<Local>::from(timestamp)
         .format("%Y-%m-%d %H:%M:%S %:z")
@@ -885,12 +1009,200 @@ mod tests {
         },
     };
     use flotsync_replication::{
+        ReplicationStore,
         RowId,
         RowKey,
         RowMutation,
         providers::VecRowProvider,
         test_support::{publish_changes, snapshot_read_token},
     };
+    use flotsync_security::{LocalStoreSecretError, install_local_store_secret_test_store};
+    use std::io::Cursor;
+
+    /// Build one isolated checklist config for startup recovery tests.
+    fn startup_test_config(test_name: &str) -> (PathBuf, ChecklistAppConfig) {
+        let test_id = Uuid::new_v4();
+        let test_root =
+            std::env::temp_dir().join(format!("flotsync-checklist-startup-{test_name}-{test_id}"));
+        let config = ChecklistAppConfig {
+            source_path: test_root.join("alice.toml"),
+            runtime_config_toml: String::new(),
+            store_path: test_root.join("alice.sqlite"),
+            store_secret_profile: flotsync_replication::LocalStoreSecretProfile::new(format!(
+                "unsafe:startup-{test_id}"
+            ))
+            .expect("test profile should build"),
+        };
+        (test_root, config)
+    }
+
+    #[test]
+    fn new_store_decline_leaves_no_setup_state() {
+        install_local_store_secret_test_store().expect("sample keyring should install");
+        let (test_root, mut config) = startup_test_config("new-decline");
+        let profile = flotsync_replication::LocalStoreSecretProfile::new(format!(
+            "managed-startup-decline-{}",
+            Uuid::new_v4()
+        ))
+        .expect("managed test profile should build");
+        config.store_secret_profile = profile.clone();
+        let store_path = config.store_path.clone();
+        let expected_application_id = checklist_application_id();
+        let expected_prompt = format!(
+            "Checklist store {} does not exist. Create it and provision a local identity and keys?",
+            store_path.display()
+        );
+        let mut input = Cursor::new(b"no\n".as_slice());
+        let mut output = Vec::new();
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
+
+        let setup = block_on(prepare_checklist_store_setup(config, &mut confirmation))
+            .expect("declined setup should succeed");
+
+        assert!(setup.is_none());
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            format!("{expected_prompt} [y/N] ")
+        );
+        assert!(!store_path.exists());
+        assert!(!test_root.exists());
+        let error = ReplicationSecuritySecrets::load_local(&expected_application_id, &profile)
+            .expect_err("declining first-run setup must not create a local store secret");
+        assert!(matches!(
+            error,
+            LoadSecurityError::LocalStoreSecret { source }
+                if matches!(
+                    source.as_ref(),
+                    LocalStoreSecretError::Missing {
+                        application_id,
+                        profile: missing_profile,
+                    } if application_id == &expected_application_id && missing_profile == &profile
+                )
+        ));
+    }
+
+    #[test]
+    fn new_store_accept_provisions_identity_before_returning_setup() {
+        let (test_root, config) = startup_test_config("new-accept");
+        let member_id = MemberIdentity::from_array(["alice"]);
+        let expected_prompt = format!(
+            "Checklist store {} does not exist. Create it and provision a local identity and keys?",
+            config.store_path.display()
+        );
+        let mut input = Cursor::new(b"yes\nalice\n".as_slice());
+        let mut output = Vec::new();
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
+
+        let setup = block_on(prepare_checklist_store_setup(config, &mut confirmation))
+            .expect("accepted setup should succeed")
+            .expect("accepted setup should be returned");
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            format!("{expected_prompt} [y/N] local member identity> ")
+        );
+        assert_eq!(setup.local_member, member_id);
+
+        let mut transaction =
+            block_on(setup.store.begin_read_transaction()).expect("read transaction should start");
+        let private_keys = block_on(transaction.load_local_member_private_keys(&member_id))
+            .expect("private keys should load");
+        let public_keys = block_on(transaction.load_member_public_keys_for_member(&member_id))
+            .expect("public keys should load");
+        block_on(transaction.release()).expect("transaction should release");
+        let Some(private_keys) = private_keys else {
+            panic!("private keys should be stored");
+        };
+        assert_eq!(private_keys.member_id, member_id);
+        let [public_keys] = public_keys.as_slice() else {
+            panic!("exactly one public-key binding should be stored: {public_keys:?}");
+        };
+        assert_eq!(public_keys.key_id.member_id, member_id);
+
+        drop(setup);
+        std::fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn existing_unprovisioned_store_can_be_declined() {
+        let (test_root, config) = startup_test_config("existing-decline");
+        let provisioning = block_on(create_checklist_store_provisioner(config.clone()))
+            .expect("empty store should be created");
+        drop(provisioning);
+        let expected_prompt = format!(
+            "Checklist store {} has no local identity. Provision a local identity and keys?",
+            config.store_path.display()
+        );
+        let mut input = Cursor::new(b"no\n".as_slice());
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+        let setup = block_on(prepare_checklist_store_setup(config, &mut dialog))
+            .expect("declined provisioning should succeed");
+        assert!(setup.is_none());
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            format!("{expected_prompt} [y/N] ")
+        );
+        std::fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn existing_unprovisioned_store_can_be_provisioned() {
+        let (test_root, config) = startup_test_config("existing-accept");
+        let provisioning = block_on(create_checklist_store_provisioner(config.clone()))
+            .expect("empty store should be created");
+        drop(provisioning);
+        let expected_prompt = format!(
+            "Checklist store {} has no local identity. Provision a local identity and keys?",
+            config.store_path.display()
+        );
+        let mut input = Cursor::new(b"yes\nbob\n".as_slice());
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+
+        let setup = block_on(prepare_checklist_store_setup(config, &mut dialog))
+            .expect("accepted provisioning should succeed")
+            .expect("provisioned setup should be returned");
+        assert_eq!(setup.local_member, MemberIdentity::from_array(["bob"]));
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            format!("{expected_prompt} [y/N] local member identity> ")
+        );
+
+        drop(setup);
+        std::fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn restart_loads_stored_identity_without_prompting() {
+        let (test_root, config) = startup_test_config("existing-ready");
+        let mut input = Cursor::new(b"yes\nalice\n".as_slice());
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        let first_setup = block_on(prepare_checklist_store_setup(config.clone(), &mut dialog))
+            .expect("first setup should succeed")
+            .expect("first setup should be returned");
+        assert_eq!(
+            first_setup.local_member,
+            MemberIdentity::from_array(["alice"])
+        );
+        drop(first_setup);
+
+        let mut input = Cursor::new([]);
+        let mut output = Vec::new();
+        let mut dialog = ChecklistDialog::new(&mut input, &mut output);
+        let second_setup = block_on(prepare_checklist_store_setup(config, &mut dialog))
+            .expect("restart setup should succeed")
+            .expect("restart setup should be returned");
+        assert_eq!(
+            second_setup.local_member,
+            MemberIdentity::from_array(["alice"])
+        );
+        assert_eq!(output, Vec::<u8>::new());
+
+        drop(second_setup);
+        std::fs::remove_dir_all(test_root).expect("test directory should be removed");
+    }
 
     #[test]
     fn listener_preserves_the_read_token_for_an_empty_data_event() {
@@ -979,14 +1291,14 @@ mod tests {
                 .text,
             "second snapshot"
         );
-        assert!(
+        assert_eq!(
             format!(
                 "{:?}",
                 working_set
                     .read_token()
                     .expect("workspace token should load")
-            )
-            .contains("group_count: 2")
+            ),
+            "ReadToken { group_count: 2, .. }"
         );
 
         block_on(runtime.shutdown()).expect("test runtime should shut down");
@@ -1027,8 +1339,13 @@ mod tests {
         );
         working_set.add_item(ChecklistItemAssociation::Local, "local item");
         let session = ChecklistSession::new(working_set);
-        let mut repl =
-            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            session,
+        );
 
         let report = block_on(repl.synchronise_groups()).expect("all groups should synchronise");
 
@@ -1117,8 +1434,13 @@ mod tests {
         let moved_source =
             working_set.add_item(ChecklistItemAssociation::Group(source_group), "move source");
         let session = ChecklistSession::new(working_set);
-        let mut repl =
-            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            session,
+        );
         block_on(repl.synchronise_groups()).expect("source setup should publish");
 
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
@@ -1213,8 +1535,13 @@ mod tests {
             .expect("clean source item should queue");
         working_set.drain_queued_events();
         let session = ChecklistSession::new(working_set);
-        let mut repl =
-            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            session,
+        );
         block_on(repl.handle_workspace_command(ChecklistCommand::Edit {
             item: ItemSelector::RowKey(row_key),
             command: EditCommand::Move {
@@ -1308,8 +1635,13 @@ mod tests {
             }])
             .expect("non-conflicting listener event should queue");
         let session = ChecklistSession::new(working_set);
-        let mut repl =
-            ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
+        let mut repl = ChecklistRepl::new(
+            test_app_config(),
+            member,
+            runtime.clone(),
+            receivers,
+            session,
+        );
 
         let report = block_on(repl.synchronise_groups())
             .expect("a group publication failure should remain in the report");

@@ -33,6 +33,7 @@ use super::{
 use crate::{
     MAX_VERSION_VALUE,
     SqliteReplicationStore,
+    SqliteReplicationStoreProvisioner,
     api::{
         ApiError,
         AuthorityScope,
@@ -131,10 +132,11 @@ use crate::{
         UpdateMessage,
     },
     delivery::security::{DeliverySecurity, DeliverySecurityError},
-    provision_replication_security,
+    provision_local_identity,
     security_store::{SecurityStore, SecurityStoreError},
     test_support::{
         load_test_delivery_security,
+        provision_test_identity as provision_shared_test_identity,
         provision_test_security as provision_shared_test_security,
         test_public_member_keys,
         test_replication_security_secrets,
@@ -142,10 +144,11 @@ use crate::{
     },
 };
 use flotsync_core::{
+    ApplicationId,
     GroupId,
     MemberIdentity,
     MemberIndex,
-    member::{Identifier, TrieMap},
+    member::TrieMap,
     membership::GroupMembers,
     versions::{PureVersionVector, UpdateId, VersionVector},
 };
@@ -159,11 +162,9 @@ use flotsync_io::test_support::{
 use flotsync_security::{
     GROUP_CIPHER_SUITE_CHACHA20_POLY1305,
     KeyFingerprint,
-    PublicKeyBundle,
     PublicMemberKeys,
     StoreSecretKey,
     install_local_store_secret_test_store,
-    test_support::{TEST_MEMBER_KEY_SEED_LENGTH, member_key_bundles_from_seed},
 };
 use flotsync_utils::BoxFuture;
 use futures_util::FutureExt;
@@ -198,6 +199,8 @@ struct RuntimeFixture<S> {
 /// delegating all stored state to the wrapped `SQLite` store.
 struct FailingStore<S> {
     inner: Arc<S>,
+    /// Whether delegated read transactions should hide all local-private key records.
+    hide_local_private_keys: bool,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
     fail_next_activate_replication_group: Arc<Mutex<bool>>,
     fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
@@ -207,10 +210,18 @@ impl<S> FailingStore<S> {
     fn new(inner: Arc<S>) -> Self {
         Self {
             inner,
+            hide_local_private_keys: false,
             fail_next_apply_dataset_row_patch: Arc::new(Mutex::new(None)),
             fail_next_activate_replication_group: Arc::new(Mutex::new(false)),
             fail_after_next_pending_group_commit: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Configure this wrapper to emulate an unsupported store that exposes an identity without
+    /// its corresponding local-private key record.
+    fn with_hidden_local_private_keys(mut self) -> Self {
+        self.hide_local_private_keys = true;
+        self
     }
 
     fn fail_next_apply_dataset_row_patch(&self, dataset_id: DatasetId) {
@@ -259,6 +270,7 @@ where
             self.fail_next_activate_replication_group.clone();
         let fail_after_next_pending_group_commit =
             self.fail_after_next_pending_group_commit.clone();
+        let hide_local_private_keys = self.hide_local_private_keys;
         async move {
             let inner = inner.begin_transaction().await?;
             Ok(Box::new(FailingStoreTransaction {
@@ -266,6 +278,7 @@ where
                 fail_next_apply_dataset_row_patch,
                 fail_next_activate_replication_group,
                 fail_after_next_pending_group_commit,
+                hide_local_private_keys,
                 wrote_pending_group_work: false,
             }) as Box<dyn ReplicationStoreTransaction>)
         }
@@ -275,12 +288,35 @@ where
     fn begin_read_transaction(
         &self,
     ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreReadTransaction>, StoreError>> {
-        self.inner.begin_read_transaction()
+        if !self.hide_local_private_keys {
+            return self.inner.begin_read_transaction();
+        }
+
+        let inner = self.inner.clone();
+        let fail_next_apply_dataset_row_patch = self.fail_next_apply_dataset_row_patch.clone();
+        let fail_next_activate_replication_group =
+            self.fail_next_activate_replication_group.clone();
+        let fail_after_next_pending_group_commit =
+            self.fail_after_next_pending_group_commit.clone();
+        async move {
+            let inner = inner.begin_transaction().await?;
+            Ok(Box::new(FailingStoreTransaction {
+                inner: Some(inner),
+                hide_local_private_keys: true,
+                fail_next_apply_dataset_row_patch,
+                fail_next_activate_replication_group,
+                fail_after_next_pending_group_commit,
+                wrote_pending_group_work: false,
+            }) as Box<dyn ReplicationStoreReadTransaction>)
+        }
+        .boxed()
     }
 }
 
 struct FailingStoreTransaction {
     inner: Option<Box<dyn ReplicationStoreTransaction>>,
+    /// Whether this transaction emulates an absent local-private key record.
+    hide_local_private_keys: bool,
     fail_next_apply_dataset_row_patch: Arc<Mutex<Option<DatasetId>>>,
     fail_next_activate_replication_group: Arc<Mutex<bool>>,
     fail_after_next_pending_group_commit: Arc<Mutex<bool>>,
@@ -337,10 +373,22 @@ impl ReplicationStoreReadTransaction for FailingStoreTransaction {
             .load_group_dataset_schema(group_id, dataset_id)
     }
 
+    fn load_local_member_identity(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>> {
+        self.inner
+            .as_mut()
+            .expect("failing store transaction must remain open during delegated reads")
+            .load_local_member_identity()
+    }
+
     fn load_local_member_private_keys<'a>(
         &'a mut self,
         member_id: &'a MemberIdentity,
     ) -> BoxFuture<'a, Result<Option<LocalMemberPrivateKeysRecord>, StoreError>> {
+        if self.hide_local_private_keys {
+            return futures_util::future::ready(Ok(None)).boxed();
+        }
         self.inner
             .as_mut()
             .expect("failing store transaction must remain open during delegated reads")

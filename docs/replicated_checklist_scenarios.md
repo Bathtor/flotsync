@@ -23,12 +23,9 @@ traffic between the peers.
 
 ## Setup
 
-Initialise local identity material, then start each peer from the repository
-root:
+Start each peer from the repository root:
 
 ```bash
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local alice.toml
-cargo run -p flotsync_replication_examples --bin replicated_checklist -- keys init-local bob.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run alice.toml
 cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob.toml
 ```
@@ -36,11 +33,14 @@ cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob
 For a release binary:
 
 ```bash
-target/release/replicated_checklist keys init-local alice.toml
-target/release/replicated_checklist keys init-local bob.toml
 target/release/replicated_checklist run alice.toml
 target/release/replicated_checklist run bob.toml
 ```
+
+On first use, each process asks whether it should create the store and initialise
+local identity keys. Answer `y` or `yes` to continue. Declining exits without
+creating the store or its setup state. An existing unprovisioned store uses the
+same setup dialogue before runtime startup.
 
 Inside each running REPL, print the local bundle:
 
@@ -79,10 +79,10 @@ remains `probing` or becomes `stale` points to route establishment rather than
 group membership; no matching route usually points to discovery or static-route
 configuration.
 
-Each config needs `local-member`, `store-path`, and `store-secret-profile` in
-the replicated-checklist section. The profile selects a device-local
-store-secret slot. Static group ids, ordered members, and shared group-secret
-passwords are no longer application configuration.
+Each config needs `store-path` and `store-secret-profile` in the
+replicated-checklist section. The profile selects a device-local store-secret
+slot. On first run, the application asks for the local member identity and
+stores it together with its new key material.
 
 <!-- TODO(flotsync-lsi8): Remove this unsafe headless workaround note once the
 proper local store-secret backend exists. -->

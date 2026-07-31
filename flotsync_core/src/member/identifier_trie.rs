@@ -31,7 +31,8 @@ impl<V> TrieMap<V> {
         self.root.count()
     }
 
-    pub fn insert(&mut self, key: Identifier, value: V) -> Option<V> {
+    pub fn insert(&mut self, key: impl Into<Identifier>, value: V) -> Option<V> {
+        let key = key.into();
         let mut node = &mut self.root;
         for segment in key.into_segments() {
             node = node.children.entry(segment).or_insert_with(|| TrieNode {
@@ -314,12 +315,12 @@ impl TrieSet {
         self.0.len()
     }
 
-    pub fn insert(&mut self, key: Identifier) -> bool {
+    pub fn insert(&mut self, key: impl Into<Identifier>) -> bool {
         self.0.insert(key, ()).is_none()
     }
 
     #[must_use]
-    pub fn contains(&self, key: &Identifier) -> bool {
+    pub fn contains<I: IdentifierLike>(&self, key: &I) -> bool {
         self.0.get(key).is_some()
     }
 

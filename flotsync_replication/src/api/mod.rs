@@ -1,10 +1,11 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use enumset::{EnumSet, EnumSetType};
 use flotsync_core::{
+    ApplicationId,
     GroupId,
     MemberIdentity,
     MemberIndex,
-    member::{Identifier, TrieMap},
+    member::TrieMap,
     membership::{GroupMembers, GroupMembersError},
     versions::{UpdateId, VersionVector},
 };

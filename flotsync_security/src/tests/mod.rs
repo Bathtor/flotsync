@@ -50,7 +50,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE},
 };
 use bytes::Bytes;
-use flotsync_core::{GroupId, member::Identifier};
+use flotsync_core::{ApplicationId, GroupId};
 use flotsync_messages::{
     buffa::{EnumValue, Message as _, MessageField, MessageView as _},
     discovery::DiscoverySignatureView,

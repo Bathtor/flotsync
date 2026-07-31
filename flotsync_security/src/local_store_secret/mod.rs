@@ -3,7 +3,7 @@
 #[cfg(feature = "local-secret-manager")]
 use crate::SecurityError;
 use crate::{StoreSecretKey, StoreSecretKeyId};
-use flotsync_core::member::Identifier;
+use flotsync_core::ApplicationId;
 #[cfg(feature = "local-secret-manager")]
 use keyring_core::Error as KeyringError;
 use snafu::prelude::*;
@@ -140,7 +140,7 @@ pub enum LocalStoreSecretError {
     ))]
     #[cfg(feature = "local-secret-manager")]
     BuildEntry {
-        application_id: Identifier,
+        application_id: ApplicationId,
         profile: LocalStoreSecretProfile,
         source: KeyringError,
     },
@@ -149,7 +149,7 @@ pub enum LocalStoreSecretError {
         "No local store secret exists for application '{application_id}' and profile '{profile}'."
     ))]
     Missing {
-        application_id: Identifier,
+        application_id: ApplicationId,
         profile: LocalStoreSecretProfile,
     },
     /// Reading the selected local secret failed.
@@ -158,7 +158,7 @@ pub enum LocalStoreSecretError {
     ))]
     #[cfg(feature = "local-secret-manager")]
     Read {
-        application_id: Identifier,
+        application_id: ApplicationId,
         profile: LocalStoreSecretProfile,
         source: KeyringError,
     },
@@ -172,7 +172,7 @@ pub enum LocalStoreSecretError {
     ))]
     #[cfg(feature = "local-secret-manager")]
     Write {
-        application_id: Identifier,
+        application_id: ApplicationId,
         profile: LocalStoreSecretProfile,
         source: KeyringError,
     },
@@ -181,7 +181,7 @@ pub enum LocalStoreSecretError {
         "Stored local secret for application '{application_id}' and profile '{profile}' is invalid: {message}"
     ))]
     InvalidRecord {
-        application_id: Identifier,
+        application_id: ApplicationId,
         profile: LocalStoreSecretProfile,
         message: String,
     },

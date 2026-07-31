@@ -1,30 +1,24 @@
-//! Local identity initialisation and runtime-backed key commands.
+//! Runtime-backed key commands.
 
-use super::{setup::load_checklist_store_setup, *};
-
-/// Run the sole pre-runtime key-management command.
-pub(super) async fn run_key_command(
-    command: ReplicatedChecklistKeyCommand,
-) -> Result<(), ReplicatedChecklistError> {
-    match command {
-        ReplicatedChecklistKeyCommand::InitLocal { config } => init_local_keys(&config).await,
-    }
-}
+use super::*;
 
 /// Run one key command through the already-unlocked replication runtime.
 pub(super) async fn run_runtime_key_command(
     replication: &dyn ReplicationApi,
     command: ChecklistKeyCommand,
 ) -> Result<(), ReplicatedChecklistError> {
-    let mut confirm_operation = confirm;
-    run_runtime_key_command_with_confirmation(replication, command, &mut confirm_operation).await
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut output = io::stdout();
+    let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
+    run_runtime_key_command_with_confirmation(replication, command, &mut confirmation).await
 }
 
-/// Run one runtime key command with an injected confirmation boundary.
+/// Run one runtime key command with an explicit confirmation dialog.
 async fn run_runtime_key_command_with_confirmation(
     replication: &dyn ReplicationApi,
     command: ChecklistKeyCommand,
-    confirm_operation: &mut dyn FnMut(&str) -> Result<bool, ReplicatedChecklistError>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     match command {
         ChecklistKeyCommand::ExportLocal => export_local_keys(replication).await,
@@ -34,64 +28,11 @@ async fn run_runtime_key_command_with_confirmation(
         ChecklistKeyCommand::Trust {
             member_id,
             public_bundle,
-        } => trust_public_bundle(replication, member_id, &public_bundle, confirm_operation).await,
+        } => trust_public_bundle(replication, member_id, &public_bundle, confirmation).await,
         ChecklistKeyCommand::Block { public_bundle } => {
-            block_public_bundle(replication, &public_bundle, confirm_operation).await
+            block_public_bundle(replication, &public_bundle, confirmation).await
         }
     }
-}
-
-/// Create local identity keys if absent and print the local public bundle.
-async fn init_local_keys(config_path: &Path) -> Result<(), ReplicatedChecklistError> {
-    let setup = load_checklist_store_setup(config_path).await?;
-    let existing_bundle = load_local_public_key_bundle(
-        setup.store.as_ref(),
-        &setup.config.local_member,
-        &setup.replication_security,
-    )
-    .await
-    .context(repl_error::ProvisionSecuritySnafu {
-        action: "loading local identity keys",
-    })?;
-    let (bundle, created) = if let Some(bundle) = existing_bundle {
-        (bundle, false)
-    } else {
-        let generated = generate_member_key_bundles(setup.config.local_member.clone()).context(
-            repl_error::SecuritySnafu {
-                action: "generating local identity keys",
-            },
-        )?;
-        provision_replication_security(
-            setup.store.as_ref(),
-            &setup.config.local_member,
-            &setup.replication_security,
-            generated.local_private_bundle.as_bytes(),
-            std::iter::empty(),
-        )
-        .await
-        .context(repl_error::ProvisionSecuritySnafu {
-            action: "storing local identity keys",
-        })?;
-        let bundle = PublicKeyBundle::from_bytes(&generated.public_bundle).context(
-            repl_error::SecuritySnafu {
-                action: "decoding generated public key bundle",
-            },
-        )?;
-        (bundle, true)
-    };
-
-    store_observed_public_key_binding(
-        setup.store.as_ref(),
-        setup.config.local_member.clone(),
-        &bundle,
-    )
-    .await?;
-    println!(
-        "local identity keys: {}",
-        if created { "created" } else { "existing" }
-    );
-    print_local_public_bundle(&setup.config.local_member, &bundle);
-    Ok(())
 }
 
 /// Print the local public bundle from the running replication runtime.
@@ -122,7 +63,7 @@ async fn trust_public_bundle(
     replication: &dyn ReplicationApi,
     member_id: MemberIdentity,
     public_bundle: &str,
-    confirm_operation: &mut dyn FnMut(&str) -> Result<bool, ReplicatedChecklistError>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let report = assess_public_bundle(
@@ -132,7 +73,7 @@ async fn trust_public_bundle(
     )
     .await?;
     println!("{report}");
-    if !confirm_operation(&format!("Trust this bundle for member {member_id}?"))? {
+    if !confirmation.confirm(&format!("Trust this bundle for member {member_id}?"))? {
         println!("trust cancelled");
         return Ok(());
     }
@@ -155,12 +96,12 @@ async fn trust_public_bundle(
 async fn block_public_bundle(
     replication: &dyn ReplicationApi,
     public_bundle: &str,
-    confirm_operation: &mut dyn FnMut(&str) -> Result<bool, ReplicatedChecklistError>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let report = assess_public_bundle(replication, bundle.clone(), HashSet::new()).await?;
     println!("{report}");
-    if !confirm_operation("Block this bundle fingerprint globally?")? {
+    if !confirmation.confirm("Block this bundle fingerprint globally?")? {
         println!("block cancelled");
         return Ok(());
     }
@@ -202,31 +143,6 @@ fn decode_pasteable_public_bundle(
     })
 }
 
-/// Store the local public-key binding needed by later member enumeration.
-async fn store_observed_public_key_binding(
-    store: &dyn ReplicationStore,
-    member_id: MemberIdentity,
-    bundle: &PublicKeyBundle,
-) -> Result<(), ReplicatedChecklistError> {
-    let public_keys = bundle.clone().bind_member(member_id);
-    let record = MemberPublicKeysRecord::from_public_keys(&public_keys);
-    let mut transaction = store
-        .begin_transaction()
-        .await
-        .context(repl_error::StoreSnafu)?;
-    transaction
-        .ensure_member_public_keys(record)
-        .await
-        .context(repl_error::StoreSnafu)?;
-    transaction.commit().await.context(repl_error::StoreSnafu)
-}
-
-/// Print the local public bundle in copy/paste and verification forms.
-fn print_local_public_bundle(member_id: &MemberIdentity, bundle: &PublicKeyBundle) {
-    println!("member id: {member_id}");
-    print_local_public_bundle_without_member(bundle);
-}
-
 /// Print identity-free local public material returned by the runtime.
 fn print_local_public_bundle_without_member(bundle: &PublicKeyBundle) {
     println!("public bundle (copy this value):");
@@ -254,8 +170,7 @@ mod tests {
         test_support::test_public_member_keys,
     };
     use futures_util::future;
-    use std::sync::Mutex;
-    use uuid::Uuid;
+    use std::{io::Cursor, sync::Mutex};
 
     struct RecordingApi {
         local_bundle: PublicKeyBundle,
@@ -377,23 +292,21 @@ mod tests {
             member_id: member_id.clone(),
             public_bundle: bundle.to_pasteable_string(),
         };
-        let mut confirm_after_assessment = |_: &str| {
-            assert_eq!(
-                api.assessments
-                    .lock()
-                    .expect("assessment lock should be available")
-                    .len(),
-                1
-            );
-            Ok(true)
-        };
+        let mut input = Cursor::new(b"yes\n".as_slice());
+        let mut output = Vec::new();
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
 
         block_on(run_runtime_key_command_with_confirmation(
             &api,
             command,
-            &mut confirm_after_assessment,
+            &mut confirmation,
         ))
         .expect("trust command should succeed");
+
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            "Trust this bundle for member bob? [y/N] "
+        );
 
         let assessments = api
             .assessments
@@ -427,23 +340,21 @@ mod tests {
         let command = ChecklistKeyCommand::Block {
             public_bundle: bundle.to_pasteable_string(),
         };
-        let mut decline_after_assessment = |_: &str| {
-            assert_eq!(
-                api.assessments
-                    .lock()
-                    .expect("assessment lock should be available")
-                    .len(),
-                1
-            );
-            Ok(false)
-        };
+        let mut input = Cursor::new(b"no\n".as_slice());
+        let mut output = Vec::new();
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
 
         block_on(run_runtime_key_command_with_confirmation(
             &api,
             command,
-            &mut decline_after_assessment,
+            &mut confirmation,
         ))
         .expect("declined block should succeed without mutation");
+
+        assert_eq!(
+            String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
+            "Block this bundle fingerprint globally? [y/N] "
+        );
 
         let assessments = api
             .assessments
@@ -456,66 +367,5 @@ mod tests {
                 .expect("feedback lock should be available")
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn local_initialisation_is_idempotent_and_does_not_create_a_group() {
-        let test_id = Uuid::new_v4();
-        let test_dir = std::env::temp_dir().join(format!("flotsync-checklist-keys-{test_id}"));
-        std::fs::create_dir_all(&test_dir).expect("test directory should be created");
-        let config_path = test_dir.join("alice.toml");
-        let store_path = test_dir.join("alice.sqlite");
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"
-                [flotsync.examples.replicated-checklist]
-                local-member = "alice"
-                store-path = "alice.sqlite"
-                store-secret-profile = "unsafe:test-{test_id}"
-                "#
-            ),
-        )
-        .expect("test config should be written");
-
-        block_on(init_local_keys(&config_path)).expect("first initialisation should succeed");
-        block_on(init_local_keys(&config_path)).expect("second initialisation should reuse keys");
-
-        block_on(async {
-            let setup = load_checklist_store_setup(&config_path)
-                .await
-                .expect("test store should reopen");
-            let bundle = load_local_public_key_bundle(
-                setup.store.as_ref(),
-                &setup.config.local_member,
-                &setup.replication_security,
-            )
-            .await
-            .expect("local bundle should load");
-            assert!(bundle.is_some());
-            let mut transaction = setup
-                .store
-                .begin_read_transaction()
-                .await
-                .expect("read transaction should start");
-            let bindings = transaction
-                .load_member_public_keys_for_member(&setup.config.local_member)
-                .await
-                .expect("local bindings should load");
-            let groups = transaction
-                .load_replication_groups()
-                .await
-                .expect("groups should load");
-            transaction
-                .release()
-                .await
-                .expect("read transaction should release");
-            assert_eq!(bindings.len(), 1);
-            assert!(groups.is_empty());
-        });
-
-        std::fs::remove_file(store_path).expect("test store should be removed");
-        std::fs::remove_file(config_path).expect("test config should be removed");
-        std::fs::remove_dir(test_dir).expect("test directory should be removed");
     }
 }

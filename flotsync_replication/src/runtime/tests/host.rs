@@ -6,10 +6,21 @@ use super::*;
 fn load_replication_runtime_accepts_store_provisioned_security() {
     let runtime_endpoint_lease = reserve_sockets(&[ReservedSocketKind::UdpSocket]);
     let application_id = app_probe_id();
-    let store = sqlite_store(alice_member());
     let security = setup_api_test_security_secrets();
-    let expected_public_bundle =
-        provision_runtime_security_through_setup_api(store.as_ref(), &alice_member(), &security);
+    let provisioner = wait_for_test_future(SqliteReplicationStoreProvisioner::in_memory())
+        .expect("store provisioner should build");
+    let identity_setup = wait_for_test_reply(provision_local_identity(
+        &provisioner,
+        alice_member(),
+        &security,
+    ))
+    .expect("identity should provision");
+    assert_eq!(identity_setup.member_id(), &alice_member());
+    let expected_public_bundle = identity_setup.into_public_bundle();
+    let store = Arc::new(
+        wait_for_test_future(provisioner.into_replication_store())
+            .expect("provisioned store should activate"),
+    );
     let listener = Arc::new(ListenerStub::default());
     let runtime_config_toml = local_endpoint_toml(runtime_endpoint_lease.addr(0));
 
@@ -115,9 +126,11 @@ fn replication_security_secrets_load_or_create_reuses_local_profile() {
 }
 
 #[test]
-fn load_replication_runtime_rejects_missing_local_private_keys() {
+fn load_replication_runtime_reports_unsupported_identity_without_private_keys() {
     let application_id = app_probe_id();
-    let store = sqlite_store(alice_member());
+    let inner_store = sqlite_store(alice_member());
+    provision_test_security(inner_store.as_ref(), &alice_member(), []);
+    let store = Arc::new(FailingStore::new(inner_store).with_hidden_local_private_keys());
     let listener = Arc::new(ListenerStub::default());
 
     let loaded_runtime = wait_for_test_reply(load_replication_runtime(
@@ -128,13 +141,16 @@ fn load_replication_runtime_rejects_missing_local_private_keys() {
         test_replication_security_secrets(),
     ));
     let Err(error) = loaded_runtime else {
-        panic!("public runtime loading should reject missing security provisioning");
+        panic!("runtime loading should reject an identity without private keys");
     };
 
     let error = security_load_error(error, &application_id);
+    let LoadSecurityError::Other { source, .. } = error else {
+        panic!("unsupported broken store state should remain an internal error: {error:?}");
+    };
     assert!(matches!(
-        &error,
-        LoadSecurityError::MissingLocalPrivateKeys { member_id }
+        source.downcast_ref::<DeliverySecurityError>(),
+        Some(DeliverySecurityError::MissingLocalPrivateKeys { member_id })
             if member_id == &alice_member()
     ));
 }
@@ -321,7 +337,7 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
     let store = sqlite_store(alice_member.clone());
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let alternate_bob_keys =
-        MemberPublicKeysRecord::from_public_keys(&test_public_keys(&Identifier::from_array([
+        MemberPublicKeysRecord::from_public_keys(&test_public_keys(&MemberIdentity::from_array([
             "bob", "phone",
         ])));
     let mut alternate_bob_record = alternate_bob_keys;
@@ -370,7 +386,7 @@ fn load_replication_runtime_allows_ambiguous_member_keys_when_group_names_exact_
 
 #[test]
 fn delivery_runtime_host_defaults_to_loopback_local_endpoint_bind_in_tests() {
-    let mut host = start_host(&Identifier::from_array(PROBE_MEMBER_SEGMENTS));
+    let mut host = start_host(&MemberIdentity::from_array(PROBE_MEMBER_SEGMENTS));
 
     assert!(host.external_udp_bind_addr().ip().is_loopback());
     wait_for_test_future(host.shutdown()).expect("host should shut down cleanly");

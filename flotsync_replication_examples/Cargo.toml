@@ -31,7 +31,9 @@ snafu = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+flotsync_io = { path = "../flotsync_io", features = ["test-support"] }
 flotsync_replication = { path = "../flotsync_replication", features = ["test-support"] }
+flotsync_security = { path = "../flotsync_security", features = ["test-support"] }
 
 [[bin]]
 name = "replicated_checklist"

@@ -54,7 +54,7 @@ fn bootstrap_payload_validation_rejects_unpermitted_sender_fingerprint() {
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &bob_member);
     let bob_keys = test_public_keys(&bob_member);
-    let probe_keys = test_public_keys(&Identifier::from_array(["probe", "laptop"]));
+    let probe_keys = test_public_keys(&MemberIdentity::from_array(["probe", "laptop"]));
     let mismatched_alice_key =
         BootstrapMemberKeyMessage::from_fingerprint(probe_keys.fingerprint());
     let payload = GroupSetupMessage::new(
@@ -94,7 +94,7 @@ fn bootstrap_payload_validation_accepts_advertised_sender_fingerprint_when_multi
     let bob_member = bob_member();
     let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
-    let alternate_alice_source = test_public_keys(&Identifier::from_array(["alice", "phone"]));
+    let alternate_alice_source = test_public_keys(&MemberIdentity::from_array(["alice", "phone"]));
     let alternate_alice_keys = PublicMemberKeys::from_key_bytes(
         alice_member.clone(),
         alternate_alice_source.signing_key_bytes(),
@@ -189,7 +189,7 @@ fn bootstrap_payload_validation_rejects_sender_without_bootstrap_activation_perm
 fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let charlie_member = Identifier::from_array(["charlie", "laptop"]);
+    let charlie_member = MemberIdentity::from_array(["charlie", "laptop"]);
     let store = sqlite_store(bob_member.clone());
     provision_test_security(store.as_ref(), &bob_member, [alice_member.clone()]);
     let security = load_test_runtime_security(store.clone(), &bob_member);
@@ -237,7 +237,7 @@ fn bootstrap_prepare_stores_inline_unknown_keys_without_trust_evidence() {
 fn bootstrap_preparation_elides_inline_bundles_above_configured_limit() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let charlie_member = Identifier::from_array(["charlie", "laptop"]);
+    let charlie_member = MemberIdentity::from_array(["charlie", "laptop"]);
     let store = sqlite_store(alice_member.clone());
     provision_test_security(
         store.as_ref(),

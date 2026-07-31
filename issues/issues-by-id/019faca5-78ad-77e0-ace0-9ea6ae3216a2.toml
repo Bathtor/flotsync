@@ -1,0 +1,133 @@
+id = "019faca5-78ad-77e0-ace0-9ea6ae3216a2"
+ref = "flotsync-mrl"
+title = "Remove checklist local member identity from configuration"
+body = """
+Objective
+
+P01. Remove the replicated-checklist local member identity from application configuration and make locally stored identity and private-key state authoritative.
+
+Agreed constraints
+
+P02. The existing local_members table owns both the local identity and its current encrypted private-key material. Do not add a separate identity table.
+P03. Provisioning commits the private-key record and matching public-key binding in one transaction. Persisted identity-only or partially populated private-key states are not supported.
+P04. Determine identity from distinct member identities in local_members so future storage of several key materials for one identity does not make the store ambiguous.
+P05. A replication-ready store always has exactly one authoritative local identity. Missing or multiple distinct identities are provisioning or corruption states, not optional runtime state.
+P06. No compatibility work for previous development databases is required.
+
+Runtime and storage design
+
+P07. Add a SqliteReplicationStoreProvisioner that can open a schema with no local identity and does not implement ReplicationStore.
+P08. Move disk-backed and in-memory SQLite construction to the provisioner. Constructors no longer accept a member identity.
+P09. Add a narrow LocalIdentityProvisioningStore capability for inspecting the optional provisioned identity and starting the transaction used by provisioning.
+P10. Add transaction storage access that resolves zero or one distinct local member identity without exposing ordering; reject multiple distinct identities precisely.
+P11. Add provision_local_identity(store, member_id, security). It generates key material, verifies that the store is unprovisioned, and commits encrypted private keys plus the matching public-key binding atomically.
+P12. Replace initialise_local_identity, InitialiseLocalIdentityError, and LocalIdentityInitialisation with provisioning-specific APIs and result/error types. Successful provisioning always creates material, so there is no was_created flag.
+P13. SqliteReplicationStoreProvisioner::into_replication_store consumes the provisioner, re-reads the authoritative identity, and returns a SqliteReplicationStore caching that required identity.
+P14. A custom ReplicationStore that reports an identity without corresponding private material violates the replication-ready invariant. Keep the internal DeliverySecurityError::MissingLocalPrivateKeys diagnostic, but do not expose a caller-actionable recovery variant or claim that provision_local_identity can repair this unsupported state.
+P15. Use test-support provisioning helpers so in-memory stores obey the same identity-and-key invariant as file stores.
+P16. During runtime security loading, derive the local public keys from decrypted authoritative private material and idempotently restore a missing matching public-key record. Absence of this redundant public projection does not reject store activation or runtime loading; genuine storage conflicts and write failures remain errors.
+
+Nominal identifier types
+
+P17. Replace the MemberIdentity alias with a nominal MemberIdentity(Identifier) newtype.
+P18. Add a nominal ApplicationId(Identifier) newtype and use it throughout runtime loading, load errors, local-store-secret selection, checklist application identity, and test fixtures.
+P19. Give both newtypes their own construction, parsing, formatting, ordering, equality, hashing, IdentifierLike implementation, and explicit Identifier conversions. Do not implement Deref or implicit cross-domain conversions.
+P20. Keep the compressed membership trie storing Identifier internally and convert explicitly at the GroupMembers boundary without adding a second identity representation.
+P21. Thread MemberIdentity through membership, persistence, protocol, and key-material boundaries, and ApplicationId through application-scoping APIs, so the compiler rejects exchanging them.
+
+Checklist application
+
+P22. Remove local-member parsing and storage from ChecklistAppConfig and all example configuration.
+P23. New and unprovisioned stores ask for confirmation, then read a local member identity, provision identity and keys, activate the SQLite replication store, and load the runtime.
+P24. Existing provisioned stores activate directly and load their identity from local_members. Configuration cannot override it.
+P25. Replace ConfirmationDialog with a general ChecklistDialog supporting confirmation, line input, required member identities, and optional member identities.
+P26. Use ChecklistDialog for first-run identity selection and group-member entry, removing the closure-based group-member prompt boundary.
+P27. Store the authoritative identity explicitly in checklist setup/runtime application state and use it for me output, group creation, membership markers, invitations, and related diagnostics.
+P28. Remove the obsolete runtime-load identity recovery flow from the checklist.
+
+Validation and documentation
+
+P29. Add exhaustive tests for atomic provisioning, repeated provisioning rejection, ready-store activation, restart identity recovery, missing and ambiguous identity rejection, malformed stored identity, and in-memory provisioning.
+P30. Add a regression test that loads runtime security from authoritative private material without its redundant public record and verifies automatic restoration of the exact derived binding.
+P31. Keep negative coverage for a faulty custom ReplicationStore that reports identity without private material. Assert the opaque public security error and precise internal missing-private-material source, without presenting a supported repair path.
+P32. Add checklist tests for accepted and declined first-run provisioning, restart without an identity prompt, configuration parsing without local-member, and general dialogue member input.
+P33. Update checklist examples, scenario fixtures, and security documentation to describe first-run identity provisioning and remove local-member.
+P34. Keep new tests exhaustive rather than relying on substring contains assertions.
+P35. Run the complete checklist suite repeatedly with normal parallel scheduling outside the sandbox. Do not increase its control timeout to conceal a lifecycle failure; if the shutdown timeout recurs, diagnose and fix it before review hand-off.
+
+Implementation boundaries and estimate
+
+P36. Boundary one is the existing runtime/storage provisioning and checklist switch.
+P37. Boundary two introduces and propagates MemberIdentity and ApplicationId.
+P38. Boundary three adds local public-binding restoration, removes stale broken-store recovery guidance, and adds the negative/regression coverage.
+P39. The combined task is deliberately over 1,000 LOC and remains organised into the three reviewable boundaries above. The remaining agreed review corrections and timeout repair are estimated at roughly 70 to 130 touched LOC and do not warrant another task split.
+
+Acceptance
+
+P40. A new checklist store provisions one identity and key pair without local-member configuration.
+P41. Identity and private-key material become visible together only after the provisioning transaction commits.
+P42. Restarting loads the same authoritative identity from local_members.
+P43. Missing or multiple stored identities prevent construction of a replication-ready SQLite store with precise errors.
+P44. Runtime startup, public-bundle export, group creation, and invitation handling use the stored identity.
+P45. A missing redundant local public-key record is reconstructed from authoritative private material during runtime loading.
+P46. MemberIdentity and ApplicationId are nominally distinct at compile time across public and internal APIs.
+P47. The repository no longer exposes or calls initialise_local_identity and does not advertise provisioning as recovery for an already broken replication-ready store.
+
+Agreed review corrections
+
+P48. Keep ApplicationId in flotsync_core. Both replication runtime APIs and flotsync_security consume application identity, which justifies treating it as a shared core primitive.
+P49. Move collect_schema_sources from a top-level private function into SqliteReplicationStoreProvisioner as a private associated helper. Keep public associated methods before private helpers, preserving behaviour while conforming to item ordering.
+P50. Remove ensure_store_is_unprovisioned and inline direct if-let checks at both provisioning preflight points. Absence is success, so ok_or_else has the wrong polarity here.
+P51. Expose the existing test-support application id through one documented helper and reuse it throughout secure_runtime.rs. Remove the per-peer application constants and helpers because those scenarios use isolated stores and do not test application-id isolation.
+P52. Retain permitted_reachable_members as filter_map: moving Identifier into MemberIdentity for the predicate and back again avoids cloning the identifier. Add a developer comment explaining this non-obvious ownership optimisation, and apply the same comment discipline to borrow-checker- or allocation-driven code whose shape otherwise appears unnecessarily strange.
+P53. After implementing P49-P54, rerun focused core, security, replication, secure-runtime, and checklist tests, then the workspace all-target check, pedantic Clippy, rustfmt, and diff checks.
+P54. Fix the reproduced peer-announcement shutdown timeout at its source. Run the synchronous system-interface snapshot through the existing blocking-I/O pool so the Kompact component remains able to process lifecycle events; apply snapshot results and announcement state through spawn_local, permit only one refresh in flight, remove the duplicate refresh call, and treat already inactive lifecycle components as stopped."""
+status = "closed"
+status_reason = "completed"
+type = "task"
+priority = 0
+assignee = "codex"
+blocked_by = ["019f4076-d998-7720-94b8-6cc1bddd76aa"]
+created_at = "2026-07-29T06:52:33.32526Z"
+updated_at = "2026-07-31T14:44:05.469485Z"
+closed_at = "2026-07-31T14:44:05.469485Z"
+
+[[links]]
+target = "019f4076-d998-7720-94b8-6cc1bddd76aa"
+label = "discovered from"
+
+[[comments]]
+id = "019fb3ff-8e8c-7c02-9c27-5f2f146a67f1"
+author = "codex"
+body = "Implemented P01-P35: added provisioning-only store capabilities and SQLite activation, atomic provision_local_identity, authoritative identity loading, checklist dialogue/config/startup changes, test-support updates, and refreshed OKF docs. Validation passed for 238 replication unit tests, 6 secure-runtime integration tests, all 20 checklist group tests, workspace all-target check, pedantic Clippy, rustfmt, git diff check, and OKF docs. The full 69-test checklist binary twice hit the existing PeerAnnouncementComponent shutdown timeout in created_group_is_visible_to_the_runtime_registry_and_listener after its assertions passed; that exact test and the complete 20-test group module pass in isolation."
+created_at = "2026-07-30T17:08:17.676236Z"
+
+[[comments]]
+id = "019fb430-0ba1-7421-b132-501a00acd36e"
+author = "codex"
+body = "Review delta agreed: missing local public material is a recoverable redundant projection and will be reconstructed during runtime security loading; the already-identified/no-private-material custom-store state remains unsupported and loses its stale public provisioning guidance; MemberIdentity and ApplicationId become distinct newtypes. Follow-up validation reran the 69-test checklist library suite serially, four times with normal parallelism, and once with 32 test threads, all passing. The earlier PeerAnnouncementComponent timeout did not reproduce; it remains a stop condition if it returns during implementation validation."
+created_at = "2026-07-30T18:01:15.425513Z"
+
+[[comments]]
+id = "019fb446-895d-76c0-87e9-169a6542394b"
+author = "codex"
+body = "Review follow-up implemented: runtime security now idempotently reconstructs a missing local public-key binding from authoritative decrypted private material; identity-without-private custom stores surface as opaque public security failures with their precise internal source retained; MemberIdentity and ApplicationId are nominal newtypes propagated across core, security, replication, routes, messages, checklist, and tests. Validation passed: 53 core tests, 60 security tests with all features, 240 replication unit tests, 6 secure-runtime integration tests, 69 checklist tests serially plus three consecutive normal-parallel runs, workspace all-target check, warning-free workspace all-feature pedantic Clippy, rustfmt, git diff check, and OKF docs check. The shutdown timeout did not recur and no timeout was raised or suppressed."
+created_at = "2026-07-30T18:25:49.40514Z"
+
+[[comments]]
+id = "019fb6f2-174b-7543-a13a-f64bcd4d3fac"
+author = "codex"
+body = "Review plan agreed without implementation: ApplicationId remains in flotsync_core because replication and security both consume it; collect_schema_sources becomes a private provisioner helper; provisioning preflight checks are inlined; secure-runtime tests reuse one test-support application id; and the allocation-free Identifier/MemberIdentity filter_map remains with an ownership rationale comment. Production changes are explicitly deferred."
+created_at = "2026-07-31T06:52:26.827185Z"
+
+[[comments]]
+id = "019fb89b-7e4d-7f82-b0bd-85580760d5ad"
+author = "codex"
+body = "Implemented agreed review corrections P49-P54. The SQLite helper now follows associated-item ordering; provisioning checks are inlined; secure-runtime fixtures share the canonical test application id; and the allocation-free route conversion now explains its ownership rationale. The reproduced shutdown timeout was traced with a process sample to macOS CoreWLAN blocking inside netdev interface discovery on the PeerAnnouncementComponent worker. Interface snapshots now run through the existing blocking pool, only one refresh can be pending, the duplicate refresh was removed, and already inactive components are treated as stopped. Validation passed: 53 core tests, 60 security tests, 30 discovery tests, 240 replication unit tests, 6 secure-runtime integration tests, the complete 69-test checklist suite once serially and three times with normal parallel scheduling, workspace all-target check, all-feature workspace pedantic Clippy, rustfmt, and diff checks. The targeted runtime test also passed four consecutive post-fix runs at roughly 50 ms without changing the control timeout."
+created_at = "2026-07-31T14:37:05.997308Z"
+
+[[comments]]
+id = "019fb8a1-e4dd-7d42-b22d-25229f751a87"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-31T14:44:05.469485Z"

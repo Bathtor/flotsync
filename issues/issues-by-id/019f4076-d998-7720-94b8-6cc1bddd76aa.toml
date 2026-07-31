@@ -2,31 +2,189 @@ id = "019f4076-d998-7720-94b8-6cc1bddd76aa"
 ref = "flotsync-bks"
 title = "Reassess temporary local public key bundle provisioning API"
 body = """
-Reassess load_local_public_key_bundle after flotsync-git-d03 removes the replicated-checklist dependency on the temporary fixed static-group setup bridge.
+Objective
 
-Current understanding:
-C01. The helper itself is already group-independent: it loads encrypted local private-key material and derives the shareable public bundle from the replication store.
-C02. Pre-runtime keys init-local and keys export-local still require this capability.
-C03. The current static-group coupling lives in replicated-checklist config parsing, runner startup, and the init-local/trust side effects rather than in the helper signature or implementation.
-C04. Moving the helper into the example would require exposing or duplicating lower-level encrypted-store handling, so reassessment should preserve that encapsulation.
+B01. Replace the temporary piecemeal local-key provisioning surface with one replication-owned, idempotent local identity initialisation operation.
 
-Scope:
-S01. Review the helper against the decoupled checklist setup produced by flotsync-git-d03.
-S02. Decide whether it should remain a replication provisioning API, move behind a narrower replication-owned setup/key-management boundary, or disappear only if the decoupled flow provides a real replacement.
-S03. Update its API placement, naming, documentation, exports, and focused tests as required by that decision.
-S04. Remove stale fixed-static-group wording and references from the surviving boundary.
+B02. Remove the replicated-checklist pre-runtime keys init-local command. Ordinary run startup detects missing local identity keys, asks for confirmation, initialises them only when accepted, and then retries runtime loading once.
 
-Acceptance:
-A01. The decision reflects the post-d03 callers rather than the temporary static-group bridge.
-A02. Local public-bundle initialisation/export remains possible without exposing encrypted store internals to the example.
-A03. The resulting API and documentation describe the actual ownership and stability of the capability."""
-status = "open"
+Current state
+
+B03. Runtime-backed keys export-local no longer needs pre-runtime store access.
+
+B04. load_local_public_key_bundle has one production caller: checklist keys init-local.
+
+B05. The checklist currently coordinates existing-key lookup, key generation, encrypted private-key provisioning, public-binding storage, and created/existing reporting.
+
+B06. provision_replication_security otherwise remains only in one runtime setup-boundary test. ProvisionedReplicationSecurity and the static-group prepare/validate helpers have no remaining production responsibility.
+
+Replication-owned initialisation API
+
+B07. Add an opaque LocalIdentityInitialisation result with member_id(), public_bundle(), into_public_bundle(), and was_created() accessors. Document that was_created returns true only when the call generated fresh private key material.
+
+B08. Add:
+
+pub async fn initialise_local_identity(
+    store: &dyn ReplicationStore,
+    security: &ReplicationSecuritySecrets,
+) -> Result<LocalIdentityInitialisation, InitialiseLocalIdentityError>;
+
+B09. The store is authoritative for the local member identity; callers do not repeat it as an initialisation argument.
+
+B10. Run initialisation in one mutable transaction. Load an existing encrypted local-private record when present; otherwise generate fresh member keys and seal the private bundle.
+
+B11. In both existing and newly generated cases, derive and ensure the corresponding local public-key binding before committing. Return the authoritative member, public bundle, and created/existing outcome.
+
+B12. Keep the operation idempotent. If another actor has completed compatible initialisation, reuse it; report incompatible or invalid stored material precisely.
+
+B13. Replace the broad temporary security_provisioning boundary with a narrowly named local-identity implementation and root exports for only the operation, opaque result, and Snafu error.
+
+Runtime-load recovery API
+
+B14. Add LoadError::missing_local_private_keys_member(&self) -> Option<&MemberIdentity> so applications can classify the currently recoverable startup condition without matching nested Snafu representation.
+
+B15. Update LoadSecurityError::MissingLocalPrivateKeys developer documentation to name initialise_local_identity as the recovery operation.
+
+B16. Update the error display text to say that local private keys are not initialised and that callers should invoke flotsync_replication::initialise_local_identity before retrying runtime loading.
+
+B17. Treat only the missing-local-private-keys condition as automatically recoverable in this slice. Preserve all other load errors unchanged; future explicit recovery operations remain possible.
+
+Checklist startup flow
+
+B18. Load and validate checklist configuration before any setup mutation.
+
+B19. Check store_path.try_exists() before loading or creating a store secret, creating directories, or opening SQLite.
+
+B20. When the configured store path does not exist, ask whether to generate and store new local identity keys before creating any setup state. Declining returns success without filesystem, keyring, database, private-key, or public-binding changes.
+
+B21. When new-store initialisation is accepted, create or load the store secret, create the store, call initialise_local_identity, and start the runtime normally.
+
+B22. When the store path exists, load its existing store secret rather than creating a replacement, open the store, and attempt ordinary runtime startup.
+
+B23. If existing-store startup reports missing local private keys, use the same confirmation dialog. Declining exits without provisioning key material; accepting calls initialise_local_identity and retries runtime startup exactly once.
+
+B24. Propagate initialisation failures and second-start failures normally. Do not add a retry loop.
+
+B25. Keep confirmation injectable at a narrow startup helper so acceptance and refusal are testable without replacing standard input globally.
+
+Checklist cleanup and documentation
+
+B26. Remove the top-level Keys and ReplicatedChecklistKeyCommand command surface, keys init-local parsing, the pre-runtime handler, application-owned key generation, load_local_public_key_bundle usage, and store_observed_public_key_binding.
+
+B27. Retain runtime REPL commands keys export-local, keys inspect, keys trust, and keys block.
+
+B28. Remove load_local_public_key_bundle, provision_replication_security, ProvisionedReplicationSecurity, prepare_initial_group_security_material, validate_initial_group_security_material, obsolete error variants, stale fixed-static-group wording, and obsolete exports.
+
+B29. Update checklist usage and security documentation so ordinary run is the only first-run entry point and explains the conditional identity-generation prompt.
+
+Coverage
+
+B30. Cover idempotent create/reuse initialisation, atomic private/public record establishment, derived public-bundle correctness, and invalid or wrongly encrypted stored material.
+
+B31. Cover LoadError missing-key classification and recovery guidance while ensuring other load failures are not classified as missing keys.
+
+B32. Cover new-store acceptance and refusal, including a refusal assertion that no path, store secret, SQLite database, or identity records are created.
+
+B33. Cover existing-store missing-key acceptance and refusal, successful first-attempt startup without prompting, one retry after accepted initialisation, and propagation of non-missing and second-start failures.
+
+B34. Preserve runtime setup-boundary coverage by loading a runtime from records created through initialise_local_identity.
+
+B35. Update command parsing tests to reject the removed top-level key initialisation command while retaining ordinary run behaviour.
+
+Follow-up
+
+B36. P0 follow-up flotsync-mrl removes local-member from checklist configuration and makes stored local identity state authoritative. It is blocked by and linked as discovered from this task.
+
+Estimate and conformance
+
+B37. Estimated implementation size is 700-950 touched LOC across the replication initialisation boundary, checklist startup and CLI cleanup, focused tests, exports, and documentation. The work should remain below 1,000 LOC and does not need splitting.
+
+B38. Preserve repository Rust, Snafu, formatting, pedantic Clippy, socket-reservation, documentation, and single-threaded sandbox test requirements. No migration or compatibility work is required.
+
+Agreed review fixes
+
+B39. Exercise first-run refusal with a unique managed store-secret profile and the process-global sample keyring. Assert that the profile remains missing as well as that no filesystem setup state exists.
+
+B40. Keep decoded LocalMemberKeys through local identity initialisation. Build the stored public-key record directly from its identity-bound public keys and derive the returned identity-free bundle once, avoiding a clone-and-rebind round trip.
+
+B41. Split wrong-secret and store-secret-key-id mismatch tests into precisely named cases. Add correctly sealed malformed private material that must return InvalidPrivateBundle.
+
+B42. Assert complete, exact recovery error rendering rather than substring membership when the full display contract is knowable.
+
+B43. Use separate confirmation text for first-run setup and existing-store key recovery. The first-run prompt names the store path and explains that acceptance sets up the store, local secret, and identity keys; tests assert complete prompt text.
+
+B44. Rename docs/flotsync_security_mvp.md to docs/flotsync_security.md and maintain it as the current Flotsync security protocol overview. Remove obsolete MVP and first-slice framing, remove already-completed deferred work, update README links, regenerate docs/index.md, and validate the OKF corpus while preserving still-current protocol rules.
+
+B45. Do not add a local-identity partial-write failure-injection test. Both security writes occur before the sole commit in one rollback-by-default ReplicationStoreTransaction; partial application is excluded by the store transaction contract and belongs to store transaction testing.
+
+B46. The agreed review-fix delta is estimated at 160-240 LOC and remains a single self-contained review pass.
+
+Second agreed review fixes
+
+B47. Remove obsolete negative documentation about checklist configuration fields that no longer exist; document only the current store-secret profile behaviour.
+
+B48. Remove the low-value top-level parser test for the sole remaining command while retaining behavioural confirmation parsing coverage.
+
+B49. Report declined identity initialisation inside the setup or recovery helper that observes the decision. At the entry point, report the affected operation as store setup cancelled or runtime load aborted.
+
+B50. Replace opaque mutable confirmation callbacks throughout checklist startup and runtime key commands with one private ConfirmationDialog over borrowed buffered input and writable output. Production binds it to standard input/output; tests use in-memory cursors and buffers.
+
+B51. Preserve exact prompt assertions through the dialog output and scripted answer input while retaining acceptance, refusal, no-prompt, retry-once, and runtime-key confirmation coverage.
+
+B52. The second agreed review delta is estimated at 130-230 touched LOC and remains a single self-contained review pass below 1,000 LOC."""
+status = "closed"
+status_reason = "completed"
 type = "task"
 priority = 3
+assignee = "codex"
 blocked_by = ["019f502e-2262-70a0-bf74-6da295fff88e"]
+blocks = ["019faca5-78ad-77e0-ace0-9ea6ae3216a2"]
 created_at = "2026-07-08T06:42:38.616686Z"
-updated_at = "2026-07-26T12:04:18.04885Z"
+updated_at = "2026-07-30T15:56:54.574228Z"
+closed_at = "2026-07-30T15:56:54.574228Z"
 
 [[links]]
 target = "019f0dc5-e3e6-7001-adf5-d3958d34f82f"
 label = "discovered from"
+
+[[comments]]
+id = "019facaa-56dd-7d51-aab3-ccb34c616b99"
+author = "lkroll"
+body = "Plan agreed: replace piecemeal provisioning with one idempotent replication-owned local identity initialiser; remove the top-level checklist key-init command; prompt and recover during ordinary startup; preserve a truly side-effect-free decline when the store path is absent; make missing-key recovery discoverable through LoadError and its documentation; and defer configuration-owned member identity removal to P0 follow-up flotsync-mrl."
+created_at = "2026-07-29T06:57:52.349049Z"
+
+[[comments]]
+id = "019faf17-534b-7cf0-9600-f380b98144ad"
+author = "codex"
+body = "Implementation completed against B01-B38: added the replication-owned initialise_local_identity API and missing-key classifier/guidance; switched checklist run startup to confirmed first-run creation and one-shot missing-key recovery; removed the separate key initialisation command and obsolete provisioning surface; retained runtime key commands; updated usage/security documentation; and added coverage for create/reuse/repair, invalid security, prompt acceptance/refusal, no-prompt startup, non-missing errors, and retry-once behaviour. Validation passed for the replication library (234 tests), checklist example library (73 tests), workspace all-target check, pedantic Clippy, rustfmt check, and focused post-Clippy startup tests."
+created_at = "2026-07-29T18:16:09.291541Z"
+
+[[comments]]
+id = "019faf29-cc01-7121-9ae5-e7b0fe01482c"
+author = "codex"
+body = "Review plan agreed: strengthen first-run refusal coverage with the sample keyring; remove the public-bundle clone/rebind round trip; separate invalid-material tests and add malformed plaintext coverage; assert complete recovery error and prompt rendering; use distinct first-run and existing-store prompts; and rename the maintained security protocol overview to docs/flotsync_security.md with OKF link/index updates. The proposed partial-write failure-injection test was withdrawn because both writes are enclosed by the same rollback-by-default transaction and a single commit."
+created_at = "2026-07-29T18:36:19.84132Z"
+
+[[comments]]
+id = "019faf31-8adc-7b42-a055-65bf44fdd399"
+author = "codex"
+body = "Review fixes C01-C07 reconciled. Implemented sample-keyring refusal verification; retained identity-bound LocalMemberKeys without clone/rebind; split wrong-secret and key-id tests and added correctly sealed malformed material; switched recovery error and startup prompt tests to exact complete strings; separated first-run and existing-store prompts; and renamed the maintained security overview to docs/flotsync_security.md with regenerated links/index. C02 remains intentionally withdrawn because private and public writes share one rollback-by-default transaction and one commit. Validation passed: 236 flotsync_replication tests, 73 flotsync_replication_examples tests, workspace all-target check, pedantic Clippy, rustfmt check, git diff check, and OKF validation for 16 documents."
+created_at = "2026-07-29T18:44:47.452635Z"
+
+[[comments]]
+id = "019fb1c1-0591-7a50-9c35-e90020bf39fb"
+author = "codex"
+body = "Second review plan agreed: remove obsolete negative documentation and the low-value top-level parser test; report identity-decline causes inside setup/recovery helpers and operation-level cancellation at the entry point; replace opaque mutable confirmation callbacks with a concrete ConfirmationDialog backed by borrowed input/output; and adapt startup plus runtime-key tests to scripted input and exact rendered prompts."
+created_at = "2026-07-30T06:40:44.945836Z"
+
+[[comments]]
+id = "019fb1cc-1f3c-7581-a40f-af9af5aa93f3"
+author = "codex"
+body = "Review fixes C08-C12 implemented: removed obsolete negative checklist documentation and the low-value top-level parser test; moved identity-decline feedback into setup/recovery helpers with store-setup and runtime-abort messages at the entry point; replaced every checklist confirmation callback, including startup, key commands, and group creation, with the concrete ConfirmationDialog over borrowed buffered input/output; and converted affected tests to scripted answers plus exact rendered prompts. Validation passed: 236 replication tests, 72 checklist tests, workspace all-target check, warning-free pedantic Clippy, rustfmt, diff checks, Rust instruction audit, and OKF validation for 16 documents."
+created_at = "2026-07-30T06:52:52.412715Z"
+
+[[comments]]
+id = "019fb3be-33ae-7e33-910e-8e3b2894f0f5"
+author = "lkroll"
+body = "completed"
+created_at = "2026-07-30T15:56:54.574228Z"

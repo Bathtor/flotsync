@@ -1,15 +1,27 @@
 //! Tests for application-facing security-store reports.
 
 use super::fixtures::*;
+use crate::test_support::test_public_member_keys;
 
 #[test]
-fn known_member_keys_report_names_empty_store() {
+fn known_member_keys_report_includes_provisioned_local_binding() {
     let security_store = security_store(sqlite_store());
 
     let report = wait_for_security_store_future(security_store.known_member_keys_report())
-        .expect("empty known-member report should load");
+        .expect("known-member report should load");
 
-    assert!(report.members.is_empty());
+    let [local] = report.members.as_slice() else {
+        panic!("only the provisioned local member should be reported: {report:?}");
+    };
+    assert_eq!(local.member_id, local_member());
+    let [local_key] = local.keys.as_slice() else {
+        panic!("exactly one local key should be reported: {local:?}");
+    };
+    assert_eq!(
+        local_key.fingerprint,
+        test_public_member_keys(&local_member()).fingerprint()
+    );
+    assert!(!local_key.trust.has_local_explicit_trust);
 }
 
 #[test]
@@ -30,7 +42,19 @@ fn known_member_keys_report_groups_bindings_and_local_trust() {
     let report = wait_for_security_store_future(security_store.known_member_keys_report())
         .expect("known-member report should load");
 
-    assert_eq!(report.members.len(), 2);
+    assert_eq!(report.members.len(), 3);
+    let local = report
+        .members
+        .iter()
+        .find(|member| member.member_id == local_member())
+        .expect("local member should be reported");
+    let [local_key] = local.keys.as_slice() else {
+        panic!("exactly one local key should be reported: {local:?}");
+    };
+    assert_eq!(
+        local_key.fingerprint,
+        test_public_member_keys(&local_member()).fingerprint()
+    );
     let alternate = report
         .members
         .iter()

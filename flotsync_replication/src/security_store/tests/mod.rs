@@ -16,9 +16,8 @@ use crate::{
             RecordPublicKeyBundleFeedbackRequest,
         },
     },
-    test_support::test_public_member_keys,
+    test_support::{provisioned_sqlite_store, test_public_member_keys},
 };
-use flotsync_core::member::Identifier;
 use std::{collections::HashSet, time::Duration};
 
 mod feedback;

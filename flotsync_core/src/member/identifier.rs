@@ -40,6 +40,16 @@ pub trait IdentifierLike: fmt::Debug + fmt::Display {
         self.len() == 0
     }
 
+    /// Return this identifier's segment count in the protocol boundary width.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an implementation bypasses the shared segment-count invariant.
+    #[must_use]
+    fn segment_count_u8(&self) -> u8 {
+        u8::try_from(self.len()).expect("identifier segment count must fit into u8")
+    }
+
     /// The number of bytes in the identifier.
     ///
     /// This does *not* include any separators.
@@ -125,7 +135,7 @@ impl Identifier {
     /// Panics if the central segment-count invariant was bypassed.
     #[must_use]
     pub fn segment_count_u8(&self) -> u8 {
-        u8::try_from(self.len()).expect("identifier segment count must fit into u8")
+        IdentifierLike::segment_count_u8(self)
     }
 
     #[must_use]

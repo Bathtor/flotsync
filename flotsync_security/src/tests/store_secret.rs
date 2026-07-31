@@ -43,7 +43,7 @@ fn store_secret_open_fails_when_context_changes() {
 #[test]
 fn local_store_secret_create_then_load_round_trips_key() {
     install_local_store_secret_test_store().unwrap();
-    let application_id = Identifier::from_array(["flotsync", "security", "tests"]);
+    let application_id = ApplicationId::from_array(["flotsync", "security", "tests"]);
     let profile = unique_local_store_secret_profile("round-trip");
 
     let created = load_or_create_local_store_secret(&application_id, &profile).unwrap();
@@ -71,7 +71,7 @@ fn local_store_secret_create_then_load_round_trips_key() {
 #[test]
 fn local_store_secret_profiles_are_isolated() {
     install_local_store_secret_test_store().unwrap();
-    let application_id = Identifier::from_array(["flotsync", "security", "tests"]);
+    let application_id = ApplicationId::from_array(["flotsync", "security", "tests"]);
     let first_profile = unique_local_store_secret_profile("first");
     let second_profile = unique_local_store_secret_profile("second");
 
@@ -84,8 +84,8 @@ fn local_store_secret_profiles_are_isolated() {
 #[test]
 fn local_store_secret_application_ids_are_isolated() {
     install_local_store_secret_test_store().unwrap();
-    let first_application = Identifier::from_array(["flotsync", "security", "first"]);
-    let second_application = Identifier::from_array(["flotsync", "security", "second"]);
+    let first_application = ApplicationId::from_array(["flotsync", "security", "first"]);
+    let second_application = ApplicationId::from_array(["flotsync", "security", "second"]);
     let profile = unique_local_store_secret_profile("same-profile");
 
     let first = load_or_create_local_store_secret(&first_application, &profile).unwrap();
@@ -97,7 +97,7 @@ fn local_store_secret_application_ids_are_isolated() {
 #[test]
 fn local_store_secret_load_reports_missing_profile() {
     install_local_store_secret_test_store().unwrap();
-    let application_id = Identifier::from_array(["flotsync", "security", "tests"]);
+    let application_id = ApplicationId::from_array(["flotsync", "security", "tests"]);
     let profile = unique_local_store_secret_profile("missing");
 
     let err = load_local_store_secret(&application_id, &profile).unwrap_err();
@@ -145,7 +145,7 @@ fn local_store_secret_profile_rejects_account_separator() {
 #[test]
 fn local_store_secret_rejects_non_portable_application_id() {
     install_local_store_secret_test_store().unwrap();
-    let application_id = Identifier::from_array(["Flotsync", "security", "tests"]);
+    let application_id = ApplicationId::from_array(["Flotsync", "security", "tests"]);
     let profile = unique_local_store_secret_profile("application");
 
     let err = load_or_create_local_store_secret(&application_id, &profile).unwrap_err();

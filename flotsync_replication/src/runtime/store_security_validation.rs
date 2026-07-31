@@ -15,14 +15,14 @@ use crate::{
     },
     delivery::security::DeliverySecurityError,
 };
-use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembersError};
+use flotsync_core::{ApplicationId, GroupId, MemberIdentity, membership::GroupMembersError};
 use flotsync_security::STORE_SECRET_NONCE_LENGTH;
 use snafu::{IntoError, prelude::*};
 use std::sync::Arc;
 
 /// Validate persisted group security metadata required during runtime startup.
 pub(super) async fn validate_loaded_group_security(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     expected_store_secret_key_id: &StoreSecretKeyId,
 ) -> Result<(), RuntimeSecurityLoadError> {
@@ -52,7 +52,7 @@ pub(super) async fn validate_loaded_group_security(
 /// Build the public load error variant while keeping the concrete security type boxed.
 #[track_caller]
 pub(super) fn security_load_error(
-    application_id: Identifier,
+    application_id: ApplicationId,
     source: LoadSecurityError,
 ) -> LoadError {
     let source: Box<LoadSecurityError> = source.into();
@@ -66,9 +66,6 @@ pub(super) fn load_security_error_from_local_member(
     source: DeliverySecurityError,
 ) -> LoadSecurityError {
     match source {
-        DeliverySecurityError::MissingLocalPrivateKeys { member_id } => {
-            LoadSecurityError::MissingLocalPrivateKeys { member_id }
-        }
         DeliverySecurityError::InvalidLocalPrivateKeys { .. }
         | DeliverySecurityError::OpenLocalPrivateKeys { .. }
         | DeliverySecurityError::UnsupportedStoreSecretVersion { .. }
@@ -201,7 +198,7 @@ pub(super) enum RuntimeSecurityLoadError {
         "Failed to load security records for application '{application_id}': {source}"
     ))]
     StoreAccess {
-        application_id: Identifier,
+        application_id: ApplicationId,
         source: StoreError,
     },
     /// A persisted group record no longer satisfies group-member invariants.

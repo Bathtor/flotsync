@@ -178,7 +178,7 @@ fn member_identity_from_wire_segments(
             .push_checked(segment.clone())
             .context(InvalidIdentifierSegmentWireValueSnafu { field, segment })?;
     }
-    Ok(buffer.into_identifier())
+    Ok(MemberIdentity::from(buffer.into_identifier()))
 }
 
 fn ensure_identifier_segment_count(

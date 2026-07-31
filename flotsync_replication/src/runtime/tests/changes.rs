@@ -289,15 +289,13 @@ fn change_group_membership_emits_inline_snapshot_upserts_for_new_group() {
     let alice_member = alice_member();
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
-    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+    let store = sqlite_store_with_schemas(
         alice_member.clone(),
         [(
             dataset_id.clone(),
             SchemaSource::from(title_schema_shared()),
         )],
-    ))
-    .expect("store should build");
-    let store = Arc::new(store);
+    );
     provision_test_security(store.as_ref(), &alice_member, [bob_member.clone()]);
     let listener = Arc::new(ListenerStub::default());
     let runtime = load_runtime_with_parts(app_alice_id(), store.clone(), listener.clone());

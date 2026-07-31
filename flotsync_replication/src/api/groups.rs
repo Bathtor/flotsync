@@ -136,7 +136,7 @@ impl ReplicationSecuritySecrets {
     /// Returns [`LoadSecurityError::LocalStoreSecret`] if the local secret slot
     /// is missing, inaccessible, or malformed.
     pub fn load_local(
-        application_id: &Identifier,
+        application_id: &ApplicationId,
         profile: &LocalStoreSecretProfile,
     ) -> Result<Self, LoadSecurityError> {
         let secret =
@@ -151,7 +151,7 @@ impl ReplicationSecuritySecrets {
     /// Returns [`LoadSecurityError::LocalStoreSecret`] if the local secret slot
     /// cannot be loaded or created.
     pub fn load_or_create_local(
-        application_id: &Identifier,
+        application_id: &ApplicationId,
         profile: &LocalStoreSecretProfile,
     ) -> Result<Self, LoadSecurityError> {
         let secret = load_or_create_local_store_secret(application_id, profile)

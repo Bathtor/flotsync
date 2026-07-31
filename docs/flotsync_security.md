@@ -1,28 +1,30 @@
 ---
 type: Protocol
-title: Flotsync Security MVP
-description: Defines the initial Flotsync security model for identities, group secrets, encryption, and signatures.
+title: Flotsync Security
+description: Defines the Flotsync security model for identities, group secrets, encryption, and signatures.
 status: draft
 ---
 
-# Flotsync Security MVP
+# Flotsync Security
 
-This document records the high-level design decisions for the first
-`flotsync_security` slice. It is intentionally a baseline for review and
-implementation, not a full protocol specification.
+This document records the high-level security protocol and ownership boundaries
+implemented across `flotsync_security` and `flotsync_replication`. It is
+maintained as the protocol evolves; concrete Rust types and wire definitions
+remain authoritative for implementation details.
 
 ## 1. Scope
 
-The MVP secures replication delivery envelopes by default:
+Flotsync secures replication delivery envelopes by default:
 
 - runtime payloads are encrypted before they leave the replication runtime
 - delivery envelopes are signed by the claimed sender
 - group secrets are installed during bootstrap and stored with group metadata,
   encrypted by a device-local application database secret
-- local identities and trusted peer identities come from external key files
+- local private identities are encrypted in the replication store, while peer
+  public identities are observed and assessed through the replication API
 
-The first pass does not try to solve discovery trust, key rotation, revocation,
-certificate infrastructure, relay session encryption, or migration UX.
+The security protocol does not yet define key rotation, revocation, certificate
+infrastructure, relay session encryption, or migration recovery UX.
 
 ## 2. Crate Boundary
 
@@ -46,17 +48,34 @@ leaking into low-level security code.
 `flotsync_security` accepts typed key material and protocol inputs. It does not
 parse TOML or Kompact configuration.
 
-For this MVP slice, the replicated-checklist example reads the local member,
-store path, and store-secret profile from application config. The pre-runtime
-`keys init-local` command creates or reuses encrypted local private identity
-material because runtime loading requires it. Other key operations run through
-the already-unlocked replication runtime.
+The replicated-checklist example reads the store path and store-secret profile
+from application config. For a new or empty store, startup asks for a local
+member identity and passes it to the public
+`flotsync_replication::provision_local_identity` setup API. The API commits the
+identity, its encrypted private bundle, and the matching public-key binding in
+one store transaction. Other key operations run through the already-unlocked
+replication runtime.
+
+Setup uses `LocalIdentityProvisioningStore`, which tolerates the absence of a
+local identity. A provisioned store is activated as a `ReplicationStore`; that
+ready interface always exposes the authoritative identity loaded from
+`local_members`. Activation rejects missing, malformed, or ambiguous stored
+identities. Provisioning an already provisioned store also fails rather than
+silently replacing its identity.
+
+The encrypted local-private bundle is authoritative for the local member's key
+material. Runtime security derives the matching public keys from that bundle
+and idempotently restores a missing local public-key binding during startup.
+An identity without its corresponding private bundle is outside the ready-store
+contract; runtime loading reports that malformed custom-store state as an
+internal security failure rather than offering provisioning as recovery.
 
 The replicated-checklist store-secret profile is scoped to the example
-application id and selects a device-local store-secret slot. The current
-implementation stores that secret through OS-backed local storage and creates it
-on first run. The profile is intentionally not tied to member identity, so later
-multi-identity stores can share the same encrypted-store secret.
+application id and selects a device-local store-secret slot. The secret is held
+in OS-backed local storage and is created only after the user accepts first-run
+setup. The profile is intentionally not tied to member identity. The current
+storage contract permits one local identity, while allowing several key records
+for that identity in a future key-evolution design.
 
 Replication runtime reads provisioned identity, trust, block, and group-security
 state from `ReplicationStore` with normal group metadata.
@@ -78,7 +97,7 @@ are encrypted in the local replication store rather than retained as
 application configuration files.
 
 Rationale: signing and encryption keys have different roles and compromise
-properties, but a single identity bundle keeps MVP setup small.
+properties, but a single identity bundle keeps the setup surface small.
 
 ## 5. Key Generation
 
@@ -93,7 +112,7 @@ first secure example harder to run and easier to misconfigure.
 
 ## 6. Trust Model
 
-The MVP stores observed member/public-key bindings, explicit local trust
+Flotsync stores observed member/public-key bindings, explicit local trust
 evidence, and globally blocked fingerprints in the replication store. The
 replicated-checklist assesses pasteable public bundles through the running
 runtime before recording explicit trust for one member or blocking the bundle's
@@ -114,10 +133,10 @@ Each local store keeps sensitive group-security material in encrypted columns or
 an opaque encrypted BLOB next to the existing `replication_groups` metadata. The
 material is encrypted at rest with a device-local application database secret.
 
-For this MVP slice, replicated-checklist loads or creates that database secret
-through OS-backed secure storage via the `keyring` crate. Group creation and
+The replicated-checklist loads or creates that database secret through
+OS-backed secure storage via the `keyring` crate. Group creation and
 membership-change flows generate and distribute group secrets through the
-replication runtime; the checklist no longer accepts a plaintext shared group
+replication runtime; the checklist does not accept a plaintext shared group
 secret in application config.
 
 The stored group-security material includes the group symmetric key, cipher
@@ -148,8 +167,8 @@ Delivery message ids are required to be unique under one group key. Nonce
 derivation hashes the immutable context with SHA-256 and uses the leftmost 12
 bytes as the ChaCha20-Poly1305 nonce. Fixed byte positions in a secure digest
 are not treated as weaker than other fixed positions; the relevant residual risk
-is digest-prefix collision probability, which is acceptable for this MVP under
-the message-id uniqueness requirement.
+is digest-prefix collision probability, which is accepted under the message-id
+uniqueness requirement.
 
 The public routing header stays clear so delivery ingress can perform cheap
 local-interest classification, but the same header is included as authenticated
@@ -195,7 +214,7 @@ The bootstrap payload carries:
 
 Rationale: bootstrap happens before recipients share the group key. HPKE gives a
 standard public-key encryption path for exactly that case, while keeping
-multi-message session state out of the first slice.
+multi-message session state out of the bootstrap path.
 
 Inbound bootstrap stores accepted group-security material through the
 `ReplicationStore` sensitive-column path before installing membership.
@@ -222,18 +241,14 @@ Rationale: keeping a plaintext mode in the production path would complicate the
 security boundary. Deterministic fixtures give tests the convenience they need
 without preserving insecure runtime behaviour.
 
-## 13. Deferred Work
+## 13. Out of Scope
 
-The following are deliberately outside this MVP and tracked separately:
+The following require separate protocol and product design:
 
 - key rotation and revocation
-- passphrase-protected identity files
-- OS keyring storage for the local database secret
-- discovery-published public keys
 - certificate or PKI-based trust
 - relay or TCP session encryption
-- secure migration UX
+- migration recovery UX
 
 Rationale: each item affects user experience or long-term lifecycle semantics
-enough to deserve its own design pass after the secure envelope foundation is in
-place.
+enough to require its own design pass.

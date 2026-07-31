@@ -17,7 +17,7 @@ pub(super) fn local_member(name: &str, seed: [u8; MEMBER_KEY_SEED_LENGTH]) -> Lo
 }
 
 pub(super) fn member(name: &str) -> MemberIdentity {
-    Identifier::from_array([name, "laptop"])
+    MemberIdentity::from_array([name, "laptop"])
 }
 
 pub(super) fn unique_local_store_secret_profile(label: &str) -> LocalStoreSecretProfile {
