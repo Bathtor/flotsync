@@ -1,0 +1,100 @@
+id = "019fb909-22f5-76b2-8798-58953f218e4e"
+ref = "flotsync-rok"
+title = "Design an opinionated typed FSM abstraction for Kompact"
+body = """
+## Objective
+
+Design an opinionated typed finite-state-machine abstraction for Kompact that is more expressive than switching `Actor` handlers, but substantially narrows the policy space exposed to component authors. Use the strongest guarantees Rust and Kompact can offer without claiming that local types can prove global protocol state in the presence of aliases, queued messages, concurrency, cancellation, timeouts, or restarts.
+
+## Context
+
+C01. A conventional `ActorRef<Message>` types the complete message vocabulary, but it does not express which messages are valid in the component's current state.
+
+C02. Behaviour switching makes implementation-side dispatch clearer, but existing clients retain the same protocol type after a transition.
+
+C03. State-specific Rust handles can express consuming transitions, but their ergonomics and semantics become difficult around sharing, cancellation, timeouts, lost replies, and uncertain remote outcomes.
+
+C04. The existing `kompact_fsm` helper tracked by `flotsync-ct7n` is a useful narrow starting point for owned-state transitions. This issue captures the broader protocol and policy design inspired by Erlang `gen_statem`, Gleam subjects/selectors, capability-based interfaces, and session-style APIs.
+
+## Design direction to evaluate
+
+D01. Avoid a generic `reject()` result. Classify incoming events by provenance so the framework can provide useful defaults:
+
+- request: return a typed `UnavailableInCurrentState` or state-specific protocol error;
+- notification: drop with observable diagnostics;
+- internal event: fault the component because an implementation invariant was violated;
+- stale capability or protocol epoch: return a stale error when a reply path exists, otherwise discard with diagnostics.
+
+D02. Keep four concepts distinct: request rejection is a protocol outcome; reset is an explicit domain transition with cleanup; fault reports an invariant failure; restart remains a supervisor policy.
+
+D03. Make postponement explicit, bounded, and observable. Evaluate a default that retries after the next state transition at most once, then applies the event class's normal rejection policy. Require explicit limits, deadline/expiry behaviour, and diagnostics for broader policies. Long-lived waiting should normally be represented in domain state rather than a hidden framework queue.
+
+D04. Evaluate a small transition algebra along the lines of `Stay`, `Enter`, `Postpone`, and `Fault`, with replies represented so requests cannot be silently ignored. Determine whether notification and internal-event outcomes need separate types rather than one highly generic enum.
+
+D05. Explore state-specific capability handles such as `Capability<S>` carrying a runtime epoch or freshly minted recipient identity. A transition advances the externally visible protocol epoch; stale aliases and races are rejected at runtime even when Rust ownership prevents many local mistakes.
+
+D06. Separate two user-facing layers if one API cannot serve both well:
+
+- a cloneable shared handle with a stable protocol union, typed responses, and runtime state validation;
+- a non-cloneable `Session<S>` API with consuming transitions for exclusive, short-lived conversations, backed by an epoch or lease.
+
+D07. Treat timeout or cancellation after sending a transition request as an indeterminate outcome, not proof that the transition did not occur. Define how callers reconcile state, recover authority, or receive an explicit `OutcomeUnknown` token.
+
+D08. Decide how the abstraction fits Kompact actors, ports, component lifecycle, scheduling, and supervision. In particular, determine whether state-specific capabilities should be actor recipients, port-facing façade values, session components, or a combination.
+
+## Questions the design must answer
+
+Q01. Which guarantees are compile-time, which are runtime checks, and which remain application responsibilities?
+
+Q02. How are per-request reply types expressed without forcing every request into one undifferentiated response enum?
+
+Q03. What happens to queued and postponed events across state changes, protocol-epoch changes, component faults, and supervisor restarts?
+
+Q04. How are stale, duplicate, future-epoch, and otherwise impossible events distinguished and observed?
+
+Q05. What ownership and sharing restrictions make strict sessions useful without making ordinary concurrent services awkward?
+
+Q06. Can the common path remain concise enough that component authors do not need to design a bespoke fault model for every transition table?
+
+## Deliverables and acceptance criteria
+
+A01. Document the semantic model and invariants, including a table of default handling for every event class and invalid-state condition.
+
+A02. Compare at least the shared-handle, strict-session, and hybrid/session-component shapes using the same small example state machine.
+
+A03. Specify transition, postponement, timeout, cancellation, stale-capability, fault, and supervision semantics precisely enough to implement and test.
+
+A04. Prototype the preferred API against at least one request/reply transition and one notification or internal-event path, including stale-handle and indeterminate-outcome tests.
+
+A05. Assess how the design relates to the existing `kompact_fsm` helper and decide whether to extend it, replace it, introduce a separate abstraction, or keep the idea application-local until it proves useful.
+
+A06. Record explicit non-goals and escape hatches so the opinionated defaults do not silently grow into a full session-type framework or supervisor redesign.
+
+## Initial size estimate and suggested split
+
+E01. Design investigation and documentation: approximately 200–400 LOC.
+
+E02. Focused API prototype: approximately 400–800 LOC.
+
+E03. Examples and tests for transitions, stale capabilities, postponement, and uncertain outcomes: approximately 300–600 LOC.
+
+E04. Total likely range: approximately 900–1,800 LOC, so the full effort may exceed 1,000 LOC. Complete the design comparison first, then split the chosen prototype and any production integration into self-contained child issues rather than expanding this issue indefinitely.
+
+## Out of scope
+
+O01. Proving global protocol fidelity for arbitrary shared clients.
+
+O02. Exactly-once delivery or elimination of distributed indeterminate outcomes.
+
+O03. Redesigning Kompact supervision itself.
+
+O04. Converting existing Flotsync components before the abstraction and its ergonomics have been validated."""
+status = "open"
+type = "task"
+priority = 3
+created_at = "2026-07-31T16:36:51.573096Z"
+updated_at = "2026-07-31T16:36:55.465043Z"
+
+[[links]]
+target = "019f0542-b0cc-70a2-9d97-61e54f93a036"
+label = "related to"
