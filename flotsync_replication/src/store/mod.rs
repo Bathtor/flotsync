@@ -1,3 +1,3 @@
 mod sqlite;
 
-pub use sqlite::SqliteReplicationStore;
+pub use sqlite::{SqliteReplicationStore, SqliteReplicationStoreProvisioner};

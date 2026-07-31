@@ -48,23 +48,34 @@ leaking into low-level security code.
 `flotsync_security` accepts typed key material and protocol inputs. It does not
 parse TOML or Kompact configuration.
 
-The replicated-checklist example reads the local member, store path, and
-store-secret profile from application config. Runtime startup offers local
-identity initialisation when the store is new or its encrypted local private
-identity material is missing. Other key operations run through the
-already-unlocked replication runtime.
+The replicated-checklist example reads the store path and store-secret profile
+from application config. For a new or empty store, startup asks for a local
+member identity and passes it to the public
+`flotsync_replication::provision_local_identity` setup API. The API commits the
+identity, its encrypted private bundle, and the matching public-key binding in
+one store transaction. Other key operations run through the already-unlocked
+replication runtime.
 
-The public `flotsync_replication::initialise_local_identity` setup API creates
-or reuses the authoritative store member's private bundle and ensures the
-matching public-key binding in one store transaction. Runtime loading reports
-missing local private keys without mutating setup state and directs callers to
-that API, leaving recovery policy to the application.
+Setup uses `LocalIdentityProvisioningStore`, which tolerates the absence of a
+local identity. A provisioned store is activated as a `ReplicationStore`; that
+ready interface always exposes the authoritative identity loaded from
+`local_members`. Activation rejects missing, malformed, or ambiguous stored
+identities. Provisioning an already provisioned store also fails rather than
+silently replacing its identity.
+
+The encrypted local-private bundle is authoritative for the local member's key
+material. Runtime security derives the matching public keys from that bundle
+and idempotently restores a missing local public-key binding during startup.
+An identity without its corresponding private bundle is outside the ready-store
+contract; runtime loading reports that malformed custom-store state as an
+internal security failure rather than offering provisioning as recovery.
 
 The replicated-checklist store-secret profile is scoped to the example
 application id and selects a device-local store-secret slot. The secret is held
 in OS-backed local storage and is created only after the user accepts first-run
-setup. The profile is intentionally not tied to member identity, so a store can
-later host multiple local identities under the same encrypted-store secret.
+setup. The profile is intentionally not tied to member identity. The current
+storage contract permits one local identity, while allowing several key records
+for that identity in a future key-evolution design.
 
 Replication runtime reads provisioned identity, trust, block, and group-security
 state from `ReplicationStore` with normal group metadata.

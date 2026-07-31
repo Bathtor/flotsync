@@ -227,55 +227,43 @@ fn known_member_reference_sorts_members_and_fingerprints_at_the_ui_boundary() {
 fn additional_group_members_read_one_per_line_until_blank() {
     let creator = MemberIdentity::from_array(["alice"]);
     let bob = MemberIdentity::from_array(["bob"]);
-    let mut member_inputs = ["bob", "carol", ""].into_iter();
-    let mut read_member = || {
-        Ok(member_inputs
-            .next()
-            .expect("member input should include a terminating blank")
-            .to_owned())
-    };
+    let mut input = Cursor::new(b"bob\ncarol\n\n".as_slice());
+    let mut output = Vec::new();
+    let mut dialog = ChecklistDialog::new(&mut input, &mut output);
     assert_eq!(
-        read_additional_group_members(&mut read_member, &creator)
+        read_additional_group_members(&mut dialog, &creator)
             .expect("distinct valid members should parse"),
         vec![bob.clone(), MemberIdentity::from_array(["carol"])]
     );
+    assert_eq!(
+        String::from_utf8(output).expect("dialog output should be UTF-8"),
+        "additional member id (blank to finish)> ".repeat(3)
+    );
 
-    let mut member_inputs = ["alice"].into_iter();
-    let mut read_member = || {
-        Ok(member_inputs
-            .next()
-            .expect("creator input should be read")
-            .to_owned())
-    };
+    let mut input = Cursor::new(b"alice\n".as_slice());
+    let mut output = Vec::new();
+    let mut dialog = ChecklistDialog::new(&mut input, &mut output);
     assert!(matches!(
-        read_additional_group_members(&mut read_member, &creator),
+        read_additional_group_members(&mut dialog, &creator),
         Err(ReplicatedChecklistError::RepeatedGroupCreator { member_id })
             if member_id == creator
     ));
 
-    let mut member_inputs = ["bob", "bob"].into_iter();
-    let mut read_member = || {
-        Ok(member_inputs
-            .next()
-            .expect("duplicate inputs should be read")
-            .to_owned())
-    };
+    let mut input = Cursor::new(b"bob\nbob\n".as_slice());
+    let mut output = Vec::new();
+    let mut dialog = ChecklistDialog::new(&mut input, &mut output);
     assert!(matches!(
-        read_additional_group_members(&mut read_member, &creator),
+        read_additional_group_members(&mut dialog, &creator),
         Err(ReplicatedChecklistError::DuplicateGroupMember { member_id })
             if member_id == bob
     ));
 
-    let mut member_inputs = ["bad!"].into_iter();
-    let mut read_member = || {
-        Ok(member_inputs
-            .next()
-            .expect("invalid input should be read")
-            .to_owned())
-    };
+    let mut input = Cursor::new(b"bad!\n".as_slice());
+    let mut output = Vec::new();
+    let mut dialog = ChecklistDialog::new(&mut input, &mut output);
     assert!(matches!(
-        read_additional_group_members(&mut read_member, &creator),
-        Err(ReplicatedChecklistError::InvalidGroupMemberIdentity {
+        read_additional_group_members(&mut dialog, &creator),
+        Err(ReplicatedChecklistError::InvalidMemberIdentity {
             source: IdentifierParseError::InvalidSegment { .. }
         })
     ));
@@ -331,22 +319,23 @@ fn creation_handler_uses_injected_prompts_refreshes_groups_and_keeps_default_cle
     let (_store, runtime, _listener, receivers) =
         load_test_runtime_with_groups(&member, std::iter::empty());
     let session = ChecklistSession::new(ChecklistWorkingSet::new());
-    let mut repl = ChecklistRepl::new(test_app_config(member), runtime.clone(), receivers, session);
-    let mut read_members = || Ok(String::new());
-    let mut input = Cursor::new(b"yes\n".as_slice());
+    let mut repl = ChecklistRepl::new(
+        test_app_config(),
+        member,
+        runtime.clone(),
+        receivers,
+        session,
+    );
+    let mut input = Cursor::new(b"\nyes\n".as_slice());
     let mut output = Vec::new();
-    let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
+    let mut dialog = ChecklistDialog::new(&mut input, &mut output);
 
-    block_on(repl.create_group_with_prompts(
-        vec!["shared".to_owned()],
-        &mut read_members,
-        &mut confirmation,
-    ))
-    .expect("creation handler should complete");
+    block_on(repl.create_group_with_dialog(vec!["shared".to_owned()], &mut dialog))
+        .expect("creation handler should complete");
 
     assert_eq!(
         String::from_utf8(output).expect("confirmation prompt should be UTF-8"),
-        "Create this group and send invitations? [y/N] "
+        "additional member id (blank to finish)> Create this group and send invitations? [y/N] "
     );
     assert_eq!(repl.session.default_group, None);
     let group_state = runtime
@@ -382,7 +371,8 @@ fn invitation_accept_handler_applies_listener_rows_and_keeps_the_default() {
     let mut session = ChecklistSession::new(working_set);
     session.default_group = Some(default_group_id);
     let mut repl = ChecklistRepl::new(
-        test_app_config(member.clone()),
+        test_app_config(),
+        member.clone(),
         runtime.clone(),
         receivers,
         session,
@@ -454,7 +444,8 @@ fn invitation_reject_handler_reports_user_denied_without_changing_the_default() 
         load_test_runtime_with_groups(&member, std::iter::empty());
     let session = ChecklistSession::new(ChecklistWorkingSet::new());
     let mut repl = ChecklistRepl::new(
-        test_app_config(member.clone()),
+        test_app_config(),
+        member.clone(),
         runtime.clone(),
         receivers,
         session,

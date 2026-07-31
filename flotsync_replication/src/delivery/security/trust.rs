@@ -171,6 +171,7 @@ impl DeliverySecurity {
         }
         if payload.member_keys().len() != payload.members().len() {
             for (member_id, _) in payload.member_keys().owned_entries() {
+                let member_id = MemberIdentity::from(member_id);
                 if !payload.members().contains(&member_id) {
                     return Err(DeliverySecurityError::UnexpectedBootstrapMemberKey { member_id });
                 }
@@ -200,6 +201,7 @@ impl DeliverySecurity {
             .await?;
         }
         for (member_id, member_key) in payload.member_keys().owned_entries() {
+            let member_id = MemberIdentity::from(member_id);
             if let Some(public_keys) = member_key.public_keys() {
                 validate_bootstrap_public_key_bundle_matches_fingerprint(
                     &member_id,

@@ -161,9 +161,13 @@ impl DeliverySecurity {
             .member_keys()
             .owned_entries()
             .filter_map(|(member_id, member_key)| {
-                member_key
-                    .public_keys()
-                    .map(|public_keys| (member_id, member_key.fingerprint(), public_keys.clone()))
+                member_key.public_keys().map(|public_keys| {
+                    (
+                        MemberIdentity::from(member_id),
+                        member_key.fingerprint(),
+                        public_keys.clone(),
+                    )
+                })
             })
             .collect_vec();
         if !inline_public_keys.is_empty() {

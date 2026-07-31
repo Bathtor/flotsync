@@ -4,7 +4,6 @@ use flotsync_core::{
     GroupId,
     MemberIdentity,
     MemberIndex,
-    member::Identifier,
     membership::GroupMembers,
     versions::{UpdateId, VersionVector},
 };
@@ -23,7 +22,6 @@ use flotsync_replication::{
     RowId,
     RowKey,
     RowMutation,
-    SqliteReplicationStore,
     SummaryRequest,
     test_support::{
         CapturedDataChange,
@@ -32,8 +30,10 @@ use flotsync_replication::{
         docs_group_schema,
         provision_test_security,
         provision_test_trusted_public_keys,
+        provisioned_sqlite_store_with_schemas,
         publish_changes,
         snapshot_read_token,
+        test_application_id,
         test_public_member_keys,
         wait_for_test_future,
         wait_for_test_reply,
@@ -50,10 +50,6 @@ const ALICE_MEMBER_SEGMENTS: [&str; 2] = ["alice", "laptop"];
 const BOB_MEMBER_SEGMENTS: [&str; 2] = ["bob", "laptop"];
 const CHARLIE_MEMBER_SEGMENTS: [&str; 2] = ["charlie", "laptop"];
 const PROBE_MEMBER_SEGMENTS: [&str; 2] = ["probe", "laptop"];
-const APP_ALICE_SEGMENTS: [&str; 2] = ["app", "alice"];
-const APP_BOB_SEGMENTS: [&str; 2] = ["app", "bob"];
-const APP_CHARLIE_SEGMENTS: [&str; 2] = ["app", "charlie"];
-
 static STATIC_TITLE_SCHEMA: LazyLock<Schema> =
     LazyLock::new(|| Schema::from_fields([Field::linear_string("title")]));
 
@@ -120,13 +116,13 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
     let charlie_member = charlie_member();
     let dataset_id = docs_dataset_id();
     let alice_fixture = RuntimeTestFixture::load(
-        app_alice_id(),
+        test_application_id(),
         &alice_member,
         [(dataset_id.clone(), title_schema_shared())],
         [bob_member.clone(), charlie_member.clone()],
     );
     let bob_fixture = RuntimeTestFixture::load_with_config(
-        app_bob_id(),
+        test_application_id(),
         &bob_member,
         [(dataset_id.clone(), title_schema_shared())],
         [alice_member.clone()],
@@ -143,7 +139,7 @@ fn membership_change_delivers_proposal_to_continuing_member_and_invitation_to_ad
         },
     );
     let charlie_fixture = RuntimeTestFixture::load_with_config(
-        app_charlie_id(),
+        test_application_id(),
         &charlie_member,
         [(dataset_id, title_schema_shared())],
         [alice_member.clone()],
@@ -395,32 +391,30 @@ fn bootstrap_with_mismatched_trusted_sender_keys_does_not_install_group() {
     let bob_member = bob_member();
     let dataset_id = docs_dataset_id();
     let alice_fixture = RuntimeTestFixture::load(
-        app_alice_id(),
+        test_application_id(),
         &alice_member,
         [(dataset_id.clone(), title_schema_shared())],
         [bob_member.clone()],
     );
-    let bob_store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
-        bob_member.clone(),
+    let bob_store = provisioned_sqlite_store_with_schemas(
+        &bob_member,
         [(dataset_id.clone(), title_schema_shared())],
-    ))
-    .expect("store should build");
-    let bob_store = Arc::new(bob_store);
+    );
     wait_for_test_reply(provision_test_security(
-        app_bob_id(),
+        test_application_id(),
         bob_store.as_ref(),
         &bob_member,
         std::iter::empty::<MemberIdentity>(),
     ))
     .expect("bob local security should provision");
     wait_for_test_reply(provision_test_trusted_public_keys(
-        app_bob_id(),
+        test_application_id(),
         bob_store.as_ref(),
         alice_member.clone(),
         &test_public_member_keys(&probe_member()),
     ))
     .expect("bob mismatched trusted public keys should provision");
-    let bob_fixture = RuntimeTestFixture::load_from_store(app_bob_id(), bob_store);
+    let bob_fixture = RuntimeTestFixture::load_from_store(test_application_id(), bob_store);
 
     alice_fixture.connect_direct_peer_routes(&bob_fixture);
     let group_id = wait_for_test_reply(alice_fixture.api().create_group(CreateGroupRequest {
@@ -436,32 +430,20 @@ fn docs_dataset_id() -> DatasetId {
     DatasetId::try_new("docs").expect("dataset id should be valid")
 }
 
-fn alice_member() -> Identifier {
-    Identifier::from_array(ALICE_MEMBER_SEGMENTS)
+fn alice_member() -> MemberIdentity {
+    MemberIdentity::from_array(ALICE_MEMBER_SEGMENTS)
 }
 
-fn bob_member() -> Identifier {
-    Identifier::from_array(BOB_MEMBER_SEGMENTS)
+fn bob_member() -> MemberIdentity {
+    MemberIdentity::from_array(BOB_MEMBER_SEGMENTS)
 }
 
-fn charlie_member() -> Identifier {
-    Identifier::from_array(CHARLIE_MEMBER_SEGMENTS)
+fn charlie_member() -> MemberIdentity {
+    MemberIdentity::from_array(CHARLIE_MEMBER_SEGMENTS)
 }
 
-fn probe_member() -> Identifier {
-    Identifier::from_array(PROBE_MEMBER_SEGMENTS)
-}
-
-fn app_alice_id() -> Identifier {
-    Identifier::from_array(APP_ALICE_SEGMENTS)
-}
-
-fn app_bob_id() -> Identifier {
-    Identifier::from_array(APP_BOB_SEGMENTS)
-}
-
-fn app_charlie_id() -> Identifier {
-    Identifier::from_array(APP_CHARLIE_SEGMENTS)
+fn probe_member() -> MemberIdentity {
+    MemberIdentity::from_array(PROBE_MEMBER_SEGMENTS)
 }
 
 fn title_schema_shared() -> Arc<Schema> {
@@ -502,13 +484,13 @@ fn load_title_runtime_pair_with_trust(
     let alice_member = alice_member();
     let bob_member = bob_member();
     let alice_fixture = RuntimeTestFixture::load(
-        app_alice_id(),
+        test_application_id(),
         &alice_member,
         [(dataset_id.clone(), title_schema_shared())],
         [bob_member.clone()],
     );
     let bob_fixture = RuntimeTestFixture::load_with_config(
-        app_bob_id(),
+        test_application_id(),
         &bob_member,
         [(dataset_id.clone(), title_schema_shared())],
         [alice_member],

@@ -348,6 +348,7 @@ impl DeliverySecurity {
             })?;
         transaction.release().await.context(StoreAccessSnafu)?;
         let local_keys = open_local_private_keys(&record, &store_secret_key)?;
+        Self::ensure_local_public_keys(&security_store, &local_keys).await?;
         Ok(Self {
             security_store,
             local_member: local_member.clone(),
@@ -355,6 +356,24 @@ impl DeliverySecurity {
             store_secret_key,
             store_secret_key_id,
         })
+    }
+
+    /// Restore the redundant local public-key projection derived from authoritative private keys.
+    async fn ensure_local_public_keys(
+        security_store: &SecurityStore,
+        local_keys: &LocalMemberKeys,
+    ) -> Result<(), DeliverySecurityError> {
+        let record = MemberPublicKeysRecord::from_public_keys(local_keys.public_keys());
+        let mut transaction = security_store
+            .replication_store()
+            .begin_transaction()
+            .await
+            .context(StoreAccessSnafu)?;
+        transaction
+            .ensure_member_public_keys(record)
+            .await
+            .context(StoreAccessSnafu)?;
+        transaction.commit().await.context(StoreAccessSnafu)
     }
 
     pub(crate) fn local_keys(&self) -> &LocalMemberKeys {
@@ -411,11 +430,12 @@ mod tests {
         test_support::{
             provision_test_security,
             provision_test_trusted_public_keys,
+            provisioned_sqlite_store,
             test_public_member_keys,
             test_replication_security_secrets,
         },
     };
-    use flotsync_core::member::Identifier;
+    use flotsync_core::ApplicationId;
     use flotsync_security::{GROUP_CIPHER_SUITE_CHACHA20_POLY1305, sign_discovery_payload};
     use std::{future::Future, sync::Arc, time::Duration};
 
@@ -432,27 +452,24 @@ mod tests {
         )
     }
 
-    fn application_id() -> Identifier {
-        Identifier::from_array(["delivery-security", "application"])
+    fn application_id() -> ApplicationId {
+        ApplicationId::from_array(["delivery-security", "application"])
     }
 
     fn alice_member() -> MemberIdentity {
-        Identifier::from_array(["delivery-security", "alice"])
+        MemberIdentity::from_array(["delivery-security", "alice"])
     }
 
     fn bob_member() -> MemberIdentity {
-        Identifier::from_array(["delivery-security", "bob"])
+        MemberIdentity::from_array(["delivery-security", "bob"])
     }
 
     fn charlie_member() -> MemberIdentity {
-        Identifier::from_array(["delivery-security", "charlie"])
+        MemberIdentity::from_array(["delivery-security", "charlie"])
     }
 
-    fn sqlite_store(local_member: MemberIdentity) -> Arc<SqliteReplicationStore> {
-        Arc::new(
-            wait_for_delivery_security_future(SqliteReplicationStore::in_memory(local_member))
-                .expect("store should build"),
-        )
+    fn sqlite_store(local_member: &MemberIdentity) -> Arc<SqliteReplicationStore> {
+        provisioned_sqlite_store(local_member)
     }
 
     fn provision_security(
@@ -494,7 +511,7 @@ mod tests {
 
     fn signing_security() -> DeliverySecurity {
         let alice = alice_member();
-        let store = sqlite_store(alice.clone());
+        let store = sqlite_store(&alice);
         provision_security(store.as_ref(), &alice, Vec::new());
         load_delivery_security(store, &alice)
     }
@@ -526,7 +543,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let group_id = GroupId(Uuid::from_u128(70_001));
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let bob_security = load_delivery_security(bob_store, &bob);
         let setup = test_group_setup(&alice, &bob, 41);
@@ -546,7 +563,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let group_id = GroupId(Uuid::from_u128(70_002));
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let bob_security = load_delivery_security(bob_store, &bob);
         let original = test_group_setup(&alice, &bob, 42);
@@ -578,7 +595,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let alice_security = signing_security();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let bob_security = load_delivery_security(bob_store, &bob);
         let payload = b"signed introduction claim";
@@ -600,7 +617,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let alice_security = signing_security();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, Vec::new());
         let bob_security = load_delivery_security(bob_store, &bob);
         let payload = b"signed introduction claim";
@@ -633,7 +650,7 @@ mod tests {
         let bob = bob_member();
         let charlie = charlie_member();
         let alice_security = signing_security();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, Vec::new());
         wait_for_delivery_security_future(provision_test_trusted_public_keys(
             application_id(),
@@ -671,7 +688,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let alice_security = signing_security();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let bob_security = load_delivery_security(bob_store, &bob);
         let signed_payload = b"signed introduction claim";
@@ -703,7 +720,7 @@ mod tests {
         let alice = alice_member();
         let bob = bob_member();
         let alice_security = signing_security();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let alice_fingerprint = test_public_member_keys(&alice).fingerprint();
         let mut transaction = wait_for_delivery_security_future(bob_store.begin_transaction())
@@ -741,7 +758,7 @@ mod tests {
     fn ensure_discovery_public_key_bundle_stores_candidate_without_runtime_trust() {
         let alice = alice_member();
         let bob = bob_member();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, Vec::new());
         let bob_security = load_delivery_security(bob_store, &bob);
         let alice_bundle = test_public_member_keys(&alice).public_key_bundle();
@@ -786,7 +803,7 @@ mod tests {
     fn route_publication_permission_rejects_policy_denial() {
         let alice = alice_member();
         let bob = bob_member();
-        let bob_store = sqlite_store(bob.clone());
+        let bob_store = sqlite_store(&bob);
         provision_security(bob_store.as_ref(), &bob, vec![alice.clone()]);
         let bob_security = load_delivery_security_with_policy(
             bob_store,

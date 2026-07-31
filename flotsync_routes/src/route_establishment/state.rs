@@ -245,14 +245,23 @@ fn permitted_reachable_members<'a>(
 ) -> Cow<'a, TrieSet> {
     let all_members_permitted = members
         .owned_keys()
-        .all(|member| interest.permits_member(&member));
+        .all(|member| interest.permits_member(&MemberIdentity::from(member)));
     if all_members_permitted {
         return Cow::Borrowed(members);
     }
 
+    // `owned_keys` yields owned identifiers. Moving each key through `MemberIdentity` and back
+    // lets the typed predicate inspect it while retaining accepted keys without cloning them.
     let permitted = members
         .owned_keys()
-        .filter(|member| interest.permits_member(member))
+        .filter_map(|member| {
+            let member = MemberIdentity::from(member);
+            if interest.permits_member(&member) {
+                Some(member.into_identifier())
+            } else {
+                None
+            }
+        })
         .collect();
     Cow::Owned(permitted)
 }

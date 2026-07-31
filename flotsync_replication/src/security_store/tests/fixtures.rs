@@ -16,22 +16,19 @@ where
 }
 
 pub(super) fn local_member() -> MemberIdentity {
-    Identifier::from_array(["security", "local"])
+    MemberIdentity::from_array(["security", "local"])
 }
 
 pub(super) fn remote_member() -> MemberIdentity {
-    Identifier::from_array(["security", "remote"])
+    MemberIdentity::from_array(["security", "remote"])
 }
 
 pub(super) fn alternate_member() -> MemberIdentity {
-    Identifier::from_array(["security", "alternate"])
+    MemberIdentity::from_array(["security", "alternate"])
 }
 
 pub(super) fn sqlite_store() -> Arc<SqliteReplicationStore> {
-    Arc::new(
-        wait_for_security_store_future(SqliteReplicationStore::in_memory(local_member()))
-            .expect("store should build"),
-    )
+    provisioned_sqlite_store(&local_member())
 }
 
 pub(super) fn security_store(store: Arc<SqliteReplicationStore>) -> SecurityStore {

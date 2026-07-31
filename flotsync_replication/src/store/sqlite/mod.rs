@@ -12,6 +12,7 @@ use crate::{
         EncryptedStoreSecret,
         GroupMemberKeys,
         GroupSchema,
+        LocalIdentityProvisioningStore,
         LocalMemberPrivateKeysRecord,
         MemberKeyId,
         MemberKeyTrustEvidenceKind,
@@ -86,8 +87,9 @@ use sqlx::{
 use std::{
     collections::{HashMap, HashSet},
     error::Error as StdError,
+    fs::OpenOptions,
     num::NonZeroUsize,
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
@@ -97,66 +99,62 @@ use uuid::Uuid;
 const STATEMENT_CACHE_CAPACITY: usize = 64;
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// In-memory SQLite-backed [`ReplicationStore`] implementation for the first
-/// replication storage slice.
+/// SQLite store handle used before a local identity has been provisioned.
 ///
 /// The named in-memory database is owned by the `sqlx` pool. Keeping one
 /// minimum pooled connection alive avoids an extra keeper connection while
 /// still preserving the shared-cache memory database across transaction
 /// acquisitions. `sqlx` caches prepared statements per connection, so the store
 /// keeps query shapes stable and relies on a modest per-connection cache rather
-/// than trying to share prepared handles globally.
-pub struct SqliteReplicationStore {
-    local_member: MemberIdentity,
+/// than trying to share prepared handles globally. A provisioner may represent
+/// an empty store; consume it with [`Self::into_replication_store`] only after
+/// local identity material has been provisioned.
+pub struct SqliteReplicationStoreProvisioner {
     schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
     pool: Arc<SqlitePool>,
 }
 
-impl SqliteReplicationStore {
-    /// Create one empty in-memory store for `local_member`.
+impl SqliteReplicationStoreProvisioner {
+    /// Create one empty in-memory store provisioner.
     ///
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub async fn in_memory(local_member: MemberIdentity) -> Result<Self, StoreError> {
-        Self::in_memory_with_schema_sources(
-            local_member,
-            std::iter::empty::<(DatasetId, SchemaSource)>(),
-        )
-        .await
+    pub async fn in_memory() -> Result<Self, StoreError> {
+        Self::in_memory_with_schema_sources(std::iter::empty::<(DatasetId, SchemaSource)>()).await
     }
 
-    /// Open one disk-backed `SQLite` store for `local_member`.
+    /// Create one new disk-backed `SQLite` store provisioner.
     ///
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub async fn file(
-        local_member: MemberIdentity,
-        path: impl AsRef<Path>,
-    ) -> Result<Self, StoreError> {
-        Self::file_with_schema_sources(
-            local_member,
-            path,
-            std::iter::empty::<(DatasetId, SchemaSource)>(),
-        )
-        .await
+    pub async fn create_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::create_file_with_schema_sources(path, std::iter::empty::<(DatasetId, SchemaSource)>())
+            .await
     }
 
-    /// Create one in-memory store with the provided application schema sources.
+    /// Open one existing disk-backed `SQLite` store provisioner.
     ///
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub async fn in_memory_with_schema_sources<I, S>(
-        local_member: MemberIdentity,
-        schema_sources: I,
-    ) -> Result<Self, StoreError>
+    pub async fn open_file(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        Self::open_file_with_schema_sources(path, std::iter::empty::<(DatasetId, SchemaSource)>())
+            .await
+    }
+
+    /// Create one empty in-memory provisioner with the supplied application schemas.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub async fn in_memory_with_schema_sources<I, S>(schema_sources: I) -> Result<Self, StoreError>
     where
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
-        let schema_sources = collect_schema_sources(schema_sources);
+        let schema_sources = Self::collect_schema_sources(schema_sources);
         let database_url = format!(
             "sqlite:file:flotsync-replication-{}?mode=memory&cache=shared",
             Uuid::new_v4()
@@ -167,16 +165,15 @@ impl SqliteReplicationStore {
             })?
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options).await
+        Self::from_connect_options(schema_sources, connect_options).await
     }
 
-    /// Open one disk-backed `SQLite` store with the provided application schema sources.
+    /// Create one new disk-backed provisioner with the supplied application schemas.
     ///
     /// # Errors
     ///
     /// See `StoreError` for failure conditions.
-    pub async fn file_with_schema_sources<I, S>(
-        local_member: MemberIdentity,
+    pub async fn create_file_with_schema_sources<I, S>(
         path: impl AsRef<Path>,
         schema_sources: I,
     ) -> Result<Self, StoreError>
@@ -184,17 +181,76 @@ impl SqliteReplicationStore {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
-        let schema_sources = collect_schema_sources(schema_sources);
+        let path = path.as_ref().to_path_buf();
+        let reserved_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|_| CreateDatabaseFileSnafu { path: path.clone() })?;
+        drop(reserved_file);
+        let schema_sources = Self::collect_schema_sources(schema_sources);
         let connect_options = SqliteConnectOptions::new()
-            .filename(path)
-            .create_if_missing(true)
+            .filename(&path)
+            .create_if_missing(false)
             .foreign_keys(true)
             .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-        Self::from_connect_options(local_member, schema_sources, connect_options).await
+        Self::from_connect_options(schema_sources, connect_options).await
     }
 
+    /// Open one existing disk-backed provisioner with the supplied application schemas.
+    ///
+    /// # Errors
+    ///
+    /// See `StoreError` for failure conditions.
+    pub async fn open_file_with_schema_sources<I, S>(
+        path: impl AsRef<Path>,
+        schema_sources: I,
+    ) -> Result<Self, StoreError>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        let schema_sources = Self::collect_schema_sources(schema_sources);
+        let connect_options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+        Self::from_connect_options(schema_sources, connect_options).await
+    }
+
+    /// Consume this provisioner and construct a replication-ready store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no local identity has been provisioned or when stored local-private
+    /// material represents more than one distinct member identity.
+    pub async fn into_replication_store(self) -> Result<SqliteReplicationStore, StoreError> {
+        let local_member = self
+            .local_member_identity()
+            .await?
+            .ok_or_else(|| StoreError::from(MissingLocalMemberIdentitySnafu.build()))?;
+        Ok(SqliteReplicationStore {
+            local_member,
+            schema_sources: self.schema_sources,
+            pool: self.pool,
+        })
+    }
+
+    /// Collect caller-provided schemas into the representation shared by store handles.
+    fn collect_schema_sources<I, S>(schema_sources: I) -> HashMap<DatasetId, SchemaSource>
+    where
+        I: IntoIterator<Item = (DatasetId, S)>,
+        S: Into<SchemaSource>,
+    {
+        schema_sources
+            .into_iter()
+            .map(|(dataset_id, schema)| (dataset_id, schema.into()))
+            .collect()
+    }
+
+    /// Build a provisioner from fully configured `SQLite` connection options.
     async fn from_connect_options(
-        local_member: MemberIdentity,
         schema_sources: HashMap<DatasetId, SchemaSource>,
         connect_options: SqliteConnectOptions,
     ) -> Result<Self, StoreError> {
@@ -212,22 +268,47 @@ impl SqliteReplicationStore {
         drop(connection);
 
         Ok(Self {
-            local_member,
             schema_sources: Arc::new(schema_sources),
             pool: Arc::new(pool),
         })
     }
 }
 
-fn collect_schema_sources<I, S>(schema_sources: I) -> HashMap<DatasetId, SchemaSource>
-where
-    I: IntoIterator<Item = (DatasetId, S)>,
-    S: Into<SchemaSource>,
-{
-    schema_sources
-        .into_iter()
-        .map(|(dataset_id, schema)| (dataset_id, schema.into()))
-        .collect()
+impl LocalIdentityProvisioningStore for SqliteReplicationStoreProvisioner {
+    fn local_member_identity(&self) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>> {
+        let pool = self.pool.clone();
+        async move {
+            let mut connection = pool.acquire().await.context(SqlxSnafu)?;
+            load_local_member_identity(&mut connection).await
+        }
+        .boxed()
+    }
+
+    fn begin_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>> {
+        let pool = self.pool.clone();
+        let schema_sources = self.schema_sources.clone();
+        async move {
+            let connection = pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .context(SqlxSnafu)?;
+            Ok(Box::new(SqliteReplicationStoreTransaction::new(
+                connection,
+                schema_sources,
+                SqliteReplicationTransactionKind::Write,
+            )) as Box<dyn ReplicationStoreTransaction>)
+        }
+        .boxed()
+    }
+}
+
+/// SQLite-backed [`ReplicationStore`] with exactly one authoritative local identity.
+pub struct SqliteReplicationStore {
+    local_member: MemberIdentity,
+    schema_sources: Arc<HashMap<DatasetId, SchemaSource>>,
+    pool: Arc<SqlitePool>,
 }
 
 impl ReplicationStore for SqliteReplicationStore {
@@ -365,6 +446,12 @@ impl ReplicationStoreReadTransaction for SqliteReplicationStoreTransaction {
             load_group_dataset_schema(self.assert_open_connection(), group_id, dataset_id).await
         }
         .boxed()
+    }
+
+    fn load_local_member_identity(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>> {
+        async move { load_local_member_identity(self.assert_open_connection()).await }.boxed()
     }
 
     fn load_local_member_private_keys<'a>(
@@ -955,6 +1042,27 @@ enum SqliteStoreError {
     ParseSqliteUrl {
         database_url: String,
         source: sqlx::Error,
+    },
+    #[snafu(display("Failed to create new SQLite database file '{}': {source}", path.display()))]
+    CreateDatabaseFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[snafu(display("The replication store has no provisioned local member identity."))]
+    MissingLocalMemberIdentity,
+    #[snafu(display(
+        "The replication store contains local-private key material for several member identities: '{first}' and '{second}'."
+    ))]
+    AmbiguousLocalMemberIdentities {
+        first: MemberIdentity,
+        second: MemberIdentity,
+    },
+    #[snafu(display(
+        "The replication store is provisioned for local member '{existing}' and cannot store local-private key material for '{requested}'."
+    ))]
+    ConflictingLocalMemberIdentity {
+        existing: MemberIdentity,
+        requested: MemberIdentity,
     },
     #[snafu(display("Stored group id was not a valid UUID: {source}"))]
     InvalidGroupId { source: uuid::Error },

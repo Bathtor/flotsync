@@ -75,7 +75,10 @@ impl GroupMembers {
                 }
                 .fail();
             };
-            if member_indices.insert(member.clone(), index).is_some() {
+            if member_indices
+                .insert(member.clone().into_identifier(), index)
+                .is_some()
+            {
                 return DuplicateMemberSnafu { member }.fail();
             }
         }
@@ -100,7 +103,7 @@ impl GroupMembers {
         let mut entries = self.member_indices.entries();
         while let Some((member, member_index)) = entries.next() {
             if *member_index == index {
-                return Some(member.to_owned());
+                return Some(MemberIdentity::from(member.to_owned()));
             }
         }
         None
@@ -108,7 +111,7 @@ impl GroupMembers {
 
     /// Iterate all members currently in this group in an unspecified order.
     pub fn iter(&self) -> impl Iterator<Item = MemberIdentity> + '_ {
-        self.member_indices.owned_keys()
+        self.member_indices.owned_keys().map(MemberIdentity::from)
     }
 
     /// Return the canonical bootstrap order for this group.
@@ -125,7 +128,7 @@ impl GroupMembers {
             let slot = raw_storage
                 .get_mut(index.as_usize())
                 .expect("Member indices should not exceed number of members");
-            slot.write(member);
+            slot.write(MemberIdentity::from(member));
             members_added += 1;
         }
 
@@ -160,10 +163,8 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
-    use crate::member::Identifier;
-
     fn member<const N: usize>(segments: [&str; N]) -> MemberIdentity {
-        Identifier::from_array(segments)
+        MemberIdentity::from_array(segments)
     }
 
     #[test]

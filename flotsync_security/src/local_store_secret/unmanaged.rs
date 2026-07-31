@@ -6,7 +6,7 @@ use super::{
     LocalStoreSecretProfile,
     LocalStoreSecretResult,
 };
-use flotsync_core::member::Identifier;
+use flotsync_core::ApplicationId;
 
 /// Report unavailable local secret-manager support in feature-minimal builds.
 ///
@@ -14,7 +14,7 @@ use flotsync_core::member::Identifier;
 ///
 /// Always returns [`LocalStoreSecretError::LocalSecretManagerUnavailable`](super::LocalStoreSecretError::LocalSecretManagerUnavailable).
 pub fn load_local_store_secret(
-    _application_id: &Identifier,
+    _application_id: &ApplicationId,
     _profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<LoadedLocalStoreSecret> {
     LocalSecretManagerUnavailableSnafu.fail()
@@ -26,7 +26,7 @@ pub fn load_local_store_secret(
 ///
 /// Always returns [`LocalStoreSecretError::LocalSecretManagerUnavailable`](super::LocalStoreSecretError::LocalSecretManagerUnavailable).
 pub fn load_or_create_local_store_secret(
-    _application_id: &Identifier,
+    _application_id: &ApplicationId,
     _profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<LoadedLocalStoreSecret> {
     LocalSecretManagerUnavailableSnafu.fail()

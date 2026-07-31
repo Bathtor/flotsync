@@ -2,11 +2,15 @@
 
 use super::*;
 use crate::{
-    SqliteReplicationStore,
     delivery::ingress::{DeliveryIngressComponent, DeliveryInterestConfig},
-    test_support::{TestGroupMemberships, load_test_delivery_security, provision_test_security},
+    test_support::{
+        TestGroupMemberships,
+        load_test_delivery_security,
+        provision_test_security,
+        provisioned_sqlite_store,
+    },
 };
-use flotsync_core::GroupId;
+use flotsync_core::{ApplicationId, GroupId};
 use flotsync_io::{
     prelude::UdpLocalBind,
     test_support::{
@@ -576,14 +580,13 @@ fn reliable_envelope_wire_round_trips_group_scope() {
 }
 
 fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
-    let store = block_on(SqliteReplicationStore::in_memory(local_member.clone()))
-        .expect("security store should build");
-    let store = Arc::new(store);
+    let store = provisioned_sqlite_store(local_member);
+    let application_id = ApplicationId::from_array(["reliable-delivery", "security-test"]);
     let trusted_members = [member_identity(&["alice"]), member_identity(&["bob"])]
         .into_iter()
         .filter(|member| member != local_member);
     block_on(provision_test_security(
-        local_member.clone(),
+        application_id.clone(),
         store.as_ref(),
         local_member,
         trusted_members,
@@ -591,7 +594,7 @@ fn test_delivery_security(local_member: &MemberIdentity) -> DeliverySecurity {
     .expect("test security should provision");
     let store: Arc<dyn crate::api::ReplicationStore> = store;
     block_on(load_test_delivery_security(
-        local_member.clone(),
+        application_id,
         store,
         local_member,
     ))

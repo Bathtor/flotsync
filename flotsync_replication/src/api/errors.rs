@@ -1,5 +1,5 @@
 use super::StoreSecretKeyId;
-use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembersError};
+use flotsync_core::{ApplicationId, GroupId, MemberIdentity, membership::GroupMembersError};
 use flotsync_security::LocalStoreSecretError;
 pub use flotsync_utils::BoxError;
 use snafu::{Location, prelude::*};
@@ -81,14 +81,6 @@ pub enum LoadSecurityError {
         #[snafu(source(from(LocalStoreSecretError, Box::new)))]
         source: Box<LocalStoreSecretError>,
     },
-    /// The store does not contain private keys for the local member.
-    ///
-    /// Applications may recover by calling [`crate::initialise_local_identity`] and retrying
-    /// runtime loading.
-    #[snafu(display(
-        "Local private keys for member {member_id} are not initialised. Call flotsync_replication::initialise_local_identity before retrying runtime loading."
-    ))]
-    MissingLocalPrivateKeys { member_id: MemberIdentity },
     /// The local private-key record exists but cannot be used with the provided setup.
     #[snafu(display("Local private keys for member {member_id} are invalid: {source}"))]
     InvalidLocalPrivateKeys {
@@ -178,34 +170,16 @@ pub enum LoadSecurityError {
 pub enum LoadError {
     #[snafu(display("Failed to load replication for application '{application_id}': {source}"))]
     Runtime {
-        application_id: Identifier,
+        application_id: ApplicationId,
         source: BoxError,
     },
     #[snafu(display(
         "Failed to load replication security for application '{application_id}': {source}"
     ))]
     Security {
-        application_id: Identifier,
+        application_id: ApplicationId,
         source: Box<LoadSecurityError>,
     },
     #[snafu(display("Replication runtime is not available for application '{application_id}'."))]
-    Unavailable { application_id: Identifier },
-}
-
-impl LoadError {
-    /// Return the member whose missing local-private keys prevented runtime loading.
-    ///
-    /// Callers may recover this condition with [`crate::initialise_local_identity`] before
-    /// retrying runtime loading. Other security and runtime failures return `None` and should be
-    /// handled without implicitly replacing local identity material.
-    #[must_use]
-    pub fn missing_local_private_keys_member(&self) -> Option<&MemberIdentity> {
-        match self {
-            Self::Security { source, .. } => match source.as_ref() {
-                LoadSecurityError::MissingLocalPrivateKeys { member_id } => Some(member_id),
-                _ => None,
-            },
-            Self::Runtime { .. } | Self::Unavailable { .. } => None,
-        }
-    }
+    Unavailable { application_id: ApplicationId },
 }

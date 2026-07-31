@@ -129,9 +129,10 @@ where
         control_timeout: Duration,
     ) -> BoxFuture<'a, Result<(), RuntimeHostError>> {
         async move {
-            // Faulty and destroyed components cannot process lifecycle messages.
-            // The enclosing system shutdown remains responsible for final cleanup.
-            if self.is_faulty() || self.is_destroyed() {
+            // Kompact only reports a new stop transition for active components. Inactive,
+            // faulty, and destroyed components cannot acknowledge another lifecycle message;
+            // the enclosing system shutdown remains responsible for final cleanup.
+            if !self.is_active() {
                 return Ok(());
             }
             system

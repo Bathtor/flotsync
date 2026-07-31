@@ -1,5 +1,6 @@
 use crate::{
     SqliteReplicationStore,
+    SqliteReplicationStoreProvisioner,
     api::{
         DatasetId,
         DatasetSchema,
@@ -9,6 +10,7 @@ use crate::{
         ListenerError,
         ListenerExternalSnafu,
         LoadError,
+        LocalIdentityProvisioningStore,
         LocalMemberPrivateKeysRecord,
         MemberKeyTrustEvidenceKind,
         MemberKeyTrustEvidenceRecord,
@@ -25,6 +27,7 @@ use crate::{
         ReplicationGroupSnapshot,
         ReplicationSecuritySecrets,
         ReplicationStore,
+        ReplicationStoreTransaction,
         RowChange,
         RowChangeBatch,
         RowId,
@@ -49,7 +52,7 @@ use crate::{
 };
 #[cfg(test)]
 use flotsync_core::membership::{GroupMemberships, SharedGroupMemberships};
-use flotsync_core::{GroupId, MemberIdentity, member::Identifier, membership::GroupMembers};
+use flotsync_core::{ApplicationId, GroupId, MemberIdentity, membership::GroupMembers};
 use flotsync_data_types::{Field, RowOperations, Schema};
 use flotsync_security::{
     GroupKey,
@@ -76,6 +79,12 @@ use std::{
 const TEST_STORE_SECRET_KEY_ID: StoreSecretKeyId = StoreSecretKeyId::from_u128_for_test(1);
 const TEST_STORE_SECRET_KEY_BYTES: [u8; 32] = [149; 32];
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Application namespace used when deterministic test support provisions a standalone store.
+#[must_use]
+pub fn test_application_id() -> ApplicationId {
+    ApplicationId::from_array(["flotsync", "replication", "test-support"])
+}
 
 /// Project complete active-group records through the production runtime snapshot implementation.
 ///
@@ -194,7 +203,7 @@ pub fn docs_group_schema() -> GroupSchema {
 /// Returns [`LoadError`] when store access, deterministic key generation,
 /// local-private-key sealing, or runtime startup fails.
 pub async fn load_replication_runtime_with_test_security_toml(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -539,7 +548,7 @@ impl RuntimeTestFixture {
     /// provisioned, or the runtime cannot be loaded.
     #[must_use]
     pub fn load<I, S>(
-        application_id: Identifier,
+        application_id: ApplicationId,
         local_member: &MemberIdentity,
         schemas: I,
         trusted_members: impl IntoIterator<Item = MemberIdentity>,
@@ -565,7 +574,7 @@ impl RuntimeTestFixture {
     /// provisioned, or the runtime cannot be loaded.
     #[must_use]
     pub fn load_with_config<I, S>(
-        application_id: Identifier,
+        application_id: ApplicationId,
         local_member: &MemberIdentity,
         schemas: I,
         trusted_members: impl IntoIterator<Item = MemberIdentity>,
@@ -575,7 +584,7 @@ impl RuntimeTestFixture {
         I: IntoIterator<Item = (DatasetId, S)>,
         S: Into<SchemaSource>,
     {
-        let store = sqlite_store_with_schemas(local_member.clone(), schemas);
+        let store = provisioned_sqlite_store_with_schemas(local_member, schemas);
         wait_for_test_reply(provision_test_security(
             application_id.clone(),
             store.as_ref(),
@@ -593,7 +602,10 @@ impl RuntimeTestFixture {
     /// Panics if the local member cannot be loaded, deterministic runtime
     /// security cannot be loaded, or the runtime cannot be started.
     #[must_use]
-    pub fn load_from_store(application_id: Identifier, store: Arc<SqliteReplicationStore>) -> Self {
+    pub fn load_from_store(
+        application_id: ApplicationId,
+        store: Arc<SqliteReplicationStore>,
+    ) -> Self {
         let local_member = wait_for_test_reply(store.local_member_identity())
             .expect("local member identity should load");
         let security = wait_for_test_reply(load_test_delivery_security(
@@ -620,7 +632,7 @@ impl RuntimeTestFixture {
     /// security cannot be loaded, or the runtime cannot be started.
     #[must_use]
     pub fn load_from_store_with_config(
-        application_id: Identifier,
+        application_id: ApplicationId,
         store: Arc<SqliteReplicationStore>,
         config: ReplicationConfig,
     ) -> Self {
@@ -644,7 +656,7 @@ impl RuntimeTestFixture {
 
     /// Finish loading a fixture once local member identity and security are available.
     fn load_from_store_with_loaded_security(
-        application_id: Identifier,
+        application_id: ApplicationId,
         store: Arc<SqliteReplicationStore>,
         local_member: MemberIdentity,
         config: ReplicationConfig,
@@ -751,20 +763,47 @@ impl RuntimeTestFixture {
     }
 }
 
-fn sqlite_store_with_schemas<I, S>(
-    local_member: MemberIdentity,
+/// Build one replication-ready in-memory SQLite store with deterministic local identity material.
+///
+/// # Panics
+///
+/// Panics if the provisioner cannot be created, identity material cannot be stored, or activation
+/// does not discover the provisioned local identity.
+pub fn provisioned_sqlite_store_with_schemas<I, S>(
+    local_member: &MemberIdentity,
     schemas: I,
 ) -> Arc<SqliteReplicationStore>
 where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    let store = wait_for_test_future(SqliteReplicationStore::in_memory_with_schema_sources(
+    let provisioner = wait_for_test_future(
+        SqliteReplicationStoreProvisioner::in_memory_with_schema_sources(schemas),
+    )
+    .expect("store provisioner should build");
+    wait_for_test_future(provision_test_identity(
+        test_application_id(),
+        &provisioner,
         local_member,
-        schemas,
+        [],
     ))
-    .expect("store should build");
+    .expect("local test identity should provision");
+    let store = wait_for_test_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate");
     Arc::new(store)
+}
+
+/// Build one replication-ready in-memory SQLite store with no application schemas.
+///
+/// # Panics
+///
+/// Panics if local identity provisioning or store activation fails.
+#[must_use]
+pub fn provisioned_sqlite_store(local_member: &MemberIdentity) -> Arc<SqliteReplicationStore> {
+    provisioned_sqlite_store_with_schemas(
+        local_member,
+        std::iter::empty::<(DatasetId, SchemaSource)>(),
+    )
 }
 
 /// Provision deterministic local-private keys and trusted peer keys into one store.
@@ -774,9 +813,49 @@ where
 /// Returns [`LoadError`] when store-secret sealing or any store transaction
 /// operation fails.
 pub async fn provision_test_security(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: &dyn ReplicationStore,
-    local_member: &Identifier,
+    local_member: &MemberIdentity,
+    trusted_members: impl IntoIterator<Item = MemberIdentity>,
+) -> Result<(), LoadError> {
+    let transaction = store
+        .begin_transaction()
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    provision_test_security_transaction(application_id, transaction, local_member, trusted_members)
+        .await
+}
+
+/// Provision deterministic identity material through a store that is not replication-ready yet.
+///
+/// # Errors
+///
+/// Returns [`LoadError`] when store-secret sealing or any store transaction operation fails.
+pub async fn provision_test_identity(
+    application_id: ApplicationId,
+    store: &dyn LocalIdentityProvisioningStore,
+    local_member: &MemberIdentity,
+    trusted_members: impl IntoIterator<Item = MemberIdentity>,
+) -> Result<(), LoadError> {
+    let transaction = store
+        .begin_transaction()
+        .await
+        .boxed()
+        .context(RuntimeSnafu {
+            application_id: application_id.clone(),
+        })?;
+    provision_test_security_transaction(application_id, transaction, local_member, trusted_members)
+        .await
+}
+
+/// Write deterministic identity and trust records through one already-open transaction.
+async fn provision_test_security_transaction(
+    application_id: ApplicationId,
+    mut transaction: Box<dyn ReplicationStoreTransaction>,
+    local_member: &MemberIdentity,
     trusted_members: impl IntoIterator<Item = MemberIdentity>,
 ) -> Result<(), LoadError> {
     let local_seed = test_member_seed(local_member);
@@ -808,15 +887,16 @@ pub async fn provision_test_security(
             ),
         },
     };
-    let mut transaction = store
-        .begin_transaction()
+    transaction
+        .ensure_local_member_private_keys(record)
         .await
         .boxed()
         .context(RuntimeSnafu {
             application_id: application_id.clone(),
         })?;
+    let local_public_keys = test_public_member_keys(local_member);
     transaction
-        .ensure_local_member_private_keys(record)
+        .ensure_member_public_keys(MemberPublicKeysRecord::from_public_keys(&local_public_keys))
         .await
         .boxed()
         .context(RuntimeSnafu {
@@ -860,7 +940,7 @@ pub async fn provision_test_security(
 ///
 /// Returns [`LoadError`] when the store transaction or trust-evidence write fails.
 pub async fn provision_test_trusted_public_keys(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: &dyn ReplicationStore,
     member_id: MemberIdentity,
     public_keys: &PublicMemberKeys,
@@ -902,7 +982,7 @@ pub async fn provision_test_trusted_public_keys(
 /// Load delivery security from deterministic test records already provisioned in a store.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_test_delivery_security(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     local_member: &MemberIdentity,
 ) -> Result<DeliverySecurity, LoadError> {
@@ -918,7 +998,7 @@ pub(crate) async fn load_test_delivery_security(
 /// Load delivery security from deterministic test records with custom policy.
 #[cfg(any(test, feature = "test-support"))]
 async fn load_test_delivery_security_with_config(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     local_member: &MemberIdentity,
     config: &ReplicationConfig,
@@ -941,7 +1021,7 @@ pub fn test_replication_security_secrets() -> ReplicationSecuritySecrets {
 }
 
 /// Build deterministic seed material for one test member identity.
-fn test_member_seed(member: &Identifier) -> [u8; TEST_MEMBER_KEY_SEED_LENGTH] {
+fn test_member_seed(member: &MemberIdentity) -> [u8; TEST_MEMBER_KEY_SEED_LENGTH] {
     let mut seed = [0u8; TEST_MEMBER_KEY_SEED_LENGTH];
     for (index, byte) in member.to_string().bytes().enumerate() {
         let slot = index % seed.len();
@@ -978,6 +1058,6 @@ fn test_store_secret_key() -> StoreSecretKey {
 }
 
 /// Build the deterministic nonce used for one member's encrypted local keys.
-fn test_store_secret_nonce(member: &Identifier) -> [u8; STORE_SECRET_NONCE_LENGTH] {
+fn test_store_secret_nonce(member: &MemberIdentity) -> [u8; STORE_SECRET_NONCE_LENGTH] {
     [test_member_seed(member)[0]; STORE_SECRET_NONCE_LENGTH]
 }

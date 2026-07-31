@@ -341,7 +341,7 @@ fn member_public_keys_debug_prints_lengths_by_default() {
 
     assert_eq!(
         output,
-        r#"MemberPublicKeysRecord { key_id: MemberKeyId { member_id: Identifier(i"debug", i"alice"), fingerprint: KeyFingerprint("CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQk") }, signing_public_key_len: 3, encryption_public_key_len: 3 }"#,
+        r#"MemberPublicKeysRecord { key_id: MemberKeyId { member_id: MemberIdentity(Identifier(i"debug", i"alice")), fingerprint: KeyFingerprint("CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQk") }, signing_public_key_len: 3, encryption_public_key_len: 3 }"#,
     );
 }
 
@@ -353,7 +353,9 @@ fn member_public_keys_alternate_debug_prints_base64url() {
         output,
         r#"MemberPublicKeysRecord {
     key_id: MemberKeyId {
-        member_id: Identifier(i"debug", i"alice"),
+        member_id: MemberIdentity(
+            Identifier(i"debug", i"alice"),
+        ),
         fingerprint: KeyFingerprint(
             "CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQkJ-CQk",
         ),

@@ -18,9 +18,9 @@ pub mod test_support;
 
 pub use api::*;
 pub use local_identity::{
-    InitialiseLocalIdentityError,
-    LocalIdentityInitialisation,
-    initialise_local_identity,
+    ProvisionLocalIdentityError,
+    ProvisionedLocalIdentity,
+    provision_local_identity,
 };
 pub use runtime::{load_replication_runtime, load_replication_runtime_with_runtime_config_toml};
-pub use store::SqliteReplicationStore;
+pub use store::{SqliteReplicationStore, SqliteReplicationStoreProvisioner};

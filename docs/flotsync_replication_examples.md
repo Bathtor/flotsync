@@ -22,13 +22,12 @@ terminals or machines can stage local edits and exchange them when the user runs
 
 ## Setup
 
-Each peer needs its local identity, store, and store-secret profile in the
-application section. Runtime and route settings may remain in the same TOML.
+Each peer needs its store and store-secret profile in the application section.
+Runtime and route settings may remain in the same TOML.
 
 ```toml
 # alice.toml
 [flotsync.examples.replicated-checklist]
-local-member = "alice"
 store-path = "alice.sqlite"
 store-secret-profile = "alice-dev"
 ```
@@ -41,10 +40,11 @@ cargo run -p flotsync_replication_examples --bin replicated_checklist -- run bob
 ```
 
 When the configured store does not exist, `run` asks before creating setup
-state and initialising local identity keys. Declining exits without creating the
-store or its local secret. When an existing store lacks local private keys,
-`run` offers the same initialisation and retries runtime startup exactly once
-after acceptance. Other startup errors are reported without invoking recovery.
+state. After acceptance it prompts for the local member identity, then commits
+that identity, its encrypted private keys, and the matching public-key binding
+together. Declining exits without creating the store or its local secret. An
+existing empty store uses the same provisioning dialogue. Provisioned stores
+load their local identity from the store without prompting.
 
 Once inside the REPL, export, inspect, trust, and block through the already
 unlocked runtime:

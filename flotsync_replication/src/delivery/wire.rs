@@ -757,7 +757,7 @@ mod tests {
                 .push_checked((*segment).to_owned())
                 .expect("test identifier must be valid");
         }
-        buffer.into_identifier()
+        MemberIdentity::from(buffer.into_identifier())
     }
 
     fn proto_identifier(segments: &[&str]) -> discovery_proto::Identifier {

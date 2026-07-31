@@ -2,6 +2,35 @@
 
 use super::*;
 
+pub(super) async fn load_local_member_identity(
+    connection: &mut SqliteStoreConnection,
+) -> Result<Option<MemberIdentity>, StoreError> {
+    let rows = sqlx::query(
+        "
+SELECT DISTINCT member_identity
+FROM local_members
+LIMIT 2
+",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .context(SqlxSnafu)?;
+    let mut rows = rows.into_iter();
+    let Some(first_row) = rows.next() else {
+        return Ok(None);
+    };
+    let first_identity_text = first_row.get::<String, _>("member_identity");
+    let first = decode_member_identity(&first_identity_text)?;
+    let Some(second_row) = rows.next() else {
+        return Ok(Some(first));
+    };
+    let second_identity_text = second_row.get::<String, _>("member_identity");
+    let second = decode_member_identity(&second_identity_text)?;
+    Err(AmbiguousLocalMemberIdentitiesSnafu { first, second }
+        .build()
+        .into())
+}
+
 pub(super) async fn load_local_member_private_keys(
     connection: &mut SqliteStoreConnection,
     member_id: &MemberIdentity,
@@ -39,6 +68,15 @@ pub(super) async fn ensure_local_member_private_keys(
     connection: &mut SqliteStoreConnection,
     record: &LocalMemberPrivateKeysRecord,
 ) -> Result<(), StoreError> {
+    if let Some(existing_member) = load_local_member_identity(connection).await? {
+        ensure!(
+            existing_member == record.member_id,
+            ConflictingLocalMemberIdentitySnafu {
+                existing: existing_member,
+                requested: record.member_id.clone(),
+            }
+        );
+    }
     if let Some(existing) = load_local_member_private_keys(connection, &record.member_id).await? {
         ensure!(
             existing == *record,

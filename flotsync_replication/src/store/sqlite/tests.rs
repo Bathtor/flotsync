@@ -22,9 +22,10 @@ use crate::{
         SnapshotRef,
         current_slice_placeholder_group_security_material,
     },
-    test_support::test_public_member_keys,
+    provision_local_identity,
+    test_support::{test_public_member_keys, test_replication_security_secrets},
 };
-use flotsync_core::member::{Identifier, MAX_IDENTIFIER_SEGMENTS};
+use flotsync_core::member::MAX_IDENTIFIER_SEGMENTS;
 use flotsync_data_types::{
     Field,
     RowValues,
@@ -54,8 +55,21 @@ where
 }
 
 fn in_memory_store(local_member: MemberIdentity) -> SqliteReplicationStore {
-    wait_for_store_future(SqliteReplicationStore::in_memory(local_member))
-        .expect("store should build")
+    let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::in_memory())
+        .expect("provisioner should build");
+    wait_for_store_future(provision_local_identity(
+        &provisioner,
+        local_member,
+        &test_replication_security_secrets(),
+    ))
+    .expect("identity should provision");
+    wait_for_store_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate")
+}
+
+fn in_memory_provisioner() -> SqliteReplicationStoreProvisioner {
+    wait_for_store_future(SqliteReplicationStoreProvisioner::in_memory())
+        .expect("provisioner should build")
 }
 
 fn in_memory_store_with_schema_sources<I, S>(
@@ -66,11 +80,18 @@ where
     I: IntoIterator<Item = (DatasetId, S)>,
     S: Into<SchemaSource>,
 {
-    wait_for_store_future(SqliteReplicationStore::in_memory_with_schema_sources(
+    let provisioner = wait_for_store_future(
+        SqliteReplicationStoreProvisioner::in_memory_with_schema_sources(schema_sources),
+    )
+    .expect("provisioner should build");
+    wait_for_store_future(provision_local_identity(
+        &provisioner,
         local_member,
-        schema_sources,
+        &test_replication_security_secrets(),
     ))
-    .expect("store should build")
+    .expect("identity should provision");
+    wait_for_store_future(provisioner.into_replication_store())
+        .expect("provisioned store should activate")
 }
 
 fn docs_dataset_id() -> DatasetId {
@@ -78,15 +99,157 @@ fn docs_dataset_id() -> DatasetId {
 }
 
 fn local_member() -> MemberIdentity {
-    Identifier::from_array(["app", "alice"])
+    MemberIdentity::from_array(["app", "alice"])
 }
 
 fn remote_member() -> MemberIdentity {
-    Identifier::from_array(["app", "bob"])
+    MemberIdentity::from_array(["app", "bob"])
 }
 
 fn third_member() -> MemberIdentity {
-    Identifier::from_array(["app", "carol"])
+    MemberIdentity::from_array(["app", "carol"])
+}
+
+fn insert_raw_local_member(
+    provisioner: &SqliteReplicationStoreProvisioner,
+    member_identity: &str,
+    secret_byte: u8,
+) {
+    wait_for_store_future(async {
+        let mut connection = provisioner.pool.acquire().await.context(SqlxSnafu)?;
+        sqlx::query(
+            "
+INSERT INTO local_members (
+    member_identity,
+    private_keys_crypto_version,
+    private_keys_key_id,
+    private_keys_nonce,
+    private_keys_ciphertext
+)
+VALUES (?1, ?2, ?3, ?4, ?5)
+",
+        )
+        .bind(member_identity)
+        .bind(1_i64)
+        .bind(StoreSecretKeyId::from_u128_for_test(1).to_string())
+        .bind(vec![0_u8; 24])
+        .bind(vec![secret_byte])
+        .execute(&mut *connection)
+        .await
+        .context(SqlxSnafu)?;
+        Ok::<_, StoreError>(())
+    })
+    .expect("raw local member should insert");
+}
+
+#[test]
+fn sqlite_store_activation_requires_one_provisioned_identity() {
+    let provisioner = in_memory_provisioner();
+
+    let result = wait_for_store_future(provisioner.into_replication_store());
+    let Err(error) = result else {
+        panic!("empty provisioner should not activate");
+    };
+    assert!(matches!(
+        error,
+        StoreError::StoreExternal { ref source }
+            if matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::MissingLocalMemberIdentity)
+            )
+    ));
+}
+
+#[test]
+fn rolled_back_identity_material_remains_unprovisioned() {
+    let provisioner = in_memory_provisioner();
+    let mut transaction =
+        wait_for_store_future(provisioner.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.ensure_local_member_private_keys(
+        LocalMemberPrivateKeysRecord {
+            member_id: local_member(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret(41),
+            },
+        },
+    ))
+    .expect("private keys should be staged");
+    wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
+
+    let stored_member = wait_for_store_future(provisioner.local_member_identity())
+        .expect("identity lookup should succeed");
+    assert_eq!(stored_member, None);
+}
+
+#[test]
+fn sqlite_store_activation_rejects_several_distinct_local_identities() {
+    let provisioner = in_memory_provisioner();
+    insert_raw_local_member(&provisioner, &local_member().to_string(), 41);
+    insert_raw_local_member(&provisioner, &remote_member().to_string(), 42);
+
+    let result = wait_for_store_future(provisioner.into_replication_store());
+    let Err(error) = result else {
+        panic!("ambiguous provisioner should not activate");
+    };
+    assert!(matches!(
+        error,
+        StoreError::StoreExternal { ref source }
+            if matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::AmbiguousLocalMemberIdentities { first, second })
+                    if HashSet::from([first.clone(), second.clone()])
+                        == HashSet::from([local_member(), remote_member()])
+            )
+    ));
+}
+
+#[test]
+fn sqlite_store_activation_rejects_malformed_local_identity() {
+    let provisioner = in_memory_provisioner();
+    insert_raw_local_member(&provisioner, "bad!", 1);
+
+    let result = wait_for_store_future(provisioner.into_replication_store());
+    let Err(error) = result else {
+        panic!("malformed identity should not activate");
+    };
+    assert!(matches!(
+        error,
+        StoreError::StoreExternal { ref source }
+            if matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::InvalidMemberIdentity { raw, .. }) if raw == "bad!"
+            )
+    ));
+}
+
+#[test]
+fn sqlite_file_store_reopens_with_its_provisioned_identity() {
+    let path = std::env::temp_dir().join(format!(
+        "flotsync-replication-store-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let member = local_member();
+    let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::create_file(&path))
+        .expect("file provisioner should build");
+    wait_for_store_future(provision_local_identity(
+        &provisioner,
+        member.clone(),
+        &test_replication_security_secrets(),
+    ))
+    .expect("identity should provision");
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("new store should activate");
+    drop(store);
+
+    let provisioner = wait_for_store_future(SqliteReplicationStoreProvisioner::open_file(&path))
+        .expect("existing store should open");
+    let store = wait_for_store_future(provisioner.into_replication_store())
+        .expect("existing store should activate");
+    let loaded_member =
+        wait_for_store_future(store.local_member_identity()).expect("identity should load");
+    assert_eq!(loaded_member, member);
+    drop(store);
+    std::fs::remove_file(path).expect("test database should be removed");
 }
 
 fn initial_versions(member_count: usize) -> VersionVector {
@@ -1222,7 +1385,7 @@ fn sqlite_store_loads_only_writable_group_versions_without_ordering() {
 
 #[test]
 fn sqlite_store_roundtrips_local_member_private_keys() {
-    let store = in_memory_store(local_member());
+    let provisioner = in_memory_provisioner();
     let record = LocalMemberPrivateKeysRecord {
         member_id: local_member(),
         private_keys: EncryptedLocalMemberPrivateKeys {
@@ -1231,7 +1394,7 @@ fn sqlite_store_roundtrips_local_member_private_keys() {
     };
 
     let mut transaction =
-        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(provisioner.begin_transaction()).expect("transaction should start");
     wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
         .expect("private keys should store");
     wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
@@ -1242,6 +1405,9 @@ fn sqlite_store_roundtrips_local_member_private_keys() {
             .expect("private keys should exist");
     assert_eq!(loaded, record);
     wait_for_store_future(transaction.commit()).expect("commit should succeed");
+
+    let store =
+        wait_for_store_future(provisioner.into_replication_store()).expect("store should activate");
 
     let mut read_transaction =
         wait_for_store_future(store.begin_read_transaction()).expect("transaction should start");
@@ -1255,7 +1421,7 @@ fn sqlite_store_roundtrips_local_member_private_keys() {
 
 #[test]
 fn sqlite_store_rejects_conflicting_local_member_private_keys() {
-    let store = in_memory_store(local_member());
+    let provisioner = in_memory_provisioner();
     let record = LocalMemberPrivateKeysRecord {
         member_id: local_member(),
         private_keys: EncryptedLocalMemberPrivateKeys {
@@ -1270,7 +1436,7 @@ fn sqlite_store_rejects_conflicting_local_member_private_keys() {
     };
 
     let mut transaction =
-        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+        wait_for_store_future(provisioner.begin_transaction()).expect("transaction should start");
     wait_for_store_future(transaction.ensure_local_member_private_keys(record.clone()))
         .expect("private keys should store");
     let error =
@@ -1282,6 +1448,46 @@ fn sqlite_store_rejects_conflicting_local_member_private_keys() {
         &record.member_id,
     ));
     wait_for_store_future(transaction.rollback()).expect("rollback should succeed");
+}
+
+#[test]
+fn sqlite_store_rejects_private_keys_for_a_second_local_identity() {
+    let provisioner = in_memory_provisioner();
+    let first_member = local_member();
+    let second_member = remote_member();
+    let mut transaction =
+        wait_for_store_future(provisioner.begin_transaction()).expect("transaction should start");
+    wait_for_store_future(transaction.ensure_local_member_private_keys(
+        LocalMemberPrivateKeysRecord {
+            member_id: first_member.clone(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret(42),
+            },
+        },
+    ))
+    .expect("first local identity should store");
+
+    let error = wait_for_store_future(transaction.ensure_local_member_private_keys(
+        LocalMemberPrivateKeysRecord {
+            member_id: second_member.clone(),
+            private_keys: EncryptedLocalMemberPrivateKeys {
+                secret: sample_encrypted_secret(43),
+            },
+        },
+    ))
+    .expect_err("second local identity should fail");
+    assert!(matches!(
+        error,
+        StoreError::StoreExternal { ref source }
+            if matches!(
+                source.downcast_ref::<SqliteStoreError>(),
+                Some(SqliteStoreError::ConflictingLocalMemberIdentity {
+                    existing,
+                    requested,
+                }) if existing == &first_member && requested == &second_member
+            )
+    ));
+    wait_for_store_future(transaction.rollback()).expect("transaction should roll back");
 }
 
 #[test]
@@ -1339,17 +1545,20 @@ fn sqlite_store_lists_all_member_public_key_ids() {
     let mut remote_second =
         MemberPublicKeysRecord::from_public_keys(&test_public_member_keys(&third_member()));
     remote_second.key_id.member_id = remote_member();
+    let mut transaction =
+        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
+    let initial = wait_for_store_future(transaction.load_member_public_key_ids())
+        .expect("provisioned member-key ids should load");
+    let [initial] = initial.as_slice() else {
+        panic!("exactly one provisioned member-key id should exist: {initial:?}");
+    };
+    assert_eq!(initial.member_id, local_member());
     let expected = HashSet::from([
+        initial.clone(),
         remote_first.key_id.clone(),
         local.key_id.clone(),
         remote_second.key_id.clone(),
     ]);
-
-    let mut transaction =
-        wait_for_store_future(store.begin_transaction()).expect("transaction should start");
-    let empty = wait_for_store_future(transaction.load_member_public_key_ids())
-        .expect("empty member-key ids should load");
-    assert!(empty.is_empty());
     wait_for_store_future(transaction.ensure_member_public_keys(remote_first.clone()))
         .expect("first remote public keys should store");
     wait_for_store_future(transaction.ensure_member_public_keys(local))

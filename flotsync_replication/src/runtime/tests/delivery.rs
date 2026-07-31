@@ -196,7 +196,7 @@ fn partial_update_batch_retry_narrows_remaining_need() {
 fn update_batch_forwarded_by_non_producer_member_applies() {
     let alice_member = alice_member();
     let bob_member = bob_member();
-    let probe_member = Identifier::from_array(PROBE_MEMBER_SEGMENTS);
+    let probe_member = MemberIdentity::from_array(PROBE_MEMBER_SEGMENTS);
     let dataset_id = docs_dataset_id();
     let probe_fixture = load_runtime_fixture(
         app_probe_id(),

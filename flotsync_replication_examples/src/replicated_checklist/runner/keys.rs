@@ -10,7 +10,7 @@ pub(super) async fn run_runtime_key_command(
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut output = io::stdout();
-    let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
+    let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
     run_runtime_key_command_with_confirmation(replication, command, &mut confirmation).await
 }
 
@@ -18,7 +18,7 @@ pub(super) async fn run_runtime_key_command(
 async fn run_runtime_key_command_with_confirmation(
     replication: &dyn ReplicationApi,
     command: ChecklistKeyCommand,
-    confirmation: &mut ConfirmationDialog<'_>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     match command {
         ChecklistKeyCommand::ExportLocal => export_local_keys(replication).await,
@@ -63,7 +63,7 @@ async fn trust_public_bundle(
     replication: &dyn ReplicationApi,
     member_id: MemberIdentity,
     public_bundle: &str,
-    confirmation: &mut ConfirmationDialog<'_>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let report = assess_public_bundle(
@@ -96,7 +96,7 @@ async fn trust_public_bundle(
 async fn block_public_bundle(
     replication: &dyn ReplicationApi,
     public_bundle: &str,
-    confirmation: &mut ConfirmationDialog<'_>,
+    confirmation: &mut ChecklistDialog<'_>,
 ) -> Result<(), ReplicatedChecklistError> {
     let bundle = decode_pasteable_public_bundle(public_bundle)?;
     let report = assess_public_bundle(replication, bundle.clone(), HashSet::new()).await?;
@@ -294,7 +294,7 @@ mod tests {
         };
         let mut input = Cursor::new(b"yes\n".as_slice());
         let mut output = Vec::new();
-        let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
 
         block_on(run_runtime_key_command_with_confirmation(
             &api,
@@ -342,7 +342,7 @@ mod tests {
         };
         let mut input = Cursor::new(b"no\n".as_slice());
         let mut output = Vec::new();
-        let mut confirmation = ConfirmationDialog::new(&mut input, &mut output);
+        let mut confirmation = ChecklistDialog::new(&mut input, &mut output);
 
         block_on(run_runtime_key_command_with_confirmation(
             &api,

@@ -26,10 +26,11 @@ use flotsync_replication::{
     GroupInvitation,
     GroupInvitationResponder,
     GroupSchema,
-    InitialiseLocalIdentityError,
     ListenerError,
     LoadError,
     LoadSecurityError,
+    LocalIdentityProvisioningStore,
+    ProvisionLocalIdentityError,
     PublishChangesRequest,
     ReadToken,
     RejectionReason,
@@ -39,15 +40,17 @@ use flotsync_replication::{
     ReplicationEventListener,
     ReplicationGroupView,
     ReplicationSecuritySecrets,
+    ReplicationStore,
     RowChange,
     RowProviderError,
     SnapshotRowsRequest,
     SqliteReplicationStore,
+    SqliteReplicationStoreProvisioner,
     StoreError,
     StoreSecretKeyId,
     SummaryRequest,
-    initialise_local_identity,
     load_replication_runtime_with_runtime_config_toml,
+    provision_local_identity,
     security::{
         AssessPublicKeyBundleRequest,
         KnownMemberKeysReport,
@@ -154,10 +157,8 @@ pub enum ReplicatedChecklistError {
         action: &'static str,
         source: SecurityError,
     },
-    #[snafu(display("Failed to initialise local identity: {source}"))]
-    InitialiseLocalIdentity {
-        source: InitialiseLocalIdentityError,
-    },
+    #[snafu(display("Failed to provision local identity: {source}"))]
+    ProvisionLocalIdentity { source: ProvisionLocalIdentityError },
     #[snafu(display("Failed to prepare checklist store directory {}: {source}", path.display()))]
     CreateStoreDirectory { path: PathBuf, source: io::Error },
     #[snafu(display("Failed to open checklist replication store: {source}"))]
@@ -206,8 +207,8 @@ pub enum ReplicatedChecklistError {
     NoDefaultGroup,
     #[snafu(display("Listener reported changes for unknown checklist group {group_id}."))]
     UnknownListenerGroup { group_id: GroupId },
-    #[snafu(display("Proposed group member identity is invalid: {source}"))]
-    InvalidGroupMemberIdentity { source: IdentifierParseError },
+    #[snafu(display("Member identity is invalid: {source}"))]
+    InvalidMemberIdentity { source: IdentifierParseError },
     #[snafu(display("Member {member_id} occurs more than once in the proposed group."))]
     DuplicateGroupMember { member_id: MemberIdentity },
     #[snafu(display(
@@ -241,39 +242,70 @@ fn parse_confirmation(answer: &str) -> Result<bool, ReplicatedChecklistError> {
     })
 }
 
-/// Fail-closed confirmation interaction over an explicit input and output pair.
-struct ConfirmationDialog<'io> {
-    /// Buffered source of confirmation answers.
+/// Typed checklist interaction over an explicit input and output pair.
+struct ChecklistDialog<'io> {
+    /// Buffered source of checklist answers.
     input: &'io mut dyn BufRead,
     /// Destination for prompts shown before reading an answer.
     output: &'io mut dyn Write,
 }
 
-impl<'io> ConfirmationDialog<'io> {
-    /// Build one confirmation dialog over the supplied input and output.
+impl<'io> ChecklistDialog<'io> {
+    /// Build one checklist dialog over the supplied input and output.
     fn new(input: &'io mut dyn BufRead, output: &'io mut dyn Write) -> Self {
         Self { input, output }
     }
 
     /// Prompt once and interpret a missing or negative answer as refusal.
     fn confirm(&mut self, prompt: &str) -> Result<bool, ReplicatedChecklistError> {
-        write!(self.output, "{prompt} [y/N] ").context(repl_error::IoSnafu {
-            action: "writing confirmation prompt",
+        let answer = self.read_line(&format!("{prompt} [y/N] "), "reading confirmation")?;
+        parse_confirmation(&answer)
+    }
+
+    /// Prompt once and return the entered line without its line terminator.
+    fn read_line(
+        &mut self,
+        prompt: &str,
+        action: &'static str,
+    ) -> Result<String, ReplicatedChecklistError> {
+        write!(self.output, "{prompt}").context(repl_error::IoSnafu {
+            action: "writing checklist prompt",
         })?;
         self.output.flush().context(repl_error::IoSnafu {
-            action: "flushing confirmation prompt",
+            action: "flushing checklist prompt",
         })?;
         let mut answer = String::new();
-        let bytes_read = self
-            .input
+        self.input
             .read_line(&mut answer)
-            .context(repl_error::IoSnafu {
-                action: "reading confirmation",
-            })?;
-        if bytes_read == 0 {
-            Ok(false)
+            .context(repl_error::IoSnafu { action })?;
+        Ok(answer.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    /// Read one required member identity.
+    fn read_member_identity(
+        &mut self,
+        prompt: &str,
+    ) -> Result<MemberIdentity, ReplicatedChecklistError> {
+        let raw = self.read_line(prompt, "reading member identity")?;
+        raw.trim()
+            .parse()
+            .context(repl_error::InvalidMemberIdentitySnafu)
+    }
+
+    /// Read one optional member identity, interpreting a blank line as completion.
+    fn read_optional_member_identity(
+        &mut self,
+        prompt: &str,
+    ) -> Result<Option<MemberIdentity>, ReplicatedChecklistError> {
+        let raw = self.read_line(prompt, "reading member identity")?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            Ok(None)
         } else {
-            parse_confirmation(&answer)
+            let member = raw
+                .parse()
+                .context(repl_error::InvalidMemberIdentitySnafu)?;
+            Ok(Some(member))
         }
     }
 }

@@ -242,6 +242,8 @@ pub struct PeerAnnouncementComponent {
     advertised_routes: Vec<PeerAnnouncementRoute>,
     next_transmission_id: TransmissionId,
     announcement_timer: Option<ScheduledTimer>,
+    /// Whether one system-interface snapshot is already running outside the component worker.
+    interface_refresh_in_progress: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +327,7 @@ impl PeerAnnouncementComponent {
             advertised_routes: Vec::new(),
             next_transmission_id: TransmissionId::ONE,
             announcement_timer: None,
+            interface_refresh_in_progress: false,
         }
     }
 
@@ -433,8 +436,7 @@ impl PeerAnnouncementComponent {
             })
     }
 
-    fn refresh_broadcast_addresses(&mut self) {
-        let active_interfaces = Self::get_active_broadcast_interfaces();
+    fn refresh_broadcast_addresses(&mut self, active_interfaces: Vec<InterfaceSnapshotEntry>) {
         trace!(
             self.log(),
             "There are {} active interfaces: {}",
@@ -557,8 +559,23 @@ impl PeerAnnouncementComponent {
     }
 
     fn run_announcement_cycle(&mut self) -> HandlerResult {
-        self.refresh_broadcast_addresses();
-        self.announce_to_known_targets_and_set_timer()
+        if self.interface_refresh_in_progress {
+            return Handled::OK;
+        }
+
+        self.interface_refresh_in_progress = true;
+        self.spawn_local(|mut async_self| async move {
+            // macOS interface discovery can block in CoreWLAN for several seconds. Isolate that
+            // synchronous OS call so lifecycle and socket events keep progressing meanwhile.
+            let active_interfaces = blocking::unblock(Self::get_active_broadcast_interfaces).await;
+            async_self.interface_refresh_in_progress = false;
+            if !matches!(async_self.state, SocketState::Running { .. }) {
+                return Handled::OK;
+            }
+            async_self.refresh_broadcast_addresses(active_interfaces);
+            async_self.announce_to_known_targets_and_set_timer()
+        });
+        Handled::OK
     }
 
     fn replace_advertised_routes(&mut self, routes: Vec<PeerAnnouncementRoute>) -> HandlerResult {
@@ -572,7 +589,7 @@ impl PeerAnnouncementComponent {
             return Handled::OK;
         }
         if self.broadcast_addresses.is_empty() {
-            self.refresh_broadcast_addresses();
+            return self.run_announcement_cycle();
         }
         self.announce_to_known_targets_and_set_timer()
     }

@@ -14,7 +14,7 @@ use super::{
     ensure_portable_selector,
 };
 use crate::{STORE_SECRET_KEY_LENGTH, StoreSecretKey, StoreSecretKeyId};
-use flotsync_core::member::Identifier;
+use flotsync_core::ApplicationId;
 use keyring_core::{Entry, Error as KeyringError};
 use snafu::prelude::*;
 use zeroize::Zeroizing;
@@ -50,7 +50,7 @@ impl LoadedLocalStoreSecret {
 
     /// Decode one keyring record into the runtime store-secret input.
     fn decode_record(
-        application_id: &Identifier,
+        application_id: &ApplicationId,
         profile: &LocalStoreSecretProfile,
         record: &[u8],
     ) -> LocalStoreSecretResult<Self> {
@@ -120,7 +120,7 @@ impl LoadedLocalStoreSecret {
 /// initialised, or another [`LocalStoreSecretError`] when local secret storage
 /// cannot be accessed or the stored record is malformed.
 pub fn load_local_store_secret(
-    application_id: &Identifier,
+    application_id: &ApplicationId,
     profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<LoadedLocalStoreSecret> {
     let entry = local_store_secret_entry(application_id, profile)?;
@@ -140,7 +140,7 @@ pub fn load_local_store_secret(
 /// Returns [`LocalStoreSecretError`] if local secret storage cannot be accessed,
 /// key generation fails, or the stored/generated record cannot be read back.
 pub fn load_or_create_local_store_secret(
-    application_id: &Identifier,
+    application_id: &ApplicationId,
     profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<LoadedLocalStoreSecret> {
     match load_local_store_secret(application_id, profile) {
@@ -165,7 +165,7 @@ pub fn load_or_create_local_store_secret(
 
 /// Build the keyring entry address for one application/profile slot.
 fn local_store_secret_entry(
-    application_id: &Identifier,
+    application_id: &ApplicationId,
     profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<Entry> {
     ensure_default_local_secret_store()?;
@@ -252,7 +252,7 @@ fn install_default_local_secret_store() -> LocalStoreSecretResult<()> {
 /// Read the opaque stored keyring bytes for one local secret entry.
 fn read_local_store_secret_record(
     entry: &Entry,
-    application_id: &Identifier,
+    application_id: &ApplicationId,
     profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<Zeroizing<Vec<u8>>> {
     match entry.get_secret() {
@@ -281,7 +281,7 @@ fn generate_local_store_secret() -> LocalStoreSecretResult<LoadedLocalStoreSecre
 
 /// Derive the keyring account name from non-secret application/profile context.
 fn local_store_secret_account(
-    application_id: &Identifier,
+    application_id: &ApplicationId,
     profile: &LocalStoreSecretProfile,
 ) -> LocalStoreSecretResult<String> {
     let application_id = application_id.to_string();

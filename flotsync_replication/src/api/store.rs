@@ -144,6 +144,14 @@ pub trait ReplicationStoreReadTransaction: Send {
         dataset_id: &'a DatasetId,
     ) -> BoxFuture<'a, Result<Option<SchemaSource>, StoreError>>;
 
+    /// Load the unique local member identity represented by local-private key material.
+    ///
+    /// Returns `None` when the store has not been provisioned. Implementations must reject
+    /// several distinct local member identities rather than selecting one arbitrarily.
+    fn load_local_member_identity(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>>;
+
     /// Load encrypted local-private key material for one member identity.
     fn load_local_member_private_keys<'a>(
         &'a mut self,
@@ -470,6 +478,24 @@ pub trait ReplicationStoreTransaction: ReplicationStoreReadTransaction {
     /// explicit rollback allows store implementations to release resources
     /// promptly and surface rollback failures directly.
     fn rollback(self: Box<Self>) -> BoxFuture<'static, Result<(), StoreError>>;
+}
+
+/// Storage capabilities available before a local replication identity has been provisioned.
+///
+/// Provisioning stores deliberately do not implement [`ReplicationStore`]: a runtime store must
+/// already have one authoritative local identity, while this interface also represents an empty
+/// store. Applications should provision identity material and then activate the backend-specific
+/// replication-store type.
+pub trait LocalIdentityProvisioningStore: Send + Sync {
+    /// Load the identity already represented by local-private key material, when present.
+    ///
+    /// Implementations must reject several distinct local member identities.
+    fn local_member_identity(&self) -> BoxFuture<'_, Result<Option<MemberIdentity>, StoreError>>;
+
+    /// Begin the mutable transaction used to establish identity and key material atomically.
+    fn begin_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Box<dyn ReplicationStoreTransaction>, StoreError>>;
 }
 
 /// Persistence extension point.

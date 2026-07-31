@@ -48,7 +48,7 @@ use crate::{
 use flotsync_core::MemberIdentity;
 #[cfg(any(test, feature = "test-support"))]
 use flotsync_core::membership::{GroupMembers, GroupMemberships};
-use flotsync_core::{GroupId, member::Identifier};
+use flotsync_core::{ApplicationId, GroupId};
 use flotsync_routes::route_establishment::RouteEstablishmentMessage;
 use flotsync_security::PublicKeyBundle;
 use flotsync_utils::BoxFuture;
@@ -87,7 +87,7 @@ const TEST_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -115,7 +115,7 @@ pub async fn load_replication_runtime(
 ///
 /// See `LoadError` for failure conditions.
 pub async fn load_replication_runtime_with_runtime_config_toml(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -135,7 +135,7 @@ pub async fn load_replication_runtime_with_runtime_config_toml(
 }
 
 pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -182,7 +182,7 @@ pub(super) async fn load_replication_runtime_typed_with_runtime_config_toml(
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -201,7 +201,7 @@ pub(crate) async fn load_replication_runtime_typed_with_security_for_test(
 }
 
 async fn load_replication_runtime_typed_with_security(
-    application_id: Identifier,
+    application_id: ApplicationId,
     store: Arc<dyn ReplicationStore>,
     listener: Arc<dyn ReplicationEventListener>,
     config: ReplicationConfig,
@@ -256,7 +256,7 @@ async fn load_replication_runtime_typed_with_security(
 
 /// Concrete application-facing runtime returned by `load_replication_runtime`.
 pub(crate) struct ReplicationRuntime {
-    _application_id: Identifier,
+    _application_id: ApplicationId,
     /// Non-owning self-view used to expose another trait object for this exact allocation.
     self_weak: Weak<Self>,
     /// Live runtime ownership, taken exactly once during graceful shutdown.
